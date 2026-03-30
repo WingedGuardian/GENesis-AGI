@@ -515,6 +515,7 @@ class MailMonitor:
 
             # Fire triage pipeline for kept findings
             if self._triage_pipeline is not None and result.layer2_kept > 0:
+                from genesis.cc.types import CCOutput
                 from genesis.util.tasks import tracked_task
 
                 kept_decisions = [
@@ -528,8 +529,20 @@ class MailMonitor:
                     f"Subject: {emails[d['email_index'] - 1].subject}"
                     for d in kept_decisions
                 )
+                # Wrap findings in CCOutput so the triage pipeline can
+                # access .session_id, .text, .input_tokens, etc.
+                mail_output = CCOutput(
+                    session_id=f"mail-batch-{datetime.now(UTC).strftime('%Y%m%dT%H%M')}",
+                    text=findings_text,
+                    model_used="mail-triage",
+                    cost_usd=0.0,
+                    input_tokens=0,
+                    output_tokens=0,
+                    duration_ms=0,
+                    exit_code=0,
+                )
                 tracked_task(
-                    self._triage_pipeline(findings_text, user_text, "mail"),
+                    self._triage_pipeline(mail_output, user_text, "mail"),
                     name="mail-triage",
                     event_bus=self._event_bus,
                     subsystem=Subsystem.MAIL,

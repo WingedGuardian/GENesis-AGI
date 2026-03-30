@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -125,9 +126,27 @@ class StandaloneHealthDataService:
                 "input_tokens, output_tokens FROM call_site_last_run"
             )
             sites = {}
+            now = datetime.now(UTC)
             for row in await cursor.fetchall():
+                last_run = row["last_run_at"]
+                status = "unknown"
+                if last_run:
+                    try:
+                        run_dt = datetime.fromisoformat(last_run)
+                        if run_dt.tzinfo is None:
+                            run_dt = run_dt.replace(tzinfo=UTC)
+                        age = now - run_dt
+                        if age < timedelta(hours=1):
+                            status = "active"
+                        elif age < timedelta(hours=24):
+                            status = "idle"
+                        else:
+                            status = "stale"
+                    except (ValueError, TypeError):
+                        status = "unknown"
                 sites[row["call_site_id"]] = {
-                    "last_run_at": row["last_run_at"],
+                    "status": status,
+                    "last_run_at": last_run,
                     "last_provider": row["provider_used"],
                     "last_model": row["model_id"],
                     "last_tokens": (row["input_tokens"] or 0) + (row["output_tokens"] or 0),

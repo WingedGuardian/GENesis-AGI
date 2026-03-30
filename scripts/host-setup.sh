@@ -228,7 +228,7 @@ echo "  Cloning Genesis into container..."
 if echo "$REPO_URL" | grep -q "github.com" && ! curl -sf "$REPO_URL" >/dev/null 2>&1; then
     echo "  NOTE: Private repo detected. You may need to configure git credentials"
     echo "        inside the container after this script finishes:"
-    echo "        incus exec $CONTAINER_NAME --user $UBUNTU_UID -t -- bash"
+    echo "        incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu -t -- bash -l"
 fi
 
 # NOTE: The bash -c uses single quotes so /home/ubuntu paths survive the
@@ -266,19 +266,21 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
-        --env "HOME=/home/ubuntu" -t --cwd /home/ubuntu/genesis -- \
+        --env "HOME=/home/ubuntu" \
+        --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
+        -t --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
         echo "  WARNING: install.sh exited with errors."
         echo "  Connect to the container to debug:"
-        echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID -t -- bash"
+        echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu -t -- bash -l"
     }
 else
     echo ""
     echo "  ERROR: Genesis repo not found in container."
     echo "  Push the code manually, then run install.sh:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
-    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
+    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
 # ── Install Guardian on host ───────────────────────────────────
@@ -315,7 +317,7 @@ echo ""
 echo "  What to do next:"
 echo ""
 echo "    1. Connect to the Genesis container:"
-echo "       incus exec $CONTAINER_NAME --user $UBUNTU_UID -t -- bash"
+echo "       incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu -t -- bash -l"
 echo ""
 echo "    2. Inside the container, start a Claude Code session:"
 echo "       claude"
