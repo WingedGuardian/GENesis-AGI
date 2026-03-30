@@ -366,13 +366,15 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o
     echo "    + $(basename "$f"): VM IP templated"
 done
 
-# Replace YOUR_GITHUB_USER in scripts and docs (not already handled by CLAUDE.md step)
+# Replace WingedGuardian in scripts and docs (not already handled by CLAUDE.md step)
 find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.sh" -o -name "*.md" -o -name "*.service" \) \
-    -exec grep -l "YOUR_GITHUB_USER" {} \; 2>/dev/null | while IFS= read -r f; do
-    sed -i 's|YOUR_GITHUB_USER/genesis|YOUR_GITHUB_USER/genesis|gi' "$f"
+    -exec grep -l "WingedGuardian" {} \; 2>/dev/null | while IFS= read -r f; do
+    # Replace private repo references but preserve shared public repos:
+    # - WingedGuardian/agent-zero is our shared AZ fork — all users clone it
+    # - WingedGuardian/GENesis-AGI is the public repo itself
     sed -i 's|YOUR_GITHUB_USER/genesis-backups|YOUR_GITHUB_USER/genesis-backups|gi' "$f"
-    sed -i 's|YOUR_GITHUB_USER/agent-zero|YOUR_GITHUB_USER/agent-zero|gi' "$f"
-    sed -i 's|YOUR_GITHUB_USER|YOUR_GITHUB_USER|g' "$f"
+    sed -i 's|WingedGuardian/GENesis\.git|YOUR_GITHUB_USER/genesis.git|g' "$f"
+    sed -i 's|YOUR_GITHUB_USER/genesis |YOUR_GITHUB_USER/genesis |g' "$f"
     echo "    + $(basename "$f"): GitHub username templated"
 done
 
@@ -476,7 +478,8 @@ portability_hits=$(
         -e '10\.176\.34\.199' \
         -e '10\.176\.34\.206' \
         -e '192\.168\.50\.' \
-        -e 'YOUR_GITHUB_USER' \
+        -e 'WingedGuardian/GENesis\.git' \
+        -e 'YOUR_GITHUB_USER/genesis-backups' \
         -e 'America/New_York' \
         "$OUTPUT_DIR/src" "$OUTPUT_DIR/config" "$OUTPUT_DIR/scripts" \
         $([ -f "$OUTPUT_DIR/env.example" ] && echo "$OUTPUT_DIR/env.example") \
@@ -509,7 +512,7 @@ echo "  Source: $source_commit"
 echo "  Files: $file_count  Directories: $dir_count  Size: $size"
 echo ""
 echo "  Manual verification:"
-echo "    1. grep -r '10.176.34\|192.168.50\|YOUR_GITHUB_USER\|5070ti\|nanobot' $OUTPUT_DIR"
+echo "    1. grep -r '10.176.34\|192.168.50\|WingedGuardian\|5070ti\|nanobot' $OUTPUT_DIR"
 echo "    2. Check exemplar files are empty templates"
 echo "    3. Check no product track plans remain"
 echo "    4. Verify docs/history/ and docs/superpowers/ are absent"

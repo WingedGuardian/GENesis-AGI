@@ -22,7 +22,7 @@ what they miss — that's part of your job.
   via the `guardian-gateway.sh` command dispatcher. NOT the Ollama server.
   only. Do NOT install locally. NOT the host VM.
 - **Qdrant**: `localhost:6333` (systemd service)
-- **GitHub**: `YOUR_GITHUB_USER/genesis`
+- **GitHub**: `WingedGuardian/Genesis`
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
 - **Backups**: `YOUR_GITHUB_USER/genesis-backups`, cron every 6h (`scripts/backup.sh`)
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis

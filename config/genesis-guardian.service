@@ -1,6 +1,6 @@
 [Unit]
 Description=Genesis Guardian health check
-Documentation=https://github.com/YOUR_GITHUB_USER/genesis
+Documentation=https://github.com/WingedGuardian/GENesis
 # No After/Wants — intentionally standalone. Timer triggers this.
 
 [Service]

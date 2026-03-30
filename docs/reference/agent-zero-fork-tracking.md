@@ -1,6 +1,6 @@
 # Agent Zero Fork Tracking
 
-**Fork:** `YOUR_GITHUB_USER/agent-zero` (from `frdel/agent-zero`)
+**Fork:** `WingedGuardian/agent-zero` (from `frdel/agent-zero`)
 **Created:** 2026-03-01
 **Upstream pin:** commit `fa65fa3` (v0.9.8.2, 2026-02-24)
 **Local clone:** `~/agent-zero`
@@ -9,7 +9,7 @@
 
 | Name | URL | Purpose |
 |------|-----|---------|
-| `origin` | `github.com/YOUR_GITHUB_USER/agent-zero` | Our fork (push here) |
+| `origin` | `github.com/WingedGuardian/agent-zero` | Our fork (push here) |
 | `upstream` | `github.com/frdel/agent-zero` | Community upstream (pull from here) |
 
 ## Applied Patches
