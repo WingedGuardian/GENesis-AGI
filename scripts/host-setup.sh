@@ -244,7 +244,7 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
 
 # ── Run install.sh inside container ──────────────────────────
 # Guard: only run if the repo actually exists
-if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -- test -f /home/ubuntu/genesis/scripts/install.sh; then
+if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -f /home/ubuntu/genesis/scripts/install.sh; then
     echo ""
     echo "  Running install.sh inside container..."
     echo "  ─────────────────────────────────────────"
@@ -254,7 +254,8 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -- test -f /home/ubuntu/gen
     [ "$NON_INTERACTIVE" = "1" ] && _install_flags="--non-interactive"
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
-    incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -t --cwd /home/ubuntu/genesis -- \
+    incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
+        --env "HOME=/home/ubuntu" -t --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
         echo "  WARNING: install.sh exited with errors."
