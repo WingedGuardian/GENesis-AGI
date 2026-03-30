@@ -203,8 +203,13 @@ incus exec "$CONTAINER_NAME" -- bash -c 'id ubuntu &>/dev/null || useradd -m -s 
 # Enable linger for systemd user services
 incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || true
 
-# Install git inside container (needed for clone)
-incus exec "$CONTAINER_NAME" -- bash -c 'command -v git &>/dev/null || { apt-get update -qq && apt-get install -y -qq git; }' 2>/dev/null
+# Install git + curl inside container (needed for clone and install.sh network checks)
+incus exec "$CONTAINER_NAME" -- bash -c '
+    _NEED=""
+    command -v git  &>/dev/null || _NEED="$_NEED git"
+    command -v curl &>/dev/null || _NEED="$_NEED curl"
+    [ -n "$_NEED" ] && { apt-get update -qq && apt-get install -y -qq $_NEED; }
+' 2>/dev/null
 echo "  + User 'ubuntu' configured"
 
 # Resolve actual UID (don't assume 1000)
