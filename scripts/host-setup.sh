@@ -203,13 +203,16 @@ incus exec "$CONTAINER_NAME" -- bash -c 'id ubuntu &>/dev/null || useradd -m -s 
 # Enable linger for systemd user services
 incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || true
 
-# Install git + curl inside container (needed for clone and install.sh network checks)
+# Install all prerequisites inside container as root.
+# install.sh has its own checks as defense-in-depth, but pre-installing here
+# (as root, no sudo needed) is more reliable than install.sh's sudo fallbacks.
 incus exec "$CONTAINER_NAME" -- bash -c '
-    _NEED=""
-    command -v git  &>/dev/null || _NEED="$_NEED git"
-    command -v curl &>/dev/null || _NEED="$_NEED curl"
-    [ -n "$_NEED" ] && { apt-get update -qq && apt-get install -y -qq $_NEED; }
-' 2>/dev/null
+    apt-get update -qq
+    apt-get install -y -qq \
+        git curl sudo \
+        python3 python3-pip python3.12-venv \
+        nodejs npm
+' 2>&1 | tail -5
 echo "  + User 'ubuntu' configured"
 
 # Resolve actual UID (don't assume 1000)

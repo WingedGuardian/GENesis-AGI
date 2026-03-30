@@ -200,17 +200,19 @@ if ! python3 -m pip --version &>/dev/null; then
     fi
 fi
 
-# venv module
-if ! python3 -c "import venv" &>/dev/null; then
-    echo "    python3-venv not found — installing..."
+# venv module — check ensurepip, not just "import venv" (the venv module ships
+# with base Python but ensurepip requires the python3.XX-venv package)
+_PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
+if ! python3 -c "import ensurepip" &>/dev/null; then
+    echo "    python3.${_PY_MINOR}-venv not found — installing..."
     if command -v apt-get &>/dev/null; then
-        sudo apt-get install -y -qq python3-venv 2>/dev/null || {
-            echo "    ERROR: Could not install python3-venv."
+        sudo apt-get install -y -qq "python3.${_PY_MINOR}-venv" 2>/dev/null || {
+            echo "    ERROR: Could not install python3.${_PY_MINOR}-venv."
             exit 1
         }
-        echo "    + python3-venv installed"
+        echo "    + python3.${_PY_MINOR}-venv installed"
     else
-        echo "    ERROR: python3-venv not found. Install manually."
+        echo "    ERROR: python3.${_PY_MINOR}-venv not found. Install manually."
         exit 1
     fi
 fi
