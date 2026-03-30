@@ -392,7 +392,12 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o
 done
 
 # Replace hardcoded ${HOME}/ install path in docs and source
+# EXCLUDE host-setup.sh, install_guardian.sh, install.sh — these reference
+# the container's internal /home/ubuntu path, not the host user's home.
 find "$OUTPUT_DIR" -type f \( -name "*.md" -o -name "*.py" -o -name "*.sh" \) \
+    -not -name "host-setup.sh" \
+    -not -name "install_guardian.sh" \
+    -not -name "install.sh" \
     -exec grep -l "${HOME}/" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|${HOME}/|${HOME}/|g' "$f"
     echo "    + $(basename "$f"): install path templated"
