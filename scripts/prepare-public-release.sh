@@ -399,7 +399,7 @@ find "$OUTPUT_DIR" -type f \( -name "*.md" -o -name "*.py" -o -name "*.sh" \) \
 done
 
 # Replace user timezone with UTC default in config and source (not tests/docs)
-find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" \) \
+find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" "$OUTPUT_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" -o -name "*.example" \) \
     -exec grep -l "America/New_York" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|America/New_York|UTC|g' "$f"
     echo "    + $(basename "$f"): timezone templated"

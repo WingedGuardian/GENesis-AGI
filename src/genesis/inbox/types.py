@@ -41,7 +41,7 @@ class InboxConfig:
     timeout_s: int = 600
     max_retries: int = 3
     recursive: bool = False
-    timezone: str = "UTC"
+    timezone: str = "America/New_York"
     evaluation_cooldown_seconds: int = 3600
 
 

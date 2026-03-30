@@ -30,7 +30,7 @@ _COUNTER_FILE = ".genesis-counters.json"
 class ResponseWriter:
     """Writes evaluation results as Obsidian-compatible markdown."""
 
-    def __init__(self, *, watch_path: Path, timezone: str = "UTC"):
+    def __init__(self, *, watch_path: Path, timezone: str = "America/New_York"):
         self._watch_path = watch_path
         self._tz = ZoneInfo(timezone)
 

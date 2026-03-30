@@ -147,9 +147,16 @@ if [[ -f "$SECRETS_FILE" ]]; then
 fi
 if [[ -z "$GENESIS_TIMEZONE" ]]; then
     CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
-    echo "  Current timezone: $CURRENT_TZ"
-    read -rp "  Enter timezone (e.g. America/New_York) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
-    GENESIS_TIMEZONE="${INPUT_TZ:-$CURRENT_TZ}"
+    if [[ -t 0 ]]; then
+        # Interactive — ask the user
+        echo "  Current timezone: $CURRENT_TZ"
+        read -rp "  Enter timezone (e.g. America/New_York) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
+        GENESIS_TIMEZONE="${INPUT_TZ:-$CURRENT_TZ}"
+    else
+        # Non-interactive — use current or UTC
+        GENESIS_TIMEZONE="$CURRENT_TZ"
+        echo "  Using timezone: $GENESIS_TIMEZONE (non-interactive)"
+    fi
 fi
 if command -v timedatectl &>/dev/null; then
     sudo timedatectl set-timezone "$GENESIS_TIMEZONE" 2>/dev/null && \
