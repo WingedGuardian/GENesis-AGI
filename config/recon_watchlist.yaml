@@ -1,0 +1,83 @@
+# Recon Watchlist — Projects Genesis actively monitors for updates.
+#
+# These are hardcoded watch targets. The recon system checks these on schedule
+# regardless of salience scoring or LLM judgment. Add/remove entries here;
+# recon_sources (MCP tool) manages dynamic sources separately.
+#
+# Fields:
+#   name:        Human-readable project name
+#   repo:        GitHub owner/repo (primary source)
+#   track:       What to watch — releases, commits, issues, discussions, stars
+#   priority:    high | medium | low — affects check frequency and triage urgency
+#   notes:       Why this project matters to Genesis / the user
+#   urls:        Additional non-GitHub URLs to monitor (docs, blogs, changelogs)
+
+projects:
+
+  - name: Agent Zero
+    repo: frdel/agent-zero
+    track: [commits, releases, issues]
+    priority: high
+    notes: >
+      Genesis runtime substrate. We are 1441+ commits behind upstream.
+      Every change here is a potential rebase conflict or new capability.
+    urls:
+      - https://github.com/frdel/agent-zero/releases
+
+  - name: Claude Code
+    repo: anthropics/claude-code
+    track: [releases, commits, discussions]
+    priority: high
+    notes: >
+      Primary intelligence layer (CC Max). New flags, features, and breaking
+      changes directly affect Genesis CC integration (invoker, session_manager,
+      conversation, checkpoint).
+    urls:
+      - https://docs.anthropic.com/en/docs/claude-code
+      - https://code.claude.com/docs/en/overview
+
+  - name: OpenClaw
+    repo: openclaw/openclaw
+    track: [releases, commits, issues]
+    priority: medium
+    notes: >
+      Personal AI assistant — any OS, any platform. Competitive intelligence
+      and potential pattern source for Genesis architecture.
+
+  - name: Cognee
+    repo: topoteretes/cognee
+    track: [releases, commits]
+    priority: medium
+    notes: >
+      Knowledge graph / memory infrastructure for AI agents. Relevant to
+      Genesis memory-mcp and knowledge pipeline design.
+    urls:
+      - https://www.cognee.ai/
+
+  - name: OpenFang
+    repo: RightNow-AI/openfang
+    track: [releases, commits, issues]
+    priority: medium
+    notes: >
+      Open-source Agent Operating System. Agentic AI infrastructure —
+      relevant to Genesis architecture and agent orchestration patterns.
+
+  - name: claude-code-telegram (RichardAtCT)
+    repo: RichardAtCT/claude-code-telegram
+    track: [commits, releases, issues]
+    priority: medium
+    notes: >
+      Telegram bridge for Claude Code. Reference implementation for DraftStreamer
+      pattern and stop-button interrupt. Patterns directly adaptable to Genesis
+      subprocess model (CCInvoker.interrupt via SIGINT). 2,185 stars.
+
+  - name: NVIDIA NeMo
+    repo: NVIDIA/NeMo
+    track: [releases]
+    priority: medium
+    notes: >
+      NVIDIA's end-to-end platform for LLM training, fine-tuning, and
+      inference. Relevant to model routing strategy and local compute options.
+    urls:
+      - https://docs.nvidia.com/nemo-framework/
+      - https://github.com/NVIDIA/NeMo/releases

@@ -1,0 +1,779 @@
+# Model intelligence profiles — machine-readable model capabilities.
+# Source: docs/reference/models.md (manually reviewed).
+# Used by: ModelProfileRegistry for contingency routing, matcher, recon.
+
+profiles:
+  gpt-5.4:
+    display_name: "GPT-5.4"
+    provider: openai
+    api_id: "openai/gpt-5.4"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 1048576
+    cost_tier: moderate
+    cost_per_mtok_in: 2.50
+    cost_per_mtok_out: 12.00
+    latency: moderate
+    strengths:
+      - computer use and agentic work
+      - compaction training for long trajectories
+      - multi-step tool calling efficiency
+      - factuality (33 percent fewer false claims)
+      - agentic web search
+    weaknesses:
+      - creative writing (less distinctive voice)
+      - cost for bulk background work
+    best_for: [deep_reflection, task_execution, code_work, adversarial_counterargument]
+    avoid_for: [surplus_brainstorm, micro_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  kimi-k2.5:
+    display_name: "Kimi K2.5"
+    provider: moonshot
+    api_id: "moonshotai/kimi-k2.5"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 2097152
+    cost_tier: cheap
+    cost_per_mtok_in: 0.60
+    cost_per_mtok_out: 3.00
+    latency: moderate
+    strengths:
+      - parallel research and sub-agent spawning
+      - multi-file handling
+      - long-context summarization
+      - 2M token context window
+    weaknesses:
+      - single-thread speed slower than Flash
+      - mathematical precision weaker than DeepSeek
+      - beta swarm features can crash or loop
+    best_for: [foreground_conversation, research_synthesis, long_context_work]
+    avoid_for: [micro_reflection, math_heavy]
+    free_tier:
+      available: true
+      provider: nvidia_nim
+      limits: "5000 credits, 40 RPM"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  glm-5:
+    display_name: "GLM-5"
+    provider: zenmux
+    api_id: "z-ai/glm-5-turbo"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 204800
+    cost_tier: cheap
+    cost_per_mtok_in: 0.80
+    cost_per_mtok_out: 2.56
+    latency: high
+    strengths:
+      - multi-step architecture planning
+      - root cause analysis
+      - technical planning with deep thinking
+    weaknesses:
+      - response speed (high latency)
+      - creative tone (dry and academic)
+      - 200k context limit
+    best_for: [deep_reflection, cognitive_state, architecture_planning]
+    avoid_for: [foreground_conversation, surplus_brainstorm]
+    free_tier:
+      available: true
+      provider: z_ai
+      limits: "20M free tokens for new users"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  gemini-3-pro:
+    display_name: "Gemini 3 Pro"
+    provider: google
+    api_id: "google/gemini-3-pro"
+    intelligence_tier: S
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: C
+    context_window: 2097152
+    cost_tier: moderate
+    cost_per_mtok_in: 2.00
+    cost_per_mtok_out: 12.00
+    latency: moderate
+    strengths:
+      - video and audio intelligence
+      - native multimodal reasoning
+      - live search integration
+    weaknesses:
+      - expensive for text-only work
+      - verbosity and preachy tone
+      - sycophancy (validates weak reasoning)
+      - code logic inconsistency
+    best_for: [research_synthesis, multimodal_analysis]
+    avoid_for: [adversarial_counterargument, quality_calibration, fresh_eyes_review]
+    free_tier:
+      available: true
+      provider: google_ai
+      limits: "see docs/reference/models.md"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  gemini-3-flash:
+    display_name: "Gemini 3 Flash"
+    provider: google
+    api_id: "google/gemini-3-flash"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: C
+    context_window: 1048576
+    cost_tier: cheap
+    cost_per_mtok_in: 0.50
+    cost_per_mtok_out: 3.00
+    latency: low
+    strengths:
+      - speed (instant first token)
+      - bulk summarization
+      - data extraction from logs
+    weaknesses:
+      - complex logic failures
+      - emotional intelligence
+      - sycophancy
+      - software design from scratch
+    best_for: [memory_consolidation, fact_extraction, tagging, surplus_brainstorm]
+    avoid_for: [deep_reflection, adversarial_counterargument, quality_calibration]
+    free_tier:
+      available: true
+      provider: google_ai
+      limits: "1500 RPD, 15 RPM"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  mistral-large-3:
+    display_name: "Mistral Large 3"
+    provider: mistral
+    api_id: "mistralai/mistral-large-latest"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: moderate
+    cost_per_mtok_in: 2.00
+    cost_per_mtok_out: 6.00
+    latency: moderate
+    strengths:
+      - JSON instruction following
+      - multilingual mastery
+      - data privacy (free tier data NOT used for training)
+    weaknesses:
+      - creative output is boring
+      - 128k context is small
+      - narrative flow
+    best_for: [memory_consolidation, fact_extraction, triage, outreach_draft]
+    avoid_for: [creative_writing, long_context_work]
+    free_tier:
+      available: true
+      provider: mistral
+      limits: "2 RPM, 1B tokens/month"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  claude-opus-4.6:
+    display_name: "Claude 4.6 Opus"
+    provider: anthropic
+    api_id: "anthropic/claude-opus-4-6"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: S
+    anti_sycophancy: A
+    context_window: 1048576
+    cost_tier: expensive
+    cost_per_mtok_in: 5.00
+    cost_per_mtok_out: 25.00
+    latency: high
+    strengths:
+      - strategic synthesis
+      - moral and creative nuance
+      - trustworthiness (lowest hallucination rate)
+    weaknesses:
+      - speed (slowest frontier model)
+      - operational cost
+      - refusal rates on benign requests
+    best_for: [strategic_reflection, weekly_self_assessment, quality_calibration]
+    avoid_for: [micro_reflection, surplus_brainstorm, triage]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  claude-sonnet-4.5:
+    display_name: "Claude 4.5 Sonnet"
+    provider: anthropic
+    api_id: "anthropic/claude-sonnet-4-5-20250929"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: A
+    context_window: 1048576
+    cost_tier: moderate
+    cost_per_mtok_in: 3.00
+    cost_per_mtok_out: 15.00
+    latency: moderate
+    strengths:
+      - professional writing tone
+      - visual reasoning (charts, UX screenshots)
+      - consistency (low variance between calls)
+    weaknesses:
+      - pure logic puzzles
+      - speed (slower than Flash models)
+      - risk aversion
+    best_for: [deep_reflection, foreground_conversation, inbox_assessment]
+    avoid_for: [surplus_brainstorm, micro_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  claude-haiku-4.5:
+    display_name: "Claude 4.5 Haiku"
+    provider: anthropic
+    api_id: "anthropic/claude-haiku-4-5-20251001"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 204800
+    cost_tier: moderate
+    cost_per_mtok_in: 1.00
+    cost_per_mtok_out: 5.00
+    latency: low
+    strengths:
+      - conversational tone (warm, empathetic)
+      - formatting cleanup
+      - cost/speed ratio
+    weaknesses:
+      - hard sciences
+      - factuality (higher hallucination rate)
+      - large-scale system design
+    best_for: [light_reflection, triage, tagging]
+    avoid_for: [deep_reflection, strategic_reflection, quality_calibration]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  grok-4:
+    display_name: "Grok 4"
+    provider: xai
+    api_id: "xai/grok-4"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: S
+    context_window: 262144
+    cost_tier: moderate
+    cost_per_mtok_in: 3.00
+    cost_per_mtok_out: 15.00
+    latency: moderate
+    strengths:
+      - contrarian analysis
+      - unfiltered output (fewer safety refusals)
+      - finding flaws in reasoning and design
+    weaknesses:
+      - consistency (higher output quality variance)
+      - structured output (less reliable JSON)
+      - enterprise compliance
+    best_for: [adversarial_counterargument, fresh_eyes_review, quality_calibration]
+    avoid_for: [outreach_draft, structured_extraction]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  grok-4.1-fast:
+    display_name: "Grok 4.1 Fast"
+    provider: xai
+    api_id: "xai/grok-4.1-fast"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: A
+    context_window: 262144
+    cost_tier: moderate
+    cost_per_mtok_in: 1.00
+    cost_per_mtok_out: 5.00
+    latency: low
+    strengths:
+      - quick counterarguments
+      - bulk adversarial analysis at higher throughput
+    weaknesses:
+      - deep reasoning (trades depth for speed)
+      - consistency issues (same as Grok 4)
+    best_for: [adversarial_counterargument, fresh_eyes_review]
+    avoid_for: [strategic_reflection, deep_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  llama-4-scout:
+    display_name: "Llama 4 Scout"
+    provider: meta
+    api_id: "meta-llama/llama-4-scout"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 10485760
+    cost_tier: cheap
+    cost_per_mtok_in: 0.18
+    cost_per_mtok_out: 0.63
+    latency: moderate
+    strengths:
+      - library ingestion (entire doc sets in one pass)
+      - deep recall (needle in haystack)
+      - local deployment efficiency
+      - 10M token context
+    weaknesses:
+      - middle-context accuracy dip
+      - reasoning density
+      - verbose and repetitive in casual chat
+    best_for: [memory_consolidation, fact_extraction, research_synthesis]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
+    free_tier:
+      available: true
+      provider: openrouter
+      limits: "free tier variant on OpenRouter"
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  gpt-5-nano:
+    display_name: "GPT-5 Nano"
+    provider: openai
+    api_id: "openai/gpt-5-nano"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.05
+    cost_per_mtok_out: 0.20
+    latency: low
+    strengths:
+      - cheapest viable paid fallback
+      - speed
+      - structured output for simple schemas
+    weaknesses:
+      - complex reasoning
+      - nuance in analysis
+    best_for: [tagging, micro_reflection, structured_extraction]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  gpt-5-mini:
+    display_name: "GPT-5 Mini"
+    provider: openai
+    api_id: "openai/gpt-5-mini"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 262144
+    cost_tier: cheap
+    cost_per_mtok_in: 0.15
+    cost_per_mtok_out: 0.60
+    latency: low
+    strengths:
+      - strong capability-to-cost ratio
+      - larger context than Nano
+    weaknesses:
+      - same as Nano (slightly less severe)
+    best_for: [tagging, micro_reflection, memory_consolidation]
+    avoid_for: [deep_reflection, strategic_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  qwen-3.5-plus:
+    display_name: "Qwen 3.5 Plus"
+    provider: alibaba
+    api_id: "qwen/qwen3.5-plus"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.40
+    cost_per_mtok_out: 2.40
+    latency: moderate
+    strengths:
+      - agent benchmarks (top agentic task completion)
+      - value (strong reasoning at fraction of Sonnet cost)
+      - structured output (reliable JSON)
+    weaknesses:
+      - English nuance (occasional awkward phrasing)
+      - creative tasks (functional but uninspired)
+    best_for: [task_retrospective, outcome_classification, structured_extraction]
+    avoid_for: [foreground_conversation, creative_writing]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  qwen3-max-thinking:
+    display_name: "Qwen3-Max-Thinking"
+    provider: alibaba
+    api_id: "qwen/qwen3-max-thinking"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: moderate
+    cost_per_mtok_in: 1.20
+    cost_per_mtok_out: 6.00
+    latency: high
+    strengths:
+      - mathematical reasoning (strong chain-of-thought)
+      - multi-step planning
+    weaknesses:
+      - speed (thinking mode adds latency)
+      - cost if not using reasoning capabilities
+    best_for: [deep_reflection, triage_calibration, delta_assessment]
+    avoid_for: [micro_reflection, surplus_brainstorm]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  minimax-m2.5:
+    display_name: "MiniMax M2.5"
+    provider: minimax
+    api_id: "minimax/minimax-m2.5"
+    intelligence_tier: A
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 209715
+    cost_tier: cheap
+    cost_per_mtok_in: 0.30
+    cost_per_mtok_out: 1.20
+    latency: moderate
+    strengths:
+      - office deliverables (Word, PPT, Excel)
+      - roleplay and persona adaptation
+      - value for capability level
+    weaknesses:
+      - obscure facts (high hallucination on niche topics)
+      - coding security (generates vulnerable code)
+      - conversation length (loses focus after 20+ turns)
+    best_for: [outreach_draft, content_draft, surplus_brainstorm]
+    avoid_for: [deep_reflection, code_work, quality_calibration]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  gpt-5.3-codex:
+    display_name: "GPT-5.3 Codex"
+    provider: openai
+    api_id: "openai/gpt-5.3-codex"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 409600
+    cost_tier: expensive
+    cost_per_mtok_in: 1.75
+    cost_per_mtok_out: 14.00
+    latency: moderate
+    strengths:
+      - terminal autonomy (independent code fix in live terminal)
+      - zero-shot accuracy (highest first-try bug fix rate)
+      - technical recall (zero degradation across 400k window)
+    weaknesses:
+      - budget work (expensive for routine scripting)
+      - creative brainstorming (extremely literal)
+      - multilingual coding (English-optimized)
+    best_for: [code_work, task_execution, deep_reflection]
+    avoid_for: [surplus_brainstorm, outreach_draft, micro_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-14"
+    review_source: manual
+
+  # --- Profiles added for routing config coverage (2026-03-26) ---
+
+  claude-sonnet-4.6:
+    display_name: "Claude 4.6 Sonnet"
+    provider: anthropic
+    api_id: "anthropic/claude-sonnet-4-6-20250514"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: S
+    anti_sycophancy: A
+    context_window: 1048576
+    cost_tier: moderate
+    cost_per_mtok_in: 3.00
+    cost_per_mtok_out: 15.00
+    latency: moderate
+    strengths:
+      - agentic coding (SWE-bench SOTA)
+      - instruction following (best-in-class)
+      - tool use precision
+      - parallel tool calls
+    weaknesses:
+      - speed (slower than Flash models)
+      - cost for bulk background work
+    best_for: [deep_reflection, code_work, foreground_conversation, inbox_assessment]
+    avoid_for: [surplus_brainstorm, micro_reflection]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  qwen2.5-3b:
+    display_name: "Qwen 2.5 3B"
+    provider: ollama
+    api_id: "qwen2.5:3b"
+    intelligence_tier: C
+    reasoning: C
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 32768
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - local inference (zero network latency)
+      - zero cost
+      - simple classification and tagging
+    weaknesses:
+      - complex reasoning
+      - factuality (high hallucination rate)
+      - nuanced analysis
+    best_for: [triage, tagging]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation, code_work]
+    free_tier:
+      available: true
+      provider: local
+      limits: "unlimited (local inference)"
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  llama-3.3-70b:
+    display_name: "Llama 3.3 70B"
+    provider: meta
+    api_id: "meta-llama/llama-3.3-70b-versatile"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: low
+    strengths:
+      - speed (Groq inference)
+      - general-purpose capability
+      - free tier availability
+    weaknesses:
+      - complex multi-step reasoning
+      - creative output quality
+      - instruction following under ambiguity
+    best_for: [triage, memory_consolidation, fact_extraction, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection, quality_calibration]
+    free_tier:
+      available: true
+      provider: groq
+      limits: "30 RPM, 6000 RPD"
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  qwen-2.5-72b:
+    display_name: "Qwen 2.5 72B Instruct"
+    provider: alibaba
+    api_id: "qwen/qwen-2.5-72b-instruct"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - structured output (reliable JSON)
+      - multilingual capability
+      - free tier on OpenRouter
+    weaknesses:
+      - reasoning depth vs frontier models
+      - creative tasks
+    best_for: [memory_consolidation, fact_extraction, triage, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
+    free_tier:
+      available: true
+      provider: openrouter
+      limits: "free tier variant"
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  mimo-v2-pro:
+    display_name: "MiMo V2 Pro"
+    provider: xiaomi
+    api_id: "xiaomi/mimo-v2-pro"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.60
+    cost_per_mtok_out: 2.40
+    latency: moderate
+    strengths:
+      - mathematical reasoning (strong chain-of-thought)
+      - code generation accuracy
+      - reasoning-to-cost ratio
+    weaknesses:
+      - creative writing
+      - English nuance
+      - limited community tooling
+    best_for: [code_work, triage, outcome_classification]
+    avoid_for: [foreground_conversation, outreach_draft, creative_writing]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  deepseek-v3:
+    display_name: "DeepSeek V3"
+    provider: deepseek
+    api_id: "deepseek/deepseek-chat"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.27
+    cost_per_mtok_out: 1.10
+    latency: moderate
+    strengths:
+      - code generation and analysis (671B MoE, code-specialized)
+      - mathematical reasoning
+      - cost efficiency (fraction of frontier model pricing)
+      - 128K context window
+    weaknesses:
+      - creative and conversational tasks
+      - English fluency in long-form output
+      - API availability (occasional outages)
+    best_for: [code_work, fact_extraction, memory_consolidation]
+    avoid_for: [foreground_conversation, outreach_draft, creative_writing]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  grok-3-mini:
+    display_name: "Grok 3 Mini"
+    provider: xai
+    api_id: "xai/grok-3-mini"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: A
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.30
+    cost_per_mtok_out: 0.50
+    latency: low
+    strengths:
+      - speed (fast inference)
+      - anti-sycophancy (inherits Grok contrarian stance)
+      - cost efficiency
+    weaknesses:
+      - reasoning depth (smaller model)
+      - factuality on niche topics
+      - structured output reliability
+    best_for: [triage, adversarial_counterargument, fresh_eyes_review]
+    avoid_for: [deep_reflection, strategic_reflection, code_work]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  mistral-nemo:
+    display_name: "Mistral Nemo"
+    provider: mistral
+    api_id: "mistralai/mistral-nemo"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.15
+    cost_per_mtok_out: 0.15
+    latency: low
+    strengths:
+      - speed
+      - multilingual capability
+      - cost efficiency for simple tasks
+    weaknesses:
+      - complex reasoning
+      - large-scale system design
+      - creative output depth
+    best_for: [tagging, micro_reflection, memory_consolidation]
+    avoid_for: [deep_reflection, strategic_reflection, code_work]
+    free_tier:
+      available: false
+    last_reviewed: "2026-03-26"
+    review_source: manual
+
+  mistral-small-3.2-24b:
+    display_name: "Mistral Small 3.2 24B"
+    provider: mistral
+    api_id: "mistral-small-3.2-24b-instruct-2506"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - local inference (LM Studio)
+      - zero cost
+      - instruction following for its size
+      - good at structured output
+    weaknesses:
+      - complex multi-step reasoning
+      - creative output
+      - speed depends on hardware
+    best_for: [triage, tagging, memory_consolidation, triage_calibration]
+    avoid_for: [deep_reflection, strategic_reflection, foreground_conversation]
+    free_tier:
+      available: true
+      provider: local
+      limits: "unlimited (local inference)"
+    last_reviewed: "2026-03-26"
+    review_source: manual

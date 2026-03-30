@@ -1,0 +1,4 @@
+title: Genesis Memory
+description: Qdrant + SQLite FTS5 memory backend replacing Agent Zero's FAISS memory
+version: "0.1.0"
+always_enabled: true

@@ -1,0 +1,61 @@
+#!/bin/bash
+# Genesis pre-commit hook — block secrets, large files, and warn on direct-to-main
+# Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
+
+# Warn on direct commits to main
+current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
+    # Check if other worktrees exist (indicates concurrent sessions)
+    worktree_count=$(git worktree list 2>/dev/null | wc -l)
+    if [ "$worktree_count" -gt 1 ]; then
+        echo "BLOCKED: Committing directly to '$current_branch' while worktrees are active."
+        echo "Other sessions are working in worktrees — use a feature branch."
+        echo "  git worktree list    # see active worktrees"
+        echo "  git checkout -b <scope>/<description>"
+        exit 1
+    fi
+    echo "WARNING: Committing directly to '$current_branch'."
+    echo "If other sessions are active, use a worktree + feature branch instead."
+    echo "  See CLAUDE.md 'Concurrent Sessions & Worktrees' section."
+fi
+
+# Block .env and secrets files
+if git diff --cached --name-only | grep -qE '\.env$|\.env\.|secrets\.env|secrets\.json'; then
+    echo "BLOCKED: Secrets/env file staged for commit. Remove with: git reset HEAD <file>"
+    exit 1
+fi
+
+# Block common secret patterns
+if git diff --cached --diff-filter=ACM -z -- '*.py' '*.js' '*.json' '*.yml' '*.yaml' '*.toml' '*.md' | \
+   grep -PIz '(?i)(sk-[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|-----BEGIN (RSA |EC )?PRIVATE KEY-----)' 2>/dev/null; then
+    echo "BLOCKED: Possible secret/API key detected in staged changes."
+    echo "If this is a false positive, commit with --no-verify (but think twice)."
+    exit 1
+fi
+
+# Block files over 5MB
+large_files=$(git diff --cached --name-only --diff-filter=ACM | while read f; do
+    size=$(git cat-file -s ":$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt 5242880 ]; then
+        echo "$f ($(( size / 1024 / 1024 ))MB)"
+    fi
+done)
+
+if [ -n "$large_files" ]; then
+    echo "BLOCKED: Files over 5MB:"
+    echo "$large_files"
+    exit 1
+fi
+
+# Lint staged Python files with ruff
+staged_py=$(git diff --cached --name-only --diff-filter=ACM | grep '\.py$' || true)
+if [ -n "$staged_py" ]; then
+    if command -v ruff &>/dev/null; then
+        if ! ruff check $staged_py; then
+            echo "BLOCKED: ruff lint errors in staged Python files. Fix and re-stage."
+            exit 1
+        fi
+    fi
+fi
+
+exit 0

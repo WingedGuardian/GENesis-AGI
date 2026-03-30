@@ -1,0 +1,397 @@
+providers:
+  ollama-3b:
+    type: ollama
+    model: qwen2.5:3b
+    profile: qwen2.5-3b
+    base_url: ${OLLAMA_URL:-http://localhost:11434}
+    free: true
+    enabled: ${GENESIS_ENABLE_OLLAMA:-true}
+    keep_alive: -1
+    open_duration_s: 60
+  ollama-embedding:
+    type: ollama
+    model: ${OLLAMA_EMBEDDING_MODEL:-qwen3-embedding:0.6b-fp16}
+    base_url: ${OLLAMA_URL:-http://localhost:11434}
+    free: true
+    enabled: ${GENESIS_ENABLE_OLLAMA:-true}
+    keep_alive: -1
+    open_duration_s: 60
+  mistral-free:
+    type: mistral
+    model: mistral-large-latest
+    profile: mistral-large-3
+    free: true
+    rpm_limit: 2
+    open_duration_s: 120
+  groq-free:
+    type: groq
+    model: llama-3.3-70b-versatile
+    profile: llama-3.3-70b
+    free: true
+    rpm_limit: 30
+    open_duration_s: 120
+  gemini-free:
+    type: google
+    model: gemini-3-flash-preview
+    profile: gemini-3-flash
+    free: true
+    rpm_limit: 15
+    open_duration_s: 120
+  openrouter-free:
+    type: openrouter
+    model: qwen/qwen-2.5-72b-instruct
+    profile: qwen-2.5-72b
+    free: true
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-mimo:
+    type: openrouter
+    model: xiaomi/mimo-v2-pro
+    profile: mimo-v2-pro
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  deepseek-chat:
+    type: deepseek
+    model: deepseek-chat
+    profile: deepseek-v3
+    free: false
+    open_duration_s: 120
+  openai-gpt5:
+    type: openai
+    model: gpt-5.4
+    profile: gpt-5.4
+    free: false
+    open_duration_s: 120
+  xai-grok:
+    type: xai
+    model: grok-3-mini
+    profile: grok-3-mini
+    free: false
+    open_duration_s: 120
+  qwen-plus:
+    type: qwen
+    model: qwen3.5-plus
+    profile: qwen-3.5-plus
+    free: false
+    open_duration_s: 120
+  claude-haiku:
+    type: anthropic
+    model: claude-haiku-4-5-20251001
+    profile: claude-haiku-4.5
+    free: false
+    open_duration_s: 120
+  claude-sonnet:
+    type: anthropic
+    model: claude-sonnet-4-6-20250514
+    profile: claude-sonnet-4.6
+    free: false
+    open_duration_s: 120
+  claude-opus:
+    type: anthropic
+    model: claude-opus-4-6-20250514
+    profile: claude-opus-4.6
+    free: false
+    open_duration_s: 120
+  glm5:
+    type: zenmux
+    model: z-ai/glm-5-turbo
+    profile: glm-5
+    base_url: https://zenmux.ai/api/v1
+    free: false
+    open_duration_s: 120
+  minimax-m25:
+    type: minimax
+    model: MiniMax-M2.5
+    profile: minimax-m2.5
+    base_url: https://api.minimaxi.com/v1
+    free: false
+    open_duration_s: 120
+  mistral-large:
+    type: mistral
+    model: mistral-large-latest
+    profile: mistral-large-3
+    free: false
+    rpm_limit: 60
+    open_duration_s: 120
+  openrouter-nemo:
+    type: openrouter
+    model: mistralai/mistral-nemo
+    profile: mistral-nemo
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  gpt-5.4:
+    type: openrouter
+    model: openai/gpt-5.4
+    profile: gpt-5.4
+    free: false
+    open_duration_s: 120
+  kimi-k2.5:
+    type: openrouter
+    model: moonshotai/kimi-k2.5
+    profile: kimi-k2.5
+    free: false
+    open_duration_s: 120
+  lmstudio-30b:
+    type: lmstudio
+    model: mistral-small-3.2-24b-instruct-2506
+    profile: mistral-small-3.2-24b
+    base_url: ${LM_STUDIO_URL:-http://localhost:1234/v1}
+    free: true
+    enabled: ${GENESIS_ENABLE_LM_STUDIO:-false}
+    open_duration_s: 120
+call_sites:
+  2_triage:
+    chain:
+    - ollama-3b
+    - mistral-free
+    - groq-free
+    - openrouter-free
+  3_micro_reflection:
+    chain:
+    - mistral-free
+    - groq-free
+    retry_profile: background
+  4_light_reflection:
+    chain:
+    - mistral-free
+    - groq-free
+    default_paid: false
+    never_pays: true
+  5_deep_reflection:
+    chain:
+    - claude-sonnet
+    - claude-opus
+    default_paid: true
+    retry_profile: background
+  6_strategic_reflection:
+    chain:
+    - claude-opus
+    default_paid: true
+    retry_profile: background
+  7_task_retrospective:
+    chain:
+    - openrouter-free
+    default_paid: true
+  8_memory_consolidation:
+    chain:
+    - mistral-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+  9_fact_extraction:
+    chain:
+    - mistral-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+  10_cognitive_state:
+    chain:
+    - glm5
+    - claude-sonnet
+    default_paid: true
+  11_user_model_synthesis:
+    chain:
+    - claude-sonnet
+    - claude-opus
+    default_paid: true
+    retry_profile: background
+  12_surplus_brainstorm:
+    chain:
+    - mistral-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+    never_pays: true
+  13_morning_report:
+    chain:
+    - mistral-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+  14_weekly_self_assessment:
+    chain:
+    - claude-opus
+    default_paid: true
+  15_triage_calibration:
+    chain:
+    - openrouter-free
+    default_paid: true
+  16_quality_calibration:
+    chain:
+    - claude-opus
+    default_paid: true
+  17_fresh_eyes_review:
+    chain:
+    - openrouter-free
+    - claude-sonnet
+    default_paid: true
+  18_meta_prompting:
+    chain:
+    - openrouter-free
+    default_paid: true
+  19_outreach_draft:
+    chain:
+    - mistral-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+  20_adversarial_counterargument:
+    chain:
+    - openrouter-free
+    - claude-sonnet
+    default_paid: true
+  21_embeddings:
+    chain:
+    - ollama-embedding
+  22_tagging:
+    chain:
+    - ollama-3b
+    - mistral-free
+    - groq-free
+  27_pre_execution_assessment:
+    chain:
+    - claude-sonnet
+    - claude-haiku
+    default_paid: true
+    retry_profile: user_facing
+  28_observation_sweep:
+    chain:
+    - claude-sonnet
+    default_paid: true
+  29_retrospective_triage:
+    chain:
+    - ollama-3b
+    - groq-free
+    - mistral-free
+  30_triage_calibration:
+    chain:
+    - lmstudio-30b
+    - mistral-large
+    default_paid: true
+    retry_profile: background
+  31_outcome_classification:
+    chain:
+    - glm5
+    - mistral-large
+    default_paid: true
+    never_pays: false
+  32_delta_assessment:
+    chain:
+    - glm5
+    - mistral-large
+    default_paid: true
+    never_pays: false
+  33_skill_refiner:
+    chain:
+    - gemini-free
+    - groq-free
+    description: LLM-driven skill improvement proposals
+  34_research_synthesis:
+    chain:
+    - gemini-free
+    - groq-free
+    - mistral-free
+    description: Synthesize research results into concise summaries
+  38_procedure_extraction:
+    chain:
+    - groq-free
+    - mistral-free
+    - gemini-free
+    description: Extract reusable procedures from interaction outcomes
+  35_content_draft:
+    chain:
+    - gemini-free
+    - groq-free
+    - mistral-free
+    description: Draft content for various platforms
+  23_fresh_eyes_review:
+    chain:
+    - gemini-free
+    - groq-free
+    - mistral-free
+  36_code_auditor:
+    chain:
+    - kimi-k2.5
+    - gemini-free
+    - openrouter-mimo
+    description: "Surplus code review \u2014 evaluate codebase for bugs and quality\
+      \ issues"
+  37_infrastructure_monitor:
+    chain:
+    - groq-free
+    - mistral-free
+    - openrouter-nemo
+    default_paid: true
+    retry_profile: background
+    description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
+  contingency_deep_reflection:
+    chain:
+    - gpt-5.4
+    - glm5
+    default_paid: true
+    retry_profile: background
+    description: "CC contingency \u2014 deep reflection via API when CC unavailable"
+  contingency_foreground:
+    chain:
+    - kimi-k2.5
+    - gpt-5.4
+    default_paid: true
+    retry_profile: user_facing
+    description: "CC contingency \u2014 foreground conversation via API when CC unavailable"
+  contingency_inbox:
+    chain:
+    - mistral-free
+    - gemini-free
+    - groq-free
+    never_pays: true
+    retry_profile: background
+    description: "CC contingency \u2014 inbox evaluation via free API when CC unavailable"
+  cc_update_analysis:
+    chain:
+    - mistral-free
+    - groq-free
+    default_paid: true
+    description: Analyze CC version changes for impact on Genesis
+  email_triage:
+    chain:
+    - gemini-free
+    - mistral-free
+    - groq-free
+    never_pays: true
+    description: "Email triage — Gemini-primary light filter for weekly email batch"
+retry:
+  default:
+    max_retries: 3
+    base_delay_ms: 500
+    max_delay_ms: 30000
+  user_facing:
+    max_retries: 2
+    base_delay_ms: 300
+    max_delay_ms: 5000
+  background:
+    max_retries: 4
+    base_delay_ms: 1000
+    max_delay_ms: 60000
+surplus:
+  idle_threshold_minutes: 15
+  dispatch_interval_minutes: 5
+  brainstorm_check_interval_hours: 12
+  task_expiry_hours: 72
+  max_attempts: 2
+  tier_policy:
+    brainstorm_user:
+    - free_api
+    - local_30b
+    brainstorm_self:
+    - free_api
+    - local_30b
+    meta_brainstorm:
+    - free_api
+    - local_30b
+  health_checks:
+    lmstudio:
+      url: ${LM_STUDIO_HEALTH_URL:-http://localhost:1234/v1/models}
+      timeout_s: 3
+      cache_ttl_s: 60

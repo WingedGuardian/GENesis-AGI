@@ -1,0 +1,29 @@
+# TTS Configuration — edit on-the-fly, changes take effect next synthesis call.
+# Provider switching requires bridge restart. Everything else is hot-reloadable.
+#
+# Resolution order: this file → environment variables → built-in defaults.
+# Empty string values ("") fall through to env vars.
+
+provider: elevenlabs
+
+elevenlabs:
+  voice_id: ""          # Set here or in secrets.env as TTS_VOICE_ID_ELEVENLABS
+  model: eleven_flash_v2_5
+  stability: 0.85       # 0.0-1.0 — higher = more consistent (0.85 good for custom voices)
+  similarity_boost: 0.7  # 0.0-1.0 — higher = closer to original (0.7 avoids robotic sound)
+  style: 0.3            # 0.0-1.0 — higher = more expressive
+  speed: 1.1            # 0.7-1.2
+  use_speaker_boost: true
+
+fish_audio:
+  voice_id: ""
+
+cartesia:
+  voice_id: ""
+
+sanitization:
+  strip_markdown: true
+  max_chars: 2000
+
+voice_gate:
+  block_background_sessions: true

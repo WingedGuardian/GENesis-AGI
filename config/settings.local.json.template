@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "default": "default",
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(source:*)",
+      "Bash(git merge:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(git worktree:*)",
+      "Bash(chmod:*)",
+      "Bash(ruff:*)",
+      "Bash(pytest:*)",
+      "Bash(sqlite3:*)",
+      "Bash(systemctl --user:*)",
+      "Bash(pip install:*)",
+      "Bash(pip list:*)",
+      "Bash(yt-dlp:*)",
+      "mcp__genesis-health__*",
+      "mcp__genesis-memory__*",
+      "mcp__genesis-outreach__*",
+      "mcp__genesis-recon__*"
+    ]
+  }
+}

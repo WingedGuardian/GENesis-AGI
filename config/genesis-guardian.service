@@ -1,0 +1,19 @@
+[Unit]
+Description=Genesis Guardian health check
+Documentation=https://github.com/YOUR_GITHUB_USER/genesis
+# No After/Wants — intentionally standalone. Timer triggers this.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/share/genesis-guardian/.venv/bin/python -m genesis.guardian
+WorkingDirectory=%h/.local/share/genesis-guardian
+Environment=PYTHONPATH=%h/.local/share/genesis-guardian/src
+Environment=GUARDIAN_CONFIG=%h/.local/share/genesis-guardian/config/guardian.yaml
+Environment=GUARDIAN_SECRETS=%h/.local/share/genesis-guardian/secrets.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+StandardOutput=journal
+StandardError=journal
+
+# Allow up to 10 minutes for full confirm -> diagnose -> recover cycle
+TimeoutStartSec=600

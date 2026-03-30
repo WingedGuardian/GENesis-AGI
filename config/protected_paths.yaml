@@ -1,0 +1,71 @@
+# Genesis v3 Protected Paths Configuration
+#
+# Defines which file paths Genesis can modify and from where.
+# Three levels:
+#   CRITICAL  — cannot be modified from any relay/chat channel (Telegram, etc.)
+#               Only modifiable from direct CC CLI sessions.
+#   SENSITIVE — modifiable with explicit user approval + self-review prompt.
+#   NORMAL    — no special gates (default for unlisted paths).
+#
+# Patterns use fnmatch glob syntax (*, ?, [seq]).
+# Paths are relative to the repository root.
+
+critical:
+  # Channel/relay infrastructure — modifying via relay could lock user out
+  - pattern: "src/genesis/channels/**"
+    reason: "Relay infrastructure — modifying via Telegram could break Telegram"
+  - pattern: "config/genesis-bridge.service"
+    reason: "Bridge systemd unit — misconfiguration kills remote access"
+  - pattern: "config/genesis-watchdog.*"
+    reason: "Watchdog infrastructure — self-healing must not break itself"
+
+  # Autonomy protection module — Genesis cannot weaken its own guardrails via relay
+  - pattern: "src/genesis/autonomy/protection.py"
+    reason: "Protection module — self-protection invariant"
+  - pattern: "config/protected_paths.yaml"
+    reason: "Protection config — Genesis cannot modify its own guardrails"
+  - pattern: "config/autonomy.yaml"
+    reason: "Autonomy config — level/threshold changes require CLI access"
+
+  # Secrets and authentication
+  - pattern: "*/secrets.env"
+    reason: "API keys and tokens — exposure or corruption is catastrophic"
+  - pattern: ".env"
+    reason: "Environment config — accidental override breaks infrastructure"
+
+  # Systemd units (deployed and source)
+  - pattern: "*.service"
+    reason: "Systemd units — misconfiguration kills services"
+  - pattern: "*.timer"
+    reason: "Systemd timers — misconfiguration breaks scheduled tasks"
+
+  # Networking (system-wide, outside repo but may be touched by CC sessions)
+  - pattern: "/etc/netplan/**"
+    reason: "Network config — misconfiguration locks out remote access"
+  - pattern: "/etc/iptables/**"
+    reason: "Firewall rules — misconfiguration locks out remote access"
+
+  # Claude Code hooks — Genesis cannot weaken its own safety hooks
+  - pattern: ".claude/settings.json"
+    reason: "CC hooks enforce safety invariants"
+
+sensitive:
+  # Runtime core — changes affect all subsystems
+  - pattern: "src/genesis/runtime.py"
+    reason: "Runtime bootstrap — changes affect all subsystem initialization"
+  - pattern: "src/genesis/db/schema.py"
+    reason: "Database schema — migrations must be carefully reviewed"
+
+  # Identity files — shape LLM behavior
+  - pattern: "src/genesis/identity/*.md"
+    reason: "Identity files shape how Genesis thinks"
+  - pattern: "src/genesis/identity/loader.py"
+    reason: "Identity loading — changes affect all LLM prompts"
+
+  # Model routing — affects cost and quality
+  - pattern: "config/model_routing.yaml"
+    reason: "Model routing — changes affect cost, quality, and reliability"
+
+  # Resilience config — affects recovery behavior
+  - pattern: "config/resilience.yaml"
+    reason: "Resilience thresholds — changes affect self-healing behavior"

@@ -1,0 +1,36 @@
+# Example external module configuration.
+# Copy this file, remove the .template extension, and customize for your program.
+# Genesis auto-discovers *.yaml files in this directory at bootstrap.
+
+name: My External Program
+description: >
+  Brief description of what this program does and how Genesis should use it.
+
+ipc:
+  method: http          # "http" for REST APIs, "stdio" for local JSON-line programs
+  url: "http://localhost:8080"
+  timeout: 30
+
+health_check:
+  endpoint: "/health"
+  interval_seconds: 60
+  timeout_seconds: 10
+  expected_status: 200
+
+# Optional: SSH lifecycle management for remote programs
+# lifecycle:
+#   ssh_host: "user@hostname"
+#   ssh_key: "~/.ssh/my_key"
+#   source_dir: "/path/to/source"
+#   restart_cmd: "systemctl restart my-service"
+#   logs_cmd: "journalctl -u my-service --tail=50"
+
+# Optional: subscribe to a Genesis research profile for signal routing
+# research_profile: my-profile
+
+enabled: false
+
+# Optional: user-editable configuration fields (shown in dashboard modal)
+# configurable:
+#   max_items: 100
+#   auto_process: true

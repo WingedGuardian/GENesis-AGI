@@ -1,0 +1,292 @@
+"""ContextAssembler — builds relevance-based context per reflection depth."""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime, timedelta
+
+import aiosqlite
+
+from genesis.awareness.types import Depth, TickResult
+from genesis.db.crud import cognitive_state, observations, predictions
+from genesis.identity.loader import IdentityLoader
+from genesis.memory.user_model import UserModelEvolver
+from genesis.perception.types import LIGHT_FOCUS_ROTATION, PromptContext
+
+logger = logging.getLogger(__name__)
+
+# Minimum sample count per domain before injecting calibration feedback
+_DEFAULT_MIN_SAMPLES = 10
+
+_AGE_GUARD_HOURS: dict = {
+    "light": 12,
+    "deep": 48,
+    "strategic": 168,  # 7 days
+}
+
+
+class ContextAssembler:
+    """Assembles context for prompt rendering based on depth.
+
+    Scopes context by relevance, not budget. Never truncates.
+    Micro: identity + signals only.
+    Light: + user profile + cognitive state + user model.
+    Deep/Strategic: + calibration feedback.
+    """
+
+    def __init__(
+        self,
+        *,
+        identity_loader: IdentityLoader,
+        user_model_evolver: UserModelEvolver | None = None,
+        calibration_min_samples: int = _DEFAULT_MIN_SAMPLES,
+    ) -> None:
+        self._identity = identity_loader
+        self._user_model_evolver = user_model_evolver
+        self._calibration_min_samples = calibration_min_samples
+
+    async def assemble(
+        self,
+        depth: Depth,
+        tick: TickResult,
+        *,
+        db: aiosqlite.Connection,
+        prior_context: str | None = None,
+    ) -> PromptContext:
+        # Micro: SOUL.md only. Light+: full identity block (SOUL.md + USER.md + STEERING.md).
+        if depth == Depth.MICRO:
+            identity = self._identity.soul()
+        else:
+            identity = self._identity.identity_block()
+        signals_text = self._format_signals(tick)
+        tick_number = self._extract_tick_number(tick)
+
+        user_profile = None
+        cog_state = None
+        user_model = None
+        calibration_text = None
+
+        if depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
+            user_text = self._identity.user()
+            user_profile = user_text if user_text else None
+            cog_state = await cognitive_state.render(db)
+            if self._user_model_evolver:
+                user_model = await self._user_model_evolver.get_model_summary()
+            else:
+                user_model = None  # No evolver injected yet
+
+        # Calibration feedback — deep/strategic only, when sufficient data
+        if depth in (Depth.DEEP, Depth.STRATEGIC):
+            calibration_text = await self._build_calibration_text(db)
+
+        # Recent observations — light and above, for reflection context
+        memory_hits = None
+        if depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
+            memory_hits = await self._build_memory_hits(db, depth.value.lower())
+
+        # Light focus rotation: tick-based, same pattern as micro's template rotation.
+        # Previously suggested_focus was never set (always None → always "situation").
+        suggested_focus = None
+        if depth == Depth.LIGHT:
+            suggested_focus = LIGHT_FOCUS_ROTATION[tick_number % len(LIGHT_FOCUS_ROTATION)]
+            # Focus-aware context: only include what this focus needs.
+            # Keeps parity with CC bridge path (reflection_bridge._build_light_prompt_enriched).
+            if suggested_focus == "situation":
+                user_profile = None
+                user_model = None
+                memory_hits = None
+            elif suggested_focus == "user_impact":
+                memory_hits = None
+            elif suggested_focus == "anomaly":
+                user_profile = None
+                user_model = None
+        else:
+            suggested_focus = getattr(tick, "suggested_focus", None)
+
+        return PromptContext(
+            depth=depth.value,
+            identity=identity,
+            signals_text=signals_text,
+            tick_number=tick_number,
+            user_profile=user_profile,
+            cognitive_state=cog_state,
+            memory_hits=memory_hits,
+            prior_context=prior_context,
+            user_model=user_model,
+            suggested_focus=suggested_focus,
+            calibration_text=calibration_text,
+        )
+
+    async def _build_memory_hits(self, db: aiosqlite.Connection, depth_value: str = "deep") -> str | None:
+        """Build recent observation context for reflection prompts.
+
+        Two-pass diversity query ensures reflection-source observations always
+        get representation even under high-volume noise from other sources.
+        Tracks retrieval via increment_retrieved_batch.
+        """
+        _REFLECTION_SOURCES = [
+            "reflection", "light_reflection", "deep_reflection",
+            "cc_reflection_deep", "cc_reflection_light",
+        ]
+        # Depth-aware caps: light gets focused context (7 obs),
+        # deep/strategic get full context (up to 20 obs).
+        _MEMORY_CAPS: dict[str, tuple[int, int]] = {
+            "light": (3, 4),       # 3 reflection-source + 4 other = 7 total
+            "deep": (10, 20),      # existing behavior
+            "strategic": (10, 20),
+        }
+        refl_cap, other_cap = _MEMORY_CAPS.get(depth_value, (10, 20))
+
+        try:
+            # Pass 1: reflection-origin observations
+            reflection_obs = await observations.query(
+                db, resolved=False, source_in=_REFLECTION_SOURCES, limit=refl_cap,
+            )
+            # Pass 2: everything else
+            other_obs = await observations.query(
+                db, resolved=False, limit=other_cap,
+            )
+
+            # Depth-specific age guard — drop observations older than the cutoff
+            cutoff_hours = _AGE_GUARD_HOURS.get(depth_value, 48)
+            cutoff = (datetime.now(UTC) - timedelta(hours=cutoff_hours)).isoformat()
+            reflection_obs = [o for o in reflection_obs if o.get("created_at", "") >= cutoff]
+            other_obs = [o for o in other_obs if o.get("created_at", "") >= cutoff]
+            logger.debug("Age guard (%s, %dh): %d obs after filtering", depth_value, cutoff_hours, len(reflection_obs) + len(other_obs))
+        except Exception:
+            logger.warning("Failed to query observations for memory_hits", exc_info=True)
+            return None
+
+        # Merge and dedup by ID
+        seen_ids: set[str] = set()
+        merged: list[dict] = []
+        for obs in reflection_obs:
+            oid = obs.get("id")
+            if oid and oid not in seen_ids:
+                seen_ids.add(oid)
+                merged.append(obs)
+        for obs in other_obs:
+            oid = obs.get("id")
+            if oid and oid not in seen_ids:
+                seen_ids.add(oid)
+                merged.append(obs)
+
+        # Depth-aware total cap
+        merged = merged[:refl_cap + other_cap]
+
+        if not merged:
+            return None
+
+        # Sort by priority: high > medium > low
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        merged.sort(key=lambda o: priority_order.get(o.get("priority", "low"), 3))
+
+        lines: list[str] = []
+        obs_ids: list[str] = []
+        for obs in merged:
+            oid = obs.get("id", "?")
+            obs_ids.append(oid)
+            priority = obs.get("priority", "?")
+            obs_type = obs.get("type", "?")
+            content = obs.get("content", "")
+            created = obs.get("created_at", "?")
+            lines.append(f"- [{priority}] {obs_type} ({created}): {content}")
+
+        # Track retrieval and influence (displayed in prompt = influenced awareness)
+        if obs_ids:
+            try:
+                await observations.increment_retrieved_batch(db, obs_ids)
+                await observations.mark_influenced_batch(db, obs_ids)
+            except Exception:
+                logger.warning("Failed to track observation retrieval in memory_hits", exc_info=True)
+
+        return "\n".join(lines)
+
+    async def _build_calibration_text(self, db: aiosqlite.Connection) -> str | None:
+        """Build calibration feedback text from calibration_curves table.
+
+        Only includes domains with enough samples. Returns None if no data.
+        """
+        try:
+            # Get all domains that have calibration data
+            cursor = await db.execute(
+                "SELECT DISTINCT domain FROM calibration_curves"
+            )
+            domains = [row[0] for row in await cursor.fetchall()]
+        except Exception:
+            logger.debug("Could not query calibration domains", exc_info=True)
+            return None
+
+        if not domains:
+            return None
+
+        lines: list[str] = []
+        for domain in domains:
+            try:
+                curves = await predictions.get_calibration_curves(db, domain)
+            except Exception:
+                logger.debug("Could not load calibration for domain=%s", domain, exc_info=True)
+                continue
+
+            # Filter to buckets with enough samples
+            relevant = [
+                c for c in curves
+                if c.get("sample_count", 0) >= self._calibration_min_samples
+            ]
+            if not relevant:
+                continue
+
+            domain_lines: list[str] = []
+            for curve in relevant:
+                predicted = curve.get("predicted_confidence", 0)
+                actual = curve.get("actual_success_rate", 0)
+                samples = curve.get("sample_count", 0)
+                predicted_pct = int(predicted * 100)
+                actual_pct = int(actual * 100)
+                domain_lines.append(
+                    f"  - When you report ~{predicted_pct}% confidence, "
+                    f"you're historically right ~{actual_pct}% of the time "
+                    f"(n={samples})"
+                )
+            if domain_lines:
+                lines.append(f"Domain: {domain}")
+                lines.extend(domain_lines)
+
+        if not lines:
+            return None
+
+        header = (
+            "Historical calibration (adjust your confidence accordingly):"
+        )
+        return header + "\n" + "\n".join(lines)
+
+    def _format_signals(self, tick: TickResult) -> str:
+        lines = []
+        for s in tick.signals:
+            line = f"{s.name}: {s.value} (source={s.source})"
+            if s.normal_max is not None:
+                status = (
+                    "CRITICAL" if s.critical_threshold is not None and s.value >= s.critical_threshold
+                    else "WARNING" if s.warning_threshold is not None and s.value >= s.warning_threshold
+                    else "normal"
+                )
+                line += (
+                    f" [{status}; normal<={s.normal_max},"
+                    f" warn>={s.warning_threshold}, crit>={s.critical_threshold}]"
+                )
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _extract_tick_number(self, tick: TickResult) -> int:
+        """Derive a deterministic tick number from tick_id for template rotation.
+
+        Uses UUID int conversion (stable across processes) rather than hash()
+        which is randomized per-process via PYTHONHASHSEED.
+        """
+        import uuid as _uuid
+
+        try:
+            return _uuid.UUID(tick.tick_id).int % 10000
+        except ValueError:
+            # Fallback for non-UUID tick_ids
+            return int.from_bytes(tick.tick_id.encode()[:8], "big") % 10000

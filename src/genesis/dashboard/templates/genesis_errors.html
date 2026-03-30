@@ -1,0 +1,788 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Genesis Error Log</title>
+  <link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
+  <link rel="stylesheet" href="/index.css">
+  <link rel="stylesheet" href="/vendor/google/google-icons.css">
+  <script type="module" src="/js/initFw.js"></script>
+
+  <script type="module">
+    import { fetchApi } from "/js/api.js";
+
+    document.addEventListener("alpine:init", () => {
+      Alpine.store("genesisErrors", {
+        // State
+        groups: [],
+        activeAlerts: [],
+        totals: { events: 0, dead_letters: 0, deferred_failures: 0 },
+        loading: true,
+        error: null,
+        lastSuccess: null,
+        fetchState: "idle",
+        autoRefresh: true,
+        expandedGroupKey: null,
+        expandedEntries: [],
+        alertsCollapsed: false,
+
+        // Filters
+        filters: {
+          timeRange: "7d",
+          subsystem: "",
+        },
+        sortBy: "last_seen",
+
+        _refreshInterval: null,
+
+        // Lifecycle
+        async onOpen() {
+          await this.fetchErrors();
+          this.loading = false;
+          this._refreshInterval = setInterval(() => {
+            if (this.autoRefresh) this.fetchErrors();
+          }, 15000);
+        },
+
+        cleanup() {
+          if (this._refreshInterval) clearInterval(this._refreshInterval);
+        },
+
+        // Fetch
+        async fetchErrors() {
+          this.startFetch();
+          try {
+            let url = "/api/genesis/unified-errors?grouped=true&limit=100";
+            const ranges = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
+            const hours = ranges[this.filters.timeRange] || 24;
+            const since = new Date(Date.now() - hours * 3600000).toISOString();
+            url += `&since=${encodeURIComponent(since)}`;
+            if (this.filters.subsystem) url += `&subsystem=${this.filters.subsystem}`;
+
+            const resp = await fetchApi(url);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.groups = data.groups || [];
+              this.activeAlerts = data.active_alerts || [];
+              this.totals = data.totals || { events: 0, dead_letters: 0, deferred_failures: 0 };
+              this.error = null;
+              this.finishFetch();
+            } else {
+              this.failFetch("Error log unavailable");
+            }
+          } catch (e) {
+            console.warn("Error log fetch failed:", e);
+            this.failFetch("Failed to load errors");
+          }
+        },
+
+        async toggleGroup(key) {
+          if (this.expandedGroupKey === key) {
+            this.expandedGroupKey = null;
+            this.expandedEntries = [];
+            return;
+          }
+          this.expandedGroupKey = key;
+          // For now show group info; individual entry drill-down could be added later
+          const group = this.groups.find(g => g.key === key);
+          this.expandedEntries = group ? [group] : [];
+        },
+
+        applyFilters() {
+          this.groups = [];
+          this.fetchErrors();
+        },
+
+        toggleAutoRefresh() {
+          this.autoRefresh = !this.autoRefresh;
+        },
+
+        startFetch() {
+          this.fetchState = this.lastSuccess ? "refreshing" : "loading";
+          this.error = null;
+        },
+
+        finishFetch() {
+          this.fetchState = "current";
+          this.lastSuccess = Date.now();
+          this.error = null;
+        },
+
+        failFetch(message) {
+          this.fetchState = this.lastSuccess ? "stale" : "fetch_error";
+          this.error = message;
+        },
+
+        // Helpers
+        pageStateColor() {
+          const map = {
+            current: "#4caf50",
+            loading: "#2196F3",
+            refreshing: "#2196F3",
+            stale: "#f0ad4e",
+            fetch_error: "#d9534f",
+            idle: "#888",
+          };
+          return map[this.fetchState] || "#888";
+        },
+
+        pageStateLabel() {
+          const map = {
+            current: "current",
+            loading: "loading",
+            refreshing: "refreshing",
+            stale: "stale",
+            fetch_error: "error",
+            idle: "idle",
+          };
+          return map[this.fetchState] || "unknown";
+        },
+
+        relativeTime(value) {
+          if (!value) return "-";
+          const ts = typeof value === "number" ? value : Date.parse(value);
+          if (!ts) return "-";
+          const diff = Math.max(0, Date.now() - ts);
+          const s = Math.round(diff / 1000);
+          if (s < 60) return `${s}s ago`;
+          const m = Math.round(s / 60);
+          if (m < 60) return `${m}m ago`;
+          const h = Math.round(m / 60);
+          if (h < 48) return `${h}h ago`;
+          return `${Math.round(h / 24)}d ago`;
+        },
+
+        pageStatusDetail() {
+          if (this.fetchState === "stale") {
+            const parts = [];
+            if (this.error) parts.push(this.error);
+            if (this.lastSuccess) parts.push(`last ok ${this.relativeTime(this.lastSuccess)}`);
+            return parts.join(" — ");
+          }
+          if (this.fetchState === "current" && this.lastSuccess) {
+            return `updated ${this.relativeTime(this.lastSuccess)}`;
+          }
+          if (this.fetchState === "refreshing" && this.lastSuccess) {
+            return `refreshing — last ok ${this.relativeTime(this.lastSuccess)}`;
+          }
+          return this.error || "";
+        },
+
+        severityColor(severity) {
+          const map = { debug: "#666", info: "#ccc", warning: "#f0ad4e", error: "#d9534f", critical: "#ff2d2d" };
+          return map[severity] || "#ccc";
+        },
+
+        severityBg(severity) {
+          const map = { warning: "rgba(240,173,78,0.06)", error: "rgba(217,83,79,0.06)", critical: "rgba(255,45,45,0.1)" };
+          return map[severity] || "transparent";
+        },
+
+        sourceIcon(source) {
+          const map = { events: "event", dead_letter: "delete_sweep", deferred_work: "schedule" };
+          return map[source] || "error";
+        },
+
+        sourceLabel(source) {
+          const map = { events: "Event", dead_letter: "Dead Letter", deferred_work: "Deferred Work" };
+          return map[source] || source;
+        },
+
+        alertSeverityColor(sev) {
+          const map = { warning: "#f0ad4e", critical: "#ff2d2d" };
+          return map[sev] || "#f0ad4e";
+        },
+
+        formatTime(isoStr) {
+          if (!isoStr) return "-";
+          try { return new Date(isoStr).toLocaleTimeString("en-US", { hour12: false }); } catch { return isoStr; }
+        },
+
+        formatDateTime(isoStr) {
+          if (!isoStr) return "-";
+          try {
+            const d = new Date(isoStr);
+            return d.toLocaleDateString("en-US", { month: "short", day: "numeric" })
+              + " " + d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit" });
+          } catch { return isoStr; }
+        },
+
+        get sortedGroups() {
+          const s = this.sortBy;
+          return [...this.groups].sort((a, b) => {
+            if (s === "count") return (b.count || 0) - (a.count || 0);
+            if (s === "first_seen") return (b.first_seen || "").localeCompare(a.first_seen || "");
+            return (b.last_seen || "").localeCompare(a.last_seen || "");
+          });
+        },
+
+        get totalErrors() {
+          return this.totals.events + this.totals.dead_letters + this.totals.deferred_failures;
+        },
+
+        get subsystems() {
+          return ["", "routing", "awareness", "surplus", "memory", "health",
+                  "perception", "learning", "inbox", "reflection", "providers", "web", "outreach", "dashboard"];
+        },
+
+        async resolveGroup(key) {
+          try {
+            await fetchApi("/api/genesis/errors/" + encodeURIComponent(key) + "/resolve", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({resolved_by: "user"})
+            });
+            await this.fetchErrors();
+          } catch (e) { console.error("resolve failed", e); }
+        },
+
+        async unresolveGroup(key) {
+          try {
+            await fetchApi("/api/genesis/errors/" + encodeURIComponent(key) + "/resolve", {
+              method: "DELETE"
+            });
+            await this.fetchErrors();
+          } catch (e) { console.error("unresolve failed", e); }
+        },
+      });
+    });
+  </script>
+
+  <style>
+    :root { --color-text-secondary: var(--color-text-muted, #d4d4d4e4); }
+    html, body { overflow: auto !important; position: static !important; height: auto !important; }
+
+    .error-banner {
+      background: rgba(217,83,79,0.1);
+      border: 1px solid rgba(217,83,79,0.3);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 0.75rem;
+      font-size: 0.8rem;
+      color: #d9534f;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .error-banner .material-symbols-outlined { font-size: 1rem; }
+
+    .genesis-errors {
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 1rem 1.5rem;
+      color: var(--color-text);
+      font-family: var(--font-family);
+    }
+
+    /* Nav (shared) */
+    .genesis-nav {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--color-border);
+    }
+    .genesis-nav a {
+      color: var(--color-text-secondary);
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 0.3rem 0;
+    }
+    .genesis-nav a:hover { color: var(--color-text); }
+    .genesis-nav a.active {
+      color: var(--color-accent);
+      border-bottom: 2px solid var(--color-accent);
+    }
+
+    /* Header */
+    .errors-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .errors-header h1 {
+      font-size: 1.3rem;
+      font-weight: 600;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .errors-header h1 .material-symbols-outlined {
+      font-size: 1.5rem;
+      color: #d9534f;
+    }
+    .auto-refresh-btn {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--color-panel);
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      padding: 0.3rem 0.6rem;
+      color: var(--color-text-secondary);
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .auto-refresh-btn:hover { color: var(--color-text); }
+    .auto-refresh-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+
+    .page-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+
+    .page-status-detail {
+      font-size: 0.78rem;
+      color: var(--color-text-secondary);
+      margin-bottom: 0.75rem;
+    }
+
+    /* Summary bar */
+    .summary-bar {
+      display: flex;
+      gap: 1rem;
+      margin-bottom: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .summary-stat {
+      display: flex;
+      align-items: center;
+      gap: 0.3rem;
+      font-size: 0.8rem;
+      color: var(--color-text-secondary);
+    }
+    .summary-stat .stat-value {
+      font-weight: 600;
+      color: var(--color-text);
+      font-size: 0.9rem;
+    }
+    .summary-stat .stat-value.zero { color: #4caf50; }
+
+    /* Alert banner */
+    .alert-banner {
+      background: rgba(217,83,79,0.08);
+      border: 1px solid rgba(217,83,79,0.3);
+      border-radius: 6px;
+      margin-bottom: 0.75rem;
+      overflow: hidden;
+    }
+    .alert-banner-header {
+      padding: 0.5rem 0.75rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      color: #d9534f;
+    }
+    .alert-banner-header .material-symbols-outlined { font-size: 1rem; }
+    .alert-banner-body { padding: 0 0.75rem 0.5rem; }
+    .alert-item {
+      padding: 0.3rem 0;
+      font-size: 0.8rem;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .alert-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      display: inline-block;
+      flex-shrink: 0;
+    }
+
+    /* Filter bar */
+    .filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+      align-items: center;
+    }
+    .filter-bar select {
+      background: var(--color-background);
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      color: var(--color-text);
+      padding: 0.35rem 0.5rem;
+      font-size: 0.8rem;
+      font-family: var(--font-family);
+    }
+    .filter-bar .time-btns {
+      display: flex;
+      gap: 2px;
+    }
+    .filter-bar .time-btn {
+      background: var(--color-background);
+      border: 1px solid var(--color-border);
+      color: var(--color-text-secondary);
+      padding: 0.35rem 0.5rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+      font-family: var(--font-family);
+    }
+    .filter-bar .time-btn:first-child { border-radius: 4px 0 0 4px; }
+    .filter-bar .time-btn:last-child { border-radius: 0 4px 4px 0; }
+    .filter-bar .time-btn.active {
+      background: var(--color-accent);
+      color: #fff;
+      border-color: var(--color-accent);
+    }
+
+    /* Error groups */
+    .error-groups {
+      border: 1px solid var(--color-border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .group-row {
+      display: grid;
+      grid-template-columns: 28px 32px 80px 130px 1fr 50px 180px 16px;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: background 0.1s;
+      align-items: center;
+    }
+    .group-row:hover { background: rgba(255,255,255,0.03); }
+    .group-row:last-child { border-bottom: none; }
+
+    .group-header {
+      display: grid;
+      grid-template-columns: 28px 32px 80px 130px 1fr 50px 180px 16px;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
+      background: var(--color-background);
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.7rem;
+      color: var(--color-text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+
+    .group-source-icon .material-symbols-outlined {
+      font-size: 1rem;
+      color: var(--color-text-secondary);
+    }
+    .group-active-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .group-subsystem {
+      background: rgba(255,255,255,0.06);
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      font-size: 0.75rem;
+    }
+    .group-type { color: var(--color-text-secondary); font-size: 0.78rem; }
+    .group-msg {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .group-count {
+      font-weight: 600;
+      text-align: center;
+      font-size: 0.85rem;
+    }
+    .group-times {
+      font-size: 0.75rem;
+      color: var(--color-text-secondary);
+      font-family: monospace;
+    }
+    .group-expand .material-symbols-outlined {
+      font-size: 0.9rem;
+      color: var(--color-text-secondary);
+      transition: transform 0.15s;
+    }
+
+    /* Expanded group detail */
+    .group-detail {
+      padding: 0.75rem;
+      background: var(--color-background);
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.8rem;
+    }
+    .group-detail-row {
+      display: flex;
+      gap: 0.75rem;
+      margin-bottom: 0.3rem;
+    }
+    .group-detail-label {
+      font-size: 0.7rem;
+      color: var(--color-text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      min-width: 80px;
+    }
+
+    /* Loading/empty */
+    .loading-spinner {
+      text-align: center;
+      padding: 3rem;
+      color: var(--color-text-secondary);
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { animation: spin 1s linear infinite; display: inline-block; }
+    .empty-state {
+      text-align: center;
+      padding: 3rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+    }
+    .empty-state .material-symbols-outlined {
+      font-size: 2rem;
+      display: block;
+      margin-bottom: 0.5rem;
+      color: #4caf50;
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .group-row, .group-header {
+        grid-template-columns: 28px 32px 1fr 50px 16px;
+      }
+      .group-row .group-subsystem,
+      .group-row .group-type,
+      .group-row .group-times,
+      .group-header span:nth-child(3),
+      .group-header span:nth-child(4),
+      .group-header span:nth-child(7) { display: none; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="genesis-errors" x-data x-init="$store.genesisErrors.onOpen()" @beforeunload.window="$store.genesisErrors.cleanup()">
+
+    <!-- Nav -->
+    <nav class="genesis-nav">
+      <a href="/genesis">Dashboard</a>
+      <a href="/genesis/logs">Event Log</a>
+      <a href="/genesis/errors" class="active">Error Log</a>
+      <a href="/genesis/monitor">Neural Monitor</a>
+    </nav>
+
+    <!-- Error banner -->
+    <div class="error-banner" x-show="$store.genesisErrors.error" x-transition>
+      <span class="material-symbols-outlined">warning</span>
+      <span x-text="$store.genesisErrors.error"></span>
+    </div>
+
+    <!-- Header -->
+    <div class="errors-header">
+      <h1>
+        <span class="material-symbols-outlined">error</span>
+        Error Log
+      </h1>
+      <span class="page-status"
+            :style="`color:${$store.genesisErrors.pageStateColor()}`">
+        <span class="auto-refresh-dot"
+              :style="`background:${$store.genesisErrors.pageStateColor()}`"></span>
+        <span x-text="$store.genesisErrors.pageStateLabel()"></span>
+      </span>
+      <button class="auto-refresh-btn" @click="$store.genesisErrors.toggleAutoRefresh()">
+        <span class="auto-refresh-dot"
+              :style="`background: ${$store.genesisErrors.autoRefresh ? '#4caf50' : '#666'}`"></span>
+        <span x-text="$store.genesisErrors.autoRefresh ? 'Live' : 'Paused'"></span>
+      </button>
+    </div>
+
+    <div class="page-status-detail" x-show="$store.genesisErrors.pageStatusDetail()" x-text="$store.genesisErrors.pageStatusDetail()"></div>
+
+    <!-- Active alerts banner -->
+    <div class="alert-banner" x-show="$store.genesisErrors.activeAlerts.length > 0">
+      <div class="alert-banner-header" @click="$store.genesisErrors.alertsCollapsed = !$store.genesisErrors.alertsCollapsed">
+        <span class="material-symbols-outlined">warning</span>
+        <span x-text="$store.genesisErrors.activeAlerts.length + ' Active Alert' + ($store.genesisErrors.activeAlerts.length !== 1 ? 's' : '')"></span>
+        <span class="material-symbols-outlined" style="margin-left:auto; font-size:1rem;"
+              x-text="$store.genesisErrors.alertsCollapsed ? 'expand_more' : 'expand_less'"></span>
+      </div>
+      <div class="alert-banner-body" x-show="!$store.genesisErrors.alertsCollapsed" x-transition>
+        <template x-for="alert in $store.genesisErrors.activeAlerts" :key="alert.id">
+          <div class="alert-item">
+            <span class="alert-dot" :style="`background: ${$store.genesisErrors.alertSeverityColor(alert.severity)}`"></span>
+            <span x-text="alert.message"></span>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Summary bar -->
+    <div class="summary-bar" x-show="!$store.genesisErrors.loading">
+      <div class="summary-stat">
+        Total:
+        <span class="stat-value" :class="{ zero: $store.genesisErrors.totalErrors === 0 }"
+              x-text="$store.genesisErrors.totalErrors"></span>
+      </div>
+      <div class="summary-stat">
+        Events:
+        <span class="stat-value" x-text="$store.genesisErrors.totals.events"></span>
+      </div>
+      <div class="summary-stat">
+        Dead Letters:
+        <span class="stat-value" x-text="$store.genesisErrors.totals.dead_letters"></span>
+      </div>
+      <div class="summary-stat">
+        Deferred Failures:
+        <span class="stat-value" x-text="$store.genesisErrors.totals.deferred_failures"></span>
+      </div>
+    </div>
+
+    <!-- Filter bar -->
+    <div class="filter-bar">
+      <div class="time-btns">
+        <template x-for="t in ['1h','6h','24h','7d']" :key="t">
+          <button class="time-btn"
+                  :class="{ active: $store.genesisErrors.filters.timeRange === t }"
+                  @click="$store.genesisErrors.filters.timeRange = t; $store.genesisErrors.applyFilters()"
+                  x-text="t.toUpperCase()"></button>
+        </template>
+      </div>
+      <select x-model="$store.genesisErrors.filters.subsystem" @change="$store.genesisErrors.applyFilters()">
+        <option value="">All subsystems</option>
+        <template x-for="s in $store.genesisErrors.subsystems.filter(s => s)" :key="s">
+          <option :value="s" x-text="s"></option>
+        </template>
+      </select>
+    </div>
+
+    <!-- Sort controls -->
+    <div style="display: flex; gap: 0.4rem; align-items: center; margin: 0.5rem 0; font-size: 0.78rem;">
+      <span style="color: var(--color-text-secondary);">Sort by:</span>
+      <template x-for="s in [{v: 'last_seen', l: 'Last Seen'}, {v: 'first_seen', l: 'First Seen'}, {v: 'count', l: 'Count'}]" :key="s.v">
+        <button style="padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; font-size: 0.72rem; transition: all 0.15s;"
+                :style="`border: 1px solid ${$store.genesisErrors.sortBy === s.v ? '#4caf50' : '#555'}; background: ${$store.genesisErrors.sortBy === s.v ? '#4caf5033' : 'transparent'}; color: ${$store.genesisErrors.sortBy === s.v ? '#4caf50' : '#aaa'}`"
+                @click="$store.genesisErrors.sortBy = s.v"
+                x-text="s.l"></button>
+      </template>
+    </div>
+
+    <!-- Loading -->
+    <div class="loading-spinner" x-show="$store.genesisErrors.loading">
+      <span class="material-symbols-outlined spinner">progress_activity</span>
+      <div>Loading errors...</div>
+    </div>
+
+    <!-- Error groups table -->
+    <div class="error-groups" x-show="!$store.genesisErrors.loading && $store.genesisErrors.groups.length > 0">
+      <div class="group-header">
+        <span></span>
+        <span></span>
+        <span>Subsystem</span>
+        <span>Type</span>
+        <span>Message</span>
+        <span>Count</span>
+        <span>Time Range</span>
+        <span></span>
+      </div>
+
+      <template x-for="group in $store.genesisErrors.sortedGroups" :key="group.key">
+        <div>
+          <div class="group-row"
+               :style="`background: ${$store.genesisErrors.severityBg(group.worst_severity)}`"
+               @click="$store.genesisErrors.toggleGroup(group.key)">
+            <span class="group-active-dot"
+                  :style="`background: ${group.still_active ? '#d9534f' : '#4caf50'}`"
+                  :title="group.still_active ? 'Still occurring' : 'Resolved'"></span>
+            <span class="group-source-icon">
+              <span class="material-symbols-outlined" x-text="$store.genesisErrors.sourceIcon(group.source)"></span>
+            </span>
+            <span class="group-subsystem" x-text="group.subsystem"></span>
+            <span class="group-type" x-text="group.event_type"></span>
+            <span class="group-msg" :style="`color: ${$store.genesisErrors.severityColor(group.worst_severity)}`"
+                  x-text="group.message_prefix"></span>
+            <span class="group-count" x-text="group.count"></span>
+            <span class="group-times"
+                  x-text="$store.genesisErrors.formatDateTime(group.first_seen) + ' \u2192 ' + $store.genesisErrors.formatTime(group.last_seen)"></span>
+            <span class="group-expand">
+              <span class="material-symbols-outlined"
+                    :style="$store.genesisErrors.expandedGroupKey === group.key ? 'transform:rotate(180deg)' : ''"
+                    >expand_more</span>
+            </span>
+          </div>
+
+          <!-- Expanded detail -->
+          <div class="group-detail" x-show="$store.genesisErrors.expandedGroupKey === group.key" x-transition>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Source</span>
+              <span x-text="$store.genesisErrors.sourceLabel(group.source)"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Severity</span>
+              <span :style="`color: ${$store.genesisErrors.severityColor(group.worst_severity)}`"
+                    x-text="group.worst_severity"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Occurrences</span>
+              <span x-text="group.count"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">First Seen</span>
+              <span style="font-family: monospace;" x-text="group.first_seen"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Last Seen</span>
+              <span style="font-family: monospace;" x-text="group.last_seen"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Status</span>
+              <span :style="`color: ${group.manually_resolved ? '#2196F3' : group.still_active ? '#d9534f' : '#4caf50'}`"
+                    x-text="group.manually_resolved ? 'Manually resolved by ' + group.resolved_by + ' at ' + $store.genesisErrors.formatDateTime(group.resolved_at) : group.still_active ? 'Active - still occurring' : 'Resolved - no recent recurrence'"></span>
+            </div>
+            <div class="group-detail-row">
+              <span class="group-detail-label">Key</span>
+              <span style="font-family: monospace; font-size: 0.75rem; color: var(--color-text-secondary);"
+                    x-text="group.key"></span>
+            </div>
+            <div class="group-detail-row" style="margin-top: 0.5rem;">
+              <template x-if="!group.manually_resolved">
+                <button style="padding: 0.3rem 0.8rem; border: 1px solid #4caf50; background: transparent; color: #4caf50; border-radius: 4px; cursor: pointer; font-size: 0.78rem;"
+                        @click="$store.genesisErrors.resolveGroup(group.key)">
+                  Mark Resolved
+                </button>
+              </template>
+              <template x-if="group.manually_resolved">
+                <button style="padding: 0.3rem 0.8rem; border: 1px solid #f0ad4e; background: transparent; color: #f0ad4e; border-radius: 4px; cursor: pointer; font-size: 0.78rem;"
+                        @click="$store.genesisErrors.unresolveGroup(group.key)">
+                  Unresolve
+                </button>
+              </template>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
+    <!-- Empty state -->
+    <div class="empty-state" x-show="!$store.genesisErrors.loading && $store.genesisErrors.groups.length === 0 && $store.genesisErrors.fetchState !== 'fetch_error'">
+      <span class="material-symbols-outlined">check_circle</span>
+      <span x-text="'No errors matching the last ' + $store.genesisErrors.filters.timeRange + '. Current data is clean.'"></span>
+    </div>
+
+    <div class="empty-state" x-show="!$store.genesisErrors.loading && $store.genesisErrors.groups.length === 0 && $store.genesisErrors.fetchState === 'fetch_error'">
+      <span class="material-symbols-outlined" style="color:#d9534f;">warning</span>
+      Error data is unavailable.
+    </div>
+
+  </div>
+</body>
+</html>

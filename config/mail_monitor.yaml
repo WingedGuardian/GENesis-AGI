@@ -1,0 +1,12 @@
+mail_monitor:
+  enabled: true
+  cron_expression: "0 5 * * 0"        # Sunday 05:00 UTC
+  batch_size: 10                       # Max emails per Layer 2 CC session
+  model: "sonnet"
+  effort: "medium"
+  timeout_s: 600
+  max_retries: 3
+  imap_timeout_s: 30
+  max_emails_per_run: 50               # Safety cap per batch run
+  timezone: "UTC"
+  min_relevance: 3                     # Layer 1 filter: only relevance >= this goes to judge

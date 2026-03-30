@@ -1,0 +1,11 @@
+[Unit]
+Description=Guardian watchman — ensure guardian timer is active
+
+[Timer]
+# Start 3 minutes after boot (after guardian timer should be running)
+OnBootSec=180
+# Check every 5 minutes
+OnUnitActiveSec=300
+
+[Install]
+WantedBy=timers.target

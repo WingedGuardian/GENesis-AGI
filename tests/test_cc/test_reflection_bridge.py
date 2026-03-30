@@ -1,0 +1,256 @@
+"""Tests for CCReflectionBridge."""
+
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from genesis.awareness.types import Depth, TickResult
+from genesis.cc.reflection_bridge import CCReflectionBridge
+from genesis.cc.types import CCModel, CCOutput, EffortLevel
+
+
+@pytest.fixture
+def mock_invoker():
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(
+        return_value=CCOutput(
+            session_id="refl-1",
+            text='{"observations":["test obs"],"patterns":[],"recommendations":[]}',
+            model_used="sonnet",
+            cost_usd=0.02,
+            input_tokens=500,
+            output_tokens=200,
+            duration_ms=5000,
+            exit_code=0,
+        ),
+    )
+    return invoker
+
+
+@pytest.fixture
+def mock_session_mgr():
+    mgr = AsyncMock()
+    mgr.create_background = AsyncMock(return_value={"id": "bg-sess-1"})
+    return mgr
+
+
+@pytest.fixture
+def tick():
+    return TickResult(
+        tick_id="tick-1",
+        timestamp="2026-03-07T12:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.DEEP,
+        trigger_reason="test",
+    )
+
+
+@pytest.fixture
+def bridge(db, mock_invoker, mock_session_mgr):
+    return CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=mock_invoker, db=db,
+    )
+
+
+def test_model_for_depth(bridge):
+    assert bridge._model_for_depth(Depth.LIGHT) == CCModel.HAIKU
+    assert bridge._model_for_depth(Depth.DEEP) == CCModel.SONNET
+    assert bridge._model_for_depth(Depth.STRATEGIC) == CCModel.OPUS
+
+
+def test_effort_for_context(bridge):
+    # LIGHT→LOW, DEEP→HIGH (fixed), STRATEGIC→MAX
+    assert bridge._effort_for_context(Depth.LIGHT) == EffortLevel.LOW
+    assert bridge._effort_for_context(Depth.DEEP) == EffortLevel.HIGH
+    assert bridge._effort_for_context(Depth.STRATEGIC) == EffortLevel.MAX
+    # Deep is fixed HIGH regardless of escalation source or signal load
+    # (escalation_source is logged but doesn't change effort — that's V4 executor)
+    assert bridge._effort_for_context(Depth.DEEP, escalation_source="critical_bypass") == EffortLevel.HIGH
+    assert bridge._effort_for_context(Depth.DEEP, escalation_source="light_escalation") == EffortLevel.HIGH
+
+
+async def test_reflect_deep(db, bridge, tick, mock_invoker):
+    result = await bridge.reflect(Depth.DEEP, tick, db=db)
+    assert result.success
+    mock_invoker.run.assert_called_once()
+    call_args = mock_invoker.run.call_args[0][0]
+    assert call_args.model == CCModel.SONNET
+
+
+async def test_reflect_strategic(db, bridge, tick, mock_invoker):
+    result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
+    assert result.success
+    call_args = mock_invoker.run.call_args[0][0]
+    assert call_args.model == CCModel.OPUS
+
+
+async def test_reflect_handles_cc_error(db, mock_session_mgr):
+    bad_invoker = AsyncMock()
+    bad_invoker.run = AsyncMock(
+        return_value=CCOutput(
+            session_id="",
+            text="",
+            model_used="sonnet",
+            cost_usd=0,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=100,
+            exit_code=1,
+            is_error=True,
+            error_message="CLI crashed",
+        ),
+    )
+    mock_session_mgr.create_background = AsyncMock(return_value={"id": "bg-fail"})
+    b = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=bad_invoker, db=db,
+    )
+    t = TickResult(
+        tick_id="t1",
+        timestamp="2026-03-07T12:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.DEEP,
+        trigger_reason="test",
+    )
+    result = await b.reflect(Depth.DEEP, t, db=db)
+    assert not result.success
+    assert result.reason == "CLI crashed"
+
+
+async def test_reflect_handles_session_creation_failure(db):
+    bad_mgr = AsyncMock()
+    bad_mgr.create_background = AsyncMock(side_effect=RuntimeError("boom"))
+    invoker = AsyncMock()
+    b = CCReflectionBridge(
+        session_manager=bad_mgr, invoker=invoker, db=db,
+    )
+    t = TickResult(
+        tick_id="t2",
+        timestamp="2026-03-07T12:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.DEEP,
+        trigger_reason="test",
+    )
+    result = await b.reflect(Depth.DEEP, t, db=db)
+    assert not result.success
+    assert result.reason == "Session creation failed"
+    invoker.run.assert_not_called()
+
+
+def test_system_prompt_loads_from_file(tmp_path, db, mock_invoker, mock_session_mgr):
+    deep_file = tmp_path / "REFLECTION_DEEP.md"
+    deep_file.write_text("Deep prompt content here")
+    strategic_file = tmp_path / "REFLECTION_STRATEGIC.md"
+    strategic_file.write_text("Strategic prompt content here")
+
+    b = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=mock_invoker, db=db,
+        prompt_dir=tmp_path,
+    )
+    assert "Deep prompt content" in b._system_prompt_for_depth(Depth.DEEP)
+    assert "Strategic prompt content" in b._system_prompt_for_depth(Depth.STRATEGIC)
+
+
+def test_system_prompt_falls_back_when_file_missing(db, mock_invoker, mock_session_mgr):
+    b = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=mock_invoker, db=db,
+        prompt_dir=Path("/nonexistent"),
+    )
+    prompt = b._system_prompt_for_depth(Depth.DEEP)
+    assert "Genesis" in prompt
+
+
+async def test_reflection_prompt_includes_cognitive_state(db, bridge, tick):
+    from genesis.db.crud import cognitive_state
+
+    now = datetime.now(UTC).isoformat()
+    await cognitive_state.create(
+        db, id=str(uuid.uuid4()), content="Currently researching vehicles",
+        section="active_context", generated_by="test", created_at=now,
+    )
+    prompt = await bridge._build_reflection_prompt(depth=Depth.DEEP, tick=tick, db=db)
+    assert "vehicles" in prompt.lower()
+
+
+def test_awareness_loop_accepts_bridge_param(db):
+    from genesis.awareness.loop import AwarenessLoop
+
+    mock_bridge = AsyncMock()
+    loop = AwarenessLoop(db, [], cc_reflection_bridge=mock_bridge)
+    assert loop._cc_reflection_bridge is mock_bridge
+
+
+def test_awareness_loop_set_cc_reflection_bridge(db):
+    from genesis.awareness.loop import AwarenessLoop
+
+    loop = AwarenessLoop(db, [])
+    assert loop._cc_reflection_bridge is None
+    mock_bridge = AsyncMock()
+    loop.set_cc_reflection_bridge(mock_bridge)
+    assert loop._cc_reflection_bridge is mock_bridge
+
+
+@pytest.mark.asyncio
+async def test_route_deep_output_failure_falls_back_to_legacy(db, bridge, tick):
+    """When _route_deep_output raises, _store_reflection_output must be called."""
+    bridge._output_router = AsyncMock()  # enable deep routing path
+    bridge._route_deep_output = AsyncMock(side_effect=RuntimeError("routing broke"))
+    bridge._store_reflection_output = AsyncMock()
+
+    result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+
+    assert result.success
+    bridge._route_deep_output.assert_awaited_once()
+    bridge._store_reflection_output.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_route_deep_output_success_skips_legacy(db, bridge, tick):
+    """When _route_deep_output succeeds, _store_reflection_output must NOT be called."""
+    bridge._output_router = AsyncMock()  # enable deep routing path
+    bridge._route_deep_output = AsyncMock()  # succeeds
+    bridge._store_reflection_output = AsyncMock()
+
+    result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+
+    assert result.success
+    bridge._route_deep_output.assert_awaited_once()
+    bridge._store_reflection_output.assert_not_awaited()
+
+
+# ── Per-model prompt loading ──────────────────────────────────────────
+
+
+def test_model_specific_prompt_loaded(tmp_path):
+    """When REFLECTION_LIGHT_HAIKU.md exists, it's loaded for LIGHT depth."""
+    (tmp_path / "REFLECTION_LIGHT.md").write_text("generic prompt")
+    (tmp_path / "REFLECTION_LIGHT_HAIKU.md").write_text("haiku-optimized prompt")
+    bridge = CCReflectionBridge(
+        session_manager=AsyncMock(),
+        invoker=AsyncMock(),
+        db=AsyncMock(),
+        prompt_dir=tmp_path,
+    )
+    result = bridge._system_prompt_for_depth(Depth.LIGHT)
+    assert result == "haiku-optimized prompt"
+
+
+def test_fallback_to_generic_prompt(tmp_path):
+    """When no model-specific file exists, falls back to generic."""
+    (tmp_path / "REFLECTION_LIGHT.md").write_text("generic prompt")
+    bridge = CCReflectionBridge(
+        session_manager=AsyncMock(),
+        invoker=AsyncMock(),
+        db=AsyncMock(),
+        prompt_dir=tmp_path,
+    )
+    result = bridge._system_prompt_for_depth(Depth.LIGHT)
+    assert result == "generic prompt"

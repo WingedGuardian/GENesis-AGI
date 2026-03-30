@@ -1,0 +1,21 @@
+#!/bin/bash
+# Genesis pre-push hook — block force pushes to main
+# Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
+
+remote="$1"
+
+while read local_ref local_oid remote_ref remote_oid; do
+    if echo "$remote_ref" | grep -qE 'refs/heads/(main|master)$'; then
+        # Check if this is a force push (non-fast-forward)
+        if [ "$remote_oid" != "0000000000000000000000000000000000000000" ]; then
+            merge_base=$(git merge-base "$remote_oid" "$local_oid" 2>/dev/null)
+            if [ "$merge_base" != "$remote_oid" ]; then
+                echo "BLOCKED: Force push to $remote_ref is not allowed."
+                echo "Use a feature branch and PR instead."
+                exit 1
+            fi
+        fi
+    fi
+done
+
+exit 0

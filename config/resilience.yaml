@@ -1,0 +1,28 @@
+# Genesis v3 Resilience Configuration
+
+flapping:
+  transition_count: 3
+  window_seconds: 900
+  stabilization_seconds: 600
+
+recovery:
+  confirmation_probes: 3
+  confirmation_interval_s: 30
+  drain_pace_s: 30
+  embedding_pace_per_min: 10
+  queue_overflow_threshold: 1000
+
+cc:
+  max_sessions_per_hour: 20
+  throttle_threshold_pct: 0.80
+
+status:
+  path: "~/.genesis/status.json"
+  write_every_tick: true
+
+notifications:
+  webhook_url: null
+  webhook_events:
+    - state_changed
+    - recovery_complete
+    - queue_overflow

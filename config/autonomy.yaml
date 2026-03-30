@@ -1,0 +1,91 @@
+# Genesis v3 Autonomy Configuration
+
+# Default autonomy levels per category (user can override via natural language)
+defaults:
+  direct_session: 1      # L1 — conservative start
+  background_cognitive: 1
+  sub_agent: 1
+  outreach: 1
+
+# Context ceilings — hard caps regardless of earned level
+ceilings:
+  direct_session: 7      # Effectively uncapped
+  background_cognitive: 3 # L3 max
+  sub_agent: 2           # L2 for irreversible actions
+  outreach: 2            # L2 until engagement data proves calibration
+
+# V3 approval policy: action class → gate decision
+# In V3, costly_reversible and irreversible ALWAYS require user approval.
+# User can grant per-task exemptions for costly_reversible via NL.
+approval_policy:
+  reversible: "act"            # Proceed without approval
+  costly_reversible: "propose" # Ask user first (always in V3)
+  irreversible: "propose"      # Ask user first (always, no exceptions in V3)
+
+# Approval timeout (seconds) per action type
+# Expired = rejected, never auto-approved.
+# null = wait forever (no timeout).
+approval_timeouts:
+  outreach: 3600         # 60 minutes
+  task_proposal: 86400   # 24 hours
+  irreversible: null     # Wait forever
+
+# Regression policy
+regression:
+  consecutive_corrections_threshold: 2  # Drop one level after this many
+  announce_regression: true             # Notify user when regression fires
+
+# Watchdog configuration
+watchdog:
+  status_file: "~/.genesis/status.json"  # Reuse existing StatusFileWriter output
+  staleness_threshold_seconds: 300       # 5 minutes — if status.json older than this, bridge may be dead
+  check_interval_seconds: 60             # How often watchdog checks
+  max_restart_attempts: 5                # Stop trying after this many consecutive failures
+  backoff_initial_seconds: 10
+  backoff_max_seconds: 300               # Cap at 5 minutes
+  config_validation: true                # Validate config before restart
+
+# CC rate limit detection patterns
+# These are parsed from CC CLI stderr/stdout when rate limits are hit.
+# Update when CC CLI changes behavior.
+rate_limit_patterns:
+  exit_codes: []          # To be populated after empirical testing
+  stderr_patterns:
+    - "rate limit"
+    - "usage limit"
+    - "Rate limit"
+    - "try again"
+    - "quota exceeded"
+
+# STEERING.md configuration
+steering:
+  max_rules: 20           # FIFO eviction at this count
+  file_path: "src/genesis/identity/STEERING.md"
+
+# Calibration feedback injection
+calibration:
+  min_sample_count: 10    # Minimum predictions per domain before injecting feedback
+  injection_depths:       # Only inject at these reflection depths
+    - "deep"
+    - "strategic"
+
+# Task model/effort defaults (user override always wins)
+task_models:
+  deep_reflection:
+    model: "sonnet"
+    effort: "high"
+  strategic_reflection:
+    model: "opus"
+    effort: "high"
+  surplus_brainstorm:
+    model: "sonnet"
+    effort: "medium"
+  inbox_evaluation:
+    model: "sonnet"
+    effort: "medium"
+  research:
+    model: "sonnet"
+    effort: "high"
+  code_modification:
+    model: "opus"
+    effort: "high"

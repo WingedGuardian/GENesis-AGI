@@ -1,0 +1,304 @@
+"""CRUD operations for ego_cycles, ego_proposals, and ego_state tables."""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+
+import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# ego_cycles
+# ---------------------------------------------------------------------------
+
+
+async def create_cycle(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    output_text: str,
+    proposals_json: str = "[]",
+    focus_summary: str = "",
+    model_used: str = "",
+    cost_usd: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    duration_ms: int = 0,
+    created_at: str | None = None,
+) -> str:
+    """Insert a new ego cycle record. Returns the id."""
+    if created_at is None:
+        created_at = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO ego_cycles
+           (id, output_text, proposals_json, focus_summary,
+            model_used, cost_usd, input_tokens, output_tokens,
+            duration_ms, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, output_text, proposals_json, focus_summary,
+         model_used, cost_usd, input_tokens, output_tokens,
+         duration_ms, created_at),
+    )
+    await db.commit()
+    return id
+
+
+async def get_cycle(db: aiosqlite.Connection, id: str) -> dict | None:
+    """Fetch a single cycle by id. Returns None if not found."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_cycles WHERE id = ?", (id,),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
+async def list_recent_cycles(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 10,
+) -> list[dict]:
+    """Most recent cycles, newest first."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_cycles ORDER BY created_at DESC, id DESC LIMIT ?",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def list_uncompacted_beyond_window(
+    db: aiosqlite.Connection,
+    *,
+    window_size: int = 10,
+) -> list[dict]:
+    """Uncompacted cycles outside the recent window, oldest first.
+
+    Returns cycles where ``compacted_into IS NULL`` excluding the most
+    recent *window_size* uncompacted cycles.  These are the candidates
+    for compaction (oldest first so callers compact incrementally).
+
+    Secondary sort on ``id`` breaks ties when ``created_at`` values match.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM ego_cycles
+           WHERE compacted_into IS NULL
+             AND id NOT IN (
+                 SELECT id FROM ego_cycles
+                 WHERE compacted_into IS NULL
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+             )
+           ORDER BY created_at ASC, id ASC""",
+        (window_size,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+async def mark_compacted(
+    db: aiosqlite.Connection,
+    *,
+    cycle_id: str,
+    compacted_into: str,
+) -> bool:
+    """Set ``compacted_into`` on a cycle. Returns True if a row was updated."""
+    cursor = await db.execute(
+        "UPDATE ego_cycles SET compacted_into = ? WHERE id = ?",
+        (compacted_into, cycle_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def count_uncompacted(db: aiosqlite.Connection) -> int:
+    """Count cycles where ``compacted_into IS NULL``."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM ego_cycles WHERE compacted_into IS NULL",
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+# ---------------------------------------------------------------------------
+# ego_state  (key-value store)
+# ---------------------------------------------------------------------------
+
+
+async def get_state(db: aiosqlite.Connection, key: str) -> str | None:
+    """Get a value from ego_state. Returns None if key not found."""
+    cursor = await db.execute(
+        "SELECT value FROM ego_state WHERE key = ?", (key,),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def set_state(
+    db: aiosqlite.Connection,
+    *,
+    key: str,
+    value: str,
+) -> None:
+    """Upsert a key-value pair in ego_state.
+
+    Uses ON CONFLICT to guarantee ``updated_at`` is refreshed on every
+    call.  ``INSERT OR REPLACE`` does NOT re-fire DEFAULT expressions —
+    verified against live SQLite.
+    """
+    await db.execute(
+        """INSERT INTO ego_state (key, value, updated_at)
+           VALUES (?, ?, datetime('now'))
+           ON CONFLICT(key) DO UPDATE SET
+             value = excluded.value,
+             updated_at = datetime('now')""",
+        (key, value),
+    )
+    await db.commit()
+
+
+# ---------------------------------------------------------------------------
+# ego_proposals
+# ---------------------------------------------------------------------------
+
+
+async def create_proposal(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    action_type: str,
+    action_category: str = "",
+    content: str,
+    rationale: str = "",
+    confidence: float = 0.0,
+    urgency: str = "normal",
+    alternatives: str = "",
+    status: str = "pending",
+    cycle_id: str | None = None,
+    batch_id: str | None = None,
+    created_at: str | None = None,
+    expires_at: str | None = None,
+) -> str:
+    """Insert a new ego proposal. Returns the id."""
+    if created_at is None:
+        created_at = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO ego_proposals
+           (id, action_type, action_category, content, rationale,
+            confidence, urgency, alternatives, status, cycle_id,
+            batch_id, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, action_type, action_category, content, rationale,
+         confidence, urgency, alternatives, status, cycle_id,
+         batch_id, created_at, expires_at),
+    )
+    await db.commit()
+    return id
+
+
+async def get_proposal(db: aiosqlite.Connection, id: str) -> dict | None:
+    """Fetch a single proposal by id."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_proposals WHERE id = ?", (id,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def list_proposals_by_batch(
+    db: aiosqlite.Connection,
+    batch_id: str,
+) -> list[dict]:
+    """All proposals in a batch, ordered by rowid (insertion order)."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_proposals WHERE batch_id = ? ORDER BY rowid",
+        (batch_id,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def list_pending_proposals(db: aiosqlite.Connection) -> list[dict]:
+    """All pending proposals, oldest first."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_proposals WHERE status = 'pending' "
+        "ORDER BY created_at ASC",
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def resolve_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    status: str,
+    user_response: str | None = None,
+    resolved_at: str | None = None,
+) -> bool:
+    """Update a proposal's status. Returns True if a row was updated."""
+    if resolved_at is None:
+        resolved_at = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
+        "WHERE id = ? AND status = 'pending'",
+        (status, user_response, resolved_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def expire_proposals(db: aiosqlite.Connection, *, now: str) -> int:
+    """Bulk-expire pending proposals past their expires_at. Returns count."""
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'expired', resolved_at = ? "
+        "WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?",
+        (now, now),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def get_batch_for_delivery(
+    db: aiosqlite.Connection,
+    delivery_id: str,
+) -> str | None:
+    """Resolve a delivery_id to its batch_id via ego_state."""
+    return await get_state(db, f"delivery_batch:{delivery_id}")
+
+
+def _next_date(date_str: str) -> str:
+    """Return the next day as YYYY-MM-DD."""
+    from datetime import date as dt_date
+    from datetime import timedelta
+    d = dt_date.fromisoformat(date_str)
+    return (d + timedelta(days=1)).isoformat()
+
+
+async def daily_ego_cost(
+    db: aiosqlite.Connection,
+    *,
+    date: str | None = None,
+) -> float:
+    """Sum cost_usd for ego cycles created on the given date.
+
+    Parameters
+    ----------
+    date:
+        ISO date string (YYYY-MM-DD). Defaults to today (UTC).
+
+    Returns 0.0 if no cycles found.
+    """
+    if date is None:
+        from datetime import UTC, datetime
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
+    async with db.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ego_cycles "
+        "WHERE created_at >= ? || 'T00:00:00' "
+        "AND created_at < ? || 'T00:00:00'",
+        (date, _next_date(date)),
+    ) as cur:
+        row = await cur.fetchone()
+        return float(row[0]) if row else 0.0

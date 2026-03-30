@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>Genesis Event Log</title>
+  <link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
+  <link rel="stylesheet" href="/index.css">
+  <link rel="stylesheet" href="/vendor/google/google-icons.css">
+  <script type="module" src="/js/initFw.js"></script>
+
+  <script type="module">
+    import { fetchApi } from "/js/api.js";
+
+    document.addEventListener("alpine:init", () => {
+      Alpine.store("genesisLogs", {
+        // State
+        events: [],
+        loading: true,
+        error: null,
+        lastSuccess: null,
+        fetchState: "idle",
+        autoRefresh: true,
+        expandedEventId: null,
+        totalMatching: 0,
+        hasMore: false,
+        nextCursor: null,
+        loadingMore: false,
+
+        // Filters
+        filters: {
+          severities: "debug",
+          subsystem: "",
+          eventType: "",
+          search: "",
+          timeRange: "24h",
+        },
+
+        _refreshInterval: null,
+
+        // Lifecycle
+        async onOpen() {
+          await this.fetchEvents();
+          this.loading = false;
+          this._refreshInterval = setInterval(() => {
+            if (this.autoRefresh) this.fetchEvents();
+          }, 10000);
+        },
+
+        cleanup() {
+          if (this._refreshInterval) clearInterval(this._refreshInterval);
+        },
+
+        // Fetch
+        async fetchEvents(append) {
+          if (!append) this.startFetch();
+          try {
+            let url = `/api/genesis/events?page_size=100`;
+            if (append && this.nextCursor) {
+              url += `&cursor_ts=${encodeURIComponent(this.nextCursor.ts)}&cursor_id=${encodeURIComponent(this.nextCursor.id)}`;
+            }
+            if (this.filters.severities) url += `&severities=${this.filters.severities}`;
+            if (this.filters.subsystem) url += `&subsystems=${this.filters.subsystem}`;
+            if (this.filters.eventType) url += `&event_types=${this.filters.eventType}`;
+            if (this.filters.search) url += `&search=${encodeURIComponent(this.filters.search)}`;
+
+            if (this.filters.timeRange !== "all") {
+              const ranges = { "1h": 1, "6h": 6, "24h": 24, "7d": 168 };
+              const hours = ranges[this.filters.timeRange] || 1;
+              const since = new Date(Date.now() - hours * 3600000).toISOString();
+              url += `&since=${encodeURIComponent(since)}`;
+            }
+
+            const resp = await fetchApi(url);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              if (append) {
+                this.events = this.events.concat(data.events);
+              } else {
+                this.events = data.events;
+                this.totalMatching = data.total_matching;
+              }
+              this.hasMore = data.has_more;
+              this.nextCursor = data.next_cursor;
+              this.error = null;
+              if (!append) this.finishFetch();
+            } else if (!append) {
+              this.failFetch("Event log unavailable");
+            }
+          } catch (e) {
+            console.warn("Event log fetch failed:", e);
+            if (!append) this.failFetch("Failed to load events");
+          }
+        },
+
+        async loadMore() {
+          if (!this.hasMore || this.loadingMore) return;
+          this.loadingMore = true;
+          await this.fetchEvents(true);
+          this.loadingMore = false;
+        },
+
+        applyFilters() {
+          this.events = [];
+          this.nextCursor = null;
+          this.fetchEvents();
+        },
+
+        resetFilters() {
+          this.filters = { severities: "info", subsystem: "", eventType: "", search: "", timeRange: "1h" };
+          this.applyFilters();
+        },
+
+        toggleExpand(id) {
+          this.expandedEventId = this.expandedEventId === id ? null : id;
+        },
+
+        toggleAutoRefresh() {
+          this.autoRefresh = !this.autoRefresh;
+        },
+
+        startFetch() {
+          this.fetchState = this.lastSuccess ? "refreshing" : "loading";
+          this.error = null;
+        },
+
+        finishFetch() {
+          this.fetchState = "current";
+          this.lastSuccess = Date.now();
+          this.error = null;
+        },
+
+        failFetch(message) {
+          this.fetchState = this.lastSuccess ? "stale" : "fetch_error";
+          this.error = message;
+        },
+
+        // Helpers
+        pageStateColor() {
+          const map = {
+            current: "#4caf50",
+            loading: "#2196F3",
+            refreshing: "#2196F3",
+            stale: "#f0ad4e",
+            fetch_error: "#d9534f",
+            idle: "#888",
+          };
+          return map[this.fetchState] || "#888";
+        },
+
+        pageStateLabel() {
+          const map = {
+            current: "current",
+            loading: "loading",
+            refreshing: "refreshing",
+            stale: "stale",
+            fetch_error: "error",
+            idle: "idle",
+          };
+          return map[this.fetchState] || "unknown";
+        },
+
+        relativeTime(value) {
+          if (!value) return "-";
+          const ts = typeof value === "number" ? value : Date.parse(value);
+          if (!ts) return "-";
+          const diff = Math.max(0, Date.now() - ts);
+          const s = Math.round(diff / 1000);
+          if (s < 60) return `${s}s ago`;
+          const m = Math.round(s / 60);
+          if (m < 60) return `${m}m ago`;
+          const h = Math.round(m / 60);
+          if (h < 48) return `${h}h ago`;
+          return `${Math.round(h / 24)}d ago`;
+        },
+
+        pageStatusDetail() {
+          if (this.fetchState === "stale") {
+            const parts = [];
+            if (this.error) parts.push(this.error);
+            if (this.lastSuccess) parts.push(`last ok ${this.relativeTime(this.lastSuccess)}`);
+            return parts.join(" — ");
+          }
+          if (this.fetchState === "current" && this.lastSuccess) {
+            return `updated ${this.relativeTime(this.lastSuccess)}`;
+          }
+          if (this.fetchState === "refreshing" && this.lastSuccess) {
+            return `refreshing — last ok ${this.relativeTime(this.lastSuccess)}`;
+          }
+          return this.error || "";
+        },
+
+        severityColor(severity) {
+          const map = { debug: "#666", info: "#ccc", warning: "#f0ad4e", error: "#d9534f", critical: "#ff2d2d" };
+          return map[severity] || "#ccc";
+        },
+
+        severityBg(severity) {
+          const map = { debug: "transparent", info: "transparent", warning: "rgba(240,173,78,0.08)", error: "rgba(217,83,79,0.08)", critical: "rgba(255,45,45,0.12)" };
+          return map[severity] || "transparent";
+        },
+
+        formatTime(isoStr) {
+          if (!isoStr) return "-";
+          try {
+            const d = new Date(isoStr);
+            return d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" })
+              + "." + String(d.getMilliseconds()).padStart(3, "0");
+          } catch { return isoStr; }
+        },
+
+        formatDate(isoStr) {
+          if (!isoStr) return "";
+          try { return new Date(isoStr).toLocaleDateString("en-US", { month: "short", day: "numeric" }); } catch { return ""; }
+        },
+
+        formatDetails(details) {
+          if (!details) return "null";
+          try { return JSON.stringify(details, null, 2); } catch { return String(details); }
+        },
+
+        get subsystems() {
+          return ["", "routing", "awareness", "surplus", "memory", "health",
+                  "perception", "learning", "inbox", "reflection", "providers", "web", "outreach", "dashboard"];
+        },
+
+        get severityOptions() {
+          return [
+            { value: "debug", label: "DEBUG+" },
+            { value: "info", label: "INFO+" },
+            { value: "warning", label: "WARN+" },
+            { value: "error", label: "ERROR+" },
+            { value: "critical", label: "CRIT" },
+          ];
+        },
+      });
+    });
+  </script>
+
+  <style>
+    :root { --color-text-secondary: var(--color-text-muted, #d4d4d4e4); }
+    html, body { overflow: auto !important; position: static !important; height: auto !important; }
+
+    .error-banner {
+      background: rgba(217,83,79,0.1);
+      border: 1px solid rgba(217,83,79,0.3);
+      border-radius: 6px;
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 0.75rem;
+      font-size: 0.8rem;
+      color: #d9534f;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+    .error-banner .material-symbols-outlined { font-size: 1rem; }
+
+    .genesis-logs {
+      max-width: 100%;
+      margin: 0 auto;
+      padding: 1rem 1.5rem;
+      color: var(--color-text);
+      font-family: var(--font-family);
+    }
+
+    /* Nav */
+    .genesis-nav {
+      display: flex;
+      gap: 1.5rem;
+      margin-bottom: 1rem;
+      padding-bottom: 0.5rem;
+      border-bottom: 1px solid var(--color-border);
+    }
+    .genesis-nav a {
+      color: var(--color-text-secondary);
+      text-decoration: none;
+      font-size: 0.85rem;
+      padding: 0.3rem 0;
+    }
+    .genesis-nav a:hover { color: var(--color-text); }
+    .genesis-nav a.active {
+      color: var(--color-accent);
+      border-bottom: 2px solid var(--color-accent);
+    }
+
+    /* Header */
+    .logs-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 1rem;
+    }
+    .logs-header h1 {
+      font-size: 1.3rem;
+      font-weight: 600;
+      margin: 0;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    .logs-header h1 .material-symbols-outlined {
+      font-size: 1.5rem;
+      color: var(--color-accent);
+    }
+    .auto-refresh-btn {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: var(--color-panel);
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      padding: 0.3rem 0.6rem;
+      color: var(--color-text-secondary);
+      font-size: 0.8rem;
+      cursor: pointer;
+    }
+    .auto-refresh-btn:hover { color: var(--color-text); }
+    .auto-refresh-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .page-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.2rem 0.5rem;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .page-status-detail {
+      font-size: 0.78rem;
+      color: var(--color-text-secondary);
+      margin-bottom: 0.75rem;
+    }
+    .total-badge {
+      font-size: 0.8rem;
+      color: var(--color-text-secondary);
+      background: var(--color-background);
+      padding: 0.2rem 0.6rem;
+      border-radius: 10px;
+      border: 1px solid var(--color-border);
+    }
+
+    /* Filter bar */
+    .filter-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+      align-items: center;
+    }
+    .filter-bar select, .filter-bar input {
+      background: var(--color-background);
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      color: var(--color-text);
+      padding: 0.35rem 0.5rem;
+      font-size: 0.8rem;
+      font-family: var(--font-family);
+    }
+    .filter-bar input { min-width: 150px; }
+    .filter-bar .time-btns {
+      display: flex;
+      gap: 2px;
+    }
+    .filter-bar .time-btn {
+      background: var(--color-background);
+      border: 1px solid var(--color-border);
+      color: var(--color-text-secondary);
+      padding: 0.35rem 0.5rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+      font-family: var(--font-family);
+    }
+    .filter-bar .time-btn:first-child { border-radius: 4px 0 0 4px; }
+    .filter-bar .time-btn:last-child { border-radius: 0 4px 4px 0; }
+    .filter-bar .time-btn.active {
+      background: var(--color-accent);
+      color: #fff;
+      border-color: var(--color-accent);
+    }
+    .reset-btn {
+      background: none;
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      color: var(--color-text-secondary);
+      padding: 0.35rem 0.5rem;
+      font-size: 0.75rem;
+      cursor: pointer;
+      font-family: var(--font-family);
+    }
+    .reset-btn:hover { color: var(--color-text); border-color: var(--color-text-secondary); }
+
+    /* Event table */
+    .event-table {
+      width: 100%;
+      border: 1px solid var(--color-border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .event-row {
+      display: grid;
+      grid-template-columns: 110px 70px 90px 140px 1fr;
+      gap: 0.5rem;
+      padding: 0.4rem 0.75rem;
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.8rem;
+      cursor: pointer;
+      transition: background 0.1s;
+      align-items: center;
+    }
+    .event-row:hover { background: rgba(255,255,255,0.03); }
+    .event-row:last-child { border-bottom: none; }
+
+    .event-table-header {
+      display: grid;
+      grid-template-columns: 110px 70px 90px 140px 1fr;
+      gap: 0.5rem;
+      padding: 0.5rem 0.75rem;
+      background: var(--color-background);
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.75rem;
+      color: var(--color-text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-weight: 600;
+    }
+
+    .event-ts { font-family: monospace; font-size: 0.78rem; color: var(--color-text-secondary); }
+    .event-severity {
+      display: inline-block;
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      text-align: center;
+    }
+    .event-subsystem {
+      background: rgba(255,255,255,0.06);
+      padding: 0.1rem 0.4rem;
+      border-radius: 3px;
+      font-size: 0.75rem;
+    }
+    .event-type { color: var(--color-text-secondary); font-size: 0.78rem; }
+    .event-msg {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Expanded detail */
+    .event-detail {
+      padding: 0.75rem;
+      background: var(--color-background);
+      border-bottom: 1px solid var(--color-border);
+      font-size: 0.8rem;
+    }
+    .event-detail pre {
+      background: rgba(0,0,0,0.2);
+      padding: 0.5rem;
+      border-radius: 4px;
+      overflow-x: auto;
+      font-size: 0.75rem;
+      margin: 0.5rem 0 0 0;
+      max-height: 300px;
+    }
+    .event-detail-label {
+      font-size: 0.7rem;
+      color: var(--color-text-secondary);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-top: 0.5rem;
+    }
+    .event-detail-label:first-child { margin-top: 0; }
+
+    /* Load more */
+    .load-more-bar {
+      text-align: center;
+      padding: 0.75rem;
+    }
+    .load-more-btn {
+      background: var(--color-panel);
+      border: 1px solid var(--color-border);
+      border-radius: 4px;
+      color: var(--color-text-secondary);
+      padding: 0.4rem 1.5rem;
+      font-size: 0.8rem;
+      cursor: pointer;
+      font-family: var(--font-family);
+    }
+    .load-more-btn:hover { color: var(--color-text); border-color: var(--color-text-secondary); }
+    .load-more-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* Loading spinner */
+    .loading-spinner {
+      text-align: center;
+      padding: 3rem;
+      color: var(--color-text-secondary);
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { animation: spin 1s linear infinite; display: inline-block; }
+
+    /* Empty state */
+    .empty-state {
+      text-align: center;
+      padding: 3rem;
+      color: var(--color-text-secondary);
+      font-size: 0.9rem;
+    }
+
+    /* Responsive */
+    @media (max-width: 768px) {
+      .event-row, .event-table-header {
+        grid-template-columns: 90px 60px 1fr;
+      }
+      .event-row .event-subsystem,
+      .event-row .event-type,
+      .event-table-header span:nth-child(3),
+      .event-table-header span:nth-child(4) { display: none; }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="genesis-logs" x-data x-init="$store.genesisLogs.onOpen()" @beforeunload.window="$store.genesisLogs.cleanup()">
+
+    <!-- Nav -->
+    <nav class="genesis-nav">
+      <a href="/genesis">Dashboard</a>
+      <a href="/genesis/logs" class="active">Event Log</a>
+      <a href="/genesis/errors">Error Log</a>
+      <a href="/genesis/monitor">Neural Monitor</a>
+    </nav>
+
+    <!-- Error banner -->
+    <div class="error-banner" x-show="$store.genesisLogs.error" x-transition>
+      <span class="material-symbols-outlined">warning</span>
+      <span x-text="$store.genesisLogs.error"></span>
+    </div>
+
+    <!-- Header -->
+    <div class="logs-header">
+      <h1>
+        <span class="material-symbols-outlined">receipt_long</span>
+        Event Log
+      </h1>
+      <span class="page-status"
+            :style="`color:${$store.genesisLogs.pageStateColor()}`">
+        <span class="auto-refresh-dot"
+              :style="`background:${$store.genesisLogs.pageStateColor()}`"></span>
+        <span x-text="$store.genesisLogs.pageStateLabel()"></span>
+      </span>
+      <span class="total-badge" x-show="!$store.genesisLogs.loading"
+            x-text="$store.genesisLogs.totalMatching.toLocaleString() + ' events'"></span>
+      <button class="auto-refresh-btn" @click="$store.genesisLogs.toggleAutoRefresh()">
+        <span class="auto-refresh-dot"
+              :style="`background: ${$store.genesisLogs.autoRefresh ? '#4caf50' : '#666'}`"></span>
+        <span x-text="$store.genesisLogs.autoRefresh ? 'Live' : 'Paused'"></span>
+      </button>
+    </div>
+
+    <div class="page-status-detail" x-show="$store.genesisLogs.pageStatusDetail()" x-text="$store.genesisLogs.pageStatusDetail()"></div>
+
+    <!-- Filter bar -->
+    <div class="filter-bar">
+      <select x-model="$store.genesisLogs.filters.severities" @change="$store.genesisLogs.applyFilters()">
+        <template x-for="opt in $store.genesisLogs.severityOptions" :key="opt.value">
+          <option :value="opt.value" x-text="opt.label"></option>
+        </template>
+      </select>
+
+      <select x-model="$store.genesisLogs.filters.subsystem" @change="$store.genesisLogs.applyFilters()">
+        <option value="">All subsystems</option>
+        <template x-for="s in $store.genesisLogs.subsystems.filter(s => s)" :key="s">
+          <option :value="s" x-text="s"></option>
+        </template>
+      </select>
+
+      <input type="text" placeholder="Event type..."
+             x-model="$store.genesisLogs.filters.eventType"
+             @keyup.enter="$store.genesisLogs.applyFilters()">
+
+      <input type="text" placeholder="Search messages..."
+             x-model="$store.genesisLogs.filters.search"
+             @keyup.enter="$store.genesisLogs.applyFilters()">
+
+      <div class="time-btns">
+        <template x-for="t in ['1h','6h','24h','7d','all']" :key="t">
+          <button class="time-btn"
+                  :class="{ active: $store.genesisLogs.filters.timeRange === t }"
+                  @click="$store.genesisLogs.filters.timeRange = t; $store.genesisLogs.applyFilters()"
+                  x-text="t.toUpperCase()"></button>
+        </template>
+      </div>
+
+      <button class="reset-btn" @click="$store.genesisLogs.resetFilters()">Reset</button>
+    </div>
+
+    <!-- Loading -->
+    <div class="loading-spinner" x-show="$store.genesisLogs.loading">
+      <span class="material-symbols-outlined spinner">progress_activity</span>
+      <div>Loading events...</div>
+    </div>
+
+    <!-- Event table -->
+    <div class="event-table" x-show="!$store.genesisLogs.loading">
+      <div class="event-table-header">
+        <span>Time</span>
+        <span>Severity</span>
+        <span>Subsystem</span>
+        <span>Type</span>
+        <span>Message</span>
+      </div>
+
+      <template x-for="evt in $store.genesisLogs.events" :key="evt.id">
+        <div>
+          <div class="event-row"
+               :style="`background: ${$store.genesisLogs.severityBg(evt.severity)}`"
+               @click="$store.genesisLogs.toggleExpand(evt.id)">
+            <span class="event-ts" x-text="$store.genesisLogs.formatTime(evt.timestamp)"></span>
+            <span class="event-severity"
+                  :style="`color: ${$store.genesisLogs.severityColor(evt.severity)}`"
+                  x-text="evt.severity"></span>
+            <span class="event-subsystem" x-text="evt.subsystem"></span>
+            <span class="event-type" x-text="evt.event_type"></span>
+            <span class="event-msg" x-text="evt.message"></span>
+          </div>
+          <!-- Expanded detail -->
+          <div class="event-detail" x-show="$store.genesisLogs.expandedEventId === evt.id" x-transition>
+            <div class="event-detail-label">Full Message</div>
+            <div x-text="evt.message" style="margin-bottom: 0.5rem;"></div>
+            <template x-if="evt.session_id">
+              <div>
+                <div class="event-detail-label">Session ID</div>
+                <div style="font-family: monospace; font-size: 0.78rem;" x-text="evt.session_id"></div>
+              </div>
+            </template>
+            <div class="event-detail-label">Timestamp</div>
+            <div style="font-family: monospace; font-size: 0.78rem;" x-text="evt.timestamp"></div>
+            <div class="event-detail-label">Details</div>
+            <pre x-text="$store.genesisLogs.formatDetails(evt.details)"></pre>
+          </div>
+        </div>
+      </template>
+
+      <!-- Empty state -->
+      <div class="empty-state" x-show="$store.genesisLogs.events.length === 0 && !$store.genesisLogs.loading && $store.genesisLogs.fetchState !== 'fetch_error'">
+        No events matching current filters.
+      </div>
+
+      <div class="empty-state" x-show="$store.genesisLogs.events.length === 0 && !$store.genesisLogs.loading && $store.genesisLogs.fetchState === 'fetch_error'">
+        Event data is unavailable.
+      </div>
+    </div>
+
+    <!-- Load more -->
+    <div class="load-more-bar" x-show="$store.genesisLogs.hasMore && !$store.genesisLogs.loading">
+      <button class="load-more-btn"
+              @click="$store.genesisLogs.loadMore()"
+              :disabled="$store.genesisLogs.loadingMore"
+              x-text="$store.genesisLogs.loadingMore ? 'Loading...' : 'Load More'"></button>
+    </div>
+
+  </div>
+</body>
+</html>

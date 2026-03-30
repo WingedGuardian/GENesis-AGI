@@ -1,0 +1,490 @@
+"""settings tools — read and modify Genesis configuration via conversation.
+
+Exposes 3 generic tools: settings_list, settings_get, settings_update.
+Each config domain has its own validator. Writable domains use atomic
+YAML writes (tempfile + rename). Read-only domains are enforced by the
+registry, not by filesystem permissions.
+"""
+
+from __future__ import annotations
+
+import copy
+import logging
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from genesis.mcp.health import mcp
+
+logger = logging.getLogger(__name__)
+
+_CONFIG_DIR = Path(__file__).resolve().parents[4] / "config"
+
+
+# ── Domain registry ────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SettingsDomain:
+    """Metadata for a configurable settings domain."""
+
+    name: str
+    description: str
+    config_filename: str
+    readonly: bool
+    needs_restart: bool
+    dedicated_tool: str | None = None
+
+
+_DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
+    "tts": SettingsDomain(
+        name="tts",
+        description="Text-to-speech voice settings (provider, voice, synthesis params)",
+        config_filename="tts.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
+    "resilience": SettingsDomain(
+        name="resilience",
+        description="Resilience thresholds (flapping detection, recovery, CC rate limits)",
+        config_filename="resilience.yaml",
+        readonly=False,
+        needs_restart=True,
+    ),
+    "inbox_monitor": SettingsDomain(
+        name="inbox_monitor",
+        description="Inbox monitor (watch path, batch size, model, effort, timezone)",
+        config_filename="inbox_monitor.yaml",
+        readonly=False,
+        needs_restart=True,
+    ),
+    "autonomy": SettingsDomain(
+        name="autonomy",
+        description="Autonomy levels, ceilings, approval policy, watchdog (read-only — CRITICAL)",
+        config_filename="autonomy.yaml",
+        readonly=True,
+        needs_restart=True,
+    ),
+    "guardian": SettingsDomain(
+        name="guardian",
+        description="Host VM guardian health monitoring thresholds (read-only — host-side)",
+        config_filename="guardian.yaml",
+        readonly=True,
+        needs_restart=True,
+    ),
+    "content_sanitization": SettingsDomain(
+        name="content_sanitization",
+        description="Content sanitization injection detection patterns (read-only)",
+        config_filename="content_sanitization.yaml",
+        readonly=True,
+        needs_restart=True,
+    ),
+    "model_profiles": SettingsDomain(
+        name="model_profiles",
+        description="Model intelligence tiers, costs, and capabilities (read-only)",
+        config_filename="model_profiles.yaml",
+        readonly=True,
+        needs_restart=False,
+    ),
+    "model_routing": SettingsDomain(
+        name="model_routing",
+        description="Model routing call sites, provider chains, retry profiles (read-only — use dashboard for edits)",
+        config_filename="model_routing.yaml",
+        readonly=True,
+        needs_restart=False,
+    ),
+    "outreach": SettingsDomain(
+        name="outreach",
+        description="Outreach preferences (quiet hours, rate limits, channels)",
+        config_filename="outreach.yaml",
+        readonly=False,
+        needs_restart=False,
+        dedicated_tool="outreach_preferences",
+    ),
+    "recon_schedules": SettingsDomain(
+        name="recon_schedules",
+        description="Recon gathering cron schedules",
+        config_filename="recon_schedules.yaml",
+        readonly=False,
+        needs_restart=False,
+        dedicated_tool="recon_schedule",
+    ),
+    "recon_watchlist": SettingsDomain(
+        name="recon_watchlist",
+        description="Recon project watchlist (read-only)",
+        config_filename="recon_watchlist.yaml",
+        readonly=True,
+        needs_restart=False,
+        dedicated_tool="recon_watchlist",
+    ),
+    "recon_sources": SettingsDomain(
+        name="recon_sources",
+        description="Recon dynamic watch sources",
+        config_filename="recon_sources.yaml",
+        readonly=False,
+        needs_restart=False,
+        dedicated_tool="recon_sources",
+    ),
+    "ego": SettingsDomain(
+        name="ego",
+        description="Ego session settings (cadence, model, budget, morning report, circuit breaker)",
+        config_filename="ego.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
+    "confidence_gates": SettingsDomain(
+        name="confidence_gates",
+        description="Confidence gating thresholds for observations, memory, and reflection",
+        config_filename="confidence_gates.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
+}
+
+
+# ── YAML utilities ─────────────────────────────────────────────────────
+
+
+def _load_yaml(filename: str) -> dict:
+    """Read a YAML file from the config dir. Returns empty dict if missing."""
+    path = _CONFIG_DIR / filename
+    if not path.is_file():
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _atomic_yaml_write(filename: str, data: dict) -> Path:
+    """Write YAML atomically via tempfile + rename. Returns the written path."""
+    path = _CONFIG_DIR / filename
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), suffix=".yaml.tmp",
+    )
+    try:
+        with open(tmp_fd, "w") as f:
+            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+        Path(tmp_path).replace(path)
+    except Exception:
+        Path(tmp_path).unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay into base. Lists are replaced, not appended."""
+    merged = copy.deepcopy(base)
+    for key, val in overlay.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
+# ── Domain validators ──────────────────────────────────────────────────
+
+
+def _validate_tts(changes: dict) -> list[str]:
+    """Validate TTS config changes."""
+    errors: list[str] = []
+    valid_providers = {"elevenlabs", "fish_audio", "cartesia"}
+    valid_top_keys = {
+        "provider", "elevenlabs", "fish_audio", "cartesia",
+        "sanitization", "voice_gate",
+    }
+
+    for key in changes:
+        if key not in valid_top_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}")
+
+    if "provider" in changes and changes["provider"] not in valid_providers:
+        errors.append(
+            f"provider must be one of {sorted(valid_providers)}, got '{changes['provider']}'"
+        )
+
+    el = changes.get("elevenlabs", {})
+    if isinstance(el, dict):
+        _validate_float_range(el, "stability", 0.0, 1.0, errors)
+        _validate_float_range(el, "similarity_boost", 0.0, 1.0, errors)
+        _validate_float_range(el, "style", 0.0, 1.0, errors)
+        _validate_float_range(el, "speed", 0.7, 1.2, errors)
+
+    san = changes.get("sanitization", {})
+    if isinstance(san, dict) and "max_chars" in san:
+        _validate_positive_int(san, "max_chars", errors)
+
+    return errors
+
+
+def _validate_resilience(changes: dict) -> list[str]:
+    """Validate resilience config changes."""
+    errors: list[str] = []
+    valid_top_keys = {"flapping", "recovery", "cc", "status", "notifications"}
+
+    for key in changes:
+        if key not in valid_top_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}")
+
+    flapping = changes.get("flapping", {})
+    if isinstance(flapping, dict):
+        for field in ("transition_count", "window_seconds", "stabilization_seconds"):
+            _validate_positive_int(flapping, field, errors)
+
+    recovery = changes.get("recovery", {})
+    if isinstance(recovery, dict):
+        for field in (
+            "confirmation_probes", "confirmation_interval_s",
+            "drain_pace_s", "embedding_pace_per_min", "queue_overflow_threshold",
+        ):
+            _validate_positive_int(recovery, field, errors)
+
+    cc = changes.get("cc", {})
+    if isinstance(cc, dict):
+        _validate_positive_int(cc, "max_sessions_per_hour", errors)
+        _validate_float_range(cc, "throttle_threshold_pct", 0.0, 1.0, errors)
+
+    return errors
+
+
+def _validate_inbox_monitor(changes: dict) -> list[str]:
+    """Validate inbox monitor config changes."""
+    errors: list[str] = []
+
+    # The YAML has a top-level `inbox_monitor:` wrapper — auto-wrap flat changes
+    if "inbox_monitor" not in changes:
+        changes = {"inbox_monitor": changes}
+    section = changes["inbox_monitor"]
+    if not isinstance(section, dict):
+        errors.append("inbox_monitor must be a mapping")
+        return errors
+
+    if "enabled" in section and not isinstance(section["enabled"], bool):
+        errors.append("inbox_monitor.enabled must be a boolean")
+
+    _validate_positive_int(section, "check_interval_seconds", errors)
+    _validate_positive_int(section, "timeout_s", errors)
+
+    if "batch_size" in section:
+        try:
+            val = int(section["batch_size"])
+            if val < 1 or val > 10:
+                errors.append("inbox_monitor.batch_size must be 1-10")
+        except (ValueError, TypeError):
+            errors.append("inbox_monitor.batch_size must be an integer")
+
+    valid_models = {"sonnet", "opus", "haiku"}
+    if "model" in section and section["model"] not in valid_models:
+        errors.append(
+            f"inbox_monitor.model must be one of {sorted(valid_models)}, "
+            f"got '{section['model']}'"
+        )
+
+    valid_efforts = {"low", "medium", "high", "max"}
+    if "effort" in section and section["effort"] not in valid_efforts:
+        errors.append(
+            f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "
+            f"got '{section['effort']}'"
+        )
+
+    if "timezone" in section:
+        import zoneinfo
+        try:
+            zoneinfo.ZoneInfo(section["timezone"])
+        except (KeyError, zoneinfo.ZoneInfoNotFoundError):
+            errors.append(f"inbox_monitor.timezone '{section['timezone']}' is not a valid timezone")
+
+    return errors
+
+
+def _validate_ego(changes: dict) -> list[str]:
+    """Validate ego config changes."""
+    from genesis.ego.config import validate_ego_config
+    return validate_ego_config(changes)
+
+
+_DOMAIN_VALIDATORS: dict[str, Any] = {
+    "tts": _validate_tts,
+    "resilience": _validate_resilience,
+    "inbox_monitor": _validate_inbox_monitor,
+    "ego": _validate_ego,
+}
+
+
+# ── Shared validation helpers ──────────────────────────────────────────
+
+
+def _validate_float_range(
+    d: dict, key: str, lo: float, hi: float, errors: list[str],
+) -> None:
+    if key not in d:
+        return
+    try:
+        val = float(d[key])
+        if val < lo or val > hi:
+            errors.append(f"{key} must be {lo}-{hi}, got {val}")
+    except (ValueError, TypeError):
+        errors.append(f"{key} must be a number, got {d[key]!r}")
+
+
+def _validate_positive_int(d: dict, key: str, errors: list[str]) -> None:
+    if key not in d:
+        return
+    try:
+        val = int(d[key])
+        if val <= 0:
+            errors.append(f"{key} must be a positive integer, got {val}")
+    except (ValueError, TypeError):
+        errors.append(f"{key} must be an integer, got {d[key]!r}")
+
+
+# ── Tool implementations ──────────────────────────────────────────────
+
+
+async def _impl_settings_list() -> list[dict]:
+    return [
+        {
+            "domain": d.name,
+            "description": d.description,
+            "readonly": d.readonly,
+            "needs_restart": d.needs_restart,
+            "dedicated_tool": d.dedicated_tool,
+        }
+        for d in _DOMAIN_REGISTRY.values()
+    ]
+
+
+async def _impl_settings_get(domain: str) -> dict:
+    entry = _DOMAIN_REGISTRY.get(domain)
+    if entry is None:
+        available = ", ".join(sorted(_DOMAIN_REGISTRY))
+        return {"error": f"Unknown domain '{domain}'. Available: {available}"}
+
+    if entry.dedicated_tool:
+        return {
+            "domain": domain,
+            "note": f"Use the '{entry.dedicated_tool}' tool for richer access to {domain} settings.",
+            "readonly": entry.readonly,
+            "dedicated_tool": entry.dedicated_tool,
+        }
+
+    config = _load_yaml(entry.config_filename)
+    return {
+        "domain": domain,
+        "config": config,
+        "readonly": entry.readonly,
+        "needs_restart": entry.needs_restart,
+        "source_file": f"config/{entry.config_filename}",
+    }
+
+
+async def _impl_settings_update(
+    domain: str, changes: dict, dry_run: bool = False,
+) -> dict:
+    entry = _DOMAIN_REGISTRY.get(domain)
+    if entry is None:
+        available = ", ".join(sorted(_DOMAIN_REGISTRY))
+        return {"error": f"Unknown domain '{domain}'. Available: {available}"}
+
+    if entry.readonly:
+        return {
+            "domain": domain,
+            "error": f"Domain '{domain}' is read-only. {entry.description}",
+        }
+
+    if entry.dedicated_tool:
+        return {
+            "domain": domain,
+            "error": f"Use the '{entry.dedicated_tool}' tool to modify {domain} settings.",
+        }
+
+    # Normalize: inbox_monitor YAML has a top-level wrapper key
+    if domain == "inbox_monitor" and "inbox_monitor" not in changes:
+        changes = {"inbox_monitor": changes}
+
+    # Validate
+    validator = _DOMAIN_VALIDATORS.get(domain)
+    if validator:
+        errors = validator(changes)
+        if errors:
+            return {
+                "domain": domain,
+                "error": "validation failed",
+                "validation_errors": errors,
+            }
+
+    # Merge with current config
+    current = _load_yaml(entry.config_filename)
+    merged = _deep_merge(current, changes)
+
+    if dry_run:
+        return {
+            "domain": domain,
+            "status": "dry_run_ok",
+            "changes_applied": changes,
+            "needs_restart": entry.needs_restart,
+        }
+
+    # Atomic write
+    try:
+        _atomic_yaml_write(entry.config_filename, merged)
+    except Exception:
+        logger.error(
+            "Failed to write settings for %s", domain, exc_info=True,
+        )
+        return {"domain": domain, "error": "Failed to write config file"}
+
+    result: dict = {
+        "domain": domain,
+        "status": "applied",
+        "changes_applied": changes,
+        "needs_restart": entry.needs_restart,
+    }
+    if entry.needs_restart:
+        result["note"] = "Changes saved. Restart the bridge for them to take effect."
+
+    return result
+
+
+# ── MCP tool wrappers ──────────────────────────────────────────────────
+
+
+@mcp.tool()
+async def settings_list() -> list[dict]:
+    """List all configurable settings domains.
+
+    Returns each domain's name, description, whether it is read-only,
+    whether changes require a restart, and whether it has a dedicated
+    MCP tool. Use this to discover what can be configured.
+    """
+    return await _impl_settings_list()
+
+
+@mcp.tool()
+async def settings_get(domain: str) -> dict:
+    """Read the current configuration for a settings domain.
+
+    Returns the full config as a structured dict. Use settings_list()
+    first to see available domains. For outreach settings, prefer the
+    outreach_preferences tool which has richer semantics.
+    """
+    return await _impl_settings_get(domain)
+
+
+@mcp.tool()
+async def settings_update(
+    domain: str,
+    changes: dict,
+    dry_run: bool = False,
+) -> dict:
+    """Update configuration for a settings domain.
+
+    Provide a dict of changes to merge (partial update — only specified
+    keys change, existing keys are preserved). Set dry_run=True to
+    validate without saving. Read-only domains are rejected.
+
+    Example: settings_update("tts", {"elevenlabs": {"stability": 0.9}})
+    """
+    return await _impl_settings_update(domain, changes, dry_run=dry_run)

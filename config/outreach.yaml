@@ -1,0 +1,47 @@
+# Phase 8: Outreach pipeline configuration
+
+quiet_hours:
+  start: "22:00"
+  end: "07:00"
+  timezone: "UTC"
+
+channel_preferences:
+  default: telegram
+  blocker: telegram
+  alert: telegram
+  surplus: telegram
+  digest: telegram
+
+thresholds:
+  blocker: 0.0
+  alert: 0.3
+  surplus: 0.7
+  digest: 0.0
+
+rate_limits:
+  max_daily: 5
+  surplus_daily: 1
+
+morning_report:
+  trigger_time: "07:00"
+  timezone: "UTC"
+
+engagement:
+  timeout_hours: 24
+  poll_interval_minutes: 60
+
+# Delivery routing: where each category delivers.
+# Values: "supergroup" (to forum topic), "dm" (direct message), "both".
+# When forum_chat_id is not configured, "supergroup" degrades to DM.
+delivery_routing:
+  default: supergroup
+
+health_alerts:
+  # Only these alert IDs go to Telegram (CRITICAL severity only).
+  # Everything else is internal (dashboard + morning report + awareness).
+  # NOTE: service:bridge_down is intentionally absent — if the bridge is dead,
+  # the Telegram adapter is also dead, so the alert can never be delivered.
+  immediate_escalation:
+    - "infra:tmpfs_low"
+    - "infra:disk_low"
+    - "infra:container_memory_high"

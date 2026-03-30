@@ -1,0 +1,33 @@
+# Behavioral Rule: Never use os.kill(-1, ...) or os.kill(0, ...)
+#
+# Origin: 2026-03-16 — os.killpg(1, SIGKILL) killed every UID 1000 process
+# in the container. Caused by int(AsyncMock().pid) returning 1 in Python 3.12.
+# os.getpgid(1) returns 1. os.killpg(1, sig) == kill(-1, sig) == kill ALL.
+#
+# The killpg pattern is intentionally not included here because the behavioral
+# linter checks Edit new_string content, and a guarded killpg (with pgid > 1
+# check on a preceding line) would false-positive. The os.kill(-1) and
+# os.kill(0) patterns are always dangerous regardless of context.
+
+name: no-unguarded-kill
+severity: block
+description: >
+  Never call os.kill(-1, ...) or os.kill(0, ...) — these kill all processes
+  owned by the user or in the process group. Use os.killpg() with a
+  validated pgid > 1 instead. int(AsyncMock().pid) returns 1 in Python 3.12,
+  and killpg(1, sig) == kill(-1, sig) == kill ALL.
+suggestion: >
+  Use os.killpg(pgid, sig) with a preceding guard: if pgid <= 1: raise
+  ValueError(...). Catch TypeError/ValueError and fall back to proc.kill().
+  In tests, always set mock_proc.pid = 99999 (or any value > 1).
+
+patterns:
+  # Direct kill-all patterns — always dangerous, no valid use case
+  - regex: 'os\.kill\s*\(\s*-1'
+    context: "os.kill(-1, ...) kills every process owned by this user"
+  - regex: 'os\.kill\s*\(\s*0\s*,'
+    context: "os.kill(0, ...) kills every process in the current process group"
+  - regex: 'os\.killpg\s*\(\s*0\s*,'
+    context: "os.killpg(0, ...) kills every process in the current process group"
+  - regex: 'os\.killpg\s*\(\s*1\s*,'
+    context: "os.killpg(1, ...) == kill(-1, ...) — kills ALL user processes"

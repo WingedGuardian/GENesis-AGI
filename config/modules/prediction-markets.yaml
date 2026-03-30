@@ -1,0 +1,9 @@
+name: prediction_markets
+type: native
+class: genesis.modules.prediction_markets.module.PredictionMarketsModule
+description: >
+  Prediction Market Edge — calibration-driven market analysis using
+  Tetlock/GJP superforecasting methodology. Scans markets (Polymarket,
+  Metaculus, Kalshi), estimates probabilities, sizes positions via
+  fractional Kelly criterion, tracks outcomes with Brier scores.
+enabled: false

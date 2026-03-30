@@ -1,0 +1,163 @@
+"""State endpoints: approvals, cognitive, awareness, jobs, autonomy."""
+
+from __future__ import annotations
+
+import json as _json
+from datetime import UTC, datetime
+
+from flask import jsonify
+
+from genesis.dashboard._blueprint import _async_route, blueprint
+
+
+@blueprint.route("/api/genesis/approvals")
+@_async_route
+async def pending_approvals():
+    """Return pending approval requests (module proposals, etc.)."""
+    from genesis.db.crud import approval_requests
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify([])
+
+    pending = await approval_requests.list_pending(rt._db)
+    return jsonify(pending)
+
+
+@blueprint.route("/api/genesis/cognitive")
+@_async_route
+async def cognitive_state_endpoint():
+    """Return current cognitive state: active context, state flags, health flags, session patches."""
+    from genesis.db.crud import cognitive_state as cs_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"active_context": None, "state_flags": None, "health_flags": "", "session_patches": []})
+
+    active = await cs_crud.get_current(rt.db, "active_context")
+    flags_row = await cs_crud.get_current(rt.db, "state_flags")
+    health_flags = await cs_crud.compute_state_flags(rt.db)
+    patches = cs_crud.load_session_patches()
+
+    # Compute narrative freshness from active_context timestamp
+    freshness_seconds = None
+    freshness_level = "unknown"
+    if active and active.get("created_at"):
+        try:
+            created = datetime.fromisoformat(active["created_at"])
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            freshness_seconds = int((datetime.now(UTC) - created).total_seconds())
+            if freshness_seconds < 3600 * 6:
+                freshness_level = "fresh"
+            elif freshness_seconds < 3600 * 48:
+                freshness_level = "aging"
+            else:
+                freshness_level = "stale"
+        except (ValueError, TypeError):
+            pass
+
+    return jsonify({
+        "active_context": active,
+        "state_flags": flags_row,
+        "health_flags": health_flags,
+        "session_patches": patches,
+        "freshness_seconds": freshness_seconds,
+        "freshness_level": freshness_level,
+    })
+
+
+@blueprint.route("/api/genesis/awareness/signals")
+@_async_route
+async def awareness_signals():
+    """Return latest awareness tick + recent history with parsed signals/scores."""
+    from genesis.db.crud import awareness_ticks as at_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"latest": None, "history": []})
+
+    latest = await at_crud.last_tick(rt.db)
+    history = await at_crud.query(rt.db, limit=12)
+
+    def parse_tick(t):
+        if not t:
+            return t
+        try:
+            t["signals"] = _json.loads(t.get("signals_json") or "[]")
+        except (ValueError, TypeError):
+            t["signals"] = []
+        try:
+            t["scores"] = _json.loads(t.get("scores_json") or "[]")
+        except (ValueError, TypeError):
+            t["scores"] = []
+        return t
+
+    return jsonify({
+        "latest": parse_tick(latest),
+        "history": [parse_tick(t) for t in history],
+    })
+
+
+@blueprint.route("/api/genesis/jobs")
+@_async_route
+async def job_health_endpoint():
+    """Return scheduled job health + observation retrieval stats."""
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"jobs": [], "observations": {}})
+
+    cursor = await rt.db.execute(
+        "SELECT * FROM job_health ORDER BY job_name"
+    )
+    jobs = [dict(r) for r in await cursor.fetchall()]
+
+    cursor = await rt.db.execute(
+        "SELECT COUNT(*) as total, "
+        "SUM(retrieved_count) as total_retrieved, "
+        "SUM(CASE WHEN influenced_action = 1 THEN 1 ELSE 0 END) as total_influenced "
+        "FROM observations"
+    )
+    obs_row = await cursor.fetchone()
+
+    cursor = await rt.db.execute(
+        "SELECT COUNT(*) FROM observations "
+        "WHERE created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-24 hours')"
+    )
+    obs_24h = (await cursor.fetchone())[0]
+
+    return jsonify({
+        "jobs": jobs,
+        "observations": {
+            "total": obs_row[0] or 0,
+            "total_retrieved": obs_row[1] or 0,
+            "total_influenced": obs_row[2] or 0,
+            "created_24h": obs_24h,
+        },
+    })
+
+
+@blueprint.route("/api/genesis/autonomy/config")
+@_async_route
+async def autonomy_config():
+    """Return drive weights and depth thresholds."""
+    from genesis.db.crud import depth_thresholds as dt_crud
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt.db is None:
+        return jsonify({"drives": [], "thresholds": []})
+
+    thresholds = await dt_crud.list_all(rt.db)
+
+    cursor = await rt.db.execute(
+        "SELECT * FROM drive_weights ORDER BY drive_name"
+    )
+    drives = [dict(r) for r in await cursor.fetchall()]
+
+    return jsonify({"drives": drives, "thresholds": thresholds})

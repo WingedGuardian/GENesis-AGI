@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from genesis.memory.retrieval import HybridRetriever, _rrf_fuse
+
+# --- RRF unit tests ---
+
+
+def test_rrf_fuse_basic():
+    """Two lists with overlapping items produce correct fused scores."""
+    list_a = ["a", "b", "c"]
+    list_b = ["b", "c", "d"]
+    scores = _rrf_fuse([list_a, list_b], k=60)
+
+    # "b" appears at rank 2 in list_a, rank 1 in list_b
+    assert scores["b"] == pytest.approx(1 / 62 + 1 / 61)
+    # "a" only in list_a at rank 1
+    assert scores["a"] == pytest.approx(1 / 61)
+    # "d" only in list_b at rank 3
+    assert scores["d"] == pytest.approx(1 / 63)
+    # "b" should have the highest score
+    assert scores["b"] > scores["a"]
+    assert scores["b"] > scores["c"]
+
+
+def test_rrf_fuse_single_list():
+    """Single list produces simple reciprocal rank scores."""
+    scores = _rrf_fuse([["x", "y", "z"]], k=60)
+    assert scores["x"] == pytest.approx(1 / 61)
+    assert scores["y"] == pytest.approx(1 / 62)
+    assert scores["z"] == pytest.approx(1 / 63)
+
+
+def test_rrf_fuse_no_overlap():
+    """Disjoint lists produce scores for all items."""
+    scores = _rrf_fuse([["a", "b"], ["c", "d"]], k=60)
+    assert len(scores) == 4
+    for mid in ("a", "b", "c", "d"):
+        assert mid in scores
+
+
+# --- Recall integration tests (all deps mocked) ---
+
+
+def _make_qdrant_hit(mid: str, score: float, *, confidence: float = 0.8) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": mid,
+        "score": score,
+        "payload": {
+            "content": f"content for {mid}",
+            "source": "test",
+            "memory_type": "episodic",
+            "tags": [],
+            "confidence": confidence,
+            "created_at": now,
+            "retrieved_count": 5,
+            "source_type": "memory",
+        },
+    }
+
+
+def _make_fts_row(mid: str, rank: float) -> dict:
+    return {
+        "memory_id": mid,
+        "content": f"fts content for {mid}",
+        "source_type": "memory",
+        "collection": "episodic_memory",
+        "rank": rank,
+    }
+
+
+def _build_retriever():
+    embed_provider = MagicMock()
+    embed_provider.embed = AsyncMock(return_value=[0.1] * 1024)
+    qdrant_client = MagicMock()
+    db = MagicMock(spec_set=["execute", "commit"])
+    return HybridRetriever(
+        embedding_provider=embed_provider,
+        qdrant_client=qdrant_client,
+        db=db,
+    ), embed_provider, qdrant_client, db
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_returns_results(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[
+        _make_fts_row("mem-1", -5.0),
+        _make_fts_row("mem-3", -3.0),
+    ])
+    mock_links.count_links = AsyncMock(return_value=2)
+
+    results = await retriever.recall("test query", limit=10)
+    assert len(results) > 0
+    assert all(hasattr(r, "memory_id") for r in results)
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_episodic_only(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="episodic", limit=5)
+
+    # Should only search episodic_memory collection
+    assert mock_qdrant.search.call_count == 1
+    call_kwargs = mock_qdrant.search.call_args
+    assert call_kwargs.kwargs["collection"] == "episodic_memory"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="knowledge", limit=5)
+
+    assert mock_qdrant.search.call_count == 1
+    assert mock_qdrant.search.call_args.kwargs["collection"] == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="both", limit=5)
+
+    # Should search both collections
+    assert mock_qdrant.search.call_count == 2
+    collections_searched = [
+        c.kwargs["collection"] for c in mock_qdrant.search.call_args_list
+    ]
+    assert "episodic_memory" in collections_searched
+    assert "knowledge_base" in collections_searched
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95, confidence=0.01),
+        _make_qdrant_hit("mem-2", 0.80, confidence=0.01),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    # Very high min_activation should filter out low-confidence results
+    results = await retriever.recall("test", min_activation=0.99, limit=10)
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_increments_retrieved_count(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", limit=5)
+
+    # update_payload should be called for returned results
+    mock_qdrant.update_payload.assert_called()
+    call_kwargs = mock_qdrant.update_payload.call_args.kwargs
+    assert call_kwargs["point_id"] == "mem-1"
+    assert call_kwargs["payload"]["retrieved_count"] == 6  # was 5, now 6
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_empty_results(mock_qdrant, mock_crud, mock_links):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+
+    results = await retriever.recall("test", limit=10)
+    assert results == []

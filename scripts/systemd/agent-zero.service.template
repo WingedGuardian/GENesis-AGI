@@ -1,0 +1,21 @@
+[Unit]
+Description=Agent Zero Web UI (Genesis)
+After=network.target qdrant.service
+StartLimitBurst=4
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+WorkingDirectory=__AZ_ROOT__
+ExecStart=__VENV__/bin/python run_ui.py
+EnvironmentFile=__REPO_DIR__/secrets.env
+Restart=on-failure
+RestartSec=10
+MemoryMax=80%
+LimitNOFILE=65536
+OOMScoreAdjust=-500
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

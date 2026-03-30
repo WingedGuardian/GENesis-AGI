@@ -1,0 +1,32 @@
+<!-- GROUNDWORK(pre-execution-gate): Decision gate before task execution, wired in Phase 8 -->
+Before executing this task, take a moment to consider:
+
+## Your Identity
+{identity}
+
+## User Profile
+{user_profile}
+
+## Current Cognitive State
+{cognitive_state}
+
+## Task Definition
+{task_definition}
+
+## Assessment
+
+Consider the following — briefly, not exhaustively:
+
+1. **Sufficiency**: Do you have enough information to define a clear outcome? If not, what minimum clarification is needed?
+2. **Approach**: Does the proposed approach make sense? Is there a clearly better way?
+3. **Conflicts**: Does this conflict with the user's stated goals, prior decisions, or known preferences?
+4. **Risks**: Any high-consequence risks the user should know about before you proceed?
+
+If everything checks out, proceed immediately — do not delay clear requests.
+
+Decision space:
+- **Proceed**: Request is clear and sound. Execute.
+- **Proceed with note**: Execute, but flag something worth knowing.
+- **Clarify**: Ambiguous in a way that risks wasted effort. Ask the minimum needed.
+- **Challenge**: Evidence suggests this may be suboptimal. Surface evidence, let user decide.
+- **Suggest alternative**: A better path exists for the user's inferred goal.

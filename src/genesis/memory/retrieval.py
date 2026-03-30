@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+
+import aiosqlite
+from qdrant_client import QdrantClient
+
+from genesis.db.crud import memory as memory_crud
+from genesis.db.crud import memory_links, observations
+from genesis.memory.activation import compute_activation
+from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
+from genesis.memory.types import RetrievalResult
+from genesis.observability.provider_activity import track_operation
+from genesis.qdrant import collections as qdrant_ops
+
+logger = logging.getLogger(__name__)
+
+_SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
+    "episodic": ["episodic_memory"],
+    "knowledge": ["knowledge_base"],
+    "both": ["episodic_memory", "knowledge_base"],
+}
+
+
+def _rrf_fuse(
+    ranked_lists: list[list[str]],
+    *,
+    k: int = 60,
+) -> dict[str, float]:
+    """Reciprocal Rank Fusion. Returns {memory_id: fused_score}."""
+    scores: dict[str, float] = {}
+    for ranked in ranked_lists:
+        for rank, mid in enumerate(ranked, 1):
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank)
+    return scores
+
+
+class HybridRetriever:
+    """Hybrid retrieval: Qdrant vectors + FTS5 text + activation scoring, fused via RRF."""
+
+    def __init__(
+        self,
+        *,
+        embedding_provider: EmbeddingProvider,
+        qdrant_client: QdrantClient,
+        db: aiosqlite.Connection,
+    ) -> None:
+        self._embeddings = embedding_provider
+        self._qdrant = qdrant_client
+        self._db = db
+
+    async def recall(
+        self,
+        query: str,
+        *,
+        source: str = "both",
+        limit: int = 10,
+        min_activation: float = 0.0,
+    ) -> list[RetrievalResult]:
+        """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF."""
+        if source not in _SOURCE_TO_COLLECTIONS:
+            msg = f"source must be one of {list(_SOURCE_TO_COLLECTIONS)}, got {source!r}"
+            raise ValueError(msg)
+
+        collections = _SOURCE_TO_COLLECTIONS[source]
+        candidate_limit = limit * 3
+
+        # 1. Embed query (with fallback to FTS5-only)
+        embedding_available = True
+        vector = None
+        try:
+            vector = await self._embeddings.embed(query)
+        except EmbeddingUnavailableError:
+            embedding_available = False
+            logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")
+
+        # 2. Qdrant vector search across collections (skip if no embedding)
+        qdrant_results: list[dict] = []
+        qdrant_by_id: dict[str, dict] = {}
+        if embedding_available and vector is not None:
+            for coll in collections:
+                with track_operation(self._embeddings.tracker, "qdrant.search"):
+                    hits = qdrant_ops.search(
+                        self._qdrant,
+                        collection=coll,
+                        query_vector=vector,
+                        limit=candidate_limit,
+                    )
+                for hit in hits:
+                    hit["_collection"] = coll
+                qdrant_results.extend(hits)
+
+            qdrant_results.sort(key=lambda h: h["score"], reverse=True)
+
+            for hit in qdrant_results:
+                mid = hit["id"]
+                if mid not in qdrant_by_id:
+                    qdrant_by_id[mid] = hit
+
+        # 3. FTS5 text search
+        fts_collection = collections[0] if len(collections) == 1 else None
+        fts_results = await memory_crud.search_ranked(
+            self._db,
+            query=query,
+            collection=fts_collection,
+            limit=candidate_limit,
+        )
+
+        fts_by_id: dict[str, dict] = {}
+        for row in fts_results:
+            mid = row["memory_id"]
+            if mid not in fts_by_id:
+                fts_by_id[mid] = row
+
+        # 4. Union of all candidate memory_ids
+        all_ids = set(qdrant_by_id) | set(fts_by_id)
+        if not all_ids:
+            return []
+
+        # 5. Compute activation scores
+        now_str = datetime.now(UTC).isoformat()
+        activation_by_id: dict[str, float] = {}
+        for mid in all_ids:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                payload = qdrant_hit.get("payload", {})
+                confidence = payload.get("confidence", 0.5)
+                created_at = payload.get("created_at", now_str)
+                retrieved_count = payload.get("retrieved_count", 0)
+            else:
+                confidence = 0.5
+                created_at = now_str
+                retrieved_count = 0
+
+            link_count = await memory_links.count_links(self._db, mid)
+            act = compute_activation(
+                confidence=confidence,
+                created_at=created_at,
+                retrieved_count=retrieved_count,
+                link_count=link_count,
+                source=payload.get("source", "") if qdrant_hit else "",
+                tags=payload.get("tags") or [] if qdrant_hit else [],
+                now=now_str,
+            )
+            activation_by_id[mid] = act.final_score
+
+        # 6. Build ranked lists for RRF (or FTS5-only if no embedding)
+        vector_ranked_dedup: list[str] = []
+        seen: set[str] = set()
+        if embedding_available:
+            vector_ranked = [h["id"] for h in qdrant_results if h["id"] in all_ids]
+            for mid in vector_ranked:
+                if mid not in seen:
+                    seen.add(mid)
+                    vector_ranked_dedup.append(mid)
+
+        # FTS5 rank is negative, lower = better; results already ordered by rank
+        fts_ranked = [r["memory_id"] for r in fts_results if r["memory_id"] in all_ids]
+
+        activation_ranked = sorted(all_ids, key=lambda m: activation_by_id[m], reverse=True)
+
+        # 7. Fusion: RRF if we have vector results, otherwise FTS5 + activation only
+        if embedding_available:
+            fused = _rrf_fuse([vector_ranked_dedup, fts_ranked, activation_ranked])
+        else:
+            fused = _rrf_fuse([fts_ranked, activation_ranked])
+
+        # 8. Filter by min_activation
+        candidates = [
+            mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation
+        ]
+
+        # 9. Sort by fused score descending
+        candidates.sort(key=lambda m: fused[m], reverse=True)
+
+        # 10. Take top limit
+        top = candidates[:limit]
+
+        # 11. Increment retrieved_count for returned results
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                coll = qdrant_hit.get("_collection", "episodic_memory")
+                old_count = qdrant_hit.get("payload", {}).get("retrieved_count", 0)
+                try:
+                    qdrant_ops.update_payload(
+                        self._qdrant,
+                        collection=coll,
+                        point_id=mid,
+                        payload={"retrieved_count": old_count + 1},
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to update retrieved_count for %s in %s",
+                        mid, coll, exc_info=True,
+                    )
+
+        # 11b. Sync observation retrieved_count in SQLite
+        #       Extract obs:<uuid> tags from Qdrant payloads to find linked observations
+        obs_ids: list[str] = []
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                tags = qdrant_hit.get("payload", {}).get("tags") or []
+                for tag in tags:
+                    if tag.startswith("obs:"):
+                        obs_ids.append(tag[4:])
+        if obs_ids:
+            try:
+                await observations.increment_retrieved_batch(self._db, obs_ids)
+            except Exception:
+                logger.warning(
+                    "Failed to sync observation retrieved_count for %d obs",
+                    len(obs_ids), exc_info=True,
+                )
+
+        # 12. Build RetrievalResult objects
+        results: list[RetrievalResult] = []
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            fts_hit = fts_by_id.get(mid)
+
+            # Determine content and metadata
+            if qdrant_hit:
+                payload = qdrant_hit.get("payload", {})
+                content = payload.get("content", "")
+                src = payload.get("source", "")
+                mem_type = payload.get("memory_type", "")
+            elif fts_hit:
+                content = fts_hit.get("content", "")
+                src = fts_hit.get("source_type", "")
+                mem_type = fts_hit.get("collection", "")
+                payload = fts_hit
+            else:
+                continue
+
+            # Determine ranks
+            if embedding_available:
+                v_rank = (
+                    vector_ranked_dedup.index(mid) + 1
+                    if mid in seen and mid in set(vector_ranked_dedup)
+                    else None
+                )
+            else:
+                v_rank = None
+            f_rank = (
+                fts_ranked.index(mid) + 1
+                if mid in set(fts_ranked)
+                else None
+            )
+
+            # Extract provenance from Qdrant payload if available
+            _p = payload if qdrant_hit else {}
+            _line_range = _p.get("source_line_range")
+            results.append(
+                RetrievalResult(
+                    memory_id=mid,
+                    content=content,
+                    source=src,
+                    memory_type=mem_type,
+                    score=fused[mid],
+                    vector_rank=v_rank,
+                    fts_rank=f_rank,
+                    activation_score=activation_by_id.get(mid, 0.0),
+                    payload=_p,
+                    source_session_id=_p.get("source_session_id"),
+                    transcript_path=_p.get("transcript_path"),
+                    source_line_range=tuple(_line_range) if _line_range else None,
+                    source_pipeline=_p.get("source_pipeline"),
+                ),
+            )
+
+        return results

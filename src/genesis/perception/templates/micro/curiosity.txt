@@ -1,0 +1,19 @@
+What is the most interesting thing in this data?
+
+## Identity
+{identity}
+
+## Current Signals
+{signals_text}
+
+## Task
+Look for patterns, connections, or implications that aren't obvious at first glance. Focus on what is NEW or CHANGING — not what is stable. If nothing novel stands out, respond with salience 0.0 and an empty tags list. What would be worth remembering about this moment that wasn't true an hour ago?
+
+Respond in JSON:
+{{
+  "tags": ["tag1", "tag2"],
+  "salience": 0.3,
+  "anomaly": false,
+  "summary": "One or two sentences about what's most interesting or notable.",
+  "signals_examined": {signals_examined}
+}}

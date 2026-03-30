@@ -1,0 +1,10 @@
+[Unit]
+Description=Genesis Watchdog Timer — check bridge health every 60s
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target

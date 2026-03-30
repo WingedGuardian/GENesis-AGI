@@ -1,0 +1,12 @@
+[Unit]
+Description=Genesis Guardian — check container health every 30s
+
+[Timer]
+# Wait 60s after boot before first check (container may still be starting)
+OnBootSec=60
+# Fire every 30s after the last activation
+OnUnitActiveSec=30
+AccuracySec=5
+
+[Install]
+WantedBy=timers.target

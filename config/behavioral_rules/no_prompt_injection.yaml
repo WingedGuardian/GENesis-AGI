@@ -1,0 +1,40 @@
+# Behavioral Rule: Detect prompt injection patterns
+#
+# Origin: 2026-03-29 — Adapted from GSD prompt-guard patterns during
+# competitive evaluation. Severity is warn (not block) for visibility
+# first — we want to catch these early without disrupting legitimate
+# security documentation or linter rule authoring.
+
+name: no-prompt-injection
+severity: warn
+description: >
+  Detect potential prompt injection patterns in plan files, configs,
+  and generated content. These patterns attempt to override system
+  prompts, hijack agent roles, or inject hidden instructions.
+suggestion: >
+  Review the flagged content for injection attempts. If the content
+  is legitimate (e.g., documenting injection patterns in a security
+  doc), add '# behavioral-lint: ignore no-prompt-injection' to suppress.
+
+patterns:
+  # System prompt override attempts
+  - regex: '(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|above|earlier|system)\s+(?:instructions?|prompts?|rules?|guidelines?)'
+    context: Attempt to override system instructions
+  - regex: '(?:new\s+)?system\s+prompt\s*[:=]'
+    context: Attempt to inject a new system prompt
+  - regex: 'you\s+are\s+now\s+(?:a|an|acting\s+as)'
+    context: Role hijacking — attempting to reassign agent identity
+
+  # Instruction ignoring patterns
+  - regex: '(?:do\s+not|don.?t|never)\s+follow\s+(?:the\s+)?(?:rules?|instructions?|guidelines?|constraints?)'
+    context: Instruction to ignore safety rules
+  - regex: '(?:ignore|bypass|skip|circumvent)\s+(?:all\s+)?(?:safety|security|behavioral|guardrail)'
+    context: Attempt to bypass safety mechanisms
+
+  # Hidden instruction patterns
+  - regex: '<!--.*(?:instruction|prompt|ignore|override|system).*-->'
+    context: Hidden instructions in HTML comments
+
+  # Chat template delimiter injection
+  - regex: '(?:\[SYSTEM\]|\[INST\]|<\|system\|>|<\|user\|>|<\|assistant\|>)'
+    context: Chat template delimiter injection attempt

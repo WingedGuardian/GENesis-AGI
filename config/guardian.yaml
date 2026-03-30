@@ -1,0 +1,53 @@
+# Genesis Guardian — Host VM Health Monitor Configuration
+# This file configures the Guardian systemd timer on the host VM.
+# Secrets (bot token, chat ID) are loaded from secrets.env, not here.
+#
+# NOTE: install_guardian.sh generates a local copy with auto-detected
+# container_ip. This template uses empty string for auto-detection.
+
+container_name: genesis
+container_ip: ""  # Auto-detected via `incus list` if empty
+health_api_port: 5000
+check_interval_s: 30
+state_dir: "~/.local/state/genesis-guardian"
+
+probes:
+  probe_timeout_s: 10
+  ping_count: 1
+  ping_timeout_s: 3
+  http_timeout_s: 10
+  journal_lines: 1
+
+suspicious:
+  memory_warning_pct: 85.0
+  tmp_warning_pct: 70.0
+  tick_max_gap_s: 600
+  tick_min_interval_s: 120
+  tick_history_count: 10
+  error_spike_window_min: 30
+  error_spike_threshold: 50
+
+confirmation:
+  recheck_delay_s: 30
+  max_recheck_attempts: 3
+  required_failed_signals: 2
+  bootstrap_grace_s: 300
+  pause_reminder_hours: 24
+
+approval:
+  port: 8888
+  token_expiry_s: 86400
+
+cc:
+  enabled: true
+  model: sonnet
+  timeout_s: 120
+  path: "~/.local/bin/claude"
+
+snapshots:
+  retention: 5
+  prefix: "guardian-"
+
+recovery:
+  verification_delay_s: 30
+  max_escalations: 3

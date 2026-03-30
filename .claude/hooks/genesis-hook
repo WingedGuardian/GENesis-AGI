@@ -1,0 +1,40 @@
+#!/bin/bash
+# Self-locating genesis hook launcher.
+# Resolves genesis root from this script's location — portable across machines.
+# Usage: genesis-hook <script_name.py> [args...]
+#
+# IMPORTANT: $CLAUDE_PROJECT_DIR is resolved by Claude Code in hook command
+# strings (settings.json), but is NOT exported as a shell environment variable.
+# Hook scripts that read os.environ["CLAUDE_PROJECT_DIR"] will get nothing.
+# This launcher works around that by self-locating from its filesystem position.
+# All hooks MUST go through this launcher — never read $CLAUDE_PROJECT_DIR directly.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Find the Python venv. In a worktree, .venv lives in the main repo, not here.
+PYTHON="$GENESIS_ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    # Worktree detection: resolve the main worktree via git
+    MAIN_ROOT="$(cd "$GENESIS_ROOT" && git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    if [[ -n "$MAIN_ROOT" && -x "$MAIN_ROOT/.venv/bin/python" ]]; then
+        PYTHON="$MAIN_ROOT/.venv/bin/python"
+    else
+        echo "ERROR: Genesis venv not found at $GENESIS_ROOT/.venv/bin/python" >&2
+        echo "Run: cd $GENESIS_ROOT && python -m venv .venv && pip install -e ." >&2
+        exit 1
+    fi
+fi
+
+SCRIPT_NAME="${1:?Usage: genesis-hook <script_name.py> [args...]}"
+SCRIPT_PATH="$GENESIS_ROOT/scripts/$SCRIPT_NAME"
+
+if [[ ! -f "$SCRIPT_PATH" ]]; then
+    echo "ERROR: Hook script not found: $SCRIPT_PATH" >&2
+    exit 1
+fi
+
+shift
+exec "$PYTHON" "$SCRIPT_PATH" "$@"

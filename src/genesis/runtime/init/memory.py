@@ -1,0 +1,136 @@
+"""Init function: _init_memory."""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.runtime._core import GenesisRuntime
+
+logger = logging.getLogger("genesis.runtime")
+
+
+async def init(rt: GenesisRuntime) -> None:
+    """Initialize MemoryStore, HybridRetriever, ContextInjector, and Memory MCP."""
+    try:
+        from qdrant_client import QdrantClient
+
+        from genesis.env import qdrant_url
+        from genesis.memory.embeddings import EmbeddingProvider
+        from genesis.memory.linker import MemoryLinker
+        from genesis.memory.store import MemoryStore
+
+        qdrant = QdrantClient(url=qdrant_url(), timeout=5)
+        from genesis.qdrant.collections import ensure_collections
+        ensure_collections(qdrant)
+        logger.info("Qdrant collections ensured")
+
+        # Split embedding chains: storage (Ollama first) vs recall (cloud first).
+        # Both share the same L2 diskcache — cache keys are text-based, not
+        # provider-dependent, so a write cached via Ollama is instantly
+        # available for a read via cloud.
+        storage_backends = EmbeddingProvider.build_chain(ollama_first=True)
+        recall_backends = EmbeddingProvider.build_chain(ollama_first=False)
+        logger.info(
+            "Embedding chains: storage=%s, recall=%s",
+            [b.name for b in storage_backends],
+            [b.name for b in recall_backends],
+        )
+        storage_embedder = EmbeddingProvider(
+            backends=storage_backends,
+            activity_tracker=rt._activity_tracker,
+            event_bus=rt._event_bus,
+        )
+        recall_embedder = EmbeddingProvider(
+            backends=recall_backends,
+            activity_tracker=rt._activity_tracker,
+            event_bus=rt._event_bus,
+        )
+
+        linker = MemoryLinker(qdrant_client=qdrant, db=rt._db)
+        rt._memory_store = MemoryStore(
+            embedding_provider=storage_embedder,
+            qdrant_client=qdrant,
+            db=rt._db,
+            linker=linker,
+        )
+        logger.info("Genesis MemoryStore created (storage embedder)")
+
+        from genesis.cc.context_injector import ContextInjector
+        from genesis.memory.retrieval import HybridRetriever
+
+        rt._hybrid_retriever = HybridRetriever(
+            embedding_provider=recall_embedder,
+            qdrant_client=qdrant,
+            db=rt._db,
+        )
+        rt._context_injector = ContextInjector(
+            retriever=rt._hybrid_retriever,
+        )
+        logger.info("Genesis HybridRetriever + ContextInjector created (recall embedder)")
+
+        from genesis.mcp.memory_mcp import init as init_memory_mcp
+
+        init_memory_mcp(
+            db=rt._db,
+            qdrant_client=qdrant,
+            storage_embedding_provider=storage_embedder,
+            recall_embedding_provider=recall_embedder,
+            activity_tracker=rt._activity_tracker,
+        )
+        logger.info("Memory MCP initialized (dual embedders)")
+
+        if rt._result_writer is not None:
+            rt._result_writer._memory_store = rt._memory_store
+            logger.info("MemoryStore injected into ResultWriter")
+
+        if rt._resilience_state_machine is not None:
+            from genesis.resilience.status_writer import StatusFileWriter
+
+            rt._status_writer = StatusFileWriter(
+                state_machine=rt._resilience_state_machine,
+                deferred_queue=rt._deferred_work_queue,
+                dead_letter=rt._dead_letter_queue,
+                pending_embeddings_db=rt._db,
+                runtime=rt,
+            )
+            if rt._awareness_loop is not None:
+                rt._awareness_loop.set_status_writer(rt._status_writer)
+            logger.info("StatusFileWriter created and injected into awareness loop")
+
+            from genesis.resilience.embedding_recovery import EmbeddingRecoveryWorker
+            from genesis.resilience.recovery import RecoveryOrchestrator
+
+            embedding_worker = EmbeddingRecoveryWorker(
+                db=rt._db,
+                embedding_provider=storage_embedder,
+                qdrant_client=qdrant,
+            )
+            rt._recovery_orchestrator = RecoveryOrchestrator(
+                db=rt._db,
+                state_machine=rt._resilience_state_machine,
+                deferred_queue=rt._deferred_work_queue,
+                embedding_worker=embedding_worker,
+                dead_letter=rt._dead_letter_queue,
+                event_bus=rt._event_bus,
+            )
+            if rt._router is not None:
+                rt._recovery_orchestrator.set_dispatch_fn(rt._router.route_call)
+            logger.info("RecoveryOrchestrator created")
+
+    except (ConnectionError, TimeoutError) as exc:
+        logger.error(
+            "MemoryStore creation failed (Qdrant down?) — "
+            "continuing without vector memory",
+            exc_info=True,
+        )
+        from genesis.runtime._core import record_init_degradation
+        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+    except Exception as exc:
+        logger.error(
+            "MemoryStore creation failed — continuing without vector memory",
+            exc_info=True,
+        )
+        from genesis.runtime._core import record_init_degradation
+        await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")

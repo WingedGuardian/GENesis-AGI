@@ -1,0 +1,26 @@
+# Recon gathering schedules — managed by recon_schedule MCP tool.
+schedules:
+  email_recon:
+    description: "Scan email for actionable items"
+    cron: "0 5 * * *"
+    enabled: true
+
+  web_monitoring:
+    description: "Check watched web sources for updates"
+    cron: "0 6 * * 5"
+    enabled: true
+
+  github_landscape:
+    description: "Scan GitHub for repo activity, releases, issues"
+    cron: "0 6 * * 6"
+    enabled: true
+
+  model_intelligence:
+    description: "Check for new model releases, benchmarks, announcements"
+    cron: "0 6 * * 0"
+    enabled: true
+
+  source_discovery:
+    description: "Discover new sources worth monitoring"
+    cron: "0 6 1 * *"
+    enabled: true

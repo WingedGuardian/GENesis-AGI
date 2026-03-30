@@ -1,0 +1,29 @@
+#!/bin/bash
+# Self-locating MCP server launcher.
+# Resolves genesis root from this script's location — portable across machines.
+# Usage: run-mcp-server --server <name>
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+MCP_SCRIPT="$GENESIS_ROOT/scripts/genesis_mcp_server.py"
+
+# Find the Python venv. In a worktree, .venv lives in the main repo, not here.
+PYTHON="$GENESIS_ROOT/.venv/bin/python"
+if [[ ! -x "$PYTHON" ]]; then
+    MAIN_ROOT="$(cd "$GENESIS_ROOT" && git worktree list --porcelain 2>/dev/null | head -1 | sed 's/^worktree //')"
+    if [[ -n "$MAIN_ROOT" && -x "$MAIN_ROOT/.venv/bin/python" ]]; then
+        PYTHON="$MAIN_ROOT/.venv/bin/python"
+    else
+        echo "ERROR: Genesis venv not found at $GENESIS_ROOT/.venv/bin/python" >&2
+        exit 1
+    fi
+fi
+
+if [[ ! -f "$MCP_SCRIPT" ]]; then
+    echo "ERROR: MCP server script not found: $MCP_SCRIPT" >&2
+    exit 1
+fi
+
+exec "$PYTHON" "$MCP_SCRIPT" "$@"

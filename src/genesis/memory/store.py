@@ -1,0 +1,217 @@
+from __future__ import annotations
+
+import logging
+import uuid
+from datetime import UTC, datetime
+
+import aiosqlite
+from qdrant_client import QdrantClient
+
+from genesis.db.crud import memory as memory_crud
+from genesis.db.crud import pending_embeddings
+from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
+from genesis.memory.linker import MemoryLinker
+from genesis.observability.call_site_recorder import record_last_run
+from genesis.observability.events import GenesisEventBus
+from genesis.observability.provider_activity import track_operation
+from genesis.observability.types import Severity, Subsystem
+from genesis.perception.confidence import load_config as load_confidence_config
+from genesis.perception.confidence import should_gate
+from genesis.qdrant.collections import upsert_point
+
+# Qdrant connection errors — broad catch for any transport/protocol failure
+try:
+    from qdrant_client.http.exceptions import (
+        ResponseHandlingException,
+        UnexpectedResponse,
+    )
+
+    _QDRANT_ERRORS: tuple[type[Exception], ...] = (
+        UnexpectedResponse,
+        ResponseHandlingException,
+        ConnectionError,
+        TimeoutError,
+        OSError,
+    )
+except ImportError:  # pragma: no cover — safety for minimal installs
+    _QDRANT_ERRORS = (ConnectionError, TimeoutError, OSError)
+
+logger = logging.getLogger(__name__)
+
+_COLLECTION_MAP = {
+    "episodic": "episodic_memory",
+    "knowledge": "episodic_memory",  # Internal knowledge lives with episodic
+}
+
+
+class MemoryStore:
+    """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link."""
+
+    def __init__(
+        self,
+        *,
+        embedding_provider: EmbeddingProvider,
+        qdrant_client: QdrantClient,
+        db: aiosqlite.Connection,
+        linker: MemoryLinker | None = None,
+        event_bus: GenesisEventBus | None = None,
+    ) -> None:
+        self._embeddings = embedding_provider
+        self._qdrant = qdrant_client
+        self._db = db
+        self._linker = linker
+        self._event_bus = event_bus
+
+    @property
+    def linker(self) -> MemoryLinker | None:
+        """Public access to the memory linker for extraction typed links."""
+        return self._linker
+
+    async def store(
+        self,
+        content: str,
+        source: str,
+        *,
+        memory_type: str = "episodic",
+        collection: str | None = None,
+        tags: list[str] | None = None,
+        confidence: float | None = None,
+        auto_link: bool = True,
+        source_session_id: str | None = None,
+        transcript_path: str | None = None,
+        source_line_range: tuple[int, int] | None = None,
+        extraction_timestamp: str | None = None,
+        source_pipeline: str | None = None,
+    ) -> str:
+        """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
+
+        Args:
+            collection: Explicit Qdrant collection override. If provided, bypasses
+                ``_COLLECTION_MAP`` lookup. Used by ``knowledge_ingest`` and pipeline
+                orchestrator to route domain data to ``knowledge_base`` while the
+                default map routes all internal knowledge to ``episodic_memory``.
+        """
+        # Dedup: skip if exact content already stored (any collection)
+        try:
+            existing = await memory_crud.find_exact_duplicate(
+                self._db, content=content,
+            )
+            if existing:
+                logger.debug("Skipping duplicate memory store: %s", existing)
+                return existing
+        except Exception:
+            # Dedup check is best-effort — never block a store on lookup failure
+            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+
+        # Confidence gate: low-confidence → FTS5 only, skip Qdrant
+        force_fts5_only = False
+        cfg = load_confidence_config()
+        gated, gate_msg = should_gate(confidence, cfg.memory_upsertion)
+        if gate_msg:
+            logger.info("Memory confidence gate: %s", gate_msg)
+        if gated:
+            force_fts5_only = True
+
+        memory_id = str(uuid.uuid4())
+        now_iso = datetime.now(UTC).isoformat()
+        resolved_tags = tags or []
+        resolved_collection = collection or _COLLECTION_MAP.get(memory_type, "episodic_memory")
+
+        embedding_ok = not force_fts5_only
+        if embedding_ok:
+            try:
+                enriched = EmbeddingProvider.enrich(content, memory_type, resolved_tags)
+                vector = await self._embeddings.embed(enriched)
+
+                await record_last_run(
+                    self._db, "21_embeddings",
+                    provider="embedding", model_id="qwen3-embedding",
+                    response_text=f"Embedded {len(enriched)} chars → {len(vector)}d vector",
+                )
+
+                with track_operation(self._embeddings.tracker, "qdrant.upsert"):
+                    payload = {
+                        "content": content,
+                        "source": source,
+                        "memory_type": memory_type,
+                        "tags": resolved_tags,
+                        "confidence": confidence if confidence is not None else 0.5,
+                        "created_at": now_iso,
+                        "retrieved_count": 0,
+                        "source_type": "memory",
+                        "scope": "external" if resolved_collection == "knowledge_base" else "user",
+                    }
+                    # Provenance fields — trace memory back to source conversation
+                    if source_session_id:
+                        payload["source_session_id"] = source_session_id
+                    if transcript_path:
+                        payload["transcript_path"] = transcript_path
+                    if source_line_range:
+                        payload["source_line_range"] = list(source_line_range)
+                    if extraction_timestamp:
+                        payload["extraction_timestamp"] = extraction_timestamp
+                    if source_pipeline:
+                        payload["source_pipeline"] = source_pipeline
+
+                    upsert_point(
+                        self._qdrant,
+                        collection=resolved_collection,
+                        point_id=memory_id,
+                        vector=vector,
+                        payload=payload,
+                    )
+            except EmbeddingUnavailableError:
+                embedding_ok = False
+                logger.warning(
+                    "Embedding unavailable for memory %s, falling back to FTS5-only storage",
+                    memory_id,
+                )
+            except _QDRANT_ERRORS:
+                embedding_ok = False
+                logger.error(
+                    "Qdrant connection error storing memory %s — falling back to FTS5-only",
+                    memory_id,
+                    exc_info=True,
+                )
+            except Exception:
+                embedding_ok = False
+                logger.error(
+                    "Unexpected error during vector storage for memory %s — falling back to FTS5-only",
+                    memory_id,
+                    exc_info=True,
+                )
+
+        # Always write to FTS5 — include tags for keyword searchability
+        await memory_crud.upsert(
+            self._db,
+            memory_id=memory_id,
+            content=content,
+            source_type="memory",
+            tags=" ".join(resolved_tags) if resolved_tags else "",
+            collection=resolved_collection,
+        )
+
+        if not embedding_ok:
+            # Queue for later embedding
+            await pending_embeddings.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                memory_id=memory_id,
+                content=content,
+                memory_type=memory_type,
+                collection=resolved_collection,
+                created_at=now_iso,
+                tags=",".join(resolved_tags) if resolved_tags else None,
+            )
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.MEMORY,
+                    Severity.WARNING,
+                    "memory.embedding_skipped",
+                    f"Embedding unavailable, memory {memory_id} stored FTS5-only",
+                    memory_id=memory_id,
+                )
+        elif auto_link and self._linker:
+            await self._linker.auto_link(memory_id, vector, collection=resolved_collection)
+
+        return memory_id

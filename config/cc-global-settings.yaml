@@ -1,0 +1,27 @@
+# Genesis Claude Code Global Settings Manifest
+#
+# Documents the intended ~/.claude/settings.json configuration.
+# Applied via: python scripts/setup_claude_config.py --global
+#
+# For non-Genesis use (public repo): sonnet is a viable, lower-cost starter model.
+
+model: "opus[1m]"
+effortLevel: "medium"
+voiceEnabled: true
+autoDreamEnabled: true
+skipDangerousModePermissionPrompt: true
+
+# Plugin tiers — Genesis strongly recommends Tier 1, Tier 2+ are helpful.
+plugins:
+  strongly_recommended:
+    - superpowers        # Skills, brainstorming, plans, TDD — the workflow layer
+    - hookify            # Behavioral rule enforcement
+    - commit-commands    # Git workflow automation
+  also_helpful:
+    - code-review        # Mandatory review pipeline
+    - feature-dev        # Guided feature development
+    - firecrawl          # Web operations, research
+    - claude-md-management  # CLAUDE.md maintenance
+    - security-guidance  # Security guardrails
+    - claude-code-setup  # Deployment configuration
+    - pyright-lsp        # Python type checking

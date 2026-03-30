@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "genesis-health": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
+      "args": ["--server", "health"]
+    },
+    "genesis-memory": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
+      "args": ["--server", "memory"]
+    },
+    "genesis-outreach": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
+      "args": ["--server", "outreach"]
+    },
+    "genesis-recon": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
+      "args": ["--server", "recon"]
+    }
+  }
+}

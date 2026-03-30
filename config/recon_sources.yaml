@@ -1,0 +1,3 @@
+# Dynamic recon sources — managed by recon_sources MCP tool.
+# Watchlist entries (config/recon_watchlist.yaml) are separate and always included.
+sources: []

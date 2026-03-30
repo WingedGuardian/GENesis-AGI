@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <!-- Genesis logo: neural G mark -->
+  <rect width="48" height="48" rx="8" fill="#1a1a2e"/>
+  <path d="M 32 12 A 16 16 0 1 0 32 36" stroke="#27875e" stroke-width="2.5" stroke-linecap="round" fill="none"/>
+  <line x1="24" y1="24" x2="32" y2="24" stroke="#27875e" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="32" y1="24" x2="32" y2="36" stroke="#27875e" stroke-width="2.5" stroke-linecap="round"/>
+  <circle cx="24" cy="24" r="2.5" fill="#27875e"/>
+  <circle cx="32" cy="12" r="2" fill="#27875e"/>
+  <circle cx="32" cy="36" r="2" fill="#27875e"/>
+</svg>

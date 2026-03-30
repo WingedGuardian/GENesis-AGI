@@ -1,0 +1,36 @@
+# Behavioral Rule: Never hide broken/incomplete data
+#
+# Origin: 2026-03-15 — proposed hiding "unknown" resilience state instead
+# of wiring the actual state machine. User correctly identified this as
+# a trust-destroying anti-pattern.
+
+name: no-hide-problems
+severity: block
+description: >
+  Never hide, suppress, or work around broken things — fix them.
+  This applies to code, UI, plans, and reasoning. When something
+  is broken or showing placeholder/unknown data, fix the root cause.
+  If the data source genuinely doesn't exist yet, display
+  "not configured" with a clear explanation.
+suggestion: >
+  Fix the root cause. Wire the actual data source (it usually already
+  exists). Show "not configured" if genuinely missing. Never hide,
+  skip, suppress, or omit broken data. Never propose deferring the
+  fix while hiding the symptom.
+
+patterns:
+  # Code-level patterns
+  - regex: 'display:\s*none[^;]*(?:unknown|error|broken|stale|failed)'
+    context: Hiding element based on error/unknown state
+  - regex: 'x-show="[^"]*!\s*\S*(?:error|unknown|failed)'
+    context: Alpine conditional hiding error/unknown states
+
+  # Reasoning-level patterns (plans, comments, proposals)
+  - regex: '(?:hide|skip|remove|suppress|omit).{0,40}(?:unknown|error|broken|stale|failed|placeholder|not.configured|not.available)'
+    context: Proposing to hide/skip broken or unknown data
+  - regex: '(?:unknown|error|broken|stale|failed|placeholder).{0,40}(?:hide|skip|remove|suppress|omit|display:\s*none|don.?t show|do not show|not show)'
+    context: Proposing to suppress display of broken state
+  - regex: '(?:don.?t|do not|never|avoid)\s+(?:show|display|render|expose).{0,40}(?:error|unknown|broken|stale|failed)'
+    context: Proposing to not show error/broken state
+  - regex: '(?:only show|skip showing).{0,40}(?:when|if|unless).{0,40}(?:available|configured|exists|ready|healthy)'
+    context: Conditional display that omits broken states instead of showing them honestly

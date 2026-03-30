@@ -1,0 +1,4 @@
+title: Genesis
+description: Genesis autonomous agent system — core extensions, prompts, and tools
+version: "0.1.0"
+always_enabled: true

@@ -1,0 +1,11 @@
+[Unit]
+Description=Genesis Watchdog — single health check invocation
+After=genesis-bridge.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV__/bin/python -m genesis.autonomy.watchdog_runner
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal

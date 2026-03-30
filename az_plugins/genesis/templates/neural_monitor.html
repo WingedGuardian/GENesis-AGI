@@ -1,0 +1,1487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Genesis Neural Monitor</title>
+<link rel="stylesheet" href="/index.css">
+<style>
+:root { --color-text-secondary: var(--color-text-muted, #d4d4d4e4); }
+html, body { overflow: auto !important; position: static !important; height: auto !important; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    background: var(--color-background, #0f172a);
+    color: var(--color-text, #e2e8f0);
+    font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+    font-size: 13px;
+}
+.header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 16px 24px; border-bottom: 1px solid var(--color-border, #1e293b);
+}
+.header h1 { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: var(--color-text-secondary); }
+.header .meta { color: var(--color-text-secondary); font-size: 12px; }
+.container { display: flex; min-height: calc(100vh - 92px); }
+.main-panel { flex: 1; padding: 24px; overflow-y: auto; }
+.side-panel {
+    width: 300px; min-width: 300px; border-left: 1px solid var(--color-border, #1e293b);
+    padding: 16px; overflow-y: auto;
+}
+
+/* Neural Map — radial layout using polar coordinates */
+.neural-map {
+    position: relative; width: 100%;
+    margin: 0 auto;
+    min-height: 600px;
+}
+
+.dot {
+    border-radius: 50%; cursor: pointer;
+    position: absolute;
+    transition: background-color 0.3s, transform 0.15s, box-shadow 0.3s;
+    display: flex; align-items: center; justify-content: center;
+}
+.dot:hover { transform: scale(1.5) translate(-33%, -33%); z-index: 10; }
+.dot-center { width: 32px; height: 32px; }
+.dot-inner { width: 20px; height: 20px; }
+.dot-outer { width: 14px; height: 14px; }
+.dot-periphery { width: 10px; height: 10px; }
+
+.dot-healthy { background: #4ade80; }
+.dot-active { background: #4ade80; }
+.dot-degraded { background: #facc15; }
+.dot-down { background: #ef4444; }
+.dot-idle { background: #888; }
+.dot-unknown { background: #6b7280; }
+
+/* Category border colors */
+.dot-cat-reflection { box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.6); }
+.dot-cat-reasoning { box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.6); }
+.dot-cat-processing { box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.5); }
+.dot-cat-calibration { box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.5); }
+.dot-cat-content { box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.4); }
+.dot-cat-embedding { box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.6); }
+.dot-cat-classification { box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.5); }
+.dot-cat-assessment { box-shadow: 0 0 0 2px rgba(244, 114, 182, 0.5); }
+.dot-cat-core { box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.5); }
+
+/* Tooltip */
+.tooltip {
+    display: none; position: absolute; bottom: calc(100% + 10px); left: 50%;
+    transform: translateX(-50%); background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
+    border-radius: 6px; padding: 10px 14px; white-space: nowrap; z-index: 100;
+    font-size: 11px; pointer-events: none; min-width: 180px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.dot:hover .tooltip { display: block; }
+.tooltip .tt-name { color: var(--color-text, #f8fafc); font-weight: 600; margin-bottom: 4px; }
+.tooltip .tt-desc { color: #94a3b8; font-size: 10px; margin-bottom: 6px; white-space: normal; max-width: 220px; }
+.tooltip .tt-row { color: var(--color-text-secondary); }
+.tooltip .tt-cat { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-bottom: 4px; background: rgba(255,255,255,0.08); }
+
+/* Dot labels — all rings get labels */
+.dot-label {
+    position: absolute; top: calc(100% + 2px); left: 50%;
+    transform: translateX(-50%); font-size: 8px; color: var(--color-text-secondary);
+    white-space: nowrap; pointer-events: none; text-align: center;
+    max-width: 60px; overflow: hidden; text-overflow: ellipsis;
+}
+.dot-center .dot-label { font-size: 10px; max-width: 80px; }
+.dot-inner .dot-label { font-size: 8px; max-width: 65px; }
+.dot-outer .dot-label { font-size: 7px; max-width: 55px; }
+.dot-periphery .dot-label { font-size: 6px; max-width: 50px; }
+
+/* Surplus box */
+.surplus-box {
+    background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155); border-radius: 8px;
+    padding: 12px 16px; margin-top: 24px; max-width: 600px; margin-left: auto; margin-right: auto;
+}
+.surplus-box h3 { font-size: 12px; color: var(--color-text-secondary); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
+.surplus-row { display: flex; justify-content: space-between; color: var(--color-text, #cbd5e1); margin: 4px 0; }
+
+/* Legend */
+.legend {
+    display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
+    margin-top: 16px; padding: 8px; font-size: 10px; color: var(--color-text-secondary);
+}
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block;
+}
+
+/* Side panel sections */
+.section { margin-bottom: 20px; }
+.section h3 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--color-text-secondary); margin-bottom: 8px; padding-bottom: 4px; border-bottom: 1px solid var(--color-border, #1e293b);
+}
+.section-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; }
+.section-row .label { color: var(--color-text-secondary); }
+.section-row .value { font-weight: 600; }
+
+.status-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    margin-right: 6px; vertical-align: middle;
+}
+.status-healthy { background: #4ade80; }
+.status-active { background: #4ade80; }
+.status-degraded { background: #facc15; }
+.status-down { background: #ef4444; }
+.status-idle { background: #888; }
+.status-unknown { background: #6b7280; }
+
+.badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 600;
+}
+.badge-normal { background: #166534; color: #4ade80; }
+.badge-warning { background: #854d0e; color: #facc15; }
+.badge-critical { background: #991b1b; color: #ef4444; }
+
+/* Category health summary */
+.cat-health { font-size: 11px; color: var(--color-text-secondary); padding: 2px 0; }
+.cat-health .cat-name { text-transform: capitalize; }
+.cat-health .cat-count { float: right; font-weight: 600; }
+
+/* Detail panel (replaces side panel on click) */
+.detail-panel { display: none; }
+.detail-panel.active { display: block; }
+.detail-back {
+    cursor: pointer; color: #60a5fa; font-size: 12px; margin-bottom: 12px;
+    display: inline-block;
+}
+.detail-back:hover { text-decoration: underline; }
+.detail-section { margin-top: 16px; }
+.detail-section h4 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: #94a3b8; margin-bottom: 8px;
+}
+.chain-item {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 0; border-bottom: 1px solid var(--color-border, #1e293b);
+}
+.chain-item:last-child { border-bottom: none; }
+
+.detail-meta { font-size: 11px; color: var(--color-text-secondary); margin: 4px 0; }
+.detail-meta strong { color: var(--color-text, #e2e8f0); }
+.detail-desc { color: #94a3b8; font-size: 12px; margin: 8px 0 12px; line-height: 1.4; }
+.detail-cat-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+    margin-bottom: 8px;
+}
+
+/* Routing config editor */
+.config-editor {
+    margin-top: 16px; padding: 12px; border: 1px solid var(--color-border, #334155);
+    border-radius: 6px; background: rgba(15, 23, 42, 0.5);
+}
+.config-editor .chain-editor-list {
+    list-style: none; padding: 0; margin: 8px 0;
+}
+.config-editor .chain-editor-item {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    background: rgba(30, 41, 59, 0.8); border-radius: 4px; margin-bottom: 4px;
+    font-size: 12px;
+}
+.config-editor .chain-editor-item .provider-name { flex: 1; }
+.config-editor .chain-editor-item .cb-dot {
+    width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0;
+}
+.config-editor .chain-editor-item .move-btn,
+.config-editor .chain-editor-item .remove-btn {
+    background: none; border: none; cursor: pointer; font-size: 12px; padding: 2px 4px;
+    color: #64748b; border-radius: 3px;
+}
+.config-editor .chain-editor-item .move-btn:hover { color: #e2e8f0; background: rgba(100,116,139,0.3); }
+.config-editor .chain-editor-item .remove-btn:hover { color: #ef4444; background: rgba(239,68,68,0.15); }
+.config-editor .editor-actions {
+    display: flex; gap: 8px; margin-top: 8px; align-items: center;
+}
+.config-editor .editor-actions select {
+    flex: 1; background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+    border-radius: 4px; padding: 4px 8px; font-size: 11px;
+}
+.config-editor .editor-actions button {
+    padding: 4px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; border: none;
+}
+.config-editor .btn-add { background: #334155; color: #e2e8f0; }
+.config-editor .btn-add:hover { background: #475569; }
+.config-editor .btn-save { background: #22c55e; color: #0f172a; font-weight: 600; }
+.config-editor .btn-save:hover { background: #16a34a; }
+.config-editor .btn-save:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
+.config-editor .btn-revert { background: #334155; color: #94a3b8; }
+.config-editor .btn-revert:hover { background: #475569; }
+.config-editor .editor-toggles {
+    display: flex; gap: 12px; margin-top: 8px; font-size: 11px; color: #94a3b8;
+}
+.config-editor .editor-toggles label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.config-editor .editor-feedback {
+    font-size: 11px; margin-top: 6px; padding: 4px 8px; border-radius: 4px;
+}
+.config-editor .feedback-ok { background: rgba(34,197,94,0.15); color: #4ade80; }
+.config-editor .feedback-err { background: rgba(239,68,68,0.15); color: #f87171; }
+
+/* Discarded items */
+.discarded-toggle {
+    cursor: pointer; color: #ef4444; font-size: 11px; font-weight: 600;
+    padding: 4px 0; display: flex; justify-content: space-between; align-items: center;
+    margin-top: 8px; border-top: 1px solid rgba(239, 68, 68, 0.2); padding-top: 8px;
+}
+.discarded-toggle:hover { text-decoration: underline; }
+.discarded-toggle .arrow { font-size: 8px; transition: transform 0.2s; }
+.discarded-toggle .arrow.open { transform: rotate(90deg); }
+.discarded-details { display: none; margin-top: 4px; }
+.discarded-details.open { display: block; }
+.discarded-item {
+    background: rgba(239, 68, 68, 0.06); border: 1px solid rgba(239, 68, 68, 0.15);
+    border-radius: 4px; padding: 8px; margin: 4px 0; font-size: 11px;
+}
+.discarded-item .di-header { font-weight: 600; color: var(--color-text, #e2e8f0); margin-bottom: 4px; }
+.discarded-item .di-row { color: var(--color-text-secondary); font-size: 10px; margin: 2px 0; }
+.discarded-item .di-error { color: #ef4444; font-size: 10px; margin: 4px 0; }
+.discarded-item .di-actions { text-align: right; margin-top: 6px; }
+.clear-btn {
+    background: rgba(239, 68, 68, 0.12); color: #ef4444; border: 1px solid rgba(239, 68, 68, 0.25);
+    border-radius: 3px; padding: 2px 10px; font-size: 10px; cursor: pointer;
+    font-family: inherit;
+}
+.clear-btn:hover { background: rgba(239, 68, 68, 0.25); }
+.clear-all-btn { margin-top: 8px; width: 100%; padding: 4px 10px; }
+
+/* Loading */
+.loading { text-align: center; color: var(--color-text-secondary); padding: 40px; }
+
+/* Nav bar */
+.genesis-nav {
+    display: flex; gap: 1.5rem; padding: 0.5rem 24px;
+    border-bottom: 1px solid var(--color-border, #1e293b);
+}
+.genesis-nav a {
+    color: var(--color-text-secondary); text-decoration: none; font-size: 0.85rem;
+    padding: 0.3rem 0;
+}
+.genesis-nav a:hover { color: var(--color-text); }
+.genesis-nav a.active { color: var(--color-accent, #27875e); border-bottom: 2px solid var(--color-accent, #27875e); }
+</style>
+</head>
+<body>
+
+<nav class="genesis-nav">
+    <a href="/genesis">Dashboard</a>
+    <a href="/genesis/logs">Event Log</a>
+    <a href="/genesis/errors">Error Log</a>
+    <a href="/genesis/monitor" class="active">Neural Monitor</a>
+</nav>
+
+<div class="header">
+    <h1>GENESIS NEURAL MONITOR</h1>
+    <div class="meta">Last update: <span id="last-update">--</span></div>
+</div>
+
+<div class="container">
+    <div class="main-panel">
+        <div id="loading" class="loading">Connecting...</div>
+        <div id="neural-map" class="neural-map" style="display:none;"></div>
+        <div id="legend" class="legend" style="display:none;"></div>
+        <div id="surplus-box" class="surplus-box" style="display:none;">
+            <h3>Surplus Compute</h3>
+            <div id="surplus-content"></div>
+        </div>
+    </div>
+    <div class="side-panel">
+        <div id="side-default">
+            <div class="section">
+                <h3>Awareness Loop</h3>
+                <div id="awareness-content"></div>
+            </div>
+            <div class="section">
+                <h3>Services</h3>
+                <div id="services-content"></div>
+            </div>
+            <div class="section">
+                <h3>Infrastructure</h3>
+                <div id="infra-content"></div>
+            </div>
+            <div class="section">
+                <h3>Resilience</h3>
+                <div id="resilience-content"></div>
+            </div>
+            <div class="section">
+                <h3>CC Sessions</h3>
+                <div id="cc-content"></div>
+            </div>
+            <div class="section">
+                <h3>Queues</h3>
+                <div id="queue-content"></div>
+            </div>
+            <div class="section">
+                <h3>Cost</h3>
+                <div id="cost-content"></div>
+            </div>
+        </div>
+        <div id="side-detail" class="detail-panel">
+            <span class="detail-back" id="detail-back-btn">&larr; Back</span>
+            <div id="detail-content"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+// NOTE: All data rendered in this dashboard originates from Genesis's internal
+// health API (local-only Flask server). No user-supplied or external content
+// is rendered. All dynamic content uses textContent for plain text values
+// and controlled DOM construction for structured elements.
+
+// ── Call site metadata ─────────────────────────────────────────────────
+// Sourced from docs/architecture/genesis-v3-model-routing-registry.md.
+// The API also serves this metadata; JS copy provides instant render.
+
+const SITE_META = {
+    'cc_foreground': {
+        name: 'CC Foreground', desc: 'Primary user conversation via Claude Code',
+        category: 'core', frequency: 'Continuous', costPolicy: 'Subscription',
+    },
+    'cc_background': {
+        name: 'CC Background', desc: 'Autonomous background sessions (reflection, tasks)',
+        category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
+    },
+    'embedding': {
+        name: 'Embedding', desc: 'Vector embeddings via Ollama (qwen3-embedding)',
+        category: 'core', frequency: 'On store', costPolicy: 'Local',
+    },
+    '2_triage': {
+        name: 'Triage', desc: 'Classify signals \u2192 ignore/log/micro/light/deep/critical',
+        category: 'classification', frequency: 'Every 5 min', costPolicy: 'Free primary',
+    },
+    '3_micro_reflection': {
+        name: 'Micro Reflect', desc: 'Quick pattern check on recent signals',
+        category: 'reflection', frequency: 'Every 5 min', costPolicy: 'Free primary',
+    },
+    '4_light_reflection': {
+        name: 'Light Reflect', desc: 'Quick assessment of flagged signals',
+        category: 'reflection', frequency: 'On elevated urgency', costPolicy: 'Paid primary',
+    },
+    '5_deep_reflection': {
+        name: 'Deep Reflect', desc: 'Journal-quality analysis of patterns and trends',
+        category: 'reflection', frequency: 'Weekly + high urgency', costPolicy: 'CC background (Sonnet)',
+    },
+    '6_strategic_reflection': {
+        name: 'Strategic', desc: 'Quarterly-depth strategic analysis',
+        category: 'reflection', frequency: '4\u20138/month', costPolicy: 'CC background (Opus)',
+    },
+    '7_task_retrospective': {
+        name: 'Task Retro', desc: 'Root-cause classification of completed tasks',
+        category: 'processing', frequency: 'Per task', costPolicy: 'Paid (outsized impact)',
+    },
+    '8_memory_consolidation': {
+        name: 'Memory', desc: 'Deduplicate, compress, merge related memories',
+        category: 'processing', frequency: 'Daily', costPolicy: 'Free primary',
+    },
+    '9_fact_extraction': {
+        name: 'Fact Extract', desc: 'Pull structured facts from unstructured input',
+        category: 'processing', frequency: 'Per ingestion', costPolicy: 'Free primary',
+    },
+    '10_cognitive_state': {
+        name: 'Cog State', desc: 'Regenerate compressed cognitive state summary',
+        category: 'reasoning', frequency: 'Daily', costPolicy: 'Paid primary',
+    },
+    '11_user_model_synthesis': {
+        name: 'User Model', desc: 'Update user preference/behavior model',
+        category: 'reasoning', frequency: 'Weekly', costPolicy: 'CC background (Sonnet)',
+    },
+    '12_surplus_brainstorm': {
+        name: 'Surplus', desc: 'Creative exploration using idle compute',
+        category: 'content', frequency: 'Opportunistic', costPolicy: 'Free only (never pays)',
+    },
+    '13_morning_report': {
+        name: 'Morning Rpt', desc: 'Compile overnight observations into morning report',
+        category: 'content', frequency: 'Daily', costPolicy: 'Free primary',
+    },
+    '14_weekly_self_assessment': {
+        name: 'Weekly Self', desc: 'Honest evaluation of own performance',
+        category: 'reasoning', frequency: 'Weekly', costPolicy: 'CC background (Opus)',
+    },
+    '15_triage_calibration': {
+        name: 'Triage Cal', desc: 'Calibrate triage accuracy (shapes most frequent call)',
+        category: 'calibration', frequency: 'Weekly', costPolicy: 'Paid (outsized impact)',
+    },
+    '16_quality_calibration': {
+        name: 'Quality Cal', desc: 'Audit recent outputs for quality regression',
+        category: 'calibration', frequency: 'Weekly', costPolicy: 'CC background (Opus)',
+    },
+    '17_fresh_eyes_review': {
+        name: 'Fresh Eyes', desc: 'Cross-vendor review of reasoning',
+        category: 'assessment', frequency: 'Per major decision', costPolicy: 'Paid (cross-vendor)',
+    },
+    '18_meta_prompting': {
+        name: 'Meta Prompt', desc: 'Determine what expensive models should think about',
+        category: 'calibration', frequency: 'Per reflection', costPolicy: 'Paid (outsized impact)',
+    },
+    '19_outreach_draft': {
+        name: 'Outreach', desc: 'Draft surplus insight / blocker / alert messages',
+        category: 'content', frequency: 'Per outreach', costPolicy: 'Free primary',
+    },
+    '20_adversarial_counterargument': {
+        name: 'Adversarial', desc: "Devil's advocate review (different vendor)",
+        category: 'assessment', frequency: 'Per major decision', costPolicy: 'Paid (cross-vendor)',
+    },
+    '21_embeddings': {
+        name: 'Embeddings', desc: 'Generate 1024-dim vectors for Qdrant memory',
+        category: 'embedding', frequency: 'On write', costPolicy: 'Free (Ollama)',
+    },
+    '22_tagging': {
+        name: 'Tagging', desc: 'Entity extraction and metadata tagging',
+        category: 'classification', frequency: 'Per input', costPolicy: 'Free primary',
+    },
+    '23_fresh_eyes_review': {
+        name: 'Fresh Eyes 2', desc: 'Additional cross-vendor review of code decisions',
+        category: 'assessment', frequency: 'Per decision', costPolicy: 'Free primary',
+    },
+    '27_pre_execution_assessment': {
+        name: 'Pre-Exec', desc: 'Sanity check before task execution',
+        category: 'reasoning', frequency: 'Per task', costPolicy: 'CC foreground',
+    },
+    '28_observation_sweep': {
+        name: 'Obs Sweep', desc: 'Scan environment for noteworthy changes',
+        category: 'processing', frequency: 'Per awareness tick', costPolicy: 'Paid primary',
+    },
+    '29_retrospective_triage': {
+        name: 'Retro Triage', desc: 'Re-evaluate triage decisions after outcome known',
+        category: 'classification', frequency: 'Per outcome', costPolicy: 'Free primary',
+    },
+    '30_triage_calibration': {
+        name: 'Triage Cal 2', desc: 'Secondary triage calibration with local models',
+        category: 'calibration', frequency: 'Weekly', costPolicy: 'Paid primary',
+    },
+    '31_outcome_classification': {
+        name: 'Outcome', desc: 'Classify task outcomes for learning pipeline',
+        category: 'processing', frequency: 'Per outcome', costPolicy: 'Paid primary',
+    },
+    '32_delta_assessment': {
+        name: 'Delta', desc: 'Assess changes between cognitive state snapshots',
+        category: 'processing', frequency: 'Daily', costPolicy: 'Paid primary',
+    },
+    '33_skill_refiner': {
+        name: 'Skill Refine', desc: 'LLM-driven skill improvement proposals',
+        category: 'content', frequency: 'Periodic', costPolicy: 'Free primary',
+    },
+    '34_research_synthesis': {
+        name: 'Research', desc: 'Synthesize multi-source search results',
+        category: 'content', frequency: 'On demand', costPolicy: 'Free primary',
+    },
+    '35_content_draft': {
+        name: 'Content', desc: 'Draft content for various platforms',
+        category: 'content', frequency: 'On demand', costPolicy: 'Free primary',
+    },
+};
+
+// ── Ring assignment — grouped by function ───────────────────────────────
+const RING_ASSIGNMENT = {
+    center: ['cc_foreground', 'cc_background'],
+    inner: [
+        '3_micro_reflection', '4_light_reflection', '5_deep_reflection',
+        '6_strategic_reflection', '10_cognitive_state', '11_user_model_synthesis',
+        '14_weekly_self_assessment', '16_quality_calibration', '27_pre_execution_assessment',
+    ],
+    outer: [
+        '2_triage', '7_task_retrospective', '8_memory_consolidation',
+        '9_fact_extraction', '15_triage_calibration', '18_meta_prompting',
+        '28_observation_sweep', '30_triage_calibration', '31_outcome_classification',
+        '32_delta_assessment',
+    ],
+    periphery: [
+        '12_surplus_brainstorm', '13_morning_report', '17_fresh_eyes_review',
+        '19_outreach_draft', '20_adversarial_counterargument', '21_embeddings',
+        '22_tagging', '23_fresh_eyes_review', '29_retrospective_triage',
+        '33_skill_refiner', '34_research_synthesis', '35_content_draft',
+    ],
+};
+
+// Ring labels for legend
+const RING_LABELS = {
+    center: 'Core', inner: 'Reflection & Reasoning',
+    outer: 'Processing & Calibration', periphery: 'Content & Utility',
+};
+
+// Category colors for legend
+const CAT_COLORS = {
+    core: '#60a5fa', reflection: '#818cf8', reasoning: '#a78bfa',
+    processing: '#fb923c', calibration: '#fbbf24', content: '#34d399',
+    embedding: '#22d3ee', classification: '#94a3b8', assessment: '#f472b6',
+};
+
+const DOT_SIZES = { center: 'dot-center', inner: 'dot-inner', outer: 'dot-outer', periphery: 'dot-periphery' };
+
+let lastData = null;
+let lastFetchTime = 0;
+
+document.getElementById('detail-back-btn').addEventListener('click', showDefaultPanel);
+
+function getMeta(siteId) {
+    return SITE_META[siteId] || { name: siteId, desc: '', category: 'unknown', frequency: '', costPolicy: '' };
+}
+
+function getRing(siteId) {
+    for (const [ring, ids] of Object.entries(RING_ASSIGNMENT)) {
+        if (ids.includes(siteId)) return ring;
+    }
+    return 'periphery';
+}
+
+function statusClass(status) {
+    if (status === 'healthy') return 'dot-healthy';
+    if (status === 'active') return 'dot-active';
+    if (status === 'degraded') return 'dot-degraded';
+    if (status === 'down') return 'dot-down';
+    if (status === 'idle') return 'dot-idle';
+    return 'dot-unknown';
+}
+
+function catClass(category) {
+    return 'dot-cat-' + (category || 'unknown');
+}
+
+function infraStatusClass(probe) {
+    const status = typeof probe === 'string' ? probe : probe?.status;
+    if (status === 'healthy' || status === 'active') return 'status-healthy';
+    if (status === 'degraded' || status === 'warning') return 'status-degraded';
+    if (status === 'down') return 'status-down';
+    if (probe?.free_pct != null) {
+        if (probe.free_pct > 20) return 'status-healthy';
+        if (probe.free_pct > 10) return 'status-degraded';
+        return 'status-down';
+    }
+    return 'status-unknown';
+}
+
+function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+}
+
+function formatAge(seconds) {
+    if (seconds == null) return '';
+    if (seconds < 120) return Math.round(seconds) + 's';
+    if (seconds < 7200) return Math.round(seconds / 60) + 'm';
+    return (seconds / 3600).toFixed(1) + 'h';
+}
+
+function sectionRow(label, value, valueStyle) {
+    const row = el('div', 'section-row');
+    row.appendChild(el('span', 'label', label));
+    const val = el('span', 'value', value);
+    if (valueStyle) val.style.cssText = valueStyle;
+    row.appendChild(val);
+    return row;
+}
+
+// ── Neural Map ────────────────────────────────────────────────────────
+
+function buildNeuralMap(data) {
+    const map = document.getElementById('neural-map');
+    map.replaceChildren();
+    map.style.display = 'block';
+
+    const mapW = map.clientWidth || 700;
+    const mapH = Math.max(map.clientHeight, 600);
+    const cx = mapW / 2;
+    const cy = mapH / 2;
+
+    const minDim = Math.min(mapW, mapH);
+    const radii = {
+        center: minDim * 0.06,
+        inner: minDim * 0.18,
+        outer: minDim * 0.30,
+        periphery: minDim * 0.42,
+    };
+
+    const rings = { center: [], inner: [], outer: [], periphery: [] };
+
+    // CC sessions → center
+    const ccSessions = data.cc_sessions || {};
+    const fgStatus = (ccSessions.foreground || {}).status || 'unknown';
+    const bgStatus = (ccSessions.background || {}).status || 'unknown';
+    rings.center.push({ id: 'cc_foreground', status: fgStatus, data: ccSessions.foreground || {} });
+    rings.center.push({ id: 'cc_background', status: bgStatus, data: ccSessions.background || {} });
+
+    // Call sites → rings by RING_ASSIGNMENT
+    for (const [siteId, info] of Object.entries(data.call_sites || {})) {
+        const ring = getRing(siteId);
+        rings[ring].push({ id: siteId, status: info.status, data: info });
+    }
+
+    for (const [ringName, items] of Object.entries(rings)) {
+        const radius = radii[ringName];
+        const sizeClass = DOT_SIZES[ringName];
+
+        for (let i = 0; i < items.length; i++) {
+            const item = items[i];
+            const meta = getMeta(item.id);
+            const angle = (i / items.length) * 2 * Math.PI - Math.PI / 2;
+            const x = cx + radius * Math.cos(angle);
+            const y = cy + radius * Math.sin(angle);
+
+            const dot = el('div', 'dot ' + sizeClass + ' ' + statusClass(item.status) + ' ' + catClass(meta.category));
+            dot.style.left = x + 'px';
+            dot.style.top = y + 'px';
+            dot.style.transform = 'translate(-50%, -50%)';
+            dot.addEventListener('click', () => showDetail(item));
+
+            // Tooltip — enriched with description and category
+            const tooltip = el('div', 'tooltip');
+            tooltip.appendChild(el('div', 'tt-name', meta.name));
+            tooltip.appendChild(el('div', 'tt-desc', meta.desc));
+            tooltip.appendChild(el('span', 'tt-cat', meta.category));
+            if (item.data.active_provider) {
+                tooltip.appendChild(el('div', 'tt-row', 'Provider: ' + item.data.active_provider));
+            }
+            if (item.data.chain_health) {
+                const healthy = item.data.chain_health.filter(c => c.state !== 'open').length;
+                tooltip.appendChild(el('div', 'tt-row', healthy + '/' + item.data.chain_health.length + ' providers healthy'));
+            }
+            if (item.data.active !== undefined) {
+                tooltip.appendChild(el('div', 'tt-row', 'Active: ' + item.data.active));
+            }
+            if (item.data.hourly_budget) {
+                tooltip.appendChild(el('div', 'tt-row', 'Budget: ' + item.data.hourly_budget));
+            }
+            dot.appendChild(tooltip);
+
+            // Labels on ALL rings
+            dot.appendChild(el('div', 'dot-label', meta.name));
+
+            map.appendChild(dot);
+        }
+    }
+
+    // Build legend
+    buildLegend();
+}
+
+function buildLegend() {
+    const legend = document.getElementById('legend');
+    legend.replaceChildren();
+    legend.style.display = 'flex';
+
+    // Category legend
+    const seen = new Set();
+    for (const meta of Object.values(SITE_META)) {
+        if (seen.has(meta.category)) continue;
+        seen.add(meta.category);
+        const item = el('div', 'legend-item');
+        const dot = el('span', 'legend-dot');
+        dot.style.background = CAT_COLORS[meta.category] || '#6b7280';
+        item.appendChild(dot);
+        item.appendChild(el('span', null, meta.category));
+        legend.appendChild(item);
+    }
+}
+
+// ── Detail panel ─────────────────────────────────────────────────────
+
+function showDetail(item) {
+    document.getElementById('side-default').style.display = 'none';
+    const detail = document.getElementById('side-detail');
+    detail.classList.add('active');
+
+    const content = document.getElementById('detail-content');
+    content.replaceChildren();
+    const meta = getMeta(item.id);
+
+    // Title
+    const heading = el('h3', null, meta.name);
+    heading.style.cssText = 'color:#f8fafc;margin:12px 0 4px';
+    content.appendChild(heading);
+
+    // Category badge
+    const catBadge = el('span', 'detail-cat-badge', meta.category);
+    catBadge.style.background = (CAT_COLORS[meta.category] || '#6b7280') + '33';
+    catBadge.style.color = CAT_COLORS[meta.category] || '#6b7280';
+    content.appendChild(catBadge);
+
+    // Description
+    if (meta.desc) {
+        content.appendChild(el('div', 'detail-desc', meta.desc));
+    }
+
+    // Status
+    const statusColor = item.status === 'healthy' ? '#4ade80' : item.status === 'active' ? '#4ade80' : item.status === 'degraded' ? '#facc15' : item.status === 'down' ? '#ef4444' : item.status === 'idle' ? '#888' : '#6b7280';
+    content.appendChild(sectionRow('Status', item.status, 'color:' + statusColor));
+
+    // Metadata
+    if (meta.frequency) content.appendChild(sectionRow('Frequency', meta.frequency));
+    if (meta.costPolicy) content.appendChild(sectionRow('Cost Policy', meta.costPolicy));
+
+    // Active provider
+    if (item.data.active_provider) {
+        content.appendChild(sectionRow('Active Provider', item.data.active_provider));
+    }
+
+    // Provider chain
+    if (item.data.chain_health && item.data.chain_health.length > 0) {
+        const chainSection = el('div', 'detail-section');
+        const chainHead = el('h4', null, 'Provider Chain');
+        chainSection.appendChild(chainHead);
+
+        for (const c of item.data.chain_health) {
+            const color = c.state === 'open' ? '#ef4444' : c.state === 'half_open' ? '#facc15' : '#4ade80';
+            const chainItem = el('div', 'chain-item');
+            const dot = el('span', 'status-dot');
+            dot.style.background = color;
+            chainItem.appendChild(dot);
+            const nameSpan = el('span', null, c.provider);
+            nameSpan.style.flex = '1';
+            chainItem.appendChild(nameSpan);
+            const stateText = c.state + (c.failures > 0 ? ' (' + c.failures + ' fails)' : '');
+            const stateSpan = el('span', null, stateText);
+            stateSpan.style.color = '#64748b';
+            stateSpan.style.fontSize = '11px';
+            chainItem.appendChild(stateSpan);
+            chainSection.appendChild(chainItem);
+        }
+        content.appendChild(chainSection);
+    }
+
+    // CC session details
+    if (item.data.active !== undefined) {
+        content.appendChild(sectionRow('Active Sessions', String(item.data.active)));
+    }
+    if (item.data.hourly_budget) {
+        content.appendChild(sectionRow('Hourly Budget', item.data.hourly_budget));
+    }
+
+    // Last run info
+    if (item.data.last_run_at) {
+        const lastRunSection = el('div', 'detail-section');
+        lastRunSection.appendChild(el('h4', null, 'Last Run'));
+        const runTime = new Date(item.data.last_run_at);
+        const runStr = runTime.toLocaleDateString('en-US', {month: 'short', day: 'numeric'})
+            + ' ' + runTime.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
+        lastRunSection.appendChild(sectionRow('Time', runStr));
+        if (item.data.last_run_provider) {
+            lastRunSection.appendChild(sectionRow('Provider', item.data.last_run_provider + (item.data.last_run_model ? ' (' + item.data.last_run_model + ')' : '')));
+        }
+        if (item.data.last_run_tokens) {
+            lastRunSection.appendChild(sectionRow('Tokens', String(item.data.last_run_tokens)));
+        }
+        content.appendChild(lastRunSection);
+
+        // Full response in scrollable box
+        if (item.data.last_response) {
+            const respSection = el('div', 'detail-section');
+            respSection.appendChild(el('h4', null, 'Last Response'));
+            const respBox = document.createElement('pre');
+            respBox.textContent = item.data.last_response;
+            respBox.style.cssText = 'font-size: 11px; max-height: 200px; overflow-y: auto; background: #1e293b; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; margin: 4px 0; color: #e2e8f0;';
+            respSection.appendChild(respBox);
+            content.appendChild(respSection);
+        }
+    } else {
+        content.appendChild(sectionRow('Last Run', 'No runs recorded'));
+    }
+
+    // Routing config editor — loads live config from API
+    if (item.data.chain_health && item.data.chain_health.length > 0) {
+        const editorDiv = el('div', 'config-editor');
+        editorDiv.appendChild(el('div', 'chain-label', 'Routing Config'));
+
+        // Static info
+        const costPolicy = SITE_META[item.id]?.costPolicy || 'unknown';
+        const frequency = SITE_META[item.id]?.frequency || 'unknown';
+        editorDiv.appendChild(sectionRow('Cost Policy', costPolicy));
+        editorDiv.appendChild(sectionRow('Frequency', frequency));
+
+        // Chain editor placeholder — populated async
+        const chainList = document.createElement('ul');
+        chainList.className = 'chain-editor-list';
+        const loadingLi = document.createElement('li');
+        loadingLi.style.cssText = 'color:#64748b;font-size:11px;';
+        loadingLi.textContent = 'Loading config...';
+        chainList.appendChild(loadingLi);
+        editorDiv.appendChild(chainList);
+
+        // Action row: add provider dropdown + add button
+        const actionsDiv = el('div', 'editor-actions');
+        const addSelect = document.createElement('select');
+        const defaultOpt = document.createElement('option');
+        defaultOpt.value = '';
+        defaultOpt.textContent = 'Add provider...';
+        addSelect.appendChild(defaultOpt);
+        actionsDiv.appendChild(addSelect);
+        const addBtn = document.createElement('button');
+        addBtn.className = 'btn-add';
+        addBtn.textContent = 'Add';
+        actionsDiv.appendChild(addBtn);
+        editorDiv.appendChild(actionsDiv);
+
+        // Toggles row
+        const togglesDiv = el('div', 'editor-toggles');
+        const dpLabel = document.createElement('label');
+        const dpCheck = document.createElement('input');
+        dpCheck.type = 'checkbox';
+        dpLabel.appendChild(dpCheck);
+        dpLabel.appendChild(document.createTextNode(' default_paid'));
+        togglesDiv.appendChild(dpLabel);
+        const npLabel = document.createElement('label');
+        const npCheck = document.createElement('input');
+        npCheck.type = 'checkbox';
+        npLabel.appendChild(npCheck);
+        npLabel.appendChild(document.createTextNode(' never_pays'));
+        togglesDiv.appendChild(npLabel);
+        editorDiv.appendChild(togglesDiv);
+
+        // Save / Revert buttons
+        const saveRow = el('div', 'editor-actions');
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'btn-save';
+        saveBtn.textContent = 'Save';
+        saveBtn.disabled = true;
+        saveRow.appendChild(saveBtn);
+        const revertBtn = document.createElement('button');
+        revertBtn.className = 'btn-revert';
+        revertBtn.textContent = 'Revert';
+        revertBtn.disabled = true;
+        saveRow.appendChild(revertBtn);
+        editorDiv.appendChild(saveRow);
+
+        // Feedback area
+        const feedbackDiv = el('div', 'editor-feedback');
+        feedbackDiv.style.display = 'none';
+        editorDiv.appendChild(feedbackDiv);
+
+        content.appendChild(editorDiv);
+
+        // Load config from API and populate editor
+        _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv);
+    }
+}
+
+// ── Chain editor logic ───────────────────────────────────────────────
+
+let _editorState = {};  // {chain, originalChain, allProviders, cbStates, default_paid, never_pays, original_dp, original_np}
+
+async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackEl) {
+    try {
+        const resp = await fetch('/api/genesis/routing/config');
+        if (!resp.ok) throw new Error('API error');
+        const cfg = await resp.json();
+
+        const site = cfg.call_sites[callSiteId];
+        if (!site) {
+            listEl.textContent = '';
+            const noSiteLi = document.createElement('li');
+            noSiteLi.style.cssText = 'color:#64748b;font-size:11px;';
+            noSiteLi.textContent = 'Not a router call site';
+            listEl.appendChild(noSiteLi);
+            return;
+        }
+
+        _editorState = {
+            callSiteId,
+            chain: [...site.chain],
+            originalChain: [...site.chain],
+            allProviders: cfg.providers,
+            cbStates: cfg.cb_states || {},
+            default_paid: site.default_paid,
+            never_pays: site.never_pays,
+            original_dp: site.default_paid,
+            original_np: site.never_pays,
+        };
+
+        dpCheck.checked = site.default_paid;
+        npCheck.checked = site.never_pays;
+
+        _renderChainList(listEl);
+        _populateAddSelect(selectEl);
+        _updateDirtyState(saveBtn, revertBtn);
+
+        // Event handlers
+        addBtn.onclick = () => {
+            if (selectEl.value) {
+                _editorState.chain.push(selectEl.value);
+                _renderChainList(listEl);
+                _populateAddSelect(selectEl);
+                _updateDirtyState(saveBtn, revertBtn);
+            }
+        };
+
+        dpCheck.onchange = () => {
+            _editorState.default_paid = dpCheck.checked;
+            _updateDirtyState(saveBtn, revertBtn);
+        };
+        npCheck.onchange = () => {
+            _editorState.never_pays = npCheck.checked;
+            _updateDirtyState(saveBtn, revertBtn);
+        };
+
+        saveBtn.onclick = () => _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn);
+        revertBtn.onclick = () => {
+            _editorState.chain = [..._editorState.originalChain];
+            _editorState.default_paid = _editorState.original_dp;
+            _editorState.never_pays = _editorState.original_np;
+            dpCheck.checked = _editorState.original_dp;
+            npCheck.checked = _editorState.original_np;
+            _renderChainList(listEl);
+            _populateAddSelect(selectEl);
+            _updateDirtyState(saveBtn, revertBtn);
+            feedbackEl.style.display = 'none';
+        };
+    } catch (e) {
+        listEl.textContent = '';
+        const errLi = document.createElement('li');
+        errLi.style.cssText = 'color:#f87171;font-size:11px;';
+        errLi.textContent = 'Failed to load config';
+        listEl.appendChild(errLi);
+    }
+}
+
+function _renderChainList(listEl) {
+    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+    _editorState.chain.forEach((prov, idx) => {
+        const li = document.createElement('li');
+        li.className = 'chain-editor-item';
+
+        // CB health dot
+        const dot = document.createElement('span');
+        dot.className = 'cb-dot';
+        const cbState = _editorState.cbStates[prov] || 'closed';
+        dot.style.background = cbState === 'open' ? '#ef4444' : cbState === 'half_open' ? '#facc15' : '#4ade80';
+        dot.title = cbState;
+        li.appendChild(dot);
+
+        // Free badge
+        const provCfg = _editorState.allProviders[prov];
+        const nameText = prov + (provCfg?.free ? ' [free]' : '');
+        const nameSpan = el('span', 'provider-name', nameText);
+        if (provCfg?.free) nameSpan.style.color = '#4ade80';
+        li.appendChild(nameSpan);
+
+        // Move up
+        if (idx > 0) {
+            const upBtn = document.createElement('button');
+            upBtn.className = 'move-btn';
+            upBtn.textContent = '\u25B2';
+            upBtn.title = 'Move up';
+            upBtn.onclick = () => {
+                [_editorState.chain[idx - 1], _editorState.chain[idx]] = [_editorState.chain[idx], _editorState.chain[idx - 1]];
+                _renderChainList(listEl);
+                const editor = listEl.closest('.config-editor');
+                if (editor) {
+                    const btns = editor.querySelectorAll('.editor-actions button');
+                    _updateDirtyState(btns[btns.length - 2], btns[btns.length - 1]);
+                }
+            };
+            li.appendChild(upBtn);
+        }
+
+        // Move down
+        if (idx < _editorState.chain.length - 1) {
+            const downBtn = document.createElement('button');
+            downBtn.className = 'move-btn';
+            downBtn.textContent = '\u25BC';
+            downBtn.title = 'Move down';
+            downBtn.onclick = () => {
+                [_editorState.chain[idx], _editorState.chain[idx + 1]] = [_editorState.chain[idx + 1], _editorState.chain[idx]];
+                _renderChainList(listEl);
+                const editor = listEl.closest('.config-editor');
+                if (editor) {
+                    const btns = editor.querySelectorAll('.editor-actions button');
+                    _updateDirtyState(btns[btns.length - 2], btns[btns.length - 1]);
+                }
+            };
+            li.appendChild(downBtn);
+        }
+
+        // Remove (only if chain has >1)
+        if (_editorState.chain.length > 1) {
+            const rmBtn = document.createElement('button');
+            rmBtn.className = 'remove-btn';
+            rmBtn.textContent = '\u2715';
+            rmBtn.title = 'Remove';
+            rmBtn.onclick = () => {
+                _editorState.chain.splice(idx, 1);
+                _renderChainList(listEl);
+                const selectEl = listEl.parentElement.querySelector('select');
+                if (selectEl) _populateAddSelect(selectEl);
+                const editor = listEl.closest('.config-editor');
+                if (editor) {
+                    const btns = editor.querySelectorAll('.editor-actions button');
+                    _updateDirtyState(btns[btns.length - 2], btns[btns.length - 1]);
+                }
+            };
+            li.appendChild(rmBtn);
+        }
+
+        listEl.appendChild(li);
+    });
+}
+
+function _populateAddSelect(selectEl) {
+    while (selectEl.firstChild) selectEl.removeChild(selectEl.firstChild);
+    const defaultOpt = document.createElement('option');
+    defaultOpt.value = '';
+    defaultOpt.textContent = 'Add provider...';
+    selectEl.appendChild(defaultOpt);
+    for (const [name, prov] of Object.entries(_editorState.allProviders)) {
+        if (!_editorState.chain.includes(name)) {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name + (prov.free ? ' [free]' : '');
+            selectEl.appendChild(opt);
+        }
+    }
+}
+
+function _updateDirtyState(saveBtn, revertBtn) {
+    const chainChanged = JSON.stringify(_editorState.chain) !== JSON.stringify(_editorState.originalChain);
+    const dpChanged = _editorState.default_paid !== _editorState.original_dp;
+    const npChanged = _editorState.never_pays !== _editorState.original_np;
+    const dirty = chainChanged || dpChanged || npChanged;
+    saveBtn.disabled = !dirty;
+    revertBtn.disabled = !dirty;
+}
+
+async function _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn) {
+    saveBtn.disabled = true;
+    saveBtn.textContent = 'Saving...';
+    feedbackEl.style.display = 'none';
+
+    try {
+        const resp = await fetch('/api/genesis/routing/config/' + encodeURIComponent(_editorState.callSiteId), {
+            method: 'PUT',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                chain: _editorState.chain,
+                default_paid: _editorState.default_paid,
+                never_pays: _editorState.never_pays,
+            }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Save failed');
+
+        // Update original state
+        _editorState.originalChain = [..._editorState.chain];
+        _editorState.original_dp = _editorState.default_paid;
+        _editorState.original_np = _editorState.never_pays;
+
+        feedbackEl.textContent = 'Saved + reloaded';
+        feedbackEl.className = 'editor-feedback feedback-ok';
+        feedbackEl.style.display = 'block';
+        setTimeout(() => feedbackEl.style.display = 'none', 3000);
+    } catch (e) {
+        feedbackEl.textContent = e.message;
+        feedbackEl.className = 'editor-feedback feedback-err';
+        feedbackEl.style.display = 'block';
+    }
+
+    saveBtn.textContent = 'Save';
+    _updateDirtyState(saveBtn, revertBtn);
+}
+
+function showDefaultPanel() {
+    document.getElementById('side-detail').classList.remove('active');
+    document.getElementById('side-default').style.display = 'block';
+}
+
+// ── Side panel ───────────────────────────────────────────────────────
+
+function updateSidePanel(data) {
+    // Services
+    const services = data.services || {};
+    const svcEl = document.getElementById('services-content');
+    if (svcEl) {
+        svcEl.replaceChildren();
+        const bridge = services.bridge || {};
+        const bridgeState = bridge.active_state || 'unknown';
+        const bridgeColor = bridgeState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
+        let bridgeDetail = bridgeState;
+        if (bridge.uptime_seconds != null) {
+            bridgeDetail += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
+        }
+        svcEl.appendChild(sectionRow('Bridge', bridgeDetail, bridgeColor + ';font-weight:600'));
+
+        const timer = services.watchdog_timer || {};
+        const timerState = timer.active_state || 'unknown';
+        const timerColor = timerState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
+        svcEl.appendChild(sectionRow('Watchdog', timerState, timerColor));
+
+        const wd = services.watchdog || {};
+        if (wd.consecutive_failures > 0) {
+            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#facc15;font-weight:600'));
+        }
+        if (wd.in_backoff) {
+            svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#facc15'));
+        }
+
+        const tmpfs = (data.infrastructure || {}).tmpfs || {};
+        if (tmpfs.free_pct != null) {
+            const tmpColor = tmpfs.free_pct > 20 ? 'color:#4ade80' : tmpfs.free_pct > 10 ? 'color:#facc15' : 'color:#ef4444';
+            svcEl.appendChild(sectionRow('/tmp', Math.round(tmpfs.free_mb) + 'MB free (' + Math.round(tmpfs.free_pct) + '%)', tmpColor));
+        }
+    }
+
+    // Infrastructure
+    const infra = data.infrastructure || {};
+    const infraEl = document.getElementById('infra-content');
+    infraEl.replaceChildren();
+    for (const [name, info] of Object.entries(infra)) {
+        // tmpfs is rendered in the Services section — skip here to avoid duplication
+        if (name === 'tmpfs') continue;
+        const row = el('div', 'section-row');
+        const labelSpan = el('span', 'label');
+        const dot = el('span', 'status-dot ' + infraStatusClass(info));
+        labelSpan.appendChild(dot);
+        labelSpan.appendChild(document.createTextNode(name));
+        row.appendChild(labelSpan);
+        let detail = '';
+        if (info.latency_ms !== undefined) {
+            detail = (info.status || 'ok') + ' (' + Math.round(info.latency_ms) + 'ms)';
+        } else if (info.free_pct !== undefined) {
+            const freeVal = info.free_gb != null
+                ? info.free_gb.toFixed(1) + ' GB'
+                : info.free_mb != null
+                ? Math.round(info.free_mb) + ' MB'
+                : '?';
+            detail = freeVal + ' free (' + Math.round(info.free_pct) + '%)';
+        } else {
+            detail = info.status || 'ok';
+        }
+        row.appendChild(el('span', 'value', detail));
+        infraEl.appendChild(row);
+    }
+    if (!Object.keys(infra).length) infraEl.appendChild(el('div', null, 'No data'));
+
+    // Awareness Loop
+    const awareness = data.awareness || {};
+    const awarenessEl = document.getElementById('awareness-content');
+    if (awarenessEl) {
+        awarenessEl.replaceChildren();
+        const aStatus = awareness.status || 'unknown';
+        const aColor = aStatus === 'healthy' ? 'color:#4ade80' : aStatus === 'stale' ? 'color:#facc15' : 'color:#6b7280';
+        awarenessEl.appendChild(sectionRow('Status', aStatus, aColor + ';font-weight:600'));
+        if (awareness.ticks_24h !== undefined) awarenessEl.appendChild(sectionRow('Ticks/24h', String(awareness.ticks_24h)));
+        if (awareness.time_since_last_tick_seconds !== undefined) {
+            const secs = Math.round(awareness.time_since_last_tick_seconds);
+            awarenessEl.appendChild(sectionRow('Last tick', secs < 120 ? secs + 's ago' : Math.round(secs / 60) + 'm ago'));
+        }
+        if (awareness.critical_bypasses_24h) {
+            awarenessEl.appendChild(sectionRow('Critical bypasses', String(awareness.critical_bypasses_24h), 'color:#facc15'));
+        }
+    }
+
+    // Resilience — enriched with provider summary and per-category health
+    const resEl = document.getElementById('resilience-content');
+    if (resEl) {
+        resEl.replaceChildren();
+        const resState = data.resilience || 'not configured';
+        const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#facc15';
+        resEl.appendChild(sectionRow('State', String(resState), rColor + ';font-weight:600'));
+
+        // Provider summary: X/Y call sites healthy
+        const sites = data.call_sites || {};
+        const siteIds = Object.keys(sites);
+        const totalSites = siteIds.length;
+        const healthySites = siteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active').length;
+        if (totalSites > 0) {
+            const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#facc15' : 'color:#ef4444';
+            resEl.appendChild(sectionRow('Call sites', healthySites + '/' + totalSites + ' healthy', summaryColor));
+        }
+
+        // Per-category health
+        const catHealth = {};
+        for (const [siteId, info] of Object.entries(sites)) {
+            const meta = getMeta(siteId);
+            const cat = meta.category;
+            if (!catHealth[cat]) catHealth[cat] = { total: 0, healthy: 0 };
+            catHealth[cat].total++;
+            if (info.status === 'healthy' || info.status === 'active') catHealth[cat].healthy++;
+        }
+        const cats = Object.keys(catHealth).sort();
+        if (cats.length > 0) {
+            const catHeader = el('div', 'section-row');
+            catHeader.style.cssText = 'margin-top:8px;padding-bottom:4px;border-bottom:1px solid #1e293b';
+            catHeader.appendChild(el('span', 'label', 'By Category'));
+            catHeader.appendChild(el('span', 'value', ''));
+            resEl.appendChild(catHeader);
+
+            for (const cat of cats) {
+                const c = catHealth[cat];
+                const row = el('div', 'cat-health');
+                const nameSpan = el('span', 'cat-name', cat);
+                const countSpan = el('span', 'cat-count', c.healthy + '/' + c.total);
+                countSpan.style.color = c.healthy === c.total ? '#4ade80' : '#facc15';
+                row.appendChild(nameSpan);
+                row.appendChild(countSpan);
+                resEl.appendChild(row);
+            }
+        }
+    }
+
+    // CC Sessions
+    const cc = data.cc_sessions || {};
+    const ccEl = document.getElementById('cc-content');
+    ccEl.replaceChildren();
+    if (cc.foreground) ccEl.appendChild(sectionRow('Foreground', (cc.foreground.active || 0) + ' active'));
+    if (cc.background) {
+        ccEl.appendChild(sectionRow('Background', (cc.background.active || 0) + ' active'));
+        if (cc.background.hourly_budget) ccEl.appendChild(sectionRow('Budget', cc.background.hourly_budget + '/hr'));
+    }
+    if (cc.failed_24h) ccEl.appendChild(sectionRow('Failed/24h', String(cc.failed_24h), 'color:#ef4444'));
+
+    // Queues
+    const queues = data.queues || {};
+    const qEl = document.getElementById('queue-content');
+    qEl.replaceChildren();
+    for (const [name, val] of Object.entries(queues)) {
+        // Skip non-scalar and array fields
+        if (typeof val !== 'number' && val !== null) continue;
+        // Format age fields as human-readable
+        if (name.endsWith('_age_seconds')) {
+            if (val == null) continue;
+            const label = name.replace(/_age_seconds$/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            qEl.appendChild(sectionRow(label + ' Age', formatAge(val), 'color:#94a3b8'));
+            continue;
+        }
+        if (typeof val !== 'number') continue;
+        const label = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const color = val > 0 ? 'color:#facc15' : 'color:#4ade80';
+        qEl.appendChild(sectionRow(label, String(val), color));
+    }
+    // Show pending deferred item details
+    if (queues.deferred_items && queues.deferred_items.length > 0) {
+        for (const item of queues.deferred_items) {
+            const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
+            const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
+            qEl.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
+        }
+    }
+    // Discarded/expired items — iLO-style: always visible, expandable, user-clearable
+    renderDiscardedItems(qEl, queues);
+
+    // Cost
+    const cost = data.cost || {};
+    const costEl = document.getElementById('cost-content');
+    costEl.replaceChildren();
+    if (cost.monthly_usd !== undefined) costEl.appendChild(sectionRow('Month', '$' + cost.monthly_usd.toFixed(2)));
+    if (cost.daily_usd !== undefined) costEl.appendChild(sectionRow('Today', '$' + cost.daily_usd.toFixed(3)));
+    if (cost.budget_status) {
+        const cls = cost.budget_status === 'UNDER_LIMIT' ? 'badge-normal' : cost.budget_status === 'WARNING' ? 'badge-warning' : 'badge-critical';
+        const row = el('div', 'section-row');
+        row.appendChild(el('span', 'label', 'Status'));
+        row.appendChild(el('span', 'badge ' + cls, cost.budget_status));
+        costEl.appendChild(row);
+    }
+}
+
+// ── Discarded items — iLO-style expand/clear ────────────────────────
+
+function renderDiscardedItems(container, queues) {
+    const items = queues.discarded_items || [];
+    const count = queues.discarded_count || items.length;
+    if (count === 0) return;
+
+    // Toggle header
+    const toggle = el('div', 'discarded-toggle');
+    const toggleText = el('span', null, 'Discarded (' + count + ')');
+    const arrow = el('span', 'arrow', '\u25B6');
+    toggle.appendChild(toggleText);
+    toggle.appendChild(arrow);
+    container.appendChild(toggle);
+
+    // Collapsible details container
+    const details = el('div', 'discarded-details');
+    container.appendChild(details);
+
+    toggle.addEventListener('click', function() {
+        const isOpen = details.classList.toggle('open');
+        arrow.classList.toggle('open', isOpen);
+    });
+
+    // Render each discarded item
+    for (const item of items) {
+        const card = el('div', 'discarded-item');
+
+        const header = el('div', 'di-header', (item.site || item.type));
+        card.appendChild(header);
+
+        const statusLabel = item.status === 'expired' ? 'Expired' : 'Discarded';
+        card.appendChild(el('div', 'di-row', 'Status: ' + statusLabel));
+        card.appendChild(el('div', 'di-row', 'Reason: ' + (item.reason || 'unknown')));
+
+        if (item.error) {
+            card.appendChild(el('div', 'di-error', 'Error: ' + item.error));
+        }
+
+        const meta = [];
+        if (item.attempts > 0) meta.push(item.attempts + ' attempts');
+        meta.push('age: ' + formatAge(item.age_s));
+        if (item.discarded_at) {
+            const d = new Date(item.discarded_at);
+            meta.push('at ' + d.toLocaleTimeString());
+        }
+        card.appendChild(el('div', 'di-row', meta.join(' | ')));
+
+        // Clear button
+        const actions = el('div', 'di-actions');
+        const clearBtn = el('button', 'clear-btn', 'Clear');
+        clearBtn.addEventListener('click', function() {
+            clearDiscardedItem(item.id).then(function() { fetchHealth(); });
+        });
+        actions.appendChild(clearBtn);
+        card.appendChild(actions);
+
+        details.appendChild(card);
+    }
+
+    // Clear All button
+    if (items.length > 1) {
+        const clearAllBtn = el('button', 'clear-btn clear-all-btn', 'Clear All Discarded (' + count + ')');
+        clearAllBtn.addEventListener('click', function() {
+            clearDiscardedItem('all').then(function() { fetchHealth(); });
+        });
+        details.appendChild(clearAllBtn);
+    }
+}
+
+async function clearDiscardedItem(itemId) {
+    try {
+        const resp = await fetch('/api/genesis/deferred/' + itemId + '/clear', { method: 'DELETE' });
+        if (!resp.ok) {
+            console.error('Clear failed:', resp.status);
+        }
+    } catch (e) {
+        console.error('Clear request failed:', e);
+    }
+}
+
+// ── Surplus — enriched ──────────────────────────────────────────────
+
+function updateSurplus(data) {
+    const surplus = data.surplus || {};
+    const box = document.getElementById('surplus-box');
+    if (surplus.status === 'unknown') { box.style.display = 'none'; return; }
+    box.style.display = 'block';
+    const content = document.getElementById('surplus-content');
+    content.replaceChildren();
+
+    const color = surplus.status === 'idle' ? '#4ade80' : surplus.status === 'dispatching' ? '#facc15' : '#6b7280';
+    content.appendChild(sectionRow('Status', surplus.status, 'color:' + color + ';font-weight:600'));
+    if (surplus.queue_depth !== undefined) content.appendChild(sectionRow('Queue Depth', String(surplus.queue_depth)));
+    if (surplus.last_dispatch) content.appendChild(sectionRow('Last Dispatch', surplus.last_dispatch));
+    if (surplus.tasks_pending !== undefined) content.appendChild(sectionRow('Tasks Pending', String(surplus.tasks_pending)));
+    if (surplus.idle_since) {
+        const idleSince = new Date(surplus.idle_since);
+        const ago = Math.round((Date.now() - idleSince.getTime()) / 60000);
+        content.appendChild(sectionRow('Idle Since', ago + 'm ago'));
+    }
+}
+
+// ── Polling ─────────────────────────────────────────────────────────
+
+function tickUpdateTimer() {
+    const elapsed = Math.round((Date.now() - lastFetchTime) / 1000);
+    document.getElementById('last-update').textContent = elapsed + 's ago';
+}
+
+async function fetchHealth() {
+    try {
+        const resp = await fetch('/api/genesis/health');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        lastData = await resp.json();
+        lastFetchTime = Date.now();
+
+        document.getElementById('loading').style.display = 'none';
+        buildNeuralMap(lastData);
+        updateSidePanel(lastData);
+        updateSurplus(lastData);
+    } catch (e) {
+        console.error('Health fetch failed:', e);
+        document.getElementById('loading').textContent = 'Connection error \u2014 retrying...';
+        document.getElementById('loading').style.display = 'block';
+    }
+}
+
+// ── Pause / Kill Switch ──────────────────────────────
+let pauseState = { paused: false, reason: null, since: null };
+
+async function fetchPauseState() {
+    try {
+        const resp = await fetch('/api/genesis/pause');
+        if (resp.ok) {
+            pauseState = await resp.json();
+            renderPauseFooter();
+        }
+    } catch (e) { console.warn('Pause state fetch failed:', e); }
+}
+
+function renderPauseFooter() {
+    const dot = document.getElementById('pause-dot');
+    const label = document.getElementById('pause-label');
+    const since = document.getElementById('pause-since');
+    const btn = document.getElementById('pause-btn');
+    if (!dot || !label || !btn) return;
+    if (pauseState.paused) {
+        dot.style.background = '#ffa726';
+        label.textContent = 'PAUSED';
+        label.style.color = '#ffa726';
+        since.textContent = pauseState.since ? 'since ' + new Date(pauseState.since).toLocaleTimeString() : '';
+        btn.textContent = 'Resume Genesis';
+        btn.style.color = '#66bb6a';
+        btn.style.borderColor = 'rgba(102,187,106,0.3)';
+        btn.style.background = 'rgba(102,187,106,0.12)';
+    } else {
+        dot.style.background = '#66bb6a';
+        label.textContent = 'RUNNING';
+        label.style.color = '#66bb6a';
+        since.textContent = '';
+        btn.textContent = 'Pause Genesis';
+        btn.style.color = '#ffa726';
+        btn.style.borderColor = 'rgba(255,167,38,0.3)';
+        btn.style.background = 'rgba(255,167,38,0.12)';
+    }
+}
+
+async function togglePause() {
+    const newState = !pauseState.paused;
+    const pauseMsg = "Pause Genesis?\n\nThis will stop ALL background activity:\n\u2022 Reflections\n\u2022 Surplus tasks\n\u2022 Outreach\n\u2022 Inbox monitoring\n\nConversations still work but without background enrichment.\nYou must manually resume via this button or /pause off in Telegram.";
+    const resumeMsg = "Resume Genesis?\n\nAll background activity will restart\n(reflections, surplus tasks, outreach, inbox monitoring).";
+    if (!confirm(newState ? pauseMsg : resumeMsg)) return;
+    try {
+        const resp = await fetch('/api/genesis/pause', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ paused: newState, reason: 'Dashboard toggle' }),
+        });
+        if (resp.ok) await fetchPauseState();
+    } catch (e) { console.warn('Pause toggle failed:', e); }
+}
+
+fetchHealth();
+fetchPauseState();
+setInterval(fetchHealth, 15000);
+setInterval(fetchPauseState, 15000);
+setInterval(tickUpdateTimer, 1000);
+</script>
+
+<!-- Kill Switch Footer -->
+<div id="pause-footer" style="position:fixed;bottom:0;left:0;right:0;z-index:1000;
+    background:#1a1a2e;border-top:1px solid #333;padding:0.5rem 1.5rem;
+    display:flex;align-items:center;justify-content:space-between;font-size:0.78rem;">
+  <div style="display:flex;align-items:center;gap:0.75rem;">
+    <span id="pause-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#66bb6a;"></span>
+    <span id="pause-label" style="color:#66bb6a;font-weight:600;">RUNNING</span>
+    <span id="pause-since" style="color:#888;"></span>
+  </div>
+  <button id="pause-btn" onclick="togglePause()"
+    style="font-size:0.74rem;padding:0.35rem 0.9rem;border-radius:4px;cursor:pointer;
+           font-weight:500;color:#ffa726;border:1px solid rgba(255,167,38,0.3);
+           background:rgba(255,167,38,0.12);">Pause Genesis</button>
+</div>
+<div style="height:50px;"></div>
+
+</body>
+</html>

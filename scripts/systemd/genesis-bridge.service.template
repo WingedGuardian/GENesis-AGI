@@ -1,0 +1,26 @@
+[Unit]
+Description=Genesis Telegram Bridge (CC conversation relay)
+After=network.target
+# Stop crash-looping: max 4 restarts in 120s, then give up until manual reset.
+# Must be in [Unit], not [Service] — systemd 255 ignores them in [Service].
+StartLimitBurst=4
+StartLimitIntervalSec=120
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV__/bin/python -m genesis.channels.bridge
+Restart=on-failure
+RestartSec=10
+
+# Exit code 200 = "another instance holds the lock" — don't restart for that.
+# See genesis.util.process_lock.EXIT_ALREADY_RUNNING.
+RestartPreventExitStatus=200
+
+Environment=PATH=__VENV__/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=TG_ADAPTER=v2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

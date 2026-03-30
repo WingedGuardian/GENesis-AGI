@@ -1,0 +1,16 @@
+inbox_monitor:
+  enabled: true
+  watch_path: "~/inbox"
+  # response_dir is a scanner exclusion pattern — any subdirectory matching
+  # this name is skipped during scanning. It is NOT the write target for
+  # responses. Responses are written as sibling .genesis.md files next to
+  # the source (e.g. Untitled.md → Untitled.genesis.md).
+  response_dir: "_genesis"
+  check_interval_seconds: 1800
+  batch_size: 1
+  model: "sonnet"
+  effort: "medium"
+  timeout_s: 600
+  # max_retries: 3        # Max retry attempts before permanently excluding a failed item
+  # recursive: false      # Set true to scan subdirectories recursively
+  timezone: "UTC"  # Used for response file dates (supports DST)

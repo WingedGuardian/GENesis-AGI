@@ -1,0 +1,9 @@
+name: crypto_ops
+type: native
+class: genesis.modules.crypto_ops.module.CryptoOpsModule
+description: >
+  Crypto Token Operations — LLM-driven narrative detection across
+  chains (Solana, Base). Monitors position health (price, volume,
+  holders), tracks launch outcomes, and extracts generalizable lessons
+  for core memory.
+enabled: false

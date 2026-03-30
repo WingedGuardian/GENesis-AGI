@@ -1,0 +1,55 @@
+generated_at: '2026-03-20T19:02:08.329050+00:00'
+triggers:
+- tool:
+  - Bash
+  context_patterns:
+  - pip.*-e
+  - pip.*--editable
+  procedure_id: 35e431cd-916c-5ccb-9adb-e5abc4cecfde
+  task_type: pip_editable_worktree_safety
+  principle: "Never pip install -e to a worktree \u2014 it redirects ALL system imports\
+    \ and crashes the bridge."
+  steps:
+  - Use PYTHONPATH=/path/to/worktree/src instead of pip install -e
+  - 'Example: PYTHONPATH=.claude/worktrees/my-feature/src pytest tests/'
+  - "The editable install is system-wide \u2014 it affects ALL processes, not just\
+    \ the current session"
+  confidence: 0.9
+- tool:
+  - WebFetch
+  context_patterns:
+  - youtube
+  - video
+  - transcript
+  - ssl
+  - content-fetch
+  procedure_id: e1266345-43bf-5d65-855f-940af8efa9dc
+  task_type: youtube_content_fetch
+  principle: YouTube WebFetch is unreliable in this environment. Use yt-dlp instead.
+  steps:
+  - Use yt-dlp instead of WebFetch for YouTube URLs
+  - 'For metadata: yt-dlp --skip-download --print ''%(title)s|||%(uploader)s|||%(description)s''
+    URL'
+  - 'For transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o ''~/tmp/%(id)s''
+    URL'
+  - Read the VTT file at ~/tmp/VIDEO_ID.en.vtt for full transcript
+  - 'If SSL issues recur: add --no-check-certificate flag'
+  confidence: 0.86
+- tool:
+  - Write
+  - Edit
+  context_patterns:
+  - os.killpg
+  - os.kill(
+  - killpg(
+  - mock_proc.pid
+  - pgid
+  procedure_id: 53051c4f-0933-5a62-8a2d-5fa740faaf36
+  task_type: process_kill_safety
+  principle: Always validate pgid > 1 before os.killpg(). int(AsyncMock().pid) ==
+    1 in Python 3.12.
+  steps:
+  - Validate pgid > 1 before any os.killpg() or os.kill() call
+  - 'In tests: always set mock_proc.pid = <explicit value>, never rely on default'
+  - os.killpg(1, sig) == kill(-1, sig) == kill ALL user processes in container
+  confidence: 0.86

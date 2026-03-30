@@ -1,0 +1,8 @@
+[Unit]
+Description=Guardian watchman — restart guardian timer if it stopped
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'systemctl --user is-active genesis-guardian.timer || systemctl --user start genesis-guardian.timer'
+StandardOutput=journal
+StandardError=journal

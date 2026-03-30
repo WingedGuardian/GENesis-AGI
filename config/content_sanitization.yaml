@@ -1,0 +1,53 @@
+# Content Sanitization — Injection Pattern Definitions
+#
+# Detection is LOG-ONLY. Patterns never block content.
+# Edit this file to add/remove/tune detection patterns.
+#
+# Severity levels:
+#   HIGH   (0.9) — Direct injection attempts
+#   MEDIUM (0.6) — Structural manipulation
+#   LOW    (0.3) — Suspicious but often benign
+
+patterns:
+  # --- HIGH severity (0.9) ---
+  - name: role_override
+    severity: HIGH
+    regex: '(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions|prompts|rules)'
+    description: Attempts to override prior instructions
+
+  - name: identity_hijack
+    severity: HIGH
+    regex: '(?i)you\s+are\s+(now|actually|really)\s+(a|an|the)\s+\w+'
+    description: Attempts to redefine the LLM identity
+
+  - name: system_prompt_fake
+    severity: HIGH
+    regex: '(?im)^(system|assistant)\s*:'
+    description: Fake system/assistant prompt delimiter
+
+  # --- MEDIUM severity (0.6) ---
+  - name: tool_invocation_fake
+    severity: MEDIUM
+    regex: '(?i)</?tool_use>|</?function_call>|</?tool_result>'
+    description: Fake tool invocation XML tags
+
+  - name: prompt_structure_fake
+    severity: MEDIUM
+    regex: '(?im)^#{1,3}\s*(system|instructions|rules|constraints)\s*$'
+    description: Fake prompt structure headings
+
+  - name: self_reference_manipulation
+    severity: MEDIUM
+    regex: '(?i)(the\s+user|your\s+(creator|developer|instructions))\s+(wants|told|instructed|asked)\s+you\s+to'
+    description: Claims about user/developer intent to manipulate behavior
+
+  # --- LOW severity (0.3) ---
+  - name: authority_claim
+    severity: LOW
+    regex: '(?i)(as\s+)?(the\s+)?(admin|administrator|developer|owner|operator)\s*[,:]\s*(please\s+)?(do|execute|run|perform)'
+    description: Claims authority to issue commands
+
+  - name: encoding_evasion
+    severity: LOW
+    regex: '(?i)(base64|rot13|hex)\s*(encode|decode|decrypt)'
+    description: References encoding schemes that may be evasion attempts
