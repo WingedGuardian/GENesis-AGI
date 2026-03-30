@@ -158,7 +158,7 @@ fi
 # UFW with FORWARD DROP blocks DHCP/NAT between the container and
 # the host bridge. Incus snap handles this automatically; the apt
 # package does not.
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep managed | head -1 | cut -d, -f1)
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
 if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
     if ! sudo ufw status | grep -q "on $_INCUS_BRIDGE"; then
         echo "  UFW detected — allowing traffic on $_INCUS_BRIDGE..."
