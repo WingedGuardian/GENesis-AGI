@@ -172,7 +172,11 @@ echo "[2/12] Setting up code..."
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-if [ -d "$INSTALL_DIR/src/genesis/guardian" ]; then
+# If already running from the install dir (e.g. host-setup.sh cloned directly
+# into INSTALL_DIR), skip the copy — code is already in place.
+if [ "$(cd "$REPO_ROOT" && pwd)" = "$(cd "$INSTALL_DIR" 2>/dev/null && pwd)" ] 2>/dev/null; then
+    echo "  Code already in $INSTALL_DIR (same as repo)"
+elif [ -d "$INSTALL_DIR/src/genesis/guardian" ]; then
     echo "  Updating from local repo: $REPO_ROOT"
     cp -r "$REPO_ROOT/src" "$INSTALL_DIR/src"
     cp -r "$REPO_ROOT/config" "$INSTALL_DIR/config"
