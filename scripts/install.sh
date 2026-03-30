@@ -530,7 +530,7 @@ SYSTEMD_TEMPLATE_DIR="$REPO_DIR/scripts/systemd"
 SERVICES_GENERATED=0
 
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
-    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template; do
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
         target="$SYSTEMD_USER_DIR/$svc_name"
