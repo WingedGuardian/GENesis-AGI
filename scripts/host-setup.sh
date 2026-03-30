@@ -154,6 +154,22 @@ else
     fi
 fi
 
+# ── Firewall: ensure Incus bridge traffic is allowed ────────
+# UFW with FORWARD DROP blocks DHCP/NAT between the container and
+# the host bridge. Incus snap handles this automatically; the apt
+# package does not.
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep managed | head -1 | cut -d, -f1)
+if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! sudo ufw status | grep -q "on $_INCUS_BRIDGE"; then
+        echo "  UFW detected — allowing traffic on $_INCUS_BRIDGE..."
+        sudo ufw allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1
+        sudo ufw allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1
+        sudo ufw route allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1
+        sudo ufw route allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1
+        echo "  + UFW rules added for Incus bridge"
+    fi
+fi
+
 # ── Create container ─────────────────────────────────────────
 if incus info "$CONTAINER_NAME" &>/dev/null; then
     echo ""
