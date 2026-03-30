@@ -255,16 +255,21 @@ if [ ! -d "$VENV_PATH" ]; then
     echo "    + venv created"
 fi
 
-# AZ requirements
+# AZ requirements — exclude torch/whisper (cloud-primary, patched to lazy import)
 if ! "$VENV_PATH/bin/python" -c "import flask" &>/dev/null 2>&1; then
     echo "    Installing Agent Zero requirements (this may take several minutes)..."
     "$VENV_PATH/bin/pip" install --upgrade pip --quiet 2>&1 | tail -1 || true
-    "$VENV_PATH/bin/pip" install -r "$AZ_ROOT/requirements.txt" --quiet 2>&1 | tail -3 || {
+    # Filter out torch and openai-whisper — they pull ~2GB and are only needed
+    # for local STT. whisper.py is patched below to lazy-import.
+    grep -v -iE '^(torch|openai-whisper|torchaudio|torchvision)' "$AZ_ROOT/requirements.txt" \
+        > /tmp/az-requirements-filtered.txt
+    "$VENV_PATH/bin/pip" install -r /tmp/az-requirements-filtered.txt --quiet 2>&1 | tail -3 || {
         echo "    WARNING: Some AZ requirements failed to install."
-        echo "    Try manually: $VENV_PATH/bin/pip install -r $AZ_ROOT/requirements.txt"
+        echo "    Try manually: $VENV_PATH/bin/pip install -r /tmp/az-requirements-filtered.txt"
         SETUP_WARNINGS=1
     }
-    echo "    + Agent Zero requirements installed"
+    rm -f /tmp/az-requirements-filtered.txt
+    echo "    + Agent Zero requirements installed (torch excluded — cloud STT only)"
 else
     echo "    . Agent Zero venv OK"
 fi
@@ -804,7 +809,7 @@ if command -v claude &>/dev/null; then
     echo "    . Claude Code already installed ($cc_ver)"
 else
     echo "    Installing Claude Code..."
-    if curl -fsSL https://claude.ai/install.sh | sh; then
+    if curl -fsSL https://claude.ai/install.sh | bash; then
         export PATH="$HOME/.local/bin:$PATH"
         # Persist PATH addition
         if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
@@ -814,7 +819,7 @@ else
         echo "    + Claude Code installed ($cc_ver)"
     else
         echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: curl -fsSL https://claude.ai/install.sh | sh"
+        echo "    Install manually: curl -fsSL https://claude.ai/install.sh | bash"
         SETUP_WARNINGS=1
     fi
 fi
