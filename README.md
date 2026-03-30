@@ -457,7 +457,7 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
 <p align="center">
   <img src="docs/images/data-acceptable.jpg" alt="That is acceptable." width="280">
   <br>
-  <i>Think less Siri, more Data. Without the yellow eyes.</i>
+  <i>Data, probably, after hearing about Genesis.</i>
 </p>
 
 ---
