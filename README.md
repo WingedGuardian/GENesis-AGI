@@ -470,7 +470,7 @@ Genesis is a full system, not a pip package. Setup requires several components:
 
 | Requirement | Details |
 |---|---|
-| **Claude Code** | Claude Pro subscription (minimum) |
+| **Claude Code** | Claude Pro subscription (minimum), Max preferred |
 | **Python** | 3.12+ |
 | **Qdrant** | Vector database for memory (1024-dim embeddings) |
 | **SQLite** | Ships with Python (FTS5 extension required) |
