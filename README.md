@@ -478,37 +478,46 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 | **CPU** | 2 cores | 4-8 cores | Concurrent background tasks (awareness loop, reflection, outreach, triage) benefit from parallelism. |
 | **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
 
-Genesis runs best in an LXC/Incus container or VM — this is the tested and recommended deployment. Container deployment enables the Guardian health monitor, which runs on the host and watches the container for issues. The deploy test was validated on an Incus container (4 vCPUs, 8 GB RAM) on a Proxmox VM host.
+These are the requirements for the **host VM** — the machine you run the installer on. Genesis itself runs inside a container that the installer creates with its own resource limits and security boundaries.
 
 ### Prerequisites
 
-You need two things installed before you start. The bootstrap script handles everything else.
+The host VM needs `git` and `sudo`. That's it — the installer handles everything else, including Incus, the container, and all software inside it.
 
 ```bash
 # Ubuntu/Debian
 sudo apt install git sudo
-
-# Already have both? Skip to the install.
 ```
 
 ### Install
 
+One script sets up the entire infrastructure: creates an Incus container with resource limits (RAM, CPU, disk I/O), installs Genesis and all dependencies inside it, deploys the Guardian health monitor on the host, and configures bidirectional SSH between host and container.
+
 ```bash
-git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis
-cd ~/genesis
-./scripts/install.sh
+git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis-setup
+cd ~/genesis-setup
+./scripts/host-setup.sh
 ```
 
-The install script handles the full setup end-to-end: system prerequisites, Python environment, [Agent Zero](https://github.com/frdel/agent-zero) integration, Qdrant vector database, systemd services, Claude Code installation, API key configuration, timezone, and a smoke test to verify everything works. It's interactive by default (prompts for API keys and preferences) or can run headless with `--non-interactive`.
+The installer is interactive by default — it will prompt for API keys, timezone, and preferences. Use `--non-interactive` for scripted/CI deployments.
 
-After install completes, start Claude Code from the genesis directory:
+**What you get after install:**
+
+| Component | Where | What it does |
+|---|---|---|
+| **Genesis container** | Incus container on host | Runs all Genesis services with resource limits and isolation |
+| **Agent Zero** | Inside container, port 5000 | Web UI and dashboard at `http://<container-ip>:5000` |
+| **Qdrant** | Inside container, port 6333 | Vector database for semantic memory |
+| **Guardian** | Host VM | Monitors container health every 30s, auto-recovers, alerts via Telegram |
+| **Claude Code** | Inside container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
+
+**After install, access the container:**
 
 ```bash
+incus exec genesis --user ubuntu -t -- bash
 cd ~/genesis
 claude
 ```
-
-Genesis hooks and MCP servers activate automatically when Claude Code starts.
 
 ### Optional components
 
