@@ -466,15 +466,23 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
 
 **Alpha release.** Genesis v3-alpha is feature-complete but actively stabilizing. Expect rough edges, configuration that assumes familiarity with the stack, and bugs that you'll occasionally want to use Genesis' CLI (Claude Code) to diagnose and fix. The good news is: you can simply tell Genesis to iron out its own kinks. If you're comfortable working with a few bumps for the time being, you'll be fine. If you want a more polished experience, check back when we hit beta.
 
-Genesis is a full system, not a pip package. Setup requires several components:
+Genesis is a full system, not a pip package. You need two things installed before you start:
 
-| Requirement | Details |
+| Prerequisite | Why |
 |---|---|
-| **Claude Code** | Claude Pro subscription (minimum), Max preferred |
-| **Python** | 3.12+ |
-| **Qdrant** | Vector database for memory (1024-dim embeddings) |
-| **SQLite** | Ships with Python (FTS5 extension required) |
-| **Agent Zero** | [frdel/agent-zero](https://github.com/frdel/agent-zero) — current operational layer (being phased out) |
+| **git** | To clone the repo (`sudo apt install git` on Ubuntu/Debian) |
+| **sudo** | Bootstrap installs system packages (Python venv, pip, Node.js) |
+
+Everything else is handled by the bootstrap script automatically.
+
+| Component | Details | Installed by |
+|---|---|---|
+| **Python 3.12+** | Core runtime | Pre-installed on Ubuntu 24.04 |
+| **python3-venv, pip** | Venv and package management | bootstrap.sh |
+| **Node.js** | Optional, for some features | bootstrap.sh |
+| **Claude Code** | Claude Pro subscription (minimum), Max preferred | You (see [claude.ai/code](https://claude.ai/code)) |
+| **Qdrant** | Vector database for memory (optional, FTS5 fallback) | You (see [qdrant.tech](https://qdrant.tech)) |
+| **Agent Zero** | [frdel/agent-zero](https://github.com/frdel/agent-zero) — current operational layer (being phased out) | You |
 
 **Optional:** Local embedding models via [Ollama](https://ollama.com) or any OpenAI-compatible embedding API. Bring your own inference infrastructure if you have it — Genesis adapts to what's available.
 
@@ -484,7 +492,7 @@ cd GENesis-AGI
 ./scripts/bootstrap.sh
 ```
 
-The bootstrap script sets up the Python virtual environment, configuration files, systemd services, and memory stores. The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
+The bootstrap script installs Python dependencies, sets up the virtual environment, renders configuration files, and configures your timezone. After bootstrap, edit `secrets.env` with your API keys and start Claude Code. The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
 ---
 
