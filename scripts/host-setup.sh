@@ -221,14 +221,14 @@ if echo "$REPO_URL" | grep -q "github.com" && ! curl -sf "$REPO_URL" >/dev/null 
 fi
 
 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
-    --env "BRANCH=$BRANCH" --env "REPO_URL=$REPO_URL" -- bash -c '
+    --env "HOME=/home/ubuntu" -- bash -c "
     if [ -d ${HOME}/genesis ]; then
-        echo "    . Genesis repo already exists"
+        echo '    . Genesis repo already exists'
         cd ${HOME}/genesis && git pull --ff-only 2>/dev/null || true
     else
-        GIT_TERMINAL_PROMPT=0 git clone --branch "$BRANCH" "$REPO_URL" ${HOME}/genesis 2>&1 | tail -3
+        GIT_TERMINAL_PROMPT=0 git clone --branch '$BRANCH' '$REPO_URL' ${HOME}/genesis 2>&1 | tail -3
     fi
-' || {
+" || {
     echo "  WARNING: Git clone failed (private repo?)"
     echo "  You can push the code manually:"
     echo "    incus file push -r . ${CONTAINER_NAME}${HOME}/genesis/"
