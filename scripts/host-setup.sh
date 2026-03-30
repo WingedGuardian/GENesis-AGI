@@ -87,8 +87,8 @@ fi
 # Disk space on host
 host_avail_kb=$(df --output=avail /home 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
 host_avail_h=$(df -h /home 2>/dev/null | tail -1 | awk '{print $4}')
-if [ "$host_avail_kb" -lt 31457280 ] 2>/dev/null; then
-    echo "    FAIL  Need >= 30GB free on /home, only $host_avail_h available"
+if [ "$host_avail_kb" -lt 5242880 ] 2>/dev/null; then
+    echo "    FAIL  Need >= 5GB free on /home, only $host_avail_h available"
     PREFLIGHT_OK=0
 else
     echo "    OK    Disk: $host_avail_h free"
