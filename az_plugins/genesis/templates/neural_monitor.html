@@ -348,8 +348,8 @@ const SITE_META = {
         category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
     },
     'embedding': {
-        name: 'Embedding', desc: 'Vector embeddings via Ollama (qwen3-embedding)',
-        category: 'core', frequency: 'On store', costPolicy: 'Local',
+        name: 'Embedding', desc: 'Vector embeddings (cloud or local)',
+        category: 'core', frequency: 'On store', costPolicy: 'Varies by provider',
     },
     '2_triage': {
         name: 'Triage', desc: 'Classify signals \u2192 ignore/log/micro/light/deep/critical',
@@ -429,7 +429,7 @@ const SITE_META = {
     },
     '21_embeddings': {
         name: 'Embeddings', desc: 'Generate 1024-dim vectors for Qdrant memory',
-        category: 'embedding', frequency: 'On write', costPolicy: 'Free (Ollama)',
+        category: 'embedding', frequency: 'On write', costPolicy: 'Varies by provider',
     },
     '22_tagging': {
         name: 'Tagging', desc: 'Entity extraction and metadata tagging',
@@ -608,8 +608,10 @@ function buildNeuralMap(data) {
     rings.center.push({ id: 'cc_foreground', status: fgStatus, data: ccSessions.foreground || {} });
     rings.center.push({ id: 'cc_background', status: bgStatus, data: ccSessions.background || {} });
 
-    // Call sites → rings by RING_ASSIGNMENT
+    // Call sites → rings by RING_ASSIGNMENT (skip cc_foreground/cc_background — already placed above)
+    const explicitCenter = new Set(['cc_foreground', 'cc_background']);
     for (const [siteId, info] of Object.entries(data.call_sites || {})) {
+        if (explicitCenter.has(siteId)) continue;
         const ring = getRing(siteId);
         rings[ring].push({ id: siteId, status: info.status, data: info });
     }
