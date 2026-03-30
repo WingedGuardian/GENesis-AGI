@@ -124,8 +124,8 @@ if command -v incus &>/dev/null; then
     echo "  Incus already installed ($(incus version 2>/dev/null || echo 'unknown'))"
 else
     echo "  Installing Incus..."
-    if command -v snap &>/dev/null; then
-        sudo snap install incus --channel=latest/stable
+    if command -v snap &>/dev/null && sudo snap install incus --channel=latest/stable 2>/dev/null; then
+        true  # snap install succeeded
     elif command -v apt-get &>/dev/null; then
         # Debian/Ubuntu without snap — use Zabbly repo
         sudo mkdir -p /etc/apt/keyrings/
