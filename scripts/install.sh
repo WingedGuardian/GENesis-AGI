@@ -267,6 +267,36 @@ else
     echo "    . Agent Zero venv OK"
 fi
 
+# Patch AZ whisper to lazy-import (torch is optional for cloud-primary users)
+if [ -f "$AZ_ROOT/helpers/whisper.py" ]; then
+    if grep -q "^import whisper$" "$AZ_ROOT/helpers/whisper.py" 2>/dev/null; then
+        python3 -c "
+p = '$AZ_ROOT/helpers/whisper.py'
+c = open(p).read()
+c = c.replace('import whisper', 'try:\n    import whisper\nexcept ImportError:\n    whisper = None  # torch/whisper not installed — cloud STT only')
+open(p, 'w').write(c)
+"
+        echo "    + Patched whisper.py (torch optional)"
+    fi
+fi
+
+# Verify critical AZ imports — retry if missing
+_critical_fail=0
+for mod in flask langchain_core litellm; do
+    if ! "$VENV_PATH/bin/python" -c "import $mod" &>/dev/null 2>&1; then
+        echo "    $mod missing — installing..."
+        "$VENV_PATH/bin/pip" install "$mod" --quiet 2>&1 | tail -1 || true
+        if ! "$VENV_PATH/bin/python" -c "import $mod" &>/dev/null 2>&1; then
+            echo "    WARNING: Could not install $mod"
+            _critical_fail=1
+        fi
+    fi
+done
+if [ "$_critical_fail" = "1" ]; then
+    echo "    WARNING: Some critical dependencies missing. AZ may not start."
+    SETUP_WARNINGS=1
+fi
+
 # secrets.env
 if [ ! -f "$SECRETS_FILE" ]; then
     if [ -f "$REPO_DIR/secrets.env.example" ]; then
@@ -274,6 +304,13 @@ if [ ! -f "$SECRETS_FILE" ]; then
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"
     fi
+fi
+
+# Bind AZ web UI to all interfaces so it's reachable from host
+# (container is network-isolated — 0.0.0.0 inside container is safe)
+if [ -f "$SECRETS_FILE" ] && ! grep -q "^WEB_UI_HOST=" "$SECRETS_FILE" 2>/dev/null; then
+    set_secret "WEB_UI_HOST" "0.0.0.0" "$SECRETS_FILE"
+    echo "    + WEB_UI_HOST set to 0.0.0.0 (reachable from host)"
 fi
 
 echo ""
