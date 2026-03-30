@@ -244,7 +244,7 @@ fi
 # Agent Zero
 if [ ! -d "$AZ_ROOT" ]; then
     echo "    Agent Zero not found at $AZ_ROOT — cloning upstream..."
-    git clone https://github.com/frdel/agent-zero.git "$AZ_ROOT" 2>&1 | tail -1
+    git clone https://github.com/YOUR_GITHUB_USER/agent-zero.git "$AZ_ROOT" 2>&1 | tail -1
     echo "    + Agent Zero cloned"
 fi
 
@@ -368,6 +368,12 @@ for dir in data logs; do
 done
 
 mkdir -p ~/.genesis 2>/dev/null || true
+
+# Enable Genesis CC hooks on first launch. Without this flag,
+# SessionStart hook exits immediately → no identity injection,
+# no onboarding detection. The /genesis slash command toggles it.
+touch "$HOME/.genesis/cc_context_enabled"
+echo "    + Genesis CC hooks enabled"
 
 
 # ══════════════════════════════════════════════════════════════
@@ -759,6 +765,12 @@ if [ "$SERVICES_CREATED" = "1" ] || [ "${SERVICES_GENERATED:-0}" = "1" ]; then
                 curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1 && break
                 sleep 2
             done
+        fi
+    fi
+
+    if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
+        if systemctl --user enable --now genesis-watchdog.timer 2>/dev/null; then
+            echo "    + genesis-watchdog.timer enabled + started"
         fi
     fi
 
