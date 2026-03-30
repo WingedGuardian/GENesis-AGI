@@ -182,8 +182,11 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     incus config set "$CONTAINER_NAME" limits.cpu "$CPUS"
     echo "  + Resource limits: RAM=$RAM, CPUs=$CPUS"
 
-    # Disk and IOPS limits
-    incus config device set "$CONTAINER_NAME" root size "$DISK" 2>/dev/null || true
+    # Disk: override the root device to actually resize the filesystem.
+    # On LVM-backed pools, the default thin volume is only 10GB.
+    # "device override" resizes the underlying LV + filesystem.
+    incus config device override "$CONTAINER_NAME" root size="$DISK" 2>/dev/null || true
+    # I/O limits
     incus config device set "$CONTAINER_NAME" root limits.read 190MB 2>/dev/null || true
     incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || true
     echo "  + Disk: $DISK, IOPS limits applied"
