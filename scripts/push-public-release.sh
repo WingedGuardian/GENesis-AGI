@@ -16,6 +16,14 @@ COMMIT_MSG="${2:-Genesis v3 — public release update}"
 PUBLIC_REPO="YOUR_GITHUB_USER/genesis-AGI"
 WORK_DIR="$(mktemp -d)/genesis-agi-push"
 
+# Files where the PUBLIC repo version is authoritative.
+# These are never overwritten by the staging dir — the public repo's
+# version always wins. Add files here that are edited directly on the
+# public repo (e.g., README with community-facing content).
+PUBLIC_AUTHORITATIVE=(
+    "README.md"
+)
+
 if [[ -z "$STAGING_DIR" ]]; then
     echo "Usage: $0 <staging-dir> [commit-message]"
     exit 1
@@ -42,22 +50,32 @@ git config user.email "noreply@github.com"
 git config user.name "Genesis Release"
 echo
 
-# --- Identify public-only files (exist in repo but not in staging) ---
-echo "--- Identifying public-only files ---"
-PUBLIC_ONLY=()
+# --- Identify files to preserve from public repo ---
+echo "--- Identifying files to preserve ---"
+PRESERVE_FILES=()
+
+# 1. Public-authoritative files (public repo version always wins)
+for f in "${PUBLIC_AUTHORITATIVE[@]}"; do
+    if [[ -f "$f" ]]; then
+        PRESERVE_FILES+=("$f")
+        echo "  Preserving (authoritative): $f"
+    fi
+done
+
+# 2. Public-only files (exist in repo but not in staging)
 while IFS= read -r -d '' file; do
     rel="${file#./}"
     if [[ ! -e "$STAGING_DIR/$rel" ]]; then
-        PUBLIC_ONLY+=("$rel")
-        echo "  Preserving: $rel"
+        PRESERVE_FILES+=("$rel")
+        echo "  Preserving (public-only): $rel"
     fi
 done < <(find . -not -path './.git/*' -not -path './.git' -not -name '.' -type f -print0)
-echo "  ${#PUBLIC_ONLY[@]} public-only file(s) found"
+echo "  ${#PRESERVE_FILES[@]} file(s) to preserve"
 echo
 
-# --- Save public-only files ---
+# --- Save preserved files ---
 SAVE_DIR="$(mktemp -d)"
-for f in "${PUBLIC_ONLY[@]}"; do
+for f in "${PRESERVE_FILES[@]}"; do
     mkdir -p "$SAVE_DIR/$(dirname "$f")"
     cp "$f" "$SAVE_DIR/$f"
 done
@@ -70,8 +88,8 @@ git ls-files -z | xargs -0 rm -f 2>/dev/null || true
 find . -not -path './.git/*' -not -path './.git' -type d -empty -delete 2>/dev/null || true
 # Copy staging content
 cp -a "$STAGING_DIR/." .
-# Restore public-only files
-for f in "${PUBLIC_ONLY[@]}"; do
+# Restore preserved files
+for f in "${PRESERVE_FILES[@]}"; do
     mkdir -p "$(dirname "$f")"
     cp "$SAVE_DIR/$f" "$f"
 done
@@ -107,7 +125,7 @@ fi
 echo
 echo "=== Push complete ==="
 echo "  Repo: https://github.com/$PUBLIC_REPO"
-echo "  Files preserved: ${#PUBLIC_ONLY[@]}"
+echo "  Files preserved: ${#PRESERVE_FILES[@]}"
 
 # Cleanup
 rm -rf "$SAVE_DIR"
