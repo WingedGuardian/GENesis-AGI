@@ -149,6 +149,12 @@ if command -v ss &>/dev/null; then
 fi
 
 # Python 3.12+
+if ! command -v python3 &>/dev/null; then
+    echo "    python3 not found — installing..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3 > /dev/null 2>&1
+    fi
+fi
 if command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
     if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
@@ -158,7 +164,7 @@ if command -v python3 &>/dev/null; then
         PREFLIGHT_OK=0
     fi
 else
-    echo "    FAIL  python3 not found"
+    echo "    FAIL  python3 not found and could not auto-install"
     PREFLIGHT_OK=0
 fi
 
@@ -214,6 +220,20 @@ if ! command -v curl &>/dev/null; then
         exit 1
     }
     echo "    + curl installed"
+fi
+
+# Node.js (optional but recommended)
+if ! command -v node &>/dev/null; then
+    echo "    Node.js not found — installing..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get install -y -qq nodejs > /dev/null 2>&1 && \
+            echo "    + Node.js installed ($(node --version))" || \
+            echo "    WARNING: Could not install Node.js. Some features may not work."
+    else
+        echo "    WARNING: Node.js not found. Install manually for full functionality."
+    fi
+else
+    echo "    . Node.js $(node --version)"
 fi
 
 # Agent Zero
@@ -852,6 +872,39 @@ else
     echo "    - Skipped (non-interactive mode)."
     echo "    - On first CC session, Genesis will guide you through setup interactively."
     echo "    - Or edit secrets.env manually: $SECRETS_FILE"
+fi
+echo ""
+
+
+# ══════════════════════════════════════════════════════════════
+#  Timezone configuration
+# ══════════════════════════════════════════════════════════════
+echo "  Configuring timezone..."
+
+GENESIS_TIMEZONE=""
+if [ -f "$SECRETS_FILE" ]; then
+    GENESIS_TIMEZONE=$(grep -oP '^USER_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
+    [ -z "$GENESIS_TIMEZONE" ] && GENESIS_TIMEZONE=$(grep -oP '^GENESIS_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
+fi
+if [ -z "$GENESIS_TIMEZONE" ]; then
+    CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
+    if should_prompt; then
+        echo "    Current timezone: $CURRENT_TZ"
+        read -rp "    Enter timezone (e.g. America/New_York) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
+        GENESIS_TIMEZONE="${INPUT_TZ:-$CURRENT_TZ}"
+    else
+        GENESIS_TIMEZONE="$CURRENT_TZ"
+        echo "    Using timezone: $GENESIS_TIMEZONE (non-interactive)"
+    fi
+fi
+if command -v timedatectl &>/dev/null; then
+    sudo timedatectl set-timezone "$GENESIS_TIMEZONE" 2>/dev/null && \
+        echo "    + System timezone set to $GENESIS_TIMEZONE" || \
+        echo "    WARNING: Could not set timezone. Set manually: sudo timedatectl set-timezone $GENESIS_TIMEZONE"
+fi
+if [ -f "$SECRETS_FILE" ] && ! grep -q "^USER_TIMEZONE=" "$SECRETS_FILE" 2>/dev/null; then
+    set_secret "USER_TIMEZONE" "$GENESIS_TIMEZONE" "$SECRETS_FILE"
+    echo "    + Saved to secrets.env"
 fi
 echo ""
 
