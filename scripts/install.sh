@@ -93,12 +93,15 @@ echo ""
 echo "  Pre-flight checks..."
 PREFLIGHT_OK=1
 
-# Disk: >= 15GB free on $HOME (AZ venv ~7GB + Qdrant + Genesis)
+# Disk: >= 5GB free on $HOME (Genesis ~2GB + Qdrant ~1GB + headroom)
+# AZ with torch needs more but torch is optional for cloud-primary setups.
 home_avail_kb=$(df --output=avail "$HOME" 2>/dev/null | tail -1 | tr -d ' ')
-if [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt 15728640 ] 2>/dev/null; then
+if [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt 5242880 ] 2>/dev/null; then
     home_avail_h=$(df -h "$HOME" | tail -1 | awk '{print $4}')
-    echo "    FAIL  Disk: need >= 15GB free on \$HOME, only $home_avail_h available"
+    echo "    FAIL  Disk: need >= 5GB free on \$HOME, only $home_avail_h available"
     PREFLIGHT_OK=0
+elif [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt 10485760 ] 2>/dev/null; then
+    echo "    WARN  Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free (10GB+ recommended)"
 else
     echo "    OK    Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free"
 fi
