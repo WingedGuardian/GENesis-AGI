@@ -466,33 +466,58 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
 
 **Alpha release.** Genesis v3-alpha is feature-complete but actively stabilizing. Expect rough edges, configuration that assumes familiarity with the stack, and bugs that you'll occasionally want to use Genesis' CLI (Claude Code) to diagnose and fix. The good news is: you can simply tell Genesis to iron out its own kinks. If you're comfortable working with a few bumps for the time being, you'll be fine. If you want a more polished experience, check back when we hit beta.
 
-Genesis is a full system, not a pip package. You need two things installed before you start:
+### System requirements
 
-| Prerequisite | Why |
-|---|---|
-| **git** | To clone the repo (`sudo apt install git` on Ubuntu/Debian) |
-| **sudo** | Bootstrap installs system packages (Python venv, pip, Node.js) |
+Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine or container.
 
-Everything else is handled by the bootstrap script automatically.
+| Resource | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
+| **RAM** | 4 GB | 8 GB+ | Genesis itself uses ~200 MB. Qdrant and background tasks benefit from headroom. |
+| **Disk** | 2 GB | 20 GB+ | Fresh install is ~400 MB. Data, logs, and memory grow over time. Production uses 1-2 GB within weeks. |
+| **CPU** | 2 cores | 4 cores | More cores help with concurrent background tasks (awareness loop, reflection, outreach). |
+| **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
 
-| Component | Details | Installed by |
-|---|---|---|
-| **Python 3.12+** | Core runtime | Pre-installed on Ubuntu 24.04 |
-| **python3-venv, pip** | Venv and package management | bootstrap.sh |
-| **Node.js** | Optional, for some features | bootstrap.sh |
-| **Claude Code** | Claude Pro subscription (minimum), Max preferred | You (see [claude.ai/code](https://claude.ai/code)) |
-| **Qdrant** | Vector database for memory (optional, FTS5 fallback) | You (see [qdrant.tech](https://qdrant.tech)) |
-| **Agent Zero** | [frdel/agent-zero](https://github.com/frdel/agent-zero) — current operational layer (being phased out) | You |
+Genesis runs well in LXC/Incus containers, VMs, cloud instances, or bare metal. The deploy test was validated on an Incus container with 4 vCPUs and 8 GB RAM on a Proxmox host.
 
-**Optional:** Local embedding models via [Ollama](https://ollama.com) or any OpenAI-compatible embedding API. Bring your own inference infrastructure if you have it — Genesis adapts to what's available.
+### Prerequisites
+
+You need two things installed before you start. The bootstrap script handles everything else.
 
 ```bash
-git clone https://github.com/WingedGuardian/GENesis-AGI.git
-cd GENesis-AGI
+# Ubuntu/Debian
+sudo apt install git sudo
+
+# Already have both? Skip to the install.
+```
+
+### Install
+
+```bash
+git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis
+cd ~/genesis
 ./scripts/bootstrap.sh
 ```
 
-The bootstrap script installs Python dependencies, sets up the virtual environment, renders configuration files, and configures your timezone. After bootstrap, edit `secrets.env` with your API keys and start Claude Code. The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
+Bootstrap automatically installs Python venv, pip, and Node.js if missing. It also sets up the virtual environment, renders configuration files, and configures your timezone.
+
+### Post-install
+
+1. **Edit API keys:** `nano secrets.env` — at minimum, add your Anthropic API key (or use Claude Code's built-in key via Claude Pro/Max subscription).
+2. **Install Claude Code:** See [claude.ai/code](https://claude.ai/code). Genesis is built to be operated through Claude Code.
+3. **Start:** `claude` from the genesis directory. Genesis hooks and MCP servers activate automatically.
+
+### Optional components
+
+| Component | What it does | Install |
+|---|---|---|
+| **[Qdrant](https://qdrant.tech)** | Vector database for semantic memory search | `docker run -d -p 6333:6333 qdrant/qdrant` |
+| **[Ollama](https://ollama.com)** | Local embedding models (privacy, speed) | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[Agent Zero](https://github.com/frdel/agent-zero)** | Web UI and subordinate agent framework | Clone separately, see architecture docs |
+
+Without Qdrant, Genesis falls back to SQLite FTS5 full-text search for memory. Without Ollama, it uses cloud embedding APIs. Both optional components enhance performance but aren't required to get started.
+
+The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
 ---
 
