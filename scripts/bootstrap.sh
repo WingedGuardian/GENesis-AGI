@@ -14,27 +14,79 @@ echo "Genesis root: $GENESIS_ROOT"
 echo
 
 # --- Prerequisites ---
-echo "--- Checking prerequisites ---"
+echo "--- Checking and installing prerequisites ---"
 
-if ! command -v python3 &>/dev/null; then
-    echo "ERROR: Python 3 not found. Install Python 3.12+."
-    exit 1
+# Detect package manager
+if command -v apt-get &>/dev/null; then
+    PKG_MGR="apt"
+elif command -v dnf &>/dev/null; then
+    PKG_MGR="dnf"
+elif command -v yum &>/dev/null; then
+    PKG_MGR="yum"
+else
+    PKG_MGR=""
 fi
 
+install_pkg() {
+    local pkg="$1"
+    if [[ -z "$PKG_MGR" ]]; then
+        echo "  ERROR: No package manager found. Install $pkg manually."
+        return 1
+    fi
+    echo "  Installing $pkg..."
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq "$pkg" > /dev/null 2>&1
+    else
+        sudo "$PKG_MGR" install -y -q "$pkg" > /dev/null 2>&1
+    fi
+}
+
+# Python 3
+if ! command -v python3 &>/dev/null; then
+    echo "  Python 3 not found — installing..."
+    install_pkg python3 || { echo "ERROR: Could not install Python 3."; exit 1; }
+fi
 PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo "  Python: $PYTHON_VERSION"
 
-if ! command -v node &>/dev/null; then
-    echo "WARNING: Node.js not found. Some features may not work."
-else
-    echo "  Node: $(node --version)"
+# python3-venv (needed for venv creation on Debian/Ubuntu)
+if [[ "$PKG_MGR" == "apt" ]]; then
+    if ! python3 -c "import ensurepip" &>/dev/null; then
+        echo "  python3-venv not found — installing..."
+        install_pkg "python${PYTHON_VERSION}-venv" || install_pkg python3-venv || {
+            echo "ERROR: Could not install python3-venv."
+            exit 1
+        }
+    fi
 fi
 
+# pip (may be missing on minimal installs)
+if ! python3 -m pip --version &>/dev/null; then
+    echo "  pip not found — installing..."
+    install_pkg python3-pip || { echo "WARNING: Could not install pip. Venv install may fail."; }
+fi
+
+# git
 if ! command -v git &>/dev/null; then
-    echo "ERROR: git not found."
-    exit 1
+    echo "  git not found — installing..."
+    install_pkg git || { echo "ERROR: Could not install git."; exit 1; }
 fi
 echo "  git: $(git --version | head -1)"
+
+# Node.js (optional but recommended)
+if ! command -v node &>/dev/null; then
+    echo "  Node.js not found — installing..."
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        install_pkg nodejs || echo "  WARNING: Could not install Node.js. Some features may not work."
+    else
+        install_pkg nodejs || echo "  WARNING: Could not install Node.js. Some features may not work."
+    fi
+fi
+if command -v node &>/dev/null; then
+    echo "  Node: $(node --version)"
+else
+    echo "  Node: not available (optional)"
+fi
 echo
 
 # --- Python venv ---
