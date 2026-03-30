@@ -496,16 +496,19 @@ sudo apt install git sudo
 ```bash
 git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis
 cd ~/genesis
-./scripts/bootstrap.sh
+./scripts/install.sh
 ```
 
-Bootstrap automatically installs Python venv, pip, and Node.js if missing. It also sets up the virtual environment, renders configuration files, and configures your timezone.
+The install script handles the full setup end-to-end: system prerequisites, Python environment, [Agent Zero](https://github.com/frdel/agent-zero) integration, Qdrant vector database, systemd services, Claude Code installation, API key configuration, timezone, and a smoke test to verify everything works. It's interactive by default (prompts for API keys and preferences) or can run headless with `--non-interactive`.
 
-### Post-install
+After install completes, start Claude Code from the genesis directory:
 
-1. **Edit API keys:** `nano secrets.env` — at minimum, add your Anthropic API key (or use Claude Code's built-in key via Claude Pro/Max subscription).
-2. **Install Claude Code:** See [claude.ai/code](https://claude.ai/code). Genesis is built to be operated through Claude Code.
-3. **Start:** `claude` from the genesis directory. Genesis hooks and MCP servers activate automatically.
+```bash
+cd ~/genesis
+claude
+```
+
+Genesis hooks and MCP servers activate automatically when Claude Code starts.
 
 ### Optional components
 
