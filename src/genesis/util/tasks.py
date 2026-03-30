@@ -115,7 +115,7 @@ def emit_sync(
     from genesis.observability.types import Severity
     from genesis.observability.types import Subsystem as Sub
 
-    sev = Severity(severity_str) if severity_str in Severity.__members__ else Severity.ERROR
+    sev = Severity[severity_str] if severity_str in Severity.__members__ else Severity.ERROR
     sub = subsystem or Sub.HEALTH
 
     try:

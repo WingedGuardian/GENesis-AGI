@@ -72,7 +72,26 @@ class TestHealthStatus:
         })
         health_mcp.init_health_mcp(svc)
         result = await _impl_health_status()
-        assert result["provider_summary"] == "1/3 call sites healthy"
+        assert result["provider_summary"] == "1/3 call sites ok, 1 degraded, 1 down"
+
+    @pytest.mark.asyncio
+    async def test_provider_summary_standalone_statuses(self):
+        """Standalone MCP uses active/idle/stale instead of healthy/degraded/down."""
+        svc = _mock_service({
+            "call_sites": {
+                "a": {"status": "active"},
+                "b": {"status": "idle"},
+                "c": {"status": "stale"},
+            },
+            "cc_sessions": {},
+            "infrastructure": {},
+            "queues": {},
+            "cost": {},
+            "surplus": {},
+        })
+        health_mcp.init_health_mcp(svc)
+        result = await _impl_health_status()
+        assert result["provider_summary"] == "1/3 call sites ok, 1 idle, 1 stale"
 
     @pytest.mark.asyncio
     async def test_includes_all_sections(self):
