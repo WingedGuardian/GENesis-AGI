@@ -244,7 +244,7 @@ fi
 # Agent Zero
 if [ ! -d "$AZ_ROOT" ]; then
     echo "    Agent Zero not found at $AZ_ROOT — cloning upstream..."
-    GIT_TERMINAL_PROMPT=0 git clone https://github.com/YOUR_GITHUB_USER/agent-zero.git "$AZ_ROOT" 2>&1 | tail -1
+    GIT_TERMINAL_PROMPT=0 git clone https://github.com/WingedGuardian/agent-zero.git "$AZ_ROOT" 2>&1 | tail -1
     echo "    + Agent Zero cloned"
 fi
 

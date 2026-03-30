@@ -13,7 +13,7 @@ set -euo pipefail
 
 STAGING_DIR="${1:-}"
 COMMIT_MSG="${2:-Genesis v3 — public release update}"
-PUBLIC_REPO="YOUR_GITHUB_USER/genesis-AGI"
+PUBLIC_REPO="WingedGuardian/GENesis-AGI"
 WORK_DIR="$(mktemp -d)/genesis-agi-push"
 
 # Files where the PUBLIC repo version is authoritative.

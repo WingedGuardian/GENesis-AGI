@@ -678,7 +678,7 @@ class TestWebFetchHookAllowedUrls:
         "url",
         [
             "https://example.com",
-            "https://github.com/YOUR_GITHUB_USER/genesis",
+            "https://github.com/WingedGuardian/Genesis",
             "https://docs.python.org/3/library/asyncio.html",
             "https://api.openai.com/v1/models",
             "https://www.google.com/search?q=python",

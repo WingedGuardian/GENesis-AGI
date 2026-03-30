@@ -51,7 +51,7 @@ cd ~
 git clone --depth=1 https://github.com/frdel/agent-zero.git
 
 # Genesis v3 project
-git clone https://github.com/YOUR_GITHUB_USER/genesis.git genesis
+git clone https://github.com/WingedGuardian/Genesis.git genesis
 ```
 
 ## Step 6: Python Virtual Environment
