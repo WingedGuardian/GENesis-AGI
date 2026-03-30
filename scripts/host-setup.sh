@@ -220,24 +220,31 @@ if echo "$REPO_URL" | grep -q "github.com" && ! curl -sf "$REPO_URL" >/dev/null 
     echo "        incus exec $CONTAINER_NAME --user $UBUNTU_UID -t -- bash"
 fi
 
+# NOTE: The bash -c uses single quotes so /home/ubuntu paths survive the
+# prepare-public-release.sh sed replacement (which converts /home/ubuntu/ to
+# ${HOME}/ — that would break in double-quoted strings on a non-ubuntu host).
+# BRANCH and REPO_URL are injected via --env instead.
 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
-    --env "HOME=/home/ubuntu" -- bash -c "
-    if [ -d ${HOME}/genesis ]; then
-        echo '    . Genesis repo already exists'
-        cd ${HOME}/genesis && git pull --ff-only 2>/dev/null || true
+    --env "HOME=/home/ubuntu" \
+    --env "_BRANCH=$BRANCH" --env "_REPO_URL=$REPO_URL" -- \
+    bash -c '
+    _DEST=/home/ubuntu/genesis
+    if [ -d "$_DEST" ]; then
+        echo "    . Genesis repo already exists"
+        cd "$_DEST" && git pull --ff-only 2>/dev/null || true
     else
-        GIT_TERMINAL_PROMPT=0 git clone --branch '$BRANCH' '$REPO_URL' ${HOME}/genesis 2>&1 | tail -3
+        GIT_TERMINAL_PROMPT=0 git clone --branch "$_BRANCH" "$_REPO_URL" "$_DEST" 2>&1 | tail -3
     fi
-" || {
+' || {
     echo "  WARNING: Git clone failed (private repo?)"
     echo "  You can push the code manually:"
-    echo "    incus file push -r . ${CONTAINER_NAME}${HOME}/genesis/"
+    echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
     echo "  Then run install.sh inside the container."
 }
 
 # ── Run install.sh inside container ──────────────────────────
 # Guard: only run if the repo actually exists
-if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -- test -f ${HOME}/genesis/scripts/install.sh; then
+if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -- test -f /home/ubuntu/genesis/scripts/install.sh; then
     echo ""
     echo "  Running install.sh inside container..."
     echo "  ─────────────────────────────────────────"
@@ -247,7 +254,7 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -- test -f ${HOME}/genesis/
     [ "$NON_INTERACTIVE" = "1" ] && _install_flags="--non-interactive"
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
-    incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -t --cwd ${HOME}/genesis -- \
+    incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" -t --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
         echo "  WARNING: install.sh exited with errors."
@@ -258,8 +265,8 @@ else
     echo ""
     echo "  ERROR: Genesis repo not found in container."
     echo "  Push the code manually, then run install.sh:"
-    echo "    incus file push -r . ${CONTAINER_NAME}${HOME}/genesis/"
-    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID -t --cwd ${HOME}/genesis -- bash scripts/install.sh"
+    echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
+    echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
 # ── Install Guardian on host ───────────────────────────────────
@@ -270,36 +277,20 @@ echo "  Installing Guardian (host-side health monitor)..."
 echo "  ─────────────────────────────────────────"
 echo ""
 
-# Guardian install script is in the Genesis repo (already cloned to INSTALL_DIR or container)
-_guardian_script="$HOME/.local/share/genesis-guardian/scripts/install_guardian.sh"
+# Run install_guardian.sh from the LOCAL checkout (this repo).
+# install_guardian.sh copies code from its parent dir into ~/.local/share/genesis-guardian.
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_guardian_script="$_SCRIPT_DIR/install_guardian.sh"
 if [ -f "$_guardian_script" ]; then
     _guardian_flags="--container-name $CONTAINER_NAME"
-    [ -n "$REPO_URL" ] && _guardian_flags="$_guardian_flags --repo-url $REPO_URL"
     [ "$NON_INTERACTIVE" = "1" ] && _guardian_flags="$_guardian_flags --non-interactive"
     # shellcheck disable=SC2086
     bash "$_guardian_script" $_guardian_flags || {
         echo "  WARNING: Guardian installation failed."
-        echo "  Run manually later: bash scripts/install_guardian.sh --container-name $CONTAINER_NAME"
+        echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
     }
 else
-    # Guardian not yet cloned — clone it then install
-    _GUARDIAN_DIR="$HOME/.local/share/genesis-guardian"
-    if [ ! -d "$_GUARDIAN_DIR/.git" ]; then
-        echo "  Cloning Genesis repo for Guardian..."
-        git clone "$REPO_URL" "$_GUARDIAN_DIR" 2>&1 | tail -3 || true
-    fi
-    if [ -f "$_GUARDIAN_DIR/scripts/install_guardian.sh" ]; then
-        _guardian_flags="--container-name $CONTAINER_NAME"
-        [ -n "$REPO_URL" ] && _guardian_flags="$_guardian_flags --repo-url $REPO_URL"
-        [ "$NON_INTERACTIVE" = "1" ] && _guardian_flags="$_guardian_flags --non-interactive"
-        # shellcheck disable=SC2086
-        bash "$_GUARDIAN_DIR/scripts/install_guardian.sh" $_guardian_flags || {
-            echo "  WARNING: Guardian installation failed."
-            echo "  Run manually later: bash $_GUARDIAN_DIR/scripts/install_guardian.sh --container-name $CONTAINER_NAME"
-        }
-    else
-        echo "  WARNING: Guardian install script not found. Install manually later."
-    fi
+    echo "  WARNING: Guardian install script not found at $_guardian_script"
 fi
 
 # ── Report ───────────────────────────────────────────────────
