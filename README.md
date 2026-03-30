@@ -473,12 +473,12 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 | Resource | Minimum | Recommended | Notes |
 |---|---|---|---|
 | **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
-| **RAM** | 4 GB | 8 GB+ | Genesis itself uses ~200 MB. Qdrant and background tasks benefit from headroom. |
-| **Disk** | 2 GB | 20 GB+ | Fresh install is ~400 MB. Data, logs, and memory grow over time. Production uses 1-2 GB within weeks. |
-| **CPU** | 2 cores | 4 cores | More cores help with concurrent background tasks (awareness loop, reflection, outreach). |
+| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. |
+| **Disk** | 10 GB | 40 GB+ | Fresh install is ~400 MB. Qdrant data, logs, memory, and model caches grow steadily. Production uses 2-5 GB within weeks, more with active memory. |
+| **CPU** | 2 cores | 4-8 cores | Concurrent background tasks (awareness loop, reflection, outreach, triage) benefit from parallelism. |
 | **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
 
-Genesis runs well in LXC/Incus containers, VMs, cloud instances, or bare metal. The deploy test was validated on an Incus container with 4 vCPUs and 8 GB RAM on a Proxmox host.
+Genesis runs best in an LXC/Incus container or VM — this is the tested and recommended deployment. Container deployment enables the Guardian health monitor, which runs on the host and watches the container for issues. The deploy test was validated on an Incus container (4 vCPUs, 8 GB RAM) on a Proxmox VM host.
 
 ### Prerequisites
 
