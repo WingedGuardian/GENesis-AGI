@@ -19,22 +19,6 @@ async def _impl_health_status() -> dict:
         return {"status": "unavailable", "message": "HealthDataService not initialized"}
 
     snap = await _service.snapshot()
-    call_sites = snap.get("call_sites", {})
-    total = len(call_sites)
-    # Count by status — supports both live ("healthy"/"degraded"/"down")
-    # and standalone ("active"/"idle"/"stale") status values
-    status_counts: dict[str, int] = {}
-    for s in call_sites.values():
-        st = s.get("status", "unknown")
-        status_counts[st] = status_counts.get(st, 0) + 1
-    healthy = status_counts.get("healthy", 0)
-    active = status_counts.get("active", 0)
-    ok_count = healthy + active
-    summary_parts = [f"{ok_count}/{total} call sites ok"]
-    for label in ("idle", "stale", "degraded", "down"):
-        cnt = status_counts.get(label, 0)
-        if cnt:
-            summary_parts.append(f"{cnt} {label}")
 
     provider_activity = []
     if _activity_tracker and hasattr(_activity_tracker, "summary"):
@@ -44,7 +28,6 @@ async def _impl_health_status() -> dict:
             logger.warning("Failed to get provider activity summary", exc_info=True)
 
     return {
-        "provider_summary": ", ".join(summary_parts),
         "cc_sessions": snap.get("cc_sessions", {}),
         "infrastructure": snap.get("infrastructure", {}),
         "queues": snap.get("queues", {}),

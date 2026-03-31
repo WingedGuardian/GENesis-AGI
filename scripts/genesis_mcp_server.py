@@ -236,10 +236,21 @@ def main(argv: list[str] | None = None) -> None:
         stream=sys.stderr,  # MCP uses stdout for protocol; logs go to stderr
     )
 
-    # Load infrastructure URLs (not API keys) from secrets.env so MCP servers
-    # can reach Ollama, Qdrant, etc. without hardcoding addresses.
-    # Only allowlisted non-secret vars are imported — API keys stay out.
-    _INFRA_VARS = {"OLLAMA_URL", "QDRANT_URL", "GENESIS_DB_PATH", "GENESIS_CC_PROJECT_ID"}
+    # Load infrastructure URLs and provider API keys from secrets.env.
+    # MCP servers need these to reach Ollama, Qdrant, and embedding APIs.
+    # Principle of least privilege: only load vars the MCP servers actually use.
+    # Without the API keys, EmbeddingProvider gets zero backends and silently degrades.
+    _MCP_VARS = {
+        # Infrastructure
+        "OLLAMA_URL", "QDRANT_URL", "GENESIS_DB_PATH", "GENESIS_CC_PROJECT_ID",
+        # Embedding providers (required for memory MCP)
+        "API_KEY_DEEPINFRA", "API_KEY_QWEN",
+        # LLM providers (used by recon/outreach MCP tools)
+        "GOOGLE_API_KEY", "API_KEY_GROQ", "API_KEY_MISTRAL", "API_KEY_OPENROUTER",
+        "API_KEY_DEEPSEEK",
+        # Ollama config
+        "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+    }
     from genesis.env import secrets_path
 
     secrets = secrets_path()
@@ -249,7 +260,7 @@ def main(argv: list[str] | None = None) -> None:
         from dotenv import dotenv_values
 
         for key, value in dotenv_values(secrets).items():
-            if key in _INFRA_VARS and key not in os.environ and value:
+            if key in _MCP_VARS and key not in os.environ and value:
                 os.environ[key] = value
 
     if not is_genesis_enabled():
