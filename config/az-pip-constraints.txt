@@ -1,0 +1,4 @@
+# Constraints for AZ requirements to resolve version conflicts.
+# AZ pins openai==1.x but Genesis needs openai>=2.0 for the v2 API.
+# This file is passed via pip install --constraint to override AZ's pins.
+openai>=2.0,<3.0

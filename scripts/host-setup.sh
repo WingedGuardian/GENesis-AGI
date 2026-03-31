@@ -314,11 +314,24 @@ _guardian_script="$_SCRIPT_DIR/install_guardian.sh"
 if [ -f "$_guardian_script" ]; then
     _guardian_flags="--container-name $CONTAINER_NAME"
     [ "$NON_INTERACTIVE" = "1" ] && _guardian_flags="$_guardian_flags --non-interactive"
+    # Guardian uses systemctl --user, which needs the invoking user's session
+    # bus — not root's. When run via sudo, drop back to the original user.
     # shellcheck disable=SC2086
-    bash "$_guardian_script" $_guardian_flags || {
-        echo "  WARNING: Guardian installation failed."
-        echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
-    }
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        _guardian_uid=$(id -u "$SUDO_USER")
+        sudo -u "$SUDO_USER" \
+            XDG_RUNTIME_DIR="/run/user/$_guardian_uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_guardian_uid/bus" \
+            bash "$_guardian_script" $_guardian_flags || {
+            echo "  WARNING: Guardian installation failed."
+            echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
+        }
+    else
+        bash "$_guardian_script" $_guardian_flags || {
+            echo "  WARNING: Guardian installation failed."
+            echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
+        }
+    fi
 else
     echo "  WARNING: Guardian install script not found at $_guardian_script"
 fi

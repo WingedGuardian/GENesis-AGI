@@ -21,6 +21,9 @@ Environment=PATH=__VENV__/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=TG_ADAPTER=v2
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
 
 [Install]
 WantedBy=default.target

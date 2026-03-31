@@ -673,7 +673,7 @@ git log --oneline -6
 After this plan is complete, setting up Genesis on a new machine is:
 
 ```bash
-git clone git@github.com:YOUR_GITHUB_USER/genesis.git ~/genesis
+git clone git@github.com:YOUR_GITHUB_USER/GENesis.git ~/genesis
 cd ~/genesis
 python -m venv .venv && source .venv/bin/activate && pip install -e .
 python scripts/setup_claude_config.py

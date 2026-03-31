@@ -93,14 +93,21 @@ echo ""
 echo "  Pre-flight checks..."
 PREFLIGHT_OK=1
 
+# Size constants (KB)
+_KB_PER_GB=1048576
+_MIN_DISK_KB=$(( 5 * _KB_PER_GB ))   # 5GB
+_WARN_DISK_KB=$(( 10 * _KB_PER_GB )) # 10GB
+_MIN_RAM_KB=$(( 2 * _KB_PER_GB ))    # 2GB
+_WARN_RAM_KB=$(( 4 * _KB_PER_GB ))   # 4GB
+
 # Disk: >= 5GB free on $HOME (Genesis ~2GB + Qdrant ~1GB + headroom)
 # AZ with torch needs more but torch is optional for cloud-primary setups.
 home_avail_kb=$(df --output=avail "$HOME" 2>/dev/null | tail -1 | tr -d ' ')
-if [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt 5242880 ] 2>/dev/null; then
+if [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt "$_MIN_DISK_KB" ] 2>/dev/null; then
     home_avail_h=$(df -h "$HOME" | tail -1 | awk '{print $4}')
     echo "    FAIL  Disk: need >= 5GB free on \$HOME, only $home_avail_h available"
     PREFLIGHT_OK=0
-elif [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt 10485760 ] 2>/dev/null; then
+elif [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt "$_WARN_DISK_KB" ] 2>/dev/null; then
     echo "    WARN  Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free (10GB+ recommended)"
 else
     echo "    OK    Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free"
@@ -109,11 +116,11 @@ fi
 # RAM
 mem_total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
 if [ -n "${mem_total_kb:-}" ]; then
-    mem_total_gb=$((mem_total_kb / 1048576))
-    if [ "$mem_total_kb" -lt 2097152 ]; then
+    mem_total_gb=$((mem_total_kb / _KB_PER_GB))
+    if [ "$mem_total_kb" -lt "$_MIN_RAM_KB" ]; then
         echo "    FAIL  RAM: ${mem_total_gb}GB (need >= 2GB)"
         PREFLIGHT_OK=0
-    elif [ "$mem_total_kb" -lt 4194304 ]; then
+    elif [ "$mem_total_kb" -lt "$_WARN_RAM_KB" ]; then
         echo "    WARN  RAM: ${mem_total_gb}GB (Genesis will work but may be slow)"
     elif [ "$mem_total_kb" -lt 8388608 ]; then
         echo "    OK    RAM: ${mem_total_gb}GB (8GB+ recommended for torch models)"
@@ -149,6 +156,8 @@ if command -v ss &>/dev/null; then
             echo "    WARN  Port $port already in use"
         fi
     done
+else
+    echo "    WARN  'ss' not found — cannot check for port conflicts"
 fi
 
 # Python 3.12+
@@ -261,14 +270,21 @@ if ! "$VENV_PATH/bin/python" -c "import flask" &>/dev/null 2>&1; then
     "$VENV_PATH/bin/pip" install --upgrade pip --quiet 2>&1 | tail -1 || true
     # Filter out torch and openai-whisper — they pull ~2GB and are only needed
     # for local STT. whisper.py is patched below to lazy-import.
+    _az_filtered=$(mktemp)
+    trap "rm -f '$_az_filtered'" EXIT
     grep -v -iE '^(torch|openai-whisper|torchaudio|torchvision)' "$AZ_ROOT/requirements.txt" \
-        > /tmp/az-requirements-filtered.txt
-    "$VENV_PATH/bin/pip" install -r /tmp/az-requirements-filtered.txt --quiet 2>&1 | tail -3 || {
+        > "$_az_filtered"
+    # Use constraints to resolve version conflicts (AZ pins openai 1.x, Genesis needs 2.x)
+    _constraints="$REPO_DIR/config/az-pip-constraints.txt"
+    _constraint_flag=""
+    [ -f "$_constraints" ] && _constraint_flag="--constraint $_constraints"
+    # shellcheck disable=SC2086
+    "$VENV_PATH/bin/pip" install -r "$_az_filtered" $_constraint_flag --quiet 2>&1 | tail -3 || {
         echo "    WARNING: Some AZ requirements failed to install."
-        echo "    Try manually: $VENV_PATH/bin/pip install -r /tmp/az-requirements-filtered.txt"
+        echo "    Try manually: $VENV_PATH/bin/pip install -r $AZ_ROOT/requirements.txt"
         SETUP_WARNINGS=1
     }
-    rm -f /tmp/az-requirements-filtered.txt
+    rm -f "$_az_filtered"
     echo "    + Agent Zero requirements installed (torch excluded — cloud STT only)"
 else
     echo "    . Agent Zero venv OK"
@@ -330,7 +346,7 @@ echo "  [1/$TOTAL_STEPS] Installing git hooks..."
 
 HOOKS_SRC="$REPO_DIR/scripts/hooks"
 # Handle both regular repos (.git/hooks) and worktrees (.git is a file)
-GIT_COMMON_DIR=$(cd "$REPO_DIR" && git rev-parse --git-common-dir 2>/dev/null | xargs realpath 2>/dev/null || echo "")
+GIT_COMMON_DIR=$(cd "$REPO_DIR" && _gcd=$(git rev-parse --git-common-dir 2>/dev/null) && cd "$_gcd" && pwd || echo "")
 if [ -n "$GIT_COMMON_DIR" ] && [ -d "$GIT_COMMON_DIR/hooks" ]; then
     HOOKS_DST="$GIT_COMMON_DIR/hooks"
 elif [ -d "$REPO_DIR/.git/hooks" ]; then
@@ -648,6 +664,8 @@ else
 storage:
   storage_path: $HOME/.qdrant/storage
 service:
+  # Bind to localhost only for security (prevents external access).
+  # To allow remote access, change to 0.0.0.0 and add authentication.
   host: 127.0.0.1
   http_port: 6333
   grpc_port: 6334
@@ -700,17 +718,22 @@ elif [ -n "$QDRANT_BIN" ] && [ ! -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
 [Unit]
 Description=Qdrant Vector Database
 After=network.target
+StartLimitBurst=4
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
-ExecStart=$QDRANT_BIN --config-path $HOME/.qdrant/config.yaml
-Restart=always
+ExecStart="$QDRANT_BIN" "--config-path" "$HOME/.qdrant/config.yaml"
+Restart=on-failure
 RestartSec=5
 MemoryMax=4G
 LimitNOFILE=65536
 OOMScoreAdjust=-500
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
 
 [Install]
 WantedBy=default.target
@@ -760,11 +783,19 @@ if [ "$SERVICES_CREATED" = "1" ] || [ "${SERVICES_GENERATED:-0}" = "1" ]; then
             else
                 echo "    WARNING: could not start qdrant"
             fi
-            # Wait for Qdrant to initialize (retry up to 10s)
-            for _i in 1 2 3 4 5; do
-                curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1 && break
+            # Wait for Qdrant to initialize (retry up to 30s)
+            _qdrant_ready=0
+            for _i in $(seq 1 15); do
+                if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
+                    _qdrant_ready=1
+                    echo "    + Qdrant ready"
+                    break
+                fi
                 sleep 2
             done
+            if [ "$_qdrant_ready" = "0" ]; then
+                echo "    WARNING: Qdrant not responding after 30s — check: journalctl --user -u qdrant"
+            fi
         fi
     fi
 
