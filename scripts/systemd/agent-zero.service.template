@@ -1,6 +1,7 @@
 [Unit]
 Description=Agent Zero Web UI (Genesis)
 After=network.target qdrant.service
+Wants=qdrant.service
 StartLimitBurst=4
 StartLimitIntervalSec=120
 
@@ -16,6 +17,9 @@ LimitNOFILE=65536
 OOMScoreAdjust=-500
 StandardOutput=journal
 StandardError=journal
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
 
 [Install]
 WantedBy=default.target
