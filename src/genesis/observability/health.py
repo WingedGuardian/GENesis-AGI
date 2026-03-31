@@ -306,6 +306,24 @@ async def probe_guardian(
     start = time.monotonic()
     path = Path(heartbeat_path) if heartbeat_path else Path.home() / ".genesis" / "guardian_heartbeat.json"
 
+    # Check if Genesis is paused — Guardian stops writing heartbeats when
+    # Genesis is paused (by design). Report DEGRADED, not DOWN.
+    pause_path = path.parent / "paused.json"
+    try:
+        pause_data = json.loads(pause_path.read_text())
+        if pause_data.get("paused"):
+            latency = (time.monotonic() - start) * 1000
+            return ProbeResult(
+                name="guardian",
+                status=ProbeStatus.DEGRADED,
+                latency_ms=round(latency, 2),
+                message="Guardian paused",
+                checked_at=_clock().isoformat(),
+                details={"paused": True},
+            )
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        pass  # Not paused or file unreadable — proceed with normal check
+
     try:
         raw = path.read_text()
         data = json.loads(raw)

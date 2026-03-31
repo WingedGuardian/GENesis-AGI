@@ -106,6 +106,56 @@ class TestProbeGuardian:
         assert result.status == ProbeStatus.DEGRADED
 
     @pytest.mark.asyncio
+    async def test_paused_returns_degraded(self, tmp_path: Path) -> None:
+        """When Genesis is paused, probe returns DEGRADED with 'Guardian paused'."""
+        now = datetime.now(UTC)
+        old = now - timedelta(seconds=9999)  # Very stale — would be DOWN normally
+        hb_file = tmp_path / "guardian_heartbeat.json"
+        hb_file.write_text(json.dumps({
+            "guardian_alive": True,
+            "timestamp": old.isoformat(),
+        }))
+        # Create paused.json in the same directory
+        pause_file = tmp_path / "paused.json"
+        pause_file.write_text(json.dumps({"paused": True, "reason": "Dashboard toggle"}))
+
+        result = await probe_guardian(hb_file, clock=lambda: now)
+        assert result.status == ProbeStatus.DEGRADED
+        assert result.message == "Guardian paused"
+        assert result.details.get("paused") is True
+
+    @pytest.mark.asyncio
+    async def test_paused_corrupt_json_falls_through(self, tmp_path: Path) -> None:
+        """Corrupt paused.json should fall through to normal staleness check."""
+        now = datetime.now(UTC)
+        hb_file = tmp_path / "guardian_heartbeat.json"
+        hb_file.write_text(json.dumps({
+            "guardian_alive": True,
+            "timestamp": now.isoformat(),
+        }))
+        pause_file = tmp_path / "paused.json"
+        pause_file.write_text("not json{{{")
+
+        result = await probe_guardian(hb_file, clock=lambda: now)
+        assert result.status == ProbeStatus.HEALTHY  # Falls through to normal check
+
+    @pytest.mark.asyncio
+    async def test_paused_false_still_checks_staleness(self, tmp_path: Path) -> None:
+        """paused.json with paused=false should not short-circuit."""
+        now = datetime.now(UTC)
+        old = now - timedelta(seconds=400)
+        hb_file = tmp_path / "guardian_heartbeat.json"
+        hb_file.write_text(json.dumps({
+            "guardian_alive": True,
+            "timestamp": old.isoformat(),
+        }))
+        pause_file = tmp_path / "paused.json"
+        pause_file.write_text(json.dumps({"paused": False}))
+
+        result = await probe_guardian(hb_file, clock=lambda: now)
+        assert result.status == ProbeStatus.DOWN  # Normal staleness check
+
+    @pytest.mark.asyncio
     async def test_staleness_in_details(self, tmp_path: Path) -> None:
         now = datetime.now(UTC)
         hb_file = tmp_path / "guardian_heartbeat.json"

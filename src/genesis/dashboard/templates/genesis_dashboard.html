@@ -2127,6 +2127,12 @@
           Health data stale — API unreachable. Data shown may be outdated.
         </div>
       </template>
+      <!-- Genesis paused banner -->
+      <template x-if="$store.genesisDashboard.pauseState.paused">
+        <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;">
+          Genesis is paused — background processing suspended. Use the pause button or /pause off in Telegram to resume.
+        </div>
+      </template>
       <!-- Resilience degradation banner -->
       <template x-if="$store.genesisDashboard.health.resilience && $store.genesisDashboard.health.resilience !== 'L0' && $store.genesisDashboard.health.resilience !== 'not configured'">
         <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;`"
