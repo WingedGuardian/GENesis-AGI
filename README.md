@@ -236,7 +236,7 @@ But what if the Guardian itself fails?
 
 Genesis watches the Guardian right back. If the Guardian heartbeat goes stale, Genesis auto-restarts it over SSH. Guardian watches Genesis. Genesis watches Guardian. The loop closes itself. Deploy with `scripts/install_guardian.sh`. Escalation to you via Telegram happens only when it genuinely needs approval (in the current V3 Alpha, the Guardian will always wait for approval before taking any action--no accidental misfires).
 
-We believe that if something were truly worthy of the title of "AGI," you shouldn't have to fix it. Let Genesis fix Genesis. If it can't, the Guardian will. If the Guardian goes down, Genesis will handle it. The cognitive architecture never runs unprotected.
+We believe that if something were truly worthy of the title of "AGI," you wouldn't have to fix it. Let Genesis fix Genesis. If it can't, the Guardian will. If the Guardian goes down, Genesis will handle it. The cognitive architecture never runs unprotected.
 
 ---
 
@@ -546,8 +546,6 @@ The complete design lives in [`docs/architecture/`](docs/architecture/):
 ---
 
 ## Get involved 🤝
-
-Genesis is open source under the [MIT License](LICENSE).
 
 V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates — whether it's the memory architecture, the cognitive cycle, the autonomy model, or the audacity of building a self-evolving agent — there's work to do.
 
