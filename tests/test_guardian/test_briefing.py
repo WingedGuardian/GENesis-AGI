@@ -1,0 +1,188 @@
+"""Tests for Guardian briefing — shared filesystem bridge."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+from genesis.guardian.briefing import (
+    BriefingContent,
+    _render_briefing_markdown,
+    read_guardian_briefing,
+    write_guardian_briefing,
+)
+
+
+class TestWriteGuardianBriefing:
+    """Test briefing file generation."""
+
+    def test_writes_md_file(self, tmp_path: Path) -> None:
+        path = write_guardian_briefing(briefing_dir=tmp_path)
+        assert path.exists()
+        assert path.name == "guardian_briefing.md"
+
+    def test_writes_json_file(self, tmp_path: Path) -> None:
+        write_guardian_briefing(briefing_dir=tmp_path)
+        json_path = tmp_path / "guardian_briefing.json"
+        assert json_path.exists()
+        data = json.loads(json_path.read_text())
+        assert "generated_at" in data
+        assert "service_baseline" in data
+
+    def test_creates_directory(self, tmp_path: Path) -> None:
+        out_dir = tmp_path / "deep" / "nested" / "dir"
+        write_guardian_briefing(briefing_dir=out_dir)
+        assert out_dir.exists()
+
+    def test_custom_content(self, tmp_path: Path) -> None:
+        content = BriefingContent(
+            generated_at="2026-04-02T12:00:00Z",
+            genesis_version="abc123",
+            service_baseline={"test-svc": "test service"},
+            notes=["test note"],
+        )
+        path = write_guardian_briefing(briefing_dir=tmp_path, content=content)
+        text = path.read_text()
+        assert "abc123" in text
+        assert "test-svc" in text
+        assert "test note" in text
+
+    def test_default_content_has_baselines(self, tmp_path: Path) -> None:
+        path = write_guardian_briefing(briefing_dir=tmp_path)
+        text = path.read_text()
+        assert "genesis-bridge" in text
+        assert "qdrant" in text
+        assert "awareness_tick_interval" in text
+
+
+class TestReadGuardianBriefing:
+    """Test briefing file reading with freshness checks."""
+
+    def test_reads_fresh_file(self, tmp_path: Path) -> None:
+        md_path = tmp_path / "guardian_briefing.md"
+        md_path.write_text("# Test briefing\nSome content here.")
+        result = read_guardian_briefing(md_path, max_age_s=600)
+        assert result is not None
+        assert "Test briefing" in result
+
+    def test_returns_none_for_missing_file(self, tmp_path: Path) -> None:
+        result = read_guardian_briefing(tmp_path / "nonexistent.md")
+        assert result is None
+
+    def test_returns_none_for_empty_file(self, tmp_path: Path) -> None:
+        md_path = tmp_path / "guardian_briefing.md"
+        md_path.write_text("")
+        result = read_guardian_briefing(md_path)
+        assert result is None
+
+    def test_returns_none_for_stale_file(self, tmp_path: Path) -> None:
+        md_path = tmp_path / "guardian_briefing.md"
+        md_path.write_text("# Old briefing")
+        # Backdate the file modification time
+        old_time = time.time() - 700  # 700s ago
+        import os
+        os.utime(md_path, (old_time, old_time))
+        result = read_guardian_briefing(md_path, max_age_s=600)
+        assert result is None
+
+    def test_respects_custom_max_age(self, tmp_path: Path) -> None:
+        md_path = tmp_path / "guardian_briefing.md"
+        md_path.write_text("# Recent briefing")
+        # File is fresh (just written)
+        result = read_guardian_briefing(md_path, max_age_s=1)
+        assert result is not None
+
+    def test_whitespace_only_is_empty(self, tmp_path: Path) -> None:
+        md_path = tmp_path / "guardian_briefing.md"
+        md_path.write_text("   \n\n  ")
+        result = read_guardian_briefing(md_path)
+        assert result is None
+
+
+class TestRenderBriefingMarkdown:
+    """Test markdown rendering."""
+
+    def test_includes_header(self) -> None:
+        content = BriefingContent(generated_at="2026-04-02T12:00:00Z")
+        md = _render_briefing_markdown(content)
+        assert "Genesis Briefing" in md
+        assert "2026-04-02" in md
+
+    def test_renders_service_baseline(self) -> None:
+        content = BriefingContent(
+            service_baseline={"my-svc": "handles requests"},
+        )
+        md = _render_briefing_markdown(content)
+        assert "**my-svc**" in md
+        assert "handles requests" in md
+
+    def test_renders_metric_baselines(self) -> None:
+        content = BriefingContent(
+            metric_baselines={"cpu_normal": "10-30%"},
+        )
+        md = _render_briefing_markdown(content)
+        assert "cpu_normal" in md
+        assert "10-30%" in md
+
+    def test_renders_recent_incidents(self) -> None:
+        content = BriefingContent(
+            recent_incidents=[{
+                "when": "2026-04-01",
+                "cause": "OOM kill",
+                "resolution": "restarted bridge",
+            }],
+        )
+        md = _render_briefing_markdown(content)
+        assert "OOM kill" in md
+        assert "restarted bridge" in md
+
+    def test_renders_observations(self) -> None:
+        content = BriefingContent(
+            active_observations=["Memory trending up over 3 days"],
+        )
+        md = _render_briefing_markdown(content)
+        assert "Memory trending up" in md
+
+    def test_renders_notes(self) -> None:
+        content = BriefingContent(
+            notes=["tmpfs is 512MB"],
+        )
+        md = _render_briefing_markdown(content)
+        assert "tmpfs is 512MB" in md
+
+    def test_skips_empty_sections(self) -> None:
+        content = BriefingContent()
+        md = _render_briefing_markdown(content)
+        assert "Recent Incidents" not in md
+        assert "Active Observations" not in md
+        assert "Previously Observed" not in md
+
+
+class TestBriefingRoundTrip:
+    """Test write → read round trip."""
+
+    def test_write_then_read(self, tmp_path: Path) -> None:
+        content = BriefingContent(
+            generated_at="2026-04-02T12:00:00Z",
+            genesis_version="test123",
+            notes=["round trip test"],
+        )
+        md_path = write_guardian_briefing(briefing_dir=tmp_path, content=content)
+        result = read_guardian_briefing(md_path, max_age_s=60)
+        assert result is not None
+        assert "test123" in result
+        assert "round trip test" in result
+
+    def test_json_round_trip(self, tmp_path: Path) -> None:
+        content = BriefingContent(
+            generated_at="2026-04-02T12:00:00Z",
+            genesis_version="xyz789",
+            service_baseline={"svc1": "desc1"},
+            metric_baselines={"mem": "50%"},
+        )
+        write_guardian_briefing(briefing_dir=tmp_path, content=content)
+        json_path = tmp_path / "guardian_briefing.json"
+        data = json.loads(json_path.read_text())
+        assert data["genesis_version"] == "xyz789"
+        assert data["service_baseline"]["svc1"] == "desc1"

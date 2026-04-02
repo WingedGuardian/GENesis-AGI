@@ -46,6 +46,7 @@ EXPECTED_TABLES = [
     "telegram_topics",
     "pending_outreach",
     "task_steps",
+    "memory_metadata",
 ]
 
 
@@ -76,6 +77,7 @@ async def test_no_unexpected_tables(db):
         "processed_emails", "task_steps",
         "ego_cycles", "ego_proposals", "ego_state",
         "behavioral_corrections", "behavioral_themes", "behavioral_treatments",
+        "memory_metadata",
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

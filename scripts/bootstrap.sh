@@ -73,6 +73,15 @@ if ! command -v git &>/dev/null; then
 fi
 echo "  git: $(git --version | head -1)"
 
+# Git identity (required for commits on fresh installs)
+if ! git -C "$GENESIS_ROOT" config user.name &>/dev/null; then
+    git -C "$GENESIS_ROOT" config user.name "Genesis"
+    git -C "$GENESIS_ROOT" config user.email "genesis@$(hostname)"
+    echo "  Git identity set to Genesis <genesis@$(hostname)>"
+else
+    echo "  Git identity: $(git -C "$GENESIS_ROOT" config user.name) <$(git -C "$GENESIS_ROOT" config user.email)>"
+fi
+
 # Node.js (optional but recommended)
 if ! command -v node &>/dev/null; then
     echo "  Node.js not found — installing..."
@@ -177,6 +186,64 @@ echo "--- Initializing runtime state ---"
 mkdir -p "$HOME/.genesis"
 touch "$HOME/.genesis/setup-complete"
 echo "  ~/.genesis/ initialized"
+echo
+
+# --- AZ plugin sync ---
+AZ_ROOT="$HOME/agent-zero"
+if [[ -d "$AZ_ROOT/usr/plugins" && -d "$GENESIS_ROOT/az_plugins/genesis" ]]; then
+    echo "--- Syncing AZ plugins ---"
+    if command -v rsync &>/dev/null; then
+        rsync -a --delete "$GENESIS_ROOT/az_plugins/genesis/" "$AZ_ROOT/usr/plugins/genesis/"
+    else
+        rm -rf "$AZ_ROOT/usr/plugins/genesis"
+        cp -r "$GENESIS_ROOT/az_plugins/genesis" "$AZ_ROOT/usr/plugins/"
+    fi
+    # Clear stale bytecode — Python caches by path and stale .pyc files
+    # cause silent import of old code after source updates
+    find "$AZ_ROOT/usr/plugins/genesis" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    echo "  AZ plugins synced and bytecode cleared"
+    echo
+fi
+
+# --- Systemd service sync ---
+echo "--- Syncing systemd service files ---"
+SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+SYSTEMD_TEMPLATE_DIR="$GENESIS_ROOT/scripts/systemd"
+SERVICES_UPDATED=0
+
+if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
+    mkdir -p "$SYSTEMD_USER_DIR"
+    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
+        [[ -f "$template" ]] || continue
+        svc_name=$(basename "$template" .template)
+        target="$SYSTEMD_USER_DIR/$svc_name"
+        rendered=$(sed -e "s|__HOME__|$HOME|g" \
+                       -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
+                       -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
+                       -e "s|__AZ_ROOT__|$AZ_ROOT|g" \
+                       "$template")
+        if [[ -f "$target" ]]; then
+            current=$(cat "$target")
+            if [[ "$rendered" != "$current" ]]; then
+                echo "$rendered" > "$target"
+                echo "  Updated: $svc_name"
+                SERVICES_UPDATED=1
+            else
+                echo "  OK: $svc_name (unchanged)"
+            fi
+        else
+            echo "$rendered" > "$target"
+            echo "  Created: $svc_name"
+            SERVICES_UPDATED=1
+        fi
+    done
+    if [[ "$SERVICES_UPDATED" = "1" ]]; then
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "  systemd daemon reloaded"
+    fi
+else
+    echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
+fi
 echo
 
 # --- Memory restore ---

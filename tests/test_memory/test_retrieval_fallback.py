@@ -36,10 +36,11 @@ def _build_retriever(*, embed_side_effect=None):
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_fts_only_on_embedding_failure(mock_qdrant, mock_crud, mock_links):
+async def test_recall_fts_only_on_embedding_failure(mock_qdrant, mock_crud, mock_links, _):
     """When embedding fails, retrieval falls back to FTS5-only and returns results."""
     retriever, _, _, _ = _build_retriever(
         embed_side_effect=EmbeddingUnavailableError("all down")
@@ -60,10 +61,11 @@ async def test_recall_fts_only_on_embedding_failure(mock_qdrant, mock_crud, mock
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_fts_only_vector_rank_is_none(mock_qdrant, mock_crud, mock_links):
+async def test_recall_fts_only_vector_rank_is_none(mock_qdrant, mock_crud, mock_links, _):
     """All vector_rank fields are None in FTS5-only fallback mode."""
     retriever, _, _, _ = _build_retriever(
         embed_side_effect=EmbeddingUnavailableError("all down")
@@ -80,10 +82,11 @@ async def test_recall_fts_only_vector_rank_is_none(mock_qdrant, mock_crud, mock_
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_normal_unchanged(mock_qdrant, mock_crud, mock_links):
+async def test_recall_normal_unchanged(mock_qdrant, mock_crud, mock_links, _):
     """Normal retrieval (embedding works) still returns vector_rank values."""
     from datetime import UTC, datetime
 

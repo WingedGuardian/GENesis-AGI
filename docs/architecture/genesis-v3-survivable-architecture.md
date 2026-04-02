@@ -507,11 +507,13 @@ will reveal whether some failure modes need longer observation. The
 duration should be configurable and tunable based on what breaks.
 
 ### Guardian intelligence level
-The guardian CC session requires a Claude subscription and network
-access. If the subscription lapses or Anthropic's API is down, the
-guardian falls back to the dumb systemd timer (restart container, hope
-for the best). The intelligent layer is best-effort; the dumb layer is
-the safety net.
+The guardian CC session requires an Anthropic API key and network
+access. CC runs as a full agentic session (opus, multi-turn, tool
+access, --dangerously-skip-permissions) — it investigates, diagnoses,
+recovers, and verifies. Timeout (60 min) and max-turns (50) are
+runaway guards, not operational limits. If CC is unavailable, the
+Guardian enters alert-only mode — no recovery actions, no guessing.
+The prime directive is "first, do no harm."
 
 ### Incremental snapshot overhead
 Incus ZFS/btrfs snapshots are fast, but taking one before every code

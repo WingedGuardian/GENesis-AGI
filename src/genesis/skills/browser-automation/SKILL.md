@@ -1,6 +1,6 @@
 ---
 name: browser-automation
-description: Web automation error recovery, form filling patterns, and session management via Playwright
+description: Web automation with 4-layer escalation (Fetch, Genesis Browser, On-Demand MCP, Computer Use), anti-detection, and persistent profiles
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
@@ -10,47 +10,58 @@ skill_type: workflow
 
 ## Purpose
 
-Reference playbook for web automation tasks using Playwright MCP. Provides
+Reference playbook for web automation tasks. Provides layer selection,
 error recovery strategies, CSS selector patterns, form filling methodology,
 and safety gates. Loaded when Genesis performs browser-based tasks.
 
-## Three Browser Layers
+## Browser Layers
 
-Genesis has three layers of browser interaction. Choose the lightest layer
-that can accomplish the task.
+Genesis has four layers of browser interaction. Choose the lightest layer
+that can accomplish the task. **Token cost increases with each layer.**
 
-### Layer 1: Web Fetch (read-only, public data)
-- Tools: `genesis.web` (SearXNG + Brave), `WebFetch`
+### Layer 1: Web Fetch (read-only, public data — zero browser tokens)
+- Tools: `WebFetch`, Firecrawl, `genesis.web` (SearXNG + Brave)
 - Use for: public information retrieval, search, reading articles
 - No authentication, no interaction, no JavaScript rendering
 - Fastest and cheapest option
 
-### Layer 2: Managed Browser (persistent profile, agent-owned logins)
-- Tools: Playwright MCP with `--user-data-dir ~/.genesis/browser-profile/`
-- Use for: authenticated automation, form filling, multi-step workflows
-- Profile persists across sessions: cookies, localStorage, login state survive
+### Layer 2: Genesis Browser Tools (persistent profile, on-demand)
+- Tools: `browser_navigate`, `browser_click`, `browser_fill`,
+  `browser_screenshot`, `browser_snapshot`, `browser_run_js`,
+  `browser_sessions`, `browser_clear_domain`
+- Available via genesis-health MCP (always loaded, ~800 chars token cost)
+- Browser launches lazily on first navigation — zero overhead until used
+- Profile persists at `~/.genesis/browser-profile/` — cookies, localStorage,
+  login sessions survive across MCP restarts
+- **Standard mode**: Chromium (fast, default)
+- **Stealth mode**: `browser_navigate(url, stealth=True)` uses Camoufox
+  (anti-detection Firefox) for sites that block automated browsers.
+  Separate profile at `~/.genesis/camoufox-profile/`.
 - **Agent-owned accounts**: log into accounts created FOR the agent, never the
-  user's personal accounts. Treat the agent like a new employee — give it its
-  own Google account, its own service logins, etc.
-- To log in: navigate to the login page, fill credentials, submit. The profile
-  saves the session automatically.
+  user's personal accounts. Treat the agent like a new employee.
 
-### Layer 3: Browser Relay (connect to user's browser)
-- Tools: Playwright MCP with `--extension` flag
-- Use for: interacting with services the user is logged into
-- Requires: user installs "Playwright MCP Bridge" Chrome extension
-- User must be present and approve the connection
-- Use sparingly — only when the user explicitly requests it
+### Layer 3: On-Demand MCP (heavy sessions — activate when needed)
+- Tools: Chrome DevTools MCP (29 tools) or Playwright MCP
+- Activate: `/activate-browser` → adds to `.mcp.json` → restart session
+- Deactivate when done to reclaim ~17k tokens of context budget
+- **Remote mode**: `--browserUrl http://127.0.0.1:9222` connects to user's
+  Chrome via CDP-over-SSH tunnel (uses user's logged-in sessions)
+
+### Layer 4: Computer Use (visual fallback — V4)
+- Claude Computer Use API (screenshot-based interaction)
+- ~1000 tokens per screenshot, expensive but universal
+- Not yet implemented
 
 ### Layer Selection Guide
 | Need | Layer | Why |
 |------|-------|-----|
 | Read a public page | Fetch | No login needed |
 | Search the web | Fetch | API-based, fast |
-| Fill a form on agent's account | Managed | Persistent login |
-| Order groceries from agent's account | Managed | Persistent login |
-| Check user's Gmail | Relay | User's login |
-| Take action in user's banking app | Relay | User's login, MUST confirm |
+| Fill a form on agent's account | Genesis Browser | Persistent login |
+| Site blocks automation | Genesis Browser (stealth) | Anti-detection |
+| Network inspection / Lighthouse | On-Demand MCP | Chrome DevTools |
+| Check user's Gmail | On-Demand MCP (remote) | CDP-over-SSH |
+| Take action in user's banking app | On-Demand MCP (remote) | MUST confirm |
 
 ## When to Use
 
@@ -166,5 +177,11 @@ result: <task outcome description>
 
 ## References
 
-- Playwright MCP tools (browser_navigate, browser_click, etc.)
+- Genesis browser MCP tools: `browser_navigate`, `browser_click`, `browser_fill`,
+  `browser_screenshot`, `browser_snapshot`, `browser_run_js`, `browser_sessions`,
+  `browser_clear_domain` (via genesis-health MCP)
+- `src/genesis/mcp/health/browser.py` — MCP tool implementations
+- `src/genesis/browser/profile.py` — BrowserProfileManager (cookie DB, sessions)
+- `scripts/browser.py` — Standalone CLI (opens/closes per command, for one-off use)
 - `src/genesis/skills/osint/SKILL.md` — For web-based investigation
+- `/activate-browser` command — On-demand Chrome DevTools MCP activation

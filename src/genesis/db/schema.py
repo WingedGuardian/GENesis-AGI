@@ -758,6 +758,15 @@ TABLES = {
             created_at         TEXT NOT NULL
         )
     """,
+    "memory_metadata": """
+        CREATE TABLE IF NOT EXISTS memory_metadata (
+            memory_id        TEXT PRIMARY KEY,
+            created_at       TEXT NOT NULL,
+            collection       TEXT NOT NULL DEFAULT 'episodic_memory',
+            confidence       REAL,
+            embedding_status TEXT NOT NULL DEFAULT 'embedded'
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -915,6 +924,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_bis_treatments_theme ON behavioral_treatments(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_bis_treatments_status ON behavioral_treatments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bis_treatments_branch ON behavioral_treatments(branch)",
+    # memory metadata (companion to FTS5)
+    "CREATE INDEX IF NOT EXISTS idx_memory_metadata_created ON memory_metadata(created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_metadata_collection ON memory_metadata(collection)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

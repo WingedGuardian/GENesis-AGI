@@ -51,7 +51,20 @@ class TestGuardianConfigDefaults:
     def test_cc_defaults(self) -> None:
         cfg = GuardianConfig()
         assert cfg.cc.enabled is True
-        assert cfg.cc.model == "sonnet"
+        assert cfg.cc.model == "opus"
+        assert cfg.cc.timeout_s == 3600
+        assert cfg.cc.max_turns == 50
+
+    def test_briefing_defaults(self) -> None:
+        cfg = GuardianConfig()
+        assert cfg.briefing.enabled is True
+        assert cfg.briefing.shared_subdir == "shared"
+        assert cfg.briefing.briefing_filename == "guardian_briefing.md"
+        assert cfg.briefing.max_age_s == 600
+
+    def test_briefing_path_property(self) -> None:
+        cfg = GuardianConfig(state_dir="/tmp/test-guardian")
+        assert cfg.briefing_path == Path("/tmp/test-guardian/shared/briefing/guardian_briefing.md")
 
     def test_snapshot_defaults(self) -> None:
         cfg = GuardianConfig()

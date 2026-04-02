@@ -42,6 +42,9 @@ class RetrievalResult:
     transcript_path: str | None = None
     source_line_range: tuple[int, int] | None = None
     source_pipeline: str | None = None
+    # Intent routing — V4 groundwork
+    query_intent: str | None = None
+    intent_confidence: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -54,6 +54,7 @@ async def init_guardian_monitoring(rt) -> None:
         host_user=host_user,
         key_path=ssh_key or "~/.ssh/genesis_guardian_ed25519",
     )
+    rt._guardian_remote = remote
     watchdog = GuardianWatchdog(
         remote,
         event_bus=rt._event_bus,

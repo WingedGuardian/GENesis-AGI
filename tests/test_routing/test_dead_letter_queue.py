@@ -99,8 +99,9 @@ async def test_redispatch_succeeds(dlq, db):
     payload = {"call_site_id": "4_light_reflection", "messages": [{"role": "user", "content": "hi"}]}
     item_id = await dlq.enqueue("chain_exhausted:4_light_reflection", payload, "all", "exhausted")
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         assert call_site_id == "4_light_reflection"
+        assert kwargs.get("suppress_dead_letter") is True
         return _FakeRoutingResult(success=True)
 
     succeeded, failed = await dlq.redispatch(dispatch_fn)
@@ -117,7 +118,7 @@ async def test_redispatch_failure_increments_retry(dlq, db):
     payload = {"call_site_id": "4_light_reflection", "messages": []}
     item_id = await dlq.enqueue("chain_exhausted:4_light_reflection", payload, "all", "exhausted")
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         return _FakeRoutingResult(success=False)
 
     succeeded, failed = await dlq.redispatch(dispatch_fn)
@@ -138,7 +139,7 @@ async def test_redispatch_expires_legacy_items(dlq, db):
         "all", "exhausted",
     )
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         raise AssertionError("should not be called for legacy items")
 
     succeeded, failed = await dlq.redispatch(dispatch_fn)
@@ -155,7 +156,7 @@ async def test_redispatch_handles_dispatch_exception(dlq, db):
     payload = {"call_site_id": "test_site", "messages": []}
     item_id = await dlq.enqueue("test_op", payload, "all", "err")
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         raise ConnectionError("provider down")
 
     succeeded, failed = await dlq.redispatch(dispatch_fn)
@@ -177,7 +178,7 @@ async def test_redispatch_recovers_legacy_str_messages(dlq, db):
 
     received_messages = []
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         received_messages.extend(messages)
         return _FakeRoutingResult(success=True)
 
@@ -200,7 +201,7 @@ async def test_redispatch_handles_dict_messages(dlq, db):
 
     received_messages = []
 
-    async def dispatch_fn(call_site_id, messages):
+    async def dispatch_fn(call_site_id, messages, **kwargs):
         received_messages.extend(messages)
         return _FakeRoutingResult(success=True)
 

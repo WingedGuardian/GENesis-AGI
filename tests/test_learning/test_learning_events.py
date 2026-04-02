@@ -20,6 +20,7 @@ class TestLearningEvents:
             "triage.classified",
             "classification.completed",
             "calibration.completed",
+            "calibration.skipped",
             "calibration.failed",
             "harvesting.completed",
             "capability_gap.recorded",

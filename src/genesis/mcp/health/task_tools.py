@@ -129,6 +129,10 @@ async def _impl_task_detail(task_id: str) -> dict:
                     "description": s.get("description", ""),
                     "status": s.get("status", ""),
                     "cost_usd": s.get("cost_usd", 0.0),
+                    "result_json": s.get("result_json"),
+                    "started_at": s.get("started_at"),
+                    "completed_at": s.get("completed_at"),
+                    "model_used": s.get("model_used", ""),
                 }
                 for s in steps
             ],

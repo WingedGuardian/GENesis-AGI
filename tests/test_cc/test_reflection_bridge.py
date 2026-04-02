@@ -176,7 +176,12 @@ async def test_reflection_prompt_includes_cognitive_state(db, bridge, tick):
         db, id=str(uuid.uuid4()), content="Currently researching vehicles",
         section="active_context", generated_by="test", created_at=now,
     )
-    prompt = await bridge._build_reflection_prompt(depth=Depth.DEEP, tick=tick, db=db)
+    from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
+    prompt = await build_reflection_prompt(
+        depth=Depth.DEEP, tick=tick, db=db,
+        context_gatherer=None, context_assembler=None,
+        prompt_dir=Path("/nonexistent"),
+    )
     assert "vehicles" in prompt.lower()
 
 
@@ -200,30 +205,38 @@ def test_awareness_loop_set_cc_reflection_bridge(db):
 
 @pytest.mark.asyncio
 async def test_route_deep_output_failure_falls_back_to_legacy(db, bridge, tick):
-    """When _route_deep_output raises, _store_reflection_output must be called."""
+    """When route_deep_output raises, store_reflection_output must be called."""
+    from unittest.mock import patch
     bridge._output_router = AsyncMock()  # enable deep routing path
-    bridge._route_deep_output = AsyncMock(side_effect=RuntimeError("routing broke"))
-    bridge._store_reflection_output = AsyncMock()
 
-    result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+    mock_route = AsyncMock(side_effect=RuntimeError("routing broke"))
+    mock_store = AsyncMock()
+
+    with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route), \
+         patch("genesis.cc.reflection_bridge._bridge.store_reflection_output", mock_store):
+        result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
 
     assert result.success
-    bridge._route_deep_output.assert_awaited_once()
-    bridge._store_reflection_output.assert_awaited_once()
+    mock_route.assert_awaited_once()
+    mock_store.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_route_deep_output_success_skips_legacy(db, bridge, tick):
-    """When _route_deep_output succeeds, _store_reflection_output must NOT be called."""
+    """When route_deep_output succeeds, store_reflection_output must NOT be called."""
+    from unittest.mock import patch
     bridge._output_router = AsyncMock()  # enable deep routing path
-    bridge._route_deep_output = AsyncMock()  # succeeds
-    bridge._store_reflection_output = AsyncMock()
 
-    result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+    mock_route = AsyncMock()
+    mock_store = AsyncMock()
+
+    with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route), \
+         patch("genesis.cc.reflection_bridge._bridge.store_reflection_output", mock_store):
+        result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
 
     assert result.success
-    bridge._route_deep_output.assert_awaited_once()
-    bridge._store_reflection_output.assert_not_awaited()
+    mock_route.assert_awaited_once()
+    mock_store.assert_not_awaited()
 
 
 # ── Per-model prompt loading ──────────────────────────────────────────
@@ -254,3 +267,59 @@ def test_fallback_to_generic_prompt(tmp_path):
     )
     result = bridge._system_prompt_for_depth(Depth.LIGHT)
     assert result == "generic prompt"
+
+
+# ── Observation truncation fix ──────────────────────────────────────
+
+
+def test_data_pointers_section_exists():
+    """build_data_pointers returns a non-empty string with key resources."""
+    from genesis.cc.reflection_bridge._prompts import build_data_pointers
+    result = build_data_pointers()
+    assert "Available Data Sources" in result
+    assert "health_status" in result
+    assert "memory_recall" in result
+    assert "genesis.db" in result
+    assert "transcripts" in result.lower() or "jsonl" in result.lower()
+
+
+async def test_strategic_enriched_path_includes_observations_and_pointers(db, mock_invoker, mock_session_mgr):
+    """Strategic reflection with context_gatherer uses enriched path with observations."""
+    from genesis.reflection.types import ContextBundle, CostSummary, PendingWorkSummary, ProcedureStats
+
+    mock_gatherer = AsyncMock()
+    mock_gatherer.gather = AsyncMock(return_value=ContextBundle(
+        cognitive_state="test cognitive state",
+        recent_observations=[
+            {"id": "obs-1", "type": "test", "source": "test", "priority": "medium",
+             "content": "Observation content here", "created_at": "2026-04-02T12:00:00"},
+        ],
+        surplus_staging_items=[],
+        pending_work=PendingWorkSummary(memory_consolidation=False),
+        procedure_stats=ProcedureStats(total_active=0, total_quarantined=0, avg_success_rate=0, low_performers=[]),
+        cost_summary=CostSummary(daily_usd=0.0, weekly_usd=0.0, monthly_usd=0.0,
+                                 daily_budget_pct=0.0, weekly_budget_pct=0.0, monthly_budget_pct=0.0),
+        recent_conversations=[],
+    ))
+
+    bridge = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=mock_invoker, db=db,
+    )
+    bridge._context_gatherer = mock_gatherer
+
+    tick = TickResult(
+        tick_id="tick-strat", timestamp="2026-04-02T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.STRATEGIC, trigger_reason="test",
+    )
+
+    from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
+    prompt = await build_reflection_prompt(
+        depth=Depth.STRATEGIC, tick=tick, db=db,
+        context_gatherer=mock_gatherer, context_assembler=None,
+        prompt_dir=Path("/nonexistent"),
+    )
+
+    assert "Observation content here" in prompt
+    assert "Available Data Sources" in prompt
+    assert "Strategic" in prompt

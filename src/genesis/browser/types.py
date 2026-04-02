@@ -7,19 +7,24 @@ from enum import StrEnum
 
 
 class BrowserLayer(StrEnum):
-    """Three layers of browser interaction, from lightweight to full control."""
+    """Four layers of browser interaction, from lightweight to full control."""
 
     FETCH = "fetch"
     """Layer 1: API-like web fetch. Read-only, no authentication, no interaction.
-    Uses genesis.web (SearXNG + Brave) or WebFetch tool."""
+    Uses WebFetch, Firecrawl, or genesis.web (SearXNG + Brave)."""
 
     MANAGED = "managed"
-    """Layer 2: Managed browser with persistent profile. Agent's own logins.
-    Uses Playwright MCP with --user-data-dir for cross-session persistence."""
+    """Layer 2: Genesis browser tools with persistent profile. Agent's own logins.
+    Standard mode (Chromium) or stealth mode (Camoufox anti-detection).
+    Profile at ~/.genesis/browser-profile/."""
 
     RELAY = "relay"
-    """Layer 3: Browser relay/extension bridge. Connects to user's running
-    Chrome via Playwright MCP Bridge extension. Uses user's logged-in sessions."""
+    """Layer 3: On-demand MCP (Chrome DevTools or Playwright) or CDP-over-SSH
+    to user's running Chrome. Uses user's logged-in sessions."""
+
+    VISUAL = "visual"
+    """Layer 4: Claude Computer Use. Screenshot-based visual interaction.
+    Universal fallback for CAPTCHAs, canvas, non-browser applications. V4."""
 
 
 @dataclass(frozen=True)

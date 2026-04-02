@@ -25,6 +25,10 @@ test = [
     "pytest-asyncio",
     "aioresponses",
 ]
+browser = [
+    "playwright>=1.40",
+    "camoufox>=0.4",
+]
 
 [build-system]
 requires = ["setuptools>=64"]

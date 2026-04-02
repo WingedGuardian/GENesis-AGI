@@ -391,6 +391,60 @@ class TestFallbackAnalysis:
         assert "LLM analysis unavailable" in result["summary"]
         assert result["details"] == "Changelog not available"
 
+    def test_fallback_detects_rendering_keywords(self) -> None:
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Added alt-screen rendering with scrollback",
+        )
+        assert "rendering" in result["summary"]
+        assert result["impact"] == IMPACT_INFORMATIONAL
+
+    def test_fallback_detects_regression_as_action_needed(self) -> None:
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Regression in terminal scrollback behavior",
+        )
+        assert result["impact"] == IMPACT_ACTION_NEEDED
+
+    def test_fallback_deprecated_stays_informational(self) -> None:
+        """'deprecated' alone doesn't trigger action_needed (only breaking/removed/regression do)."""
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Deprecated old flag in favor of new one",
+        )
+        assert "deprecations" in result["summary"]
+        assert result["impact"] == IMPACT_INFORMATIONAL
+
+    def test_fallback_casual_removed_stays_informational(self) -> None:
+        """Casual 'removed' (e.g. 'Removed debug log') should NOT escalate to action_needed."""
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Removed unnecessary whitespace in output",
+        )
+        assert result["impact"] == IMPACT_INFORMATIONAL
+
+    def test_fallback_real_removal_escalates(self) -> None:
+        """Phrase-level removal ('removed support', 'no longer') escalates to action_needed."""
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Removed support for --old-flag",
+        )
+        assert result["impact"] == IMPACT_ACTION_NEEDED
+
+    def test_fallback_deduplicates_labels(self) -> None:
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89",
+            "Fixed alt-screen flicker, improved scrollback in terminal",
+        )
+        assert result["summary"].count("rendering") == 1
+
+    def test_fallback_detects_performance_keywords(self) -> None:
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Fixed memory leak in long-running sessions",
+        )
+        assert "performance" in result["summary"]
+
+    def test_fallback_detects_platform_keywords(self) -> None:
+        result = CCUpdateAnalyzer._fallback_analysis(
+            "2.1.88", "2.1.89", "Fixed tmux scrollback on Linux",
+        )
+        assert "platform" in result["summary"]
+
     def test_fallback_preserves_changelog_in_details(self) -> None:
         changelog = "Fixed critical subprocess bug"
         result = CCUpdateAnalyzer._fallback_analysis("2.1.84", "2.1.85", changelog)

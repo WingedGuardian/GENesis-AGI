@@ -7,6 +7,7 @@ Follows the aiohttp pattern from surplus/compute_availability.py.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from datetime import UTC, datetime
@@ -16,6 +17,56 @@ import aiohttp
 import aiosqlite
 
 from genesis.observability.types import ProbeResult, ProbeStatus
+
+logger = logging.getLogger(__name__)
+
+# Sentinel for probe_guardian's guardian_remote parameter.
+# Allows callers to explicitly pass None (skip remote) vs not passing
+# anything (auto-load from config).
+_GUARDIAN_REMOTE_UNSET = object()
+
+# Lazy-loaded GuardianRemote from config file (loaded once, cached).
+_guardian_remote_from_config: object | None = None
+_guardian_remote_config_checked: bool = False
+
+# SSH probe cache: {host_ip: (monotonic_timestamp, ProbeResult)}
+_guardian_ssh_cache: dict[str, tuple[float, ProbeResult]] = {}
+_GUARDIAN_SSH_TTL = 60.0
+
+
+def _load_guardian_remote_from_config() -> object | None:
+    """Lazy-load a GuardianRemote from ~/.genesis/guardian_remote.yaml.
+
+    Cached at module level — reads the file at most once per process lifetime.
+    Returns None if config doesn't exist or is incomplete.
+    """
+    global _guardian_remote_from_config, _guardian_remote_config_checked
+    if _guardian_remote_config_checked:
+        return _guardian_remote_from_config
+    _guardian_remote_config_checked = True
+
+    config_path = Path.home() / ".genesis" / "guardian_remote.yaml"
+    if not config_path.exists():
+        return None
+    try:
+        import yaml
+
+        config = yaml.safe_load(config_path.read_text()) or {}
+        host_ip = config.get("host_ip", "")
+        host_user = config.get("host_user", "")
+        ssh_key = config.get("ssh_key", "")
+        if host_ip and host_user:
+            from genesis.guardian.remote import GuardianRemote
+
+            _guardian_remote_from_config = GuardianRemote(
+                host_ip=host_ip,
+                host_user=host_user,
+                key_path=ssh_key or "~/.ssh/genesis_guardian_ed25519",
+            )
+            logger.debug("Loaded guardian remote from config: %s@%s", host_user, host_ip)
+    except Exception:
+        logger.warning("Failed to load guardian remote config", exc_info=True)
+    return _guardian_remote_from_config
 
 
 async def probe_db(
@@ -289,6 +340,7 @@ async def probe_disk(
 async def probe_guardian(
     heartbeat_path: str | Path | None = None,
     *,
+    guardian_remote=_GUARDIAN_REMOTE_UNSET,
     degraded_threshold_s: float = 120.0,
     down_threshold_s: float = 300.0,
     clock=None,
@@ -301,6 +353,11 @@ async def probe_guardian(
       120-300s → DEGRADED (Guardian may be delayed)
       >300s  → DOWN (Guardian appears dead)
       missing → unknown status (Guardian never ran)
+
+    When the heartbeat file is missing (Guardian runs on a remote host),
+    falls back to SSH probe via guardian_remote. If guardian_remote is
+    _GUARDIAN_REMOTE_UNSET (default), auto-loads from guardian_remote.yaml.
+    Pass guardian_remote=None to skip SSH fallback entirely (useful in tests).
     """
     _clock = clock or (lambda: datetime.now(UTC))
     start = time.monotonic()
@@ -371,6 +428,15 @@ async def probe_guardian(
 
     except FileNotFoundError:
         latency = (time.monotonic() - start) * 1000
+
+        # Resolve remote: auto-load from config if sentinel, skip if None
+        remote = guardian_remote
+        if remote is _GUARDIAN_REMOTE_UNSET:
+            remote = _load_guardian_remote_from_config()
+
+        if remote is not None:
+            return await _probe_guardian_ssh(remote, latency, _clock)
+
         return ProbeResult(
             name="guardian",
             status=ProbeStatus.DOWN,
@@ -387,3 +453,57 @@ async def probe_guardian(
             message=f"Guardian heartbeat file unreadable: {exc}",
             checked_at=_clock().isoformat(),
         )
+
+
+async def _probe_guardian_ssh(remote, latency_ms: float, clock) -> ProbeResult:
+    """Probe Guardian health via SSH with a TTL cache.
+
+    Maps remote.status() current_state to ProbeStatus:
+      running → HEALTHY
+      paused  → DEGRADED
+      anything else (unreachable, unknown) → DOWN
+    """
+    _clock = clock or (lambda: datetime.now(UTC))
+    host_ip = getattr(remote, "host_ip", "unknown")
+
+    # Check TTL cache
+    now = time.monotonic()
+    cached = _guardian_ssh_cache.get(host_ip)
+    if cached is not None:
+        cache_time, cache_result = cached
+        if (now - cache_time) < _GUARDIAN_SSH_TTL:
+            return cache_result
+
+    try:
+        status_data = await remote.status()
+        state = status_data.get("current_state", "unknown")
+
+        state_map = {
+            "running": (ProbeStatus.HEALTHY, "Guardian running on remote host"),
+            "paused": (ProbeStatus.DEGRADED, "Guardian paused on remote host"),
+        }
+        probe_status, message = state_map.get(
+            state, (ProbeStatus.DOWN, f"Guardian remote state: {state}")
+        )
+        result = ProbeResult(
+            name="guardian",
+            status=probe_status,
+            latency_ms=round(latency_ms, 2),
+            message=message,
+            checked_at=_clock().isoformat(),
+            details={"remote": True, "current_state": state},
+        )
+    except Exception:
+        logger.warning("Guardian SSH probe failed", exc_info=True)
+        result = ProbeResult(
+            name="guardian",
+            status=ProbeStatus.DOWN,
+            latency_ms=round(latency_ms, 2),
+            message="Guardian remote probe failed (SSH error)",
+            checked_at=_clock().isoformat(),
+            details={"remote": True, "ssh_error": True},
+        )
+
+    # Update cache
+    _guardian_ssh_cache[host_ip] = (now, result)
+    return result

@@ -10,6 +10,27 @@
 #   SECRETS_PATH         — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
 set -euo pipefail
 
+# ── Status tracking ──────────────────────────────────────────────────
+_STATUS_FILE="$HOME/.genesis/backup_status.json"
+_STARTED_AT=$(date +%s)
+_SQLITE_LINES=0
+_QDRANT_COUNT=0
+_TRANSCRIPT_COUNT=0
+_MEMORY_COUNT=0
+_SECRETS_OK=false
+_SUCCESS=false
+
+_write_status() {
+    local _ended_at
+    _ended_at=$(date +%s)
+    local _duration=$(( _ended_at - _STARTED_AT ))
+    mkdir -p "$(dirname "$_STATUS_FILE")"
+    cat > "$_STATUS_FILE" <<STATUSEOF
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration}
+STATUSEOF
+}
+trap '_write_status' EXIT
+
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
 AZ_DIR="${AZ_ROOT:-$HOME/agent-zero}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
@@ -56,7 +77,8 @@ if [ -f "$DB_FILE" ]; then
         log "WARNING: sqlite3 dump failed, copying raw DB"
         cp "$DB_FILE" data/genesis.db
     }
-    log "SQLite: $(wc -l < data/genesis.sql) lines"
+    _SQLITE_LINES=$(wc -l < data/genesis.sql)
+    log "SQLite: $_SQLITE_LINES lines"
 else
     log "WARNING: genesis.db not found at $DB_FILE"
 fi
@@ -80,6 +102,7 @@ for collection in episodic_memory knowledge_base; do
         log "WARNING: Could not download snapshot for $collection"
         continue
     }
+    _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
     log "Qdrant: $collection snapshot saved ($(du -sh "data/qdrant/${collection}.snapshot" | cut -f1))"
 
     # Clean up snapshot from Qdrant server
@@ -94,8 +117,8 @@ if [ -d "$TRANSCRIPT_DIR" ]; then
     find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -exec cp -u {} transcripts/ \; 2>/dev/null || {
         log "WARNING: transcript copy failed"
     }
-    transcript_count=$(find transcripts -name '*.jsonl' 2>/dev/null | wc -l)
-    log "Transcripts: $transcript_count files"
+    _TRANSCRIPT_COUNT=$(find transcripts -name '*.jsonl' 2>/dev/null | wc -l)
+    log "Transcripts: $_TRANSCRIPT_COUNT files"
 else
     log "WARNING: transcript directory not found"
 fi
@@ -107,8 +130,8 @@ if [ -d "$MEMORY_DIR" ]; then
     cp -ru "$MEMORY_DIR"/* memory/ 2>/dev/null || {
         log "WARNING: memory copy failed"
     }
-    memory_count=$(find memory -type f 2>/dev/null | wc -l)
-    log "Memory: $memory_count files"
+    _MEMORY_COUNT=$(find memory -type f 2>/dev/null | wc -l)
+    log "Memory: $_MEMORY_COUNT files"
 else
     log "WARNING: memory directory not found"
 fi
@@ -132,6 +155,7 @@ if [ -f "$SECRETS_FILE" ]; then
         echo "$BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
             --symmetric --cipher-algo AES256 \
             -o secrets/secrets.env.gpg "$SECRETS_FILE" 2>/dev/null
+        _SECRETS_OK=true
         log "Secrets: encrypted with GPG"
     else
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set, skipping secrets backup"
@@ -153,4 +177,5 @@ else
     log "Backup committed and pushed"
 fi
 
+_SUCCESS=true
 log "Backup complete"

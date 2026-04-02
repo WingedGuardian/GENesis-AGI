@@ -10,10 +10,12 @@ WorkingDirectory=%h/.local/share/genesis-guardian
 Environment=PYTHONPATH=%h/.local/share/genesis-guardian/src
 Environment=GUARDIAN_CONFIG=%h/.local/share/genesis-guardian/config/guardian.yaml
 Environment=GUARDIAN_SECRETS=%h/.local/share/genesis-guardian/secrets.env
-Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 StandardOutput=journal
 StandardError=journal
 
-# Allow up to 10 minutes for full confirm -> diagnose -> recover cycle
-TimeoutStartSec=600
+# CC diagnosis is agentic (multi-turn, tool use) — can take 30-60 min for
+# deep investigation + recovery + verification. 65 min allows CC its full
+# hour plus 5 min for signal collection, alerts, and cleanup.
+TimeoutStartSec=3900

@@ -8,6 +8,7 @@ import aiosqlite
 from qdrant_client import QdrantClient
 
 from genesis.db.crud import memory as memory_crud
+from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
@@ -17,7 +18,7 @@ from genesis.observability.provider_activity import track_operation
 from genesis.observability.types import Severity, Subsystem
 from genesis.perception.confidence import load_config as load_confidence_config
 from genesis.perception.confidence import should_gate
-from genesis.qdrant.collections import upsert_point
+from genesis.qdrant.collections import delete_point, upsert_point
 
 # Qdrant connection errors — broad catch for any transport/protocol failure
 try:
@@ -191,6 +192,16 @@ class MemoryStore:
             collection=resolved_collection,
         )
 
+        # Write companion metadata (timestamps, confidence, embedding status)
+        await memory_crud.create_metadata(
+            self._db,
+            memory_id=memory_id,
+            created_at=now_iso,
+            collection=resolved_collection,
+            confidence=confidence,
+            embedding_status="embedded" if embedding_ok else "pending",
+        )
+
         if not embedding_ok:
             # Queue for later embedding
             await pending_embeddings.create(
@@ -215,3 +226,46 @@ class MemoryStore:
             await self._linker.auto_link(memory_id, vector, collection=resolved_collection)
 
         return memory_id
+
+    async def delete(self, memory_id: str) -> dict:
+        """Delete a memory from all layers. Returns per-layer status.
+
+        Tries all layers independently — partial failure is acceptable.
+        Qdrant deletes try both collections since the FTS5 collection column
+        is unreliable (documented in memory.py:72-73).
+        """
+        results: dict[str, bool | int] = {}
+
+        # 1. memory_metadata companion table
+        results["metadata"] = await memory_crud.delete_metadata(
+            self._db, memory_id=memory_id,
+        )
+
+        # 2. FTS5 text index
+        results["fts5"] = await memory_crud.delete(
+            self._db, memory_id=memory_id,
+        )
+
+        # 3. Qdrant — try both collections (collection column unreliable)
+        for coll in ("episodic_memory", "knowledge_base"):
+            try:
+                delete_point(self._qdrant, collection=coll, point_id=memory_id)
+                results[f"qdrant_{coll}"] = True
+            except Exception:
+                logger.error(
+                    "Qdrant delete failed for %s in %s", memory_id, coll,
+                    exc_info=True,
+                )
+                results[f"qdrant_{coll}"] = False
+
+        # 4. Cascade: memory_links
+        results["links_deleted"] = await memory_links_crud.delete_by_memory(
+            self._db, memory_id=memory_id,
+        )
+
+        # 5. Cascade: pending_embeddings
+        results["pending_deleted"] = await pending_embeddings.delete_by_memory(
+            self._db, memory_id=memory_id,
+        )
+
+        return results

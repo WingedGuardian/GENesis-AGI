@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-memory")
 
-_plan_bookmark_processed = False
+_PLAN_BOOKMARK_PENDING = Path.home() / ".genesis" / "plan_bookmark_pending.json"
 
 
 def init(
@@ -126,9 +126,7 @@ def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    global _plan_bookmark_processed  # noqa: PLW0603
-    if not _plan_bookmark_processed:
-        _plan_bookmark_processed = True
+    if _PLAN_BOOKMARK_PENDING.exists():
         from genesis.util.tasks import tracked_task
 
         tracked_task(

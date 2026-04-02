@@ -8,7 +8,7 @@ script via an authorized_keys ``command=`` directive — even if this code
 tried to run arbitrary commands, the host would reject them. OpenSSH
 enforces this restriction, not our code.
 
-Four operations: restart-timer, pause, resume, status.
+Six operations: restart-timer, pause, resume, status, version, update.
 """
 
 from __future__ import annotations
@@ -112,3 +112,26 @@ class GuardianRemote:
         if not ok:
             logger.error("Guardian resume failed: %s", output[:200])
         return ok
+
+    async def version(self) -> dict:
+        """Query Guardian version info (CC, Node, code) from the host."""
+        ok, output = await self._ssh_command("version")
+        if ok:
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                logger.warning("Guardian version returned non-JSON: %s", output[:200])
+                return {"cc_version": "unknown", "raw": output[:200]}
+        return {"cc_version": "unreachable", "error": output[:200]}
+
+    async def update(self) -> dict:
+        """Pull latest code on the host. Returns old/new commit hashes."""
+        ok, output = await self._ssh_command("update")
+        if ok:
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                logger.warning("Guardian update returned non-JSON: %s", output[:200])
+                return {"ok": False, "raw": output[:200]}
+        logger.error("Guardian update failed: %s", output[:200])
+        return {"ok": False, "error": output[:200]}

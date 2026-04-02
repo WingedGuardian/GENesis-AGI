@@ -1,7 +1,9 @@
-"""CC diagnosis engine — intelligent root cause analysis via claude -p.
+"""CC diagnosis engine — intelligent investigation and recovery via claude -p.
 
-When confirmation reaches SURVEYING, invokes Claude CLI on the host for
-intelligent diagnosis.
+When confirmation reaches SURVEYING, invokes Claude Code on the host for
+intelligent diagnosis AND recovery. CC has full tool access — it investigates
+the problem, attempts recovery, and verifies the fix. It is the doctor, not
+a report writer.
 
 PRIME DIRECTIVE: First, do no harm.
 
@@ -16,10 +18,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from genesis.guardian.briefing import read_guardian_briefing
 from genesis.guardian.collector import DiagnosticSnapshot
 from genesis.guardian.config import GuardianConfig
 
@@ -45,17 +49,19 @@ class DiagnosisResult:
     confidence_pct: int
     evidence: list[str]
     recommended_action: RecoveryAction
-    reasoning: str
-    source: str  # "cc" or "cc_unavailable"
+    actions_taken: list[str] = field(default_factory=list)
+    outcome: str = "escalate"  # "resolved" | "partially_resolved" | "escalate"
+    reasoning: str = ""
+    source: str = "cc"  # "cc" or "cc_unavailable"
 
 
 _FAILURE_INVENTORY = """
-Known failure mode inventory:
+Known failure mode inventory (from real incidents):
 
 | Mode | Signals | Root cause | Recovery |
 |------|---------|------------|----------|
 | OOM kill | Container running, services dead, journal "Killed process" | Memory exhaustion | RESTART_SERVICES or RESTART_CONTAINER |
-| /tmp full | Services degraded, /tmp >95% | tmpfs overflow | RESOURCE_CLEAR |
+| /tmp full | Services degraded, /tmp >95% | tmpfs overflow (512MB limit) | RESOURCE_CLEAR |
 | Bridge crash loop | Health API down, NRestarts high | Code bug or dependency | RESTART_SERVICES, then REVERT_CODE |
 | Bad deploy | Failure correlates with recent git commit | Code regression | REVERT_CODE |
 | Container freeze | Ping OK, all APIs timeout, D-state processes | I/O deadlock | RESTART_CONTAINER |
@@ -63,56 +69,122 @@ Known failure mode inventory:
 | Full disk | Multiple services fail, disk >95% | Disk exhaustion | RESOURCE_CLEAR |
 | Network partition | Container running, ping fails, APIs fail | Network issue | RESTART_CONTAINER |
 | Total container death | All 5 probes fail | Catastrophic failure | RESTART_CONTAINER, then SNAPSHOT_ROLLBACK |
+| killpg(1) | All processes dead simultaneously | Bad PGID in test/code | RESTART_CONTAINER |
+| Systemd user manager death | All user services dead, systemd --user gone | OOM cascading | RESTART_CONTAINER |
+| Page cache I/O storm | D-state processes, high io.pressure | Memory pressure cascade | RESTART_CONTAINER |
 """
 
 
 def _build_diagnosis_prompt(
     diagnostic: DiagnosticSnapshot,
     signal_summary: str,
+    container_name: str,
+    briefing_context: str | None = None,
 ) -> str:
     """Build the full prompt for the CC diagnostic instance."""
-    return f"""You are Genesis's diagnostic brain. You are invoked ONLY when Genesis
-appears to be down. Your job: analyze the system data, identify the root cause,
-and recommend a specific recovery action.
+    briefing_section = ""
+    if briefing_context:
+        briefing_section = f"""
+## Genesis Context Briefing (from shared filesystem)
 
-## Diagnostic Data
+The following briefing was written by Genesis before it went down. It contains
+service baselines, metric norms, and recent history that may help your diagnosis.
+
+{briefing_context}
+"""
+
+    return f"""You are the Genesis Guardian — the system's last line of defense.
+Genesis appears to be down. You are running on the host VM with full tool access.
+Genesis runs inside the Incus container "{container_name}".
+
+Your job: investigate the root cause, attempt recovery, and verify the fix worked.
+You are the doctor — examine the patient, treat them, confirm the treatment worked.
+
+## Initial Diagnostic Data
 
 {diagnostic.to_prompt_text()}
 
-## Signal History
+## Recent Signal History
 
 {signal_summary}
-
+{briefing_section}
 {_FAILURE_INVENTORY}
 
-## Your Task
+## Available Commands
 
-Analyze the diagnostic data and produce a JSON response with this exact schema:
+Run these via Bash:
+- `incus exec {container_name} -- <cmd>` — Run a command inside the container
+- `incus exec {container_name} -- su - ubuntu -c "<cmd>"` — Run as the ubuntu user
+- `incus exec {container_name} -- su - ubuntu -c "systemctl --user restart genesis-bridge"` — Restart the main service
+- `incus exec {container_name} -- su - ubuntu -c "systemctl --user status genesis-bridge"` — Check service status
+- `incus exec {container_name} -- su - ubuntu -c "journalctl --user -n 200 --no-pager"` — Read recent logs
+- `incus exec {container_name} -- su - ubuntu -c "cat /sys/fs/cgroup/memory.current"` — Check memory
+- `incus exec {container_name} -- su - ubuntu -c "df -h"` — Check disk
+- `incus exec {container_name} -- su - ubuntu -c "df -h /tmp"` — Check /tmp (512MB tmpfs)
+- `incus exec {container_name} -- su - ubuntu -c "ps aux --sort=-%mem | head -20"` — Top processes
+- `incus exec {container_name} -- su - ubuntu -c "cd ~/genesis && git log --oneline -5"` — Recent commits
+- `incus exec {container_name} -- su - ubuntu -c "cd ~/genesis && git diff --stat"` — Uncommitted changes
+- `incus info {container_name}` — Container status and resource usage
+- `incus restart {container_name}` — Restart the entire container (last resort)
+- `incus snapshot create {container_name} guardian-pre-recovery` — Snapshot BEFORE recovery
+
+## Investigation Protocol
+
+1. Start with the diagnostic data above — but DO NOT stop there. Investigate.
+2. Read logs (`journalctl`), check processes (`ps aux`), inspect disk/memory.
+3. Check `git log` — was there a recent code change that correlates with failure?
+4. Form a hypothesis. State your confidence level.
+5. If confidence >= 70%:
+   a. Take an Incus snapshot first: `incus snapshot create {container_name} guardian-pre-recovery`
+   b. Attempt recovery (least destructive first: restart service > restart container > rollback)
+   c. Wait briefly, then verify: check health endpoint, service status, logs
+6. If the fix didn't work, try a different approach.
+7. If confidence < 70% or all approaches exhausted: ESCALATE to the user.
+
+## Rules
+
+- ALWAYS take an Incus snapshot before any destructive recovery action
+- Prefer least destructive recovery: restart service > clear resources > restart container > rollback
+- Never raise resource limits — fix root causes
+- Never work around symptoms — diagnose the actual problem
+- Check temporal patterns: what changed recently? What metric degraded first?
+- If you can't determine the cause with >50% confidence after investigation, ESCALATE
+
+## Final Report
+
+When you've reached a conclusion (resolved or need to escalate), output your final
+report as a JSON block:
 
 ```json
-{{
-  "likely_cause": "One-sentence description of the root cause",
+{{{{
+  "likely_cause": "One-sentence root cause description",
   "confidence_pct": 85,
   "evidence": ["Evidence point 1", "Evidence point 2"],
   "recommended_action": "RESTART_SERVICES",
-  "reasoning": "Multi-sentence explanation of your analysis"
-}}
+  "actions_taken": ["Took pre-recovery snapshot", "Restarted genesis-bridge", "Verified health endpoint responded"],
+  "outcome": "resolved",
+  "reasoning": "Multi-sentence explanation of your investigation and findings"
+}}}}
 ```
 
-Rules:
-- `recommended_action` MUST be one of: RESTART_SERVICES, RESOURCE_CLEAR,
-  REVERT_CODE, RESTART_CONTAINER, SNAPSHOT_ROLLBACK, ESCALATE
-- If confidence < 70%, set recommended_action to ESCALATE
-- Never recommend raising resource limits
-- Never recommend working around symptoms — fix the root cause
-- Look at temporal patterns: what changed recently? what metric degraded first?
-- Check the git state: was there a recent commit that could have caused this?
+Field values:
+- `recommended_action`: RESTART_SERVICES | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
+- `actions_taken`: what you actually did (investigation steps + recovery actions)
+- `outcome`: "resolved" (you fixed it), "partially_resolved" (improved but not fully), or "escalate" (needs human)
 
-Respond with ONLY the JSON object, no markdown fences, no explanation outside JSON."""
+Output this JSON block at the very end of your response."""
 
 
 class DiagnosisEngine:
-    """Diagnose Genesis failures using CC. ESCALATE without action if CC unavailable."""
+    """Diagnose and treat Genesis failures using CC as an agentic investigator.
+
+    CC gets full tool access and runs as a multi-turn agent. It investigates
+    the problem, attempts recovery, and verifies the fix. The timeout and
+    max-turns are runaway guards — they should never fire during legitimate
+    work.
+
+    When CC is unavailable: ESCALATE without action (prime directive).
+    """
 
     def __init__(self, config: GuardianConfig) -> None:
         self._config = config
@@ -143,17 +215,45 @@ class DiagnosisEngine:
         diagnostic: DiagnosticSnapshot,
         signal_summary: str,
     ) -> DiagnosisResult | None:
-        """Invoke claude -p for intelligent diagnosis."""
-        prompt = _build_diagnosis_prompt(diagnostic, signal_summary)
+        """Invoke claude -p for intelligent diagnosis and recovery.
+
+        CC runs as a full agent with tool access. It investigates, attempts
+        recovery, and verifies. The response contains a JSON report at the
+        end summarizing what it found and did.
+        """
+        container_name = self._config.container_name
+
+        # Read briefing from shared filesystem (if available)
+        briefing_context = None
+        if self._config.briefing.enabled:
+            briefing_context = read_guardian_briefing(
+                self._config.briefing_path,
+                max_age_s=self._config.briefing.max_age_s,
+            )
+
+        prompt = _build_diagnosis_prompt(
+            diagnostic, signal_summary, container_name, briefing_context,
+        )
         cc_path = str(Path(self._config.cc.path).expanduser())
         work_dir = Path("~/.local/share/genesis-guardian").expanduser()
         work_dir.mkdir(parents=True, exist_ok=True)
 
-        proc = await asyncio.create_subprocess_exec(
+        cmd = [
             cc_path, "-p",
             "--model", self._config.cc.model,
             "--output-format", "json",
-            "--max-turns", "1",
+            "--max-turns", str(self._config.cc.max_turns),
+            "--dangerously-skip-permissions",
+        ]
+
+        logger.info(
+            "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds",
+            self._config.cc.model, self._config.cc.max_turns,
+            self._config.cc.timeout_s,
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -169,7 +269,11 @@ class DiagnosisEngine:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            logger.error("CC diagnosis timed out after %ds", self._config.cc.timeout_s)
+            logger.error(
+                "CC diagnosis timed out after %ds — this should not happen "
+                "during legitimate work. Possible hung process.",
+                self._config.cc.timeout_s,
+            )
             return None
 
         if proc.returncode != 0:
@@ -183,10 +287,15 @@ class DiagnosisEngine:
         return self._parse_cc_response(stdout.decode("utf-8", errors="replace"))
 
     def _parse_cc_response(self, raw: str) -> DiagnosisResult | None:
-        """Parse the CC JSON response into a DiagnosisResult."""
+        """Parse the CC response into a DiagnosisResult.
+
+        With multi-turn agentic CC, the response is wrapped in a JSON envelope
+        (--output-format json). The ``result`` field contains the final text
+        response, which should end with a JSON diagnosis block.
+        """
         try:
+            # Step 1: Unwrap CC's JSON envelope
             outer = json.loads(raw)
-            # Extract text content from CC's JSON envelope
             if isinstance(outer, dict) and "result" in outer:
                 text = outer["result"]
             elif isinstance(outer, dict) and "content" in outer:
@@ -204,15 +313,12 @@ class DiagnosisEngine:
             else:
                 text = raw
 
-            # Strip markdown fences if present
-            text = text.strip()
-            if text.startswith("```"):
-                lines = text.splitlines()
-                text = "\n".join(
-                    lines[1:-1] if lines[-1].strip() == "```" else lines[1:],
-                )
-
-            data = json.loads(text)
+            # Step 2: Extract JSON from the response text
+            data = self._extract_json_diagnosis(text)
+            if data is None:
+                logger.error("No valid JSON diagnosis found in CC response")
+                logger.debug("CC response text (first 2000 chars): %s", text[:2000])
+                return None
 
             action_str = data.get("recommended_action", "ESCALATE")
             try:
@@ -226,6 +332,8 @@ class DiagnosisEngine:
                 confidence_pct=int(data.get("confidence_pct", 0)),
                 evidence=data.get("evidence", []),
                 recommended_action=action,
+                actions_taken=data.get("actions_taken", []),
+                outcome=data.get("outcome", "escalate"),
                 reasoning=data.get("reasoning", ""),
                 source="cc",
             )
@@ -233,8 +341,54 @@ class DiagnosisEngine:
             logger.error(
                 "Failed to parse CC diagnosis response: %s", exc, exc_info=True,
             )
-            logger.debug("Raw CC response: %s", raw[:1000])
+            logger.debug("Raw CC response: %s", raw[:2000])
             return None
+
+    @staticmethod
+    def _extract_json_diagnosis(text: str) -> dict | None:
+        """Extract the JSON diagnosis block from CC's response text.
+
+        Handles multiple formats:
+        - Pure JSON (single-turn compat)
+        - JSON in markdown fences
+        - JSON block embedded in narrative text (multi-turn)
+        """
+        text = text.strip()
+
+        # Try 1: Entire text is JSON
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "likely_cause" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        # Try 2: JSON in markdown fences (```json ... ``` or ``` ... ```)
+        # Search from end — the diagnosis block should be the last one
+        fence_pattern = re.compile(
+            r"```(?:json)?\s*\n(\{.*?\})\s*\n```",
+            re.DOTALL,
+        )
+        for match in reversed(list(fence_pattern.finditer(text))):
+            try:
+                data = json.loads(match.group(1))
+                if isinstance(data, dict) and "likely_cause" in data:
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+        # Try 3: Last JSON object in the text (no fences)
+        # Match balanced braces — handles nested objects like evidence arrays
+        brace_pattern = re.compile(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL)
+        for match in reversed(list(brace_pattern.finditer(text))):
+            try:
+                data = json.loads(match.group(0))
+                if isinstance(data, dict) and "likely_cause" in data:
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+        return None
 
     def _escalate_without_cc(self, diagnostic: DiagnosticSnapshot) -> DiagnosisResult:
         """CC unavailable — collect evidence and ESCALATE. No recovery actions.
@@ -269,6 +423,8 @@ class DiagnosisEngine:
             confidence_pct=0,
             evidence=evidence,
             recommended_action=RecoveryAction.ESCALATE,
+            actions_taken=[],
+            outcome="escalate",
             reasoning="Guardian's diagnostic brain (CC) is unavailable. "
                       "Without intelligent cross-referencing of signals, any "
                       "programmatic recovery risks acting on a false signal. "

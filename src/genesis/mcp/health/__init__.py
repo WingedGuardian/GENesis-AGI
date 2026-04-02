@@ -56,6 +56,7 @@ def init_health_mcp(
     logger.info("Health MCP wired to HealthDataService")
 
 
+from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
@@ -95,6 +96,14 @@ _impl_task_resume = _task_tools._impl_task_resume
 _impl_task_cancel = _task_tools._impl_task_cancel
 _impl_module_call = _module_ops._impl_module_call
 _impl_module_list = _module_ops._impl_module_list
+_impl_browser_navigate = _browser._impl_browser_navigate
+_impl_browser_click = _browser._impl_browser_click
+_impl_browser_fill = _browser._impl_browser_fill
+_impl_browser_screenshot = _browser._impl_browser_screenshot
+_impl_browser_snapshot = _browser._impl_browser_snapshot
+_impl_browser_run_js = _browser._impl_browser_run_js
+_impl_browser_sessions = _browser._impl_browser_sessions
+_impl_browser_clear_domain = _browser._impl_browser_clear_domain
 
 # Re-export init function for runtime wiring
 init_task_tools = _task_tools.init_task_tools
@@ -134,4 +143,13 @@ __all__ = [
     "settings",
     "status",
     "task_tools",
+    "_browser",
+    "_impl_browser_navigate",
+    "_impl_browser_click",
+    "_impl_browser_fill",
+    "_impl_browser_screenshot",
+    "_impl_browser_snapshot",
+    "_impl_browser_run_js",
+    "_impl_browser_sessions",
+    "_impl_browser_clear_domain",
 ]

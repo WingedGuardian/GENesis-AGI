@@ -1,0 +1,596 @@
+---
+name: codex
+version: 2.0.0
+description: |
+  Multi-AI adversarial fallback chain — three tiers: Codex CLI (primary),
+  OpenCode/GLM5 (fallback), Claude subagent (last resort). Three modes: review
+  (code review with pass/fail gate), challenge (adversarial — tries to break
+  your code), consult (ask anything with session continuity). Use when asked
+  to "codex review", "codex challenge", "ask codex", "second opinion", or
+  "consult codex".
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - AskUserQuestion
+  - Agent
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /codex — Multi-AI Second Opinion (with fallback chain)
+
+You are running the `/codex` skill. This wraps multiple external AI tools to get an
+independent, brutally honest second opinion from a different AI system.
+
+**Fallback chain:** Codex CLI → OpenCode (GLM5 via Zen) → Claude subagent (Opus 4.6).
+Each tool is tried in order; on failure, the next is attempted automatically.
+
+The primary persona is the "200 IQ autistic developer" — direct, terse, technically
+precise, challenges assumptions, catches things you might miss. Present output
+faithfully, not summarized.
+
+---
+
+## Step 0: Check available tools
+
+```bash
+CODEX_BIN=$(which codex 2>/dev/null || echo "")
+OPENCODE_BIN=$(which opencode 2>/dev/null || echo "")
+[ -n "$CODEX_BIN" ] && echo "CODEX: FOUND" || echo "CODEX: NOT_FOUND"
+[ -n "$OPENCODE_BIN" ] && echo "OPENCODE: FOUND" || echo "OPENCODE: NOT_FOUND"
+echo "CLAUDE_SUBAGENT: ALWAYS_AVAILABLE"
+```
+
+Note which tools are available. **Do NOT stop here** — Claude subagent is always
+available, so the skill can always run even if both CLIs are missing.
+
+If both CLIs are missing, note: "Codex and OpenCode CLIs not found. Falling back to
+Claude subagent. Install Codex: `npm install -g @openai/codex`"
+
+---
+
+## Fallback Chain Rules
+
+**The chain:** Codex → OpenCode (GLM5) → Claude subagent
+
+**A tool invocation has FAILED if ANY of these are true:**
+- Binary not found (from Step 0)
+- Auth/credits error: stderr or JSON output contains "auth", "login", "unauthorized",
+  "Insufficient balance", "API key", "forbidden", "401", or "CreditsError"
+- Timeout: Bash call exceeds 5 minutes (300000ms)
+- Empty response: stdout is empty or whitespace-only after parsing
+- Non-zero exit code (catch-all)
+
+**Behavior:**
+- Fallback is **automatic and silent** — do not ask the user before falling back
+- On success at any tier, **stop** — do not continue down the chain
+- Always **attribute output** to the tool that produced it (see Attribution section)
+- After completion, print a **chain summary** showing what happened at each tier
+
+**OpenCode model:** Use `opencode/glm-5` with `--variant max`. If GLM5 fails due to
+credits, fall through to Claude subagent (Opus 4.6 is stronger than free-tier models).
+
+---
+
+## Step 1: Detect mode
+
+Parse the user's input to determine which mode to run:
+
+1. `/codex review` or `/codex review <instructions>` — **Review mode** (Step 2A)
+2. `/codex challenge` or `/codex challenge <focus>` — **Challenge mode** (Step 2B)
+3. `/codex` with no arguments — **Auto-detect:**
+   - Check for a diff (with fallback if origin isn't available):
+     `git diff origin/<base> --stat 2>/dev/null | tail -1 || git diff <base> --stat 2>/dev/null | tail -1`
+   - If a diff exists, use AskUserQuestion:
+     ```
+     Codex detected changes against the base branch. What should it do?
+     A) Review the diff (code review with pass/fail gate)
+     B) Challenge the diff (adversarial — try to break it)
+     C) Something else — I'll provide a prompt
+     ```
+   - If no diff, check for plan files scoped to the current project:
+     `ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1`
+     If no project-scoped match, fall back to: `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+     but warn the user: "Note: this plan may be from a different project."
+   - If a plan file exists, offer to review it
+   - Otherwise, ask: "What would you like to ask Codex?"
+4. `/codex <anything else>` — **Consult mode** (Step 2C), where the remaining text is the prompt
+
+---
+
+## Step 2A: Review Mode
+
+Run code review against the current branch diff. Try each tier in order until one succeeds.
+
+### Tier 1 — Codex
+
+Skip if `CODEX: NOT_FOUND` from Step 0.
+
+1. Create temp files:
+```bash
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+2. Run the review (5-minute timeout):
+```bash
+codex review --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
+```
+
+Use `timeout: 300000` on the Bash call. If the user provided custom instructions
+(e.g., `/codex review focus on security`), pass them as the prompt argument:
+```bash
+codex review "focus on security" --base <base> -c 'model_reasoning_effort="xhigh"' --enable web_search_cached 2>"$TMPERR"
+```
+
+3. Check for failure (see Fallback Chain Rules). Read stderr:
+```bash
+cat "$TMPERR" 2>/dev/null
+```
+
+If failed, note the reason (e.g., "Codex failed: auth error") and proceed to Tier 2.
+Clean up: `rm -f "$TMPERR"`
+
+4. If succeeded — parse cost from stderr:
+```bash
+grep "tokens used" "$TMPERR" 2>/dev/null || echo "tokens: unknown"
+```
+
+5. Determine gate verdict: `[P1]` present → **FAIL**. No `[P1]` → **PASS**.
+
+6. Present output, then skip to "Post-review" section below.
+
+### Tier 2 — OpenCode
+
+Skip if `OPENCODE: NOT_FOUND` from Step 0.
+
+```bash
+opencode run "Review the changes on this branch against <base>. Run git diff origin/<base> to see the full diff. Perform a thorough code review. For each finding, classify as [P1] (critical - must fix) or [P2] (minor - should fix). Be direct and terse. No compliments — just the problems." --model opencode/glm-5 --format json --variant max 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'text':
+            p = obj.get('part',{})
+            text = p.get('text','')
+            if text: print(text)
+        elif t == 'error':
+            err = obj.get('error',{})
+            msg = err.get('data',{}).get('message','') or str(err)
+            print(f'OPENCODE_ERROR: {msg}', file=sys.stderr)
+        elif t == 'step_finish':
+            p = obj.get('part',{})
+            tokens = p.get('tokens',{})
+            total = tokens.get('total',0)
+            if total: print(f'\ntokens used: {total}')
+    except: pass
+"
+```
+
+Use `timeout: 300000`. If output contains `OPENCODE_ERROR` or is empty, note the
+failure reason and proceed to Tier 3.
+
+If succeeded — determine gate verdict same as Tier 1, present output, skip to "Post-review."
+
+### Tier 3 — Claude subagent
+
+Dispatch via the Agent tool:
+
+```
+subagent_type: "feature-dev:code-reviewer"
+prompt: "Read the diff for this branch with `git diff origin/<base>`. Perform a thorough
+code review. For each finding, classify as [P1] (critical - must fix before merge) or
+[P2] (minor - should fix but not blocking). Check for: bugs, race conditions, security
+issues, error handling gaps, performance problems, and API misuse. Be direct and terse.
+No compliments — just the problems."
+```
+
+If the subagent also fails: report `STATUS: BLOCKED` with what was tried at each tier.
+
+### Post-review (after any tier succeeds)
+
+1. Present the output with attribution (see Attribution section).
+
+2. **Cross-model comparison:** If `/review` (Claude's own review) was already run
+   earlier in this conversation, compare the two sets of findings:
+
+```
+CROSS-MODEL ANALYSIS:
+  Both found: [findings that overlap]
+  Only <source> found: [findings unique to the tool that ran]
+  Only Claude found: [findings unique to Claude's /review]
+  Agreement rate: X% (N/M total unique findings overlap)
+```
+
+3. Persist the review result:
+```bash
+~/.claude/skills/gstack/bin/gstack-review-log '{"skill":"codex-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N,"source":"SOURCE"}'
+```
+
+Substitute: TIMESTAMP (ISO 8601), STATUS ("clean" if PASS, "issues_found" if FAIL),
+GATE ("pass" or "fail"), findings (count of [P1] + [P2] markers),
+findings_fixed (count of findings that were addressed/fixed before shipping).
+SOURCE: "codex", "opencode", or "claude-subagent".
+
+4. Clean up temp files:
+```bash
+rm -f "$TMPERR"
+```
+
+5. Print the fallback chain summary.
+
+{{PLAN_FILE_REVIEW_REPORT}}
+
+---
+
+## Step 2B: Challenge (Adversarial) Mode
+
+Try to break your code — finding edge cases, race conditions, security holes,
+and failure modes that a normal review would miss.
+
+1. Construct the adversarial prompt. If the user provided a focus area
+(e.g., `/codex challenge security`), include it:
+
+Default prompt (no focus):
+"Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Your job is to find ways this code will fail in production. Think like an attacker and a chaos engineer. Find edge cases, race conditions, security holes, resource leaks, failure modes, and silent data corruption paths. Be adversarial. Be thorough. No compliments — just the problems."
+
+With focus (e.g., "security"):
+"Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Focus specifically on SECURITY. Your job is to find every way an attacker could exploit this code. Think about injection vectors, auth bypasses, privilege escalation, data exposure, and timing attacks. Be adversarial."
+
+2. Try each tier in order:
+
+### Tier 1 — Codex
+
+Skip if `CODEX: NOT_FOUND` from Step 0.
+
+Run codex exec with `--dangerously-bypass-approvals-and-sandbox` and **JSONL output** (5-minute timeout):
+```bash
+codex exec "<prompt>" --dangerously-bypass-approvals-and-sandbox -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}')
+                print()
+            elif itype == 'agent_message' and text:
+                print(text)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}')
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}')
+    except: pass
+"
+```
+
+**Note:** `--dangerously-bypass-approvals-and-sandbox` gives Codex full filesystem
+access. This is intentional for adversarial analysis — Codex needs to run git diff,
+read files, and potentially run tests. The Genesis container is the sandbox boundary.
+
+If failed (empty output, non-zero exit, auth error), proceed to Tier 2.
+
+### Tier 2 — OpenCode
+
+Skip if `OPENCODE: NOT_FOUND` from Step 0.
+
+```bash
+opencode run "<same adversarial prompt>" --model opencode/glm-5 --format json --variant max 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'text':
+            p = obj.get('part',{})
+            text = p.get('text','')
+            if text: print(text)
+        elif t == 'error':
+            err = obj.get('error',{})
+            msg = err.get('data',{}).get('message','') or str(err)
+            print(f'OPENCODE_ERROR: {msg}', file=sys.stderr)
+        elif t == 'step_finish':
+            p = obj.get('part',{})
+            tokens = p.get('tokens',{})
+            total = tokens.get('total',0)
+            if total: print(f'\ntokens used: {total}')
+    except: pass
+"
+```
+
+If failed, proceed to Tier 3.
+
+### Tier 3 — Claude subagent
+
+Dispatch via the Agent tool:
+
+```
+subagent_type: "general-purpose"
+prompt: "Read the diff for this branch with `git diff origin/<base>`. Your job is to find
+ways this code will fail in production. Think like an attacker and a chaos engineer. Find
+edge cases, race conditions, security holes, resource leaks, failure modes, and silent
+data corruption paths. Be adversarial. Be thorough. No compliments — just the problems.
+For each finding, classify as FIXABLE (can be addressed now) or INVESTIGATE (needs more
+analysis). This is research only — do NOT modify any files."
+```
+
+If all three tiers fail: `STATUS: BLOCKED`.
+
+3. Present the full output with attribution (see Attribution section).
+4. Print the fallback chain summary.
+
+---
+
+## Step 2C: Consult Mode
+
+Ask anything about the codebase. Supports session continuity for follow-ups.
+
+1. **Check for existing session:**
+```bash
+cat .context/codex-session-id 2>/dev/null || echo "NO_SESSION"
+```
+
+If a session file exists (not `NO_SESSION`), parse the tool name from it.
+Use AskUserQuestion:
+```
+You have an active conversation from earlier (via <tool>). Continue it or start fresh?
+A) Continue the conversation (remembers the prior context)
+B) Start a new conversation
+```
+
+2. Create temp files:
+```bash
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+3. **Plan review auto-detection:** If the user's prompt is about reviewing a plan,
+or if plan files exist and the user said `/codex` with no arguments:
+```bash
+ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1
+```
+If no project-scoped match, fall back to `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+but warn: "Note: this plan may be from a different project — verify before sending."
+Read the plan file and prepend the persona to the user's prompt:
+"You are a brutally honest technical reviewer. Review this plan for: logical gaps and
+unstated assumptions, missing error handling or edge cases, overcomplexity (is there a
+simpler approach?), feasibility risks (what could go wrong?), and missing dependencies
+or sequencing issues. Be direct. Be terse. No compliments. Just the problems.
+
+THE PLAN:
+<plan content>"
+
+4. Try each tier in order:
+
+### Tier 1 — Codex
+
+Skip if `CODEX: NOT_FOUND` from Step 0.
+
+For a **new session:**
+```bash
+codex exec "<prompt>" -s read-only -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'thread.started':
+            tid = obj.get('thread_id','')
+            if tid: print(f'SESSION_ID:{tid}')
+        elif t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}')
+                print()
+            elif itype == 'agent_message' and text:
+                print(text)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}')
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}')
+    except: pass
+"
+```
+
+For a **resumed session** (user chose "Continue" and prior tool was codex):
+```bash
+codex exec resume <session-id> "<prompt>" -s read-only -c 'model_reasoning_effort="xhigh"' --enable web_search_cached --json 2>"$TMPERR" | python3 -c "
+<same python streaming parser as above>
+"
+```
+
+If failed, proceed to Tier 2.
+
+### Tier 2 — OpenCode
+
+Skip if `OPENCODE: NOT_FOUND` from Step 0.
+
+```bash
+opencode run "<prompt>" --model opencode/glm-5 --format json --variant max 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'text':
+            p = obj.get('part',{})
+            text = p.get('text','')
+            if text: print(text)
+        elif t == 'error':
+            err = obj.get('error',{})
+            msg = err.get('data',{}).get('message','') or str(err)
+            print(f'OPENCODE_ERROR: {msg}', file=sys.stderr)
+        elif t == 'step_finish':
+            p = obj.get('part',{})
+            sid = obj.get('sessionID','')
+            if sid: print(f'SESSION_ID:{sid}')
+            tokens = p.get('tokens',{})
+            total = tokens.get('total',0)
+            if total: print(f'\ntokens used: {total}')
+    except: pass
+"
+```
+
+For a **resumed session** (prior tool was opencode):
+```bash
+opencode run "<prompt>" --model opencode/glm-5 --format json --variant max --session <session-id> --continue 2>/dev/null | python3 -c "
+<same OpenCode parser as above>
+"
+```
+
+If failed, proceed to Tier 3.
+
+### Tier 3 — Claude subagent
+
+Dispatch via the Agent tool:
+
+```
+subagent_type: "general-purpose"
+prompt: "<the user's prompt>"
+```
+
+Claude subagent has no session continuity across invocations.
+
+5. Save session info for follow-ups:
+```bash
+mkdir -p .context
+echo "TOOL:<tool-that-succeeded> SESSION_ID:<id-if-available>" > .context/codex-session-id
+```
+
+If the tool that succeeded was Claude subagent, write `TOOL:claude-subagent SESSION_ID:none`.
+
+6. Present the full output with attribution (see Attribution section).
+
+7. After presenting, note any points where the tool's analysis differs from your own
+   understanding. If there is a disagreement, flag it:
+   "Note: Claude Code disagrees on X because Y."
+
+8. Clean up temp files:
+```bash
+rm -f "$TMPERR"
+```
+
+9. Print the fallback chain summary.
+
+---
+
+## Attribution
+
+Always present output with clear attribution showing which tool produced the result.
+
+**When primary tool (Codex) succeeds:**
+```
+CODEX SAYS (<mode>):
+════════════════════════════════════════════════════════════
+<full output, verbatim — do not truncate or summarize>
+════════════════════════════════════════════════════════════
+Source: Codex CLI | Tokens: N
+```
+
+**When fallback to OpenCode:**
+```
+OPENCODE SAYS (<mode> — codex <reason>):
+════════════════════════════════════════════════════════════
+<full output, verbatim>
+════════════════════════════════════════════════════════════
+Source: OpenCode (glm-5 via Zen) | Codex failed: <reason>
+```
+
+**When fallback to Claude subagent:**
+```
+CLAUDE SUBAGENT SAYS (<mode> — last resort fallback):
+════════════════════════════════════════════════════════════
+<full output, verbatim>
+════════════════════════════════════════════════════════════
+Source: Claude subagent (Opus 4.6) | Codex failed: <reason> | OpenCode failed: <reason>
+```
+
+**Chain summary (always print at end):**
+```
+FALLBACK CHAIN: Codex (<status>) → OpenCode (<status>) → Claude subagent (<status>)
+```
+
+Where status is one of: SUCCESS, FAILED: <reason>, SKIPPED (binary not found), NOT_NEEDED.
+
+---
+
+## Model & Reasoning
+
+**Codex model:** No model is hardcoded — codex uses whatever its current default is (the
+frontier agentic coding model). If the user wants a specific model, pass `-m` through.
+
+**OpenCode model:** `opencode/glm-5` with `--variant max` (maximum reasoning effort).
+
+**Reasoning effort:** All Codex modes use `xhigh` — maximum reasoning power.
+
+**Web search:** All codex commands use `--enable web_search_cached` so Codex can look up
+docs and APIs during review. This is OpenAI's cached index — fast, no extra cost.
+
+If the user specifies a model (e.g., `/codex review -m gpt-5.1-codex-max`
+or `/codex challenge -m gpt-5.2`), pass the `-m` flag through to codex.
+
+---
+
+## Cost Estimation
+
+**Codex:** Parse token count from stderr. Display as: `Tokens: N`
+**OpenCode:** Parse from `step_finish` event's `tokens.total` field.
+**Claude subagent:** No token count available. Display: `Tokens: (subagent — not tracked)`
+
+If token count is not available, display: `Tokens: unknown`
+
+---
+
+## Error Handling
+
+Errors at any tier trigger fallback to the next tier (see Fallback Chain Rules).
+Only report `STATUS: BLOCKED` when ALL three tiers fail.
+
+Common errors:
+- **Auth error:** "Codex authentication failed. Run `codex login` to authenticate."
+- **Credits error (OpenCode):** "OpenCode Zen insufficient balance. Falling back."
+- **Timeout:** Tool timed out after 5 minutes.
+- **Empty response:** Tool returned no response.
+- **Session resume failure:** Delete the session file and start fresh.
+
+---
+
+## Important Rules
+
+- **Challenge mode has full sandbox bypass.** Codex runs with
+  `--dangerously-bypass-approvals-and-sandbox` in challenge mode only. Review and
+  Consult modes remain read-only (`-s read-only` for Codex).
+- **Present output verbatim.** Do not truncate, summarize, or editorialize output
+  before showing it. Show it in full inside the attribution block.
+- **Add synthesis after, not instead of.** Any Claude commentary comes after full output.
+- **5-minute timeout** on all Bash calls (`timeout: 300000`).
+- **Fallback is automatic.** Do not ask the user before falling back to the next tier.
+- **Always attribute.** Every output block must clearly state which tool produced it.
+- **No double-reviewing.** If the user already ran `/review`, this provides a second
+  independent opinion. Do not re-run Claude Code's own review.

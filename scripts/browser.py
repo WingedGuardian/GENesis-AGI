@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Lightweight CLI wrapper for Playwright browser automation.
 
-Replaces the Playwright MCP server for on-demand browser use via Bash.
+NOTE: For interactive CC sessions, prefer the genesis-health MCP browser_*
+tools (lazy-init, persistent session within MCP lifetime). This CLI script
+opens and closes the browser on every command, making it slower for
+multi-step workflows but useful for one-off tasks and background scripts.
 
 Usage:
     python scripts/browser.py navigate "https://example.com" --screenshot /tmp/page.png
@@ -27,7 +30,8 @@ def _launch(pw):
     context = pw.chromium.launch_persistent_context(
         user_data_dir=str(USER_DATA_DIR),
         headless=True,
-        args=["--no-sandbox", "--disable-gpu"],
+        executable_path="/usr/bin/google-chrome",
+        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
     )
     page = context.pages[0] if context.pages else context.new_page()
     return context, page
@@ -70,28 +74,10 @@ def cmd_snapshot(args):
     with sync_playwright() as pw:
         context, page = _launch(pw)
         try:
-            tree = page.accessibility.snapshot()
-            _print_tree(tree)
+            snapshot = page.locator("body").aria_snapshot()
+            print(snapshot)
         finally:
             context.close()
-
-
-def _print_tree(node, indent=0):
-    """Recursively print the accessibility tree."""
-    if node is None:
-        print("(empty page)")
-        return
-    role = node.get("role", "")
-    name = node.get("name", "")
-    value = node.get("value", "")
-    parts = [role]
-    if name:
-        parts.append(f'"{name}"')
-    if value:
-        parts.append(f"[{value}]")
-    print("  " * indent + " ".join(parts))
-    for child in node.get("children", []):
-        _print_tree(child, indent + 1)
 
 
 def cmd_screenshot(args):

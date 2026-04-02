@@ -397,10 +397,11 @@ async def _proceed_to_diagnosis(
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
 
     logger.info(
-        "Diagnosis: %s (confidence=%d%%, action=%s, source=%s)",
+        "Diagnosis: %s (confidence=%d%%, action=%s, outcome=%s, source=%s)",
         diagnosis.likely_cause,
         diagnosis.confidence_pct,
         diagnosis.recommended_action,
+        diagnosis.outcome,
         diagnosis.source,
     )
 
@@ -414,11 +415,62 @@ async def _proceed_to_diagnosis(
             logger.info("CC recovered — resuming intelligent diagnosis")
         sm.clear_cc_unavailable()
 
+    # CC-driven recovery: if CC already resolved the issue, verify and report
+    if diagnosis.outcome == "resolved":
+        logger.info("CC resolved the issue — verifying recovery")
+        await _handle_cc_resolved(config, sm, dispatcher, diagnosis)
+        return
+
     sm.set_confirmed_dead()
 
     await _execute_recovery_with_approval(
         config, sm, dispatcher, recovery_engine, diagnosis,
     )
+
+
+async def _handle_cc_resolved(
+    config: GuardianConfig,
+    sm: ConfirmationStateMachine,
+    dispatcher: AlertDispatcher,
+    diagnosis: object,
+) -> None:
+    """CC already fixed the problem — verify and report.
+
+    When the agentic CC session resolves the issue itself (investigation +
+    recovery + verification), we skip the approval flow and just confirm
+    health has returned.
+    """
+    # Verify by re-checking signals
+    await asyncio.sleep(config.recovery.verification_delay_s)
+    snapshot = await collect_all_signals(config)
+    sm.process(snapshot)
+
+    actions_str = ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "unknown"
+
+    if sm.current_state == GuardianState.HEALTHY:
+        logger.info("CC-driven recovery verified — Genesis is healthy")
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.INFO,
+            title="Genesis recovered (CC auto-resolved)",
+            body=f"Cause: {diagnosis.likely_cause}\n"
+                 f"Confidence: {diagnosis.confidence_pct}%\n"
+                 f"Actions: {actions_str}\n"
+                 f"Outcome: {diagnosis.outcome}",
+        ))
+        await _write_guardian_heartbeat(config)
+    else:
+        logger.warning(
+            "CC reported resolved but signals still failing — "
+            "falling back to approval-based recovery",
+        )
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title="CC recovery did not fully resolve — escalating",
+            body=f"CC reported: {diagnosis.likely_cause}\n"
+                 f"Actions taken: {actions_str}\n"
+                 f"But health signals still show failure. "
+                 f"Manual investigation may be needed.",
+        ))
 
 
 async def _handle_confirmed_dead(
@@ -450,12 +502,20 @@ async def _handle_confirmed_dead(
             logger.info("CC recovered — proceeding with CC diagnosis")
         sm.clear_cc_unavailable()
 
+    # CC-driven recovery: if CC already resolved, verify and report
+    if diagnosis.outcome == "resolved":
+        logger.info("CC resolved the issue on re-diagnosis — verifying")
+        await _handle_cc_resolved(config, sm, dispatcher, diagnosis)
+        return
+
     if sm.should_escalate():
         diagnosis = diagnosis.__class__(
             likely_cause=diagnosis.likely_cause,
             confidence_pct=diagnosis.confidence_pct,
             evidence=diagnosis.evidence,
             recommended_action="ESCALATE",
+            actions_taken=diagnosis.actions_taken,
+            outcome=diagnosis.outcome,
             reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
                       + diagnosis.reasoning,
             source=diagnosis.source,

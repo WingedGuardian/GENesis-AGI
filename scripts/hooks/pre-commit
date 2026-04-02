@@ -2,21 +2,27 @@
 # Genesis pre-commit hook — block secrets, large files, and warn on direct-to-main
 # Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
 
-# Warn on direct commits to main
+# Block direct commits to main — use a feature branch
 current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
 if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
-    # Check if other worktrees exist (indicates concurrent sessions)
-    worktree_count=$(git worktree list 2>/dev/null | wc -l)
-    if [ "$worktree_count" -gt 1 ]; then
-        echo "BLOCKED: Committing directly to '$current_branch' while worktrees are active."
-        echo "Other sessions are working in worktrees — use a feature branch."
-        echo "  git worktree list    # see active worktrees"
+    if [ "${GENESIS_ALLOW_MAIN_COMMIT:-}" = "1" ]; then
+        echo "OVERRIDE: Direct commit to '$current_branch' allowed (GENESIS_ALLOW_MAIN_COMMIT=1)."
+    else
+        echo ""
+        echo "BLOCKED: Direct commit to '$current_branch'."
+        echo ""
+        echo "This is not a warning. The commit has been rejected."
+        echo ""
+        echo "Use a feature branch:"
         echo "  git checkout -b <scope>/<description>"
+        echo "  git commit ..."
+        echo "  git checkout main && git merge <branch>"
+        echo ""
+        echo "ONLY if the user explicitly approved a direct-to-main commit:"
+        echo "  GENESIS_ALLOW_MAIN_COMMIT=1 git commit ..."
+        echo ""
         exit 1
     fi
-    echo "WARNING: Committing directly to '$current_branch'."
-    echo "If other sessions are active, use a worktree + feature branch instead."
-    echo "  See CLAUDE.md 'Concurrent Sessions & Worktrees' section."
 fi
 
 # Block .env and secrets files

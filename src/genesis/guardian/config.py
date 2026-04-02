@@ -72,12 +72,33 @@ class ApprovalConfig:
 
 @dataclass
 class CCConfig:
-    """Claude Code diagnosis engine settings."""
+    """Claude Code diagnosis engine settings.
+
+    The Guardian's CC invocation is the highest-stakes CC call in the system.
+    When it fires, Genesis is down. Use the best model available (opus) with
+    generous limits — these are runaway guards, not operational constraints.
+    """
 
     enabled: bool = True
-    model: str = "sonnet"
-    timeout_s: int = 120
-    path: str = "~/.local/bin/claude"
+    model: str = "opus"
+    timeout_s: int = 3600  # 60 min — must not clip downloads or deep investigation
+    max_turns: int = 50    # Runaway guard — legitimate work is ~15-30 turns
+    path: str = "claude"
+
+
+@dataclass
+class BriefingConfig:
+    """Shared filesystem briefing settings.
+
+    Genesis writes a curated briefing to the shared mount. Guardian reads
+    it before CC diagnosis to give the investigator situational awareness.
+    """
+
+    enabled: bool = True
+    # Relative to state_dir: {state_dir}/shared/briefing/guardian_briefing.md
+    shared_subdir: str = "shared"
+    briefing_filename: str = "guardian_briefing.md"
+    max_age_s: int = 600  # 10 min — stale after this
 
 
 @dataclass
@@ -117,6 +138,7 @@ class GuardianConfig:
     alert: AlertConfig = field(default_factory=AlertConfig)
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
     cc: CCConfig = field(default_factory=CCConfig)
+    briefing: BriefingConfig = field(default_factory=BriefingConfig)
     snapshots: SnapshotConfig = field(default_factory=SnapshotConfig)
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
 
@@ -126,7 +148,11 @@ class GuardianConfig:
         return f"http://{ip}:{self.health_api_port}"
 
     def _detect_container_ip(self) -> str:
-        """Auto-detect container IP via incus list. Cache result."""
+        """Auto-detect container IP via incus list. Cache result.
+
+        Prefers eth0 over tailscale interfaces — Tailscale IPs may not
+        be routable from the host depending on network configuration.
+        """
         import subprocess
         try:
             result = subprocess.run(
@@ -135,9 +161,28 @@ class GuardianConfig:
             )
             if result.returncode == 0:
                 import re
-                match = re.search(r"(\d+\.\d+\.\d+\.\d+)", result.stdout)
-                if match:
-                    ip = match.group(1)
+                ip = None
+                # Prefer eth0, then any non-tailscale interface, then first IP
+                eth0_match = re.search(
+                    r"(\d+\.\d+\.\d+\.\d+)\s*\(eth0\)", result.stdout,
+                )
+                if eth0_match:
+                    ip = eth0_match.group(1)
+                else:
+                    for m in re.finditer(
+                        r"(\d+\.\d+\.\d+\.\d+)\s*\((\w+)\)", result.stdout,
+                    ):
+                        if "tailscale" not in m.group(2):
+                            ip = m.group(1)
+                            break
+                    else:
+                        # Last resort: first IP found
+                        fallback = re.search(
+                            r"(\d+\.\d+\.\d+\.\d+)", result.stdout,
+                        )
+                        if fallback:
+                            ip = fallback.group(1)
+                if ip:
                     self.container_ip = ip  # Cache for future calls
                     return ip
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -148,6 +193,16 @@ class GuardianConfig:
     @property
     def state_path(self) -> Path:
         return Path(self.state_dir).expanduser()
+
+    @property
+    def briefing_path(self) -> Path:
+        """Full path to the Guardian briefing file on the host."""
+        return (
+            self.state_path
+            / self.briefing.shared_subdir
+            / "briefing"
+            / self.briefing.briefing_filename
+        )
 
 
 def _env_override(config: GuardianConfig) -> GuardianConfig:
@@ -189,6 +244,8 @@ def _env_override(config: GuardianConfig) -> GuardianConfig:
     for env_var, attr, typ in [
         ("GUARDIAN_CC_ENABLED", "enabled", lambda v: v.lower() in ("1", "true", "yes")),
         ("GUARDIAN_CC_MODEL", "model", str),
+        ("GUARDIAN_CC_TIMEOUT", "timeout_s", int),
+        ("GUARDIAN_CC_MAX_TURNS", "max_turns", int),
         ("GUARDIAN_CC_PATH", "path", str),
     ]:
         val = os.environ.get(env_var)
@@ -237,6 +294,7 @@ def load_config(path: Path | None = None) -> GuardianConfig:
         alert=_build_sub(AlertConfig, raw, "alert"),
         approval=_build_sub(ApprovalConfig, raw, "approval"),
         cc=_build_sub(CCConfig, raw, "cc"),
+        briefing=_build_sub(BriefingConfig, raw, "briefing"),
         snapshots=_build_sub(SnapshotConfig, raw, "snapshots"),
         recovery=_build_sub(RecoveryConfig, raw, "recovery"),
     )

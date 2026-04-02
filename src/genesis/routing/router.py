@@ -14,6 +14,7 @@ from genesis.routing.circuit_breaker import CircuitBreakerRegistry
 from genesis.routing.cost_tracker import CostTracker
 from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.degradation import DegradationTracker
+from genesis.routing.rate_gate import RateGateRegistry
 from genesis.routing.retry import classify_error, compute_delay
 from genesis.routing.types import (
     BudgetStatus,
@@ -48,6 +49,16 @@ class Router:
         self._event_bus = event_bus
         self._dead_letter = dead_letter
         self._activity_tracker: ProviderActivityTracker | None = None
+        self._rate_gates = self._build_rate_gates(config)
+
+    @staticmethod
+    def _build_rate_gates(config: RoutingConfig) -> RateGateRegistry:
+        """Create rate gates for providers with RPM limits."""
+        registry = RateGateRegistry()
+        for name, provider in config.providers.items():
+            if provider.rpm_limit is not None and provider.rpm_limit > 0:
+                registry.register(name, provider.rpm_limit)
+        return registry
 
     def set_activity_tracker(self, tracker: ProviderActivityTracker) -> None:
         """Inject activity tracker for per-provider call metrics."""
@@ -65,6 +76,7 @@ class Router:
         old_sites = set(self.config.call_sites)
         new_sites = set(new_config.call_sites)
         self.config = new_config
+        self._rate_gates = self._build_rate_gates(new_config)
 
         # Update breaker registry so get() can create breakers for new providers
         self.breakers.update_providers(new_config.providers)
@@ -88,6 +100,7 @@ class Router:
         messages: list[dict],
         *,
         budget_override: bool = False,
+        suppress_dead_letter: bool = False,
         **kwargs,
     ) -> RoutingResult:
         """Route a call through the provider chain for the given call site."""
@@ -147,6 +160,9 @@ class Router:
             ):
                 failed_providers.append(provider_name)
                 continue
+
+            # Rate gate — pace requests per provider RPM limit
+            await self._rate_gates.acquire(provider_name)
 
             # Try with retry (timed for activity tracking)
             t0 = time.monotonic()
@@ -242,7 +258,7 @@ class Router:
             )
 
         dead_lettered = False
-        if self._dead_letter:
+        if self._dead_letter and not suppress_dead_letter:
             try:
                 await self._dead_letter.enqueue(
                     operation_type=f"chain_exhausted:{call_site_id}",

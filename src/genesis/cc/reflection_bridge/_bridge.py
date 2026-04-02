@@ -1,0 +1,448 @@
+"""CCReflectionBridge — core orchestration class.
+
+Dispatches Light/Deep/Strategic reflections to Claude Code background
+sessions. Delegates prompt building to _prompts and output handling to
+_output submodules.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from genesis.autonomy.dispatch_gate import check_dispatch_preconditions
+from genesis.autonomy.types import ActionClass, ApprovalDecision, AutonomyCategory
+from genesis.awareness.types import Depth
+from genesis.cc.contingency import RATE_LIMIT_DEFERRAL_TTL_S
+from genesis.cc.reflection_bridge._output import (
+    route_deep_output,
+    send_to_topic,
+    store_reflection_output,
+)
+from genesis.cc.reflection_bridge._prompts import (
+    build_reflection_prompt,
+    load_prompt_file,
+    system_prompt_for_depth,
+)
+from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
+from genesis.observability.call_site_recorder import record_last_run
+from genesis.perception.types import ReflectionResult
+
+if TYPE_CHECKING:
+    from genesis.cc.protocol import AgentProvider
+    from genesis.perception.context import ContextAssembler
+    from genesis.reflection.context_gatherer import ContextGatherer
+    from genesis.reflection.output_router import OutputRouter
+    from genesis.resilience.cc_budget import CCBudgetTracker
+    from genesis.resilience.deferred_work import DeferredWorkQueue
+
+logger = logging.getLogger(__name__)
+
+
+_DEPTH_MODEL = {
+    Depth.LIGHT: CCModel.HAIKU,
+    Depth.DEEP: CCModel.SONNET,
+    Depth.STRATEGIC: CCModel.OPUS,
+}
+
+_DEPTH_TIMEOUT_S = {
+    Depth.LIGHT: 600,
+    Depth.DEEP: 1800,
+    Depth.STRATEGIC: 3600,
+}
+
+_DEPTH_CALL_SITE = {
+    Depth.DEEP: "5_deep_reflection",
+    Depth.STRATEGIC: "6_strategic_reflection",
+    Depth.LIGHT: "4_light_reflection",
+}
+
+_DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "identity"
+
+_DEPTH_AUTONOMY_LEVEL = {
+    Depth.LIGHT: 1,
+    Depth.DEEP: 2,
+    Depth.STRATEGIC: 3,
+}
+
+
+class CCReflectionBridge:
+    """Dispatches Light/Deep/Strategic reflections to Claude Code background sessions."""
+
+    def __init__(
+        self,
+        *,
+        session_manager,
+        invoker: AgentProvider,
+        db,
+        event_bus=None,
+        prompt_dir: Path | None = None,
+        context_gatherer: ContextGatherer | None = None,
+        output_router: OutputRouter | None = None,
+        cc_budget: CCBudgetTracker | None = None,
+        deferred_queue: DeferredWorkQueue | None = None,
+    ):
+        self._session_manager = session_manager
+        self._invoker = invoker
+        self._db = db
+        self._event_bus = event_bus
+        self._prompt_dir = prompt_dir or _DEFAULT_PROMPT_DIR
+        self._context_gatherer = context_gatherer
+        self._output_router = output_router
+        self._cc_budget = cc_budget
+        self._deferred_queue = deferred_queue
+        self._context_assembler: ContextAssembler | None = None
+        self._topic_manager = None
+
+    # ── Injection setters (for late binding) ──────────────────────────
+
+    def set_context_gatherer(self, gatherer: ContextGatherer) -> None:
+        self._context_gatherer = gatherer
+
+    def set_output_router(self, router: OutputRouter) -> None:
+        self._output_router = router
+
+    def set_cc_budget(self, budget: CCBudgetTracker) -> None:
+        self._cc_budget = budget
+
+    def set_deferred_queue(self, queue: DeferredWorkQueue) -> None:
+        self._deferred_queue = queue
+
+    def set_context_assembler(self, assembler: ContextAssembler) -> None:
+        """Set ContextAssembler for enriched light reflection prompts."""
+        self._context_assembler = assembler
+
+    def set_topic_manager(self, manager: object) -> None:
+        """Set TopicManager for routing output to forum topics."""
+        self._topic_manager = manager
+
+    # ── Main reflection entry point ───────────────────────────────────
+
+    def _model_for_depth(self, depth: Depth) -> CCModel:
+        return _DEPTH_MODEL.get(depth, CCModel.SONNET)
+
+    def _effort_for_context(self, depth: Depth, tick=None, escalation_source: str | None = None) -> EffortLevel:
+        """Effort level per depth."""
+        if depth == Depth.STRATEGIC:
+            return EffortLevel.MAX
+        if depth == Depth.LIGHT:
+            return EffortLevel.LOW
+        # Deep: fixed HIGH. Adaptive effort is a V4 executor concern.
+        # GROUNDWORK(v4-executor): escalation_source will drive executor effort.
+        if escalation_source:
+            logger.debug("Deep reflection triggered by %s (effort fixed at HIGH)", escalation_source)
+        return EffortLevel.HIGH
+
+    async def _check_throttle(self, priority: int, work_type: str) -> ReflectionResult | None:
+        """Check CC budget throttling. Returns a deferred result if throttled, None otherwise."""
+        if self._cc_budget is None:
+            return None
+        if not await self._cc_budget.should_throttle(requested_priority=priority):
+            return None
+        logger.warning("CC throttled, deferring %s", work_type)
+        if self._deferred_queue:
+            await self._deferred_queue.enqueue(
+                work_type=work_type,
+                call_site_id=None,
+                priority=30 if work_type == "reflection" else 40,
+                payload=json.dumps({"work_type": work_type}),
+                reason="CC throttled",
+                staleness_policy="ttl",
+                staleness_ttl_s=RATE_LIMIT_DEFERRAL_TTL_S,
+            )
+        return ReflectionResult(success=False, reason=f"CC throttled — {work_type} deferred")
+
+    def _check_dispatch_gate(
+        self, depth: Depth, *, earned_level: int | None = None,
+    ) -> ReflectionResult | None:
+        """Pre-dispatch autonomy gate."""
+        required_level = _DEPTH_AUTONOMY_LEVEL.get(depth, 1)
+        if earned_level is None:
+            earned_level = 3  # BACKGROUND_COGNITIVE ceiling
+        decision = check_dispatch_preconditions(
+            category=AutonomyCategory.BACKGROUND_COGNITIVE.value,
+            required_level=required_level,
+            action_class=ActionClass.REVERSIBLE,
+            earned_level=earned_level,
+        )
+        if decision == ApprovalDecision.BLOCK:
+            logger.warning(
+                "Dispatch gate BLOCKED %s reflection (required L%d, ceiling exceeded)",
+                depth.value, required_level,
+            )
+            return ReflectionResult(
+                success=False,
+                reason=f"Dispatch gate blocked {depth.value} reflection (L{required_level} exceeds ceiling)",
+            )
+        if decision == ApprovalDecision.PROPOSE:
+            logger.info(
+                "Dispatch gate PROPOSE for %s reflection (required L%d) — proceeding in V3",
+                depth.value, required_level,
+            )
+        return None
+
+    async def reflect(
+        self, depth: Depth, tick, *, db,
+        escalation_source: str | None = None,
+    ) -> ReflectionResult:
+        """Run Deep or Strategic reflection via CC background session."""
+        # Check CC budget before proceeding
+        throttle_result = await self._check_throttle(priority=2, work_type="reflection")
+        if throttle_result is not None:
+            return throttle_result
+
+        # Pre-dispatch autonomy gate
+        gate_result = self._check_dispatch_gate(depth)
+        if gate_result is not None:
+            return gate_result
+
+        model = self._model_for_depth(depth)
+        effort = self._effort_for_context(depth, tick=tick, escalation_source=escalation_source)
+
+        # Check if there's pending work (Phase 7 enriched path)
+        if self._context_gatherer and depth == Depth.DEEP:
+            pending = await self._context_gatherer.detect_pending_work(db)
+            if not pending.has_any_work:
+                logger.info("Deep reflection skipped — no pending work")
+                return ReflectionResult(
+                    success=True,
+                    reason="No pending work for deep reflection",
+                )
+
+        # 1. Create background session
+        skill_tags = [f"{depth.value.lower()}-reflection"]
+        try:
+            sess = await self._session_manager.create_background(
+                session_type=SessionType.BACKGROUND_REFLECTION,
+                model=model,
+                effort=effort,
+                source_tag=f"reflection_{depth.value.lower()}",
+                skill_tags=skill_tags,
+            )
+        except Exception:
+            logger.exception("Failed to create background session for %s", depth.value)
+            return ReflectionResult(success=False, reason="Session creation failed")
+
+        # 2. Build prompt
+        prompt = await build_reflection_prompt(
+            depth, tick, db=db,
+            context_gatherer=self._context_gatherer,
+            context_assembler=self._context_assembler,
+            prompt_dir=self._prompt_dir,
+        )
+
+        # 3. Invoke CC
+        no_mcp = str(Path(__file__).resolve().parents[4] / "config" / "no_mcp.json")
+        invocation = CCInvocation(
+            prompt=prompt,
+            model=model,
+            effort=effort,
+            timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
+            system_prompt=self._system_prompt_for_depth(depth),
+            skip_permissions=True,
+            mcp_config=no_mcp if depth == Depth.LIGHT else None,
+            working_dir=background_session_dir(),
+            stream_idle_timeout_ms=(
+                _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
+                if depth in (Depth.DEEP, Depth.STRATEGIC)
+                else None
+            ),
+        )
+        output = await self._invoker.run(invocation)
+
+        if output.is_error:
+            logger.error(
+                "CC %s reflection failed: %s", depth.value, output.error_message,
+            )
+            await self._session_manager.fail(sess["id"], reason=output.error_message)
+            return ReflectionResult(success=False, reason=output.error_message)
+
+        # 4. Complete session
+        await self._session_manager.complete(
+            sess["id"],
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        await record_last_run(
+            db, _DEPTH_CALL_SITE.get(depth, f"cc_reflection_{depth.value.lower()}"),
+            provider="cc", model_id=output.model_used or str(model),
+            response_text=output.text,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        # 5. Route output
+        if self._output_router and depth == Depth.DEEP:
+            try:
+                await route_deep_output(output.text, db=db, output_router=self._output_router)
+            except Exception:
+                logger.error(
+                    "Deep output routing failed — falling back to legacy store",
+                    exc_info=True,
+                )
+                await store_reflection_output(depth, tick, output, db=db)
+        else:
+            await store_reflection_output(depth, tick, output, db=db)
+
+        # 6. Send to topic
+        await send_to_topic(sess["id"], depth, output, topic_manager=self._topic_manager)
+
+        logger.info(
+            "CC %s reflection completed (cost=$%.4f, tokens=%d+%d)",
+            depth.value, output.cost_usd, output.input_tokens, output.output_tokens,
+        )
+        return ReflectionResult(success=True, reason=f"CC {depth.value} reflection completed")
+
+    # ── Weekly jobs ───────────────────────────────────────────────────
+
+    async def run_weekly_assessment(self, db) -> ReflectionResult:
+        """Run weekly self-assessment via CC background session."""
+        throttle_result = await self._check_throttle(priority=3, work_type="weekly_assessment")
+        if throttle_result is not None:
+            return throttle_result
+
+        gate_result = self._check_dispatch_gate(Depth.DEEP)
+        if gate_result is not None:
+            return gate_result
+
+        if not self._context_gatherer:
+            return ReflectionResult(success=False, reason="No context gatherer available")
+
+        data = await self._context_gatherer.gather_for_assessment(db)
+
+        try:
+            sess = await self._session_manager.create_background(
+                session_type=SessionType.BACKGROUND_REFLECTION,
+                model=CCModel.SONNET,
+                effort=EffortLevel.HIGH,
+                source_tag="weekly_assessment",
+                skill_tags=["self-assessment"],
+            )
+        except Exception:
+            logger.exception("Failed to create assessment session")
+            return ReflectionResult(success=False, reason="Session creation failed")
+
+        prompt = (
+            "Perform a weekly self-assessment.\n\n"
+            f"## Assessment Data\n\n```json\n{json.dumps(data, indent=2)}\n```\n\n"
+            "Evaluate each of the 6 dimensions using this data."
+        )
+
+        invocation = CCInvocation(
+            prompt=prompt,
+            model=CCModel.SONNET,
+            effort=EffortLevel.HIGH,
+            system_prompt=load_prompt_file("SELF_ASSESSMENT.md", self._prompt_dir),
+            skip_permissions=True,
+            working_dir=background_session_dir(),
+        )
+        output = await self._invoker.run(invocation)
+
+        if output.is_error:
+            await self._session_manager.fail(sess["id"], reason=output.error_message)
+            return ReflectionResult(success=False, reason=output.error_message)
+
+        await self._session_manager.complete(
+            sess["id"],
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        await record_last_run(
+            db, "14_weekly_self_assessment",
+            provider="cc", model_id=output.model_used or str(CCModel.SONNET),
+            response_text=output.text,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        if self._output_router:
+            from genesis.reflection.output_router import parse_weekly_assessment_output
+            parsed = parse_weekly_assessment_output(output.text)
+            await self._output_router.route_assessment(parsed, db)
+
+        logger.info("Weekly self-assessment completed")
+        return ReflectionResult(success=True, reason="Weekly assessment completed")
+
+    async def run_quality_calibration(self, db) -> ReflectionResult:
+        """Run weekly quality calibration via CC background session."""
+        throttle_result = await self._check_throttle(priority=3, work_type="quality_calibration")
+        if throttle_result is not None:
+            return throttle_result
+
+        gate_result = self._check_dispatch_gate(Depth.DEEP)
+        if gate_result is not None:
+            return gate_result
+
+        if not self._context_gatherer:
+            return ReflectionResult(success=False, reason="No context gatherer available")
+
+        data = await self._context_gatherer.gather_for_calibration(db)
+
+        try:
+            sess = await self._session_manager.create_background(
+                session_type=SessionType.BACKGROUND_REFLECTION,
+                model=CCModel.SONNET,
+                effort=EffortLevel.HIGH,
+                source_tag="quality_calibration",
+                skill_tags=["strategic-reflection"],
+            )
+        except Exception:
+            logger.exception("Failed to create calibration session")
+            return ReflectionResult(success=False, reason="Session creation failed")
+
+        prompt = (
+            "Perform a quality calibration check.\n\n"
+            f"## Calibration Data\n\n```json\n{json.dumps(data, indent=2)}\n```\n\n"
+            "Evaluate quality drift and identify quarantine candidates."
+        )
+
+        invocation = CCInvocation(
+            prompt=prompt,
+            model=CCModel.SONNET,
+            effort=EffortLevel.HIGH,
+            system_prompt=load_prompt_file("QUALITY_CALIBRATION.md", self._prompt_dir),
+            skip_permissions=True,
+            working_dir=background_session_dir(),
+        )
+        output = await self._invoker.run(invocation)
+
+        if output.is_error:
+            await self._session_manager.fail(sess["id"], reason=output.error_message)
+            return ReflectionResult(success=False, reason=output.error_message)
+
+        await self._session_manager.complete(
+            sess["id"],
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        await record_last_run(
+            db, "16_quality_calibration",
+            provider="cc", model_id=output.model_used or str(CCModel.SONNET),
+            response_text=output.text,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+        )
+
+        if self._output_router:
+            from genesis.reflection.output_router import parse_quality_calibration_output
+            parsed = parse_quality_calibration_output(output.text)
+            await self._output_router.route_calibration(parsed, db)
+
+        logger.info("Quality calibration completed")
+        return ReflectionResult(success=True, reason="Quality calibration completed")
+
+    # ── Prompt delegation ─────────────────────────────────────────────
+
+    def _system_prompt_for_depth(self, depth: Depth) -> str:
+        return system_prompt_for_depth(depth, self._prompt_dir)
+
+    def _load_prompt_file(self, filename: str) -> str:
+        return load_prompt_file(filename, self._prompt_dir)

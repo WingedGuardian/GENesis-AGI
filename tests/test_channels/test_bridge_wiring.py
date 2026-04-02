@@ -37,16 +37,16 @@ def test_load_bridge_config_defaults(secrets_file):
     assert config["day_boundary_hour"] == 0
 
 
-def test_load_bridge_config_missing_token_exits(secrets_file):
+def test_load_bridge_config_missing_token_returns_none(secrets_file):
+    """Missing token → None (headless mode), not SystemExit."""
     secrets_file.write_text('SOME_KEY=value\n')
-    with pytest.raises(SystemExit):
-        _load_bridge_config()
+    assert _load_bridge_config() is None
 
 
-def test_load_bridge_config_placeholder_token_exits(secrets_file):
+def test_load_bridge_config_placeholder_token_returns_none(secrets_file):
+    """Placeholder token → None (headless mode), not SystemExit."""
     secrets_file.write_text('TELEGRAM_BOT_TOKEN=PLACEHOLDER\n')
-    with pytest.raises(SystemExit):
-        _load_bridge_config()
+    assert _load_bridge_config() is None
 
 
 def test_load_bridge_config_missing_file(monkeypatch):

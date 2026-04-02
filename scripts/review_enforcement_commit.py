@@ -9,10 +9,7 @@ Reads CLAUDE_TOOL_INPUT from environment (set by CC hook framework).
 
 Exit codes:
   0 = allow (tool proceeds)
-  2 = deny (tool blocked)
-
-Output format for denial:
-  JSON with hookSpecificOutput.permissionDecision = "deny"
+  2 = deny (tool blocked, message on stderr)
 """
 
 from __future__ import annotations
@@ -110,16 +107,9 @@ def main() -> None:
 
 
 def _deny(message: str) -> None:
-    """Output denial JSON and exit."""
-    output = {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "additionalContext": message,
-        }
-    }
-    json.dump(output, sys.stdout)
-    sys.exit(0)  # Exit 0 — hook succeeded (tool is denied via JSON, not exit code)
+    """Output denial message and block the tool via exit code 2."""
+    print(message, file=sys.stderr)
+    sys.exit(2)
 
 
 if __name__ == "__main__":

@@ -148,7 +148,7 @@ curl -s http://localhost:6333/collections | jq .
 ## Step 10: Claude Code
 
 ```bash
-curl -fsSL https://claude.ai/install.sh | sh
+npm install -g @anthropic-ai/claude-code
 ```
 
 ## Step 11: Verification

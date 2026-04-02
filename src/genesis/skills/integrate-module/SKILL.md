@@ -1,3 +1,11 @@
+---
+name: integrate-module
+description: Turn any external program into a Genesis module via structured discovery, connection mapping, config generation, and verification.
+consumer: cc_foreground
+phase: 7
+skill_type: workflow
+---
+
 # Integrate Module
 
 Turn any external program into a Genesis module. This is the standardized
