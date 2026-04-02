@@ -10,6 +10,7 @@ from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links, observations
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
+from genesis.memory.intent import classify_intent, expand_query, rank_by_intent
 from genesis.memory.types import RetrievalResult
 from genesis.observability.provider_activity import track_operation
 from genesis.qdrant import collections as qdrant_ops
@@ -98,11 +99,23 @@ class HybridRetriever:
                 if mid not in qdrant_by_id:
                     qdrant_by_id[mid] = hit
 
-        # 3. FTS5 text search
+        # 2b. Classify query intent (for RRF bias in step 7)
+        intent = classify_intent(query)
+
+        # 2c. Expand query via tag co-occurrence (improves FTS5 recall)
+        fts_query = query
+        try:
+            fts_query = await expand_query(
+                query, self._qdrant, collections, max_expansions=5,
+            )
+        except Exception:
+            logger.warning("Query expansion failed, using original", exc_info=True)
+
+        # 3. FTS5 text search (using expanded query)
         fts_collection = collections[0] if len(collections) == 1 else None
         fts_results = await memory_crud.search_ranked(
             self._db,
-            query=query,
+            query=fts_query,
             collection=fts_collection,
             limit=candidate_limit,
         )
@@ -160,11 +173,36 @@ class HybridRetriever:
 
         activation_ranked = sorted(all_ids, key=lambda m: activation_by_id[m], reverse=True)
 
+        # 6b. Build intent-biased ranked list (empty for GENERAL — no bias)
+        intent_ranked: list[str] = []
+        if intent.category != "GENERAL":
+            candidate_meta: dict[str, dict] = {}
+            for mid in all_ids:
+                qhit = qdrant_by_id.get(mid)
+                fhit = fts_by_id.get(mid)
+                if qhit:
+                    p = qhit.get("payload", {})
+                    candidate_meta[mid] = {
+                        "source": p.get("source", ""),
+                        "tags": p.get("tags") or [],
+                        "content": p.get("content", ""),
+                    }
+                elif fhit:
+                    candidate_meta[mid] = {
+                        "source": fhit.get("source_type", ""),
+                        "tags": [],
+                        "content": fhit.get("content", ""),
+                    }
+            intent_ranked = rank_by_intent(intent, candidate_meta)
+
         # 7. Fusion: RRF if we have vector results, otherwise FTS5 + activation only
         if embedding_available:
-            fused = _rrf_fuse([vector_ranked_dedup, fts_ranked, activation_ranked])
+            ranked_lists = [vector_ranked_dedup, fts_ranked, activation_ranked]
         else:
-            fused = _rrf_fuse([fts_ranked, activation_ranked])
+            ranked_lists = [fts_ranked, activation_ranked]
+        if intent_ranked:
+            ranked_lists.append(intent_ranked)
+        fused = _rrf_fuse(ranked_lists)
 
         # 8. Filter by min_activation
         candidates = [
@@ -268,6 +306,8 @@ class HybridRetriever:
                     transcript_path=_p.get("transcript_path"),
                     source_line_range=tuple(_line_range) if _line_range else None,
                     source_pipeline=_p.get("source_pipeline"),
+                    query_intent=intent.category,
+                    intent_confidence=intent.confidence,
                 ),
             )
 

@@ -112,6 +112,9 @@ class WatchdogChecker:
         # 0.5. Quick check: is the bridge process even running?
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
+            if self._bridge_exited_unconfigured():
+                logger.info("Bridge exited unconfigured (exit 2) — skipping restart")
+                return WatchdogAction.SKIP
             logger.warning("Bridge service is not active — skipping staleness check, going to restart logic")
             # Fall through to backoff/validation/restart below
             state = self._load_state()
@@ -215,6 +218,17 @@ class WatchdogChecker:
             return result.stdout.strip() == "active"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None  # Can't determine — don't block on this
+
+    def _bridge_exited_unconfigured(self) -> bool:
+        """Check if the bridge exited with code 2 (unconfigured — missing secrets.env)."""
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show", "-p", "ExecMainStatus", "genesis-bridge.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "ExecMainStatus=2" in result.stdout
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
 
     def _check_az_health(self) -> None:
         """Check if Agent Zero service is active. Auto-restart if down.

@@ -181,9 +181,39 @@ profiles:
     free_tier:
       available: true
       provider: mistral
-      limits: "2 RPM, 1B tokens/month"
-    last_reviewed: "2026-03-14"
-    review_source: manual
+      limits: "2 RPM, 4M tokens/month"
+    last_reviewed: "2026-04-01"
+    review_source: api_headers
+
+  mistral-small:
+    display_name: "Mistral Small (latest)"
+    provider: mistral
+    api_id: "mistralai/mistral-small-latest"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: A
+    anti_sycophancy: C
+    context_window: 32768
+    cost_tier: cheap
+    cost_per_mtok_in: 0.10
+    cost_per_mtok_out: 0.30
+    latency: fast
+    strengths:
+      - fast response times
+      - low cost
+      - good at routine NLP tasks
+    weaknesses:
+      - weaker reasoning than large
+      - less creative
+      - shorter context window
+    best_for: [micro_reflection, tagging, simple_extraction]
+    avoid_for: [brainstorming, deep_analysis, creative_writing]
+    free_tier:
+      available: true
+      provider: mistral
+      limits: "separate quota from large"
+    last_reviewed: "2026-04-01"
+    review_source: api_test
 
   claude-opus-4.6:
     display_name: "Claude 4.6 Opus"

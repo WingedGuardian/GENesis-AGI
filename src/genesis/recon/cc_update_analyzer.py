@@ -33,8 +33,10 @@ IMPACT_ACTION_NEEDED = "action_needed"
 IMPACT_BREAKING = "breaking"
 
 _ANALYSIS_PROMPT = """\
-Analyze this Claude Code version change for impact on Genesis (an autonomous AI agent
-that uses Claude Code as its primary intelligence layer via background sessions).
+Analyze this Claude Code version change for impact on Genesis (an autonomous AI
+agent that uses Claude Code as its primary intelligence layer). Genesis runs on
+a headless Linux server, often inside tmux, dispatching background CC sessions
+via `claude -p` and using CC interactively for foreground development.
 
 Old version: {old_version}
 New version: {new_version}
@@ -42,20 +44,56 @@ New version: {new_version}
 Changelog/release notes:
 {changelog}
 
-Genesis integration points to check for impact:
-- CCInvoker flags: --bare, --model, --effort, --output-format, --mcp-config,
-  --dangerously-skip-permissions, --allowedTools, --disallowedTools
-- Hooks: PreToolUse, PostToolUse, SessionStart, Stop, UserPromptSubmit (settings.json)
-- MCP servers: genesis-health, genesis-memory, genesis-recon, genesis-outreach
-- Env vars: GENESIS_CC_SESSION, CLAUDE_STREAM_IDLE_TIMEOUT_MS
-- Session management: --resume, -p (print mode), subprocess stdin prompt delivery
-- Output parsing: JSON result type, stream-json events, cost/usage fields
+Evaluate EVERY changelog entry through ALL of these lenses:
 
-Classify the impact as one of:
+1. PROGRAMMATIC INTEGRATION — Does it affect how Genesis dispatches or consumes
+   CC sessions? (CCInvoker flags: --bare, --model, --effort, --output-format,
+   --mcp-config, --dangerously-skip-permissions, --allowedTools, --disallowedTools,
+   -p mode, --resume, subprocess stdin/stdout, output parsing)
+
+2. HOOK & PERMISSION PROTOCOL — Does it change how hooks work, what they can
+   return, when they fire, or how permissions are evaluated? (PreToolUse,
+   PostToolUse, SessionStart, Stop, UserPromptSubmit, PermissionDenied,
+   --dangerously-skip-permissions, auto mode classifier)
+
+3. MCP & TOOL ECOSYSTEM — Does it affect MCP server connections, tool
+   availability, tool behavior, or the skill/plugin system?
+
+4. INTERACTIVE CLI EXPERIENCE — Does it change terminal rendering, scrollback,
+   display, keyboard shortcuts, UI layout, or any behavior the user sees in
+   foreground sessions? Regressions here are high-impact even if programmatic
+   integration is unaffected.
+
+5. PERFORMANCE & STABILITY — Does it fix or introduce memory leaks, caching
+   changes, startup time changes, context window management, or crash fixes?
+   Does it affect long-running or resumed sessions?
+
+6. SECURITY & TRUST MODEL — Does it change permission boundaries, sandbox
+   behavior, credential handling, or trust assumptions?
+
+7. PLATFORM & ENVIRONMENT — Does it have platform-specific behavior? Genesis
+   runs on Linux headless (no desktop app), often in tmux. Flag anything that
+   behaves differently on Linux/headless vs macOS/desktop.
+
+8. MODEL & API — Does it change prompt caching, token counting, model
+   selection, API request format, or cost/usage tracking?
+
+Classify the OVERALL impact as one of:
 - none: No relevant changes for Genesis
-- informational: Interesting but no action needed
-- action_needed: Changes that may affect Genesis behavior (new flags, deprecated features, API changes)
-- breaking: Changes that WILL break Genesis (removed flags, changed output format, session behavior changes)
+- informational: New optional capabilities that don't change existing behavior.
+  Additive features, fixes to things we don't use. A new feature is
+  informational even if valuable — "available" is not "required"
+- action_needed: Changes to EXISTING behavior that could affect Genesis, OR
+  regressions that degrade the user's experience. The test: "Could this change
+  cause something that worked before to work differently or stop working?"
+- breaking: Removal or incompatible change to a feature Genesis actively uses
+  in production code today
+
+Calibration: analyze each changelog entry independently. A new optional feature
+is informational, not action_needed. A behavior change or regression that affects
+the user's daily experience IS action_needed even if it doesn't touch the
+programmatic integration surface. Report the highest-severity individual item
+as the overall impact.
 
 Respond with ONLY a JSON object:
 {{"impact": "<level>", "summary": "<1-2 sentence summary>", "details": "<relevant changes>"}}
@@ -197,23 +235,63 @@ class CCUpdateAnalyzer:
         keywords_found: list[str] = []
         if changelog:
             lower = changelog.lower()
+            # Organized by evaluation lens — matches the LLM prompt structure
             checks = [
-                ("hook", "hooks"),
+                # Lens 1: Programmatic integration
                 ("--bare", "CLI flags"),
                 ("-p ", "print mode"),
+                ("--resume", "session resume"),
+                ("output-format", "output format"),
+                ("subprocess", "subprocess"),
+                # Lens 2: Hooks & permissions
+                ("hook", "hooks"),
+                ("permission", "permissions"),
+                ("auto mode", "auto mode"),
+                # Lens 3: MCP & tools
                 ("mcp", "MCP"),
-                ("env var", "env vars"),
+                ("skill", "skills"),
+                ("plugin", "plugins"),
+                # Lens 4: Interactive CLI experience
+                ("scrollback", "rendering"),
+                ("alt-screen", "rendering"),
+                ("flicker", "rendering"),
+                ("terminal", "terminal"),
+                ("keyboard", "keyboard"),
+                # Lens 5: Performance & stability
+                ("memory leak", "performance"),
+                ("crash", "stability"),
+                ("out-of-memory", "stability"),
+                ("cache", "caching"),
+                # Lens 6: Security
+                ("security", "security"),
+                ("credential", "credentials"),
+                ("sandbox", "sandbox"),
+                # Lens 7: Platform
+                ("linux", "platform"),
+                ("headless", "platform"),
+                ("tmux", "platform"),
+                # Lens 8: Model & API
+                ("prompt cache", "prompt caching"),
+                ("token", "tokens"),
+                # General severity signals
                 ("breaking", "breaking changes"),
                 ("removed", "removals"),
-                ("security", "security"),
+                ("deprecated", "deprecations"),
+                ("regression", "regression"),
                 ("fixed", "bug fixes"),
-                ("permission", "permissions"),
-                ("subprocess", "subprocess"),
+                ("env var", "env vars"),
             ]
             for pattern, label in checks:
-                if pattern in lower:
+                if pattern in lower and label not in keywords_found:
                     keywords_found.append(label)
-            if "breaking" in lower or "removed" in lower:
+            # Phrase-level severity triggers — "removed" alone is too broad
+            # (catches "Removed whitespace"). Use phrases that signal real removals.
+            severity_phrases = (
+                "breaking", "regression",
+                "was removed", "has been removed", "been removed",
+                "removed support", "removed flag", "no longer",
+            )
+            if any(phrase in lower for phrase in severity_phrases):
                 impact = IMPACT_ACTION_NEEDED
         summary = f"CC updated {old_version} -> {new_version}"
         if keywords_found:

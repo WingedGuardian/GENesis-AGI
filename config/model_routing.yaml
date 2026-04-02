@@ -23,6 +23,13 @@ providers:
     free: true
     rpm_limit: 2
     open_duration_s: 120
+  mistral-small-free:
+    type: mistral
+    model: mistral-small-latest
+    profile: mistral-small
+    free: true
+    rpm_limit: 2
+    open_duration_s: 120
   groq-free:
     type: groq
     model: llama-3.3-70b-versatile
@@ -150,13 +157,18 @@ call_sites:
     - openrouter-free
   3_micro_reflection:
     chain:
+    - mistral-small-free
     - mistral-free
     - groq-free
+    - gemini-free
+    - openrouter-free
     retry_profile: background
   4_light_reflection:
     chain:
     - mistral-free
     - groq-free
+    - gemini-free
+    - openrouter-free
     default_paid: false
     never_pays: true
   5_deep_reflection:
@@ -352,6 +364,7 @@ call_sites:
     chain:
     - mistral-free
     - groq-free
+    - gemini-free
     default_paid: true
     description: Analyze CC version changes for impact on Genesis
   email_triage:

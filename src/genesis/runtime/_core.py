@@ -373,6 +373,10 @@ class GenesisRuntime:
         return self._stability_monitor
 
     @property
+    def task_executor(self) -> object | None:
+        return self._task_executor
+
+    @property
     def provider_registry(self) -> ProviderRegistry | None:
         return self._provider_registry
 
@@ -555,6 +559,15 @@ class GenesisRuntime:
     def _persist_job_health(self, job_name: str, entry: dict, now: str) -> None:
         if self._db is None:
             return
+        # Check for a running event loop BEFORE creating the coroutine.
+        # Creating it eagerly (as argument to tracked_task) and then catching
+        # RuntimeError leaks an unawaited coroutine → RuntimeWarning every 60s.
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            logger.debug("No event loop — job health for %s persisted in-memory only", job_name)
+            return
+
         from genesis.util.tasks import tracked_task
 
         snapshot = dict(entry)
@@ -598,8 +611,6 @@ class GenesisRuntime:
 
         try:
             tracked_task(_write(), name=f"persist-job-health-{job_name}")
-        except RuntimeError:
-            logger.debug("No event loop — job health for %s persisted in-memory only", job_name)
         except Exception:
             logger.error("Failed to schedule job health persistence for %s", job_name, exc_info=True)
 

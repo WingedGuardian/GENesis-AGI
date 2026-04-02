@@ -851,20 +851,21 @@ if command -v claude &>/dev/null; then
     cc_ver=$(claude --version 2>/dev/null || echo "unknown")
     echo "    . Claude Code already installed ($cc_ver)"
 else
-    echo "    Installing Claude Code..."
-    if curl -fsSL https://claude.ai/install.sh | bash; then
-        export PATH="$HOME/.local/bin:$PATH"
-        # Persist PATH addition
-        if ! grep -q '.local/bin' "$HOME/.bashrc" 2>/dev/null; then
-            echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.bashrc"
-        fi
+    echo "    Installing Claude Code via npm..."
+    if npm install -g @anthropic-ai/claude-code; then
         cc_ver=$(claude --version 2>/dev/null || echo "unknown")
         echo "    + Claude Code installed ($cc_ver)"
     else
         echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: curl -fsSL https://claude.ai/install.sh | bash"
+        echo "    Install manually: npm install -g @anthropic-ai/claude-code"
         SETUP_WARNINGS=1
     fi
+fi
+
+# Suppress CC native installer nag — Genesis uses npm for version control
+if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
+    echo 'export DISABLE_INSTALLATION_CHECKS=1  # Genesis: npm-only CC install' >> "$HOME/.bashrc"
+    echo "    + Suppressed CC native installer prompt (npm-only)"
 fi
 
 # Login guidance (interactive only)

@@ -61,3 +61,13 @@ async def delete(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def delete_by_memory(db: aiosqlite.Connection, *, memory_id: str) -> int:
+    """Delete ALL links where memory_id is source or target. Returns count deleted."""
+    cursor = await db.execute(
+        "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?",
+        (memory_id, memory_id),
+    )
+    await db.commit()
+    return cursor.rowcount

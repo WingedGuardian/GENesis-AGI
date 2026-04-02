@@ -121,9 +121,9 @@ def test_load_full_yaml(monkeypatch):
 
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
-    # lmstudio-30b disabled by default → 20 enabled providers
-    # (21 total - 1 disabled lmstudio-30b)
-    assert len(cfg.providers) == 20
+    # lmstudio-30b disabled by default → 21 enabled providers
+    # (22 total - 1 disabled lmstudio-30b)
+    assert len(cfg.providers) == 21
     assert "lmstudio-30b" not in cfg.providers
     assert len(cfg.call_sites) == 39  # +contingency_*, +cc_update_analysis, +email_triage
     assert "background" in cfg.retry_profiles

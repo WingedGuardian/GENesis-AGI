@@ -19,6 +19,10 @@ def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
     entry["last_run"] = now
     entry["last_success"] = now
     entry["consecutive_failures"] = 0
+    # Clear stale failure data so _persist_job_health doesn't re-count old
+    # failures in the SQL CASE WHEN excluded.last_failure IS NOT NULL check.
+    entry.pop("last_failure", None)
+    entry.pop("last_error", None)
     rt._persist_job_health(job_name, entry, now)
 
 

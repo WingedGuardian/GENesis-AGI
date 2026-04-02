@@ -288,12 +288,23 @@ def _resolve_file(name: str) -> tuple[Path | None, str]:
     return None, ""
 
 
+_READONLY_CONFIGS = frozenset({
+    "protected_paths.yaml",
+    "autonomy.yaml",
+    "guardian.yaml",
+    "content_sanitization.yaml",
+    "model_profiles.yaml",
+    "model_routing.yaml",
+    "recon_watchlist.yaml",
+})
+
+
 def _resolve_file_for_write(name: str) -> tuple[Path | None, Path | None]:
     """Resolve a file name to (target_path, allowed_directory) for write operations."""
     if name.endswith(".yaml"):
         basename = name.split("/")[-1]
-        if basename == "protected_paths.yaml":
-            return None, None  # blocked
+        if basename in _READONLY_CONFIGS:
+            return None, None  # blocked — matches MCP settings readonly policy
         candidate = _CONFIG_DIR / name
         if candidate.is_file():
             return candidate, _CONFIG_DIR

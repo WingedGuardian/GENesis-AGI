@@ -52,16 +52,16 @@ async def test_full_stack_success(real_config, breakers, cost_tracker, degradati
     )
     result = await router.route_call("3_micro_reflection", [{"role": "user", "content": "reflect"}])
     assert result.success is True
-    assert result.provider_used == "mistral-free"  # first in chain
+    assert result.provider_used == "mistral-small-free"  # first in chain
     assert result.fallback_used is False
     assert len(delegate.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_full_stack_fallback_chain(real_config, breakers, cost_tracker, degradation):
-    """mistral-free fails, should fallback to groq-free for 3_micro_reflection."""
+    """mistral-small-free fails, should fallback to mistral-free for 3_micro_reflection."""
     delegate = MockDelegate(responses={
-        "mistral-free": CallResult(success=False, error="rate limited", status_code=429),
+        "mistral-small-free": CallResult(success=False, error="rate limited", status_code=429),
     })
     router = Router(
         config=real_config, breakers=breakers, cost_tracker=cost_tracker,
@@ -69,7 +69,7 @@ async def test_full_stack_fallback_chain(real_config, breakers, cost_tracker, de
     )
     result = await router.route_call("3_micro_reflection", [{"role": "user", "content": "reflect"}])
     assert result.success is True
-    assert result.provider_used == "groq-free"
+    assert result.provider_used == "mistral-free"
     assert result.fallback_used is True
 
 
@@ -108,8 +108,8 @@ async def test_dead_letter_queue_lifecycle(dlq):
 
 @pytest.mark.asyncio
 async def test_circuit_breaker_affects_routing(real_config, breakers, cost_tracker, degradation):
-    """Trip groq-free breaker, route 3_micro_reflection — should use mistral-free."""
-    cb = breakers.get("groq-free")
+    """Trip mistral-small-free breaker, route 3_micro_reflection — should use mistral-free."""
+    cb = breakers.get("mistral-small-free")
     for _ in range(3):
         cb.record_failure(ErrorCategory.TRANSIENT)
     assert not cb.is_available()
@@ -122,4 +122,4 @@ async def test_circuit_breaker_affects_routing(real_config, breakers, cost_track
     result = await router.route_call("3_micro_reflection", [{"role": "user", "content": "reflect"}])
     assert result.success is True
     assert result.provider_used == "mistral-free"
-    assert all(c["provider"] != "groq-free" for c in delegate.calls)
+    assert all(c["provider"] != "mistral-small-free" for c in delegate.calls)

@@ -13,6 +13,13 @@ logger = logging.getLogger("genesis.runtime")
 
 async def run_pipeline_cycle(rt: GenesisRuntime, profile_name: str) -> None:
     """Run a single pipeline cycle and record job health."""
+    try:
+        if rt.paused:
+            logger.debug("Pipeline cycle %s skipped (Genesis paused)", profile_name)
+            return
+    except Exception:
+        logger.warning("Pause check failed — skipping cycle as precaution", exc_info=True)
+        return
     job_name = f"pipeline:{profile_name}"
     try:
         if rt._pipeline_orchestrator is None:

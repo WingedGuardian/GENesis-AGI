@@ -73,6 +73,7 @@ class CCSessionExecutor:
         self._active_tasks: dict[str, TaskPhase] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._pause_events: dict[str, asyncio.Event] = {}
+        self._paused_tasks: set[str] = set()
         self._worktree_paths: dict[str, Path] = {}
 
     # =================================================================
@@ -421,8 +422,12 @@ class CCSessionExecutor:
             await self._transition(task_id, TaskPhase.CANCELLED)
             return False
 
-        # Amendment #13: global pause check
-        if self._runtime and getattr(self._runtime, "paused", False):
+        # Amendment #13: global pause check + per-task pause
+        should_pause = (
+            (self._runtime and getattr(self._runtime, "paused", False))
+            or task_id in self._paused_tasks
+        )
+        if should_pause:
             await self._transition(task_id, TaskPhase.PAUSED)
             pause_event = asyncio.Event()
             self._pause_events[task_id] = pause_event
@@ -435,6 +440,7 @@ class CCSessionExecutor:
                     return False
                 await asyncio.sleep(0.1)
 
+            self._paused_tasks.discard(task_id)
             await self._transition(task_id, TaskPhase.EXECUTING)
 
         # Emit progress event
@@ -442,7 +448,7 @@ class CCSessionExecutor:
             from genesis.observability.types import Severity, Subsystem
             await self._event_bus.emit(
                 Subsystem.AUTONOMY,
-                Severity.DEBUG,
+                Severity.INFO,
                 "task.step_completed",
                 f"Task {task_id[:8]} step {step_idx}: {result.status}",
                 task_id=task_id,
@@ -731,19 +737,29 @@ class CCSessionExecutor:
 
     def resume_task(self, task_id: str) -> bool:
         """Resume a paused task."""
+        # Clear per-task pause flag even if checkpoint hasn't created the event yet
+        was_flagged = task_id in self._paused_tasks
+        self._paused_tasks.discard(task_id)
         event = self._pause_events.get(task_id)
-        if event is None:
-            return False
-        event.set()
-        return True
+        if event is not None:
+            event.set()
+            return True
+        return was_flagged
 
     def pause_task(self, task_id: str) -> bool:
         """Request pause at next checkpoint.
 
-        Per-task pause is not yet implemented; global pause uses
-        ``runtime.paused``. Returns False for now.
+        Sets a per-task pause flag checked alongside the global
+        ``runtime.paused`` in ``_checkpoint()``.
         """
-        return False
+        if task_id not in self._active_tasks:
+            return False
+        self._paused_tasks.add(task_id)
+        return True
+
+    def is_task_paused(self, task_id: str) -> bool:
+        """Check if a per-task pause has been requested."""
+        return task_id in self._paused_tasks
 
     def get_active_tasks(self) -> dict[str, str]:
         """Return ``{task_id: phase_str}`` for all active tasks."""

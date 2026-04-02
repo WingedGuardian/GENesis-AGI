@@ -47,7 +47,10 @@ _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
 
 def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
-    """Try to extract plan file path and title from hook input.
+    """Extract plan file path and title.
+
+    Tries hook input first, falls back to most recently modified file
+    in ~/.claude/plans/.
 
     Returns (plan_path, title). Both may be empty if not available.
     """
@@ -57,21 +60,30 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
     plan_path = ""
     title = ""
 
-    # Search tool_output for plan file path
-    output_str = str(tool_output)
-    if ".claude/plans/" in output_str:
-        match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", output_str)
-        if match:
-            plan_path = match.group(1)
+    # Try to find plan path in hook input/output
+    for source_str in (str(tool_output), str(tool_input)):
+        if ".claude/plans/" in source_str:
+            match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", source_str)
+            if match:
+                plan_path = match.group(1)
+                break
 
-    # Also check tool_input
-    input_str = str(tool_input)
-    if not plan_path and ".claude/plans/" in input_str:
-        match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", input_str)
-        if match:
-            plan_path = match.group(1)
+    # Fallback: find most recently modified plan file
+    if not plan_path:
+        plans_dir = Path.home() / ".claude" / "plans"
+        if plans_dir.is_dir():
+            try:
+                candidates = sorted(
+                    plans_dir.glob("*.md"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if candidates:
+                    plan_path = str(candidates[0])
+            except OSError:
+                pass
 
-    # Try to read the plan title from the file
+    # Read the plan title from the first heading
     if plan_path:
         try:
             path = Path(plan_path)

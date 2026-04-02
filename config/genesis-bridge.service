@@ -16,8 +16,9 @@ Restart=on-failure
 RestartSec=10
 
 # Exit code 200 = "another instance holds the lock" — don't restart for that.
+# Exit code 2 = "unconfigured" (missing secrets.env) — don't restart-loop.
 # See genesis.util.process_lock.EXIT_ALREADY_RUNNING.
-RestartPreventExitStatus=200
+RestartPreventExitStatus=200 2
 
 Environment=PATH=%h/genesis/.venv/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 StandardOutput=journal

@@ -134,11 +134,17 @@ async def init(rt: GenesisRuntime) -> None:
 
         async def _calibration_with_health() -> None:
             try:
+                if rt.paused:
+                    logger.debug("Triage calibration skipped (Genesis paused)")
+                    return
+            except Exception:
+                logger.warning("Pause check failed — skipping calibration as precaution", exc_info=True)
+                return
+            try:
                 result = await _original_calibration()
                 if result is None:
-                    rt.record_job_failure(
-                        "triage_calibration_daily", "calibration returned no result",
-                    )
+                    rt.record_job_success("triage_calibration_daily")
+                    logger.info("Triage calibration: no data or validation failed, skipped")
                 else:
                     rt.record_job_success("triage_calibration_daily")
             except Exception as exc:
@@ -328,6 +334,13 @@ async def init(rt: GenesisRuntime) -> None:
         )
 
         async def _redispatch_dead_letters() -> None:
+            try:
+                if rt.paused:
+                    logger.debug("Dead letter redispatch skipped (Genesis paused)")
+                    return
+            except Exception:
+                logger.warning("Pause check failed — skipping redispatch as precaution", exc_info=True)
+                return
             if rt._dead_letter_queue is not None and rt._router is not None:
                 try:
                     ok, fail = await rt._dead_letter_queue.redispatch(

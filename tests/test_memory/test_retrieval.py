@@ -87,10 +87,11 @@ def _build_retriever():
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test query")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_returns_results(mock_qdrant, mock_crud, mock_links):
+async def test_recall_returns_results(mock_qdrant, mock_crud, mock_links, _mock_expand):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [
@@ -106,13 +107,16 @@ async def test_recall_returns_results(mock_qdrant, mock_crud, mock_links):
     results = await retriever.recall("test query", limit=10)
     assert len(results) > 0
     assert all(hasattr(r, "memory_id") for r in results)
+    # V4 groundwork: intent fields should be populated
+    assert all(r.query_intent is not None for r in results)
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_episodic_only(mock_qdrant, mock_crud, mock_links):
+async def test_recall_episodic_only(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
@@ -128,10 +132,11 @@ async def test_recall_episodic_only(mock_qdrant, mock_crud, mock_links):
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links):
+async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
@@ -145,10 +150,11 @@ async def test_recall_knowledge_only(mock_qdrant, mock_crud, mock_links):
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links):
+async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.9)]
@@ -167,10 +173,11 @@ async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links):
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links):
+async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [
@@ -186,10 +193,11 @@ async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links)
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_increments_retrieved_count(mock_qdrant, mock_crud, mock_links):
+async def test_recall_increments_retrieved_count(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = [_make_qdrant_hit("mem-1", 0.95)]
@@ -206,10 +214,11 @@ async def test_recall_increments_retrieved_count(mock_qdrant, mock_crud, mock_li
 
 
 @pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
-async def test_recall_empty_results(mock_qdrant, mock_crud, mock_links):
+async def test_recall_empty_results(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
     mock_qdrant.search.return_value = []
@@ -217,3 +226,84 @@ async def test_recall_empty_results(mock_qdrant, mock_crud, mock_links):
 
     results = await retriever.recall("test", limit=10)
     assert results == []
+
+
+# --- Intent routing integration tests ---
+
+
+def _make_qdrant_hit_with_meta(
+    mid: str, score: float, *, source: str = "test", tags: list[str] | None = None,
+    content: str = "", confidence: float = 0.8,
+) -> dict:
+    now = datetime.now(UTC).isoformat()
+    return {
+        "id": mid,
+        "score": score,
+        "payload": {
+            "content": content or f"content for {mid}",
+            "source": source,
+            "memory_type": "episodic",
+            "tags": tags or [],
+            "confidence": confidence,
+            "created_at": now,
+            "retrieved_count": 1,
+            "source_type": "memory",
+        },
+    }
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="why did we choose subprocess")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_why_intent_boosts_decision_memories(
+    mock_qdrant, mock_crud, mock_links, _mock_expand,
+):
+    """WHY query should boost memories with decision tags and reflection sources."""
+    retriever, _, _, _ = _build_retriever()
+
+    # mem-decision: has WHY-relevant metadata (deep_reflection + decision tag)
+    # mem-generic: generic memory with same vector score
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit_with_meta(
+            "mem-decision", 0.85,
+            source="deep_reflection", tags=["decision"],
+            content="we decided to use subprocess because of reliability",
+        ),
+        _make_qdrant_hit_with_meta(
+            "mem-generic", 0.90,  # Higher vector score
+            source="session_extraction", tags=["entity"],
+            content="subprocess is a Python module",
+        ),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    results = await retriever.recall("why did we choose subprocess?", limit=2)
+    assert len(results) == 2
+    # Intent routing should boost mem-decision despite lower vector score
+    assert results[0].query_intent == "WHY"
+    assert results[0].intent_confidence > 0
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="subprocess popen error")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_general_intent_no_bias(mock_qdrant, mock_crud, mock_links, _mock_expand):
+    """GENERAL query (no intent prefix) should produce no intent bias."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = [
+        _make_qdrant_hit("mem-1", 0.95),
+        _make_qdrant_hit("mem-2", 0.80),
+    ]
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    results = await retriever.recall("subprocess popen error", limit=2)
+    assert len(results) > 0
+    assert results[0].query_intent == "GENERAL"
+    assert results[0].intent_confidence == 0.0

@@ -74,8 +74,8 @@ class TriageCalibrator:
                 await self._event_bus.emit(
                     subsystem=Subsystem.LEARNING,
                     severity=Severity.INFO,
-                    event_type=LEARNING_EVENTS["CALIBRATION_FAILED"],
-                    message="No recent triage observations",
+                    event_type=LEARNING_EVENTS["CALIBRATION_SKIPPED"],
+                    message="No recent triage observations — nothing to calibrate",
                 )
             return None
 

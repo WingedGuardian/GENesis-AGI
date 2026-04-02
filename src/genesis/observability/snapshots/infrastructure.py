@@ -1,12 +1,14 @@
-"""Infrastructure snapshot — DB, Qdrant, scheduler, disk, container memory, Ollama."""
+"""Infrastructure snapshot — DB, Qdrant, scheduler, disk, container memory, CPU, Ollama."""
 
 from __future__ import annotations
 
 import logging
 import shutil
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from genesis.env import ollama_enabled
 from genesis.observability.health import (
     probe_db,
     probe_guardian,
@@ -23,6 +25,42 @@ if TYPE_CHECKING:
     from genesis.resilience.state import ResilienceStateMachine
 
 logger = logging.getLogger(__name__)
+
+# Module-level state for delta-based CPU reading (no blocking sleep)
+_last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
+
+
+def _collect_cpu_usage() -> dict:
+    """Read CPU usage from /proc/stat delta. No blocking sleep.
+
+    First call stores a baseline and returns None for used_pct.
+    Subsequent calls compute delta from the stored baseline.
+    """
+    global _last_cpu_reading  # noqa: PLW0603
+    try:
+        with open("/proc/stat") as f:
+            parts = f.readline().split()
+        # Fields: cpu user nice system idle iowait irq softirq steal guest guest_nice
+        idle = int(parts[4])
+        total = sum(int(p) for p in parts[1:])
+        now = time.monotonic()
+
+        if _last_cpu_reading is None:
+            _last_cpu_reading = (idle, total, now)
+            return {"status": "healthy", "used_pct": None}
+
+        prev_idle, prev_total, _prev_time = _last_cpu_reading
+        _last_cpu_reading = (idle, total, now)
+
+        delta_idle = idle - prev_idle
+        delta_total = total - prev_total
+        if delta_total == 0:
+            return {"status": "healthy", "used_pct": 0.0}
+
+        used_pct = round((1.0 - delta_idle / delta_total) * 100, 1)
+        return {"status": "healthy", "used_pct": used_pct}
+    except (OSError, ValueError, IndexError):
+        return {"status": "unavailable", "used_pct": None}
 
 
 async def infrastructure(
@@ -84,6 +122,8 @@ async def infrastructure(
     else:
         infra["scheduler"] = {"status": "unknown", "error": "no scheduler or DB available"}
 
+    infra["cpu"] = _collect_cpu_usage()
+
     try:
         usage = shutil.disk_usage("/")
         free_pct = round(usage.free / usage.total * 100, 1)
@@ -140,29 +180,30 @@ async def infrastructure(
     except Exception as exc:
         infra["guardian"] = {"status": "error", "error": str(exc)}
 
-    try:
-        result = await probe_ollama()
-        infra["ollama"] = {
-            "status": str(result.status),
-            "latency_ms": result.latency_ms,
-        }
-        if (
-            routing_config
-            and hasattr(result, "details")
-            and isinstance(result.details, dict)
-        ):
-            actual_models = set(result.details.get("models", []))
-            if actual_models:
-                missing = []
-                for name, cfg in routing_config.providers.items():
-                    if cfg.provider_type == "ollama" and cfg.model_id not in actual_models:
-                        missing.append({"provider": name, "model": cfg.model_id})
-                if missing:
-                    infra["ollama"]["missing_models"] = missing
-    except (ConnectionError, TimeoutError, OSError) as exc:
-        infra["ollama"] = {"status": "error", "error": str(exc)}
-    except Exception as exc:
-        infra["ollama"] = {"status": "error", "error": str(exc)}
+    if ollama_enabled():
+        try:
+            result = await probe_ollama()
+            infra["ollama"] = {
+                "status": str(result.status),
+                "latency_ms": result.latency_ms,
+            }
+            if (
+                routing_config
+                and hasattr(result, "details")
+                and isinstance(result.details, dict)
+            ):
+                actual_models = set(result.details.get("models", []))
+                if actual_models:
+                    missing = []
+                    for name, cfg in routing_config.providers.items():
+                        if cfg.provider_type == "ollama" and cfg.model_id not in actual_models:
+                            missing.append({"provider": name, "model": cfg.model_id})
+                    if missing:
+                        infra["ollama"]["missing_models"] = missing
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            infra["ollama"] = {"status": "error", "error": str(exc)}
+        except Exception as exc:
+            infra["ollama"] = {"status": "error", "error": str(exc)}
 
     return infra
 

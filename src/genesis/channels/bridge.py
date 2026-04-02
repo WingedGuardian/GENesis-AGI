@@ -28,16 +28,17 @@ logging.basicConfig(
 log = logging.getLogger("genesis.bridge")
 
 
-def _load_bridge_config() -> dict:
+def _load_bridge_config() -> dict | None:
     """Parse Telegram-specific config from the configured secrets.env.
 
     Does NOT set os.environ — GenesisRuntime._load_secrets() handles that.
-    Returns only bridge-specific values.
+    Returns bridge-specific values, or None if Telegram is not configured
+    (missing/placeholder token). Exits on missing secrets.env (broken install).
     """
     path = str(secrets_path())
     if not os.path.exists(path):
-        log.error("Secrets file not found: %s", path)
-        sys.exit(1)
+        log.error("Secrets file not found: %s — cannot start (broken install?)", path)
+        sys.exit(2)
 
     secrets: dict[str, str] = {}
     with open(path) as f:
@@ -51,8 +52,8 @@ def _load_bridge_config() -> dict:
 
     token = secrets.get("TELEGRAM_BOT_TOKEN", "")
     if not token or token == "PLACEHOLDER":
-        log.error("TELEGRAM_BOT_TOKEN not set in secrets.env")
-        sys.exit(1)
+        log.info("TELEGRAM_BOT_TOKEN not set — Telegram adapter will not start")
+        return None
 
     allowed_users: set[int] = set()
     allowed_raw = secrets.get("TELEGRAM_ALLOWED_USERS", "")
@@ -77,6 +78,30 @@ def _load_bridge_config() -> dict:
     }
 
 
+async def _run_headless(runtime: GenesisRuntime) -> None:
+    """Keep the bridge process alive without Telegram.
+
+    Background systems (awareness loop, learning scheduler, inbox monitor)
+    were started by bootstrap() and need this process to stay alive.
+    """
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        log.info("Shutdown signal received (headless)")
+        stop_event.set()
+        if runtime.awareness_loop is not None:
+            runtime.awareness_loop.request_stop()
+
+    ev_loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        ev_loop.add_signal_handler(sig, _signal_handler)
+
+    log.info("Bridge running headless — background systems active, waiting for signal")
+    await stop_event.wait()
+    await runtime.shutdown()
+    log.info("Headless bridge stopped.")
+
+
 async def main():
     # Bootstrap full Genesis runtime (DB, awareness, router, memory, learning, etc.)
     runtime = GenesisRuntime.instance()
@@ -87,6 +112,10 @@ async def main():
         sys.exit(1)
 
     config = _load_bridge_config()
+    if config is None:
+        log.info("No Telegram token configured — running headless for background systems")
+        await _run_headless(runtime)
+        return
 
     assembler = SystemPromptAssembler()
     # Inline failure detector for real-time procedure confidence updates

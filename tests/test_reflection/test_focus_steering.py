@@ -118,7 +118,8 @@ class TestFocusNextWeekFromStrategic:
             db=db,
         )
 
-        await bridge._store_reflection_output(
+        from genesis.cc.reflection_bridge._output import store_reflection_output
+        await store_reflection_output(
             Depth.STRATEGIC, tick, cc_output, db=db,
         )
 
@@ -161,7 +162,8 @@ class TestFocusNextWeekFromStrategic:
         )
 
         # Should not raise
-        await bridge._store_reflection_output(
+        from genesis.cc.reflection_bridge._output import store_reflection_output
+        await store_reflection_output(
             Depth.STRATEGIC, tick, cc_output, db=db,
         )
 
@@ -205,7 +207,8 @@ class TestFocusNextWeekFromStrategic:
             db=db,
         )
 
-        await bridge._store_reflection_output(
+        from genesis.cc.reflection_bridge._output import store_reflection_output
+        await store_reflection_output(
             Depth.DEEP, tick, cc_output, db=db,
         )
 

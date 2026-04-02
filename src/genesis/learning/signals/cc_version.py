@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -93,6 +94,12 @@ class CCVersionCollector:
                 collected_at=now,
             )
 
+        # No local change — check if a newer version is available on npm.
+        try:
+            await self._check_registry_version(current)
+        except Exception:
+            logger.debug("Registry version check failed", exc_info=True)
+
         return SignalReading(
             name=self.signal_name,
             value=0.0,
@@ -177,6 +184,87 @@ class CCVersionCollector:
         await self._db.commit()
         # Update baseline so next collect() sees the new version
         await self._store_version(new)
+
+    # ------------------------------------------------------------------
+    # Remote registry check — detect available versions without installing
+    # ------------------------------------------------------------------
+
+    async def _check_registry_version(self, installed: str) -> None:
+        """Check npm registry for newer CC version. Best-effort, never blocks.
+
+        Stores a ``cc_version_available`` observation when a newer version
+        exists on the registry but is not installed locally.  Deduplicates
+        by version so the same available version is only recorded once.
+        """
+        try:
+            available = await self._get_registry_version()
+        except Exception:
+            logger.debug("npm registry check failed", exc_info=True)
+            return
+
+        if not available or available == installed:
+            return
+
+        if not self._is_newer(available, installed):
+            return
+
+        # Dedup: skip if we already have an observation for this version.
+        cursor = await self._db.execute(
+            "SELECT 1 FROM observations "
+            "WHERE source = 'cc_version' AND type = 'cc_version_available' "
+            "AND json_extract(content, '$.available_version') = ? LIMIT 1",
+            (available,),
+        )
+        if await cursor.fetchone():
+            return
+
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid.uuid4()),
+                "cc_version",
+                "cc_version_available",
+                json.dumps({
+                    "installed_version": installed,
+                    "available_version": available,
+                    "detected_at": now,
+                }),
+                "medium",
+                now,
+            ),
+        )
+        await self._db.commit()
+        logger.info(
+            "CC version %s available on npm (installed: %s)", available, installed,
+        )
+
+    async def _get_registry_version(self) -> str:
+        """Query npm registry for latest CC version. 10s timeout."""
+        async def _run() -> str:
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "view", "@anthropic-ai/claude-code", "version",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                stderr_text = stderr.decode(errors="replace").strip()
+                logger.debug("npm view exit %d: %s", proc.returncode, stderr_text)
+                return ""
+            return stdout.decode().strip()
+
+        return await asyncio.wait_for(_run(), timeout=10)
+
+    @staticmethod
+    def _is_newer(candidate: str, baseline: str) -> bool:
+        """Return True if *candidate* is a newer semver than *baseline*."""
+        def _parse(v: str) -> tuple[int, ...]:
+            m = re.match(r"[\d.]+", v)
+            return tuple(int(x) for x in m.group().split(".")) if m else ()
+
+        return _parse(candidate) > _parse(baseline)
 
     async def _analyze_update(self, old: str, new: str) -> None:
         """Run CCUpdateAnalyzer to fetch changelog and classify impact.

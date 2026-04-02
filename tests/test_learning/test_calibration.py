@@ -131,6 +131,22 @@ class TestTriageCalibrator:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_no_observations_emits_skipped_event(self, tmp_path: Path) -> None:
+        cal_path = tmp_path / "TRIAGE_CALIBRATION.md"
+        router = _make_router(VALID_LLM_OUTPUT)
+        db = _make_db_with_observations([])
+        event_bus = AsyncMock()
+        cal = TriageCalibrator(
+            router=router, db=db, calibration_path=cal_path, event_bus=event_bus,
+        )
+        result = await cal.run_daily_calibration()
+
+        assert result is None
+        event_bus.emit.assert_called_once()
+        call_kwargs = event_bus.emit.call_args
+        assert call_kwargs.kwargs["event_type"] == "calibration.skipped"
+
+    @pytest.mark.asyncio
     async def test_atomic_write(self, tmp_path: Path) -> None:
         """File should exist only after successful calibration, not during."""
         cal_path = tmp_path / "TRIAGE_CALIBRATION.md"

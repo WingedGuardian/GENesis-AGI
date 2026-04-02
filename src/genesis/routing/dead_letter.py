@@ -126,7 +126,9 @@ class DeadLetterQueue:
                             continue
 
             try:
-                result = await dispatch_fn(call_site_id, messages)
+                result = await dispatch_fn(
+                    call_site_id, messages, suppress_dead_letter=True,
+                )
                 if result.success:
                     await dl_crud.update_status(self.db, item["id"], status="replayed")
                     succeeded += 1

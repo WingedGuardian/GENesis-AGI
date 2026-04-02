@@ -9,9 +9,12 @@ The prompt specifies your focus: situation, user_impact, or anomaly.
 - anomaly: pattern detection, produces surplus_candidates
 
 ## Task
+Primary lens: **How can Genesis help the user?** System health matters only
+when it impacts user value.
+
 1. Follow the focus-specific instructions in the prompt
 2. Decide: escalate to Deep reflection? (yes/no + reason)
-3. Cite specific signal values as evidence for every claim
+3. Cite specific evidence for every claim
 4. Confidence: below 0.5 when uncertain. Never default to 0.7.
 
 ## Output Format

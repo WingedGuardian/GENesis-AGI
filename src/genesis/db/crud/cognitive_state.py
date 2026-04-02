@@ -157,16 +157,42 @@ async def render(
         def _tz_fmt(s: str, _fmt: str = "") -> str:  # type: ignore[misc]
             return s  # fallback: return raw ISO string
 
+    def _relative_age(iso_ts: str) -> str:
+        """Return human-readable age like '2h ago' or '3d ago'."""
+        try:
+            from datetime import UTC, datetime
+
+            ts_dt = datetime.fromisoformat(iso_ts)
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=UTC)
+            delta = datetime.now(UTC) - ts_dt
+            total_seconds = int(delta.total_seconds())
+            if total_seconds < 60:
+                return "just now"
+            if total_seconds < 3600:
+                return f"{total_seconds // 60}m ago"
+            if total_seconds < 86400:
+                return f"{total_seconds // 3600}h ago"
+            return f"{total_seconds // 86400}d ago"
+        except Exception:
+            return ""
+
     if "active_context" in sections:
-        ts = _tz_fmt(sections["active_context"].get("created_at", "unknown"))
+        raw_ts = sections["active_context"].get("created_at", "unknown")
+        ts = _tz_fmt(raw_ts)
+        age = _relative_age(raw_ts)
+        age_prefix = f"{age} — " if age else ""
         parts.append(
-            f"## Active Context (generated {ts})\n"
+            f"## Active Context ({age_prefix}generated {ts})\n"
             + sections["active_context"]["content"]
         )
     if "pending_actions" in sections:
-        ts = _tz_fmt(sections["pending_actions"].get("created_at", "unknown"))
+        raw_ts = sections["pending_actions"].get("created_at", "unknown")
+        ts = _tz_fmt(raw_ts)
+        age = _relative_age(raw_ts)
+        age_prefix = f"{age} — " if age else ""
         parts.append(
-            f"## Pending Actions (generated {ts})\n"
+            f"## Pending Actions ({age_prefix}generated {ts})\n"
             + sections["pending_actions"]["content"]
         )
 
@@ -178,9 +204,12 @@ async def render(
             + computed_flags
         )
     if focus_row:
-        focus_ts = _tz_fmt(focus_row.get("created_at", "unknown"))
+        raw_focus_ts = focus_row.get("created_at", "unknown")
+        focus_ts = _tz_fmt(raw_focus_ts)
+        focus_age = _relative_age(raw_focus_ts)
+        focus_age_prefix = f"{focus_age} — " if focus_age else ""
         flag_parts.append(
-            f"## Reflection Focus Directive (generated {focus_ts})\n"
+            f"## Reflection Focus Directive ({focus_age_prefix}generated {focus_ts})\n"
             + focus_row["content"]
         )
     if flag_parts:

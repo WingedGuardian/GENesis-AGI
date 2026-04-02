@@ -163,6 +163,14 @@ class SurplusScheduler:
     async def brainstorm_check(self) -> None:
         """Ensure today's brainstorm sessions are queued."""
         try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Brainstorm check skipped (Genesis paused)")
+                return
+        except Exception:
+            logger.warning("Pause check failed — skipping brainstorm as precaution", exc_info=True)
+            return
+        try:
             await self._brainstorm_runner.schedule_daily_brainstorms()
             try:
                 from genesis.runtime import GenesisRuntime
@@ -273,6 +281,14 @@ class SurplusScheduler:
 
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Memory extraction skipped (Genesis paused)")
+                return
+        except Exception:
+            logger.warning("Pause check failed — skipping extraction as precaution", exc_info=True)
+            return
         if self._extraction_store is None or self._extraction_router is None:
             try:
                 from genesis.runtime import GenesisRuntime

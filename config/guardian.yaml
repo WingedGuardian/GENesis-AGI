@@ -40,9 +40,16 @@ approval:
 
 cc:
   enabled: true
-  model: sonnet
-  timeout_s: 120
-  path: "~/.local/bin/claude"
+  model: opus
+  timeout_s: 3600    # 60 min — runaway guard, not operational limit
+  max_turns: 50      # runaway guard — legitimate investigation is ~15-30 turns
+  path: "claude"
+
+briefing:
+  enabled: true
+  shared_subdir: "shared"
+  briefing_filename: "guardian_briefing.md"
+  max_age_s: 600
 
 snapshots:
   retention: 5

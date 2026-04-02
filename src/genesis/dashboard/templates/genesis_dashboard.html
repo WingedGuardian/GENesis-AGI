@@ -21,7 +21,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, internals: false, sessions: false, config: false },
+        _tabInitialized: { overview: false, internals: false, sessions: false, config: false, terminal: false, files: false, tasks: false, memory: false, backup: false, resources: false },
 
         // State
         health: {},
@@ -114,6 +114,44 @@
         _restartingBridge: false,
         _restartingHF: false,
         error: null,
+
+        // ── Terminal tab state ─────────────────────────────────────
+        terminalStatus: { installed: false, running: false, port: null, url: null },
+        terminalStarting: false,
+
+        // ── Files tab state ────────────────────────────────────────
+        fileBrowser: {
+          path: null,
+          parent: null,
+          entries: [],
+          loading: false,
+          selectedFile: null,
+          fileContent: null,
+          fileMode: "text",
+          fileWritable: false,
+          fileDirty: false,
+          saving: false,
+        },
+
+        // ── Tasks tab state ────────────────────────────────────────
+        taskList: [],
+        taskActive: {},
+        taskExpanded: null,
+        taskDetail: null,
+        taskDetailSteps: [],
+
+        // ── Memory tab state ──────────────────────────────────────
+        memorySearch: { query: "", results: [], loading: false },
+        memoryRecent: { items: [], total: 0, loading: false },
+        memoryStats: {},
+        memoryDetail: null,
+
+        // ── Backup tab state ──────────────────────────────────────
+        backupStatus: null,
+
+        // ── Resources tab state ───────────────────────────────────
+        systemResources: null,
+
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
           activity: { state: "idle", lastSuccess: null, error: null },
@@ -143,6 +181,7 @@
         _cognitiveInterval: null,
         _awarenessInterval: null,
         _jobHealthInterval: null,
+        _tasksInterval: null,
 
         // Tab management
         _TAB_INTERVALS: {
@@ -150,11 +189,17 @@
           internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
           config:    [],
+          terminal:  [],
+          files:     [],
+          tasks:     ["_tasksInterval"],
+          memory:    [],
+          backup:    [],
+          resources: ["_resourcesInterval"],
         },
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "internals", "sessions", "config"];
+          const valid = ["overview", "internals", "sessions", "config", "terminal", "files", "tasks", "memory", "backup", "resources"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -199,6 +244,26 @@
               break;
             case "config":
               if (first) { this.fetchConfigFiles(); this.fetchBudgets(); }
+              break;
+            case "terminal":
+              if (first) { this.fetchTerminalStatus(); }
+              break;
+            case "files":
+              if (first) { this.fetchFiles(); }
+              break;
+            case "tasks":
+              if (first) { this.fetchTasks(); }
+              this._tasksInterval = setInterval(() => this.fetchTasks(), 5000);
+              break;
+            case "memory":
+              if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
+              break;
+            case "backup":
+              if (first) { this.fetchBackupStatus(); }
+              break;
+            case "resources":
+              if (first) { this.fetchResources(); }
+              this._resourcesInterval = setInterval(() => this.fetchResources(), 10000);
               break;
           }
         },
@@ -430,6 +495,182 @@
             console.warn("Budget fetch failed:", e);
             this.failFetch("budgets", "Budget config unavailable");
           }
+        },
+
+        // ── Terminal tab fetches ──────────────────────────────────
+        async fetchTerminalStatus() {
+          try {
+            const resp = await fetchApi("/api/genesis/terminal/status");
+            if (resp && resp.ok) this.terminalStatus = await resp.json();
+          } catch (e) { console.warn("Terminal status fetch failed:", e); }
+        },
+        async startTerminal() {
+          this.terminalStarting = true;
+          try {
+            const resp = await fetchApi("/api/genesis/terminal/start", { method: "POST" });
+            const data = await resp.json();
+            if (data.status === "started" || data.status === "already_running") {
+              await this.fetchTerminalStatus();
+            } else {
+              alert(data.error || "Failed to start terminal");
+            }
+          } catch (e) { alert("Failed to start terminal: " + e.message); }
+          this.terminalStarting = false;
+        },
+        async stopTerminal() {
+          try {
+            await fetchApi("/api/genesis/terminal/stop", { method: "POST" });
+            await this.fetchTerminalStatus();
+          } catch (e) { console.warn("Terminal stop failed:", e); }
+        },
+
+        // ── Files tab fetches ─────────────────────────────────────
+        async fetchFiles(path) {
+          this.fileBrowser.loading = true;
+          try {
+            const url = path ? `/api/genesis/files?path=${encodeURIComponent(path)}` : "/api/genesis/files";
+            const resp = await fetchApi(url);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.fileBrowser.path = data.path;
+              this.fileBrowser.parent = data.parent;
+              this.fileBrowser.entries = data.entries;
+              this.fileBrowser.selectedFile = null;
+              this.fileBrowser.fileContent = null;
+            }
+          } catch (e) { console.warn("Files fetch failed:", e); }
+          this.fileBrowser.loading = false;
+        },
+        async openFile(filePath) {
+          try {
+            const resp = await fetchApi(`/api/genesis/files/read?path=${encodeURIComponent(filePath)}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.fileBrowser.selectedFile = data.path;
+              this.fileBrowser.fileContent = data.content;
+              this.fileBrowser.fileMode = data.mode;
+              this.fileBrowser.fileWritable = data.writable;
+              this.fileBrowser.fileDirty = false;
+            }
+          } catch (e) { console.warn("File read failed:", e); }
+        },
+        async saveFile() {
+          if (!this.fileBrowser.selectedFile) return;
+          this.fileBrowser.saving = true;
+          try {
+            const resp = await fetchApi("/api/genesis/files/write", {
+              method: "PUT",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ path: this.fileBrowser.selectedFile, content: this.fileBrowser.fileContent }),
+            });
+            if (resp && resp.ok) { this.fileBrowser.fileDirty = false; }
+            else { const d = await resp.json(); alert(d.error || "Save failed"); }
+          } catch (e) { alert("Save failed: " + e.message); }
+          this.fileBrowser.saving = false;
+        },
+
+        // ── Tasks tab fetches ─────────────────────────────────────
+        async fetchTasks() {
+          try {
+            const resp = await fetchApi("/api/genesis/tasks?include_completed=true&limit=50");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.taskList = data.tasks || [];
+              this.taskActive = data.active || {};
+            }
+          } catch (e) { console.warn("Tasks fetch failed:", e); }
+        },
+        async fetchTaskDetail(taskId) {
+          if (this.taskExpanded === taskId) { this.taskExpanded = null; this.taskDetail = null; this.taskDetailSteps = []; return; }
+          this.taskExpanded = taskId;
+          try {
+            const resp = await fetchApi(`/api/genesis/tasks/${taskId}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.taskDetail = data.task;
+              this.taskDetailSteps = data.steps || [];
+            }
+          } catch (e) { console.warn("Task detail fetch failed:", e); }
+        },
+        async taskAction(taskId, action) {
+          try {
+            await fetchApi(`/api/genesis/tasks/${taskId}/${action}`, { method: "POST" });
+            await this.fetchTasks();
+            if (this.taskExpanded === taskId) await this.fetchTaskDetail(taskId);
+          } catch (e) { console.warn(`Task ${action} failed:`, e); }
+        },
+
+        // ── Memory tab fetches ────────────────────────────────────
+        async fetchMemoryRecent() {
+          this.memoryRecent.loading = true;
+          try {
+            const resp = await fetchApi("/api/genesis/memory/recent?limit=50");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.memoryRecent.items = data.memories || [];
+              this.memoryRecent.total = data.total || 0;
+            }
+          } catch (e) { console.warn("Memory recent failed:", e); }
+          this.memoryRecent.loading = false;
+        },
+        async fetchMemoryStats() {
+          try {
+            const resp = await fetchApi("/api/genesis/memory/stats");
+            if (resp && resp.ok) { this.memoryStats = await resp.json(); }
+          } catch (e) { console.warn("Memory stats failed:", e); }
+        },
+        async searchMemory() {
+          if (!this.memorySearch.query.trim()) return;
+          this.memorySearch.loading = true;
+          try {
+            const resp = await fetchApi(`/api/genesis/memory/search?q=${encodeURIComponent(this.memorySearch.query)}&limit=30`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.memorySearch.results = data.results || [];
+            }
+          } catch (e) { console.warn("Memory search failed:", e); }
+          this.memorySearch.loading = false;
+        },
+        async viewMemoryDetail(memId) {
+          try {
+            const resp = await fetchApi(`/api/genesis/memory/${memId}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.memoryDetail = data.memory;
+            }
+          } catch (e) { console.warn("Memory detail failed:", e); }
+        },
+        async deleteMemory(memId) {
+          if (!confirm("Delete this memory from all layers?")) return;
+          try {
+            await fetchApi(`/api/genesis/memory/${memId}`, { method: "DELETE" });
+            this.memoryDetail = null;
+            await this.fetchMemoryRecent();
+            await this.fetchMemoryStats();
+          } catch (e) { console.warn("Memory delete failed:", e); }
+        },
+
+        // ── Backup tab fetches ───────────────────────────────────
+        async fetchBackupStatus() {
+          try {
+            const resp = await fetchApi("/api/genesis/backup/status");
+            if (resp && resp.ok) { this.backupStatus = await resp.json(); }
+          } catch (e) { console.warn("Backup status failed:", e); }
+        },
+        async triggerBackup() {
+          try {
+            const resp = await fetchApi("/api/genesis/backup/trigger", { method: "POST" });
+            if (resp && resp.ok) { alert("Backup triggered"); setTimeout(() => this.fetchBackupStatus(), 5000); }
+            else { alert("Trigger failed"); }
+          } catch (e) { alert("Trigger failed: " + e.message); }
+        },
+
+        // ── Resources tab fetches ────────────────────────────────
+        async fetchResources() {
+          try {
+            const resp = await fetchApi("/api/genesis/resources");
+            if (resp && resp.ok) { this.systemResources = await resp.json(); }
+          } catch (e) { console.warn("Resources failed:", e); }
         },
 
         async fetchRoutingConfig() {
@@ -1113,9 +1354,15 @@
             return { state: "error", reason: `${hf.name} is ${hf.status}` };
           }
           if (services?.bridge?.active_state && services.bridge.active_state !== "active") {
+            if (services.bridge.active_state === "unknown") {
+              return { state: "unknown", reason: "bridge service state is unknown" };
+            }
             return { state: "error", reason: "bridge service is not active" };
           }
           if (services?.watchdog_timer?.active_state && services.watchdog_timer.active_state !== "active") {
+            if (services.watchdog_timer.active_state === "unknown") {
+              return { state: "unknown", reason: "watchdog timer state is unknown" };
+            }
             return { state: "error", reason: "watchdog timer is not active" };
           }
           if (hf?.detected && hf.status === "degraded") {
@@ -1148,7 +1395,10 @@
           if (awareness.status === "overdue") {
             return { state: "error", reason: "awareness loop is overdue (>6 min)" };
           }
-          if (awareness.status === "unknown" || awareness.status === "no_ticks") {
+          if (awareness.status === "no_ticks") {
+            return { state: "error", reason: "awareness loop has never ticked — system may not be running" };
+          }
+          if (awareness.status === "unknown") {
             return { state: "unknown", reason: "awareness loop has no current tick data" };
           }
           if ((awareness.critical_bypasses_24h || 0) > 0) {
@@ -2104,6 +2354,18 @@
               @click="location.hash = 'sessions'">Sessions & Activity</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'config' }"
               @click="location.hash = 'config'">Configuration</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'terminal' }"
+              @click="location.hash = 'terminal'">Terminal</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'files' }"
+              @click="location.hash = 'files'">Files</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'tasks' }"
+              @click="location.hash = 'tasks'">Tasks</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
+              @click="location.hash = 'memory'">Memory</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
+              @click="location.hash = 'backup'">Backup</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'resources' }"
+              @click="location.hash = 'resources'">Resources</button>
     </nav>
 
     <!-- Panel 1: System Health [Tab: overview] -->
@@ -2504,7 +2766,7 @@
                   <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
                        :title="'Bridge: ' + ($store.genesisDashboard.health.services?.bridge?.active_state || 'unknown') + ' (PID ' + ($store.genesisDashboard.health.services?.bridge?.pid || '?') + ')'">
                     <span class="status-dot"
-                          :style="`background: ${$store.genesisDashboard.health.services?.bridge?.active_state === 'active' ? '#4caf50' : '#d9534f'}`"></span>
+                          :style="`background: ${$store.genesisDashboard.health.services?.bridge?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.bridge?.active_state) ? '#d9534f' : '#666'}`"></span>
                     Bridge
                     <span style="opacity: 0.6; font-size: 0.75rem"
                           x-text="$store.genesisDashboard.health.services?.bridge?.uptime_seconds != null ? Math.round($store.genesisDashboard.health.services.bridge.uptime_seconds / 60) + 'm' : ''"></span>
@@ -2513,7 +2775,7 @@
                   <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
                        :title="'Watchdog timer: ' + ($store.genesisDashboard.health.services?.watchdog_timer?.active_state || 'unknown')">
                     <span class="status-dot"
-                          :style="`background: ${$store.genesisDashboard.health.services?.watchdog_timer?.active_state === 'active' ? '#4caf50' : '#d9534f'}`"></span>
+                          :style="`background: ${$store.genesisDashboard.health.services?.watchdog_timer?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.watchdog_timer?.active_state) ? '#d9534f' : '#666'}`"></span>
                     Watchdog
                     <span style="opacity: 0.6; font-size: 0.75rem"
                           x-text="($store.genesisDashboard.health.services?.watchdog?.consecutive_failures || 0) > 0 ? '(' + $store.genesisDashboard.health.services.watchdog.consecutive_failures + ' fails)' : ''"></span>
@@ -4596,6 +4858,522 @@
               : $store.genesisDashboard.pauseState.paused ? 'Resume Genesis' : 'Pause Genesis'">
     </button>
   </div>
+  <!-- ═══════════════════════════════════════════════════════════════
+       Panel: Terminal [Tab: terminal]
+       ═══════════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'terminal'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">terminal</span>
+        Claude Code Terminal
+        <span class="panel-status">
+          <span class="status-dot"
+                :style="`background:${$store.genesisDashboard.terminalStatus.running ? '#66bb6a' : '#9e9e9e'}`"></span>
+          <span x-text="$store.genesisDashboard.terminalStatus.running ? 'running' : 'stopped'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Controls -->
+        <div style="display:flex; gap:0.5rem; align-items:center; margin-bottom:0.75rem;">
+          <template x-if="!$store.genesisDashboard.terminalStatus.running">
+            <button @click="$store.genesisDashboard.startTerminal()"
+                    :disabled="$store.genesisDashboard.terminalStarting"
+                    style="font-size:0.75rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer;
+                           background:rgba(33,150,243,0.15); color:#2196F3; border:1px solid rgba(33,150,243,0.3);"
+                    x-text="$store.genesisDashboard.terminalStarting ? 'Starting...' : 'Start Terminal'"></button>
+          </template>
+          <template x-if="$store.genesisDashboard.terminalStatus.running">
+            <button @click="$store.genesisDashboard.stopTerminal()"
+                    style="font-size:0.75rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer;
+                           background:rgba(239,154,154,0.15); color:#ef9a9a; border:1px solid rgba(239,154,154,0.3);">Stop Terminal</button>
+          </template>
+          <template x-if="!$store.genesisDashboard.terminalStatus.installed">
+            <span style="color:#ffa726; font-size:0.72rem;">ttyd not installed — run: sudo apt install ttyd</span>
+          </template>
+        </div>
+        <!-- Terminal iframe -->
+        <template x-if="$store.genesisDashboard.terminalStatus.running">
+          <iframe :src="$store.genesisDashboard.terminalStatus.url"
+                  style="width:100%; height:calc(100vh - 250px); min-height:400px; border:1px solid var(--color-border);
+                         border-radius:4px; background:#1a1a2e;">
+          </iframe>
+        </template>
+        <template x-if="!$store.genesisDashboard.terminalStatus.running && $store.genesisDashboard.terminalStatus.installed">
+          <div style="padding:2rem; text-align:center; color:var(--color-text-secondary);">
+            Click "Start Terminal" to open an interactive Claude Code session.
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Panel: File Browser [Tab: files]
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'files'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">folder_open</span>
+        File Browser
+      </div>
+      <div class="panel-body">
+        <!-- Breadcrumb / path bar -->
+        <div style="display:flex; gap:0.3rem; align-items:center; margin-bottom:0.75rem; font-size:0.75rem; flex-wrap:wrap;">
+          <template x-if="$store.genesisDashboard.fileBrowser.parent">
+            <button @click="$store.genesisDashboard.fetchFiles($store.genesisDashboard.fileBrowser.parent)"
+                    style="cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);
+                           padding:0.15rem 0.5rem; border-radius:3px; font-size:0.72rem;">
+              <span class="material-symbols-outlined" style="font-size:0.85rem;vertical-align:middle;">arrow_upward</span> Up
+            </button>
+          </template>
+          <span style="color:var(--color-text-secondary); font-family:monospace; word-break:break-all;"
+                x-text="$store.genesisDashboard.fileBrowser.path || 'Loading...'"></span>
+        </div>
+
+        <div style="display:flex; gap:1rem;">
+          <!-- Directory listing -->
+          <div style="flex:0 0 45%; max-height:calc(100vh - 280px); overflow-y:auto; border-right:1px solid var(--color-border); padding-right:0.75rem;">
+            <template x-if="$store.genesisDashboard.fileBrowser.loading">
+              <div style="color:var(--color-text-secondary); font-size:0.75rem; padding:1rem;">Loading...</div>
+            </template>
+            <template x-for="entry in $store.genesisDashboard.fileBrowser.entries" :key="entry.path">
+              <div @click="entry.is_dir ? $store.genesisDashboard.fetchFiles(entry.path) : $store.genesisDashboard.openFile(entry.path)"
+                   style="display:flex; align-items:center; gap:0.4rem; padding:0.25rem 0.35rem; cursor:pointer;
+                          border-radius:3px; font-size:0.73rem; transition:background 0.1s;"
+                   :style="$store.genesisDashboard.fileBrowser.selectedFile === entry.path ? 'background:rgba(33,150,243,0.15)' : ''"
+                   onmouseover="this.style.background=this.style.background||'rgba(255,255,255,0.04)'"
+                   onmouseout="if(!this.style.background.includes('33,150,243'))this.style.background=''">
+                <span class="material-symbols-outlined" style="font-size:1rem;"
+                      :style="entry.is_dir ? 'color:#ffa726' : 'color:#90caf9'"
+                      x-text="entry.is_dir ? 'folder' : 'description'"></span>
+                <span x-text="entry.name" style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                <span x-show="!entry.is_dir && entry.size != null"
+                      style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="entry.size > 1024*1024 ? (entry.size/1024/1024).toFixed(1)+'MB' : entry.size > 1024 ? (entry.size/1024).toFixed(1)+'KB' : entry.size+'B'"></span>
+              </div>
+            </template>
+          </div>
+
+          <!-- File viewer -->
+          <div style="flex:1; min-width:0;">
+            <template x-if="$store.genesisDashboard.fileBrowser.selectedFile">
+              <div>
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+                  <span style="font-size:0.72rem; font-family:monospace; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;"
+                        x-text="$store.genesisDashboard.fileBrowser.selectedFile"></span>
+                  <div style="display:flex; gap:0.3rem;">
+                    <template x-if="$store.genesisDashboard.fileBrowser.fileWritable && $store.genesisDashboard.fileBrowser.fileDirty">
+                      <button @click="$store.genesisDashboard.saveFile()"
+                              :disabled="$store.genesisDashboard.fileBrowser.saving"
+                              style="font-size:0.7rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(102,187,106,0.15); color:#66bb6a; border:1px solid rgba(102,187,106,0.3);"
+                              x-text="$store.genesisDashboard.fileBrowser.saving ? 'Saving...' : 'Save'"></button>
+                    </template>
+                  </div>
+                </div>
+                <textarea x-model="$store.genesisDashboard.fileBrowser.fileContent"
+                          @input="$store.genesisDashboard.fileBrowser.fileDirty = true"
+                          :readonly="!$store.genesisDashboard.fileBrowser.fileWritable"
+                          style="width:100%; height:calc(100vh - 320px); min-height:300px; font-family:monospace;
+                                 font-size:0.75rem; line-height:1.5; background:rgba(0,0,0,0.3); color:var(--color-text);
+                                 border:1px solid var(--color-border); border-radius:4px; padding:0.5rem;
+                                 resize:vertical; tab-size:4;"></textarea>
+              </div>
+            </template>
+            <template x-if="!$store.genesisDashboard.fileBrowser.selectedFile">
+              <div style="padding:2rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+                Select a file to view its contents.
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Panel: Task Execution Viewer [Tab: tasks]
+         ═══════════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'tasks'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">task_alt</span>
+        Task Execution
+        <span class="panel-status" x-show="Object.keys($store.genesisDashboard.taskActive).length > 0">
+          <span class="status-dot" style="background:#66bb6a;"></span>
+          <span x-text="Object.keys($store.genesisDashboard.taskActive).length + ' active'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Task list -->
+        <template x-if="$store.genesisDashboard.taskList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No tasks found. Submit tasks via the <code>task_submit</code> MCP tool.
+          </div>
+        </template>
+        <div class="activity-feed">
+          <template x-for="task in $store.genesisDashboard.taskList" :key="task.task_id">
+            <div>
+              <div class="activity-row"
+                   @click="$store.genesisDashboard.fetchTaskDetail(task.task_id)"
+                   style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;">
+                <!-- Phase badge -->
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                        'paused':    'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                      }[task.current_phase?.toLowerCase()] || 'background:rgba(33,150,243,0.15); color:#2196F3;'"
+                      x-text="task.current_phase || 'unknown'"></span>
+                <!-- Description -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
+                      x-text="task.description || task.task_id"></span>
+                <!-- Task ID -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; font-family:monospace; flex-shrink:0;"
+                      x-text="task.task_id?.substring(0,10)"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime(task.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.taskExpanded === task.task_id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.taskExpanded === task.task_id && $store.genesisDashboard.taskDetail">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
+                  <!-- Actions bar -->
+                  <div style="display:flex; gap:0.3rem; margin-bottom:0.5rem;">
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'pause')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(255,167,38,0.1); color:#ffa726; border:1px solid rgba(255,167,38,0.2);">Pause</button>
+                    </template>
+                    <template x-if="task.current_phase?.toLowerCase() === 'paused'">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'resume')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">Resume</button>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'cancel')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(239,154,154,0.1); color:#ef9a9a; border:1px solid rgba(239,154,154,0.2);">Cancel</button>
+                    </template>
+                  </div>
+                  <!-- Steps -->
+                  <div style="margin-top:0.3rem;">
+                    <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
+                    <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
+                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <!-- Status icon -->
+                        <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
+                              :style="{
+                                'completed': 'color:#66bb6a',
+                                'executing': 'color:#2196F3',
+                                'failed':    'color:#ef9a9a',
+                                'pending':   'color:#9e9e9e',
+                                'blocked':   'color:#ffa726',
+                              }[step.status] || 'color:#9e9e9e'"
+                              x-text="{
+                                'completed': 'check_circle',
+                                'executing': 'sync',
+                                'failed':    'error',
+                                'pending':   'radio_button_unchecked',
+                                'blocked':   'block',
+                              }[step.status] || 'radio_button_unchecked'"></span>
+                        <div style="flex:1; min-width:0;">
+                          <div style="display:flex; justify-content:space-between; gap:0.5rem;">
+                            <span x-text="step.description || `Step ${step.step_idx}`" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                            <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                                  x-text="step.step_type"></span>
+                          </div>
+                          <div style="display:flex; gap:0.5rem; color:var(--color-text-secondary); font-size:0.65rem; margin-top:0.1rem;">
+                            <span x-show="step.model_used" x-text="step.model_used"></span>
+                            <span x-show="step.cost_usd" x-text="'$' + step.cost_usd?.toFixed(4)"></span>
+                            <span x-show="step.started_at && step.completed_at"
+                                  x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
+                          </div>
+                          <!-- Result preview -->
+                          <template x-if="step.result_json && step.result_json.result">
+                            <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
+                                        font-family:monospace; font-size:0.65rem; max-height:80px; overflow:hidden; color:var(--color-text-secondary);"
+                                 x-text="(typeof step.result_json.result === 'string' ? step.result_json.result : JSON.stringify(step.result_json.result)).substring(0, 500)">
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskDetailSteps.length === 0">
+                      <div style="color:var(--color-text-secondary); font-size:0.7rem; padding:0.3rem 0;">No steps recorded yet.</div>
+                    </template>
+                  </div>
+                  <!-- Blockers -->
+                  <template x-if="$store.genesisDashboard.taskDetail.blockers">
+                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15);">
+                      <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
+                      <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                           x-text="JSON.stringify($store.genesisDashboard.taskDetail.blockers)"></div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Memory Browser [Tab: memory]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'memory'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">psychology</span>
+        Memory Browser
+      </div>
+      <div class="panel-body">
+        <!-- Stats row -->
+        <div style="display:flex; gap:1rem; margin-bottom:1rem; flex-wrap:wrap;" x-data>
+          <template x-if="$store.genesisDashboard.memoryStats.total != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Total Memories</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.total"></div>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.memoryStats.pending_embeddings != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Pending Embeddings</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.pending_embeddings"></div>
+            </div>
+          </template>
+          <template x-if="$store.genesisDashboard.memoryStats.qdrant_episodic_memory != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Qdrant Episodic</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.qdrant_episodic_memory"></div>
+            </div>
+          </template>
+        </div>
+
+        <!-- Search -->
+        <div style="display:flex; gap:0.5rem; margin-bottom:1rem;">
+          <input type="text" x-model="$store.genesisDashboard.memorySearch.query"
+                 @keydown.enter="$store.genesisDashboard.searchMemory()"
+                 placeholder="Semantic search..."
+                 style="flex:1; background:var(--color-bg-primary); border:1px solid var(--color-border); color:var(--color-text-primary); padding:0.5rem; border-radius:4px; font-family:inherit;">
+          <button @click="$store.genesisDashboard.searchMemory()"
+                  style="background:var(--color-accent); color:#000; border:none; padding:0.5rem 1rem; border-radius:4px; cursor:pointer;"
+                  x-text="$store.genesisDashboard.memorySearch.loading ? 'Searching...' : 'Search'"></button>
+        </div>
+
+        <!-- Search results -->
+        <template x-if="$store.genesisDashboard.memorySearch.results.length > 0">
+          <div class="card" style="margin-bottom:1rem;">
+            <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary);">
+              Search Results (<span x-text="$store.genesisDashboard.memorySearch.results.length"></span>)
+            </div>
+            <template x-for="r in $store.genesisDashboard.memorySearch.results" :key="r.memory_id">
+              <div style="padding:0.5rem; border-top:1px solid var(--color-border); cursor:pointer;"
+                   @click="$store.genesisDashboard.viewMemoryDetail(r.memory_id)">
+                <div style="font-size:0.75rem; color:var(--color-accent);" x-text="r.memory_type + ' · score: ' + (r.score || '?')"></div>
+                <div style="font-size:0.85rem; white-space:pre-wrap; max-height:3rem; overflow:hidden;" x-text="r.content"></div>
+              </div>
+            </template>
+          </div>
+        </template>
+
+        <!-- Memory detail modal -->
+        <template x-if="$store.genesisDashboard.memoryDetail">
+          <div class="card" style="margin-bottom:1rem; border:1px solid var(--color-accent);">
+            <div style="padding:0.75rem; display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-size:0.8rem; color:var(--color-accent);" x-text="'ID: ' + $store.genesisDashboard.memoryDetail.memory_id"></span>
+              <div style="display:flex; gap:0.5rem;">
+                <button @click="$store.genesisDashboard.deleteMemory($store.genesisDashboard.memoryDetail.memory_id)"
+                        style="background:rgba(239,154,154,0.2); color:#ef9a9a; border:1px solid rgba(239,154,154,0.3); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Delete</button>
+                <button @click="$store.genesisDashboard.memoryDetail = null"
+                        style="background:var(--color-bg-tertiary); color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Close</button>
+              </div>
+            </div>
+            <div style="padding:0.75rem; border-top:1px solid var(--color-border);">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:0.25rem;">
+                <span x-text="'Collection: ' + ($store.genesisDashboard.memoryDetail.collection || '?')"></span> ·
+                <span x-text="'Links: ' + ($store.genesisDashboard.memoryDetail.link_count || 0)"></span> ·
+                <span x-text="'Created: ' + ($store.genesisDashboard.memoryDetail.created_at || 'unknown')"></span>
+              </div>
+              <pre style="white-space:pre-wrap; font-size:0.85rem; max-height:400px; overflow-y:auto; margin:0;" x-text="$store.genesisDashboard.memoryDetail.content"></pre>
+            </div>
+          </div>
+        </template>
+
+        <!-- Recent memories -->
+        <div class="card">
+          <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary);">
+            Recent Memories (<span x-text="$store.genesisDashboard.memoryRecent.total"></span> total)
+          </div>
+          <template x-if="$store.genesisDashboard.memoryRecent.loading">
+            <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+          </template>
+          <template x-for="m in $store.genesisDashboard.memoryRecent.items" :key="m.memory_id">
+            <div style="padding:0.5rem; border-top:1px solid var(--color-border); cursor:pointer;"
+                 @click="$store.genesisDashboard.viewMemoryDetail(m.memory_id)">
+              <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:var(--color-text-secondary);">
+                <span x-text="m.collection"></span>
+                <span x-text="m.created_at ? new Date(m.created_at).toLocaleString() : ''"></span>
+              </div>
+              <div style="font-size:0.85rem; white-space:pre-wrap; max-height:2.5rem; overflow:hidden;" x-text="m.content"></div>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Backup Monitoring [Tab: backup]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'backup'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">backup</span>
+        Backup Monitoring
+      </div>
+      <div class="panel-body">
+        <template x-if="!$store.genesisDashboard.backupStatus">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <template x-if="$store.genesisDashboard.backupStatus">
+          <div>
+            <!-- Status card -->
+            <div class="card" style="padding:1rem; margin-bottom:1rem;">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                <h3 style="margin:0; font-size:1rem;">Backup Status</h3>
+                <button @click="$store.genesisDashboard.triggerBackup()"
+                        style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                  Run Now</button>
+              </div>
+              <template x-if="$store.genesisDashboard.backupStatus.last_backup">
+                <div>
+                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Last Run</span><br>
+                      <span style="font-size:0.9rem;" x-text="new Date($store.genesisDashboard.backupStatus.last_backup.timestamp).toLocaleString()"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
+                      <span style="font-size:0.9rem;"
+                            :style="$store.genesisDashboard.backupStatus.last_backup.success ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.backupStatus.last_backup.success ? 'Success' : 'Failed'"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Duration</span><br>
+                      <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.backupStatus.last_backup.duration_s + 's'"></span>
+                    </div>
+                  </div>
+                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
+                    <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
+                    <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
+                    <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
+                    <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
+                    <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
+                          x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
+                  </div>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.backupStatus.last_backup">
+                <div style="color:var(--color-text-secondary);">No backup status file found. Run a backup to generate status.</div>
+              </template>
+            </div>
+            <!-- Config card -->
+            <div class="card" style="padding:1rem;">
+              <h3 style="margin:0 0 0.5rem 0; font-size:1rem;">Configuration</h3>
+              <div style="font-size:0.85rem;">
+                <div style="margin-bottom:0.25rem;">
+                  <span style="color:var(--color-text-secondary);">Repo:</span>
+                  <span x-text="$store.genesisDashboard.backupStatus.repo || 'Not configured'"></span>
+                </div>
+                <div style="margin-bottom:0.25rem;">
+                  <span style="color:var(--color-text-secondary);">Cron:</span>
+                  <code style="font-size:0.8rem;" x-text="$store.genesisDashboard.backupStatus.cron_schedule || 'Not scheduled'"></code>
+                </div>
+                <div>
+                  <span style="color:var(--color-text-secondary);">Script:</span>
+                  <span x-text="$store.genesisDashboard.backupStatus.configured ? 'Installed' : 'Not found'"
+                        :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: System Resources [Tab: resources]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'resources'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">monitoring</span>
+        System Resources
+      </div>
+      <div class="panel-body">
+        <template x-if="!$store.genesisDashboard.systemResources">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <template x-if="$store.genesisDashboard.systemResources">
+          <div style="display:flex; gap:1rem; flex-wrap:wrap;">
+            <!-- CPU -->
+            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">CPU</div>
+              <template x-if="$store.genesisDashboard.systemResources.cpu && $store.genesisDashboard.systemResources.cpu.used_pct != null">
+                <div>
+                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.cpu.used_pct + '%'"></div>
+                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
+                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.systemResources.cpu.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.cpu.used_pct > 85 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.cpu.used_pct > 60 ? '#fff176' : '#81c784'))"></div>
+                  </div>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.systemResources.cpu || $store.genesisDashboard.systemResources.cpu.used_pct == null">
+                <div style="font-size:1.2rem; color:var(--color-text-secondary);">Sampling...</div>
+              </template>
+            </div>
+            <!-- Memory -->
+            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Memory</div>
+              <template x-if="$store.genesisDashboard.systemResources.memory && $store.genesisDashboard.systemResources.memory.used_pct != null">
+                <div>
+                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.memory.used_pct + '%'"></div>
+                  <div style="font-size:0.75rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.systemResources.memory.used_gb + ' / ' + $store.genesisDashboard.systemResources.memory.total_gb + ' GB'"></div>
+                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
+                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.systemResources.memory.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.memory.used_pct > 90 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.memory.used_pct > 70 ? '#fff176' : '#81c784'))"></div>
+                  </div>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.systemResources.memory || $store.genesisDashboard.systemResources.memory.used_pct == null">
+                <div style="color:var(--color-text-secondary);">Unavailable</div>
+              </template>
+            </div>
+            <!-- Disk -->
+            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Disk</div>
+              <template x-if="$store.genesisDashboard.systemResources.disk && $store.genesisDashboard.systemResources.disk.used_pct != null">
+                <div>
+                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.disk.used_pct + '%'"></div>
+                  <div style="font-size:0.75rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.systemResources.disk.used_gb + ' / ' + $store.genesisDashboard.systemResources.disk.total_gb + ' GB'"></div>
+                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
+                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.systemResources.disk.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.disk.used_pct > 85 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.disk.used_pct > 70 ? '#fff176' : '#81c784'))"></div>
+                  </div>
+                </div>
+              </template>
+              <template x-if="!$store.genesisDashboard.systemResources.disk || $store.genesisDashboard.systemResources.disk.used_pct == null">
+                <div style="color:var(--color-text-secondary);">Unavailable</div>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
   <!-- Extra bottom padding so content isn't hidden behind the fixed footer -->
   <div style="height: 50px;"></div>
 

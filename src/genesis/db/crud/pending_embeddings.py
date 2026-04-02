@@ -101,6 +101,16 @@ async def reset_failed_to_pending(
     return cursor.rowcount
 
 
+async def delete_by_memory(db: aiosqlite.Connection, *, memory_id: str) -> int:
+    """Delete all pending embeddings for a memory. Returns count deleted."""
+    cursor = await db.execute(
+        "DELETE FROM pending_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def count_pending(
     db: aiosqlite.Connection,
 ) -> int:

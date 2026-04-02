@@ -91,6 +91,37 @@ class TestCCUnavailableEscalation:
         assert any("Disk /:" in e for e in result.evidence)
 
 
+# ── Briefing integration ───────────────────────────────────────────────
+
+
+class TestBriefingIntegration:
+    """Test that briefing content is injected into the CC prompt."""
+
+    def test_prompt_without_briefing(self) -> None:
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+        snap = _snap(container_status="Running")
+        prompt = _build_diagnosis_prompt(snap, "signal data", "genesis")
+        assert "Genesis Context Briefing" not in prompt
+        assert "Genesis Guardian" in prompt
+
+    def test_prompt_with_briefing(self) -> None:
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+        snap = _snap(container_status="Stopped")
+        briefing = "### Service Baseline\n- genesis-bridge: main service"
+        prompt = _build_diagnosis_prompt(
+            snap, "signal data", "genesis", briefing_context=briefing,
+        )
+        assert "Genesis Context Briefing" in prompt
+        assert "genesis-bridge: main service" in prompt
+
+    def test_briefing_none_same_as_no_briefing(self) -> None:
+        from genesis.guardian.diagnosis import _build_diagnosis_prompt
+        snap = _snap(container_status="Running")
+        prompt_none = _build_diagnosis_prompt(snap, "", "genesis", briefing_context=None)
+        prompt_default = _build_diagnosis_prompt(snap, "", "genesis")
+        assert prompt_none == prompt_default
+
+
 # ── CC response parsing ─────────────────────────────────────────────────
 
 

@@ -160,3 +160,113 @@ async def delete(db: aiosqlite.Connection, *, memory_id: str) -> bool:
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+# ── memory_metadata companion table ─────────────────────────────────
+
+
+async def create_metadata(
+    db: aiosqlite.Connection,
+    *,
+    memory_id: str,
+    created_at: str,
+    collection: str = "episodic_memory",
+    confidence: float | None = None,
+    embedding_status: str = "embedded",
+) -> str:
+    """Insert a row into memory_metadata. Returns memory_id."""
+    await db.execute(
+        "INSERT OR IGNORE INTO memory_metadata "
+        "(memory_id, created_at, collection, confidence, embedding_status) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (memory_id, created_at, collection, confidence, embedding_status),
+    )
+    await db.commit()
+    return memory_id
+
+
+async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
+    """Delete a memory_metadata row. Returns True if deleted."""
+    cursor = await db.execute(
+        "DELETE FROM memory_metadata WHERE memory_id = ?", (memory_id,)
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
+    """Get a single memory by ID, joining FTS5 content with metadata."""
+    cursor = await db.execute(
+        "SELECT f.memory_id, f.content, f.source_type, f.tags, f.collection, "
+        "       m.created_at, m.confidence, m.embedding_status "
+        "FROM memory_fts f "
+        "LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id "
+        "WHERE f.memory_id = ?",
+        (memory_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "memory_id": row[0],
+        "content": row[1],
+        "source_type": row[2],
+        "tags": row[3],
+        "collection": row[4],
+        "created_at": row[5],
+        "confidence": row[6],
+        "embedding_status": row[7],
+    }
+
+
+async def list_recent(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    collection: str | None = None,
+) -> list[dict]:
+    """List memories ordered by created_at descending (newest first)."""
+    sql = (
+        "SELECT f.memory_id, f.content, f.source_type, f.collection, "
+        "       m.created_at, m.confidence, m.embedding_status "
+        "FROM memory_metadata m "
+        "JOIN memory_fts f ON f.memory_id = m.memory_id "
+    )
+    params: list = []
+    if collection:
+        sql += "WHERE m.collection = ? "
+        params.append(collection)
+    sql += "ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    return [
+        {
+            "memory_id": r[0],
+            "content": r[1][:500],  # truncated for list views
+            "source_type": r[2],
+            "collection": r[3],
+            "created_at": r[4],
+            "confidence": r[5],
+            "embedding_status": r[6],
+        }
+        for r in rows
+    ]
+
+
+async def count(
+    db: aiosqlite.Connection,
+    *,
+    collection: str | None = None,
+) -> int:
+    """Count memories in memory_metadata (optionally by collection)."""
+    if collection:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM memory_metadata WHERE collection = ?",
+            (collection,),
+        )
+    else:
+        cursor = await db.execute("SELECT COUNT(*) FROM memory_metadata")
+    row = await cursor.fetchone()
+    return row[0]
