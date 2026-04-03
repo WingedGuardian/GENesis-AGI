@@ -78,8 +78,31 @@ async def perform_tick(
     trigger_reason = decision.reason if decision else reason
 
     # 3b. Check for pending light→deep escalation
+    escalation_pending_id: str | None = None
     if cc_reflection_bridge is not None:
         try:
+            # Fix 3A: expire stale escalations (>8h) before checking
+            _STALE_ESCALATION_HOURS = 8
+            all_pending = await observations.query(
+                db, type="light_escalation_pending", resolved=False, limit=10,
+            )
+            for stale in all_pending:
+                stale_created = stale.get("created_at", "")
+                try:
+                    stale_age = (
+                        datetime.now(UTC) - datetime.fromisoformat(stale_created)
+                    ).total_seconds() / 3600
+                except (ValueError, TypeError):
+                    stale_age = 999
+                if stale_age >= _STALE_ESCALATION_HOURS:
+                    await observations.resolve(
+                        db, stale["id"],
+                        resolved_at=now,
+                        resolution_notes=f"Expired (age {stale_age:.1f}h > {_STALE_ESCALATION_HOURS}h TTL)",
+                    )
+                    logger.info("Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age)
+
+            # Re-query after cleanup
             pending_escalations = await observations.query(
                 db, type="light_escalation_pending", resolved=False, limit=1,
             )
@@ -92,12 +115,14 @@ async def perform_tick(
                 except (ValueError, TypeError):
                     esc_age_hours = 999  # treat unparseable as expired
 
-                if esc_age_hours < 2:
-                    # Cooldown: max 1 escalation per 2h window
+                if esc_age_hours < _STALE_ESCALATION_HOURS:
+                    # Fix 2A: daily escalation budget (max 2 per 24h)
+                    _ESCALATION_BUDGET_PER_DAY = 2
                     resolved_recent = await observations.query(
-                        db, type="light_escalation_resolved", limit=10,
+                        db, type="light_escalation_resolved", limit=20,
                     )
-                    recent_resolved_count = 0
+                    resolved_24h_count = 0
+                    resolved_2h_count = 0
                     for r in resolved_recent:
                         r_created = r.get("created_at", "")
                         try:
@@ -105,35 +130,36 @@ async def perform_tick(
                                 datetime.now(UTC) - datetime.fromisoformat(r_created)
                             ).total_seconds() / 3600
                             if r_age < 2:
-                                recent_resolved_count += 1
+                                resolved_2h_count += 1
+                            if r_age < 24:
+                                resolved_24h_count += 1
                         except (ValueError, TypeError):
                             pass
 
-                    if recent_resolved_count >= 1:
-                        logger.info("Light escalation cooldown active, skipping")
+                    # Check emergency bypass — critical signals override budget
+                    esc_content = pending_escalations[0].get("content", "").lower()
+                    is_emergency = any(kw in esc_content for kw in (
+                        "critical_failure", "data_loss", "security_breach",
+                        "all providers", "container memory critical",
+                    ))
+
+                    if resolved_2h_count >= 1 and not is_emergency:
+                        logger.info("Light escalation cooldown active (2h), skipping")
+                    elif resolved_24h_count >= _ESCALATION_BUDGET_PER_DAY and not is_emergency:
+                        logger.info(
+                            "Escalation budget exhausted (%d/%d in 24h), skipping",
+                            resolved_24h_count, _ESCALATION_BUDGET_PER_DAY,
+                        )
                     else:
+                        if is_emergency:
+                            logger.warning("Emergency escalation bypassing budget: %s", esc_content[:100])
                         classified_depth = Depth.DEEP
                         escalation_source = "light_escalation"
                         trigger_reason = f"light escalation: {pending_escalations[0].get('content', 'unknown')}"
                         logger.info("Forcing DEEP reflection due to light escalation")
 
-                        # Mark the pending escalation as resolved
-                        esc_id = pending_escalations[0]["id"]
-                        await observations.resolve(
-                            db, esc_id,
-                            resolved_at=now,
-                            resolution_notes="Escalation consumed by deep reflection",
-                        )
-                        # Record a resolved marker for cooldown tracking
-                        await observations.create(
-                            db,
-                            id=str(uuid.uuid4()),
-                            source="awareness_loop",
-                            type="light_escalation_resolved",
-                            content=f"Escalation {esc_id} consumed",
-                            priority="low",
-                            created_at=now,
-                        )
+                        # Fix 3B: defer resolution until after successful dispatch
+                        escalation_pending_id = pending_escalations[0]["id"]
         except Exception:
             logger.warning("Failed to check light escalation state", exc_info=True)
 
@@ -146,6 +172,7 @@ async def perform_tick(
         classified_depth=classified_depth,
         trigger_reason=trigger_reason,
         escalation_source=escalation_source,
+        escalation_pending_id=escalation_pending_id,
     )
 
     # 4. Store tick result
@@ -245,6 +272,25 @@ async def perform_tick(
                 db=db,
                 escalation_source=escalation_source if classified_depth == Depth.DEEP else None,
             )
+            # Resolve escalation after successful dispatch
+            if escalation_pending_id and classified_depth == Depth.DEEP:
+                try:
+                    await observations.resolve(
+                        db, escalation_pending_id,
+                        resolved_at=now,
+                        resolution_notes="Escalation consumed by deep reflection",
+                    )
+                    await observations.create(
+                        db,
+                        id=str(uuid.uuid4()),
+                        source="awareness_loop",
+                        type="light_escalation_resolved",
+                        content=f"Escalation {escalation_pending_id} consumed",
+                        priority="low",
+                        created_at=now,
+                    )
+                except Exception:
+                    logger.warning("Failed to resolve escalation %s", escalation_pending_id, exc_info=True)
         except Exception:
             logger.exception("CC reflection failed for tick %s", tick_id)
             if deferred_queue and classified_depth:
@@ -295,6 +341,8 @@ class AwarenessLoop:
         self._topic_manager = None
         self._guardian_watchdog = None
         self._credential_bridge_fn = None
+        self._briefing_writer_fn = None
+        self._findings_ingest_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
@@ -448,6 +496,22 @@ class AwarenessLoop:
                 except Exception:
                     logger.error("Credential bridge write failed", exc_info=True)
 
+            # Write dynamic Guardian briefing to shared mount
+            if self._briefing_writer_fn:
+                try:
+                    await self._briefing_writer_fn(self._db)
+                except Exception:
+                    logger.error("Guardian briefing write failed", exc_info=True)
+
+            # Ingest Guardian diagnosis results from shared mount
+            if self._findings_ingest_fn:
+                try:
+                    count = await self._findings_ingest_fn(self._db)
+                    if count:
+                        logger.info("Ingested %d Guardian findings", count)
+                except Exception:
+                    logger.error("Guardian findings ingest failed", exc_info=True)
+
         if result is None:
             return
 
@@ -560,8 +624,16 @@ class AwarenessLoop:
                     db=db,
                     escalation_source=result.escalation_source if depth == Depth.DEEP else None,
                 )
+                # Fix 3B: resolve escalation AFTER successful dispatch
+                if result.escalation_pending_id and depth == Depth.DEEP:
+                    await self._resolve_escalation(result.escalation_pending_id, result.timestamp)
             except Exception:
                 logger.exception("CC reflection failed for tick %s", tick_id)
+                if result.escalation_pending_id:
+                    logger.info(
+                        "Escalation %s left pending (dispatch failed, will retry)",
+                        result.escalation_pending_id,
+                    )
                 if self._deferred_queue:
                     try:
                         await self._deferred_queue.enqueue(
@@ -662,6 +734,29 @@ class AwarenessLoop:
                 # Reset to pending so next tick can retry
                 await self._deferred_queue.reset_to_pending(item_id)
 
+    async def _resolve_escalation(self, pending_id: str, now: str) -> None:
+        """Resolve a consumed escalation and record the cooldown marker."""
+        from genesis.db.crud import observations
+
+        try:
+            await observations.resolve(
+                self._db, pending_id,
+                resolved_at=now,
+                resolution_notes="Escalation consumed by deep reflection",
+            )
+            await observations.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source="awareness_loop",
+                type="light_escalation_resolved",
+                content=f"Escalation {pending_id} consumed",
+                priority="low",
+                created_at=now,
+            )
+            logger.info("Escalation %s resolved after successful dispatch", pending_id)
+        except Exception:
+            logger.warning("Failed to resolve escalation %s", pending_id, exc_info=True)
+
     def set_resilience_state_machine(self, sm) -> None:
         """Inject resilience state machine after construction."""
         self._resilience_state_machine = sm
@@ -693,6 +788,14 @@ class AwarenessLoop:
     def set_credential_bridge(self, fn) -> None:
         """Inject credential bridge for Telegram credential propagation."""
         self._credential_bridge_fn = fn
+
+    def set_briefing_writer(self, fn) -> None:
+        """Inject dynamic briefing writer for Guardian context updates."""
+        self._briefing_writer_fn = fn
+
+    def set_findings_ingest(self, fn) -> None:
+        """Inject Guardian findings ingest for reading diagnosis results."""
+        self._findings_ingest_fn = fn
 
     def replace_collectors(self, collectors: list) -> None:
         """Replace signal collectors (late-binding upgrade from stubs to real)."""

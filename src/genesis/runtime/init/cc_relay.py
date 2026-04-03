@@ -37,7 +37,50 @@ async def init(rt: GenesisRuntime) -> None:
                     sm.update_cc(cc_status)
                     logger.info("CC status updated to %s", status_str)
 
-        rt._cc_invoker = CCInvoker(on_cc_status_change=_on_cc_status_change)
+        async def _on_model_downgrade(requested: str, actual: str, session_id: str) -> None:
+            """Record CC model downgrade as observation + event."""
+            logger.warning(
+                "CC model downgrade: requested=%s actual=%s session=%s",
+                requested, actual, session_id,
+            )
+            if rt._event_bus:
+                try:
+                    from genesis.observability.types import Severity, Subsystem
+                    await rt._event_bus.emit(
+                        Subsystem.PROVIDERS,
+                        Severity.WARNING,
+                        "cc.model_downgrade",
+                        f"CC downgraded {requested}->{actual}",
+                        requested_model=requested,
+                        actual_model=actual,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    logger.warning("Failed to emit model downgrade event", exc_info=True)
+            if rt._db:
+                try:
+                    import uuid
+                    from datetime import UTC, datetime
+
+                    from genesis.db.crud import observations
+                    content = f"model_downgrade:{requested}->{actual}"
+                    await observations.create(
+                        rt._db,
+                        id=str(uuid.uuid4()),
+                        source="cc_invoker",
+                        type="model_downgrade",
+                        content=content,
+                        priority="high",
+                        created_at=datetime.now(UTC).isoformat(),
+                        skip_if_duplicate=True,
+                    )
+                except Exception:
+                    logger.error("Failed to create model downgrade observation", exc_info=True)
+
+        rt._cc_invoker = CCInvoker(
+            on_cc_status_change=_on_cc_status_change,
+            on_model_downgrade=_on_model_downgrade,
+        )
         rt._session_manager = SessionManager(
             db=rt._db,
             invoker=rt._cc_invoker,

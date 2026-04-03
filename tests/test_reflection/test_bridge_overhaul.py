@@ -28,6 +28,8 @@ class FakeCCOutput:
     cost_usd: float = 0.01
     input_tokens: int = 100
     output_tokens: int = 50
+    model_requested: str = ""
+    downgraded: bool = False
 
 
 @pytest.fixture

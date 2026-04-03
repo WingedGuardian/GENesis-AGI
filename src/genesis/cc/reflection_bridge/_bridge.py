@@ -7,6 +7,7 @@ _output submodules.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -58,6 +59,8 @@ _DEPTH_CALL_SITE = {
     Depth.STRATEGIC: "6_strategic_reflection",
     Depth.LIGHT: "4_light_reflection",
 }
+
+_DOWNGRADE_RETRY_BACKOFF_S = 30
 
 _DEFAULT_PROMPT_DIR = Path(__file__).resolve().parent.parent.parent / "identity"
 
@@ -251,6 +254,39 @@ class CCReflectionBridge:
             ),
         )
         output = await self._invoker.run(invocation)
+
+        # Model downgrade response (Layer 2)
+        if output.downgraded and depth == Depth.STRATEGIC:
+            logger.warning(
+                "Strategic reflection got downgraded model (%s -> %s), "
+                "retrying after %ds backoff",
+                model, output.model_used, _DOWNGRADE_RETRY_BACKOFF_S,
+            )
+            await asyncio.sleep(_DOWNGRADE_RETRY_BACKOFF_S)
+            try:
+                retry_output = await self._invoker.run(invocation)
+            except Exception:
+                logger.warning(
+                    "Strategic reflection retry failed, using original "
+                    "downgraded output",
+                    exc_info=True,
+                )
+                retry_output = None
+            if retry_output is not None and not retry_output.downgraded:
+                output = retry_output
+            elif retry_output is not None:
+                logger.warning(
+                    "Strategic reflection retry still downgraded (%s), "
+                    "proceeding with degraded output",
+                    retry_output.model_used,
+                )
+                output = retry_output
+        elif output.downgraded and depth == Depth.DEEP:
+            logger.info(
+                "Deep reflection model downgraded (%s -> %s), "
+                "proceeding (Sonnet adequate)",
+                model, output.model_used,
+            )
 
         if output.is_error:
             logger.error(

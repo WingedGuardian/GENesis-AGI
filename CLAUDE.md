@@ -132,7 +132,8 @@ Sync via `scripts/prepare-public-release.sh`. Full details: `.claude/docs/dual-r
 Session transcripts: `~/.claude/projects/{project-id}/*.jsonl` (project-id =
 repo path with `/` replaced by `-`, derivable via `cc_project_dir()` from
 `genesis.env`). Search with Grep/Read on demand. Background session transcripts
-(reflections, inbox, surplus) are in the matching `--background-sessions/` dir.
+(reflections, inbox, surplus) are stored under `~/.genesis/background-sessions/`
+(outside the repo, so CC's resume picker doesn't include them).
 
 ## Key Architecture Documents
 

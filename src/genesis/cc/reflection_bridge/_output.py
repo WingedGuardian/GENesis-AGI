@@ -96,20 +96,50 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
         if data.get("escalate_to_deep"):
             esc_reason = data.get("escalation_reason", "light CC reflection requested escalation")
             logger.info("Light CC reflection requested deep escalation: %s", esc_reason)
-            esc_hash = hashlib.sha256(esc_reason.encode()).hexdigest()
-            if not await observations.exists_by_hash(
-                db, source="awareness_loop", content_hash=esc_hash, unresolved_only=True,
-            ):
-                await observations.create(
-                    db,
-                    id=str(uuid.uuid4()),
-                    source="awareness_loop",
-                    type="light_escalation_pending",
-                    content=esc_reason,
-                    priority="high",
-                    created_at=now,
-                    content_hash=esc_hash,
-                )
+
+            # Mechanical suppression: skip non-emergency escalations if deep
+            # ran recently.  Deep reflections review ALL signals, so re-escalating
+            # persistent issues within this window is redundant noise.
+            _SUPPRESSION_HOURS = 12
+            _EMERGENCY_KEYWORDS = (
+                "critical_failure", "data_loss", "security_breach",
+                "all providers", "container memory critical",
+            )
+            esc_lower = esc_reason.lower()
+            is_emergency = any(kw in esc_lower for kw in _EMERGENCY_KEYWORDS)
+
+            suppress = False
+            if not is_emergency:
+                from genesis.db.crud import awareness_ticks
+                last_deep = await awareness_ticks.last_at_depth(db, "Deep")
+                if last_deep:
+                    try:
+                        last_deep_dt = datetime.fromisoformat(last_deep["created_at"])
+                        hours_since = (datetime.now(UTC) - last_deep_dt).total_seconds() / 3600
+                        if hours_since < _SUPPRESSION_HOURS:
+                            suppress = True
+                            logger.info(
+                                "Suppressing escalation (deep ran %.1fh ago < %dh window): %s",
+                                hours_since, _SUPPRESSION_HOURS, esc_reason[:80],
+                            )
+                    except (ValueError, TypeError):
+                        pass  # unparseable timestamp — don't suppress
+
+            if not suppress:
+                esc_hash = hashlib.sha256(esc_reason.encode()).hexdigest()
+                if not await observations.exists_by_hash(
+                    db, source="awareness_loop", content_hash=esc_hash, unresolved_only=True,
+                ):
+                    await observations.create(
+                        db,
+                        id=str(uuid.uuid4()),
+                        source="awareness_loop",
+                        type="light_escalation_pending",
+                        content=esc_reason,
+                        priority="high",
+                        created_at=now,
+                        content_hash=esc_hash,
+                    )
 
         # Confidence gate — skip delta/surplus extraction if below threshold
         if gated:

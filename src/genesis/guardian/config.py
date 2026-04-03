@@ -204,6 +204,15 @@ class GuardianConfig:
             / self.briefing.briefing_filename
         )
 
+    @property
+    def findings_path(self) -> Path:
+        """Directory for Guardian diagnosis result files on the host.
+
+        Maps to ~/.genesis/shared/findings/ inside the container via
+        the Incus shared mount.
+        """
+        return self.state_path / self.briefing.shared_subdir / "findings"
+
 
 def _env_override(config: GuardianConfig) -> GuardianConfig:
     """Apply environment variable overrides to config values."""

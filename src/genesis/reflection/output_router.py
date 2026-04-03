@@ -255,14 +255,20 @@ class OutputRouter:
                 (output.alternative_assessment or "not provided")[:100],
             )
 
-        # 1. Observations
-        for obs_text in output.observations:
+        # 1. Observations (enforce max 5 per REFLECTION_DEEP.md prompt contract)
+        _MAX_REFLECTION_OBS = 5
+        for obs_text in output.observations[:_MAX_REFLECTION_OBS]:
             if obs_text:
                 await self._write_observation(
                     db, source="deep_reflection", type="reflection_observation",
                     content=obs_text, priority="medium",
                 )
                 summary["observations_written"] += 1
+        if len(output.observations) > _MAX_REFLECTION_OBS:
+            logger.info(
+                "Capped reflection_observation at %d (had %d)",
+                _MAX_REFLECTION_OBS, len(output.observations),
+            )
 
         # 2. Learnings (also observations, tagged differently)
         for learning in output.learnings:
@@ -604,8 +610,9 @@ class OutputRouter:
             )
             return False
 
-        # Audit trail
-        await self._write_observation(
+        # Audit trail — auto-resolve so these don't inflate the unresolved
+        # backlog (no downstream code queries them in unresolved state)
+        audit_id = await self._write_observation(
             db, source="deep_reflection", type="memory_operation_executed",
             content=json.dumps({
                 "operation": op.operation,
@@ -614,6 +621,12 @@ class OutputRouter:
             }),
             priority="low",
         )
+        if audit_id:
+            now = datetime.now(UTC).isoformat()
+            await observations.resolve(
+                db, audit_id, resolved_at=now,
+                resolution_notes="Auto-resolved audit trail",
+            )
         return True
 
     async def _write_observation(

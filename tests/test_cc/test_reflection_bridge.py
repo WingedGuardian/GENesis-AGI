@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -285,7 +285,12 @@ def test_data_pointers_section_exists():
 
 async def test_strategic_enriched_path_includes_observations_and_pointers(db, mock_invoker, mock_session_mgr):
     """Strategic reflection with context_gatherer uses enriched path with observations."""
-    from genesis.reflection.types import ContextBundle, CostSummary, PendingWorkSummary, ProcedureStats
+    from genesis.reflection.types import (
+        ContextBundle,
+        CostSummary,
+        PendingWorkSummary,
+        ProcedureStats,
+    )
 
     mock_gatherer = AsyncMock()
     mock_gatherer.gather = AsyncMock(return_value=ContextBundle(
@@ -323,3 +328,123 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
     assert "Observation content here" in prompt
     assert "Available Data Sources" in prompt
     assert "Strategic" in prompt
+
+
+# ── Model downgrade response (Layer 2) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_strategic_retries_on_downgrade(db, mock_session_mgr):
+    """Strategic reflection retries once when model is downgraded."""
+    downgraded_output = CCOutput(
+        session_id="refl-1",
+        text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+        model_used="claude-sonnet-4-6",
+        cost_usd=0.02, input_tokens=500, output_tokens=200,
+        duration_ms=5000, exit_code=0,
+        model_requested="opus", downgraded=True,
+    )
+    normal_output = CCOutput(
+        session_id="refl-1",
+        text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+        model_used="claude-opus-4-6",
+        cost_usd=0.05, input_tokens=500, output_tokens=200,
+        duration_ms=8000, exit_code=0,
+        model_requested="opus", downgraded=False,
+    )
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(side_effect=[downgraded_output, normal_output])
+    bridge = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=invoker, db=db,
+    )
+    tick = TickResult(
+        tick_id="t1", timestamp="2026-04-02T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.STRATEGIC, trigger_reason="test",
+    )
+    with patch("genesis.cc.reflection_bridge._bridge.asyncio.sleep", new_callable=AsyncMock):
+        result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
+    assert result.success
+    assert invoker.run.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_strategic_proceeds_on_double_downgrade(db, mock_session_mgr):
+    """Strategic reflection completes even if retry is also downgraded."""
+    downgraded_output = CCOutput(
+        session_id="refl-1",
+        text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+        model_used="claude-sonnet-4-6",
+        cost_usd=0.02, input_tokens=500, output_tokens=200,
+        duration_ms=5000, exit_code=0,
+        model_requested="opus", downgraded=True,
+    )
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(return_value=downgraded_output)
+    bridge = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=invoker, db=db,
+    )
+    tick = TickResult(
+        tick_id="t2", timestamp="2026-04-02T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.STRATEGIC, trigger_reason="test",
+    )
+    with patch("genesis.cc.reflection_bridge._bridge.asyncio.sleep", new_callable=AsyncMock):
+        result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
+    assert result.success
+    assert invoker.run.call_count == 2  # original + 1 retry
+
+
+@pytest.mark.asyncio
+async def test_deep_no_retry_on_downgrade(db, mock_session_mgr):
+    """Deep reflection does NOT retry on downgrade."""
+    downgraded_output = CCOutput(
+        session_id="refl-1",
+        text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+        model_used="claude-haiku-4-5",
+        cost_usd=0.01, input_tokens=500, output_tokens=200,
+        duration_ms=3000, exit_code=0,
+        model_requested="sonnet", downgraded=True,
+    )
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(return_value=downgraded_output)
+    bridge = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=invoker, db=db,
+    )
+    tick = TickResult(
+        tick_id="t3", timestamp="2026-04-02T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.DEEP, trigger_reason="test",
+    )
+    result = await bridge.reflect(Depth.DEEP, tick, db=db)
+    assert result.success
+    assert invoker.run.call_count == 1  # no retry
+
+
+@pytest.mark.asyncio
+async def test_strategic_retry_failure_uses_original_output(db, mock_session_mgr):
+    """If strategic retry raises, the original downgraded output is kept."""
+    from genesis.cc.exceptions import CCTimeoutError
+
+    downgraded_output = CCOutput(
+        session_id="refl-1",
+        text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+        model_used="claude-sonnet-4-6",
+        cost_usd=0.02, input_tokens=500, output_tokens=200,
+        duration_ms=5000, exit_code=0,
+        model_requested="opus", downgraded=True,
+    )
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(side_effect=[downgraded_output, CCTimeoutError("timeout")])
+    bridge = CCReflectionBridge(
+        session_manager=mock_session_mgr, invoker=invoker, db=db,
+    )
+    tick = TickResult(
+        tick_id="t4", timestamp="2026-04-02T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.STRATEGIC, trigger_reason="test",
+    )
+    with patch("genesis.cc.reflection_bridge._bridge.asyncio.sleep", new_callable=AsyncMock):
+        result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
+    assert result.success  # original downgraded output still usable
+    assert invoker.run.call_count == 2

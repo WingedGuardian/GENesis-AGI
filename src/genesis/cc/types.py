@@ -55,6 +55,21 @@ class CCModel(StrEnum):
     OPUS = "opus"
     HAIKU = "haiku"
 
+    @staticmethod
+    def from_full_name(full_name: str) -> CCModel | None:
+        """Map a full model identifier to its CCModel tier.
+
+        Examples: "claude-opus-4-6" -> OPUS, "claude-sonnet-4-6" -> SONNET.
+        Returns None if the full name doesn't match any known tier.
+        Assumes each model name contains exactly one tier keyword (Anthropic
+        naming convention). First substring match wins.
+        """
+        lower = full_name.lower()
+        for member in CCModel:
+            if member.value in lower:
+                return member
+        return None
+
 
 class EffortLevel(StrEnum):
     LOW = "low"
@@ -83,21 +98,22 @@ class CCInvocation:
     stream_idle_timeout_ms: int | None = None
 
 
-# Directory name for background CC session isolation.  Background sessions
-# run from this subdirectory so their CC session history is stored in a
-# separate project dir, keeping ``claude --resume`` clean for the user.
-_BACKGROUND_SESSION_DIR = ".background-sessions"
+# Background CC session isolation.  Background sessions run from a
+# directory OUTSIDE the project tree so Claude Code's resume picker
+# (which prefix-matches project dirs when worktrees exist) doesn't
+# include them in the foreground session list.
+_BACKGROUND_SESSION_DIR = Path.home() / ".genesis" / "background-sessions"
 
 
 def background_session_dir() -> str:
     """Absolute path for background CC session working directory.
 
-    Creates the directory if it doesn't exist.  The path is resolved
-    relative to the project root (three parents above ``cc/types.py``).
+    Creates the directory if it doesn't exist.  Uses ``~/.genesis/``
+    (outside the repo tree) so CC's worktree-aware resume picker does
+    not match it against the main project prefix.
     """
-    d = Path(__file__).resolve().parents[3] / _BACKGROUND_SESSION_DIR
-    d.mkdir(exist_ok=True)
-    return str(d)
+    _BACKGROUND_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    return str(_BACKGROUND_SESSION_DIR)
 
 
 @dataclass(frozen=True)
@@ -112,6 +128,8 @@ class CCOutput:
     exit_code: int
     is_error: bool = False
     error_message: str | None = None
+    model_requested: str = ""
+    downgraded: bool = False
 
 
 @dataclass(frozen=True)

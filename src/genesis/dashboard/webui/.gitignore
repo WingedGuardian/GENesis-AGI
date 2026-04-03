@@ -1,0 +1,11 @@
+# Large vendored libraries — copied at install time by scripts/vendor_assets.sh
+# These are copies of third-party libraries from Agent Zero's webui/
+vendor/ace-min/
+vendor/alpine/
+vendor/google/
+
+# Base styles from AZ (copied at install time)
+index.css
+css/modals.css
+css/buttons.css
+public/favicon.svg

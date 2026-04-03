@@ -23,7 +23,7 @@ botpy.log
 .worktrees/
 .claude/worktrees/
 .claude/.session-locks/
-.background-sessions/
+# Background sessions now live at ~/.genesis/background-sessions/ (outside repo)
 data/sqlite/*.db
 data/sqlite/*.db-journal
 data/sqlite/*.db-wal
