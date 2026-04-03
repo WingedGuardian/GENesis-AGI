@@ -16,6 +16,7 @@ dependencies = [
     "html2text",
     "lxml",
     "flask>=3.0",
+    "flask-sock>=0.7",
     "fastmcp>=2.0,<3.0",  # 3.x requires mcp>=1.24 with breaking API changes
 ]
 

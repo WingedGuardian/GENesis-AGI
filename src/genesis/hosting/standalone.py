@@ -230,6 +230,14 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to register health blueprint")
 
+        # Terminal WebSocket (flask-sock)
+        try:
+            from genesis.dashboard.routes.terminal import register_terminal_ws
+
+            register_terminal_ws(app)
+        except Exception:
+            logger.exception("Failed to register terminal WebSocket")
+
         # NOTE: UI overlay blueprint (genesis_ui) is intentionally skipped.
         # It injects CSS/JS into AZ's chat UI to hide AZ-specific elements.
         # Not relevant for standalone mode — we own the entire UI.
