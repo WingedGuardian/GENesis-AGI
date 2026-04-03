@@ -294,6 +294,7 @@ class AwarenessLoop:
         self._circuit_breakers: CircuitBreakerRegistry | None = None
         self._topic_manager = None
         self._guardian_watchdog = None
+        self._credential_bridge_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
@@ -439,6 +440,13 @@ class AwarenessLoop:
                     await self._guardian_watchdog.check_and_recover()
                 except Exception:
                     logger.warning("Guardian watchdog check failed", exc_info=True)
+
+            # Propagate Telegram credentials to shared mount for Guardian
+            if self._credential_bridge_fn:
+                try:
+                    self._credential_bridge_fn()
+                except Exception:
+                    logger.error("Credential bridge write failed", exc_info=True)
 
         if result is None:
             return
@@ -681,6 +689,10 @@ class AwarenessLoop:
     def set_guardian_watchdog(self, watchdog) -> None:
         """Inject Guardian watchdog for bidirectional host monitoring."""
         self._guardian_watchdog = watchdog
+
+    def set_credential_bridge(self, fn) -> None:
+        """Inject credential bridge for Telegram credential propagation."""
+        self._credential_bridge_fn = fn
 
     def replace_collectors(self, collectors: list) -> None:
         """Replace signal collectors (late-binding upgrade from stubs to real)."""

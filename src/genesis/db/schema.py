@@ -1368,6 +1368,125 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE cc_sessions ADD COLUMN keywords TEXT DEFAULT ''",
         "cc_sessions.keywords")
 
+    # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
+    # New memories write metadata at store time, but pre-existing memories
+    # lack rows. Without backfill, the "recent" dashboard view is empty.
+    await _migrate_backfill_memory_metadata(db)
+
+
+async def _migrate_backfill_memory_metadata(db: aiosqlite.Connection) -> None:
+    """Backfill memory_metadata for memories that predate the table.
+
+    Data sources (in priority order):
+    1. Qdrant point payload — has created_at, confidence, known collection
+    2. pending_embeddings — has created_at for FTS5-only memories
+    3. Epoch fallback — for memories with no Qdrant point or pending record
+
+    Idempotent: uses INSERT OR IGNORE on memory_id PRIMARY KEY.
+    Resilient: skips gracefully if Qdrant is unreachable.
+    """
+    # Check if backfill is needed
+    try:
+        cursor = await db.execute("SELECT COUNT(*) FROM memory_metadata")
+        meta_count = (await cursor.fetchone())[0]
+        cursor = await db.execute("SELECT COUNT(*) FROM memory_fts")
+        fts_count = (await cursor.fetchone())[0]
+        if meta_count >= fts_count or fts_count == 0:
+            return  # Already backfilled or nothing to backfill
+    except Exception:
+        logger.warning("memory_metadata backfill: count check failed, skipping", exc_info=True)
+        return
+
+    # Get all FTS5 memory_ids that lack metadata
+    try:
+        cursor = await db.execute("""
+            SELECT f.memory_id, f.collection
+            FROM memory_fts f
+            LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id
+            WHERE m.memory_id IS NULL
+        """)
+        missing = await cursor.fetchall()
+    except Exception:
+        logger.warning("memory_metadata backfill: missing-row query failed, skipping", exc_info=True)
+        return
+
+    if not missing:
+        return
+
+    # Try Qdrant for timestamps + confidence (best source)
+    qdrant_data: dict[str, dict] = {}
+    try:
+        from genesis.qdrant.collections import get_client, scroll_points
+
+        client = get_client()
+        for coll in ("episodic_memory", "knowledge_base"):
+            offset = None
+            while True:
+                points, offset = scroll_points(
+                    client, collection=coll, limit=500, offset=offset,
+                )
+                for p in points:
+                    qdrant_data[p["id"]] = {
+                        "created_at": p["payload"].get(
+                            "created_at", "1970-01-01T00:00:00+00:00"
+                        ),
+                        "confidence": p["payload"].get("confidence"),
+                        "collection": coll,
+                    }
+                if offset is None:
+                    break
+    except Exception:
+        logger.warning(
+            "memory_metadata backfill: Qdrant unavailable, using fallback timestamps",
+            exc_info=True,
+        )
+
+    # Pending embeddings fallback timestamps
+    pending_ts: dict[str, str] = {}
+    try:
+        cursor = await db.execute("SELECT memory_id, created_at FROM pending_embeddings")
+        for row in await cursor.fetchall():
+            pending_ts[row[0]] = row[1]
+    except Exception:
+        logger.debug("pending_embeddings lookup skipped (table may not exist yet)", exc_info=True)
+
+    # Insert metadata rows
+    inserted = 0
+    for memory_id, fts_collection in missing:
+        if memory_id in qdrant_data:
+            d = qdrant_data[memory_id]
+            created_at = d["created_at"]
+            collection = d["collection"]
+            confidence = d["confidence"]
+            status = "embedded"
+        elif memory_id in pending_ts:
+            created_at = pending_ts[memory_id]
+            collection = fts_collection or "episodic_memory"
+            confidence = None
+            status = "pending"
+        else:
+            created_at = "1970-01-01T00:00:00+00:00"
+            collection = fts_collection or "episodic_memory"
+            confidence = None
+            status = "fts5_only"
+
+        await db.execute(
+            "INSERT OR IGNORE INTO memory_metadata "
+            "(memory_id, created_at, collection, confidence, embedding_status) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (memory_id, created_at, collection, confidence, status),
+        )
+        inserted += 1
+
+    await db.commit()
+    logger.info(
+        "Backfilled %d memory_metadata rows (%d from Qdrant, %d from pending, %d epoch fallback)",
+        inserted,
+        sum(1 for mid, _ in missing if mid in qdrant_data),
+        sum(1 for mid, _ in missing if mid not in qdrant_data and mid in pending_ts),
+        sum(1 for mid, _ in missing if mid not in qdrant_data and mid not in pending_ts),
+    )
+
 
 async def seed_data(db: aiosqlite.Connection) -> None:
     """Insert initial seed data (signal weights, drive weights)."""

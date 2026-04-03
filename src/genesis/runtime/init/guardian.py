@@ -66,6 +66,11 @@ async def init_guardian_monitoring(rt) -> None:
             "Guardian bidirectional monitoring enabled (host=%s@%s)",
             host_user, host_ip,
         )
+
+        # Propagate Telegram credentials to shared mount for Guardian
+        from genesis.guardian.credential_bridge import propagate_telegram_credentials
+        rt._awareness_loop.set_credential_bridge(propagate_telegram_credentials)
+        logger.info("Telegram credential bridge wired to awareness loop")
     else:
         logger.warning(
             "Awareness loop not available — Guardian watchdog not wired",

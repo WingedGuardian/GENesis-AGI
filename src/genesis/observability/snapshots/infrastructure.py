@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from datetime import UTC, datetime
@@ -47,7 +48,7 @@ def _collect_cpu_usage() -> dict:
 
         if _last_cpu_reading is None:
             _last_cpu_reading = (idle, total, now)
-            return {"status": "healthy", "used_pct": None}
+            return {"status": "healthy", "used_pct": None, "count": os.cpu_count()}
 
         prev_idle, prev_total, _prev_time = _last_cpu_reading
         _last_cpu_reading = (idle, total, now)
@@ -55,12 +56,12 @@ def _collect_cpu_usage() -> dict:
         delta_idle = idle - prev_idle
         delta_total = total - prev_total
         if delta_total == 0:
-            return {"status": "healthy", "used_pct": 0.0}
+            return {"status": "healthy", "used_pct": 0.0, "count": os.cpu_count()}
 
         used_pct = round((1.0 - delta_idle / delta_total) * 100, 1)
-        return {"status": "healthy", "used_pct": used_pct}
+        return {"status": "healthy", "used_pct": used_pct, "count": os.cpu_count()}
     except (OSError, ValueError, IndexError):
-        return {"status": "unavailable", "used_pct": None}
+        return {"status": "unavailable", "used_pct": None, "count": os.cpu_count()}
 
 
 async def infrastructure(

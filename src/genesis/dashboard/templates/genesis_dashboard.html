@@ -21,7 +21,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, internals: false, sessions: false, config: false, terminal: false, files: false, tasks: false, memory: false, backup: false, resources: false },
+        _tabInitialized: { overview: false, internals: false, sessions: false, config: false, terminal: false, files: false, tasks: false, memory: false, backup: false },
 
         // State
         health: {},
@@ -149,9 +149,6 @@
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
 
-        // ── Resources tab state ───────────────────────────────────
-        systemResources: null,
-
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
           activity: { state: "idle", lastSuccess: null, error: null },
@@ -194,12 +191,11 @@
           tasks:     ["_tasksInterval"],
           memory:    [],
           backup:    [],
-          resources: ["_resourcesInterval"],
         },
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "internals", "sessions", "config", "terminal", "files", "tasks", "memory", "backup", "resources"];
+          const valid = ["overview", "internals", "sessions", "config", "terminal", "files", "tasks", "memory", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -260,10 +256,6 @@
               break;
             case "backup":
               if (first) { this.fetchBackupStatus(); }
-              break;
-            case "resources":
-              if (first) { this.fetchResources(); }
-              this._resourcesInterval = setInterval(() => this.fetchResources(), 10000);
               break;
           }
         },
@@ -663,14 +655,6 @@
             if (resp && resp.ok) { alert("Backup triggered"); setTimeout(() => this.fetchBackupStatus(), 5000); }
             else { alert("Trigger failed"); }
           } catch (e) { alert("Trigger failed: " + e.message); }
-        },
-
-        // ── Resources tab fetches ────────────────────────────────
-        async fetchResources() {
-          try {
-            const resp = await fetchApi("/api/genesis/resources");
-            if (resp && resp.ok) { this.systemResources = await resp.json(); }
-          } catch (e) { console.warn("Resources failed:", e); }
         },
 
         async fetchRoutingConfig() {
@@ -1375,18 +1359,37 @@
           return { state: "healthy", reason: `${hostLabel}bridge and watchdog services are active` };
         },
 
-        containerMemorySemantic() {
-          const memory = this.health.infrastructure?.container_memory;
-          if (!memory || ["unknown", "unavailable"].includes(memory.status)) {
-            return { state: "unknown", reason: "container memory data unavailable" };
+        containerSemantic() {
+          const mem = this.health.infrastructure?.container_memory;
+          const disk = this.health.infrastructure?.disk;
+          const stateRank = { error: 3, degraded: 2, unknown: 1, healthy: 0 };
+
+          // Memory assessment (primary — OOM kills)
+          let memState = "healthy", memReason = "container resources within safe limits";
+          if (!mem || ["unknown", "unavailable"].includes(mem.status)) {
+            memState = "unknown"; memReason = "container memory data unavailable";
+          } else if (mem.used_pct > 85 || mem.status === "down") {
+            memState = "error"; memReason = "memory in danger zone (" + mem.used_pct.toFixed(0) + "%)";
+          } else if (mem.used_pct > 75 || mem.status === "degraded") {
+            memState = "degraded"; memReason = "memory usage elevated (" + mem.used_pct.toFixed(0) + "%)";
           }
-          if (memory.used_pct > 85 || memory.status === "down") {
-            return { state: "error", reason: "container memory is in the danger zone" };
+
+          // Disk assessment (secondary — write failures)
+          let diskState = "healthy", diskReason = "";
+          if (disk && disk.free_pct != null) {
+            const usedPct = 100 - disk.free_pct;
+            if (usedPct > 90) {
+              diskState = "error"; diskReason = "disk critically full (" + usedPct.toFixed(0) + "%)";
+            } else if (usedPct > 85) {
+              diskState = "degraded"; diskReason = "disk usage high (" + usedPct.toFixed(0) + "%)";
+            }
           }
-          if (memory.used_pct > 75 || memory.status === "degraded") {
-            return { state: "degraded", reason: "container memory usage is elevated" };
+
+          // Worst-of-two — disk or memory, whichever is worse
+          if ((stateRank[diskState] || 0) > (stateRank[memState] || 0)) {
+            return { state: diskState, reason: diskReason };
           }
-          return { state: "healthy", reason: "container memory usage is within safe limits" };
+          return { state: memState, reason: memReason };
         },
 
         awarenessSemantic() {
@@ -2364,8 +2367,6 @@
               @click="location.hash = 'memory'">Memory</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
               @click="location.hash = 'backup'">Backup</button>
-      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'resources' }"
-              @click="location.hash = 'resources'">Resources</button>
     </nav>
 
     <!-- Panel 1: System Health [Tab: overview] -->
@@ -2787,29 +2788,76 @@
             <div class="health-card-reason" x-text="$store.genesisDashboard.servicesSemantic().reason"></div>
           </div>
 
-          <!-- Container Memory -->
-          <div class="health-card" title="Container cgroup memory usage. >85% = danger zone (OOM watchdog triggers).">
+          <!-- Container Resources (memory + CPU + disk) -->
+          <div class="health-card" title="Container resource usage. Memory >85% = OOM danger zone. Disk >90% = write failures.">
             <div class="health-card-header">
-              <div class="health-card-title">Container Memory</div>
+              <div class="health-card-title">Container</div>
               <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.containerMemorySemantic().state)}`"
-                    x-text="$store.genesisDashboard.containerMemorySemantic().state"></span>
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.containerSemantic().state)}`"
+                    x-text="$store.genesisDashboard.containerSemantic().state"></span>
             </div>
-            <div class="health-card-value">
+            <div class="health-card-value" style="display:flex; flex-direction:column; gap:0.35rem;">
+              <!-- Memory row -->
               <template x-if="$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct != null">
-                <div>
-                  <span :style="`color: ${$store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50'}`"
-                        x-text="$store.genesisDashboard.health.infrastructure.container_memory.used_pct.toFixed(1) + '%'"></span>
-                  <div class="health-card-detail"
-                       x-text="$store.genesisDashboard.health.infrastructure.container_memory.current_gb?.toFixed(1) + ' / ' + $store.genesisDashboard.health.infrastructure.container_memory.limit_gb?.toFixed(1) + ' GB'"></div>
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">Memory</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${$store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="$store.genesisDashboard.health.infrastructure.container_memory.used_pct.toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + $store.genesisDashboard.health.infrastructure.container_memory.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="$store.genesisDashboard.health.infrastructure.container_memory.current_gb?.toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.container_memory.limit_gb?.toFixed(0) + ' GB'"></span>
                 </div>
               </template>
-              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct">
-                <span style="color: #666; font-size: 0.82rem"
-                      x-text="$store.genesisDashboard.health.infrastructure?.container_memory?.status || 'no data'"></span>
+              <!-- CPU row -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.cpu">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">CPU</span>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct != null">
+                    <span style="width:3rem; text-align:right; font-weight:600;"
+                          :style="`color: ${$store.genesisDashboard.health.infrastructure.cpu.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.cpu.used_pct > 60 ? '#f0ad4e' : '#4caf50'}`"
+                          x-text="$store.genesisDashboard.health.infrastructure.cpu.used_pct.toFixed(0) + '%'"></span>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct == null">
+                    <span style="width:3rem; text-align:right; font-size:0.7rem; color:var(--color-text-secondary);">—</span>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct != null">
+                    <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                      <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                           :style="'width:' + $store.genesisDashboard.health.infrastructure.cpu.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.cpu.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.cpu.used_pct > 60 ? '#f0ad4e' : '#4caf50')"></div>
+                    </div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct == null">
+                    <div style="flex:1;"></div>
+                  </template>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="($store.genesisDashboard.health.infrastructure.cpu.count || '?') + ' vCPUs'"></span>
+                </div>
+              </template>
+              <!-- Disk row -->
+              <template x-if="$store.genesisDashboard.health.infrastructure?.disk?.free_pct != null">
+                <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
+                  <span style="width:3.2rem; color:var(--color-text-secondary);">Disk</span>
+                  <span style="width:3rem; text-align:right; font-weight:600;"
+                        :style="`color: ${(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50'}`"
+                        x-text="(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct).toFixed(0) + '%'"></span>
+                  <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                    <div style="height:100%; border-radius:3px; transition:width 0.3s;"
+                         :style="'width:' + (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) + '%; background:' + ((100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50')"></div>
+                  </div>
+                  <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
+                        x-text="($store.genesisDashboard.health.infrastructure.disk.total_gb - $store.genesisDashboard.health.infrastructure.disk.free_gb).toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.disk.total_gb.toFixed(0) + ' GB'"></span>
+                </div>
+              </template>
+              <!-- Fallback when no data -->
+              <template x-if="!$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct && !$store.genesisDashboard.health.infrastructure?.cpu && !$store.genesisDashboard.health.infrastructure?.disk">
+                <span style="color: #666; font-size: 0.82rem;">no data</span>
               </template>
             </div>
-            <div class="health-card-reason" x-text="$store.genesisDashboard.containerMemorySemantic().reason"></div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.containerSemantic().reason"></div>
           </div>
 
           <!-- Awareness Loop -->
@@ -5297,77 +5345,6 @@
                         :style="$store.genesisDashboard.backupStatus.configured ? 'color:#81c784' : 'color:#ef9a9a'"></span>
                 </div>
               </div>
-            </div>
-          </div>
-        </template>
-      </div>
-    </div>
-
-    <!-- ═══════════════════════════════════════════════════════════
-         Panel: System Resources [Tab: resources]
-         ═══════════════════════════════════════════════════════════ -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'resources'">
-      <div class="panel-header">
-        <span class="material-symbols-outlined">monitoring</span>
-        System Resources
-      </div>
-      <div class="panel-body">
-        <template x-if="!$store.genesisDashboard.systemResources">
-          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
-        </template>
-        <template x-if="$store.genesisDashboard.systemResources">
-          <div style="display:flex; gap:1rem; flex-wrap:wrap;">
-            <!-- CPU -->
-            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
-              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">CPU</div>
-              <template x-if="$store.genesisDashboard.systemResources.cpu && $store.genesisDashboard.systemResources.cpu.used_pct != null">
-                <div>
-                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.cpu.used_pct + '%'"></div>
-                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
-                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
-                         :style="'width:' + $store.genesisDashboard.systemResources.cpu.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.cpu.used_pct > 85 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.cpu.used_pct > 60 ? '#fff176' : '#81c784'))"></div>
-                  </div>
-                </div>
-              </template>
-              <template x-if="!$store.genesisDashboard.systemResources.cpu || $store.genesisDashboard.systemResources.cpu.used_pct == null">
-                <div style="font-size:1.2rem; color:var(--color-text-secondary);">Sampling...</div>
-              </template>
-            </div>
-            <!-- Memory -->
-            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
-              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Memory</div>
-              <template x-if="$store.genesisDashboard.systemResources.memory && $store.genesisDashboard.systemResources.memory.used_pct != null">
-                <div>
-                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.memory.used_pct + '%'"></div>
-                  <div style="font-size:0.75rem; color:var(--color-text-secondary);"
-                       x-text="$store.genesisDashboard.systemResources.memory.used_gb + ' / ' + $store.genesisDashboard.systemResources.memory.total_gb + ' GB'"></div>
-                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
-                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
-                         :style="'width:' + $store.genesisDashboard.systemResources.memory.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.memory.used_pct > 90 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.memory.used_pct > 70 ? '#fff176' : '#81c784'))"></div>
-                  </div>
-                </div>
-              </template>
-              <template x-if="!$store.genesisDashboard.systemResources.memory || $store.genesisDashboard.systemResources.memory.used_pct == null">
-                <div style="color:var(--color-text-secondary);">Unavailable</div>
-              </template>
-            </div>
-            <!-- Disk -->
-            <div class="card" style="flex:1; min-width:200px; padding:1rem;">
-              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-bottom:0.5rem;">Disk</div>
-              <template x-if="$store.genesisDashboard.systemResources.disk && $store.genesisDashboard.systemResources.disk.used_pct != null">
-                <div>
-                  <div style="font-size:2rem; font-weight:600;" x-text="$store.genesisDashboard.systemResources.disk.used_pct + '%'"></div>
-                  <div style="font-size:0.75rem; color:var(--color-text-secondary);"
-                       x-text="$store.genesisDashboard.systemResources.disk.used_gb + ' / ' + $store.genesisDashboard.systemResources.disk.total_gb + ' GB'"></div>
-                  <div style="height:8px; background:var(--color-bg-tertiary); border-radius:4px; margin-top:0.5rem;">
-                    <div style="height:100%; border-radius:4px; transition:width 0.3s;"
-                         :style="'width:' + $store.genesisDashboard.systemResources.disk.used_pct + '%; background:' + ($store.genesisDashboard.systemResources.disk.used_pct > 85 ? '#ef9a9a' : ($store.genesisDashboard.systemResources.disk.used_pct > 70 ? '#fff176' : '#81c784'))"></div>
-                  </div>
-                </div>
-              </template>
-              <template x-if="!$store.genesisDashboard.systemResources.disk || $store.genesisDashboard.systemResources.disk.used_pct == null">
-                <div style="color:var(--color-text-secondary);">Unavailable</div>
-              </template>
             </div>
           </div>
         </template>
