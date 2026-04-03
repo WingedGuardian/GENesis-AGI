@@ -83,6 +83,18 @@ class GenesisBootstrap(Extension):
         except Exception:
             logger.exception("Failed to register dashboard blueprint")
 
+        # Register terminal WebSocket (flask-sock)
+        # NOTE: In AZ mode, Flask runs inside WSGIMiddleware under Starlette.
+        # flask-sock's WebSocket upgrade may not work through the ASGI/WSGI
+        # bridge. If this fails at runtime, a Starlette-level handler is needed.
+        try:
+            if webapp is not None:
+                from genesis.dashboard.routes.terminal import register_terminal_ws
+
+                register_terminal_ws(webapp)
+        except Exception:
+            logger.exception("Failed to register terminal WebSocket")
+
         # Register Genesis UI overlay blueprint
         try:
             if webapp is not None:

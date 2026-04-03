@@ -49,15 +49,29 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         if [ -d "$INSTALL_DIR/.git" ]; then
             cd "$INSTALL_DIR"
             OLD=$(git rev-parse --short HEAD 2>/dev/null)
-            # Stash local config changes (e.g., container_ip set by installer)
-            # so git pull never fails due to host-specific edits
+            # Discard CLAUDE.md before pull — it's a generated file that the
+            # repo's version would overwrite with the wrong content (container
+            # dev instructions vs Guardian diagnostic instructions). We
+            # regenerate it from config/guardian-claude.md after every pull.
+            git checkout -- CLAUDE.md 2>/dev/null || true
+            # Stash remaining local config changes (container_ip, etc.)
             STASHED=0
             if ! git diff --quiet 2>/dev/null; then
                 git stash --quiet 2>/dev/null && STASHED=1
             fi
             if git pull --ff-only 2>/dev/null; then
-                # Restore local config changes over pulled code
-                [ "$STASHED" -eq 1 ] && git stash pop --quiet 2>/dev/null || true
+                # Restore local config changes
+                if [ "$STASHED" -eq 1 ]; then
+                    if ! git stash pop --quiet 2>/dev/null; then
+                        # Conflict — drop the stash and warn (config can be re-set)
+                        git checkout -- . 2>/dev/null || true
+                        git stash drop --quiet 2>/dev/null || true
+                    fi
+                fi
+                # Regenerate Guardian CLAUDE.md from template (never use repo version)
+                if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
+                    cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+                fi
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
                 printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
             else
