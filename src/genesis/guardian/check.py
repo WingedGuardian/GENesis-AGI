@@ -60,18 +60,35 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
 
     token = config.alert.telegram_bot_token
     chat_id = config.alert.telegram_chat_id
+    thread_id = config.alert.telegram_thread_id
 
-    # Try secrets file if not in config
+    # Try shared mount credentials (auto-propagated from container)
+    # Treat each source as atomic — all-or-nothing, never mix sources
+    if not token or not chat_id:
+        from genesis.guardian.credential_bridge import load_telegram_credentials
+        creds = load_telegram_credentials(config.state_dir)
+        bridge_token = creds.get("TELEGRAM_BOT_TOKEN", "")
+        bridge_chat = creds.get("TELEGRAM_CHAT_ID", "")
+        if bridge_token and bridge_chat:
+            token = bridge_token
+            chat_id = bridge_chat
+            thread_id = thread_id or creds.get("TELEGRAM_THREAD_ID", "")
+
+    # Legacy fallback: local secrets.env copy (from pre-bridge installs)
     if not token or not chat_id:
         secrets = load_secrets()
-        token = token or secrets.get("TELEGRAM_BOT_TOKEN", "")
-        chat_id = chat_id or secrets.get("TELEGRAM_CHAT_ID", "")
+        legacy_token = secrets.get("TELEGRAM_BOT_TOKEN", "")
+        legacy_chat = secrets.get("TELEGRAM_CHAT_ID", "")
+        if legacy_token and legacy_chat:
+            token = legacy_token
+            chat_id = legacy_chat
+            thread_id = thread_id or secrets.get("TELEGRAM_THREAD_ID", "")
 
     if token and chat_id:
         dispatcher.add_channel(TelegramAlertChannel(
             bot_token=token,
             chat_id=chat_id,
-            thread_id=config.alert.telegram_thread_id or None,
+            thread_id=thread_id or None,
         ))
     else:
         logger.warning("No Telegram credentials — alerts will only go to journal")

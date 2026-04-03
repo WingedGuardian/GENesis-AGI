@@ -322,8 +322,12 @@ def load_secrets(path: Path | None = None) -> dict[str, str]:
             continue
         if "=" in line:
             key, _, value = line.partition("=")
+            key = key.strip()
+            # Handle 'export KEY=value' syntax
+            if key.startswith("export "):
+                key = key[7:].strip()
             # Strip optional quotes
             value = value.strip().strip("'\"")
-            secrets[key.strip()] = value
+            secrets[key] = value
 
     return secrets

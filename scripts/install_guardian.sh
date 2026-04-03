@@ -274,22 +274,41 @@ else
     echo "  Set approval.bind_host in guardian.yaml to a reachable IP"
 fi
 
-# ── Step 6: Copy secrets from container ───────────────────────────────
+# ── Step 6: Telegram credential bridge ────────────────────────────────
+#
+# Telegram credentials are auto-propagated from the container via the shared
+# Incus mount. The container's awareness loop extracts ONLY the Telegram keys
+# from secrets.env and writes them to shared/guardian/telegram_creds.env.
+# Guardian reads from there. The full secrets file never leaves the container.
 
 echo ""
-echo "[6/13] Copying secrets..."
+echo "[6/13] Telegram credential bridge..."
 
-SECRETS_FILE="$INSTALL_DIR/secrets.env"
-if [ ! -f "$SECRETS_FILE" ]; then
-    if incus file pull "$CONTAINER_NAME$CONTAINER_HOME/genesis/secrets.env" "$SECRETS_FILE" 2>/dev/null; then
-        chmod 600 "$SECRETS_FILE"
-        echo "  Copied secrets.env from container"
+CREDS_FILE="$STATE_DIR/shared/guardian/telegram_creds.env"
+if [ -f "$CREDS_FILE" ]; then
+    echo "  Telegram credentials found on shared mount: $CREDS_FILE"
+    if grep -q "TELEGRAM_BOT_TOKEN" "$CREDS_FILE" 2>/dev/null; then
+        echo "  Bot token present — Telegram alerts should work"
     else
-        echo "  WARNING: Could not copy secrets.env — Telegram alerts won't work"
-        echo "  Create $SECRETS_FILE with TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID"
+        echo "  WARNING: Credential file exists but has no bot token"
     fi
 else
-    echo "  secrets.env already exists"
+    echo "  Telegram credentials not yet on shared mount."
+    echo "  They auto-propagate from the container within 5 minutes."
+    echo ""
+    echo "  To set up Telegram alerts:"
+    echo "    1. Create a bot via @BotFather on Telegram"
+    echo "    2. Add to container secrets: incus exec $CONTAINER_NAME -- nano ~/genesis/secrets.env"
+    echo "       TELEGRAM_BOT_TOKEN=<your bot token>"
+    echo "       TELEGRAM_FORUM_CHAT_ID=<your chat/group ID>"
+    echo "    3. Credentials propagate to Guardian on the next awareness tick (~5 min)"
+fi
+
+# Keep legacy secrets.env for backward compatibility if it exists
+LEGACY_SECRETS="$INSTALL_DIR/secrets.env"
+if [ -f "$LEGACY_SECRETS" ]; then
+    echo "  NOTE: Legacy secrets.env found at $LEGACY_SECRETS"
+    echo "  Shared mount credentials take priority when available."
 fi
 
 # ── Step 7: Generate CLAUDE.md for diagnostic CC ──────────────────────
@@ -555,7 +574,6 @@ echo ""
 echo "  Running initial health check..."
 PYTHONPATH="$INSTALL_DIR/src" \
     GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
-    GUARDIAN_SECRETS="$INSTALL_DIR/secrets.env" \
     "$VENV_DIR/bin/python" -m genesis.guardian --check-only 2>&1 | head -20 || \
     echo "  WARNING: Initial check produced errors (may need container to be fully up)"
 
