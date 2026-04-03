@@ -37,7 +37,7 @@ class TestCheckAndRecover:
     @pytest.mark.asyncio
     async def test_healthy_no_action(self, watchdog, remote):
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.HEALTHY),
         ):
             await watchdog.check_and_recover()
@@ -46,7 +46,7 @@ class TestCheckAndRecover:
     @pytest.mark.asyncio
     async def test_degraded_no_action(self, watchdog, remote):
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.DEGRADED, staleness_s=200),
         ):
             await watchdog.check_and_recover()
@@ -55,7 +55,7 @@ class TestCheckAndRecover:
     @pytest.mark.asyncio
     async def test_down_triggers_restart(self, watchdog, remote):
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.DOWN, staleness_s=600),
         ):
             await watchdog.check_and_recover()
@@ -64,7 +64,7 @@ class TestCheckAndRecover:
     @pytest.mark.asyncio
     async def test_cooldown_prevents_second_restart(self, watchdog, remote):
         probe_down = _make_probe_result(ProbeStatus.DOWN, staleness_s=600)
-        with patch("genesis.guardian.watchdog.probe_guardian", return_value=probe_down):
+        with patch("genesis.observability.health.probe_guardian", return_value=probe_down):
             await watchdog.check_and_recover()  # First — triggers restart
             await watchdog.check_and_recover()  # Second — should be in cooldown
         assert remote.restart.call_count == 1
@@ -72,7 +72,7 @@ class TestCheckAndRecover:
     @pytest.mark.asyncio
     async def test_cooldown_expires(self, watchdog, remote):
         probe_down = _make_probe_result(ProbeStatus.DOWN, staleness_s=600)
-        with patch("genesis.guardian.watchdog.probe_guardian", return_value=probe_down):
+        with patch("genesis.observability.health.probe_guardian", return_value=probe_down):
             await watchdog.check_and_recover()
             # Simulate cooldown expiry
             watchdog._last_recovery_at = datetime.now(UTC) - timedelta(
@@ -85,7 +85,7 @@ class TestCheckAndRecover:
     async def test_restart_failure_still_sets_cooldown(self, watchdog, remote):
         remote.restart.return_value = False
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.DOWN, staleness_s=600),
         ):
             await watchdog.check_and_recover()
@@ -100,7 +100,7 @@ class TestEventEmission:
         remote.restart.return_value = True
         wd = GuardianWatchdog(remote, event_bus=event_bus)
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.DOWN, staleness_s=600),
         ):
             await wd.check_and_recover()
@@ -115,7 +115,7 @@ class TestEventEmission:
         remote.restart.return_value = False
         wd = GuardianWatchdog(remote, event_bus=event_bus)
         with patch(
-            "genesis.guardian.watchdog.probe_guardian",
+            "genesis.observability.health.probe_guardian",
             return_value=_make_probe_result(ProbeStatus.DOWN, staleness_s=600),
         ):
             await wd.check_and_recover()

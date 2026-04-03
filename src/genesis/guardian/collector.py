@@ -1,4 +1,4 @@
-"""Diagnostic data collector — gathers system metrics for CC diagnosis.
+"""Diagnostic data collector — HOST-SIDE. Gathers system metrics for CC diagnosis.
 
 Implements the design doc's diagnostic checklist. Collects ALL metrics into a
 DiagnosticSnapshot before any LLM reasoning. Each collector runs independently

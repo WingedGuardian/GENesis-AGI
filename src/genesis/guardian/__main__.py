@@ -1,4 +1,4 @@
-"""Guardian entry point — invoked by systemd timer.
+"""Guardian entry point — HOST-SIDE. Invoked by systemd timer.
 
 Usage:
     python -m genesis.guardian              # run a single check cycle

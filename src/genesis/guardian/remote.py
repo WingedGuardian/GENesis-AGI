@@ -1,4 +1,4 @@
-"""GuardianRemote — guardrailed SSH interface to host VM Guardian.
+"""GuardianRemote — CONTAINER-SIDE. Guardrailed SSH interface to host VM Guardian.
 
 # GROUNDWORK(guardian-bidirectional): Container↔Host monitoring link
 

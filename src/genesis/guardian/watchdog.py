@@ -1,4 +1,4 @@
-"""GuardianWatchdog — monitors Guardian health from inside the container.
+"""GuardianWatchdog — CONTAINER-SIDE. Monitors Guardian health from inside the container.
 
 Called every awareness tick (5 min). Reads the Guardian heartbeat file,
 triggers SSH recovery if stale, and escalates via Telegram if recovery fails.
@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-
-from genesis.observability.health import ProbeStatus, probe_guardian
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +48,8 @@ class GuardianWatchdog:
         Called from the awareness loop tick. Safe to call frequently —
         returns immediately if Guardian is healthy or cooldown is active.
         """
+        from genesis.observability.health import ProbeStatus, probe_guardian
+
         result = await probe_guardian(guardian_remote=self._remote)
 
         if result.status != ProbeStatus.DOWN:

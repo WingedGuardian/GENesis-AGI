@@ -1,4 +1,4 @@
-"""Guardian configuration — YAML loader with env var overrides."""
+"""Guardian configuration — BOTH SIDES. YAML loader with env var overrides."""
 
 from __future__ import annotations
 

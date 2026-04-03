@@ -12,9 +12,6 @@
   <link rel="stylesheet" href="/vendor/google/google-icons.css">
   <link href="/vendor/ace-min/ace.min.css" rel="stylesheet">
   <script src="/vendor/ace-min/ace.js"></script>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
   <script type="module" src="/js/initFw.js"></script>
 
   <script type="module">
@@ -119,11 +116,7 @@
         error: null,
 
         // ── Chat terminal state ───────────────────────────────────
-        terminalConnected: false,
-        _ws: null,
-        _xterm: null,
-        _fitAddon: null,
-        _resizeObserver: null,
+        _terminalWindow: null,
 
         // ── Files tab state ────────────────────────────────────────
         fileBrowser: {
@@ -316,7 +309,7 @@
           for (const tab of ["overview", "internals", "sessions", "config"]) {
             this._stopTabIntervals(tab);
           }
-          this.disconnectTerminal();
+          // Terminal runs in its own window — no cleanup needed here
         },
 
         // Fetch methods
@@ -503,77 +496,13 @@
           }
         },
 
-        // ── Chat terminal (xterm.js + WebSocket) ──────────────────
-        connectTerminal() {
-          // Clean up any existing session before reconnecting
-          this.disconnectTerminal();
-          const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-          const wsUrl = `${proto}//${window.location.host}/ws/terminal`;
-          const ws = new WebSocket(wsUrl);
-          ws.binaryType = "arraybuffer";
-
-          const term = new Terminal({
-            cursorBlink: true,
-            fontSize: 14,
-            fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace",
-            theme: { background: "#1a1a2e", foreground: "#e0e0e0", cursor: "#66bb6a" },
-          });
-          const fit = new FitAddon.FitAddon();
-          term.loadAddon(fit);
-
-          const container = document.getElementById("terminal-container");
-          term.open(container);
-          fit.fit();
-
-          ws.onopen = () => {
-            this.terminalConnected = true;
-            const dims = fit.proposeDimensions();
-            if (dims) ws.send(JSON.stringify({ resize: { rows: dims.rows, cols: dims.cols } }));
-          };
-
-          ws.onmessage = (evt) => {
-            if (evt.data instanceof ArrayBuffer) {
-              term.write(new Uint8Array(evt.data));
-            } else {
-              term.write(evt.data);
-            }
-          };
-
-          ws.onclose = () => {
-            this.terminalConnected = false;
-            if (this._xterm) this._xterm.write("\r\n\x1b[90m[Connection closed]\x1b[0m\r\n");
-          };
-
-          ws.onerror = () => {
-            this.terminalConnected = false;
-          };
-
-          term.onData((data) => {
-            if (ws.readyState === WebSocket.OPEN) ws.send(data);
-          });
-
-          term.onResize(({ rows, cols }) => {
-            if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ resize: { rows, cols } }));
-            }
-          });
-
-          this._resizeObserver = new ResizeObserver(() => {
-            if (this._fitAddon) this._fitAddon.fit();
-          });
-          this._resizeObserver.observe(container);
-
-          this._ws = ws;
-          this._xterm = term;
-          this._fitAddon = fit;
-        },
-
-        disconnectTerminal() {
-          if (this._resizeObserver) { this._resizeObserver.disconnect(); this._resizeObserver = null; }
-          if (this._ws) { this._ws.close(); this._ws = null; }
-          if (this._xterm) { this._xterm.dispose(); this._xterm = null; }
-          this._fitAddon = null;
-          this.terminalConnected = false;
+        // ── Chat terminal (opens in new window) ─────────────────
+        openTerminal() {
+          if (this._terminalWindow && !this._terminalWindow.closed) {
+            this._terminalWindow.focus();
+            return;
+          }
+          this._terminalWindow = window.open("/genesis/terminal", "genesis-terminal");
         },
 
         // ── Files tab fetches ─────────────────────────────────────
@@ -5204,36 +5133,21 @@
       <div class="panel-header">
         <span class="material-symbols-outlined">terminal</span>
         Genesis / Claude Code Terminal
-        <span class="panel-status">
-          <span class="status-dot"
-                :style="`background:${$store.genesisDashboard.terminalConnected ? '#66bb6a' : '#9e9e9e'}`"></span>
-          <span x-text="$store.genesisDashboard.terminalConnected ? 'connected' : 'disconnected'"></span>
-        </span>
       </div>
-      <div class="panel-body" style="padding:0;">
-        <!-- Disconnected state -->
-        <template x-if="!$store.genesisDashboard.terminalConnected">
-          <div style="padding:3rem; text-align:center;">
-            <span class="material-symbols-outlined" style="font-size:3rem; color:#555; display:block; margin-bottom:1rem;">terminal</span>
-            <div style="margin-bottom:1rem; color:var(--color-text-secondary); font-size:0.85rem;">
-              Open a shell in the Genesis project directory.
-            </div>
-            <button @click="$store.genesisDashboard.connectTerminal()"
-                    style="font-size:0.8rem; padding:0.4rem 1.2rem; border-radius:4px; cursor:pointer;
-                           background:rgba(33,150,243,0.15); color:#2196F3; border:1px solid rgba(33,150,243,0.3);
-                           font-weight:500;">Connect</button>
+      <div class="panel-body">
+        <div style="padding:3rem; text-align:center;">
+          <span class="material-symbols-outlined" style="font-size:3rem; color:#555; display:block; margin-bottom:1rem;">terminal</span>
+          <div style="margin-bottom:0.5rem; color:var(--color-text-secondary); font-size:0.85rem;">
+            Open a shell in the Genesis project directory.
           </div>
-        </template>
-        <!-- Terminal controls (visible when connected) -->
-        <template x-if="$store.genesisDashboard.terminalConnected">
-          <div style="display:flex; justify-content:flex-end; padding:4px 8px; background:rgba(0,0,0,0.2);">
-            <button @click="$store.genesisDashboard.disconnectTerminal()"
-                    style="font-size:0.7rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;
-                           background:rgba(239,154,154,0.12); color:#ef9a9a; border:1px solid rgba(239,154,154,0.25);">Disconnect</button>
+          <div style="margin-bottom:1.5rem; color:#888; font-size:0.75rem;">
+            Opens in a new window with a full-screen terminal.
           </div>
-        </template>
-        <!-- Terminal container -->
-        <div id="terminal-container" style="height:calc(100vh - 210px); min-height:300px;"></div>
+          <button @click="$store.genesisDashboard.openTerminal()"
+                  style="font-size:0.8rem; padding:0.5rem 1.5rem; border-radius:4px; cursor:pointer;
+                         background:rgba(33,150,243,0.15); color:#2196F3; border:1px solid rgba(33,150,243,0.3);
+                         font-weight:500;">Open Terminal</button>
+        </div>
       </div>
     </div>
 

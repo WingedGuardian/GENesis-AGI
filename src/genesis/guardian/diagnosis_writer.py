@@ -1,4 +1,4 @@
-"""Write diagnosis results to shared mount for Genesis to ingest.
+"""Write diagnosis results to shared mount for Genesis to ingest — HOST-SIDE.
 
 After Guardian diagnoses and (optionally) recovers Genesis, this module
 persists the DiagnosisResult as JSON on the shared Incus mount. Genesis

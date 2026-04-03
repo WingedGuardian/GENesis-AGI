@@ -1,4 +1,4 @@
-"""Ingest Guardian diagnosis results from shared mount into Genesis DB.
+"""Ingest Guardian diagnosis results from shared mount into Genesis DB — CONTAINER-SIDE.
 
 When Genesis recovers after an outage, Guardian may have written one or more
 diagnosis result files to the shared Incus mount. This module reads those
