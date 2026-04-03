@@ -4,11 +4,9 @@ Genesis writes curated briefings to the shared mount. Guardian reads them
 before CC diagnosis, giving the investigator situational context it would
 otherwise lack (incident history, service baselines, recent changes).
 
-Phase 1: Static/semi-static briefing written on demand.
-Phase 2: Awareness loop writes updated briefing every tick.
-
-Two entry points:
-- write_guardian_briefing() — called from Genesis (container side)
+Three entry points:
+- write_guardian_briefing() — static briefing, called on demand (container side)
+- write_dynamic_guardian_briefing(db) — live briefing from DB, called every tick
 - read_guardian_briefing() — called from Guardian diagnosis (host side)
 
 Both sides see the same file via Incus shared mount. Genesis writes to
@@ -23,13 +21,16 @@ import logging
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
+from datetime import timedelta as _timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BriefingContent",
+    "build_dynamic_briefing",
     "read_guardian_briefing",
+    "write_dynamic_guardian_briefing",
     "write_guardian_briefing",
 ]
 
@@ -53,6 +54,11 @@ class BriefingContent:
     metric_baselines: dict[str, str] = field(default_factory=dict)
     failure_modes_observed: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Dynamic fields (populated by build_dynamic_briefing)
+    last_tick_at: str = ""
+    tick_count_1h: int = 0
+    active_cc_sessions: list[dict[str, str]] = field(default_factory=list)
+    recent_errors: list[dict[str, str]] = field(default_factory=list)
 
 
 def write_guardian_briefing(
@@ -124,6 +130,93 @@ def read_guardian_briefing(
     except OSError as exc:
         logger.warning("Failed to read briefing file: %s", exc)
         return None
+
+
+async def build_dynamic_briefing(db) -> BriefingContent:
+    """Build a briefing with live data from the database.
+
+    Each query is individually wrapped — partial data is better than no briefing.
+    Falls back to static baselines from _build_default_briefing() for service
+    descriptions, metric ranges, and system notes.
+    """
+    from genesis.db.crud import awareness_ticks, cc_sessions, events, observations
+
+    static = _build_default_briefing()
+    content = BriefingContent(
+        generated_at=datetime.now(UTC).isoformat(),
+        genesis_version=static.genesis_version,
+        service_baseline=static.service_baseline,
+        metric_baselines=static.metric_baselines,
+        notes=static.notes,
+    )
+
+    # Active (unresolved) observations — most recent 15
+    try:
+        obs_rows = await observations.query(db, resolved=False, limit=15)
+        for row in obs_rows:
+            text = row.get("content", "")
+            if len(text) > 200:
+                text = text[:197] + "..."
+            source = row.get("source", "")
+            priority = row.get("priority", "")
+            content.active_observations.append(
+                f"[{priority}] ({source}) {text}"
+            )
+    except Exception:
+        logger.warning("Dynamic briefing: observations query failed", exc_info=True)
+
+    # Recent errors (last 24h)
+    try:
+        since = (datetime.now(UTC) - _timedelta(hours=24)).isoformat()
+        err_rows = await events.query(db, severity="ERROR", since=since, limit=20)
+        for row in err_rows:
+            content.recent_errors.append({
+                "subsystem": row.get("subsystem", "unknown"),
+                "message": (row.get("message", "")[:150] or "no message"),
+                "when": row.get("timestamp", "unknown"),
+            })
+    except Exception:
+        logger.warning("Dynamic briefing: events query failed", exc_info=True)
+
+    # Last tick info
+    try:
+        last = await awareness_ticks.last_tick(db)
+        if last:
+            content.last_tick_at = last.get("created_at", "")
+    except Exception:
+        logger.warning("Dynamic briefing: last_tick query failed", exc_info=True)
+
+    # Tick count in last hour (all depths)
+    try:
+        content.tick_count_1h = await awareness_ticks.count_in_window_all(
+            db, window_seconds=3600,
+        )
+    except Exception:
+        logger.warning("Dynamic briefing: tick count query failed", exc_info=True)
+
+    # Active CC sessions
+    try:
+        sessions = await cc_sessions.query_active(db)
+        for s in sessions:
+            content.active_cc_sessions.append({
+                "type": s.get("session_type", "unknown"),
+                "model": s.get("model", "unknown"),
+                "started": s.get("started_at", "unknown"),
+                "source": s.get("source_tag", "unknown"),
+            })
+    except Exception:
+        logger.warning("Dynamic briefing: cc_sessions query failed", exc_info=True)
+
+    return content
+
+
+async def write_dynamic_guardian_briefing(db) -> None:
+    """Build a dynamic briefing from the DB and write to the shared mount.
+
+    This is the function wired into the awareness loop — called every tick.
+    """
+    content = await build_dynamic_briefing(db)
+    write_guardian_briefing(content=content)
 
 
 def _build_default_briefing() -> BriefingContent:
@@ -229,6 +322,36 @@ def _render_briefing_markdown(content: BriefingContent) -> str:
         lines.append("")
         for mode in content.failure_modes_observed:
             lines.append(f"- {mode}")
+        lines.append("")
+
+    if content.last_tick_at or content.tick_count_1h:
+        lines.append("### Awareness Loop Status")
+        lines.append("")
+        if content.last_tick_at:
+            lines.append(f"- Last tick: {content.last_tick_at}")
+        if content.tick_count_1h:
+            lines.append(f"- Ticks in last hour: {content.tick_count_1h}")
+        lines.append("")
+
+    if content.active_cc_sessions:
+        lines.append("### Active CC Sessions")
+        lines.append("")
+        for sess in content.active_cc_sessions:
+            stype = sess.get("type", "unknown")
+            model = sess.get("model", "unknown")
+            started = sess.get("started", "unknown")
+            source = sess.get("source", "unknown")
+            lines.append(f"- [{source}] {stype} ({model}) started {started}")
+        lines.append("")
+
+    if content.recent_errors:
+        lines.append("### Recent Errors (last 24h)")
+        lines.append("")
+        for err in content.recent_errors:
+            subsys = err.get("subsystem", "unknown")
+            msg = err.get("message", "no message")
+            when = err.get("when", "unknown")
+            lines.append(f"- [{when}] **{subsys}**: {msg}")
         lines.append("")
 
     if content.notes:

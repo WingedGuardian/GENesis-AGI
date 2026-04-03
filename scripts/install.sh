@@ -22,6 +22,7 @@
 #   OLLAMA_EMBEDDING_MODEL — Ollama embedding model (default: qwen3-embedding:0.6b-fp16)
 #   GENESIS_ENABLE_OLLAMA  — Enable local Ollama (default: false; cloud is default)
 #   QDRANT_VERSION         — Qdrant version to install if missing (default: 1.14.0)
+#   CC_VERSION             — Claude Code version to install (default: 2.1.87)
 
 set -euo pipefail
 
@@ -845,19 +846,20 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 #  Step 12 — Claude Code install + login
 # ══════════════════════════════════════════════════════════════
-echo "  [12/$TOTAL_STEPS] Setting up Claude Code..."
+CC_VERSION="${CC_VERSION:-2.1.87}"  # Pinned — scrollback regression in 2.1.89+
+echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 
 if command -v claude &>/dev/null; then
     cc_ver=$(claude --version 2>/dev/null || echo "unknown")
     echo "    . Claude Code already installed ($cc_ver)"
 else
     echo "    Installing Claude Code via npm..."
-    if npm install -g @anthropic-ai/claude-code; then
+    if npm install -g @anthropic-ai/claude-code@"${CC_VERSION}"; then
         cc_ver=$(claude --version 2>/dev/null || echo "unknown")
         echo "    + Claude Code installed ($cc_ver)"
     else
         echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: npm install -g @anthropic-ai/claude-code"
+        echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
         SETUP_WARNINGS=1
     fi
 fi
@@ -1153,7 +1155,7 @@ _final_keys=$(grep -cE '^(API_KEY_|ANTHROPIC_API_KEY|GOOGLE_API_KEY|OPENAI_API_K
 echo ""
 echo "  Next steps:"
 echo "    1. Start Genesis:  systemctl --user start agent-zero"
-echo "    2. Run:  claude"
+echo "    2. Run:  cd ~/genesis && claude"
 echo "       Genesis will guide you through setup on first launch."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "       (API keys, user profile, channels — all handled interactively)"

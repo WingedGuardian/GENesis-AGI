@@ -37,6 +37,8 @@ class FakeCCOutput:
     exit_code: int = 0
     is_error: bool = False
     error_message: str | None = None
+    model_requested: str = ""
+    downgraded: bool = False
 
 
 # ---------------------------------------------------------------------------

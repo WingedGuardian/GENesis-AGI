@@ -19,13 +19,15 @@ from genesis.cc.exceptions import (
     CCSessionError,
     CCTimeoutError,
 )
-from genesis.cc.types import CCInvocation, CCOutput, StreamEvent
+from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent
 
 logger = logging.getLogger(__name__)
 
 
 class CCInvoker:
     """Invokes claude CLI as async subprocess."""
+
+    _TIER_RANK = {CCModel.HAIKU: 0, CCModel.SONNET: 1, CCModel.OPUS: 2}
 
     def __init__(
         self,
@@ -35,12 +37,16 @@ class CCInvoker:
         on_cc_status_change: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
+        on_model_downgrade: (
+            Callable[[str, str, str], Awaitable[None]] | None
+        ) = None,
         protected_paths: object | None = None,
     ):
         self._claude_path = claude_path
         self._working_dir = working_dir
         self._active_proc: asyncio.subprocess.Process | None = None
         self._on_cc_status_change = on_cc_status_change
+        self._on_model_downgrade = on_model_downgrade
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
@@ -48,6 +54,17 @@ class CCInvoker:
     def set_protected_paths(self, registry: object) -> None:
         """Late-bind ProtectedPathRegistry (initialized after CCInvoker)."""
         self._protected_paths = registry
+
+    async def _fire_downgrade_callback(self, output: CCOutput) -> None:
+        """Invoke model downgrade callback if applicable. Never raises."""
+        if not output.downgraded or not self._on_model_downgrade:
+            return
+        try:
+            await self._on_model_downgrade(
+                output.model_requested, output.model_used, output.session_id,
+            )
+        except Exception:
+            logger.warning("Model downgrade callback failed", exc_info=True)
 
     def _build_args(self, inv: CCInvocation) -> list[str]:
         args = [self._claude_path, "-p"]
@@ -247,6 +264,7 @@ class CCInvoker:
         # Success — notify recovery if we were previously in error state
         if self._last_was_error:
             await self._notify_status_change(None)
+        await self._fire_downgrade_callback(output)
         return output
 
     async def run_streaming(
@@ -412,6 +430,7 @@ class CCInvoker:
                     )
                     err = CCRateLimitError("CC rate limited (stream event)")
                     await self._notify_status_change(err)
+                    await self._fire_downgrade_callback(output)
                     return output
                 # Empty/no response — rate limit prevented a real answer
                 err = CCRateLimitError(output.text or "CC rate limited (stream event)")
@@ -421,12 +440,13 @@ class CCInvoker:
             # Success — notify recovery if previously errored
             if self._last_was_error:
                 await self._notify_status_change(None)
+            await self._fire_downgrade_callback(output)
             return output
 
         # No result event — treat collected text as response (success path)
         if self._last_was_error:
             await self._notify_status_change(None)
-        return CCOutput(
+        output = CCOutput(
             session_id="",
             text="".join(collected_text),
             model_used=str(invocation.model),
@@ -435,7 +455,22 @@ class CCInvoker:
             output_tokens=0,
             duration_ms=elapsed,
             exit_code=proc.returncode or 0,
+            model_requested=str(invocation.model),
         )
+        await self._fire_downgrade_callback(output)
+        return output
+
+    @staticmethod
+    def _detect_downgrade(requested: CCModel, actual_model_name: str) -> bool:
+        """Return True if the actual model is a lower tier than requested.
+
+        Tier ordering: OPUS > SONNET > HAIKU.
+        Unknown model name → False (fail open, never block).
+        """
+        actual_tier = CCModel.from_full_name(actual_model_name)
+        if actual_tier is None:
+            return False
+        return CCInvoker._TIER_RANK.get(actual_tier, 0) < CCInvoker._TIER_RANK.get(requested, 0)
 
     def _parse_result_dict(
         self, result_data: dict, inv: CCInvocation, elapsed_ms: int,
@@ -444,6 +479,12 @@ class CCInvoker:
         usage = result_data.get("usage", {})
         model_usage = result_data.get("modelUsage", {})
         model_name = next(iter(model_usage), str(inv.model))
+        downgraded = self._detect_downgrade(inv.model, model_name)
+        if downgraded:
+            logger.warning(
+                "MODEL DOWNGRADE DETECTED: requested=%s actual=%s",
+                inv.model, model_name,
+            )
         return CCOutput(
             session_id=result_data.get("session_id", ""),
             text=result_data.get("result", ""),
@@ -454,6 +495,8 @@ class CCInvoker:
             duration_ms=result_data.get("duration_ms", elapsed_ms),
             exit_code=0,
             is_error=result_data.get("is_error", False),
+            model_requested=str(inv.model),
+            downgraded=downgraded,
         )
 
     def _parse_output(self, raw: str, inv: CCInvocation, elapsed_ms: int) -> CCOutput:
@@ -507,4 +550,5 @@ class CCInvoker:
             output_tokens=0,
             duration_ms=elapsed_ms,
             exit_code=0,
+            model_requested=str(inv.model),
         )

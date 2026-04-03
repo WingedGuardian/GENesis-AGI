@@ -149,7 +149,13 @@ Detailed examination of the leaked v2.1.88 source (1,900 TypeScript files,
 - Reflection engine: fix observation truncation, add data pointers, reorient prompts
 
 ### V4 (Design Input)
-- Model-based reranking via Ollama (OpenClaw insight)
+- Model-based reranking (OpenClaw insight) — in-process cross-encoder ruled out
+  (CPU-bound on 7-core Xeon E5-2680, load already hits 2x core count; 300-600ms
+  of pure CPU per rerank pass with no GPU). Ollama also wrong serving layer
+  (optimized for generative models, not cross-encoders). Best candidates:
+  Jina Rerank API (zero local compute, ~$0.0001/call) or measure whether
+  intent routing + query expansion (V3) are sufficient before adding complexity.
+  Revisit 2026-04-09.
 - Auto-compiled codebase indices (HackerNoon insight)
 - Ego sessions as Meta-Harness-style proposer
 - Citation provenance in prompt injection

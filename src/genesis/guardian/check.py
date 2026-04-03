@@ -31,6 +31,7 @@ from genesis.guardian.approval import ApprovalServer
 from genesis.guardian.collector import collect_diagnostics
 from genesis.guardian.config import GuardianConfig, load_config, load_secrets
 from genesis.guardian.diagnosis import DiagnosisEngine
+from genesis.guardian.diagnosis_writer import write_diagnosis_result
 from genesis.guardian.dialogue import DialogueStatus, build_request, send_dialogue
 from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.recovery import RecoveryEngine
@@ -422,6 +423,14 @@ async def _proceed_to_diagnosis(
         diagnosis.source,
     )
 
+    # Persist diagnosis to shared mount for Genesis to ingest on recovery
+    first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+    try:
+        outage_s = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
+    except (ValueError, TypeError):
+        outage_s = 0.0
+    write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
+
     # Track CC availability state
     if diagnosis.source == "cc_unavailable":
         sm.set_cc_unavailable()
@@ -501,6 +510,14 @@ async def _handle_confirmed_dead(
     diagnostic = await collect_diagnostics(config)
     signal_summary = json.dumps(sm.state.signal_history[-5:], indent=2)
     diagnosis = await diagnosis_engine.diagnose(diagnostic, signal_summary)
+
+    # Persist re-diagnosis to shared mount
+    first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+    try:
+        outage_s = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
+    except (ValueError, TypeError):
+        outage_s = 0.0
+    write_diagnosis_result(diagnosis, config, outage_duration_s=outage_s)
 
     # Track CC availability transitions
     if diagnosis.source == "cc_unavailable":

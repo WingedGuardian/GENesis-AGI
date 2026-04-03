@@ -38,6 +38,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "skill_evolution": timedelta(days=14),
     "skill_proposal": timedelta(days=14),
     "light_escalation_pending": timedelta(days=1),
+    "model_downgrade": timedelta(days=1),
+    "guardian_diagnosis": timedelta(days=30),
 }
 _TTL_PREFIX: list[tuple[str, timedelta]] = [
     ("triage_depth_", timedelta(days=30)),

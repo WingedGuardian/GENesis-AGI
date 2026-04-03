@@ -168,9 +168,10 @@ def test_stream_event_thinking_before_text():
 
 
 def test_background_session_dir_returns_valid_path():
-    """background_session_dir() returns a path ending in .background-sessions and creates it."""
+    """background_session_dir() returns a path under ~/.genesis/ and creates it."""
     from pathlib import Path
 
     result = background_session_dir()
-    assert result.endswith(".background-sessions")
+    assert "background-sessions" in result
+    assert result.startswith(str(Path.home()))
     assert Path(result).is_dir()
