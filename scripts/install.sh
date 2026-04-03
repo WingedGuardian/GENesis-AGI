@@ -291,6 +291,13 @@ else
     echo "    . Agent Zero venv OK"
 fi
 
+# Ensure Genesis-specific deps are in AZ's venv (AZ runs from its own venv
+# via systemd, but imports Genesis code which may need these packages)
+if [ -d "$AZ_ROOT/.venv" ]; then
+    "$AZ_ROOT/.venv/bin/pip" install flask-sock --quiet 2>/dev/null || \
+        echo "    WARNING: Could not install flask-sock in AZ venv"
+fi
+
 # Patch AZ whisper to lazy-import (torch is optional for cloud-primary users)
 if [ -f "$AZ_ROOT/helpers/whisper.py" ]; then
     if grep -q "^import whisper$" "$AZ_ROOT/helpers/whisper.py" 2>/dev/null; then

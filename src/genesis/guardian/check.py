@@ -1,4 +1,4 @@
-"""Main check logic — the core Guardian flow per timer invocation.
+"""Main check logic — HOST-SIDE. The core Guardian flow per timer invocation.
 
 Flow:
   1. Load config + state from disk

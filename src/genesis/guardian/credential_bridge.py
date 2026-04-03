@@ -1,4 +1,4 @@
-"""Telegram credential bridge — propagates credentials via shared filesystem.
+"""Telegram credential bridge — BOTH SIDES. Propagates credentials via shared filesystem.
 
 Genesis (container) owns the secrets file. This module extracts only the
 Telegram credentials and writes them to the shared Incus mount, where

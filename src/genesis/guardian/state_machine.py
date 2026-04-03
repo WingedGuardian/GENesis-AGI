@@ -1,4 +1,4 @@
-"""Confirmation state machine — multi-step failure verification.
+"""Confirmation state machine — HOST-SIDE. Multi-step failure verification.
 
 States:
   HEALTHY → SIGNAL_DROPPED (any signal fails)

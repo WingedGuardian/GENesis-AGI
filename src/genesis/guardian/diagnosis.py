@@ -1,4 +1,4 @@
-"""CC diagnosis engine — intelligent investigation and recovery via claude -p.
+"""CC diagnosis engine — HOST-SIDE. Intelligent investigation and recovery via claude -p.
 
 When confirmation reaches SURVEYING, invokes Claude Code on the host for
 intelligent diagnosis AND recovery. CC has full tool access — it investigates

@@ -1,4 +1,4 @@
-"""Guardian briefing — shared filesystem bridge between Genesis and Guardian.
+"""Guardian briefing — BOTH SIDES. Shared filesystem bridge between Genesis and Guardian.
 
 Genesis writes curated briefings to the shared mount. Guardian reads them
 before CC diagnosis, giving the investigator situational context it would

@@ -320,6 +320,12 @@ echo "[7/13] Generating CLAUDE.md for diagnostic CC..."
 # The gateway update command also copies this file after every git pull.
 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+    # Tell git to ignore local CLAUDE.md changes. The file is tracked but the
+    # host uses guardian-claude.md instead. Without skip-worktree, git pull
+    # tries to merge the repo's container CLAUDE.md over the Guardian version.
+    if [ -d "$INSTALL_DIR/.git" ]; then
+        cd "$INSTALL_DIR" && git update-index --skip-worktree CLAUDE.md 2>/dev/null || true
+    fi
 else
     echo "  WARNING: config/guardian-claude.md not found — CLAUDE.md not generated"
 fi

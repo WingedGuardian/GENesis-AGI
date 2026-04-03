@@ -1,4 +1,4 @@
-"""Guardian ↔ Genesis dialogue — two-way health concern protocol.
+"""Guardian ↔ Genesis dialogue — HOST-SIDE. Two-way health concern protocol.
 
 Before the Guardian attempts any manual recovery, it first tries to contact
 Genesis and make it aware of the problem. Genesis gets a chance to fix itself.

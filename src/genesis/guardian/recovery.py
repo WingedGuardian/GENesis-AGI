@@ -1,4 +1,4 @@
-"""Recovery engine — executes recovery actions with verification.
+"""Recovery engine — HOST-SIDE. Executes recovery actions with verification.
 
 Recovery actions in escalation order:
 1. RESTART_SERVICES  — systemctl restart genesis-bridge

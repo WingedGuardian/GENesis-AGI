@@ -1,4 +1,4 @@
-"""Snapshot manager — incus snapshot create/restore/prune.
+"""Snapshot manager — HOST-SIDE. Incus snapshot create/restore/prune.
 
 NOTE: `dir` storage backend — snapshots are full directory copies (slow,
 minutes not seconds). Do NOT take pre-every-change snapshots. Instead:

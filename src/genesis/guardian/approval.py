@@ -1,4 +1,4 @@
-"""Single-use approval HTTP handler for recovery confirmation.
+"""Single-use approval HTTP handler for recovery confirmation — HOST-SIDE.
 
 Runs a tiny HTTP server on the host's Tailscale IP (port 8888). Telegram
 messages include a one-click approval URL. User clicks from phone. No

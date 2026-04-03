@@ -1,4 +1,4 @@
-"""Health signal collection — 5 probes + 6 suspicious checks.
+"""Health signal collection — HOST-SIDE. 5 probes + 6 suspicious checks.
 
 Each probe runs independently with its own timeout. A probe failure returns
 alive=False but never crashes the check. All probes run in parallel via
