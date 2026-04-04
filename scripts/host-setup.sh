@@ -173,7 +173,9 @@ if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]; then
     echo "  + IP forwarding enabled"
 fi
 
-_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep -v "^$" | head -1 | cut -d, -f1)
+# Find the managed bridge (not the host NIC). Column order: NAME,TYPE,MANAGED,...
+# Filter for MANAGED=YES to avoid trying to modify physical interfaces like ens4.
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
 if [ -n "$_INCUS_BRIDGE" ]; then
     _NAT_STATUS=$(incus network get "$_INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo "")
     if [ "$_NAT_STATUS" != "true" ]; then
