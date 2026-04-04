@@ -233,7 +233,7 @@ def _build_default_briefing() -> BriefingContent:
         service_baseline={
             "genesis-bridge": "Main orchestration service. If dead, most subsystems are down.",
             "qdrant": "Vector DB at localhost:6333. Used by memory system.",
-            "genesis-agent-zero": "Agent Zero web UI on port 5000. Health API lives here.",
+            "genesis-dashboard": "Genesis dashboard on port 5000. Health API lives here.",
         },
         metric_baselines={
             "memory_normal_pct": "40-65%",

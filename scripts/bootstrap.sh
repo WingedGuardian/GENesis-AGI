@@ -101,14 +101,12 @@ echo
 # --- Python venv ---
 echo "--- Setting up Python venv ---"
 VENV_DIR="$GENESIS_ROOT/.venv"
-if [[ -d "$VENV_DIR" ]]; then
-    echo "  Venv already exists at $VENV_DIR"
-else
+if [[ ! -d "$VENV_DIR" ]]; then
     echo "  Creating venv..."
     python3 -m venv "$VENV_DIR"
-    echo "  Installing genesis..."
-    "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet
 fi
+echo "  Syncing dependencies..."
+"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet
 echo
 
 # --- Secrets ---
@@ -216,6 +214,12 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
+
+        # Skip agent-zero.service if AZ is not installed
+        if [[ "$svc_name" == "agent-zero.service" && ! -f "$AZ_ROOT/run_ui.py" ]]; then
+            continue
+        fi
+
         target="$SYSTEMD_USER_DIR/$svc_name"
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \

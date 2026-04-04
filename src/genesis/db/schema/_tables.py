@@ -926,8 +926,8 @@ INDEXES = [
 # ─── Seed Data ────────────────────────────────────────────────────────────────
 
 SIGNAL_WEIGHTS_SEED = [
-    ("conversations_since_reflection", "agent_zero", 0.40, 0.40, 0.0, 1.0, '["Micro","Light"]'),
-    ("task_completion_quality", "agent_zero", 0.50, 0.50, 0.0, 1.0, '["Micro","Light"]'),
+    ("conversations_since_reflection", "genesis", 0.40, 0.40, 0.0, 1.0, '["Micro","Light"]'),
+    ("task_completion_quality", "genesis", 0.50, 0.50, 0.0, 1.0, '["Micro","Light"]'),
     ("outreach_engagement_data", "outreach_mcp", 0.45, 0.45, 0.0, 1.0, '["Micro","Deep"]'),
     ("recon_findings_pending", "recon_mcp", 0.35, 0.35, 0.0, 1.0, '["Light","Deep"]'),
     ("unprocessed_memory_backlog", "memory_mcp", 0.30, 0.30, 0.0, 1.0, '["Deep"]'),

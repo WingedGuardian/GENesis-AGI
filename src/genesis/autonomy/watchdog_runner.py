@@ -37,7 +37,7 @@ def main() -> int:
         return 1
 
     if action is WatchdogAction.RESTART:
-        return restart_bridge()
+        return restart_bridge(checker.target_service)
 
     # Note: AZ health check runs inside WatchdogChecker._check_az_health()
     # and restarts directly — it does not return RESTART_AZ via check().

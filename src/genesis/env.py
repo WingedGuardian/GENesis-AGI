@@ -26,6 +26,7 @@ def repo_root() -> Path:
 
 
 def az_root() -> Path:
+    """Resolve Agent Zero root directory. Deprecated — used only by secrets_path() fallback."""
     value = os.environ.get("AZ_ROOT")
     return Path(value).expanduser() if value else _DEFAULT_AZ_ROOT
 

@@ -45,14 +45,14 @@ class ConversationCollector:
     signal_name = "conversations_since_reflection"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "agent_zero")
+        return _stub_reading(self.signal_name, "genesis")
 
 
 class TaskQualityCollector:
     signal_name = "task_completion_quality"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "agent_zero")
+        return _stub_reading(self.signal_name, "genesis")
 
 
 class OutreachEngagementCollector:

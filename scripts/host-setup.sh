@@ -145,13 +145,21 @@ else
     sudo incus admin init --minimal
     echo "  + Incus initialized"
 
-    # Add current user to incus-admin group if not root
+    # Add current user to incus-admin group if not root.
+    # The re-exec below handles activating the group immediately.
     if [ "$(id -u)" != "0" ]; then
         sudo usermod -aG incus-admin "$(whoami)" 2>/dev/null || true
         echo "  + Added $(whoami) to incus-admin group"
-        echo "  NOTE: You may need to log out and back in for group membership to take effect."
-        echo "        If the next step fails, run: newgrp incus-admin"
     fi
+fi
+
+# ── Activate incus-admin group (re-exec if needed) ──────────
+# After fresh Incus install, the current shell doesn't have incus-admin yet.
+# Rather than asking the user to log out/in or run newgrp manually, re-exec
+# the entire script under `sg incus-admin` which activates the group immediately.
+if [ "$(id -u)" != "0" ] && ! id -Gn | grep -qw "incus-admin"; then
+    echo "  Activating incus-admin group (re-running script)..."
+    exec sg incus-admin -c "$(realpath "$0") $*"
 fi
 
 # ── Firewall: ensure Incus bridge traffic is allowed ────────
@@ -225,14 +233,16 @@ incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || tru
 # Install all prerequisites inside container as root.
 # install.sh has its own checks as defense-in-depth, but pre-installing here
 # (as root, no sudo needed) is more reliable than install.sh's sudo fallbacks.
+echo "  Installing prerequisites in container (1-3 min, please wait)..."
 incus exec "$CONTAINER_NAME" -- bash -c '
+    export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq \
+    apt-get install -y -q \
         git curl sudo \
         python3 python3-pip python3.12-venv \
-        nodejs npm
-' 2>&1 | tail -5
-echo "  + User 'ubuntu' configured"
+        nodejs npm 2>&1 | grep -E "^(Get:|Unpacking|Setting up)" | head -30 || true
+'
+echo "  + Prerequisites installed"
 
 # Resolve actual UID (don't assume 1000)
 UBUNTU_UID=$(incus exec "$CONTAINER_NAME" -- id -u ubuntu 2>/dev/null || echo "1000")

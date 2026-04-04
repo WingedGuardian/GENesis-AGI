@@ -155,9 +155,9 @@ _TERMINAL_PAGE_HTML = """\
 <head>
   <meta charset="utf-8">
   <title>Genesis Terminal</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+  <link rel="stylesheet" href="/vendor/xterm/xterm.css">
+  <script src="/vendor/xterm/xterm.js"></script>
+  <script src="/vendor/xterm/addon-fit.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
@@ -185,6 +185,8 @@ _TERMINAL_PAGE_HTML = """\
     ws.onopen = () => {
       const dims = fit.proposeDimensions();
       if (dims) ws.send(JSON.stringify({ resize: { rows: dims.rows, cols: dims.cols } }));
+      // Auto-start Claude Code after bash initializes
+      setTimeout(() => ws.send("claude --dangerously-skip-permissions\\n"), 500);
     };
 
     ws.onmessage = (evt) => {

@@ -492,6 +492,26 @@ else
     echo "    + portability scan: CLEAN"
 fi
 
+# ── 8b. CHANGELOG check ──────────────────────────────────
+echo "  [8b/9] Checking CHANGELOG..."
+if [[ ! -f "$OUTPUT_DIR/CHANGELOG.md" ]]; then
+    echo "    ! CHANGELOG.md missing from staging."
+    echo "      Create it and commit before tagging a release."
+elif grep -q "^## \[Unreleased\]" "$OUTPUT_DIR/CHANGELOG.md"; then
+    # Has [Unreleased] — check it has actual content (not just the header)
+    # Use found-flag pattern: skip header line, stop at next ## [, print content
+    unreleased_content=$(awk '/^## \[Unreleased\]/{found=1; next} found && /^## \[/{exit} found{print}' \
+        "$OUTPUT_DIR/CHANGELOG.md" | grep -v '^$' | head -3)
+    if [[ -z "$unreleased_content" ]]; then
+        echo "    ! CHANGELOG.md has an empty [Unreleased] section."
+        echo "      Populate it before tagging a release."
+    else
+        echo "    + CHANGELOG.md has [Unreleased] content (ready to tag)"
+    fi
+else
+    echo "    + CHANGELOG.md present (no [Unreleased] section — already released)"
+fi
+
 # ── 9. Report ────────────────────────────────────────────
 echo "  [9/9] Release preparation complete."
 echo ""
