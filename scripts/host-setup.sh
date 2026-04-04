@@ -220,9 +220,12 @@ fi
 
 if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     echo "  Creating container '$CONTAINER_NAME'..."
-    # images:ubuntu/noble — the images: remote is always available after incus admin init
-    incus launch images:ubuntu/noble "$CONTAINER_NAME"
-    echo "  + Container created"
+
+    # Create stopped (incus init, not incus launch) so we can configure
+    # networking BEFORE first boot. images:ubuntu/noble defaults to IPv6-only;
+    # cloud-init must see our DHCPv4 config on its first run.
+    incus init images:ubuntu/noble "$CONTAINER_NAME"
+    echo "  + Container created (stopped)"
 
     # Apply resource limits
     incus config set "$CONTAINER_NAME" limits.memory "$RAM"
@@ -238,9 +241,23 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || true
     echo "  + Disk: $DISK, IOPS limits applied"
 
-    # Wait for container to be ready
+    # Configure DHCPv4 before first boot.
+    # The images:ubuntu/noble cloud image defaults to IPv6-only networking.
+    # Setting cloud-init.network-config ensures DHCPv4 is enabled when
+    # cloud-init runs on first start.
+    incus config set "$CONTAINER_NAME" cloud-init.network-config \
+        "network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+      dhcp6: true"
+    echo "  + Network: DHCPv4 + DHCPv6 configured"
+
+    # Now start the container
+    incus start "$CONTAINER_NAME"
     echo "  Waiting for container to initialize..."
-    incus exec "$CONTAINER_NAME" -- cloud-init status --wait 2>/dev/null || sleep 10
+    incus exec "$CONTAINER_NAME" -- cloud-init status --wait 2>/dev/null || sleep 15
     echo "  + Container ready"
 fi
 
