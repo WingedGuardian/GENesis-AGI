@@ -906,12 +906,18 @@ if command -v claude &>/dev/null; then
     echo "    . Claude Code already installed ($cc_ver)"
 else
     echo "    Installing Claude Code via npm..."
-    if npm install -g @anthropic-ai/claude-code@"${CC_VERSION}"; then
+    # npm install -g needs write access to /usr/local/lib/node_modules.
+    # Use sudo if available (typical in containers), fall back to plain npm.
+    _npm_cmd="npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+    if [ "$(id -u)" != "0" ] && command -v sudo &>/dev/null; then
+        _npm_cmd="sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+    fi
+    if $_npm_cmd; then
         cc_ver=$(claude --version 2>/dev/null || echo "unknown")
         echo "    + Claude Code installed ($cc_ver)"
     else
         echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+        echo "    Install manually: sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
         SETUP_WARNINGS=1
     fi
 fi
