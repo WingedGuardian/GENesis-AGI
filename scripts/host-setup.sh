@@ -209,56 +209,45 @@ if [ -n "$_INCUS_BRIDGE" ]; then
     fi
 fi
 
-# ── Firewall: allow DHCP+DNS on bridge ──────────────────────
-# Debian 13 (Trixie) and other nftables-based distros block incoming UDP:67
-# (DHCP) and UDP/TCP:53 (DNS) on the bridge by default. The container sends
-# DHCP Discover but nftables drops it before dnsmasq processes it. IPv6 works
-# because it uses router advertisements, not DHCP. This is a documented issue:
-# https://github.com/NixOS/nixpkgs/issues/263359
+# ── Firewall: allow container traffic on bridge ─────────────
+# Incus containers need three traffic paths allowed:
+#   1. container ↔ host (DHCP, DNS to bridge dnsmasq) — INPUT/OUTPUT
+#   2. container ↔ internet (forwarded traffic)       — FORWARD
+# UFW 'deny (routed)' blocks #2, nftables may block #1.
+# Rather than trying to detect which firewall is active and failing
+# silently, just run ALL commands unconditionally. They're idempotent
+# and fail harmlessly when the tool isn't installed.
 _INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
-if [ -n "$_INCUS_BRIDGE" ] && command -v nft &>/dev/null; then
-    # Try all common nftables table/chain combos (varies by distro).
-    # Each rule is idempotent — nft silently succeeds if already present.
-    _nft_added=0
-    for _table in "inet filter" "inet nftables_svc" "ip filter"; do
-        for _chain in input forward; do
-            if sudo nft list chain $_table $_chain &>/dev/null 2>&1; then
-                sudo nft insert rule $_table $_chain iifname "$_INCUS_BRIDGE" accept 2>/dev/null && _nft_added=1 || true
-            fi
-        done
-    done
-    if [ "$_nft_added" = "1" ]; then
-        echo "  + nftables: bridge traffic allowed on $_INCUS_BRIDGE"
-    fi
-fi
+if [ -n "$_INCUS_BRIDGE" ]; then
+    echo "  Configuring firewall for container traffic on $_INCUS_BRIDGE..."
 
-# UFW: the root cause on cloud VMs (GCP confirmed). UFW default policy
-# `deny (routed)` drops ALL forwarded traffic in the FORWARD chain.
-# ICMP has an explicit allow in ufw-before-forward (so ping works),
-# but DNS (UDP:53) and HTTPS (TCP:443) are dropped — breaking apt-get.
-# Route rules are idempotent and don't show in `ufw status` (only in
-# `ufw status numbered`), so always run them.
-if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
-    echo "  Configuring UFW for container traffic on $_INCUS_BRIDGE..."
-    # Three rule types needed — each solves a different traffic path:
-    #   allow in/out  → container ↔ host (DHCP to dnsmasq, DNS to dnsmasq)
-    #   route allow   → container ↔ internet (forwarded traffic)
-    # Missing any set causes a different failure mode. All are idempotent.
+    # UFW rules (no-op if ufw not installed or not active)
     sudo ufw allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw route allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw route allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
 
-    if sudo ufw status 2>/dev/null | grep -q "on $_INCUS_BRIDGE"; then
-        echo "  + UFW: bridge INPUT/OUTPUT + FORWARD rules applied"
+    # nftables rules — try all common table/chain combos
+    for _table in "inet filter" "inet nftables_svc" "ip filter"; do
+        for _chain in input forward; do
+            sudo nft insert rule $_table $_chain iifname "$_INCUS_BRIDGE" accept 2>/dev/null || true
+        done
+    done
+
+    # Verify: check if UFW rules actually took effect
+    if command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
+        if sudo ufw status 2>/dev/null | grep -q "on $_INCUS_BRIDGE"; then
+            echo "  + Firewall: UFW rules applied for $_INCUS_BRIDGE"
+        else
+            echo "  WARN: UFW is active but rules didn't apply. Manual fix:"
+            echo "    sudo ufw allow in on $_INCUS_BRIDGE"
+            echo "    sudo ufw route allow in on $_INCUS_BRIDGE"
+        fi
     else
-        echo "  WARN: UFW commands ran but rules not visible in 'ufw status'."
-        echo "  Container networking may fail. Manual fix:"
-        echo "    sudo ufw allow in on $_INCUS_BRIDGE"
-        echo "    sudo ufw allow out on $_INCUS_BRIDGE"
-        echo "    sudo ufw route allow in on $_INCUS_BRIDGE"
-        echo "    sudo ufw route allow out on $_INCUS_BRIDGE"
+        echo "  + Firewall: nftables rules applied for $_INCUS_BRIDGE"
     fi
+else
+    echo "  WARN: No managed Incus bridge found — firewall rules skipped"
 fi
 
 # ── Create container ─────────────────────────────────────────

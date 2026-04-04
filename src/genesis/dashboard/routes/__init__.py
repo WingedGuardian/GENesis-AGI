@@ -26,7 +26,6 @@ from genesis.dashboard.routes import (
     stream,
     tasks,
     terminal,
-    ui_data,
     vitals,
 )
 
@@ -54,6 +53,5 @@ __all__ = [
     "stream",
     "tasks",
     "terminal",
-    "ui_data",
     "vitals",
 ]
