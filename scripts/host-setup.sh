@@ -162,6 +162,27 @@ if [ "$(id -u)" != "0" ] && ! id -Gn | grep -qw "incus-admin"; then
     exec sg incus-admin -c "$(realpath "$0") $*"
 fi
 
+# ── Ensure IP forwarding and bridge NAT ──────────────────────
+# Cloud VMs (GCP, AWS, Azure) often have IP forwarding disabled and
+# `incus admin init --minimal` may not enable NAT on the bridge.
+# Without both, containers have zero outbound connectivity.
+if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]; then
+    echo "  Enabling IP forwarding..."
+    sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward=1" | sudo tee /etc/sysctl.d/99-incus-forward.conf >/dev/null
+    echo "  + IP forwarding enabled"
+fi
+
+_INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep -v "^$" | head -1 | cut -d, -f1)
+if [ -n "$_INCUS_BRIDGE" ]; then
+    _NAT_STATUS=$(incus network get "$_INCUS_BRIDGE" ipv4.nat 2>/dev/null || echo "")
+    if [ "$_NAT_STATUS" != "true" ]; then
+        echo "  Enabling NAT on bridge $_INCUS_BRIDGE..."
+        incus network set "$_INCUS_BRIDGE" ipv4.nat true
+        echo "  + Bridge NAT enabled"
+    fi
+fi
+
 # ── Firewall: ensure Incus bridge traffic is allowed ────────
 # UFW with FORWARD DROP blocks DHCP/NAT between the container and
 # the host bridge. Incus snap handles this automatically; the apt
