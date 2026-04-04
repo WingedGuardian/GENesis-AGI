@@ -546,6 +546,12 @@ async def seed_data(db: aiosqlite.Connection) -> None:
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         SIGNAL_WEIGHTS_SEED,
     )
+    # Migrate existing rows from "agent_zero" → "genesis" source (AZ decoupling)
+    await db.execute(
+        """UPDATE signal_weights SET source_mcp = 'genesis'
+           WHERE source_mcp = 'agent_zero'
+           AND signal_name IN ('conversations_since_reflection', 'task_completion_quality')""",
+    )
     await db.executemany(
         """INSERT OR IGNORE INTO drive_weights
            (drive_name, current_weight, initial_weight, min_weight, max_weight)

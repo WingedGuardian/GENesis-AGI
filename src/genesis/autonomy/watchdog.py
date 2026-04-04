@@ -78,6 +78,41 @@ class WatchdogChecker:
         self._stabilization_s = stabilization_s
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
+        self._target_service = self._detect_target_service()
+        self._az_installed = self._detect_az_installed()
+
+    @property
+    def target_service(self) -> str:
+        """The systemd service name this watchdog monitors."""
+        return self._target_service
+
+    def _detect_target_service(self) -> str:
+        """Auto-detect which Genesis service to monitor.
+
+        Standalone mode uses genesis-server.service.
+        AZ/bridge mode uses genesis-bridge.service (default).
+        """
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-enabled", "genesis-server.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                return "genesis-server.service"
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+        return "genesis-bridge.service"
+
+    def _detect_az_installed(self) -> bool:
+        """Check if agent-zero.service is enabled. Cached at init time."""
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-enabled", "agent-zero.service"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return False
 
     @classmethod
     def from_yaml(cls, path: str | Path | None = None) -> WatchdogChecker:
@@ -209,10 +244,10 @@ class WatchdogChecker:
         return issues
 
     def _is_bridge_active(self) -> bool | None:
-        """Check if the bridge systemd unit is active. Returns None if unknown."""
+        """Check if the target Genesis service is active. Returns None if unknown."""
         try:
             result = subprocess.run(
-                ["systemctl", "--user", "is-active", "genesis-bridge.service"],
+                ["systemctl", "--user", "is-active", self._target_service],
                 capture_output=True, text=True, timeout=5,
             )
             return result.stdout.strip() == "active"
@@ -220,10 +255,10 @@ class WatchdogChecker:
             return None  # Can't determine — don't block on this
 
     def _bridge_exited_unconfigured(self) -> bool:
-        """Check if the bridge exited with code 2 (unconfigured — missing secrets.env)."""
+        """Check if the target service exited with code 2 (unconfigured — missing secrets.env)."""
         try:
             result = subprocess.run(
-                ["systemctl", "--user", "show", "-p", "ExecMainStatus", "genesis-bridge.service"],
+                ["systemctl", "--user", "show", "-p", "ExecMainStatus", self._target_service],
                 capture_output=True, text=True, timeout=5,
             )
             return "ExecMainStatus=2" in result.stdout
@@ -233,11 +268,16 @@ class WatchdogChecker:
     def _check_az_health(self) -> None:
         """Check if Agent Zero service is active. Auto-restart if down.
 
+        Skipped entirely in standalone mode (agent-zero.service not enabled).
         Uses a separate state file (~/.genesis/watchdog_az_state.json) from
         the bridge watchdog to keep backoff counters independent. AZ restarts
         are more impactful (kills dashboard + all Genesis subsystems), so
         max_attempts is conservative (3).
         """
+        # Skip if AZ service is not installed/enabled (standalone mode)
+        if not self._az_installed:
+            return
+
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "is-active", "agent-zero.service"],
@@ -499,21 +539,25 @@ def get_container_memory() -> tuple[int, int] | None:
         return None
 
 
-def restart_bridge() -> int:
-    """Restart the bridge via systemctl. Returns exit code."""
-    logger.info("Restarting genesis-bridge.service via systemctl...")
+def restart_bridge(service: str = "genesis-bridge.service") -> int:
+    """Restart the specified Genesis service via systemctl. Returns exit code.
+
+    Defaults to genesis-bridge.service for backward compatibility.
+    Pass checker.target_service to restart the auto-detected service.
+    """
+    logger.info("Restarting %s via systemctl...", service)
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "restart", "genesis-bridge.service"],
+            ["systemctl", "--user", "restart", service],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0:
-            logger.info("Bridge restart command succeeded")
+            logger.info("%s restart command succeeded", service)
         else:
-            logger.error("Bridge restart failed: %s", result.stderr)
+            logger.error("%s restart failed: %s", service, result.stderr)
         return result.returncode
     except subprocess.TimeoutExpired:
-        logger.error("Bridge restart command timed out")
+        logger.error("%s restart command timed out", service)
         return -1
     except FileNotFoundError:
         logger.error("systemctl not found — cannot restart bridge")
@@ -521,7 +565,23 @@ def restart_bridge() -> int:
 
 
 def restart_az() -> int:
-    """Restart Agent Zero via systemctl. Returns exit code."""
+    """Restart Agent Zero via systemctl. Returns exit code.
+
+    Returns 0 (no-op) if agent-zero.service is not enabled (standalone mode).
+    """
+    # Guard: skip if AZ not installed
+    try:
+        check = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "agent-zero.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if check.returncode != 0:
+            logger.info("AZ not installed (standalone mode) — skipping restart")
+            return 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        logger.info("Cannot determine AZ status — skipping restart")
+        return 0
+
     logger.info("Restarting agent-zero.service via systemctl...")
     try:
         result = subprocess.run(

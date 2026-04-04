@@ -11,18 +11,33 @@ from flask import jsonify
 from genesis.dashboard._blueprint import _async_route, blueprint
 
 
-@blueprint.route("/api/genesis/restart/bridge", methods=["POST"])
-def restart_bridge():
-    """Restart the Genesis bridge via systemd. Idempotent, never duplicates."""
+def _detect_genesis_service() -> str:
+    """Detect which Genesis service to restart (standalone vs bridge mode)."""
     try:
         result = subprocess.run(
-            ["systemctl", "--user", "restart", "genesis-bridge.service"],
+            ["systemctl", "--user", "is-enabled", "genesis-server.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return "genesis-server.service"
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return "genesis-bridge.service"
+
+
+@blueprint.route("/api/genesis/restart/bridge", methods=["POST"])
+def restart_bridge():
+    """Restart the Genesis service via systemd. Auto-detects standalone vs bridge mode."""
+    service = _detect_genesis_service()
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", service],
             capture_output=True,
             text=True,
             timeout=30,
         )
         if result.returncode == 0:
-            return jsonify({"status": "ok", "message": "Bridge restart initiated"})
+            return jsonify({"status": "ok", "message": f"{service} restart initiated"})
         return jsonify({"status": "error", "message": result.stderr.strip()}), 500
     except subprocess.TimeoutExpired:
         return jsonify({"status": "error", "message": "Restart timed out"}), 500
@@ -32,7 +47,23 @@ def restart_bridge():
 
 @blueprint.route("/api/genesis/restart/agent-zero", methods=["POST"])
 def restart_agent_zero():
-    """Restart Agent Zero via systemd. Dashboard will reload after restart."""
+    """Restart Agent Zero via systemd. Returns 404 if AZ not installed."""
+    try:
+        check = subprocess.run(
+            ["systemctl", "--user", "is-enabled", "agent-zero.service"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if check.returncode != 0:
+            return jsonify({
+                "status": "error",
+                "message": "Agent Zero not installed (standalone mode)",
+            }), 404
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return jsonify({
+            "status": "error",
+            "message": "Cannot determine Agent Zero status",
+        }), 503
+
     try:
         result = subprocess.run(
             ["systemctl", "--user", "restart", "agent-zero.service"],
