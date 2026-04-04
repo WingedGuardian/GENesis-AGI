@@ -17,6 +17,13 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 - **host-setup.sh**: Show progress during container prerequisite installation —
   was completely silent for 1-3 minutes, causing users to assume the script
   had hung
+- **host-setup.sh**: Auto-detect and fix container DNS on cloud VMs (GCP, AWS,
+  Azure) — Incus bridge dnsmasq often fails to forward to cloud DNS resolvers,
+  blocking all package installation inside the container
+- **push-public-release.sh**: Create tag and GitHub Release even when content
+  was already pushed (previously exited early, skipping the release step)
+- **install.sh**: Add `cd ~/genesis &&` to headless login instructions so
+  first-time users run `claude login` from the correct directory
 
 ---
 

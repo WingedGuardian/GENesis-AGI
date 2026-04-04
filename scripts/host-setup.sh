@@ -221,6 +221,28 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     echo "  + Container ready"
 fi
 
+# ── Verify container networking ──────────────────────────────
+# Cloud VMs (GCP, AWS, Azure) often use custom DNS resolvers that Incus's
+# bridge dnsmasq doesn't forward to automatically. Test and fix.
+echo "  Checking container networking..."
+if ! incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
+    echo "  Container DNS not working — injecting fallback nameservers..."
+    incus exec "$CONTAINER_NAME" -- bash -c '
+        cat > /etc/resolv.conf <<RESOLV
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+RESOLV
+    '
+    if incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
+        echo "  + DNS fixed (using Google DNS)"
+    else
+        echo "  WARNING: DNS still not working. Container may not have internet access."
+        echo "  Check: incus exec $CONTAINER_NAME -- ping -c1 8.8.8.8"
+    fi
+else
+    echo "  + Container networking OK"
+fi
+
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
 
