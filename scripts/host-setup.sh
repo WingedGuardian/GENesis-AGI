@@ -245,11 +245,40 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
 fi
 
 # ── Verify container networking ──────────────────────────────
-# Cloud VMs (GCP, AWS, Azure) often use custom DNS resolvers that Incus's
-# bridge dnsmasq doesn't forward to automatically. Test and fix.
+# Some container images (images:ubuntu/noble) default to IPv6-only via netplan.
+# Without DHCPv4, the container has no IPv4 address and can't reach IPv4 hosts.
 echo "  Checking container networking..."
+_CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+if [ -z "$_CONTAINER_IP" ]; then
+    echo "  No IPv4 address — enabling DHCPv4 via netplan..."
+    incus exec "$CONTAINER_NAME" -- bash -c '
+        mkdir -p /etc/netplan
+        cat > /etc/netplan/10-dhcp4.yaml <<NETPLAN
+network:
+  version: 2
+  ethernets:
+    eth0:
+      dhcp4: true
+NETPLAN
+        netplan apply 2>/dev/null
+    '
+    sleep 5
+    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+    if [ -n "$_CONTAINER_IP" ]; then
+        echo "  + IPv4 address acquired: $_CONTAINER_IP"
+    else
+        echo "  ERROR: Container still has no IPv4 address after enabling DHCPv4."
+        echo "  Debug: incus exec $CONTAINER_NAME -- networkctl status eth0"
+        echo "         incus network show incusbr0"
+        exit 1
+    fi
+else
+    echo "  + Container networking OK ($_CONTAINER_IP)"
+fi
+
+# DNS fallback: cloud VMs may have DNS resolvers the container can't reach.
 if ! incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
-    echo "  Container DNS not working — injecting fallback nameservers..."
+    echo "  DNS not resolving — injecting Google DNS fallback..."
     incus exec "$CONTAINER_NAME" -- bash -c '
         cat > /etc/resolv.conf <<RESOLV
 nameserver 8.8.8.8
@@ -259,11 +288,9 @@ RESOLV
     if incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
         echo "  + DNS fixed (using Google DNS)"
     else
-        echo "  WARNING: DNS still not working. Container may not have internet access."
+        echo "  WARNING: DNS still not working after fallback."
         echo "  Check: incus exec $CONTAINER_NAME -- ping -c1 8.8.8.8"
     fi
-else
-    echo "  + Container networking OK"
 fi
 
 # ── Set up user inside container ─────────────────────────────
