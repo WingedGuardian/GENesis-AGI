@@ -248,7 +248,7 @@ fi
 # Some container images (images:ubuntu/noble) default to IPv6-only via netplan.
 # Without DHCPv4, the container has no IPv4 address and can't reach IPv4 hosts.
 echo "  Checking container networking..."
-_CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+_CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
 if [ -z "$_CONTAINER_IP" ]; then
     echo "  No IPv4 address — enabling DHCPv4 via netplan..."
     incus exec "$CONTAINER_NAME" -- bash -c '
@@ -263,7 +263,7 @@ NETPLAN
         netplan apply 2>/dev/null
     '
     sleep 5
-    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1)
+    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
     if [ -n "$_CONTAINER_IP" ]; then
         echo "  + IPv4 address acquired: $_CONTAINER_IP"
     else
