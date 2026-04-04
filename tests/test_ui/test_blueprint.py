@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from flask import Flask
 
@@ -121,5 +123,80 @@ def test_injection_no_double_inject():
         assert html.count("/genesis-ui/genesis-overlay.js") == 1
 
 
-# NOTE: /api/genesis/ui/* data endpoints moved to genesis_dashboard blueprint.
-# Tests for those endpoints: tests/test_dashboard/test_ui_data.py
+# ── API endpoints ────────────────────────────────────────────────────
+
+
+def test_sessions_empty_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/sessions")
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+
+def test_memory_stats_empty_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/memory/stats")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["episodic"] == 0
+
+
+def test_memory_search_empty_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/memory/search?type=episodic")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["results"] == []
+
+
+def test_memory_search_invalid_type(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/memory/search?type=invalid")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["results"] == []
+
+
+def test_inbox_empty_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/inbox")
+        assert resp.status_code == 200
+        assert resp.get_json() == []
+
+
+def test_tasks_empty_when_not_bootstrapped(client):
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = False
+    mock_rt.db = None
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/ui/tasks")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["jobs"] == []

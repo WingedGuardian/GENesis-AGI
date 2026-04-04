@@ -35,8 +35,7 @@ class GenesisObservability(Extension):
                     NotificationType,
                 )
 
-                from genesis.observability.az_bridge import NotificationBridge
-                from genesis.observability import Severity
+                from genesis.observability import NotificationBridge, Severity
 
                 _TYPE_MAP = {
                     "warning": NotificationType.WARNING,
