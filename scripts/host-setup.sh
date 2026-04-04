@@ -303,6 +303,13 @@ NETPLAN
         "
         sleep 2
         _CONTAINER_IP="${_BRIDGE_GW%.*}.10"
+        # Force /etc/resolv.conf directly — netplan nameservers feed into
+        # systemd-resolved which may not work on fresh containers.
+        incus exec "$CONTAINER_NAME" -- bash -c '
+            rm -f /etc/resolv.conf 2>/dev/null
+            echo "nameserver 8.8.8.8" > /etc/resolv.conf
+            echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+        '
         if incus exec "$CONTAINER_NAME" -- ping -c1 -W2 8.8.8.8 &>/dev/null; then
             echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW)"
         else
