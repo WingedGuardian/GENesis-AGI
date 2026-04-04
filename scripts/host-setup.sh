@@ -220,12 +220,9 @@ fi
 
 if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     echo "  Creating container '$CONTAINER_NAME'..."
-
-    # Create stopped (incus init, not incus launch) so we can configure
-    # networking BEFORE first boot. images:ubuntu/noble defaults to IPv6-only;
-    # cloud-init must see our DHCPv4 config on its first run.
-    incus init images:ubuntu/noble "$CONTAINER_NAME"
-    echo "  + Container created (stopped)"
+    # images:ubuntu/noble — the images: remote is always available after incus admin init
+    incus launch images:ubuntu/noble "$CONTAINER_NAME"
+    echo "  + Container created"
 
     # Apply resource limits
     incus config set "$CONTAINER_NAME" limits.memory "$RAM"
@@ -241,73 +238,61 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     incus config device set "$CONTAINER_NAME" root limits.write 90MB 2>/dev/null || true
     echo "  + Disk: $DISK, IOPS limits applied"
 
-    # Configure DHCPv4 before first boot.
-    # The images:ubuntu/noble cloud image defaults to IPv6-only networking.
-    # Setting cloud-init.network-config ensures DHCPv4 is enabled when
-    # cloud-init runs on first start.
-    incus config set "$CONTAINER_NAME" cloud-init.network-config \
-        "network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-      dhcp6: true"
-    echo "  + Network: DHCPv4 + DHCPv6 configured"
-
-    # Now start the container
-    incus start "$CONTAINER_NAME"
+    # Wait for container to be ready
     echo "  Waiting for container to initialize..."
-    incus exec "$CONTAINER_NAME" -- cloud-init status --wait 2>/dev/null || sleep 15
+    incus exec "$CONTAINER_NAME" -- cloud-init status --wait 2>/dev/null || sleep 10
     echo "  + Container ready"
 fi
 
 # ── Verify container networking ──────────────────────────────
-# Some container images (images:ubuntu/noble) default to IPv6-only via netplan.
-# Without DHCPv4, the container has no IPv4 address and can't reach IPv4 hosts.
+# The images:ubuntu/noble image ships with dhcp4: true in /etc/netplan/10-lxc.yaml,
+# but on some platforms (GCP, etc.) the bridge DHCP server doesn't serve IPv4 leases.
+# If the container has no IPv4 after boot, assign a static IP from the bridge subnet.
 echo "  Checking container networking..."
 _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
 if [ -z "$_CONTAINER_IP" ]; then
-    echo "  No IPv4 address — enabling DHCPv4 via netplan..."
-    incus exec "$CONTAINER_NAME" -- bash -c '
-        mkdir -p /etc/netplan
-        cat > /etc/netplan/10-dhcp4.yaml <<NETPLAN
+    echo "  No IPv4 address (DHCP not working) — assigning static IP..."
+    # Parse the bridge subnet to derive a static IP
+    _BRIDGE_ADDR=$(incus network get incusbr0 ipv4.address 2>/dev/null || true)
+    if [ -n "$_BRIDGE_ADDR" ]; then
+        _BRIDGE_GW="${_BRIDGE_ADDR%%/*}"
+        _BRIDGE_CIDR="${_BRIDGE_ADDR##*/}"
+        _STATIC_IP="${_BRIDGE_GW%.*}.10/${_BRIDGE_CIDR}"
+        incus exec "$CONTAINER_NAME" -- bash -c "
+            cat > /etc/netplan/20-static.yaml <<NETPLAN
 network:
   version: 2
   ethernets:
     eth0:
-      dhcp4: true
+      dhcp4: false
+      addresses:
+        - $_STATIC_IP
+      routes:
+        - to: default
+          via: $_BRIDGE_GW
+      nameservers:
+        addresses:
+          - 8.8.8.8
+          - 8.8.4.4
 NETPLAN
-        netplan apply 2>/dev/null
-    '
-    sleep 5
-    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
-    if [ -n "$_CONTAINER_IP" ]; then
-        echo "  + IPv4 address acquired: $_CONTAINER_IP"
+            netplan apply 2>/dev/null
+        "
+        sleep 2
+        _CONTAINER_IP="${_BRIDGE_GW%.*}.10"
+        if incus exec "$CONTAINER_NAME" -- ping -c1 -W2 8.8.8.8 &>/dev/null; then
+            echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW)"
+        else
+            echo "  ERROR: Static IP assigned but no internet connectivity."
+            echo "  Debug: incus exec $CONTAINER_NAME -- ip route"
+            echo "         incus exec $CONTAINER_NAME -- ping -c1 $_BRIDGE_GW"
+            exit 1
+        fi
     else
-        echo "  ERROR: Container still has no IPv4 address after enabling DHCPv4."
-        echo "  Debug: incus exec $CONTAINER_NAME -- networkctl status eth0"
-        echo "         incus network show incusbr0"
+        echo "  ERROR: Cannot determine bridge subnet. Check: incus network show incusbr0"
         exit 1
     fi
 else
     echo "  + Container networking OK ($_CONTAINER_IP)"
-fi
-
-# DNS fallback: cloud VMs may have DNS resolvers the container can't reach.
-if ! incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
-    echo "  DNS not resolving — injecting Google DNS fallback..."
-    incus exec "$CONTAINER_NAME" -- bash -c '
-        cat > /etc/resolv.conf <<RESOLV
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-RESOLV
-    '
-    if incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
-        echo "  + DNS fixed (using Google DNS)"
-    else
-        echo "  WARNING: DNS still not working after fallback."
-        echo "  Check: incus exec $CONTAINER_NAME -- ping -c1 8.8.8.8"
-    fi
 fi
 
 # ── Set up user inside container ─────────────────────────────
