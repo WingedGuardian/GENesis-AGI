@@ -18,6 +18,29 @@
 
 set -euo pipefail
 
+# ── Error handling ──────────────────────────────────────────
+# Print the failing line and command on any error so debugging
+# doesn't require back-and-forth guesswork.
+_on_error() {
+    local exit_code=$?
+    echo ""
+    echo "  ──────────────────────────────────────────────────"
+    echo "  FAILED at line $1"
+    echo "  Command: $2"
+    echo "  Exit code: $exit_code"
+    echo "  ──────────────────────────────────────────────────"
+    echo ""
+    echo "  To re-run with full debug output:"
+    echo "    DEBUG=1 ./scripts/host-setup.sh ${_ORIG_ARGS:-}"
+    echo ""
+}
+trap '_on_error $LINENO "$BASH_COMMAND"' ERR
+
+# DEBUG=1 enables bash tracing (set -x) for full command-by-command output
+if [ "${DEBUG:-}" = "1" ]; then
+    set -x
+fi
+
 # ── Defaults ─────────────────────────────────────────────────
 CONTAINER_NAME="genesis"
 RAM="24GiB"
@@ -26,6 +49,7 @@ CPUS="8"
 REPO_URL=""
 BRANCH="main"
 NON_INTERACTIVE=0
+_ORIG_ARGS="$*"
 
 # ── Parse args ───────────────────────────────────────────────
 while [ $# -gt 0 ]; do
