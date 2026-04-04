@@ -933,7 +933,7 @@ if should_prompt && command -v claude &>/dev/null; then
         if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
             # Headless environment
             echo "    Since you're on a headless machine:"
-            echo "      1. Run: claude login"
+            echo "      1. Run: cd ~/genesis && claude login"
             echo "      2. It will print a URL — open it in YOUR browser"
             echo "      3. Complete the OAuth flow in your browser"
             echo "      4. Come back here — Claude Code will detect the login"

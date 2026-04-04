@@ -156,25 +156,31 @@ echo "--- Committing ---"
 git add -A
 CHANGES=$(git diff --cached --stat)
 if [[ -z "$CHANGES" ]]; then
-    echo "  No changes to push. Public repo is up to date."
-    rm -rf "$WORK_DIR" "$SAVE_DIR"
-    exit 0
-fi
-echo "$CHANGES" | tail -3
+    if [[ -n "$VERSION" ]]; then
+        echo "  No file changes — content already up to date."
+        echo "  Proceeding to tag and release..."
+    else
+        echo "  No changes to push. Public repo is up to date."
+        rm -rf "$WORK_DIR" "$SAVE_DIR"
+        exit 0
+    fi
+else
+    echo "$CHANGES" | tail -3
 
-git commit -m "$COMMIT_MSG
+    git commit -m "$COMMIT_MSG
 
 Source: $SOURCE_COMMIT
 
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
-echo
-echo "--- Pushing (normal push, never force) ---"
-if ! git push origin main 2>&1; then
     echo
-    echo "ERROR: Push failed. Remote has commits not in this staging."
-    echo "       Resolve manually: cd $WORK_DIR && git pull --rebase origin main && git push"
-    exit 1
+    echo "--- Pushing (normal push, never force) ---"
+    if ! git push origin main 2>&1; then
+        echo
+        echo "ERROR: Push failed. Remote has commits not in this staging."
+        echo "       Resolve manually: cd $WORK_DIR && git pull --rebase origin main && git push"
+        exit 1
+    fi
 fi
 
 # ── Tag and GitHub Release ────────────────────────────────
