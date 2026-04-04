@@ -217,16 +217,18 @@ fi
 # https://github.com/NixOS/nixpkgs/issues/263359
 _INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
 if [ -n "$_INCUS_BRIDGE" ] && command -v nft &>/dev/null; then
-    # Check if nftables has an inet filter input chain (Debian 13 default)
-    if sudo nft list chain inet filter input &>/dev/null 2>&1; then
-        # Only add rules if not already present (idempotent)
-        if ! sudo nft list chain inet filter input 2>/dev/null | grep -q "iifname \"$_INCUS_BRIDGE\" udp dport 67"; then
-            echo "  Adding nftables rules for DHCP+DNS on $_INCUS_BRIDGE..."
-            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" udp dport 67 accept comment \"Incus DHCP\"
-            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" udp dport 53 accept comment \"Incus DNS\"
-            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" tcp dport 53 accept comment \"Incus DNS\"
-            echo "  + nftables: DHCP+DNS allowed on bridge"
-        fi
+    # Try all common nftables table/chain combos (varies by distro).
+    # Each rule is idempotent — nft silently succeeds if already present.
+    _nft_added=0
+    for _table in "inet filter" "inet nftables_svc" "ip filter"; do
+        for _chain in input forward; do
+            if sudo nft list chain $_table $_chain &>/dev/null 2>&1; then
+                sudo nft insert rule $_table $_chain iifname "$_INCUS_BRIDGE" accept 2>/dev/null && _nft_added=1 || true
+            fi
+        done
+    done
+    if [ "$_nft_added" = "1" ]; then
+        echo "  + nftables: bridge traffic allowed on $_INCUS_BRIDGE"
     fi
 fi
 
@@ -363,8 +365,25 @@ incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || tru
 # install.sh has its own checks as defense-in-depth, but pre-installing here
 # (as root, no sudo needed) is more reliable than install.sh's sudo fallbacks.
 echo "  Installing prerequisites in container (1-3 min, please wait)..."
+# Force DNS inside the container right before apt-get. Incus may bind-mount
+# its own resolv.conf (pointing to the bridge dnsmasq) which can fail if
+# the bridge DNS forwarder isn't working. Overwrite in the same exec session.
 incus exec "$CONTAINER_NAME" -- bash -c '
     export DEBIAN_FRONTEND=noninteractive
+    # Force Google DNS — Incus/systemd-resolved may override resolv.conf
+    systemctl stop systemd-resolved 2>/dev/null || true
+    rm -f /etc/resolv.conf 2>/dev/null; true
+    echo "nameserver 8.8.8.8" > /etc/resolv.conf
+    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+    echo "  Resolv.conf: $(cat /etc/resolv.conf | tr "\n" " ")"
+    # Quick DNS test
+    if getent hosts archive.ubuntu.com >/dev/null 2>&1; then
+        echo "  DNS: OK"
+    else
+        echo "  DNS: FAILED (resolv.conf=$(cat /etc/resolv.conf | head -1))"
+        echo "  Trying: ping -c1 -W2 8.8.8.8"
+        ping -c1 -W2 8.8.8.8 2>&1 | tail -1 || true
+    fi
     apt-get update -qq
     apt-get install -y -q \
         git curl sudo \
