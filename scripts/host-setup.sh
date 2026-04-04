@@ -303,15 +303,22 @@ NETPLAN
         "
         sleep 2
         _CONTAINER_IP="${_BRIDGE_GW%.*}.10"
-        # Force /etc/resolv.conf directly — netplan nameservers feed into
-        # systemd-resolved which may not work on fresh containers.
+        # Disable systemd-resolved and write /etc/resolv.conf directly.
+        # systemd-resolved on Ubuntu Noble overwrites resolv.conf with its
+        # stub (127.0.0.53) which can't forward without a working upstream.
         incus exec "$CONTAINER_NAME" -- bash -c '
-            rm -f /etc/resolv.conf 2>/dev/null
+            systemctl disable --now systemd-resolved 2>/dev/null || true
+            rm -f /etc/resolv.conf
             echo "nameserver 8.8.8.8" > /etc/resolv.conf
             echo "nameserver 8.8.4.4" >> /etc/resolv.conf
         '
         if incus exec "$CONTAINER_NAME" -- ping -c1 -W2 8.8.8.8 &>/dev/null; then
-            echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW)"
+            # Verify DNS too (ping only tests IP connectivity)
+            if incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
+                echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW, DNS OK)"
+            else
+                echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW, DNS may be slow)"
+            fi
         else
             echo "  ERROR: Static IP assigned but no internet connectivity."
             echo "  Debug: incus exec $CONTAINER_NAME -- ip route"
