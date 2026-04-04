@@ -209,11 +209,28 @@ if [ -n "$_INCUS_BRIDGE" ]; then
     fi
 fi
 
-# ── Firewall: ensure Incus bridge traffic is allowed ────────
-# UFW with FORWARD DROP blocks DHCP/NAT between the container and
-# the host bridge. Incus snap handles this automatically; the apt
-# package does not.
+# ── Firewall: allow DHCP+DNS on bridge ──────────────────────
+# Debian 13 (Trixie) and other nftables-based distros block incoming UDP:67
+# (DHCP) and UDP/TCP:53 (DNS) on the bridge by default. The container sends
+# DHCP Discover but nftables drops it before dnsmasq processes it. IPv6 works
+# because it uses router advertisements, not DHCP. This is a documented issue:
+# https://github.com/NixOS/nixpkgs/issues/263359
 _INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
+if [ -n "$_INCUS_BRIDGE" ] && command -v nft &>/dev/null; then
+    # Check if nftables has an inet filter input chain (Debian 13 default)
+    if sudo nft list chain inet filter input &>/dev/null 2>&1; then
+        # Only add rules if not already present (idempotent)
+        if ! sudo nft list chain inet filter input 2>/dev/null | grep -q "iifname \"$_INCUS_BRIDGE\" udp dport 67"; then
+            echo "  Adding nftables rules for DHCP+DNS on $_INCUS_BRIDGE..."
+            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" udp dport 67 accept comment \"Incus DHCP\"
+            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" udp dport 53 accept comment \"Incus DNS\"
+            sudo nft add rule inet filter input iifname "$_INCUS_BRIDGE" tcp dport 53 accept comment \"Incus DNS\"
+            echo "  + nftables: DHCP+DNS allowed on bridge"
+        fi
+    fi
+fi
+
+# UFW: same concept for UFW-based distros
 if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
     if ! sudo ufw status | grep -q "on $_INCUS_BRIDGE"; then
         echo "  UFW detected — allowing traffic on $_INCUS_BRIDGE..."
