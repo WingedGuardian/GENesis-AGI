@@ -551,7 +551,7 @@ V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've
 
 <!-- **[Discord →](https://discord.gg/TODO)** — architecture discussions, contributor coordination, roadmap input -->
 
-Curious how it all fits together? Join our Discord server (coming soon). Or hell, have Claude read the architecture docs and give you it's analysis! The design is intentional and forward-thinking.
+Curious how it all fits together? Join our Discord server [https://discord.gg/jQ57c5f6Pc]. Or hell, have Claude read the architecture docs and give you it's analysis! The design is intentional and forward-thinking.
 
 ---
 
