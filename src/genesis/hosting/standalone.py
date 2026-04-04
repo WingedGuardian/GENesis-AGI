@@ -184,76 +184,20 @@ class StandaloneAdapter:
         return app
 
     def _register_blueprints(self) -> None:
-        """Register all Genesis blueprints on the Flask app.
+        """Register all Genesis blueprints on the Flask app via the adapter.
 
-        Mirrors the registration logic in
-        ``az_plugins/genesis/extensions/server_startup/_00_genesis_bootstrap.py``.
+        NOTE: UI overlay (genesis_ui) is intentionally skipped — it injects
+        CSS/JS into AZ's chat UI.  Not relevant for standalone mode.
         """
         app = self._app
         if app is None:
             raise RuntimeError("Flask app not created — call bootstrap() first")
 
-        # Dashboard blueprint (all /api/genesis/* routes)
-        try:
-            from genesis.dashboard.api import blueprint as dash_bp
+        from genesis.hosting.agent_zero.adapter import AgentZeroAdapter
 
-            if "genesis_dashboard" not in app.blueprints:
-                app.register_blueprint(dash_bp)
-                logger.info("Dashboard blueprint registered")
-
-            # Start heartbeat
-            from genesis.dashboard.heartbeat import DashboardHeartbeat
-
-            DashboardHeartbeat(interval_seconds=60).start()
-        except Exception:
-            logger.exception("Failed to register dashboard blueprint")
-
-        # Health API blueprint
-        try:
-            import importlib.util
-
-            health_path = (
-                Path(__file__).resolve().parent.parent.parent.parent
-                / "az_plugins" / "genesis" / "api_health.py"
-            )
-            if health_path.exists():
-                spec = importlib.util.spec_from_file_location(
-                    "genesis_api_health", health_path,
-                )
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                health_bp = mod.blueprint
-
-                if "genesis_health" not in app.blueprints:
-                    app.register_blueprint(health_bp)
-                    logger.info("Health API blueprint registered")
-        except Exception:
-            logger.exception("Failed to register health blueprint")
-
-        # Terminal WebSocket (flask-sock)
-        try:
-            from genesis.dashboard.routes.terminal import register_terminal_ws
-
-            register_terminal_ws(app)
-        except Exception:
-            logger.exception("Failed to register terminal WebSocket")
-
-        # NOTE: UI overlay blueprint (genesis_ui) is intentionally skipped.
-        # It injects CSS/JS into AZ's chat UI to hide AZ-specific elements.
-        # Not relevant for standalone mode — we own the entire UI.
-
-        # Outreach API blueprint
-        try:
-            from genesis.outreach.api import init_outreach_api, outreach_api
-
-            if self._runtime and self._runtime.db:
-                init_outreach_api(db=self._runtime.db)
-
-            if "outreach_api" not in app.blueprints:
-                app.register_blueprint(outreach_api)
-                logger.info("Outreach API blueprint registered")
-        except Exception:
-            logger.exception("Failed to register outreach blueprint")
+        adapter = AgentZeroAdapter()
+        adapter.register_blueprints(app)
+        # register_overlay() deliberately omitted — standalone owns its own UI.
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""

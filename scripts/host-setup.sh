@@ -183,7 +183,7 @@ fi
 # the entire script under `sg incus-admin` which activates the group immediately.
 if [ "$(id -u)" != "0" ] && ! id -Gn | grep -qw "incus-admin"; then
     echo "  Activating incus-admin group (re-running script)..."
-    exec sg incus-admin -c "$(realpath "$0") $*"
+    exec sg incus-admin -c "\"$(realpath "$0")\" $_ORIG_ARGS"
 fi
 
 # ── Ensure IP forwarding and bridge NAT ──────────────────────
@@ -232,16 +232,19 @@ if [ -n "$_INCUS_BRIDGE" ] && command -v nft &>/dev/null; then
     fi
 fi
 
-# UFW: same concept for UFW-based distros
+# UFW: the root cause on cloud VMs (GCP confirmed). UFW default policy
+# `deny (routed)` drops ALL forwarded traffic in the FORWARD chain.
+# ICMP has an explicit allow in ufw-before-forward (so ping works),
+# but DNS (UDP:53) and HTTPS (TCP:443) are dropped — breaking apt-get.
+# Route rules are idempotent and don't show in `ufw status` (only in
+# `ufw status numbered`), so always run them.
 if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
-    if ! sudo ufw status | grep -q "on $_INCUS_BRIDGE"; then
-        echo "  UFW detected — allowing traffic on $_INCUS_BRIDGE..."
-        sudo ufw allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1
-        sudo ufw allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1
-        sudo ufw route allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1
-        sudo ufw route allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1
-        echo "  + UFW rules added for Incus bridge"
-    fi
+    echo "  Configuring UFW for container traffic on $_INCUS_BRIDGE..."
+    sudo ufw allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
+    sudo ufw allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
+    sudo ufw route allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
+    sudo ufw route allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
+    echo "  + UFW: bridge traffic + routing allowed"
 fi
 
 # ── Create container ─────────────────────────────────────────
@@ -288,65 +291,17 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
 fi
 
 # ── Verify container networking ──────────────────────────────
-# The images:ubuntu/noble image ships with dhcp4: true in /etc/netplan/10-lxc.yaml,
-# but on some platforms (GCP, etc.) the bridge DHCP server doesn't serve IPv4 leases.
-# If the container has no IPv4 after boot, assign a static IP from the bridge subnet.
 echo "  Checking container networking..."
 _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
 if [ -z "$_CONTAINER_IP" ]; then
-    echo "  No IPv4 address (DHCP not working) — assigning static IP..."
-    # Parse the bridge subnet to derive a static IP
-    _BRIDGE_ADDR=$(incus network get incusbr0 ipv4.address 2>/dev/null || true)
-    if [ -n "$_BRIDGE_ADDR" ]; then
-        _BRIDGE_GW="${_BRIDGE_ADDR%%/*}"
-        _BRIDGE_CIDR="${_BRIDGE_ADDR##*/}"
-        _STATIC_IP="${_BRIDGE_GW%.*}.10/${_BRIDGE_CIDR}"
-        incus exec "$CONTAINER_NAME" -- bash -c "
-            cat > /etc/netplan/20-static.yaml <<NETPLAN
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: false
-      addresses:
-        - $_STATIC_IP
-      routes:
-        - to: default
-          via: $_BRIDGE_GW
-      nameservers:
-        addresses:
-          - 8.8.8.8
-          - 8.8.4.4
-NETPLAN
-            netplan apply 2>/dev/null
-        "
-        sleep 2
-        _CONTAINER_IP="${_BRIDGE_GW%.*}.10"
-        # Disable systemd-resolved and write /etc/resolv.conf directly.
-        # systemd-resolved on Ubuntu Noble overwrites resolv.conf with its
-        # stub (127.0.0.53) which can't forward without a working upstream.
-        incus exec "$CONTAINER_NAME" -- bash -c '
-            systemctl disable --now systemd-resolved 2>/dev/null || true
-            rm -f /etc/resolv.conf
-            echo "nameserver 8.8.8.8" > /etc/resolv.conf
-            echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-        '
-        if incus exec "$CONTAINER_NAME" -- ping -c1 -W2 8.8.8.8 &>/dev/null; then
-            # Verify DNS too (ping only tests IP connectivity)
-            if incus exec "$CONTAINER_NAME" -- nslookup archive.ubuntu.com &>/dev/null 2>&1; then
-                echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW, DNS OK)"
-            else
-                echo "  + Static IP assigned: $_CONTAINER_IP (bridge: $_BRIDGE_GW, DNS may be slow)"
-            fi
-        else
-            echo "  ERROR: Static IP assigned but no internet connectivity."
-            echo "  Debug: incus exec $CONTAINER_NAME -- ip route"
-            echo "         incus exec $CONTAINER_NAME -- ping -c1 $_BRIDGE_GW"
-            exit 1
-        fi
+    echo "  WARNING: Container has no IPv4 address yet (DHCP may be slow)."
+    echo "  Waiting 10s for DHCP lease..."
+    sleep 10
+    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
+    if [ -z "$_CONTAINER_IP" ]; then
+        echo "  WARNING: Still no IPv4. Check UFW/nftables if apt-get fails below."
     else
-        echo "  ERROR: Cannot determine bridge subnet. Check: incus network show incusbr0"
-        exit 1
+        echo "  + Container networking OK ($_CONTAINER_IP)"
     fi
 else
     echo "  + Container networking OK ($_CONTAINER_IP)"
@@ -365,31 +320,21 @@ incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || tru
 # install.sh has its own checks as defense-in-depth, but pre-installing here
 # (as root, no sudo needed) is more reliable than install.sh's sudo fallbacks.
 echo "  Installing prerequisites in container (1-3 min, please wait)..."
-# Force DNS inside the container right before apt-get. Incus may bind-mount
-# its own resolv.conf (pointing to the bridge dnsmasq) which can fail if
-# the bridge DNS forwarder isn't working. Overwrite in the same exec session.
 incus exec "$CONTAINER_NAME" -- bash -c '
     export DEBIAN_FRONTEND=noninteractive
-    # Force Google DNS — Incus/systemd-resolved may override resolv.conf
-    systemctl stop systemd-resolved 2>/dev/null || true
-    rm -f /etc/resolv.conf 2>/dev/null; true
-    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-    echo "nameserver 8.8.4.4" >> /etc/resolv.conf
-    echo "  Resolv.conf: $(cat /etc/resolv.conf | tr "\n" " ")"
-    # Quick DNS test
-    if getent hosts archive.ubuntu.com >/dev/null 2>&1; then
-        echo "  DNS: OK"
-    else
-        echo "  DNS: FAILED (resolv.conf=$(cat /etc/resolv.conf | head -1))"
-        echo "  Trying: ping -c1 -W2 8.8.8.8"
-        ping -c1 -W2 8.8.8.8 2>&1 | tail -1 || true
-    fi
-    apt-get update -qq
+    apt-get update -qq || { echo "  FATAL: apt-get update failed — check container DNS"; exit 1; }
     apt-get install -y -q \
         git curl sudo \
         python3 python3-pip python3.12-venv \
-        nodejs npm 2>&1 | grep -E "^(Get:|Unpacking|Setting up)" | head -30 || true
-'
+        nodejs npm || { echo "  FATAL: package install failed"; exit 1; }
+' || {
+    echo ""
+    echo "  FATAL: Prerequisites installation failed inside container."
+    echo "  Debug DNS:  incus exec $CONTAINER_NAME -- getent hosts archive.ubuntu.com"
+    echo "  Debug ping: incus exec $CONTAINER_NAME -- ping -c1 8.8.8.8"
+    echo "  Debug resolv: incus exec $CONTAINER_NAME -- cat /etc/resolv.conf"
+    exit 1
+}
 echo "  + Prerequisites installed"
 
 # Resolve actual UID (don't assume 1000)
@@ -421,10 +366,12 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         GIT_TERMINAL_PROMPT=0 git clone --branch "$_BRANCH" "$_REPO_URL" "$_DEST" 2>&1 | tail -3
     fi
 ' || {
-    echo "  WARNING: Git clone failed (private repo?)"
-    echo "  You can push the code manually:"
+    echo ""
+    echo "  FATAL: Git clone failed."
+    echo "  If this is a private repo, push code manually:"
     echo "    incus file push -r . ${CONTAINER_NAME}/home/ubuntu/genesis/"
     echo "  Then run install.sh inside the container."
+    exit 1
 }
 
 # ── Run install.sh inside container ──────────────────────────
