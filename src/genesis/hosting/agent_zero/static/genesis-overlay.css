@@ -1,0 +1,198 @@
+/*
+ * Genesis UI Overlay — CSS
+ *
+ * Injected into the AZ index.html via after_request hook.
+ * Hides AZ-specific elements, overrides branding, and styles
+ * Genesis-specific components.
+ *
+ * Uses high-specificity selectors + !important to override AZ styles.
+ */
+
+/* ── Batch 2: Branding ─────────────────────────────────────────────── */
+
+/* Item 1: Replace AZ watermark on welcome screen */
+.welcome-container::before {
+    background-image: url("/genesis-ui/genesis-watermark.svg") !important;
+}
+
+/* Scheduler/Projects are REPLACED via JS (not hidden) — see genesis-overlay.js */
+
+/* ── Genesis modal styles ──────────────────────────────────────────── */
+
+.genesis-modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+}
+
+.genesis-modal-overlay.visible {
+    opacity: 1;
+}
+
+.genesis-modal {
+    background: var(--color-panel, #1a1a1a);
+    border: 1px solid var(--color-border, #444);
+    border-radius: 12px;
+    width: 90%;
+    max-width: 750px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: scale(0.95);
+    transition: transform 0.15s ease;
+}
+
+.genesis-modal-overlay.visible .genesis-modal {
+    transform: scale(1);
+}
+
+.genesis-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--color-border, #444);
+    font-weight: 600;
+    font-size: 0.95rem;
+}
+
+.genesis-modal-close {
+    background: none;
+    border: none;
+    color: var(--color-text-muted, #d4d4d4e4);
+    cursor: pointer;
+    font-size: 1.2rem;
+    padding: 0.2rem;
+    border-radius: 4px;
+}
+
+.genesis-modal-close:hover {
+    color: var(--color-text, #fff);
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.genesis-modal-body {
+    padding: 1rem;
+    overflow-y: auto;
+    flex: 1;
+}
+
+/* Memory browser styles */
+.genesis-mem-tabs {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 0.75rem;
+}
+
+.genesis-mem-tab {
+    background: var(--color-background, #131313);
+    border: 1px solid var(--color-border, #444);
+    color: var(--color-text-muted, #d4d4d4e4);
+    padding: 0.35rem 0.6rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    font-family: inherit;
+}
+
+.genesis-mem-tab:first-child { border-radius: 4px 0 0 4px; }
+.genesis-mem-tab:last-child { border-radius: 0 4px 4px 0; }
+
+.genesis-mem-tab.active {
+    background: var(--color-accent, #27875e);
+    color: #fff;
+    border-color: var(--color-accent, #27875e);
+}
+
+.genesis-mem-search {
+    width: 100%;
+    background: var(--color-background, #131313);
+    border: 1px solid var(--color-border, #444);
+    border-radius: 6px;
+    color: var(--color-text, #fff);
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    font-family: inherit;
+    margin-bottom: 0.75rem;
+}
+
+.genesis-mem-search::placeholder { color: var(--color-text-muted, #d4d4d4e4); }
+
+.genesis-mem-stats {
+    display: flex;
+    gap: 1rem;
+    font-size: 0.75rem;
+    color: var(--color-text-muted, #d4d4d4e4);
+    margin-bottom: 0.75rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid var(--color-border, #444);
+}
+
+.genesis-mem-stat-value {
+    font-weight: 600;
+    color: var(--color-text, #fff);
+}
+
+.genesis-mem-item {
+    padding: 0.6rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    font-size: 0.82rem;
+}
+
+.genesis-mem-item:last-child { border-bottom: none; }
+
+.genesis-mem-item-time {
+    font-size: 0.72rem;
+    color: var(--color-text-muted, #d4d4d4e4);
+    font-family: monospace;
+    margin-bottom: 0.2rem;
+}
+
+.genesis-mem-item-content {
+    line-height: 1.4;
+    word-break: break-word;
+    white-space: pre-wrap;
+    max-height: 120px;
+    overflow: hidden;
+    position: relative;
+}
+
+.genesis-mem-empty {
+    text-align: center;
+    padding: 2rem;
+    color: var(--color-text-muted, #d4d4d4e4);
+    font-size: 0.85rem;
+}
+
+/* Sidebar overrides */
+.genesis-section-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--color-text-muted, #d4d4d4e4);
+    margin: 0.75rem 0 0.4rem;
+    padding-bottom: 0.3rem;
+    border-bottom: 1px solid var(--color-border, #444);
+    font-weight: 600;
+}
+
+.genesis-section-label:first-child {
+    margin-top: 0;
+}
+
+.genesis-session-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+    background: rgba(207, 102, 121, 0.2);
+    color: var(--color-accent, #27875e);
+    margin-left: 0.3rem;
+    vertical-align: middle;
+}

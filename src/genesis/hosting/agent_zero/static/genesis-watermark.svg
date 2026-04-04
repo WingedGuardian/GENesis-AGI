@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" fill="none" stroke="currentColor" stroke-width="1.5" opacity="0.5">
+  <!-- Neural network inspired G shape -->
+  <!-- Outer arc of the G -->
+  <path d="M 280 100 A 140 140 0 1 0 280 300" stroke-linecap="round"/>
+  <!-- Horizontal bar of the G -->
+  <line x1="200" y1="200" x2="280" y2="200" stroke-linecap="round"/>
+  <!-- Vertical stub of the G -->
+  <line x1="280" y1="200" x2="280" y2="300" stroke-linecap="round"/>
+  <!-- Neural nodes -->
+  <circle cx="280" cy="100" r="6" fill="currentColor" stroke="none"/>
+  <circle cx="280" cy="200" r="6" fill="currentColor" stroke="none"/>
+  <circle cx="280" cy="300" r="6" fill="currentColor" stroke="none"/>
+  <circle cx="140" cy="60" r="4" fill="currentColor" stroke="none"/>
+  <circle cx="60" cy="200" r="4" fill="currentColor" stroke="none"/>
+  <circle cx="140" cy="340" r="4" fill="currentColor" stroke="none"/>
+  <circle cx="200" cy="200" r="5" fill="currentColor" stroke="none"/>
+  <!-- Neural connections from center -->
+  <line x1="200" y1="200" x2="140" y2="60" stroke-width="0.5" opacity="0.4"/>
+  <line x1="200" y1="200" x2="60" y2="200" stroke-width="0.5" opacity="0.4"/>
+  <line x1="200" y1="200" x2="140" y2="340" stroke-width="0.5" opacity="0.4"/>
+  <line x1="200" y1="200" x2="280" y2="100" stroke-width="0.5" opacity="0.4"/>
+  <line x1="200" y1="200" x2="280" y2="300" stroke-width="0.5" opacity="0.4"/>
+</svg>
