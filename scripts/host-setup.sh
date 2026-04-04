@@ -240,11 +240,25 @@ fi
 # `ufw status numbered`), so always run them.
 if [ -n "$_INCUS_BRIDGE" ] && command -v ufw &>/dev/null && sudo ufw status 2>/dev/null | grep -q "Status: active"; then
     echo "  Configuring UFW for container traffic on $_INCUS_BRIDGE..."
+    # Three rule types needed — each solves a different traffic path:
+    #   allow in/out  → container ↔ host (DHCP to dnsmasq, DNS to dnsmasq)
+    #   route allow   → container ↔ internet (forwarded traffic)
+    # Missing any set causes a different failure mode. All are idempotent.
     sudo ufw allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw route allow in on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
     sudo ufw route allow out on "$_INCUS_BRIDGE" >/dev/null 2>&1 || true
-    echo "  + UFW: bridge traffic + routing allowed"
+
+    if sudo ufw status 2>/dev/null | grep -q "on $_INCUS_BRIDGE"; then
+        echo "  + UFW: bridge INPUT/OUTPUT + FORWARD rules applied"
+    else
+        echo "  WARN: UFW commands ran but rules not visible in 'ufw status'."
+        echo "  Container networking may fail. Manual fix:"
+        echo "    sudo ufw allow in on $_INCUS_BRIDGE"
+        echo "    sudo ufw allow out on $_INCUS_BRIDGE"
+        echo "    sudo ufw route allow in on $_INCUS_BRIDGE"
+        echo "    sudo ufw route allow out on $_INCUS_BRIDGE"
+    fi
 fi
 
 # ── Create container ─────────────────────────────────────────
@@ -291,21 +305,51 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
 fi
 
 # ── Verify container networking ──────────────────────────────
+# DHCP can be slow, especially on first boot or after UFW rules are freshly added.
+# Actively kick the DHCP client if needed rather than just waiting and hoping.
 echo "  Checking container networking..."
 _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
 if [ -z "$_CONTAINER_IP" ]; then
-    echo "  WARNING: Container has no IPv4 address yet (DHCP may be slow)."
-    echo "  Waiting 10s for DHCP lease..."
-    sleep 10
-    _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
-    if [ -z "$_CONTAINER_IP" ]; then
-        echo "  WARNING: Still no IPv4. Check UFW/nftables if apt-get fails below."
-    else
-        echo "  + Container networking OK ($_CONTAINER_IP)"
-    fi
+    echo "  No IPv4 yet — reconfiguring network interface to trigger DHCP..."
+    # networkctl reconfigure forces systemd-networkd to re-send DHCP Discover.
+    # This handles the case where DHCP failed on boot (e.g. UFW was blocking it
+    # and we just added the allow rules above).
+    incus exec "$CONTAINER_NAME" -- networkctl reconfigure eth0 2>/dev/null || true
+    for _i in 1 2 3 4 5 6; do
+        sleep 2
+        _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
+        [ -n "$_CONTAINER_IP" ] && break
+    done
+fi
+
+if [ -z "$_CONTAINER_IP" ]; then
+    echo "  FATAL: Container has no IPv4 address after 12s."
+    echo ""
+    echo "  This usually means the host firewall is blocking DHCP (UDP:67) on the"
+    echo "  Incus bridge. UFW 'deny (incoming)' default drops DHCP Discover packets"
+    echo "  from the container before dnsmasq can respond."
+    echo ""
+    echo "  Fix: sudo ufw allow in on ${_INCUS_BRIDGE:-incusbr0}"
+    echo "       sudo ufw allow out on ${_INCUS_BRIDGE:-incusbr0}"
+    echo "  Then re-run this script."
+    exit 1
 else
     echo "  + Container networking OK ($_CONTAINER_IP)"
 fi
+
+# Verify DNS works (IP alone isn't enough — apt/git need name resolution)
+if ! incus exec "$CONTAINER_NAME" -- bash -c 'getent hosts github.com' &>/dev/null; then
+    echo "  WARNING: Container has IPv4 but DNS is not resolving."
+    echo "  Attempting to fix by restarting systemd-resolved..."
+    incus exec "$CONTAINER_NAME" -- systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 2
+    if ! incus exec "$CONTAINER_NAME" -- bash -c 'getent hosts github.com' &>/dev/null; then
+        echo "  FATAL: DNS still not working. apt-get and git will fail."
+        echo "  Debug: incus exec $CONTAINER_NAME -- resolvectl status"
+        exit 1
+    fi
+fi
+echo "  + DNS resolution OK"
 
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
