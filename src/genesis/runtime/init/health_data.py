@@ -16,9 +16,23 @@ def init(rt: GenesisRuntime) -> None:
     try:
         from genesis.observability.health_data import HealthDataService
 
+        # Provider health checker — probes /v1/models endpoints periodically
+        provider_health_checker = None
+        routing_config = rt._router.config if rt._router else None
+        if routing_config:
+            try:
+                from genesis.observability.provider_health import ProviderHealthChecker
+
+                provider_health_checker = ProviderHealthChecker(
+                    routing_config, breakers=rt._circuit_breakers,
+                )
+                rt._provider_health_checker = provider_health_checker
+            except Exception:
+                logger.warning("Provider health checker init skipped", exc_info=True)
+
         rt._health_data = HealthDataService(
             circuit_breakers=rt._circuit_breakers,
-            routing_config=rt._router.config if rt._router else None,
+            routing_config=routing_config,
             cost_tracker=rt._cost_tracker,
             cc_budget=rt._cc_budget_tracker,
             deferred_queue=rt._deferred_work_queue,
@@ -28,6 +42,7 @@ def init(rt: GenesisRuntime) -> None:
             learning_scheduler=rt._learning_scheduler,
             resilience_state_machine=rt._resilience_state_machine,
             activity_tracker=rt._activity_tracker,
+            provider_health_checker=provider_health_checker,
         )
 
         from genesis.mcp.health_mcp import init_health_mcp

@@ -116,6 +116,44 @@ def _extract_keywords(prompt: str) -> list[str]:
     return keywords[:8]
 
 
+def _keywords_from_files(file_paths: list[str]) -> list[str]:
+    """Decompose file paths into searchable keywords.
+
+    E.g., 'src/genesis/memory/store.py' → ['genesis', 'memory', 'store']
+    """
+    keywords: list[str] = []
+    for fp in file_paths[:5]:  # Top 5 most recent
+        # Strip common prefixes and extensions
+        path = fp.replace("${HOME}/genesis/", "")
+        parts = path.replace("/", " ").replace("_", " ").replace(".", " ").split()
+        for part in parts:
+            part = part.lower()
+            if part not in _STOP_WORDS and len(part) >= 3 and part not in ("src", "py", "md", "txt", "json", "yaml", "tests", "test"):
+                keywords.append(part)
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    result: list[str] = []
+    for k in keywords:
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result[:6]
+
+
+def _load_recent_files(session_id: str) -> list[str]:
+    """Load recently-touched files for this session from PostToolUse state."""
+    if not session_id or "/" in session_id or ".." in session_id:
+        return []
+    state_file = Path(os.path.expanduser("~/.genesis/sessions")) / session_id / "recent_files.json"
+    if not state_file.exists():
+        return []
+    try:
+        data = json.loads(state_file.read_text())
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
 def _escape_fts5(query: str) -> str:
     """Escape special FTS5 characters."""
     return "".join(c if c.isalnum() or c.isspace() else " " for c in query)
@@ -231,6 +269,7 @@ async def _search_qdrant(vector: list[float]) -> list[dict]:
                         "content": payload.get("content", ""),
                         "score": hit.get("score", 0.0),
                         "source_session_id": payload.get("source_session_id"),
+                        "memory_class": payload.get("memory_class", "fact"),
                         "_retrieved_count": payload.get("retrieved_count", 0),
                     })
                 return results
@@ -268,13 +307,20 @@ def _rrf_fusion(
 
 
 def _format_results(results: list[dict]) -> str:
-    """Format surfaced memories for injection."""
+    """Format surfaced memories for injection.
+
+    Two-tier output: rank 1 and rules always get full content (200 chars).
+    Rank 2+ non-rules get compact format (80 chars) to reduce noise.
+    """
     if not results:
         return ""
 
     lines = []
-    for r in results:
-        content = r.get("content", "")[:200]
+    for rank, r in enumerate(results):
+        is_rule = r.get("memory_class") == "rule"
+        # Full content for rank 1 or rules; compact for lower-ranked non-rules
+        max_len = 200 if (rank == 0 or is_rule) else 80
+        content = r.get("content", "")[:max_len]
         session_id = r.get("source_session_id", "")
         session_hint = f" (session: {session_id[:8]})" if session_id else ""
         lines.append(f"[Memory] {content}{session_hint}")
@@ -383,11 +429,19 @@ def _record_detail(
         pass  # Never block user prompt
 
 
-async def _run(prompt: str) -> None:
+async def _run(prompt: str, session_id: str = "") -> None:
     """Main async entry point."""
     start = time.monotonic()
 
     keywords = _extract_keywords(prompt)
+
+    # Augment keywords with file-context from PostToolUse tracking
+    recent_files = _load_recent_files(session_id)
+    if recent_files:
+        file_keywords = _keywords_from_files(recent_files)
+        # Append file keywords after prompt keywords (lower priority in FTS5)
+        keywords = keywords + [k for k in file_keywords if k not in keywords]
+
     if len(keywords) < _MIN_PROMPT_WORDS:
         return
 
@@ -456,7 +510,8 @@ def main() -> None:
         if not prompt:
             return
 
-        asyncio.run(_run(prompt))
+        session_id = data.get("session_id", "")
+        asyncio.run(_run(prompt, session_id=session_id))
     except Exception:
         # Hooks must never crash — log to stderr for debugging
         import traceback

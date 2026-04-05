@@ -485,7 +485,14 @@ TABLES = {
             created_at      TEXT NOT NULL,
             status          TEXT NOT NULL DEFAULT 'pending',
             embedded_at     TEXT,
-            error_message   TEXT
+            error_message   TEXT,
+            source          TEXT,
+            confidence          REAL,
+            source_session_id   TEXT,
+            transcript_path     TEXT,
+            source_line_range   TEXT,
+            extraction_timestamp TEXT,
+            source_pipeline     TEXT
         )
     """,
     "predictions": """
@@ -758,7 +765,8 @@ TABLES = {
             created_at       TEXT NOT NULL,
             collection       TEXT NOT NULL DEFAULT 'episodic_memory',
             confidence       REAL,
-            embedding_status TEXT NOT NULL DEFAULT 'embedded'
+            embedding_status TEXT NOT NULL DEFAULT 'embedded',
+            memory_class     TEXT DEFAULT 'fact'
         )
     """,
 }

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import sqlite3
 from typing import TYPE_CHECKING
@@ -122,12 +121,24 @@ async def cc_sessions(
         logger.debug("Shadow cost query failed", exc_info=True)
 
     cc_realtime_status = "unknown"
+    fg_status = "healthy"  # CC is always "on" — default to healthy
     if state_machine:
-        with contextlib.suppress(AttributeError):
-            cc_realtime_status = state_machine.current.cc.name
+        try:
+            from genesis.resilience.state import CCStatus
+
+            cc_state = state_machine.current.cc
+            cc_realtime_status = cc_state.name
+            fg_status = {
+                CCStatus.NORMAL: "healthy",
+                CCStatus.THROTTLED: "degraded",
+                CCStatus.RATE_LIMITED: "degraded",
+                CCStatus.UNAVAILABLE: "down",
+            }.get(cc_state, "healthy")
+        except (AttributeError, ImportError):
+            pass  # keep defaults
 
     return {
-        "foreground": {"status": "active" if fg_active > 0 else "idle", "active": fg_active},
+        "foreground": {"status": fg_status, "active": fg_active},
         "background": {
             "status": cc_status,
             "active": bg_active,

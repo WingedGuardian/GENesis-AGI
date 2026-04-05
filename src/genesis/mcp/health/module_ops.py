@@ -3,7 +3,7 @@
 The MCP server runs standalone (no GenesisRuntime). This tool reads module
 YAML configs directly and creates IPC adapters to communicate with external
 programs. Native modules are not accessible via this path — they run inside
-the bridge process.
+the genesis-server process.
 """
 
 from __future__ import annotations

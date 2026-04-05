@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from genesis.observability.types import ProbeStatus
+from genesis.util.systemd import systemctl_env
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,7 @@ class RemediationRegistry:
                 *action.command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=systemctl_env(),
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(), timeout=30,

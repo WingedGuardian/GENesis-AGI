@@ -41,6 +41,7 @@ firebase-debug.log
 scripts/cc_cli_output/
 .firecrawl/
 .mcp.json
+config/.generated/
 .gstack/
 .context/
 .playwright-mcp/
@@ -48,5 +49,9 @@ logs/
 genesis.db
 *.bak.*
 data/telegram/
+# Action item tracking — structure tracked, contents gitignored
+docs/actions/genesis/*.md
+docs/actions/user/*.md
+!docs/actions/README.md
 data/genesis.db
 *.jsonl

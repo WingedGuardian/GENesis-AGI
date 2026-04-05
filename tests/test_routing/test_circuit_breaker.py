@@ -116,6 +116,67 @@ def test_degraded_errors_trip():
     assert cb.state == ProviderState.OPEN
 
 
+# --- probe_suspect tests ---
+
+
+def test_probe_suspect_closed_to_half_open():
+    """Probe suspect should move CLOSED → HALF_OPEN."""
+    cb = CircuitBreaker(_provider())
+    assert cb.state == ProviderState.CLOSED
+    changed = cb.probe_suspect()
+    assert changed is True
+    assert cb.state == ProviderState.HALF_OPEN
+
+
+def test_probe_suspect_noop_when_open():
+    """Probe suspect should NOT change OPEN state (already worse)."""
+    cb = CircuitBreaker(_provider(), failure_threshold=2, clock=lambda: 0)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    assert cb.state == ProviderState.OPEN
+    changed = cb.probe_suspect()
+    assert changed is False
+    assert cb.state == ProviderState.OPEN
+
+
+def test_probe_suspect_noop_when_half_open():
+    """Probe suspect should NOT change HALF_OPEN (already suspect)."""
+    t = [0.0]
+    cb = CircuitBreaker(
+        _provider(), failure_threshold=2, open_duration_s=10, clock=lambda: t[0]
+    )
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    cb.record_failure(ErrorCategory.TRANSIENT)
+    t[0] = 10.0
+    assert cb.state == ProviderState.HALF_OPEN
+    changed = cb.probe_suspect()
+    assert changed is False
+    assert cb.state == ProviderState.HALF_OPEN
+
+
+def test_probe_suspect_resets_consecutive_successes():
+    """Probe suspect should clear success counter so recovery requires fresh successes."""
+    cb = CircuitBreaker(_provider(), success_threshold=2)
+    # Manually set to HALF_OPEN with 1 success already banked
+    cb._state = ProviderState.HALF_OPEN
+    cb._consecutive_successes = 1
+    # Recover to CLOSED
+    cb.record_success()
+    assert cb.state == ProviderState.CLOSED
+    # Now probe suspect — should reset successes
+    changed = cb.probe_suspect()
+    assert changed is True
+    assert cb._consecutive_successes == 0
+
+
+def test_probe_suspect_triggers_state_persistence():
+    """Probe suspect should trigger on_state_change callback (state persistence)."""
+    changes = []
+    cb = CircuitBreaker(_provider(), on_state_change=lambda: changes.append(1))
+    cb.probe_suspect()
+    assert len(changes) == 1
+
+
 # --- Escalating backoff tests ---
 
 

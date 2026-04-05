@@ -1,10 +1,9 @@
 #!/bin/bash
-# Capture the current Genesis + Agent Zero recovery baseline without mutating either repo.
+# Capture the current Genesis recovery baseline without mutating the repo.
 
 set -euo pipefail
 
 GENESIS_REPO="${GENESIS_REPO:-$HOME/genesis}"
-AZ_REPO="${AZ_REPO:-$HOME/agent-zero}"
 OUT_DIR="${1:-$HOME/tmp/genesis-recovery-$(date -u +%Y%m%dT%H%M%SZ)}"
 
 mkdir -p "$OUT_DIR"
@@ -24,7 +23,6 @@ capture_repo() {
 }
 
 capture_repo genesis "$GENESIS_REPO"
-capture_repo agent-zero "$AZ_REPO"
 
 python3 --version > "$OUT_DIR/python_version.txt"
 node --version > "$OUT_DIR/node_version.txt"

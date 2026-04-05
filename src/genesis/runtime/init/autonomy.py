@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -45,12 +46,47 @@ def init(rt: GenesisRuntime) -> None:
 
         if rt._db is not None:
             from genesis.autonomy.approval import ApprovalManager
+            from genesis.autonomy.autonomous_dispatch import (
+                AutonomousCliApprovalGate,
+                AutonomousDispatchRouter,
+            )
+            from genesis.autonomy.cli_policy import AutonomousCliPolicyExporter
 
             rt._approval_manager = ApprovalManager(
                 db=rt._db,
                 event_bus=rt._event_bus,
                 classifier=rt._action_classifier,
             )
+            rt._autonomous_cli_policy_exporter = AutonomousCliPolicyExporter()
+            if rt._router is not None:
+                rt._autonomous_cli_approval_gate = AutonomousCliApprovalGate(
+                    runtime=rt,
+                    approval_manager=rt._approval_manager,
+                )
+                rt._autonomous_dispatcher = AutonomousDispatchRouter(
+                    router=rt._router,
+                    approval_gate=rt._autonomous_cli_approval_gate,
+                )
+                if rt._cc_reflection_bridge is not None:
+                    with contextlib.suppress(Exception):
+                        rt._cc_reflection_bridge.set_autonomous_dispatcher(
+                            rt._autonomous_dispatcher,
+                        )
+                if rt._inbox_monitor is not None and hasattr(
+                    rt._inbox_monitor, "set_autonomous_dispatcher",
+                ):
+                    with contextlib.suppress(Exception):
+                        rt._inbox_monitor.set_autonomous_dispatcher(
+                            rt._autonomous_dispatcher,
+                        )
+                logger.info("Autonomous dispatch router initialized")
+            if rt._awareness_loop is not None:
+                with contextlib.suppress(Exception):
+                    rt._awareness_loop.set_autonomous_cli_policy_exporter(
+                        rt._autonomous_cli_policy_exporter.export,
+                    )
+            with contextlib.suppress(Exception):
+                rt._autonomous_cli_policy_exporter.export()
 
             from genesis.util.tasks import tracked_task
 

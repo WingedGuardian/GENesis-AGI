@@ -63,7 +63,7 @@ class TestClassify:
         assert registry.classify("config/genesis-watchdog.service") is ProtectionLevel.CRITICAL
 
     def test_critical_secrets(self, registry: ProtectedPathRegistry):
-        assert registry.classify("~/agent-zero/usr/secrets.env") is ProtectionLevel.CRITICAL
+        assert registry.classify("~/genesis/secrets.env") is ProtectionLevel.CRITICAL
 
     def test_critical_cc_hooks(self, registry: ProtectedPathRegistry):
         assert registry.classify(".claude/settings.json") is ProtectionLevel.CRITICAL

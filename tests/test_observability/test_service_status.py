@@ -86,7 +86,7 @@ class TestCollectServiceStatus:
 
     def test_bridge_active(self):
         def mock_query(unit):
-            if "bridge" in unit:
+            if "genesis-server" in unit or "genesis-bridge" in unit:
                 return {
                     "ActiveState": "active",
                     "SubState": "running",
@@ -98,11 +98,14 @@ class TestCollectServiceStatus:
         with (
             patch("genesis.observability.service_status.query_systemd_unit", side_effect=mock_query),
             patch("genesis.observability.service_status._bridge_pid_alive", return_value=(12345, True)),
+            patch("genesis.observability.service_status._detect_genesis_service",
+                  return_value=("genesis-server.service", "Server")),
         ):
             result = collect_service_status()
         assert result["bridge"]["active_state"] == "active"
         assert result["bridge"]["pid"] == 12345
         assert result["bridge"]["pid_alive"] is True
+        assert result["bridge"]["service_label"] == "Server"
 
     def test_watchdog_in_backoff(self, tmp_path):
         state_file = tmp_path / "watchdog_state.json"

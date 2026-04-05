@@ -5,9 +5,24 @@ from __future__ import annotations
 import json as _json
 from datetime import UTC, datetime
 
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+
+
+def _parse_approval_rows(rows: list[dict]) -> list[dict]:
+    parsed: list[dict] = []
+    for row in rows:
+        entry = dict(row)
+        try:
+            context = _json.loads(entry.get("context") or "{}")
+        except (TypeError, ValueError):
+            context = {}
+        if not isinstance(context, dict):
+            context = {}
+        entry["context_data"] = context
+        parsed.append(entry)
+    return parsed
 
 
 @blueprint.route("/api/genesis/approvals")
@@ -22,7 +37,52 @@ async def pending_approvals():
         return jsonify([])
 
     pending = await approval_requests.list_pending(rt._db)
-    return jsonify(pending)
+    return jsonify(_parse_approval_rows(pending))
+
+
+@blueprint.route("/api/genesis/approvals/<request_id>/resolve", methods=["POST"])
+@_async_route
+async def resolve_approval(request_id: str):
+    """Resolve a pending approval request from the dashboard."""
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    gate = getattr(rt, "_autonomous_cli_approval_gate", None)
+    if not rt.is_bootstrapped or gate is None:
+        return jsonify({"error": "Approval gate unavailable"}), 503
+
+    payload = request.get_json(silent=True) or {}
+    decision = str(payload.get("decision") or "").strip().lower()
+    if decision not in {"approved", "rejected"}:
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    ok = await gate.resolve_request(
+        request_id,
+        decision=decision,
+        resolved_by="dashboard",
+    )
+    if not ok:
+        return jsonify({"error": "Approval not found or no longer pending"}), 404
+    return jsonify({"id": request_id, "status": decision})
+
+
+@blueprint.route("/api/genesis/autonomous-cli-policy")
+@_async_route
+async def autonomous_cli_policy():
+    """Return effective autonomous CLI policy plus export status."""
+    from genesis.autonomy.cli_policy import load_autonomous_cli_policy
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    exporter = getattr(rt, "_autonomous_cli_policy_exporter", None)
+    if exporter is not None and hasattr(exporter, "status"):
+        return jsonify(exporter.status())
+    return jsonify({
+        "effective_policy": load_autonomous_cli_policy().as_dict(),
+        "last_export_at": None,
+        "last_export_path": None,
+        "last_export_error": None,
+    })
 
 
 @blueprint.route("/api/genesis/cognitive")

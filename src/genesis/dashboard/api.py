@@ -21,23 +21,7 @@ def dashboard_page():
     return send_from_directory(str(TEMPLATE_DIR), "genesis_dashboard.html")
 
 
-from genesis.dashboard.routes import (  # noqa: F401,E402
-    activity,
-    budget,
-    config,
-    errors,
-    events,
-    health,
-    modules,
-    outreach,
-    providers,
-    recon,
-    resolution,
-    routing,
-    services,
-    state,
-    vitals,
-)
+import genesis.dashboard.routes  # noqa: F401,E402 — triggers route registration via side effects
 
 genesis_dashboard = blueprint
 

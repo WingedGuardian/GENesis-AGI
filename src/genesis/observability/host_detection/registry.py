@@ -32,12 +32,6 @@ class HostDetectorRegistry:
     def _discover_detectors(self) -> None:
         """Import and register all concrete detectors."""
         detectors: list[HostDetector] = []
-        try:
-            from genesis.observability.host_detection.agent_zero import AgentZeroDetector
-
-            detectors.append(AgentZeroDetector())
-        except Exception:
-            logger.warning("Failed to load AgentZeroDetector", exc_info=True)
 
         # Future detectors go here:
         # from genesis.observability.host_detection.openclaw import OpenClawDetector

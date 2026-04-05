@@ -28,6 +28,12 @@ _READONLY_DISALLOWED = [
 # disallowed_tools matches tool NAMES (e.g. "Bash"), not command substrings.
 # Hooks fire for ALL sessions including claude -p, so protection is global.
 
+# MCP server profiles — which servers each session type needs.
+# Module-level constant (immutable intent), consistent with _READONLY_DISALLOWED.
+_MCP_PROFILES: dict[str, list[str]] = {
+    "reflection": ["genesis-health", "genesis-memory"],
+}
+
 
 class SessionConfigBuilder:
     """Builds CC session configurations per type."""
@@ -97,10 +103,72 @@ class SessionConfigBuilder:
         logger.warning("SOUL.md not found, using minimal identity")
         return "You are Genesis, an autonomous AI agent."
 
-    # GROUNDWORK(mcp-config): MCP config generation for CC sessions
-    def build_mcp_config(self) -> dict | None:
-        """Placeholder for MCP config generation. Needs CC features."""
-        return None
+    def build_mcp_config(self, profile: str = "full") -> str | None:
+        """Generate MCP config file path for a session profile.
+
+        Profiles:
+          - ``"none"``: no MCP servers (LIGHT reflection).
+          - ``"reflection"``: health + memory only (DEEP/STRATEGIC).
+          - ``"full"``: all servers — returns *None* so CC uses its default config.
+
+        Returns a file path string or *None*.
+        """
+        import json
+        import os
+        from pathlib import Path
+
+        config_dir = Path(__file__).resolve().parent.parent.parent.parent / "config"
+
+        if profile == "full":
+            return None
+
+        if profile == "none":
+            return str(config_dir / "no_mcp.json")
+
+        servers = _MCP_PROFILES.get(profile)
+        if not servers:
+            logger.warning("Unknown MCP profile %r, using full", profile)
+            return None
+
+        generated_dir = config_dir / ".generated"
+        generated_path = generated_dir / f"{profile}_mcp.json"
+        template_path = config_dir / "mcp.json.template"
+
+        # Cache: skip regeneration if generated file is fresh.
+        if (
+            generated_path.exists()
+            and template_path.exists()
+            and generated_path.stat().st_mtime >= template_path.stat().st_mtime
+        ):
+            return str(generated_path)
+
+        # Generate from template.
+        try:
+            genesis_root = str(config_dir.parent)
+            template_text = template_path.read_text(encoding="utf-8")
+            resolved = template_text.replace("{{GENESIS_ROOT}}", genesis_root)
+            full_config = json.loads(resolved)
+
+            filtered = {
+                "mcpServers": {
+                    k: v
+                    for k, v in full_config.get("mcpServers", {}).items()
+                    if k in servers
+                }
+            }
+
+            os.makedirs(generated_dir, exist_ok=True)
+            generated_path.write_text(
+                json.dumps(filtered, indent=2) + "\n", encoding="utf-8",
+            )
+            return str(generated_path)
+        except Exception:
+            logger.warning(
+                "MCP config generation failed for profile %r, using full",
+                profile,
+                exc_info=True,
+            )
+            return None
 
     # GROUNDWORK(hook-inheritance): Hook inheritance for CC sessions
     def build_hook_config(self) -> dict | None:

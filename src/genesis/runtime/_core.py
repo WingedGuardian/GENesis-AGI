@@ -209,6 +209,9 @@ class GenesisRuntime:
         self._recovery_orchestrator: object | None = None
         self._result_writer: object | None = None
         self._approval_manager: object | None = None
+        self._autonomous_cli_approval_gate: object | None = None
+        self._autonomous_dispatcher: object | None = None
+        self._autonomous_cli_policy_exporter: object | None = None
         self._approval_timeout_task: asyncio.Task | None = None
         self._findings_bridge: object | None = None
         self._idle_detector: IdleDetector | None = None
@@ -375,6 +378,10 @@ class GenesisRuntime:
     @property
     def task_executor(self) -> object | None:
         return self._task_executor
+
+    @property
+    def autonomous_dispatcher(self) -> object | None:
+        return self._autonomous_dispatcher
 
     @property
     def provider_registry(self) -> ProviderRegistry | None:

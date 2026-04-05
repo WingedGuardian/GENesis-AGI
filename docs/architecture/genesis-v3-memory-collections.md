@@ -1,6 +1,6 @@
 # Genesis v3 — Memory Collection Architecture
 
-**Status:** Active | **Last updated:** 2026-03-24
+**Status:** Active | **Last updated:** 2026-04-03
 
 
 ## Overview
@@ -28,6 +28,16 @@ extracted facts, session bookmarks, and reflection outputs.
 **Scope tags in payload:**
 - `scope: "user"` — Conversations, decisions, evaluations, facts (default)
 - `scope: "internal"` — Reflection outputs, extraction metadata
+
+**Classification in payload (added 2026-04-03):**
+- `memory_class: "rule"` — Actionable instructions (NEVER, ALWAYS, MUST).
+  Gets 1.3x activation boost. Two-tier formatting in proactive hook (always full).
+- `memory_class: "fact"` — Informational (default). Neutral weight.
+- `memory_class: "reference"` — Pointers to external resources. 0.7x weight.
+
+Auto-classified at store time by `classification.classify_memory()` based on
+content heuristics + CC file memory type. Can be overridden via `memory_class`
+param on `memory_store` MCP tool or `MemoryStore.store()`.
 
 **Searched by:** proactive memory hook (UserPromptSubmit), `memory_recall` MCP,
 `memory_proactive` MCP, `HybridRetriever.recall()`.
@@ -82,6 +92,16 @@ All other callers use the default map, which routes everything to
 | `procedural_memory` | Learned procedures, versioned | No — SQLite only |
 | `session_bookmarks` | Session resumption markers | Partially — also stored in episodic_memory |
 | `memory_links` | Graph connections between memories | References Qdrant point IDs |
+| `memory_metadata` | Timestamps, confidence, embedding_status, memory_class | Yes — `memory_id` = Qdrant point ID |
+| `pending_embeddings` | Embedding failure recovery queue (with provenance) | Pending → Qdrant on recovery |
+
+## Proactive Hook File-Context Awareness (added 2026-04-03)
+
+A PostToolUse hook (`scripts/file_context_hook.py`) tracks file paths from
+Read/Edit/Write/Glob/Grep operations, writing them to
+`~/.genesis/sessions/{session_id}/recent_files.json`. The proactive memory
+hook reads this file and decomposes paths into keywords that augment the
+FTS5 query, improving retrieval relevance for the current work context.
 
 ## History
 
@@ -91,6 +111,20 @@ entries (evaluations, session facts) to accumulate in the domain store.
 The fix: route all internal knowledge to `episodic_memory`, give domain
 writers explicit collection overrides, migrate existing entries, and
 clear `knowledge_base` for its intended purpose.
+
+**Memory rebalance (2026-04-03):**
+- Added `memory_class` (rule/fact/reference) to Qdrant payloads and
+  `memory_metadata` table. Auto-classified at store time.
+- Rules get 1.3x activation boost; references get 0.7x.
+- Proactive hook uses two-tier formatting (full for rank 1 + rules, compact
+  for lower-ranked non-rules).
+- PostToolUse file-context hook tracks recent files per session; proactive
+  hook augments FTS5 queries with file-derived keywords.
+- Purged ~1,600 orphaned memory_links (24% of graph) via migration.
+- Added provenance columns to `pending_embeddings` so recovery worker
+  preserves source_session_id, transcript_path, etc.
+- Query expansion in `HybridRetriever.recall()` defaulted to off
+  (`expand_query_terms=False`). Opt-in for callers that need it.
 
 ---
 

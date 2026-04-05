@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     import aiosqlite
 
+    from genesis.observability.provider_health import ProviderHealthChecker
     from genesis.resilience.cc_budget import CCBudgetTracker
     from genesis.resilience.deferred_work import DeferredWorkQueue
     from genesis.resilience.state import ResilienceStateMachine
@@ -52,6 +53,7 @@ class HealthDataService:
         learning_scheduler: object | None = None,
         resilience_state_machine: ResilienceStateMachine | None = None,
         activity_tracker: object | None = None,
+        provider_health_checker: ProviderHealthChecker | None = None,
     ) -> None:
         self._breakers = circuit_breakers
         self._routing_config = routing_config
@@ -64,6 +66,7 @@ class HealthDataService:
         self._learning_scheduler = learning_scheduler
         self._state_machine = resilience_state_machine
         self._activity_tracker = activity_tracker
+        self._provider_health = provider_health_checker
 
     async def snapshot(self) -> dict:
         """Return full system health state as a dict."""
@@ -85,9 +88,24 @@ class HealthDataService:
         )
 
         now = datetime.now(UTC).isoformat()
+
+        # Probe providers if cache is stale (probes are free — /v1/models endpoints)
+        probe_results = None
+        if self._provider_health:
+            if self._provider_health.is_stale():
+                try:
+                    await self._provider_health.probe_all()
+                except Exception:
+                    logger.warning("Provider health probe failed", exc_info=True)
+            probe_results = self._provider_health.results
+
         return {
             "timestamp": now,
-            "call_sites": await call_sites(self._db, self._routing_config, self._breakers),
+            "call_sites": await call_sites(
+                self._db, self._routing_config, self._breakers,
+                probe_results=probe_results,
+                state_machine=self._state_machine,
+            ),
             "cc_sessions": await cc_sessions(self._db, self._cc_budget, self._state_machine),
             "resilience": self._resilience_state(),
             "infrastructure": await infrastructure(
@@ -104,6 +122,22 @@ class HealthDataService:
             "conversation": conversation_activity(),
             "provider_activity": await provider_activity(self._activity_tracker),
             "proactive_memory": proactive_memory_metrics(),
+            "provider_health": self._serialize_provider_health(),
+        }
+
+    def _serialize_provider_health(self) -> dict:
+        """Serialize provider probe results for the snapshot."""
+        if not self._provider_health:
+            return {}
+        return {
+            name: {
+                "reachable": r.reachable,
+                "model_available": r.model_available,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+                "checked_at": r.checked_at,
+            }
+            for name, r in self._provider_health.results.items()
         }
 
     def _resilience_state(self) -> str:

@@ -9,6 +9,28 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ## [Unreleased]
 
+### Changed
+
+- **Standalone-only architecture** — Agent Zero fully removed. Genesis runs as
+  a standalone server (`python -m genesis serve`) with its own dashboard,
+  terminal, and API. AZ can still be used as an optional external agent
+  framework via the adapter interface, but is no longer required or bundled.
+- **OpenClaw gateway** — Genesis exposes `POST /v1/chat/completions` so OpenClaw
+  (or any OpenAI-compatible router) can route channels through it
+- **SDK-primary engine routing** — Claude SDK API is the primary execution path;
+  Claude Code subprocess is optional based on operator preference
+
+### Added
+
+- **Neural monitor overhaul** — provider probes, subsystem grouping, circuit
+  breaker wiring, detail panel with live backend data, warning severity color
+- **Autonomy enforcement** — data-driven RuleEngine with graduated enforcement
+  spectrum (inform → guide → guard → block), SteerMessage abstraction
+- **Anti-vision identity boundaries** — selective MCP loading, executor plan
+  directive for content evaluation
+- **User-evaluate skill** — evaluate content through Genesis's user model
+- **update.sh** — pull, sync dependencies, restart services in one command
+
 ### Fixed
 
 - **host-setup.sh**: Fix container networking on cloud VMs (GCP, AWS, Azure) —
@@ -24,6 +46,10 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
   any failure; `DEBUG=1` enables full `set -x` tracing
 - **host-setup.sh**: Enable IP forwarding and bridge NAT before container
   creation; show progress during package installation
+- **Dashboard**: uptime counter timezone bug, restart button self-restart,
+  post-AZ-removal regressions, probe override guard, detail panel staleness
+- **update.sh**: Use `--rebase` to avoid divergent-branch errors on pull
+- **Terminal**: Prefill CC command without auto-executing (user chooses when)
 - **push-public-release.sh**: Create tag and GitHub Release even when content
   was already pushed (previously exited early, skipping the release step)
 - **install.sh**: Add `cd ~/genesis &&` to headless login instructions so
@@ -33,8 +59,8 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ## [v3.0a] - 2026-04-03
 
-Genesis v3 — complete autonomous agent system built on Agent Zero.
-First public release. All Phase 0–9 subsystems built, wired, and tested.
+Genesis v3 — complete autonomous agent system. First public release.
+All Phase 0–9 subsystems built, wired, and tested.
 
 ### Added
 
@@ -57,8 +83,8 @@ First public release. All Phase 0–9 subsystems built, wired, and tested.
   with automated stripping of user-specific content
 - **Dashboard** — web UI with system health, session management, built-in
   terminal, settings hub
-- **Dual-engine architecture** — Agent Zero + standalone server mode; adapter
-  protocol for provider-agnostic operation
+- **Standalone server** — `python -m genesis serve` runs dashboard, API, and
+  all subsystems; adapter protocol for provider-agnostic operation
 - **Model routing** — configurable per-call-site routing with fallback chains,
   cost tracking, and provider health monitoring
 - **Inbox monitor** — filesystem inbox for asynchronous task ingestion
@@ -67,12 +93,11 @@ First public release. All Phase 0–9 subsystems built, wired, and tested.
 - **Hooks system** — PreToolUse/PostToolUse guards for behavioral enforcement
   (blocking pip editable installs to worktrees, validating kill signals, etc.)
 - **Bootstrap script** — idempotent machine setup: venv, secrets, systemd
-  services, AZ plugin sync, Claude Code config generation
+  services, Claude Code config generation
 
 ### Breaking
 
 - Requires Python 3.12 and Ubuntu 22.04+
-- Requires Agent Zero fork: `WingedGuardian/agent-zero`
 - `secrets.env` must be populated with API keys before first run
 - Telegram bot token required for channel features
 - Qdrant must be running locally (`localhost:6333`)

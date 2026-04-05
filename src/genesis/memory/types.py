@@ -14,6 +14,7 @@ class MemoryRecord:
     created_at: str
     retrieved_count: int
     link_count: int
+    memory_class: str = "fact"
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,8 @@ class RetrievalResult:
     transcript_path: str | None = None
     source_line_range: tuple[int, int] | None = None
     source_pipeline: str | None = None
+    # Memory classification (rule/fact/reference)
+    memory_class: str = "fact"
     # Intent routing — V4 groundwork
     query_intent: str | None = None
     intent_confidence: float = 0.0

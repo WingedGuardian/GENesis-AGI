@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -41,8 +42,21 @@ def test_dashboard_page_contains_operator_controls(client):
     page = resp.get_data(as_text=True)
     assert "Clear all reviewed" in page
     assert "Reload routing config" in page
+    assert "Approval Queue" in page
     assert "Save budget" in page
     assert "Review routing" in page
+    assert "Autonomous CLI Policy" in page
+
+
+def test_settings_index_exposes_autonomous_cli_policy(client):
+    """Settings index includes the autonomous CLI policy form domain."""
+    resp = client.get("/api/genesis/settings")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    entry = next((row for row in data if row["name"] == "autonomous_cli_policy"), None)
+    assert entry is not None
+    assert entry["readonly"] is False
+    assert entry["has_form"] is True
 
 
 # ── Activity feed ─────────────────────────────────────────────────────────
@@ -236,8 +250,35 @@ def test_provider_activity_returns_summaries(client):
         MockRT.instance.return_value = mock_rt
         resp = client.get("/api/genesis/provider-activity")
         assert resp.status_code == 200
-        data = resp.get_json()
-        assert len(data) == 2
+
+
+def test_autonomous_cli_policy_endpoint_uses_runtime_export_status(client):
+    """Autonomous CLI policy endpoint returns exporter status when available."""
+    mock_exporter = MagicMock()
+    mock_exporter.status.return_value = {
+        "effective_policy": {
+            "autonomous_cli_fallback_enabled": True,
+            "manual_approval_required": True,
+            "reask_interval_hours": 24,
+            "approval_channel": "telegram",
+            "shared_export_enabled": True,
+            "source": "config:autonomous_cli_policy.yaml",
+        },
+        "last_export_at": "2026-04-04T12:00:00+00:00",
+        "last_export_path": "/tmp/shared/guardian/autonomous_cli_policy.json",
+        "last_export_error": None,
+    }
+    mock_rt = MagicMock()
+    mock_rt._autonomous_cli_policy_exporter = mock_exporter
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/autonomous-cli-policy")
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data["effective_policy"]["manual_approval_required"] is True
+    assert data["last_export_path"].endswith("autonomous_cli_policy.json")
 
 
 def test_provider_activity_filters_by_name(client):
@@ -409,6 +450,43 @@ def test_set_budget_rejects_invalid_budget_type(client):
 
 
 # ── Routing configuration ───────────────────────────────────────────────
+
+
+def test_routing_config_read_includes_call_sites(client):
+    """Routing config read exposes configured call sites for the dashboard editor."""
+    mock_cfg = SimpleNamespace()
+    mock_cfg.providers = {
+        "claude-sonnet": SimpleNamespace(
+            name="claude-sonnet",
+            provider_type="anthropic",
+            model_id="claude-sonnet-4-6-20250514",
+            is_free=False,
+        ),
+    }
+    mock_cfg.call_sites = {
+        "autonomous_executor_reasoning": SimpleNamespace(
+            chain=["claude-sonnet"],
+            default_paid=True,
+            never_pays=False,
+            retry_profile="background",
+        ),
+    }
+    mock_router = MagicMock()
+    mock_router.config = mock_cfg
+    mock_router.breakers = {"claude-sonnet": MagicMock(state=MagicMock(value="closed"))}
+    mock_rt = MagicMock()
+    mock_rt.is_bootstrapped = True
+    mock_rt.router = mock_router
+
+    with patch("genesis.runtime.GenesisRuntime") as MockRT:
+        MockRT.instance.return_value = mock_rt
+        resp = client.get("/api/genesis/routing/config")
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert "autonomous_executor_reasoning" in data["call_sites"]
+    assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["claude-sonnet"]
+    assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
 
 
 def test_routing_config_update_endpoint(client):

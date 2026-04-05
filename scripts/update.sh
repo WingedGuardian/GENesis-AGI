@@ -22,7 +22,7 @@ echo ""
 
 # ── Pull ──────────────────────────────────────────────────
 echo "--- Pulling latest ---"
-git -C "$GENESIS_ROOT" pull origin main
+git -C "$GENESIS_ROOT" pull --rebase origin main
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
@@ -51,11 +51,10 @@ fi
 echo "  Dependencies synced"
 echo ""
 
-# ── Stop services before plugin sync ─────────────────────
-# Stop first to avoid AZ reading partially-updated plugin files during rsync
+# ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 WERE_RUNNING=()
-for svc in agent-zero genesis-bridge; do
+for svc in genesis-server genesis-bridge; do
     if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
         systemctl --user stop "$svc.service"
         WERE_RUNNING+=("$svc")
@@ -63,20 +62,6 @@ for svc in agent-zero genesis-bridge; do
 done
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
-
-# ── Sync AZ plugins ───────────────────────────────────────
-AZ_ROOT="$HOME/agent-zero"
-if [[ -d "$AZ_ROOT/usr/plugins" && -d "$GENESIS_ROOT/az_plugins/genesis" ]]; then
-    echo "--- Syncing AZ plugins ---"
-    if command -v rsync &>/dev/null; then
-        rsync -a --delete "$GENESIS_ROOT/az_plugins/genesis/" "$AZ_ROOT/usr/plugins/genesis/"
-    else
-        rm -rf "$AZ_ROOT/usr/plugins/genesis"
-        cp -r "$GENESIS_ROOT/az_plugins/genesis" "$AZ_ROOT/usr/plugins/"
-    fi
-    echo "  AZ plugins synced"
-    echo ""
-fi
 
 # ── Restart services ──────────────────────────────────────
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then

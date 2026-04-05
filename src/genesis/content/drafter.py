@@ -26,7 +26,12 @@ class ContentDrafter:
         self._event_bus = event_bus
         self._formatter = ContentFormatter()
 
-    async def draft(self, request: DraftRequest) -> DraftResult:
+    async def draft(
+        self,
+        request: DraftRequest,
+        *,
+        call_site_id: str = "35_content_draft",
+    ) -> DraftResult:
         """Draft content. Falls back to topic as content if no router."""
         if self._router is None:
             formatted = self._formatter.format(request.topic, request.target)
@@ -40,7 +45,7 @@ class ContentDrafter:
         result = None
         try:
             result = await self._router.route_call(
-                call_site_id="35_content_draft",
+                call_site_id=call_site_id,
                 messages=messages,
             )
             raw = result.content or request.topic

@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.executor import dispatch as _dispatch
 from genesis.autonomy.executor import worktree_mgr as _worktree
 from genesis.autonomy.executor.types import (
@@ -58,6 +59,7 @@ class CCSessionExecutor:
         outreach_pipeline: Any | None = None,
         event_bus: Any | None = None,
         runtime: Any | None = None,
+        autonomous_dispatcher: Any | None = None,
     ) -> None:
         self._db = db
         self._invoker = invoker
@@ -68,6 +70,7 @@ class CCSessionExecutor:
         self._outreach = outreach_pipeline
         self._event_bus = event_bus
         self._runtime = runtime
+        self._autonomous_dispatcher = autonomous_dispatcher
 
         # In-memory state
         self._active_tasks: dict[str, TaskPhase] = {}
@@ -563,6 +566,49 @@ class CCSessionExecutor:
             skip_permissions=True,
             working_dir=working_dir,
         )
+
+        api_call_site_id = None
+        if step_type in (StepType.RESEARCH, StepType.ANALYSIS, StepType.SYNTHESIS):
+            api_call_site_id = "autonomous_executor_reasoning"
+
+        if self._autonomous_dispatcher is not None:
+            decision = await self._autonomous_dispatcher.route(
+                AutonomousDispatchRequest(
+                    subsystem="task_executor",
+                    policy_id=f"executor_{step_type.value}",
+                    action_label=f"task step {step_idx} ({step_type.value})",
+                    messages=[{"role": "user", "content": prompt}],
+                    cli_invocation=invocation,
+                    api_call_site_id=api_call_site_id,
+                    cli_fallback_allowed=True,
+                    approval_required_for_cli=True,
+                    context={
+                        "task_id": task_id,
+                        "step_idx": step_idx,
+                        "step_type": step_type.value,
+                    },
+                ),
+            )
+            if decision.mode == "blocked":
+                return StepResult(
+                    idx=step_idx,
+                    status="blocked",
+                    result=decision.reason,
+                    blocker_description=decision.reason,
+                )
+            if decision.mode == "api" and decision.output is not None:
+                parsed = _dispatch.parse_step_output(decision.output.text)
+                return StepResult(
+                    idx=step_idx,
+                    status=parsed.get("status", "completed"),
+                    result=parsed.get("result", decision.output.text[:500]),
+                    cost_usd=decision.output.cost_usd,
+                    session_id=decision.output.session_id,
+                    model_used=decision.output.model_used,
+                    duration_s=0.0,
+                    artifacts=parsed.get("artifacts", []),
+                    blocker_description=parsed.get("blocker_description"),
+                )
 
         start = time.monotonic()
         output = await self._invoker.run(invocation)

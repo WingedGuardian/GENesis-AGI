@@ -51,6 +51,11 @@ class CCInvoker:
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
 
+    @property
+    def working_dir(self) -> str | None:
+        """Working directory for CC subprocess (project root for CLAUDE.md context)."""
+        return self._working_dir
+
     def set_protected_paths(self, registry: object) -> None:
         """Late-bind ProtectedPathRegistry (initialized after CCInvoker)."""
         self._protected_paths = registry

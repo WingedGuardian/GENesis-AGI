@@ -31,7 +31,7 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "dashboard" / "template
 class StandaloneAdapter:
     """Genesis running itself — no host framework needed.
 
-    Bootstrap order mirrors ``_00_genesis_bootstrap.py``:
+    Bootstrap order:
     1. ``GenesisRuntime.bootstrap(mode="full")``
     2. Create Flask app with vendored static assets
     3. Register dashboard, health, and outreach blueprints
@@ -55,6 +55,7 @@ class StandaloneAdapter:
         self._runtime: GenesisRuntime | None = None
         self._shutdown_event = asyncio.Event()
         self._telegram_adapter = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def bootstrap(self) -> None:
         """Initialize GenesisRuntime and create the Flask app."""
@@ -76,6 +77,15 @@ class StandaloneAdapter:
         if self._app is None:
             logger.error("Cannot serve — bootstrap failed or not called")
             return
+
+        # Capture the running asyncio loop so Flask threads can submit
+        # coroutines via asyncio.run_coroutine_threadsafe().
+        self._loop = asyncio.get_running_loop()
+
+        # Create shared ConversationLoop for the OpenClaw endpoint.
+        # Same pattern as _start_telegram() but without channel-specific
+        # wiring (TTS, reply waiter, etc.).
+        self._init_openclaw_conversation_loop()
 
         # Flask in daemon thread
         flask_thread = threading.Thread(
@@ -150,6 +160,52 @@ class StandaloneAdapter:
     # Internal
     # ------------------------------------------------------------------
 
+    def _init_openclaw_conversation_loop(self) -> None:
+        """Create a ConversationLoop for the OpenClaw completions endpoint.
+
+        Stored in Flask app config so the completions blueprint can access
+        it from request context.  Also stores the asyncio loop reference
+        so Flask threads can submit coroutines to the main loop.
+        """
+        if self._app is None or self._runtime is None:
+            return
+
+        rt = self._runtime
+        if rt.cc_invoker is None or rt.db is None:
+            logger.warning("CC invoker or DB unavailable — OpenClaw ConversationLoop skipped")
+            return
+
+        try:
+            from genesis.cc.conversation import ConversationLoop
+            from genesis.cc.system_prompt import SystemPromptAssembler
+
+            assembler = SystemPromptAssembler()
+
+            failure_detector = None
+            try:
+                from genesis.learning.failure_detector import FailureDetector
+
+                failure_detector = FailureDetector()
+            except Exception:
+                logger.warning("Failed to init failure detector for OpenClaw", exc_info=True)
+
+            conversation_loop = ConversationLoop(
+                db=rt.db,
+                invoker=rt.cc_invoker,
+                assembler=assembler,
+                triage_pipeline=rt.triage_pipeline,
+                context_injector=rt.context_injector,
+                session_manager=rt.session_manager,
+                contingency=rt.contingency_dispatcher,
+                failure_detector=failure_detector,
+            )
+
+            self._app.config["OPENCLAW_CONVERSATION_LOOP"] = conversation_loop
+            self._app.config["GENESIS_EVENT_LOOP"] = self._loop
+            logger.info("OpenClaw ConversationLoop initialized")
+        except Exception:
+            logger.exception("Failed to initialize OpenClaw ConversationLoop")
+
     def _create_flask_app(self) -> Flask:
         """Create Flask app with vendored static assets."""
         webui_dir = _WEBUI_DIR if _WEBUI_DIR.exists() else None
@@ -172,7 +228,7 @@ class StandaloneAdapter:
         # dashboard blueprint (api.py, routes/events.py) — no duplication.
         @app.route("/genesis/monitor")
         def genesis_monitor_page():
-            return send_from_directory(str(_TEMPLATE_DIR), "genesis_dashboard.html")
+            return send_from_directory(str(_TEMPLATE_DIR), "neural_monitor.html")
 
         # Root redirect to dashboard
         @app.route("/")
@@ -184,16 +240,12 @@ class StandaloneAdapter:
         return app
 
     def _register_blueprints(self) -> None:
-        """Register all Genesis blueprints on the Flask app.
-
-        Mirrors the registration logic in
-        ``az_plugins/genesis/extensions/server_startup/_00_genesis_bootstrap.py``.
-        """
+        """Register all Genesis blueprints on the Flask app."""
         app = self._app
         if app is None:
             raise RuntimeError("Flask app not created — call bootstrap() first")
 
-        # Dashboard blueprint (all /api/genesis/* routes)
+        # Dashboard blueprint (all /api/genesis/* routes, SSE stream, etc.)
         try:
             from genesis.dashboard.api import blueprint as dash_bp
 
@@ -201,36 +253,16 @@ class StandaloneAdapter:
                 app.register_blueprint(dash_bp)
                 logger.info("Dashboard blueprint registered")
 
-            # Start heartbeat
-            from genesis.dashboard.heartbeat import DashboardHeartbeat
+                try:
+                    from genesis.dashboard.heartbeat import DashboardHeartbeat
 
-            DashboardHeartbeat(interval_seconds=60).start()
+                    DashboardHeartbeat(interval_seconds=60).start()
+                except Exception:
+                    logger.exception("Failed to start dashboard heartbeat")
         except Exception:
             logger.exception("Failed to register dashboard blueprint")
 
-        # Health API blueprint
-        try:
-            import importlib.util
-
-            health_path = (
-                Path(__file__).resolve().parent.parent.parent.parent
-                / "az_plugins" / "genesis" / "api_health.py"
-            )
-            if health_path.exists():
-                spec = importlib.util.spec_from_file_location(
-                    "genesis_api_health", health_path,
-                )
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                health_bp = mod.blueprint
-
-                if "genesis_health" not in app.blueprints:
-                    app.register_blueprint(health_bp)
-                    logger.info("Health API blueprint registered")
-        except Exception:
-            logger.exception("Failed to register health blueprint")
-
-        # Terminal WebSocket (flask-sock)
+        # Terminal WebSocket
         try:
             from genesis.dashboard.routes.terminal import register_terminal_ws
 
@@ -238,22 +270,27 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to register terminal WebSocket")
 
-        # NOTE: UI overlay blueprint (genesis_ui) is intentionally skipped.
-        # It injects CSS/JS into AZ's chat UI to hide AZ-specific elements.
-        # Not relevant for standalone mode — we own the entire UI.
-
         # Outreach API blueprint
         try:
             from genesis.outreach.api import init_outreach_api, outreach_api
+            from genesis.runtime import GenesisRuntime
 
-            if self._runtime and self._runtime.db:
-                init_outreach_api(db=self._runtime.db)
+            rt = GenesisRuntime.instance()
+            if rt.db:
+                init_outreach_api(db=rt.db)
 
             if "outreach_api" not in app.blueprints:
                 app.register_blueprint(outreach_api)
                 logger.info("Outreach API blueprint registered")
         except Exception:
             logger.exception("Failed to register outreach blueprint")
+
+        try:
+            from genesis.hosting.openclaw.adapter import OpenClawAdapter
+
+            OpenClawAdapter().register_blueprints(app)
+        except Exception:
+            logger.exception("OpenClaw adapter registration failed")
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""

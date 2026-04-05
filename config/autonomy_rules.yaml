@@ -1,0 +1,67 @@
+# Autonomy decision rules — evaluated in priority order (first match wins).
+#
+# Each rule has:
+#   rule_id:    Unique identifier
+#   condition:  Fields to match against RuleContext (AND logic, missing = wildcard)
+#   decision:   act | propose | block
+#   timeout_seconds: Approval timeout (null = wait forever, omit for act rules)
+#   description: Human-readable explanation
+#
+# Condition fields:
+#   action_class:     reversible | costly_reversible | irreversible
+#   protection_level: critical | sensitive | normal
+#   context:          List of context categories (relay, background, direct, sub_agent)
+#
+# Rules are evaluated top-to-bottom. First full match wins.
+# If no rule matches, the default decision is 'act' (reversible baseline).
+
+rules:
+  # --- Layer 6: Permission gates (context-dependent blocks) ---
+
+  - rule_id: critical_path_block
+    condition:
+      protection_level: critical
+      context: [relay, background, sub_agent]
+    decision: block
+    description: >-
+      CRITICAL paths cannot be modified from relay, background, or sub-agent
+      contexts. Requires a direct CC CLI session.
+
+  - rule_id: sensitive_path_propose
+    condition:
+      protection_level: sensitive
+      context: [relay]
+    decision: propose
+    timeout_seconds: 3600
+    description: >-
+      SENSITIVE paths in relay context require explicit user approval
+      with self-review.
+
+  # --- Layer 5: Irreversibility gates ---
+
+  - rule_id: irreversible_propose
+    condition:
+      action_class: irreversible
+    decision: propose
+    timeout_seconds: null
+    description: >-
+      All irreversible actions require user approval. No timeout —
+      wait indefinitely. No exceptions in V3.
+
+  - rule_id: costly_reversible_propose
+    condition:
+      action_class: costly_reversible
+    decision: propose
+    timeout_seconds: 86400
+    description: >-
+      Costly reversible actions (send, push, publish) require approval.
+      24-hour timeout — auto-reject if not approved.
+
+  # --- Baseline ---
+
+  - rule_id: reversible_act
+    condition:
+      action_class: reversible
+    decision: act
+    description: >-
+      Reversible actions proceed without approval.

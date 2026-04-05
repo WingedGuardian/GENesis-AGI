@@ -1,5 +1,11 @@
 # Evaluation Action Items — 2026-03-17
 
+> **Note:** The canonical location for action items is now `docs/actions/`.
+> New items should go to `docs/actions/genesis/active.md` (Genesis dev) or
+> `docs/actions/user/active.md` (user personal). This document is retained
+> as a historical reference. Items here will be consolidated during a
+> separate triage pass.
+
 Living document capturing action items from ongoing technology evaluation
 sessions. Items are added during evaluation, then planned and executed
 separately.

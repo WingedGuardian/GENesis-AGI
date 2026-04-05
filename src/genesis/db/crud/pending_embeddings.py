@@ -16,12 +16,23 @@ async def create(
     created_at: str,
     tags: str | None = None,
     status: str = "pending",
+    source: str | None = None,
+    confidence: float | None = None,
+    source_session_id: str | None = None,
+    transcript_path: str | None = None,
+    source_line_range: str | None = None,
+    extraction_timestamp: str | None = None,
+    source_pipeline: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO pending_embeddings
-           (id, memory_id, content, memory_type, tags, collection, created_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, memory_id, content, memory_type, tags, collection, created_at, status),
+           (id, memory_id, content, memory_type, tags, collection, created_at, status,
+            source, confidence, source_session_id, transcript_path,
+            source_line_range, extraction_timestamp, source_pipeline)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, memory_id, content, memory_type, tags, collection, created_at, status,
+         source, confidence, source_session_id, transcript_path,
+         source_line_range, extraction_timestamp, source_pipeline),
     )
     await db.commit()
     return id

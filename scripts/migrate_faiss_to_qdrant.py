@@ -91,7 +91,6 @@ async def migrate(
     import aiosqlite
 
     from genesis.db.schema import create_all_tables
-    from genesis.memory.az_adapter import doc_to_payload  # noqa: F401
     from genesis.memory.embeddings import EmbeddingProvider
     from genesis.memory.store import MemoryStore
     from genesis.qdrant.collections import ensure_collections, get_client

@@ -126,6 +126,16 @@
     ],
     "PostToolUse": [
       {
+        "matcher": "Read|Edit|Write|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_context_hook.py",
+            "timeout": 500
+          }
+        ]
+      },
+      {
         "matcher": "Bash",
         "hooks": [
           {

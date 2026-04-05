@@ -37,6 +37,7 @@ class EmbeddingRecoveryWorker:
         """Embed and upsert pending items. Returns count of successfully processed items."""
         from datetime import UTC, datetime
 
+        from genesis.memory.classification import classify_memory
         from genesis.qdrant.collections import upsert_point
 
         fetch_limit = limit if limit is not None else 1000
@@ -62,14 +63,33 @@ class EmbeddingRecoveryWorker:
                     "memory_id": item["memory_id"],
                     "memory_type": item["memory_type"],
                     "content": item["content"],
-                    "source": "embedding_recovery",
+                    "source": item.get("source") or "embedding_recovery",
                     "source_type": "memory",
                     "tags": tag_list,
-                    "confidence": 0.5,
+                    "confidence": item.get("confidence") or 0.5,
                     "created_at": item.get("created_at", datetime.now(UTC).isoformat()),
                     "retrieved_count": 0,
                     "scope": "external" if collection == "knowledge_base" else "user",
                 }
+                # Restore provenance fields if queued with them
+                for prov_key in (
+                    "source_session_id", "transcript_path",
+                    "extraction_timestamp", "source_pipeline",
+                ):
+                    val = item.get(prov_key)
+                    if val:
+                        payload[prov_key] = val
+                # source_line_range stored as "start,end" — restore as list
+                slr = item.get("source_line_range")
+                if slr and "," in slr:
+                    parts = slr.split(",", 1)
+                    payload["source_line_range"] = [int(parts[0]), int(parts[1])]
+                # Classify for memory_class (consistent with store.py)
+                payload["memory_class"] = classify_memory(
+                    item["content"],
+                    source=payload.get("source", ""),
+                    source_pipeline=payload.get("source_pipeline", ""),
+                )
 
                 upsert_point(
                     self._qdrant,

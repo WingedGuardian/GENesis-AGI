@@ -5,8 +5,10 @@ V3 logic is intentionally conservative:
   - COSTLY_REVERSIBLE → PROPOSE (always)
   - IRREVERSIBLE → PROPOSE (always, no exceptions)
 
-The lookup table will become level-sensitive in V4 when earned autonomy
-unlocks per-task exemptions.
+Internally delegates to the data-driven :class:`RuleEngine` from
+``config/autonomy_rules.yaml``. Falls back to hard-coded V3 defaults
+if the rules file is missing or malformed. The lookup table will become
+level-sensitive in V4 when earned autonomy unlocks per-task exemptions.
 """
 
 from __future__ import annotations
@@ -18,14 +20,16 @@ from typing import Any
 
 import yaml
 
+from genesis.autonomy.rules import RuleContext, RuleEngine
 from genesis.autonomy.types import ActionClass, ApprovalDecision
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy.yaml"
+_DEFAULT_RULES_PATH = Path(__file__).resolve().parent.parent.parent.parent / "config" / "autonomy_rules.yaml"
 
 # ---------------------------------------------------------------------------
-# V3 defaults — used when config is missing or malformed
+# V3 defaults — used when config AND rules are both missing or malformed
 # ---------------------------------------------------------------------------
 
 _DEFAULT_APPROVAL_POLICY: dict[str, str] = {
@@ -61,24 +65,93 @@ _COSTLY_REVERSIBLE_PATTERNS: list[re.Pattern[str]] = [
 class ActionClassifier:
     """Maps (ActionClass, autonomy_level) to an ApprovalDecision.
 
-    Loads policy from ``autonomy.yaml`` on construction. Falls back to
-    hard-coded V3 defaults if the config file is missing or malformed.
+    Loads rules from ``autonomy_rules.yaml`` via :class:`RuleEngine`.
+    Falls back to the policy dict in ``autonomy.yaml`` (or hard-coded V3
+    defaults) if the rules file is unavailable.
+
+    Also loads approval timeouts from ``autonomy.yaml``.
     """
 
-    def __init__(self, *, config_path: Path | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        config_path: Path | None = None,
+        rules_path: Path | None = None,
+    ) -> None:
         self._config_path = config_path or _DEFAULT_CONFIG_PATH
-        self._approval_policy: dict[str, str] = dict(_DEFAULT_APPROVAL_POLICY)
+        self._rules_path = rules_path or _DEFAULT_RULES_PATH
+
+        # Timeouts loaded from autonomy.yaml (unchanged)
         self._approval_timeouts: dict[str, int | None] = dict(_DEFAULT_APPROVAL_TIMEOUTS)
+
+        # Fallback policy from autonomy.yaml (used when rules engine fails)
+        self._approval_policy: dict[str, str] = dict(_DEFAULT_APPROVAL_POLICY)
+
+        # Load config (timeouts + fallback policy)
         self._load_config()
+
+        # Initialize rule engine
+        self._rule_engine: RuleEngine | None = None
+        self._init_rule_engine()
 
     # -- public API --------------------------------------------------------
 
     def classify(self, action_class: ActionClass, autonomy_level: int) -> ApprovalDecision:
         """Return the approval decision for *action_class* at *autonomy_level*.
 
-        V3 ignores *autonomy_level* — the decision is purely class-based.
-        The parameter exists so the signature is stable for V4.
+        Delegates to the rule engine if available, otherwise falls back
+        to the policy dict from autonomy.yaml / V3 defaults.
         """
+        if self._rule_engine is not None:
+            ctx = RuleContext(
+                action_class=action_class,
+                autonomy_level=autonomy_level,
+            )
+            result = self._rule_engine.evaluate(ctx)
+            return result.decision
+
+        # Fallback: policy dict lookup
+        return self._classify_fallback(action_class)
+
+    def is_approval_required(self, action_class: ActionClass, autonomy_level: int) -> bool:
+        """Return ``True`` if the action requires user approval (PROPOSE or BLOCK)."""
+        decision = self.classify(action_class, autonomy_level)
+        return decision in (ApprovalDecision.PROPOSE, ApprovalDecision.BLOCK)
+
+    def get_timeout(self, action_type: str) -> int | None:
+        """Return the approval timeout in seconds for *action_type*.
+
+        Returns ``None`` for action types that should wait indefinitely
+        (e.g. irreversible actions).
+        """
+        return self._approval_timeouts.get(action_type)
+
+    # -- rule engine -------------------------------------------------------
+
+    def _init_rule_engine(self) -> None:
+        """Initialize the rule engine from autonomy_rules.yaml."""
+        try:
+            engine = RuleEngine(rules_path=self._rules_path)
+            if engine.rule_count > 0:
+                self._rule_engine = engine
+                logger.debug(
+                    "ActionClassifier using RuleEngine (%d rules)",
+                    engine.rule_count,
+                )
+            else:
+                logger.debug(
+                    "RuleEngine loaded 0 rules — using fallback policy",
+                )
+        except Exception:
+            logger.warning(
+                "Failed to initialize RuleEngine — using fallback policy",
+                exc_info=True,
+            )
+
+    # -- fallback (original V3 logic) --------------------------------------
+
+    def _classify_fallback(self, action_class: ActionClass) -> ApprovalDecision:
+        """Fallback classification using policy dict from autonomy.yaml."""
         key = action_class.value
         raw = self._approval_policy.get(key)
         if raw is None:
@@ -98,20 +171,7 @@ class ActionClassifier:
             )
             return ApprovalDecision.PROPOSE
 
-    def is_approval_required(self, action_class: ActionClass, autonomy_level: int) -> bool:
-        """Return ``True`` if the action requires user approval (PROPOSE or BLOCK)."""
-        decision = self.classify(action_class, autonomy_level)
-        return decision in (ApprovalDecision.PROPOSE, ApprovalDecision.BLOCK)
-
-    def get_timeout(self, action_type: str) -> int | None:
-        """Return the approval timeout in seconds for *action_type*.
-
-        Returns ``None`` for action types that should wait indefinitely
-        (e.g. irreversible actions).
-        """
-        return self._approval_timeouts.get(action_type)
-
-    # -- config loading ----------------------------------------------------
+    # -- config loading (timeouts + fallback policy) -----------------------
 
     def _load_config(self) -> None:
         """Load approval_policy and approval_timeouts from autonomy.yaml."""
@@ -139,7 +199,7 @@ class ActionClassifier:
             )
             return
 
-        # approval_policy
+        # approval_policy (fallback only — primary path is RuleEngine)
         policy = data.get("approval_policy")
         if isinstance(policy, dict):
             self._approval_policy = {str(k): str(v) for k, v in policy.items()}

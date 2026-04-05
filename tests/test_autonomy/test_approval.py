@@ -80,6 +80,16 @@ async def test_resolve_rejected(db):
 
 
 @pytest.mark.asyncio
+async def test_resolve_only_pending(db):
+    mgr = ApprovalManager(db=db)
+    req_id = await _create_request(mgr)
+    assert await mgr.resolve(req_id, status="approved") is True
+    assert await mgr.resolve(req_id, status="rejected") is False
+    row = await mgr.get_by_id(req_id)
+    assert row["status"] == "approved"
+
+
+@pytest.mark.asyncio
 async def test_cancel_sets_cancelled(db):
     mgr = ApprovalManager(db=db)
     req_id = await _create_request(mgr)

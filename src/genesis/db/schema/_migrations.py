@@ -417,6 +417,62 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE cc_sessions ADD COLUMN keywords TEXT DEFAULT ''",
         "cc_sessions.keywords")
 
+    # Memory rebalance: add memory_class column to memory_metadata for
+    # rule/fact/reference classification with activation weight boost.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN memory_class TEXT DEFAULT 'fact'",
+        "memory_metadata.memory_class")
+
+    # Memory rebalance: add provenance columns to pending_embeddings so the
+    # recovery worker can reconstruct full Qdrant payloads (source, confidence,
+    # session ID, transcript path, etc.) instead of losing this metadata.
+    for col, col_type in [
+        ("source", "TEXT"), ("confidence", "REAL"),
+        ("source_session_id", "TEXT"), ("transcript_path", "TEXT"),
+        ("source_line_range", "TEXT"), ("extraction_timestamp", "TEXT"),
+        ("source_pipeline", "TEXT"),
+    ]:
+        await _try_alter(db,
+            f"ALTER TABLE pending_embeddings ADD COLUMN {col} {col_type}",
+            f"pending_embeddings.{col}")
+
+    # Memory rebalance: resolve expired observations whose TTL has passed
+    # but weren't caught by the 24h scheduler (e.g., runtime was down).
+    # Idempotent — UPDATE WHERE is a no-op once resolved.
+    try:
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC).isoformat()
+        cursor = await db.execute(
+            "UPDATE observations SET resolved = 1, resolved_at = ?, "
+            "resolution_notes = 'auto-expired (TTL, migration sweep)' "
+            "WHERE resolved = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+            (now, now),
+        )
+        expired_count = cursor.rowcount
+        if expired_count:
+            await db.commit()
+            logger.info("Resolved %d expired observations (migration sweep)", expired_count)
+    except Exception:
+        logger.warning("Expired observation sweep skipped", exc_info=True)
+
+    # Memory rebalance: purge orphaned memory_links whose source/target
+    # memories were deleted but links were never cascade-cleaned.  MemoryStore
+    # .delete() now cascades, but ~1,600 stale links accumulated before that.
+    # Idempotent — DELETE WHERE NOT IN is a no-op once clean.
+    try:
+        cursor = await db.execute(
+            "DELETE FROM memory_links "
+            "WHERE source_id NOT IN (SELECT memory_id FROM memory_metadata) "
+            "   OR target_id NOT IN (SELECT memory_id FROM memory_metadata)"
+        )
+        orphan_count = cursor.rowcount
+        if orphan_count:
+            await db.commit()
+            logger.info("Purged %d orphaned memory_links", orphan_count)
+    except Exception:
+        logger.warning("Orphaned memory_links cleanup skipped", exc_info=True)
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

@@ -14,16 +14,6 @@
 
 projects:
 
-  - name: Agent Zero
-    repo: frdel/agent-zero
-    track: [commits, releases, issues]
-    priority: high
-    notes: >
-      Genesis runtime substrate. We are 1441+ commits behind upstream.
-      Every change here is a potential rebase conflict or new capability.
-    urls:
-      - https://github.com/frdel/agent-zero/releases
-
   - name: Claude Code
     repo: anthropics/claude-code
     track: [releases, commits, discussions]

@@ -140,9 +140,17 @@ class ApprovalManager:
         """Return all pending approval requests."""
         return await crud.list_pending(self._db)
 
+    async def get_recent(self, *, limit: int = 200) -> list[dict]:
+        """Return recent approval requests, newest first."""
+        return await crud.list_recent(self._db, limit=limit)
+
     async def get_by_id(self, request_id: str) -> dict | None:
         """Return a single approval request by ID, or ``None``."""
         return await crud.get_by_id(self._db, request_id)
+
+    async def update_context(self, request_id: str, *, context: str) -> bool:
+        """Replace the serialized context payload for a request."""
+        return await crud.update_context(self._db, request_id, context=context)
 
     async def _emit(
         self,

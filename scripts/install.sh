@@ -1,21 +1,19 @@
 #!/bin/bash
 # Genesis v3 — Full First-Run Installer
 # Sets up the complete Genesis environment from a fresh Ubuntu system.
-# Handles prerequisites, AZ integration, systemd services, Claude Code,
+# Handles prerequisites, systemd services, Claude Code,
 # interactive API key setup, and smoke testing.
 #
 # Usage:
 #   git clone <genesis-repo>
 #   cd genesis
-#   ./scripts/install.sh [--non-interactive] [--force-interactive] [--standalone]
+#   ./scripts/install.sh [--non-interactive] [--force-interactive]
 #
 # Flags:
 #   --non-interactive    Skip all prompts (for CI, scripted installs)
 #   --force-interactive  Force prompts even if keys already exist
-#   --standalone         Skip Agent Zero integration (Genesis runs independently)
 #
 # Environment variables (all optional):
-#   AZ_ROOT                — Agent Zero checkout (default: ~/agent-zero)
 #   VENV_PATH              — Python venv path (default: $REPO_DIR/.venv)
 #   SECRETS_PATH           — secrets.env location (default: $REPO_DIR/secrets.env)
 #   QDRANT_URL             — Qdrant server URL (default: http://localhost:6333)
@@ -29,12 +27,11 @@ set -euo pipefail
 
 # ── CLI flags ────────────────────────────────────────────────
 INTERACTIVE="auto"  # auto | off | on
-INSTALL_MODE="auto"  # auto | standalone | full
 while [ $# -gt 0 ]; do
     case "$1" in
         --non-interactive)   INTERACTIVE="off" ;;
         --force-interactive) INTERACTIVE="on" ;;
-        --standalone)        INSTALL_MODE="standalone" ;;
+        --standalone)        true ;;  # no-op, kept for backward compat
         -h|--help)
             sed -n '2,/^$/{ s/^# \?//; p }' "$0"
             exit 0
@@ -80,31 +77,15 @@ fi
 # ── Path setup ───────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-AZ_ROOT="${AZ_ROOT:-$HOME/agent-zero}"
 VENV_PATH="${VENV_PATH:-$REPO_DIR/.venv}"
 SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
 SETUP_WARNINGS=0
 TOTAL_STEPS=14
 
-# ── Install mode detection ──────────────────────────────────
-# auto: if AZ exists and has run_ui.py, install AZ integration; else standalone
-if [ "$INSTALL_MODE" = "auto" ]; then
-    if [ -d "$AZ_ROOT" ] && [ -f "$AZ_ROOT/run_ui.py" ]; then
-        INSTALL_MODE="full"
-    else
-        INSTALL_MODE="standalone"
-    fi
-fi
-INSTALL_AZ=$( [ "$INSTALL_MODE" = "standalone" ] && echo 0 || echo 1 )
-
 echo ""
 echo "  Genesis v3 — Setup"
 echo "  ─────────────────────────────────────────"
-if [ "$INSTALL_AZ" = "0" ]; then
-    echo "  Mode: standalone (no Agent Zero)"
-else
-    echo "  Mode: full (with Agent Zero at $AZ_ROOT)"
-fi
+echo "  Mode: standalone"
 echo ""
 
 # ══════════════════════════════════════════════════════════════
@@ -270,85 +251,11 @@ else
     echo "    . Node.js $(node --version)"
 fi
 
-# Python venv (needed for both standalone and AZ modes)
+# Python venv
 if [ ! -d "$VENV_PATH" ]; then
     echo "    Creating venv at $VENV_PATH..."
     python3 -m venv "$VENV_PATH"
     echo "    + venv created"
-fi
-
-if [ "$INSTALL_AZ" = "1" ]; then
-    # Agent Zero
-    if [ ! -d "$AZ_ROOT" ]; then
-        echo "    Agent Zero not found at $AZ_ROOT — cloning upstream..."
-        GIT_TERMINAL_PROMPT=0 git clone https://github.com/WingedGuardian/agent-zero.git "$AZ_ROOT" 2>&1 | tail -1
-        echo "    + Agent Zero cloned"
-    fi
-
-    # AZ requirements — exclude torch/whisper (cloud-primary, patched to lazy import)
-    if ! "$VENV_PATH/bin/python" -c "import flask" &>/dev/null 2>&1; then
-        echo "    Installing Agent Zero requirements (this may take several minutes)..."
-        "$VENV_PATH/bin/pip" install --upgrade pip --quiet 2>&1 | tail -1 || true
-        # Filter out torch and openai-whisper — they pull ~2GB and are only needed
-        # for local STT. whisper.py is patched below to lazy-import.
-        _az_filtered=$(mktemp)
-        trap "rm -f '$_az_filtered'" EXIT
-        grep -v -iE '^(torch|openai-whisper|torchaudio|torchvision)' "$AZ_ROOT/requirements.txt" \
-            > "$_az_filtered"
-        # Use constraints to resolve version conflicts (AZ pins openai 1.x, Genesis needs 2.x)
-        _constraints="$REPO_DIR/config/az-pip-constraints.txt"
-        _constraint_flag=""
-        [ -f "$_constraints" ] && _constraint_flag="--constraint $_constraints"
-        # shellcheck disable=SC2086
-        "$VENV_PATH/bin/pip" install -r "$_az_filtered" $_constraint_flag --quiet 2>&1 | tail -3 || {
-            echo "    WARNING: Some AZ requirements failed to install."
-            echo "    Try manually: $VENV_PATH/bin/pip install -r $AZ_ROOT/requirements.txt"
-            SETUP_WARNINGS=1
-        }
-        rm -f "$_az_filtered"
-        echo "    + Agent Zero requirements installed (torch excluded — cloud STT only)"
-    else
-        echo "    . Agent Zero venv OK"
-    fi
-
-    # Ensure Genesis-specific deps are in AZ's venv (AZ runs from its own venv
-    # via systemd, but imports Genesis code which may need these packages)
-    if [ -d "$AZ_ROOT/.venv" ]; then
-        "$AZ_ROOT/.venv/bin/pip" install flask-sock --quiet 2>/dev/null || \
-            echo "    WARNING: Could not install flask-sock in AZ venv"
-    fi
-
-    # Patch AZ whisper to lazy-import (torch is optional for cloud-primary users)
-    if [ -f "$AZ_ROOT/helpers/whisper.py" ]; then
-        if grep -q "^import whisper$" "$AZ_ROOT/helpers/whisper.py" 2>/dev/null; then
-            python3 -c "
-p = '$AZ_ROOT/helpers/whisper.py'
-c = open(p).read()
-c = c.replace('import whisper', 'try:\n    import whisper\nexcept ImportError:\n    whisper = None  # torch/whisper not installed — cloud STT only')
-open(p, 'w').write(c)
-"
-            echo "    + Patched whisper.py (torch optional)"
-        fi
-    fi
-
-    # Verify critical AZ imports — retry if missing
-    _critical_fail=0
-    for mod in flask langchain_core litellm; do
-        if ! "$VENV_PATH/bin/python" -c "import $mod" &>/dev/null 2>&1; then
-            echo "    $mod missing — installing..."
-            "$VENV_PATH/bin/pip" install "$mod" --quiet 2>&1 | tail -1 || true
-            if ! "$VENV_PATH/bin/python" -c "import $mod" &>/dev/null 2>&1; then
-                echo "    WARNING: Could not install $mod"
-                _critical_fail=1
-            fi
-        fi
-    done
-    if [ "$_critical_fail" = "1" ]; then
-        echo "    WARNING: Some critical dependencies missing. AZ may not start."
-        SETUP_WARNINGS=1
-    fi
-else
-    echo "    . Standalone mode — skipping Agent Zero integration"
 fi
 
 # secrets.env
@@ -357,15 +264,6 @@ if [ ! -f "$SECRETS_FILE" ]; then
         cp "$REPO_DIR/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "    + Created secrets.env from template"
-    fi
-fi
-
-# Bind AZ web UI to all interfaces so it's reachable from host
-# (container is network-isolated — 0.0.0.0 inside container is safe)
-if [ "$INSTALL_AZ" = "1" ]; then
-    if [ -f "$SECRETS_FILE" ] && ! grep -q "^WEB_UI_HOST=" "$SECRETS_FILE" 2>/dev/null; then
-        set_secret "WEB_UI_HOST" "0.0.0.0" "$SECRETS_FILE"
-        echo "    + WEB_UI_HOST set to 0.0.0.0 (reachable from host)"
     fi
 fi
 
@@ -439,120 +337,13 @@ if [ -f "$SECRETS_FILE" ]; then
     fi
 else
     echo "    ! secrets.env not found at $SECRETS_FILE"
-    OLD_SECRETS="$AZ_ROOT/usr/secrets.env"
-    if [ -f "$OLD_SECRETS" ] && [ ! -L "$OLD_SECRETS" ]; then
-        echo "    Found existing secrets at old location: $OLD_SECRETS"
-        echo "    Migrate with:"
-        echo "      mv $OLD_SECRETS $SECRETS_FILE"
-        echo "      ln -s $SECRETS_FILE $OLD_SECRETS"
-    else
-        echo "    Create from template:"
-        echo "      cp $REPO_DIR/secrets.env.example $SECRETS_FILE"
-        echo "      chmod 600 $SECRETS_FILE"
-    fi
+    echo "    Create from template:"
+    echo "      cp $REPO_DIR/secrets.env.example $SECRETS_FILE"
+    echo "      chmod 600 $SECRETS_FILE"
 fi
 
 
-# ══════════════════════════════════════════════════════════════
-#  Step 4 — Deploy AZ plugins
-# ══════════════════════════════════════════════════════════════
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "  [4/$TOTAL_STEPS] Deploying AZ plugins..."
-
-    if [ ! -d "$AZ_ROOT" ]; then
-        echo "    ERROR: Agent Zero not found at $AZ_ROOT"
-        exit 1
-    fi
-
-    mkdir -p "$AZ_ROOT/usr/plugins"
-
-    if [ -d "$REPO_DIR/az_plugins/genesis" ]; then
-        cp -r "$REPO_DIR/az_plugins/genesis" "$AZ_ROOT/usr/plugins/"
-        echo "    + genesis plugin deployed"
-    else
-        echo "    WARNING: az_plugins/genesis not found in repo"
-    fi
-
-    if [ -d "$REPO_DIR/az_plugins/genesis-memory" ]; then
-        cp -r "$REPO_DIR/az_plugins/genesis-memory" "$AZ_ROOT/usr/plugins/"
-        echo "    + genesis-memory plugin deployed"
-    else
-        echo "    WARNING: az_plugins/genesis-memory not found in repo"
-    fi
-
-    # Upstream AZ only scans usr/extensions/, not usr/plugins/*/extensions/.
-    # Symlink each plugin's extension dirs into usr/extensions/ so AZ discovers them.
-    mkdir -p "$AZ_ROOT/usr/extensions"
-    for plugin_dir in "$AZ_ROOT"/usr/plugins/*/extensions/*/; do
-        ext_type=$(basename "$plugin_dir")
-        target="$AZ_ROOT/usr/extensions/$ext_type"
-        mkdir -p "$target"
-        for ext_file in "$plugin_dir"*.py; do
-            [ -f "$ext_file" ] || continue
-            fname=$(basename "$ext_file")
-            if [ ! -e "$target/$fname" ]; then
-                ln -sf "$ext_file" "$target/$fname"
-            fi
-        done
-    done
-    echo "    + plugin extensions symlinked into usr/extensions/"
-
-    # Symlink plugin prompts into usr/prompts/
-    mkdir -p "$AZ_ROOT/usr/prompts"
-    for plugin_dir in "$AZ_ROOT"/usr/plugins/*/prompts/; do
-        [ -d "$plugin_dir" ] || continue
-        for prompt_file in "$plugin_dir"*; do
-            [ -f "$prompt_file" ] || continue
-            fname=$(basename "$prompt_file")
-            if [ ! -e "$AZ_ROOT/usr/prompts/$fname" ]; then
-                ln -sf "$prompt_file" "$AZ_ROOT/usr/prompts/$fname"
-            fi
-        done
-    done
-    echo "    + plugin prompts symlinked into usr/prompts/"
-else
-    echo "  [4/$TOTAL_STEPS] Skipping AZ plugin deployment (standalone mode)"
-fi
-
-
-# ══════════════════════════════════════════════════════════════
-#  Step 5 — Patch run_ui.py server_startup hook
-# ══════════════════════════════════════════════════════════════
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "  [5/$TOTAL_STEPS] Checking run_ui.py server_startup hook..."
-
-    RUN_UI="$AZ_ROOT/run_ui.py"
-    if [ ! -f "$RUN_UI" ]; then
-        echo "    ERROR: $RUN_UI not found"
-        exit 1
-    fi
-
-    if grep -q "server_startup" "$RUN_UI"; then
-        echo "    . server_startup hook already present"
-    else
-        echo "    + Patching run_ui.py with Genesis server_startup hook..."
-        sed -i '/initialize\.initialize_preload()/a\
-\
-    # Genesis server startup — initialize background infrastructure\
-    # CRITICAL REBASE INVARIANT: Without this, Genesis background systems\
-    # (awareness loop, learning scheduler, inbox monitor) never start.\
-    # Verify after every AZ update: grep -n "server_startup" run_ui.py\
-    from python.helpers import defer, extension\
-    defer.DeferredTask("GenesisBootstrap").start_task(\
-        extension.call_extensions, "server_startup"\
-    ).result_sync()' "$RUN_UI"
-        if grep -q "server_startup" "$RUN_UI"; then
-            echo "    + server_startup hook patched into run_ui.py"
-        else
-            echo "    ERROR: sed patch failed — 'initialize_preload()' not found in run_ui.py"
-            echo "    Patch manually. See docs/reference/agent-zero-fork-tracking.md"
-            SETUP_WARNINGS=1
-        fi
-    fi
-else
-    echo "  [5/$TOTAL_STEPS] Skipping run_ui.py patch (standalone mode)"
-    RUN_UI=""  # Ensure RUN_UI is set for smoke test
-fi
+# Steps 4-5 removed (Agent Zero plugins and run_ui.py patching no longer needed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -592,12 +383,6 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
 
-        # Skip agent-zero.service in standalone mode
-        if [ "$INSTALL_AZ" = "0" ] && [ "$svc_name" = "agent-zero.service" ]; then
-            echo "    . $svc_name skipped (standalone mode)"
-            continue
-        fi
-
         target="$SYSTEMD_USER_DIR/$svc_name"
         if [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
@@ -605,7 +390,6 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             sed -e "s|__HOME__|$HOME|g" \
                 -e "s|__VENV__|$VENV_PATH|g" \
                 -e "s|__REPO_DIR__|$REPO_DIR|g" \
-                -e "s|__AZ_ROOT__|$AZ_ROOT|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
@@ -621,24 +405,7 @@ if [ "$SERVICES_GENERATED" = "1" ]; then
 fi
 
 
-# ══════════════════════════════════════════════════════════════
-#  Step 8 — AZ secrets symlink
-# ══════════════════════════════════════════════════════════════
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "  [8/$TOTAL_STEPS] Checking AZ secrets symlink..."
-
-    AZ_SECRETS="$AZ_ROOT/usr/secrets.env"
-    if [ -f "$SECRETS_FILE" ] && [ ! -e "$AZ_SECRETS" ]; then
-        ln -s "$SECRETS_FILE" "$AZ_SECRETS"
-        echo "    + Symlink: $AZ_SECRETS → $SECRETS_FILE"
-    elif [ -e "$AZ_SECRETS" ]; then
-        echo "    . AZ secrets already exists at $AZ_SECRETS"
-    else
-        echo "    - secrets.env not found — symlink skipped"
-    fi
-else
-    echo "  [8/$TOTAL_STEPS] Skipping AZ secrets symlink (standalone mode)"
-fi
+# Step 8 removed (AZ secrets symlink no longer needed)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -799,9 +566,9 @@ else
     echo "    - Qdrant binary not found — skipping service"
 fi
 
-# agent-zero, genesis-bridge, genesis-watchdog are generated from
+# genesis-server, genesis-bridge, genesis-watchdog are generated from
 # templates in Step 7 — just report their status here.
-for _svc in agent-zero genesis-bridge genesis-watchdog; do
+for _svc in genesis-server genesis-bridge genesis-watchdog; do
     if [ -f "$SYSTEMD_USER_DIR/${_svc}.service" ]; then
         echo "    . ${_svc}.service present"
     else
@@ -858,11 +625,11 @@ if [ "$SERVICES_CREATED" = "1" ] || [ "${SERVICES_GENERATED:-0}" = "1" ]; then
         fi
     fi
 
-    if [ -f "$SYSTEMD_USER_DIR/agent-zero.service" ]; then
-        if systemctl --user enable agent-zero 2>/dev/null; then
-            echo "    + agent-zero.service enabled"
+    # Enable genesis-server (standalone)
+    if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
+        if systemctl --user enable genesis-server 2>/dev/null; then
+            echo "    + genesis-server.service enabled"
         fi
-        # Do NOT auto-start AZ yet — wait for API keys
     fi
 fi
 
@@ -1084,29 +851,6 @@ else
     SMOKE_SKIP=$((SMOKE_SKIP + 1))
 fi
 
-# AZ-specific checks (only in full mode)
-if [ "$INSTALL_AZ" = "1" ]; then
-    # Plugin dirs
-    for plugin_dir in genesis genesis-memory; do
-        if [ -d "$AZ_ROOT/usr/plugins/$plugin_dir" ]; then
-            echo "    PASS  Plugin: $plugin_dir"
-            SMOKE_PASS=$((SMOKE_PASS + 1))
-        else
-            echo "    FAIL  Plugin: $plugin_dir not found"
-            SMOKE_FAIL=$((SMOKE_FAIL + 1))
-        fi
-    done
-
-    # server_startup hook
-    if grep -q "server_startup" "$RUN_UI" 2>/dev/null; then
-        echo "    PASS  server_startup hook in run_ui.py"
-        SMOKE_PASS=$((SMOKE_PASS + 1))
-    else
-        echo "    FAIL  server_startup hook missing from run_ui.py"
-        SMOKE_FAIL=$((SMOKE_FAIL + 1))
-    fi
-fi
-
 # Qdrant
 if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
     echo "    PASS  Qdrant reachable"
@@ -1144,11 +888,7 @@ else
 fi
 
 # Systemd services (template-generated)
-if [ "$INSTALL_AZ" = "1" ]; then
-    _expected_svcs="agent-zero genesis-bridge genesis-watchdog"
-else
-    _expected_svcs="genesis-server genesis-bridge genesis-watchdog"
-fi
+_expected_svcs="genesis-server genesis-bridge genesis-watchdog"
 for _svc in $_expected_svcs; do
     if [ -f "$SYSTEMD_USER_DIR/${_svc}.service" ]; then
         echo "    PASS  ${_svc}.service"
@@ -1220,11 +960,7 @@ _final_keys=$(grep -cE '^(API_KEY_|ANTHROPIC_API_KEY|GOOGLE_API_KEY|OPENAI_API_K
 
 echo ""
 echo "  Next steps:"
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "    1. Start Genesis:  systemctl --user start agent-zero"
-else
-    echo "    1. Start Genesis:  systemctl --user start genesis-server"
-fi
+echo "    1. Start Genesis:  systemctl --user start genesis-server"
 echo "    2. Run:  cd ~/genesis && claude"
 echo "       Genesis will guide you through setup on first launch."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
@@ -1233,17 +969,9 @@ fi
 echo "    3. Web UI: http://localhost:5000"
 echo ""
 echo "  Manage services:"
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "    systemctl --user start|stop|restart agent-zero"
-else
-    echo "    systemctl --user start|stop|restart genesis-server"
-fi
+echo "    systemctl --user start|stop|restart genesis-server"
 echo "    systemctl --user start|stop|restart qdrant"
-if [ "$INSTALL_AZ" = "1" ]; then
-    echo "    journalctl --user -u agent-zero -f    # live logs"
-else
-    echo "    journalctl --user -u genesis-server -f    # live logs"
-fi
+echo "    journalctl --user -u genesis-server -f    # live logs"
 echo ""
 echo "  Documentation:"
 echo "    CLAUDE.md            — conventions & commands"

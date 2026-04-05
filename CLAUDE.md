@@ -1,6 +1,6 @@
 # Genesis v3 — Project Instructions
 
-Genesis v3 is an autonomous AI agent system built on Agent Zero (`~/agent-zero`).
+Genesis v3 is an autonomous AI agent system.
 
 ## Communication Style
 
@@ -42,7 +42,8 @@ cd ~/genesis && ruff check .                      # Lint all Python
 cd ~/genesis && pytest -v                         # Run tests
 cd ~/genesis && ruff check . && pytest -v         # Both (do before committing)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
-cd ~/agent-zero && python run_ui.py               # Agent Zero web UI (port 5000)
+python -m genesis serve                           # Standalone server (port 5000)
+python -m genesis serve --port 5001               # Custom port
 python scripts/setup_claude_config.py             # Regenerate CC config for this machine
 ```
 
@@ -101,7 +102,7 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   name. Broad staging is how one session's changes bleed into another's commit.
 - **Branch naming**: `<scope>/<description>` (e.g., `agent/awareness-loop`).
 - **NEVER run `pip install -e` pointing to a worktree.** The editable install
-  is system-wide — it redirects ALL processes (bridge, AZ, watchdog) to load
+  is system-wide — it redirects ALL processes (bridge, watchdog) to load
   code from the worktree instead of main. This caused an I/O death spiral and
   repeated system crashes on 2026-03-16. Use `PYTHONPATH` instead.
   Enforced by PreToolUse hook.
@@ -142,13 +143,15 @@ repo path with `/` replaced by `-`, derivable via `cc_project_dir()` from
 3. `docs/architecture/genesis-v3-build-phases.md` — Safety-ordered build plan
 4. `docs/architecture/genesis-v3-dual-engine-plan.md` — Multi-engine strategy
 5. `docs/architecture/genesis-v3-gap-assessment.md` — Pre-implementation risks
-6. `docs/architecture/genesis-agent-zero-integration.md` — AZ integration
 
-## Agent Zero Integration
+## Hosting Modes
 
-Genesis runs on Agent Zero (`~/agent-zero`). **CRITICAL**: `server_startup`
-hook in `run_ui.py` must exist — without it, ALL background infra is dead.
-Full integration details: `.claude/docs/agent-zero-integration.md`.
+Genesis runs standalone: `python -m genesis serve` starts the full runtime
+(dashboard, Telegram, OpenClaw endpoint).
+
+**OpenClaw** is supported as a channel gateway. Genesis exposes
+`POST /v1/chat/completions` so OpenClaw can route 20+ channels through it.
+Config example: `config/openclaw-example.json5`.
 
 ## V3 Scope Fence
 

@@ -1,7 +1,6 @@
 [Unit]
 Description=Genesis Watchdog — single health check invocation
-After=agent-zero.service genesis-bridge.service
-Wants=agent-zero.service
+After=genesis-server.service genesis-bridge.service
 
 [Service]
 Type=oneshot

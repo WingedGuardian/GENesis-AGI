@@ -33,6 +33,7 @@
         errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
         budgets: [],
         routingConfig: null,
+        approvals: [],
         queueReview: {
           clearingIds: {},
           clearingAll: false,
@@ -107,10 +108,12 @@
         codeFindings: [],
         codeAuditStats: null,
         operationalVitals: null,
+        autonomousCliPolicy: null,
         cognitiveState: null,
         awarenessSignals: null,
         jobHealth: null,
         autonomyConfig: null,
+        approvalActions: {},
         _restartingBridge: false,
         _restartingHF: false,
         error: null,
@@ -164,12 +167,14 @@
           attention: { state: "idle", lastSuccess: null, error: null },
           budgets: { state: "idle", lastSuccess: null, error: null },
           routing: { state: "idle", lastSuccess: null, error: null },
+          approvals: { state: "idle", lastSuccess: null, error: null },
           modules: { state: "idle", lastSuccess: null, error: null },
           providersDetail: { state: "idle", lastSuccess: null, error: null },
           cognitive: { state: "idle", lastSuccess: null, error: null },
           awarenessSignals: { state: "idle", lastSuccess: null, error: null },
           jobHealth: { state: "idle", lastSuccess: null, error: null },
           autonomyConfig: { state: "idle", lastSuccess: null, error: null },
+          autonomousCliPolicy: { state: "idle", lastSuccess: null, error: null },
         },
 
         // Polling interval IDs
@@ -180,6 +185,7 @@
         _codeFindingsInterval: null,
         _modulesInterval: null,
         _routingInterval: null,
+        _approvalsInterval: null,
         _cognitiveInterval: null,
         _awarenessInterval: null,
         _jobHealthInterval: null,
@@ -189,7 +195,7 @@
         _TAB_INTERVALS: {
           overview:  ["_cognitiveInterval", "_modulesInterval"],
           chat:      [],
-          internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval"],
+          internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
@@ -232,11 +238,12 @@
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
-              if (first) { this.fetchCodeFindings(); this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchRoutingConfig(); this.fetchJobHealth(); }
+              if (first) { this.fetchCodeFindings(); this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); }
               this._codeFindingsInterval = setInterval(() => this.fetchCodeFindings(), 60000);
               this._awarenessInterval = setInterval(() => this.fetchAwarenessSignals(), 30000);
               this._routingInterval = setInterval(() => this.fetchRoutingConfig(), 15000);
               this._jobHealthInterval = setInterval(() => this.fetchJobHealth(), 60000);
+              this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
             case "sessions":
               if (first) { this.fetchActivity(); this.fetchSessions(); }
@@ -244,7 +251,7 @@
               this._sessionsInterval = setInterval(() => this.fetchSessions(), 30000);
               break;
             case "config":
-              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); }
+              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); this.fetchAutonomousCliPolicy(); }
               break;
             case "chat":
               // Re-fit terminal on tab re-entry
@@ -674,6 +681,9 @@
               const d = await resp.json();
               this.settingsData[domain] = d.config;
               this.settingsEditing = null;
+              if (domain === "autonomous_cli_policy") {
+                this.fetchAutonomousCliPolicy();
+              }
               if (d.needs_restart) { alert("Settings saved. Some changes require a restart to take effect."); }
             } else {
               const err = await resp.json().catch(() => ({}));
@@ -700,6 +710,22 @@
           } catch (e) {
             console.warn("Routing config fetch failed:", e);
             this.failFetch("routing", "Routing config unavailable");
+          }
+        },
+
+        async fetchApprovals() {
+          this.startFetch("approvals");
+          try {
+            const resp = await fetchApi("/api/genesis/approvals");
+            if (resp && resp.ok) {
+              this.approvals = await resp.json();
+              this.finishFetch("approvals");
+            } else {
+              this.failFetch("approvals", "Approval queue unavailable");
+            }
+          } catch (e) {
+            console.warn("Approval fetch failed:", e);
+            this.failFetch("approvals", "Approval queue unavailable");
           }
         },
 
@@ -768,6 +794,22 @@
           }
         },
 
+        async fetchAutonomousCliPolicy() {
+          this.startFetch("autonomousCliPolicy");
+          try {
+            const resp = await fetchApi("/api/genesis/autonomous-cli-policy");
+            if (resp && resp.ok) {
+              this.autonomousCliPolicy = await resp.json();
+              this.finishFetch("autonomousCliPolicy");
+            } else {
+              this.failFetch("autonomousCliPolicy", "Autonomous CLI policy unavailable");
+            }
+          } catch (e) {
+            console.warn("Autonomous CLI policy fetch failed:", e);
+            this.failFetch("autonomousCliPolicy", "Autonomous CLI policy unavailable");
+          }
+        },
+
         // Pause / kill switch
         async fetchPauseState() {
           try {
@@ -803,20 +845,27 @@
 
         // Service restarts
         async restartBridge() {
-          if (!confirm("Restart Genesis Bridge?")) return;
+          const label = this.health.services?.bridge?.service_label || "Genesis";
+          if (!confirm(`Restart Genesis ${label}?`)) return;
           this._restartingBridge = true;
           try {
             const resp = await fetchApi("/api/genesis/restart/bridge", { method: "POST" });
             if (resp && resp.ok) {
               setTimeout(() => { this._restartingBridge = false; this.fetchHealth(); }, 5000);
             } else {
+              // Restarting ourselves kills the connection — a network error
+              // or 500 with empty message is expected, not a failure.
               const err = await resp?.json().catch(() => ({}));
-              alert("Bridge restart failed: " + (err.message || "unknown error"));
-              this._restartingBridge = false;
+              if (!err.message) {
+                setTimeout(() => { this._restartingBridge = false; this.fetchHealth(); }, 5000);
+              } else {
+                alert(`${label} restart failed: ` + err.message);
+                this._restartingBridge = false;
+              }
             }
           } catch (e) {
-            alert("Bridge restart failed: " + e.message);
-            this._restartingBridge = false;
+            // Network error from the server restarting itself — expected.
+            setTimeout(() => { this._restartingBridge = false; this.fetchHealth(); }, 5000);
           }
         },
 
@@ -968,6 +1017,40 @@
             this.routingEditor.reloadError = "Routing reload failed";
           } finally {
             this.routingEditor.reloading = false;
+          }
+        },
+
+        async resolveApproval(requestId, decision) {
+          const current = this.approvalActions[requestId] || {};
+          this.approvalActions = {
+            ...this.approvalActions,
+            [requestId]: { ...current, saving: true, error: null },
+          };
+          try {
+            const resp = await fetchApi(`/api/genesis/approvals/${encodeURIComponent(requestId)}/resolve`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ decision }),
+            });
+            if (resp?.ok) {
+              this.approvals = this.approvals.filter(req => req.id !== requestId);
+              this.approvalActions = {
+                ...this.approvalActions,
+                [requestId]: { saving: false, error: null },
+              };
+              this.finishFetch("approvals");
+            } else {
+              const error = await this.readApiError(resp, "Approval update failed");
+              this.approvalActions = {
+                ...this.approvalActions,
+                [requestId]: { saving: false, error },
+              };
+            }
+          } catch (e) {
+            this.approvalActions = {
+              ...this.approvalActions,
+              [requestId]: { saving: false, error: "Approval update failed" },
+            };
           }
         },
 
@@ -1254,6 +1337,7 @@
             healthy: "#4caf50",
             degraded: "#f0ad4e",
             fallback: "#f0ad4e",
+            warning: "#f0ad4e",
             unknown: "#888",
             error: "#d9534f",
           };
@@ -1362,6 +1446,7 @@
         servicesSemantic() {
           const services = this.health.services;
           if (!services || services.status === "unknown") return { state: "unknown", reason: "service status unavailable" };
+          const svcLabel = (services?.bridge?.service_label || "Genesis").toLowerCase();
           // Host framework health
           const hf = services?.host_framework;
           if (hf?.detected && (hf.status === "down" || hf.status === "error")) {
@@ -1369,9 +1454,9 @@
           }
           if (services?.bridge?.active_state && services.bridge.active_state !== "active") {
             if (services.bridge.active_state === "unknown") {
-              return { state: "unknown", reason: "bridge service state is unknown" };
+              return { state: "unknown", reason: `${svcLabel} service state is unknown` };
             }
-            return { state: "error", reason: "bridge service is not active" };
+            return { state: "error", reason: `${svcLabel} service is not active` };
           }
           if (services?.watchdog_timer?.active_state && services.watchdog_timer.active_state !== "active") {
             if (services.watchdog_timer.active_state === "unknown") {
@@ -1385,8 +1470,7 @@
           if ((services?.watchdog?.consecutive_failures || 0) > 0) {
             return { state: "degraded", reason: "watchdog has recent consecutive failures" };
           }
-          const hostLabel = hf?.detected ? hf.name + ', ' : '';
-          return { state: "healthy", reason: `${hostLabel}bridge and watchdog services are active` };
+          return { state: "healthy", reason: `${svcLabel} and watchdog services are active` };
         },
 
         containerSemantic() {
@@ -1613,6 +1697,28 @@
           return `${Math.round(h / 24)}d ago`;
         },
 
+        approvalActionState(requestId) {
+          return this.approvalActions[requestId] || { saving: false, error: null };
+        },
+
+        approvalActionLabel(req) {
+          return req?.context_data?.action_label || req?.description || req?.action_type || "Approval request";
+        },
+
+        approvalFallbackLabel(req) {
+          const context = req?.context_data || {};
+          const model = context.model || "claude -p";
+          const effort = context.effort ? ` (${context.effort})` : "";
+          return `${model}${effort}`;
+        },
+
+        approvalReasonLabel(req) {
+          const context = req?.context_data || {};
+          if (context.api_error) return context.api_error;
+          if (context.api_call_site_id) return `API route ${context.api_call_site_id} exhausted`;
+          return "CLI fallback requires manual approval";
+        },
+
         groupQueueItems(items) {
           const groups = new Map();
           for (const item of (items || [])) {
@@ -1703,6 +1809,10 @@
           return this.fallbackCallSites.length;
         },
 
+        get pendingApprovalCount() {
+          return this.approvals.length;
+        },
+
         get badApiKeyCount() {
           const keys = this.health.api_keys || {};
           const sites = this.health.call_sites || {};
@@ -1751,6 +1861,9 @@
           if (this.fallbackCallSiteCount > 0) {
             const names = this.fallbackCallSites.join(", ");
             items.push({ level: "warning", title: `${this.fallbackCallSiteCount} call site${this.fallbackCallSiteCount === 1 ? "" : "s"} on fallback`, detail: names, href: "#routing-health", tab: "internals", anchor: "routing-health" });
+          }
+          if (this.pendingApprovalCount > 0) {
+            items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#approval-queue", tab: "internals", anchor: "approval-queue" });
           }
           if (this.badApiKeyCount > 0) {
             items.push({ level: "critical", title: `${this.badApiKeyCount} provider key issue${this.badApiKeyCount === 1 ? "" : "s"}`, detail: "missing or failed provider credentials detected", href: null });
@@ -2364,16 +2477,16 @@
         <button @click="$store.genesisDashboard.restartBridge()"
                 :disabled="$store.genesisDashboard._restartingBridge"
                 style="font-size: 0.7rem; padding: 3px 8px; background: #1a237e; color: #90caf9; border: 1px solid #283593; border-radius: 4px; cursor: pointer;"
-                x-text="$store.genesisDashboard._restartingBridge ? 'Restarting...' : 'Restart Bridge'"></button>
+                x-text="$store.genesisDashboard._restartingBridge ? 'Restarting...' : ('Restart ' + ($store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis'))"></button>
         <template x-if="$store.genesisDashboard.health.services?.host_framework?.detected">
           <button @click="$store.genesisDashboard.restartHostFramework()"
                   :disabled="$store.genesisDashboard._restartingHF"
                   style="font-size: 0.7rem; padding: 3px 8px; background: #4a1400; color: #ef9a9a; border: 1px solid #5d1a00; border-radius: 4px; cursor: pointer;"
                   x-text="$store.genesisDashboard._restartingHF ? 'Restarting...' : 'Restart ' + ($store.genesisDashboard.health.services.host_framework.name || 'Host')"></button>
         </template>
-        <a href="/" class="back-link">
-          <span class="material-symbols-outlined" style="font-size:1rem">arrow_back</span>
-          Back to Chat
+        <a href="#" @click.prevent="$store.genesisDashboard.navigateTo('chat')" class="back-link">
+          <span class="material-symbols-outlined" style="font-size:1rem">terminal</span>
+          Terminal
         </a>
       </span>
     </h1>
@@ -2749,7 +2862,7 @@
               <template x-if="$store.genesisDashboard.health.surplus">
                 <div>
                   <span class="status-dot"
-                        :style="`background: ${$store.genesisDashboard.health.surplus.status === 'dispatching' ? '#4caf50' : '#888'}`"></span>
+                        :style="`background: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.surplusSemantic().state)}`"></span>
                   <span style="font-size: 0.82rem"
                         x-text="$store.genesisDashboard.health.surplus.status || 'unknown'"></span>
                   <div class="health-card-detail"
@@ -2794,12 +2907,12 @@
                             x-text="$store.genesisDashboard.health.services.host_framework.uptime_seconds != null ? Math.round($store.genesisDashboard.health.services.host_framework.uptime_seconds / 60) + 'm' : ''"></span>
                     </div>
                   </template>
-                  <!-- Bridge -->
+                  <!-- Genesis service (server or bridge) -->
                   <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
-                       :title="'Bridge: ' + ($store.genesisDashboard.health.services?.bridge?.active_state || 'unknown') + ' (PID ' + ($store.genesisDashboard.health.services?.bridge?.pid || '?') + ')'">
+                       :title="($store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis') + ': ' + ($store.genesisDashboard.health.services?.bridge?.active_state || 'unknown') + ' (PID ' + ($store.genesisDashboard.health.services?.bridge?.pid || '?') + ')'">
                     <span class="status-dot"
                           :style="`background: ${$store.genesisDashboard.health.services?.bridge?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.bridge?.active_state) ? '#d9534f' : '#666'}`"></span>
-                    Bridge
+                    <span x-text="$store.genesisDashboard.health.services?.bridge?.service_label || 'Genesis'"></span>
                     <span style="opacity: 0.6; font-size: 0.75rem"
                           x-text="$store.genesisDashboard.health.services?.bridge?.uptime_seconds != null ? Math.round($store.genesisDashboard.health.services.bridge.uptime_seconds / 60) + 'm' : ''"></span>
                   </div>
@@ -3408,6 +3521,80 @@
         </template>
         <template x-if="!$store.genesisDashboard.health.call_sites || Object.keys($store.genesisDashboard.health.call_sites).length === 0">
           <div class="empty-state">No call site data available.</div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Approval Queue (Collapsible) [Tab: internals] -->
+    <div class="panel" id="approval-queue" x-data="{ approvalsOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="approvalsOpen = !approvalsOpen">
+        <span class="material-symbols-outlined" :style="approvalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">approval</span>
+        Approval Queue
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.pendingApprovalCount > 0">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="$store.genesisDashboard.pendingApprovalCount + ' pending'"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('approvals')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('approvals')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="approvalsOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('approvals')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('approvals')"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.approvals.length === 0">
+          <div class="empty-state">No pending approvals.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.approvals.length > 0">
+          <div style="display:grid; gap:0.6rem;">
+            <template x-for="req in $store.genesisDashboard.approvals" :key="req.id">
+              <div style="padding:0.65rem 0.75rem; border-radius:6px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03);">
+                <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.6rem; margin-bottom:0.35rem;">
+                  <div>
+                    <div style="font-size:0.8rem; font-weight:600;" x-text="$store.genesisDashboard.approvalActionLabel(req)"></div>
+                    <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-top:0.15rem;"
+                         x-text="(req.context_data?.subsystem || 'unknown subsystem') + ' · ' + $store.genesisDashboard.relativeTime(req.created_at)"></div>
+                  </div>
+                  <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
+                    <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Reason</div>
+                    <div x-text="$store.genesisDashboard.approvalReasonLabel(req)"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">API Route</div>
+                    <div x-text="req.context_data?.api_call_site_id || 'none'"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Channel</div>
+                    <div x-text="req.context_data?.channel || 'dashboard-only'"></div>
+                  </div>
+                </div>
+                <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">
+                  <button type="button"
+                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(76,175,80,0.28); color:#4caf50; background:transparent; cursor:pointer;"
+                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                          @click="$store.genesisDashboard.resolveApproval(req.id, 'approved')"
+                          x-text="$store.genesisDashboard.approvalActionState(req.id).saving ? 'Saving...' : 'Approve'"></button>
+                  <button type="button"
+                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.28); color:#d9534f; background:transparent; cursor:pointer;"
+                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                          @click="$store.genesisDashboard.resolveApproval(req.id, 'rejected')">Reject</button>
+                </div>
+                <template x-if="$store.genesisDashboard.approvalActionState(req.id).error">
+                  <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;"
+                       x-text="$store.genesisDashboard.approvalActionState(req.id).error"></div>
+                </template>
+              </div>
+            </template>
+          </div>
         </template>
       </div>
     </div>
@@ -4320,6 +4507,63 @@
             </div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- Panel: Autonomous CLI Policy [Tab: config] -->
+    <div class="panel" id="autonomous-cli-policy" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">policy</span>
+        Autonomous CLI Policy
+        <span class="panel-status">
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('autonomousCliPolicy')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('autonomousCliPolicy')"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <template x-if="$store.genesisDashboard.panelStatusDetail('autonomousCliPolicy')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('autonomousCliPolicy')"></div>
+        </template>
+        <template x-if="!$store.genesisDashboard.autonomousCliPolicy">
+          <div class="empty-state">Policy status not loaded yet.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.autonomousCliPolicy">
+          <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem;">
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Effective policy</div>
+              <div style="font-size:0.78rem; line-height:1.7;">
+                <div style="display:flex; justify-content:space-between;"><span>CLI fallback</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.autonomous_cli_fallback_enabled ? 'enabled' : 'disabled'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Manual approval</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.manual_approval_required ? 'required' : 'not required'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Channel</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.approval_channel || 'telegram'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Re-ask</span><span x-text="(($store.genesisDashboard.autonomousCliPolicy.effective_policy?.reask_interval_hours || 24) + 'h')"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Source</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.source || 'unknown'"></span></div>
+              </div>
+            </div>
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Guardian export</div>
+              <div style="font-size:0.78rem; line-height:1.7;">
+                <div style="display:flex; justify-content:space-between;"><span>Shared export</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.effective_policy?.shared_export_enabled ? 'enabled' : 'disabled'"></span></div>
+                <div style="display:flex; justify-content:space-between;"><span>Last export</span><span x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_at ? $store.genesisDashboard.relativeTime($store.genesisDashboard.autonomousCliPolicy.last_export_at) : 'not exported'"></span></div>
+                <div style="display:flex; justify-content:space-between; gap:0.5rem;"><span>Path</span><span style="text-align:right; word-break:break-all;" x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_path || 'pending'"></span></div>
+              </div>
+              <template x-if="$store.genesisDashboard.autonomousCliPolicy.last_export_error">
+                <div style="margin-top:0.45rem; font-size:0.7rem; color:#d9534f;" x-text="$store.genesisDashboard.autonomousCliPolicy.last_export_error"></div>
+              </template>
+            </div>
+            <div style="background:var(--color-background); border:1px solid var(--color-border); border-radius:6px; padding:0.75rem;">
+              <div class="health-card-title">Operator actions</div>
+              <div style="font-size:0.74rem; color:var(--color-text-secondary); line-height:1.6;">
+                Edit the <code>autonomous_cli_policy</code> settings domain below to change the global fallback gate. Changes hot-reload for Genesis-side routing and are exported to the shared Guardian mount.
+              </div>
+              <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.55rem;">
+                <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.28); color:#2196F3; background:transparent; cursor:pointer;"
+                        @click="$store.genesisDashboard.fetchSettingsData('autonomous_cli_policy'); $store.genesisDashboard.settingsEditing = 'autonomous_cli_policy'">Edit policy</button>
+                <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); background:transparent; cursor:pointer;"
+                        @click="$store.genesisDashboard.fetchAutonomousCliPolicy()">Refresh status</button>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
     </div>
 

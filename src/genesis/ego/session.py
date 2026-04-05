@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.cc.types import (
     CCInvocation,
     CCModel,
@@ -73,6 +74,7 @@ class EgoSession:
         self._config = config
         self._db = db
         self._event_bus = event_bus
+        self._autonomous_dispatcher = None
         # Cache the static system prompt (read once, not every cycle)
         if _PROMPT_PATH.exists():
             self._static_prompt = _PROMPT_PATH.read_text()
@@ -82,6 +84,9 @@ class EgoSession:
                 "You are Genesis's executive function. "
                 "Output valid JSON matching the ego output schema."
             )
+
+    def set_autonomous_dispatcher(self, dispatcher: object) -> None:
+        self._autonomous_dispatcher = dispatcher
 
     # -- Public API --------------------------------------------------------
 
@@ -116,19 +121,7 @@ class EgoSession:
         system_prompt = self._build_system_prompt(dynamic_context)
         user_prompt = self._build_user_prompt(is_morning_report=is_morning_report)
 
-        # 5. Create background session
-        try:
-            sess = await self._session_manager.create_background(
-                session_type=SessionType.BACKGROUND_TASK,
-                model=CCModel(self._config.model),
-                effort=EffortLevel.MAX,
-                source_tag="ego_cycle",
-            )
-        except Exception:
-            logger.error("Failed to create ego background session", exc_info=True)
-            return None
-
-        # 6. Invoke CC
+        # 5. Prepare invocation
         invocation = CCInvocation(
             prompt=user_prompt,
             model=CCModel(self._config.model),
@@ -139,22 +132,62 @@ class EgoSession:
             working_dir=background_session_dir(),
         )
 
-        try:
-            output = await self._invoker.run(invocation)
-        except Exception:
-            logger.error("Ego CC invocation failed", exc_info=True)
+        output = None
+        used_cli = True
+        session_id: str | None = None
+        if self._autonomous_dispatcher is not None:
+            decision = await self._autonomous_dispatcher.route(
+                AutonomousDispatchRequest(
+                    subsystem="ego",
+                    policy_id="ego_cycle",
+                    action_label="ego cycle",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    cli_invocation=invocation,
+                    api_call_site_id="7_ego_cycle_api",
+                    cli_fallback_allowed=True,
+                    approval_required_for_cli=True,
+                ),
+            )
+            if decision.mode == "blocked":
+                logger.warning("Ego cycle blocked: %s", decision.reason)
+                return None
+            if decision.mode == "api":
+                output = decision.output
+                used_cli = False
+
+        if output is None:
             try:
-                await self._session_manager.fail(sess["id"], reason="CC invocation error")
+                sess = await self._session_manager.create_background(
+                    session_type=SessionType.BACKGROUND_TASK,
+                    model=CCModel(self._config.model),
+                    effort=EffortLevel.MAX,
+                    source_tag="ego_cycle",
+                )
+                session_id = sess["id"]
             except Exception:
-                logger.error("Session fail() also errored", exc_info=True)
-            return None
+                logger.error("Failed to create ego background session", exc_info=True)
+                return None
+
+            try:
+                output = await self._invoker.run(invocation)
+            except Exception:
+                logger.error("Ego CC invocation failed", exc_info=True)
+                try:
+                    await self._session_manager.fail(session_id, reason="CC invocation error")
+                except Exception:
+                    logger.error("Session fail() also errored", exc_info=True)
+                return None
 
         if output.is_error:
             logger.error("Ego CC session returned error: %s", output.error_message)
-            try:
-                await self._session_manager.fail(sess["id"], reason=output.error_message)
-            except Exception:
-                logger.error("Session fail() also errored", exc_info=True)
+            if used_cli and session_id is not None:
+                try:
+                    await self._session_manager.fail(session_id, reason=output.error_message)
+                except Exception:
+                    logger.error("Session fail() also errored", exc_info=True)
             return None
 
         # 7. Parse output
@@ -175,26 +208,26 @@ class EgoSession:
         )
         await self._compaction.store_cycle(cycle)
 
-        # 9. Complete session
-        await self._session_manager.complete(
-            sess["id"],
-            cost_usd=output.cost_usd,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
-        )
-
-        # 10. Record last run for neural monitor
-        try:
-            from genesis.observability.call_site_recorder import record_last_run
-            await record_last_run(
-                self._db, _CALL_SITE,
-                provider="cc", model_id=output.model_used or self._config.model,
-                response_text=output.text[:500] if output.text else "",
+        if used_cli and session_id is not None:
+            await self._session_manager.complete(
+                session_id,
+                cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
             )
-        except Exception:
-            logger.warning("Failed to record ego last_run", exc_info=True)
+
+            # 10. Record last run for neural monitor
+            try:
+                from genesis.observability.call_site_recorder import record_last_run
+                await record_last_run(
+                    self._db, _CALL_SITE,
+                    provider="cc", model_id=output.model_used or self._config.model,
+                    response_text=output.text[:500] if output.text else "",
+                    input_tokens=output.input_tokens,
+                    output_tokens=output.output_tokens,
+                )
+            except Exception:
+                logger.warning("Failed to record ego last_run", exc_info=True)
 
         # 11. Process proposals
         if parsed:
