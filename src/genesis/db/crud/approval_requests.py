@@ -46,6 +46,18 @@ async def list_pending(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_recent(
+    db: aiosqlite.Connection, *, limit: int = 200,
+) -> list[dict]:
+    cursor = await db.execute(
+        """SELECT * FROM approval_requests
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def list_expired(
     db: aiosqlite.Connection, *, now: str
 ) -> list[dict]:
@@ -73,8 +85,22 @@ async def resolve(
     cursor = await db.execute(
         """UPDATE approval_requests
            SET status = ?, resolved_at = ?, resolved_by = ?
-           WHERE id = ?""",
+           WHERE id = ?
+             AND status = 'pending'""",
         (status, resolved_at, resolved_by, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def update_context(
+    db: aiosqlite.Connection, id: str, *, context: str,
+) -> bool:
+    cursor = await db.execute(
+        """UPDATE approval_requests
+           SET context = ?
+           WHERE id = ?""",
+        (context, id),
     )
     await db.commit()
     return cursor.rowcount > 0

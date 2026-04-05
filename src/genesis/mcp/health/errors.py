@@ -255,13 +255,14 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         current_ids.add(alert_id)
 
     services = snap.get("services", {})
-    bridge_svc = services.get("bridge", {})
-    if bridge_svc.get("active_state") not in ("active", "unknown"):
-        alert_id = "service:bridge_down"
+    genesis_svc = services.get("bridge", {})  # key is "bridge" for backward compat
+    if genesis_svc.get("active_state") not in ("active", "unknown"):
+        svc_label = genesis_svc.get("service_unit", "genesis-server.service")
+        alert_id = "service:genesis_down"
         alerts.append({
             "id": alert_id,
             "severity": "CRITICAL",
-            "message": f"genesis-bridge.service is {bridge_svc.get('active_state', 'unknown')}",
+            "message": f"{svc_label} is {genesis_svc.get('active_state', 'unknown')}",
         })
         current_ids.add(alert_id)
 

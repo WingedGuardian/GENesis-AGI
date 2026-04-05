@@ -12,6 +12,8 @@ Exit codes:
 Escape hatch: Add a comment containing 'behavioral-lint: ignore <rule-name>'
 in the content to suppress a specific rule for that file. This leaves an
 audit trail — the user approved the exception.
+
+Emits SteerMessage for unified enforcement feedback.
 """
 
 import json
@@ -63,6 +65,31 @@ def _check_content(content: str, rules: list[dict]) -> list[tuple[dict, dict]]:
     return violations
 
 
+def _to_steer_messages(violations: list[tuple[dict, dict]], file_path: str) -> list:
+    """Convert violations to SteerMessage instances."""
+    from genesis.autonomy.steering import SteerMessage
+    from genesis.autonomy.types import ApprovalDecision, EnforcementLayer
+
+    messages = []
+    for rule, pattern_def in violations:
+        severity = rule.get("severity", "warn")
+        name = rule.get("name", "unnamed")
+        messages.append(SteerMessage(
+            layer=EnforcementLayer.HARD_BLOCK,
+            rule_id=name,
+            decision=ApprovalDecision.BLOCK if severity == "block" else ApprovalDecision.ACT,
+            severity="critical" if severity == "block" else "medium",
+            title=f"Behavioral rule '{name}' violated",
+            context=pattern_def.get("context", ""),
+            suggestion=rule.get("description", "") + ("\n  " + rule.get("suggestion", "") if rule.get("suggestion") else ""),
+            tool_name="Write",
+            file_path=file_path,
+            can_suppress=True,
+            suppress_key=f"# behavioral-lint: ignore {name}",
+        ))
+    return messages
+
+
 def main() -> int:
     tool_input = sys.stdin.read()
     try:
@@ -86,27 +113,15 @@ def main() -> int:
     if not violations:
         return 0
 
-    # Report violations
+    # Convert to SteerMessages and output
+    messages = _to_steer_messages(violations, file_path)
+
     exit_code = 0
-    for rule, pattern_def in violations:
-        severity = rule.get("severity", "warn")
-        name = rule.get("name", "unnamed")
-        context = pattern_def.get("context", "")
-        suggestion = rule.get("suggestion", "")
-
-        msg = (
-            f"\n{'BLOCKED' if severity == 'block' else 'WARNING'}: "
-            f"Behavioral rule '{name}' violated\n"
-            f"  File: {file_path}\n"
-            f"  Issue: {context}\n"
-            f"  Rule: {rule.get('description', '')}\n"
-            f"  Fix: {suggestion}\n"
-            f"  Escape: Add '# behavioral-lint: ignore {name}' if user-approved\n"
-        )
-        print(msg, file=sys.stderr)
-
-        if severity == "block":
-            exit_code = 2
+    for msg in messages:
+        print(msg.to_stderr(), file=sys.stderr)
+        code = msg.to_exit_code()
+        if code > exit_code:
+            exit_code = code
 
     return exit_code
 

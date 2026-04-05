@@ -53,6 +53,7 @@ async def init(rt: GenesisRuntime) -> None:
             outreach_pipeline=getattr(rt, "_outreach_pipeline", None),
             event_bus=rt._event_bus,
             runtime=rt,
+            autonomous_dispatcher=getattr(rt, "_autonomous_dispatcher", None),
         )
 
         dispatcher = TaskDispatcher(

@@ -8,6 +8,8 @@ checks against CRITICAL patterns from config/protected_paths.yaml.
 Exit codes:
   0 — allow (path is not CRITICAL)
   2 — block (path is CRITICAL, cannot be modified from this channel)
+
+Emits SteerMessage for unified enforcement feedback.
 """
 
 import json
@@ -75,13 +77,23 @@ def main() -> int:
     patterns = _load_critical_patterns()
     matched = _matches(file_path, patterns)
     if matched:
-        print(
-            f"BLOCKED: {file_path} matches CRITICAL protected pattern '{matched}'. "
-            "This path cannot be modified from a relay/chat channel. "
-            "Use a direct CC CLI session instead.",
-            file=sys.stderr,
+        from genesis.autonomy.steering import SteerMessage
+        from genesis.autonomy.types import ApprovalDecision, EnforcementLayer
+
+        msg = SteerMessage(
+            layer=EnforcementLayer.PERMISSION_GATE,
+            rule_id="critical_protected_path",
+            decision=ApprovalDecision.BLOCK,
+            severity="critical",
+            title="CRITICAL protected path",
+            context=f"Matches pattern '{matched}'",
+            suggestion="This path cannot be modified from a relay/chat channel. "
+                       "Use a direct CC CLI session instead.",
+            tool_name="Write",
+            file_path=file_path,
         )
-        return 2
+        print(msg.to_stderr(), file=sys.stderr)
+        return msg.to_exit_code()
 
     return 0
 

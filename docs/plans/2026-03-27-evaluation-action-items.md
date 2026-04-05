@@ -1,5 +1,11 @@
 # Evaluation Action Items — 2026-03-27
 
+> **Note:** The canonical location for action items is now `docs/actions/`.
+> New items should go to `docs/actions/genesis/active.md` (Genesis dev) or
+> `docs/actions/user/active.md` (user personal). This document is retained
+> as a historical reference. Items here will be consolidated during a
+> separate triage pass.
+
 Living document capturing action items from technology evaluation batch
 (hallucination mitigation, SpecEyes speculative execution, MolmoWeb visual
 web agent, generalist trust-layer thesis). Items are added during evaluation,

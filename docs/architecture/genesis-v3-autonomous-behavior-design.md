@@ -1546,7 +1546,7 @@ routing decision.
 | Task Complexity | Primary Engine | Fallback | User Notification |
 |----------------|---------------|----------|-------------------|
 | Routine (add function, fix bug, write tests) | OpenCode (cost-efficient model) | Agent Zero LiteLLM | None — within normal budget |
-| Complex (multi-file refactor, architecture) | Claude Code subprocess (subscription) | Claude SDK API (with cost estimate) | "This task may cost $X via Claude SDK. Proceed?" |
+| Complex (multi-file refactor, architecture) | Claude SDK API (with cost estimate) | Claude Code subprocess (optional) | "This task may cost $X via Claude SDK. Proceed?" |
 | Rate-limited | OpenCode (best available model) | — | "Claude unavailable, using OpenCode with [model]" |
 
 **Cost estimation before invocation:**
@@ -1565,8 +1565,8 @@ Agent Zero can attempt to invoke the `claude` CLI binary as a subprocess, which
 uses the user's subscription OAuth rather than API billing. This is running
 Anthropic's own product, not the SDK. Risks: Anthropic could restrict automated
 invocation; the CLI's interactive nature may not map cleanly to Agent Zero's tool
-interface. If it works, it's the preferred path for subscription holders. If not,
-fall back to SDK with cost notification.
+interface. Use this path as an optional mode based on user/operator preference.
+If it is unavailable or not desired, route through SDK with cost notification.
 
 **Per-engine budget tracking:**
 Execution traces (see schema above) track `cost_usd` per sub-agent. Aggregate

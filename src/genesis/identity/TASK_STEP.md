@@ -48,6 +48,11 @@ If blocked:
 
 - **research**: Do not modify files. Read, search, fetch only.
 - **code**: Write clean, tested code. Run linting. Follow existing patterns.
+  Before writing code, plan the change: (1) What specific outcome does this step
+  produce? (2) What existing code does something similar — read it first.
+  (3) Which files change and what's the minimal diff? (4) What could go wrong?
+  Only then implement. This prevents the most common failure: solving the wrong
+  problem or ignoring existing patterns.
 - **analysis**: Produce structured findings. Support conclusions with evidence.
 - **synthesis**: Combine prior results. Reference specific step outputs.
 - **verification**: Check against success criteria. Run tests if applicable.

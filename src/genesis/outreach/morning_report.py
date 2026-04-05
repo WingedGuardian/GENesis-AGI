@@ -44,14 +44,17 @@ class MorningReportGenerator:
 
         system_prompt = self._load_system_prompt()
 
-        draft = await self._drafter.draft(DraftRequest(
-            topic=topic,
-            context=context,
-            target=FormatTarget.GENERIC,
-            tone="concise and informative",
-            max_length=None,
-            system_prompt=system_prompt,
-        ))
+        draft = await self._drafter.draft(
+            DraftRequest(
+                topic=topic,
+                context=context,
+                target=FormatTarget.GENERIC,
+                tone="concise and informative",
+                max_length=None,
+                system_prompt=system_prompt,
+            ),
+            call_site_id="13_morning_report",
+        )
 
         return OutreachRequest(
             category=OutreachCategory.DIGEST,

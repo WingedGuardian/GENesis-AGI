@@ -9,6 +9,44 @@ from enum import IntEnum, StrEnum
 # Protection levels — what can Genesis modify and from where?
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Enforcement spectrum — where does a rule live?
+# ---------------------------------------------------------------------------
+
+class EnforcementLayer(IntEnum):
+    """7-layer enforcement spectrum from strictest to most permissive.
+
+    Provides a taxonomy for classifying all Genesis enforcement mechanisms.
+    When adding a new rule or constraint, use this to decide where it belongs:
+
+    HARD_BLOCK (7)     — Framework intercept, exit code 2. Unpromptable.
+                         E.g. behavioral linter blocks, destructive command blocks.
+    PERMISSION_GATE (6) — Requires explicit user action to proceed.
+                         E.g. CRITICAL protected path blocks.
+    PROPOSAL_GATE (5)  — Requires approval before acting.
+                         E.g. autonomy classification for costly_reversible/irreversible.
+    ADVISORY (4)       — Soft context injection, LLM can override.
+                         E.g. procedure advisories, system prompt steering rules.
+    DETECTION (3)      — Observation only, no enforcement.
+                         E.g. confidence gates (shadow mode), content sanitization.
+    AMBIENT (2)        — Always-on background classification.
+                         E.g. keyword action classification, pattern matching.
+    BASELINE (1)       — No enforcement — the default state.
+    """
+
+    HARD_BLOCK = 7
+    PERMISSION_GATE = 6
+    PROPOSAL_GATE = 5
+    ADVISORY = 4
+    DETECTION = 3
+    AMBIENT = 2
+    BASELINE = 1
+
+
+# ---------------------------------------------------------------------------
+# Protection levels — what can Genesis modify and from where?
+# ---------------------------------------------------------------------------
+
 class ProtectionLevel(StrEnum):
     """Path protection classification.
 
@@ -109,7 +147,6 @@ class WatchdogAction(StrEnum):
     """Actions the watchdog can take."""
 
     RESTART = "restart"           # Restart bridge
-    RESTART_AZ = "restart_az"    # Restart Agent Zero
     SKIP = "skip"                # Config validation failed, don't restart
     NOTIFY = "notify"            # Alert user, don't restart
     BACKOFF = "backoff"          # Too many restarts, wait

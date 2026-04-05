@@ -58,6 +58,7 @@ class HybridRetriever:
         source: str = "both",
         limit: int = 10,
         min_activation: float = 0.0,
+        expand_query_terms: bool = False,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF."""
         if source not in _SOURCE_TO_COLLECTIONS:
@@ -102,14 +103,15 @@ class HybridRetriever:
         # 2b. Classify query intent (for RRF bias in step 7)
         intent = classify_intent(query)
 
-        # 2c. Expand query via tag co-occurrence (improves FTS5 recall)
+        # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
         fts_query = query
-        try:
-            fts_query = await expand_query(
-                query, self._qdrant, collections, max_expansions=5,
-            )
-        except Exception:
-            logger.warning("Query expansion failed, using original", exc_info=True)
+        if expand_query_terms:
+            try:
+                fts_query = await expand_query(
+                    query, self._qdrant, collections, max_expansions=5,
+                )
+            except Exception:
+                logger.warning("Query expansion failed, using original", exc_info=True)
 
         # 3. FTS5 text search (using expanded query)
         fts_collection = collections[0] if len(collections) == 1 else None
@@ -147,6 +149,7 @@ class HybridRetriever:
                 retrieved_count = 0
 
             link_count = await memory_links.count_links(self._db, mid)
+            mem_class = payload.get("memory_class", "fact") if qdrant_hit else "fact"
             act = compute_activation(
                 confidence=confidence,
                 created_at=created_at,
@@ -155,6 +158,7 @@ class HybridRetriever:
                 source=payload.get("source", "") if qdrant_hit else "",
                 tags=payload.get("tags") or [] if qdrant_hit else [],
                 now=now_str,
+                memory_class=mem_class,
             )
             activation_by_id[mid] = act.final_score
 
@@ -306,6 +310,7 @@ class HybridRetriever:
                     transcript_path=_p.get("transcript_path"),
                     source_line_range=tuple(_line_range) if _line_range else None,
                     source_pipeline=_p.get("source_pipeline"),
+                    memory_class=_p.get("memory_class", "fact"),
                     query_intent=intent.category,
                     intent_confidence=intent.confidence,
                 ),

@@ -5,7 +5,6 @@
 # Environment variables (all optional):
 #   GENESIS_BACKUP_REPO  — Git URL for backup repo (auto-detected from existing clone)
 #   GENESIS_DIR          — Genesis repo root (default: ~/genesis)
-#   AZ_ROOT              — Agent Zero root (default: ~/agent-zero)
 #   QDRANT_URL           — Qdrant server URL (default: http://localhost:6333)
 #   SECRETS_PATH         — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
 set -euo pipefail
@@ -32,7 +31,6 @@ STATUSEOF
 trap '_write_status' EXIT
 
 GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
-AZ_DIR="${AZ_ROOT:-$HOME/agent-zero}"
 BACKUP_DIR="$HOME/backups/genesis-backups"
 # Derive CC project dir from genesis dir path (CC convention: / → -)
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')

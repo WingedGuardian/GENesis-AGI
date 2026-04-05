@@ -1,9 +1,9 @@
 """Service status collector — queries systemd units and watchdog state.
 
 Provides infrastructure-level visibility into the Genesis service stack:
-bridge process, watchdog timer, and watchdog health state. Used by
-HealthDataService.snapshot() to surface service health in the dashboard
-and MCP tools.
+genesis-server (or bridge fallback), watchdog timer, and watchdog health
+state. Used by HealthDataService.snapshot() to surface service health in
+the dashboard and MCP tools.
 
 All subprocess calls use timeout=5s to avoid blocking the health snapshot.
 """
@@ -17,6 +17,8 @@ import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
+from genesis.util.systemd import systemctl_env
+
 logger = logging.getLogger(__name__)
 
 _BRIDGE_LOCK = Path.home() / ".genesis" / "bridge.lock"
@@ -26,9 +28,44 @@ _WATCHDOG_STATE = Path.home() / ".genesis" / "watchdog_state.json"
 _EXPECTED_QDRANT_COLLECTIONS = {"episodic_memory", "knowledge_base"}
 
 _SYSTEMD_UNITS = {
-    "bridge": "genesis-bridge.service",
     "watchdog_timer": "genesis-watchdog.timer",
 }
+
+
+def _detect_genesis_service() -> tuple[str, str]:
+    """Detect which Genesis service is active.
+
+    Returns (unit_name, display_label) — prefers genesis-server,
+    falls back to genesis-bridge for legacy deployments.
+    """
+    for unit, label in [
+        ("genesis-server.service", "Server"),
+        ("genesis-bridge.service", "Bridge"),
+    ]:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-enabled", unit],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            if result.returncode == 0:
+                return unit, label
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    # Nothing enabled — check if either is at least loaded
+    for unit, label in [
+        ("genesis-server.service", "Server"),
+        ("genesis-bridge.service", "Bridge"),
+    ]:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", unit],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            if result.stdout.strip() == "active":
+                return unit, label
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    return "genesis-server.service", "Server"
 
 
 def query_systemd_unit(unit_name: str) -> dict:
@@ -39,7 +76,7 @@ def query_systemd_unit(unit_name: str) -> dict:
                 "systemctl", "--user", "show", unit_name,
                 "--property=ActiveState,SubState,NRestarts,ExecMainStartTimestamp",
             ],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=systemctl_env(),
         )
         if result.returncode != 0:
             return {}
@@ -71,17 +108,36 @@ def _bridge_pid_alive() -> tuple[int | None, bool]:
 
 
 def parse_systemd_timestamp(raw: str) -> str | None:
-    """Parse systemd's timestamp format into ISO 8601, or None."""
-    # Format: "Mon 2026-03-16 16:30:26 UTC" or empty
+    """Parse systemd's timestamp format into ISO 8601, or None.
+
+    systemd outputs local time with a timezone abbreviation, e.g.
+    ``Sat 2026-04-04 20:18:30 EDT``.  Python's ``%Z`` in strptime does
+    NOT reliably convert abbreviations to tzinfo — it produces a naive
+    datetime.  We use ``dateutil.parser`` when available (handles
+    abbreviations correctly), falling back to the system local timezone.
+    """
     if not raw or raw == "n/a":
         return None
     try:
-        # Strip weekday prefix if present
+        # Strip weekday prefix if present (e.g. "Sat ")
         parts = raw.split(" ", 1)
         if len(parts) == 2 and len(parts[0]) <= 3:
             raw = parts[1]
-        dt = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S %Z")
-        return dt.replace(tzinfo=UTC).isoformat()
+
+        # Attempt dateutil first — it handles EDT/EST/PST/etc. correctly
+        try:
+            from dateutil import parser as _du_parser
+
+            dt = _du_parser.parse(raw)
+            if dt.tzinfo is not None:
+                return dt.astimezone(UTC).isoformat()
+        except Exception:
+            pass
+
+        # Fallback: parse date+time, assume system local timezone
+        naive = datetime.strptime(raw.rsplit(" ", 1)[0], "%Y-%m-%d %H:%M:%S")
+        local_dt = naive.astimezone()  # attaches system local tz
+        return local_dt.astimezone(UTC).isoformat()
     except (ValueError, IndexError):
         return None
 
@@ -180,17 +236,20 @@ def collect_service_status() -> dict:
     """
     result = {}
 
-    # Bridge service
-    bridge_props = query_systemd_unit(_SYSTEMD_UNITS["bridge"])
+    # Genesis service (auto-detect: server or bridge)
+    svc_unit, svc_label = _detect_genesis_service()
+    svc_props = query_systemd_unit(svc_unit)
     bridge_pid, pid_alive = _bridge_pid_alive()
-    start_ts = parse_systemd_timestamp(bridge_props.get("ExecMainStartTimestamp", ""))
+    start_ts = parse_systemd_timestamp(svc_props.get("ExecMainStartTimestamp", ""))
     result["bridge"] = {
-        "active_state": bridge_props.get("ActiveState", "unknown"),
-        "sub_state": bridge_props.get("SubState", "unknown"),
+        "active_state": svc_props.get("ActiveState", "unknown"),
+        "sub_state": svc_props.get("SubState", "unknown"),
         "pid": bridge_pid,
         "pid_alive": pid_alive,
         "uptime_seconds": compute_uptime_seconds(start_ts),
-        "restart_count": int(bridge_props.get("NRestarts", 0)),
+        "restart_count": int(svc_props.get("NRestarts", 0)),
+        "service_label": svc_label,
+        "service_unit": svc_unit,
     }
 
     # Watchdog timer

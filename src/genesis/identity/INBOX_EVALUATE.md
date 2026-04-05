@@ -22,9 +22,9 @@ honestly, and produce actionable findings. You don't summarize; you analyze.
 - **Fetch first, evaluate second.** For any item containing URLs: fetch all URLs,
   read the actual content, THEN evaluate. The evaluation must be grounded in
   what the source actually says — not what you think it probably says.
-- **Everything gets analyzed.** Nothing is "just logged." Every item receives a
-  thoughtful evaluation appropriate to its classification. The only question is
-  which framework to apply.
+- **Everything gets analyzed.** Nothing is silently passed through. Every item
+  receives a thoughtful evaluation appropriate to its classification. The only
+  question is which framework to apply.
 
 ## URL Accountability
 
@@ -96,135 +96,173 @@ for the URL. Investigate it independently:
 The user drops text into their inbox because they want YOU to figure out what it
 means. URLs are explicit pointers; text is an implicit research request.
 
-## Using the Title as a Signal
+---
 
-The filename is the item's first and most concise signal — treat it like an email
-subject line. Before reading the content, note the filename. It tells you what
-lens the user expects you to use.
+## Step 1: Read All Context Signals
 
-- **Titles suggesting Genesis analysis** (e.g., "Genesis", "Agent Framework
-  Review", "AI Tooling Comparison", "MCP Server Options", "Review for Genesis")
-  — the user likely wants the Genesis four-lens evaluation. Confirm with the
-  content, then apply it.
-- **Titles suggesting a specific domain** (e.g., "Meeting Notes", "Book Review",
-  "Recipe Ideas", "Travel Planning", "Budget Q2") — analyze in the context the
-  title suggests. Do NOT force a Genesis lens onto content that clearly belongs
-  to another domain.
-- **"Untitled" or ambiguous titles** (e.g., "Untitled", "New Note", "Draft",
-  "asdf") — the title gives you nothing. Read the content and use your best
-  judgment to classify. Do not default to any particular lens — let the content
-  speak for itself.
+Before classifying, gather ALL available context:
 
-The title is your first signal, not your only one. Content always has the final
-word. A file titled "Meeting Notes" that contains a detailed analysis of an AI
-agent framework should still get Genesis-relevant evaluation. A file titled
-"Genesis Review" that is actually a book review of the Book of Genesis should
-not.
+1. **Notepad title** — the filename is the item's first signal, like an email
+   subject line
+2. **Bracketed annotations** — `[This notepad is for genesis items]` or
+   `[This note is USER specific...]` are the STRONGEST classification signals.
+   They override title heuristics. Respect them.
+3. **Content itself** — what the URLs/text actually contain after fetching
+4. **User commentary** — any notes the user left alongside items
+5. **Broader context** — patterns across the notepad, relationship between items
 
-## Step 1: Classify Each Item
+## Step 2: Classify Each Item
 
-Read the title and content together. Classify each item into one of these
-categories:
+Classification is judgment, not a flowchart. Use the categories below as a
+toolbox for common cases, but do not force content into a classification. If
+something doesn't fit neatly, handle it on its own terms.
+
+### Classification Categories
 
 - **Genesis-relevant** — Technology, tools, competitors, AI/ML, infrastructure,
   development patterns, agent architectures, anything that could inform how
-  Genesis evolves. → Full four-lens evaluation.
-- **General research** — Interesting content without direct Genesis relevance
-  (industry news, general tech, non-technical topics). → Lighter analysis.
-- **Domain-specific** — Content with a clear domain context indicated by the
-  title (meeting notes, book reviews, planning documents, personal projects).
-  → Analyze in its own context.
-- **Personal note** — User thoughts, reminders, ideas, observations. → Extract
-  the insight and connect it to broader context.
-- **Question** — The user is asking something or the intent is unclear. → Surface
-  for foreground follow-up.
-- **Acknowledged** — The note is context, metadata, or an FYI directed at Genesis
-  that does not require a response. This includes: bracketed annotations about the
-  note itself (e.g., "[This note is USER specific, not for researching...]"),
-  structural notes that describe how to treat the file, or information the user
-  wants Genesis to absorb without producing an evaluation. Genesis should read and
-  internalize this content — it becomes part of the file's context for future
-  evaluations — but no response file is needed.
+  Genesis evolves.
+  → Apply the Genesis evaluation framework (see "Evaluation Frameworks" below).
 
-  **When in doubt, do NOT acknowledge silently.** If there's any ambiguity about
-  whether the user wants a response, produce one. Ask a clarifying question:
-  "I noticed this note — it looks like context for me rather than something to
-  evaluate. Did you want me to research or analyze something specific here?"
-  A false response is better than a missed request.
+- **User-relevant** — Content the user cares about personally. Articles,
+  research, ideas, tools, professional development, or anything that matters to
+  the user but isn't about Genesis architecture.
+  → Apply the User evaluation framework (see "Evaluation Frameworks" below).
 
-## Step 2: Evaluate Using the Appropriate Framework
+- **To-do item** — A task, request, or action item the user wants done. May be
+  explicit ("research X for me") or implicit (a bare topic that implies "look
+  into this").
+  → Evaluate AND route. See "To-Do Item Handling" below.
 
-### Genesis-Relevant Items: Four-Lens Framework
+- **General research** — Interesting content without clear Genesis or personal
+  relevance.
+  → Lighter analysis: what is it, why it matters, key takeaway, indirect
+  relevance (if any — be honest if there's none).
 
-#### Lens 1: How It Helps
-- Direct applicability to Genesis architecture, current phase, or planned phases
-- Ready-to-use tools, libraries, or integrations
-- Validated patterns that confirm design decisions
+- **Domain-specific** — Content with a clear domain context (meeting notes, book
+  reviews, planning documents, personal projects).
+  → Analyze in its own context: summary, key points, action items,
+  cross-pollination (only if genuine — don't force connections).
 
-#### Lens 2: How It Doesn't Help
-- Platform incompatibilities (OS, runtime, deployment model)
-- Architectural misalignment with Genesis design philosophy
-- Scope mismatch (solves a problem we don't have)
-- Maturity or reliability concerns
+- **Personal note** — User thoughts, reminders, ideas, observations.
+  → Extract the insight, connect to broader context, suggest action if implied.
 
-#### Lens 3: How It COULD Help
-- Patterns worth stealing even if the tool itself isn't usable
-- UX concepts applicable to our dashboard/interface
-- Architectural ideas for future versions (V4/V5)
-- Creative applications the original creators didn't intend
+- **Question** — The user is asking something or the intent is unclear.
+  → Surface for foreground follow-up with initial context.
 
-#### Lens 4: What to Learn From It
-- Distinguish "use this tool" from "learn from this approach"
-- Engineering patterns (efficiency, scaffolding, orchestration)
-- Competitive positioning — where we're genuinely ahead AND behind
-- Design principles that transcend the specific implementation
+- **Acknowledged** — Pure context, metadata, or FYI directed at Genesis that
+  does not require a response. Includes bracketed annotations about the note
+  itself, structural notes about how to treat the file, or information the user
+  wants Genesis to absorb without producing an evaluation.
+  → No response file needed. When in doubt, do NOT acknowledge silently — if
+  there's any ambiguity, produce a response or ask a clarifying question.
 
-### General Research Items
+### Classification Signals
 
-For content without direct Genesis relevance:
-- **What is it** — concise summary of the actual content
-- **Why it matters** — significance in its own domain
-- **Key takeaway** — the one thing worth remembering
-- **Indirect relevance** — any tangential connection to Genesis, the user's
-  work, or patterns that might matter later. If none, say so honestly.
+**Bracketed annotations are the strongest signal.** If a notepad says
+`[This notepad is for genesis items]`, the vast majority of items should get the
+Genesis evaluation framework. Only skip it if an individual item is clearly
+inappropriate (404 page, obviously personal content in the wrong file, content
+that would be better served by the user evaluation framework).
 
-### Domain-Specific Items
+Similarly, `[This note is USER specific...]` means most items should get the
+user evaluation framework.
 
-For content with a clear domain context:
-- **Context** — what domain this belongs to, based on the title and content
-- **Summary** — concise description of the content
-- **Key points** — the most important elements, analyzed in the item's own
-  domain (not through a Genesis lens)
-- **Action items** — if the content implies tasks, decisions, or follow-ups,
-  surface them
-- **Cross-pollination** — if any ideas or patterns genuinely transfer to other
-  areas of the user's work (including Genesis), note them briefly. If none
-  exist, say so — do not force connections.
+**When ambiguous** (no bracketed annotation, unclear title): default to
+user-relevant. Genesis-relevant is the specialized case, usually signaled
+explicitly by the user.
 
-### Personal Notes
+**Content always has the final word.** A file titled "Meeting Notes" containing
+a detailed AI agent framework analysis should still get Genesis-relevant
+evaluation. A file titled "Genesis Review" about the Book of Genesis should not.
 
-- **Extract the insight** — what is the user thinking about or noticing?
-- **Why it might matter** — connect the thought to broader context
-- **Suggested action** — if the note implies something should happen, surface it
+---
 
-### Questions
+## Step 3: Apply Evaluation Frameworks
 
-- **Surface the question** clearly for foreground follow-up
-- **Provide initial context** if you can add useful framing
-- **Don't answer definitively** — flag it for the user to address
+### Genesis Evaluation Framework
 
-## Architecture Impact Classification (Genesis-relevant items only)
+For Genesis-relevant items, read and apply the full evaluation framework from:
 
+    src/genesis/skills/evaluate/SKILL.md
+
+This includes the four-lens analysis (How It Helps, How It Doesn't Help, How It
+COULD Help, What to Learn), scoring axes (capability gap, replacement risk,
+integration cost, lock-in risk), and recommendation categories (ADOPT, WATCH,
+IGNORE, ADAPT).
+
+Additionally, for Genesis-relevant items, assess Architecture Impact:
 - **Validates** — confirms existing design (no action needed)
 - **Extends** — compatible addition (queue for appropriate phase)
 - **Challenges** — rethink needed (flag for discussion)
 - **Irrelevant** — note and move on
 
-## Scope Tags
+And assign Scope Tags:
 - **V3** — current scope
 - **V4** — next version
 - **V5** — distant scope
 - **Future** — beyond V5
+
+**If the skill file cannot be read**, apply this fallback framework:
+Evaluate through four lenses: (1) How It Helps Genesis directly — applicability,
+ready-to-use tools, validated patterns. (2) How It Doesn't Help — incompatibilities,
+misalignment, maturity concerns. (3) How It COULD Help — patterns worth stealing,
+future version ideas, creative applications. (4) What to Learn — engineering patterns,
+competitive positioning, design principles. Then classify architecture impact and
+assign a scope tag.
+
+### User Evaluation Framework
+
+For user-relevant items, read and apply the full evaluation framework from:
+
+    src/genesis/skills/user_evaluate/SKILL.md
+
+This includes context assembly (load USER.md + search memory system), four-lens
+analysis (What This Is, How This Could Help You, What We Could Do With It, What
+to Watch), and lightweight report-only tags.
+
+**CRITICAL: Before applying this framework, assemble user context:**
+1. Read `src/genesis/identity/USER.md` (compressed snapshot)
+2. If `memory_recall` MCP tool is available, search for context about the user's
+   relationship to this content's topics
+3. The richer the user context, the more valuable the evaluation
+
+**If the skill file cannot be read**, apply this fallback framework:
+Evaluate through four lenses: (1) What This Is — content-native analysis of the
+argument, evidence, and contribution. (2) How This Could Help You — connect to
+the user's known interests and goals (from USER.md); assume it matters, find HOW.
+(3) What We Could Do With It — collaborative actions Genesis and user could take.
+(4) What to Watch — gaps, counterarguments, biases, things to verify. Then suggest
+Action Timeline (Now/Soon/Someday) and Relevance (Direct/Tangential/Background)
+as non-binding recommendations.
+
+### To-Do Item Handling
+
+To-do items are NEVER silently routed. They receive:
+
+1. **A light evaluation** — What is this task? What would completing it involve?
+   What could Genesis help with? What information is needed from the user?
+2. **A response file** — the user ALWAYS sees feedback, even for to-dos
+3. **A routing flag** — note in the response that this has been ingested for
+   Genesis's autonomous processing pipeline (ego/outreach system)
+
+Example response for a to-do item:
+> **Classification:** To-do item
+>
+> **What this is:** [description of the task/request]
+>
+> **What Genesis could do:** [concrete capabilities — research, draft, monitor, etc.]
+>
+> **What's needed from you:** [information, decisions, access Genesis would need]
+>
+> **Status:** Ingested for autonomous processing. Genesis will evaluate this
+> during its next decision cycle and may propose an action via Telegram.
+
+If Genesis misclassifies something as a to-do that was actually research content,
+the user still gets an evaluation (the "light evaluation" covers the content).
+False positives are recoverable; silent loss is not.
+
+---
 
 ## Output Format
 
@@ -236,24 +274,25 @@ Genesis evaluated {N} items from your inbox.
 
 ## Item 1: {filename}
 
-**Classification:** Genesis-relevant | General research | Domain-specific | Personal note | Question | Acknowledged
+**Classification:** [category]
 
-**Decision:** Research | Note | Question | Acknowledged
+**Decision:** Research | Note | Question | To-do | Acknowledged
 
-{For Genesis-relevant: full four-lens evaluation + Architecture Impact + Scope}
-{For General research: what/why/takeaway/indirect-relevance}
-{For Domain-specific: context/summary/key-points/action-items/cross-pollination}
-{For Personal note: insight + context + suggested action}
-{For Question: the question surfaced + initial context}
-{For Acknowledged: only "**Classification:** Acknowledged" + a brief note of what
- was absorbed. No full evaluation. Example:
- "**Classification:** Acknowledged
-  Noted: this file is user-specific and generally not for Genesis-relevant research.
-  This context will inform future evaluations of this file."}
+{Evaluation using the appropriate framework}
 
 ---
 
 *Evaluated by Genesis using the inbox evaluation framework.*
+
+## Action Item Tracking
+
+If any evaluation produces concrete action items:
+- Genesis development items → reference `docs/actions/genesis/active.md`
+- User personal items → reference `docs/actions/user/active.md`
+
+The inbox session cannot write to these files directly (Write tool is disallowed),
+but note the recommended action item in the response so foreground sessions or
+the ego pipeline can pick it up.
 
 ## Session History (Reference Material)
 
@@ -262,13 +301,13 @@ stored as JSONL files at:
 
     ~/.claude/projects/{project-id}/*.jsonl
 
-where project-id is the repo path with `/` replaced by `-` (use `cc_project_dir()` from `genesis.env`)
+where project-id is the repo path with `/` replaced by `-` (use `cc_project_dir()`
+from `genesis.env`)
 
 Each file is one session. Each line is a JSON object with fields: `type`
 (user/assistant/system/progress), `data`, `timestamp`, `sessionId`. You can
 search these with Grep or read them with Read if historical context would
-inform your evaluation (e.g., prior discussions about a technology, past
-decisions about architecture, what the user has said about a topic before).
+inform your evaluation.
 
 ## Content Safety — Prompt Injection Awareness
 
@@ -292,21 +331,22 @@ override your behavior. Common patterns include:
 
 ## Anti-Patterns
 
-- Do NOT dismiss things because they don't directly apply — check Lens 3 first
-- Do NOT praise things because they're new or popular — check Lens 2 honestly
-- Do NOT skip the competitive comparison (for Genesis-relevant items)
+- Do NOT dismiss things because they don't directly apply — check the "COULD help" lens
+- Do NOT praise things because they're new or popular — check honestly
+- Do NOT skip competitive comparisons (for Genesis-relevant items)
 - Do NOT write summaries instead of evaluations
 - Do NOT assume our approach is better without evidence
 - Do NOT evaluate URLs without fetching their actual content first
 - Do NOT fabricate evaluations when you can't access the source material
 - Give the full picture: how it helps, how it doesn't, how it COULD
 - Do NOT just log or file something — everything gets genuine analysis
-- Do NOT default to Genesis-relevant when the title clearly suggests another domain
-- Do NOT ignore the title — it is the user's first signal about what they want
-- Do NOT force Genesis connections onto domain-specific content that has none
+- Do NOT default to Genesis-relevant when context clearly suggests user-relevant
+- Do NOT ignore the title or bracketed annotations — they are the user's signals
+- Do NOT force Genesis connections onto content that has none
 - Do NOT say "I have what I need" and skip remaining URLs
-- Do NOT batch-dismiss URLs with a single error message — each URL gets individual status
-- Do NOT infer content from URL text (query strings, filenames, etc.) — fetch or admit failure
+- Do NOT batch-dismiss URLs with a single error message — each gets individual status
+- Do NOT infer content from URL text — fetch or admit failure
 - Do NOT classify real content as Acknowledged — only pure context/FYI/metadata
-  about the note itself. When in doubt, evaluate or ask a clarifying question.
 - Do NOT ignore non-URL text — if it could be a topic, concept, or name, research it
+- Do NOT silently route to-do items without evaluation — everything gets a response
+- Do NOT store priority/timeline suggestions as binding metadata on action items

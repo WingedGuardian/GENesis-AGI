@@ -30,6 +30,7 @@ import yaml
 
 from genesis.autonomy.types import WatchdogAction
 from genesis.env import secrets_path as default_secrets_path
+from genesis.util.systemd import systemctl_env
 
 if TYPE_CHECKING:
     from genesis.autonomy.remediation import RemediationRegistry
@@ -79,7 +80,6 @@ class WatchdogChecker:
         self._remediation_registry = remediation_registry
         self._outreach_fn = outreach_fn
         self._target_service = self._detect_target_service()
-        self._az_installed = self._detect_az_installed()
 
     @property
     def target_service(self) -> str:
@@ -89,30 +89,18 @@ class WatchdogChecker:
     def _detect_target_service(self) -> str:
         """Auto-detect which Genesis service to monitor.
 
-        Standalone mode uses genesis-server.service.
-        AZ/bridge mode uses genesis-bridge.service (default).
+        Prefers genesis-server.service, falls back to genesis-bridge.service.
         """
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "is-enabled", "genesis-server.service"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
             )
             if result.returncode == 0:
                 return "genesis-server.service"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
         return "genesis-bridge.service"
-
-    def _detect_az_installed(self) -> bool:
-        """Check if agent-zero.service is enabled. Cached at init time."""
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-enabled", "agent-zero.service"],
-                capture_output=True, text=True, timeout=5,
-            )
-            return result.returncode == 0
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return False
 
     @classmethod
     def from_yaml(cls, path: str | Path | None = None) -> WatchdogChecker:
@@ -140,9 +128,6 @@ class WatchdogChecker:
 
         # 0.25. Proactive memory pressure check — reclaim before OOM fires
         self._check_memory_pressure()
-
-        # 0.3. Check if Agent Zero is running (separate from bridge)
-        self._check_az_health()
 
         # 0.5. Quick check: is the bridge process even running?
         bridge_active = self._is_bridge_active()
@@ -248,7 +233,7 @@ class WatchdogChecker:
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "is-active", self._target_service],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
             )
             return result.stdout.strip() == "active"
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
@@ -259,72 +244,11 @@ class WatchdogChecker:
         try:
             result = subprocess.run(
                 ["systemctl", "--user", "show", "-p", "ExecMainStatus", self._target_service],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
             )
             return "ExecMainStatus=2" in result.stdout
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return False
-
-    def _check_az_health(self) -> None:
-        """Check if Agent Zero service is active. Auto-restart if down.
-
-        Skipped entirely in standalone mode (agent-zero.service not enabled).
-        Uses a separate state file (~/.genesis/watchdog_az_state.json) from
-        the bridge watchdog to keep backoff counters independent. AZ restarts
-        are more impactful (kills dashboard + all Genesis subsystems), so
-        max_attempts is conservative (3).
-        """
-        # Skip if AZ service is not installed/enabled (standalone mode)
-        if not self._az_installed:
-            return
-
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "is-active", "agent-zero.service"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.stdout.strip() == "active":
-                # Reset AZ backoff state on recovery
-                az_state_path = self._state_path.parent / "watchdog_az_state.json"
-                if az_state_path.exists():
-                    import contextlib
-
-                    with contextlib.suppress(OSError):
-                        az_state_path.write_text(json.dumps({
-                            "consecutive_failures": 0,
-                            "next_attempt_after": None,
-                        }))
-                return  # Healthy
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return  # Can't determine — don't act
-
-        # AZ is not active — attempt restart with its own backoff state
-        az_state_path = self._state_path.parent / "watchdog_az_state.json"
-        az_state = {"consecutive_failures": 0, "next_attempt_after": None}
-        try:
-            if az_state_path.exists():
-                az_state = json.loads(az_state_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-        max_az_attempts = 3  # Conservative — AZ restart is high-impact
-        if az_state.get("consecutive_failures", 0) >= max_az_attempts:
-            logger.error("AZ: max restart attempts (%d) reached", max_az_attempts)
-            return
-
-        if az_state.get("next_attempt_after") and time.time() < az_state["next_attempt_after"]:
-            return  # In backoff
-
-        logger.warning("Agent Zero service not active — attempting restart")
-        az_state["consecutive_failures"] = az_state.get("consecutive_failures", 0) + 1
-        backoff = min(self._backoff_initial * (2 ** (az_state["consecutive_failures"] - 1)), self._backoff_max)
-        az_state["next_attempt_after"] = time.time() + backoff
-        try:
-            az_state_path.write_text(json.dumps(az_state))
-        except OSError:
-            logger.error("Failed to save AZ watchdog state", exc_info=True)
-
-        restart_az()
 
     def _check_memory_pressure(self) -> None:
         """Proactive memory check — reclaim page cache if approaching limit.
@@ -549,7 +473,7 @@ def restart_bridge(service: str = "genesis-bridge.service") -> int:
     try:
         result = subprocess.run(
             ["systemctl", "--user", "restart", service],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=30, env=systemctl_env(),
         )
         if result.returncode == 0:
             logger.info("%s restart command succeeded", service)
@@ -564,38 +488,3 @@ def restart_bridge(service: str = "genesis-bridge.service") -> int:
         return -2
 
 
-def restart_az() -> int:
-    """Restart Agent Zero via systemctl. Returns exit code.
-
-    Returns 0 (no-op) if agent-zero.service is not enabled (standalone mode).
-    """
-    # Guard: skip if AZ not installed
-    try:
-        check = subprocess.run(
-            ["systemctl", "--user", "is-enabled", "agent-zero.service"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if check.returncode != 0:
-            logger.info("AZ not installed (standalone mode) — skipping restart")
-            return 0
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        logger.info("Cannot determine AZ status — skipping restart")
-        return 0
-
-    logger.info("Restarting agent-zero.service via systemctl...")
-    try:
-        result = subprocess.run(
-            ["systemctl", "--user", "restart", "agent-zero.service"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode == 0:
-            logger.info("AZ restart command succeeded")
-        else:
-            logger.error("AZ restart failed: %s", result.stderr)
-        return result.returncode
-    except subprocess.TimeoutExpired:
-        logger.error("AZ restart command timed out")
-        return -1
-    except FileNotFoundError:
-        logger.error("systemctl not found — cannot restart AZ")
-        return -2

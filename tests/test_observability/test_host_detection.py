@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import importlib
 import time
-from pathlib import Path
-from unittest.mock import patch
 
-from genesis.observability.host_detection.agent_zero import AgentZeroDetector
 from genesis.observability.host_detection.registry import HostDetectorRegistry
 from genesis.observability.host_detection.types import (
-    HostDetector,
     HostFrameworkStatus,
 )
 
@@ -31,118 +26,16 @@ class TestHostFrameworkStatus:
 
     def test_full_construction(self):
         s = HostFrameworkStatus(
-            name="Agent Zero",
+            name="Test Framework",
             detected=True,
             status="healthy",
             uptime_seconds=120.0,
-            restart_cmd="systemctl restart az",
+            restart_cmd="systemctl restart test",
             details={"port": 5000},
         )
-        assert s.name == "Agent Zero"
+        assert s.name == "Test Framework"
         assert s.detected is True
         assert s.details["port"] == 5000
-
-
-class TestProtocol:
-    def test_detector_satisfies_protocol(self):
-        assert isinstance(AgentZeroDetector(), HostDetector)
-
-
-# ---------------------------------------------------------------------------
-# AgentZeroDetector
-# ---------------------------------------------------------------------------
-
-
-def _az_patches(*, systemd=None, port=True, dir_exists=True):
-    """Helper to build common AZ detector patches."""
-    if systemd is None:
-        systemd = {}
-    return (
-        patch(
-            "genesis.observability.host_detection.agent_zero.query_systemd_unit",
-            return_value=systemd,
-        ),
-        patch(
-            "genesis.observability.host_detection.agent_zero._check_port",
-            return_value=port,
-        ),
-        patch(
-            "genesis.observability.host_detection.agent_zero._AZ_DIR",
-            Path("/tmp") if dir_exists else Path("/nonexistent-dir-xyz"),
-        ),
-    )
-
-
-class TestAgentZeroDetector:
-    def test_all_signals_present(self):
-        """3/3 signals -> detected, healthy."""
-        p1, p2, p3 = _az_patches(
-            systemd={
-                "ActiveState": "active",
-                "SubState": "running",
-                "NRestarts": "1",
-                "ExecMainStartTimestamp": "",
-            },
-            port=True,
-            dir_exists=True,
-        )
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.detected is True
-        assert result.status == "healthy"
-        assert result.name == "Agent Zero"
-        assert result.restart_cmd is not None
-
-    def test_two_signals_port_and_dir(self):
-        """2/3 signals (port + dir, no systemd) -> detected, degraded."""
-        p1, p2, p3 = _az_patches(systemd={}, port=True, dir_exists=True)
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.detected is True
-        assert result.status == "degraded"
-
-    def test_one_signal_not_detected(self):
-        """1/3 signals -> NOT detected."""
-        p1, p2, p3 = _az_patches(systemd={}, port=False, dir_exists=True)
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.detected is False
-
-    def test_zero_signals_not_detected(self):
-        """0/3 signals -> NOT detected."""
-        p1, p2, p3 = _az_patches(systemd={}, port=False, dir_exists=False)
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.detected is False
-
-    def test_systemd_active_plus_dir(self):
-        """Systemd + dir (no port) -> detected, healthy."""
-        p1, p2, p3 = _az_patches(
-            systemd={"ActiveState": "active", "SubState": "running"},
-            port=False,
-            dir_exists=True,
-        )
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.detected is True
-        assert result.status == "healthy"
-
-    def test_restart_count_in_details(self):
-        """Restart count is extracted from systemd properties."""
-        p1, p2, p3 = _az_patches(
-            systemd={"ActiveState": "active", "NRestarts": "3"},
-            port=True,
-            dir_exists=True,
-        )
-        with p1, p2, p3:
-            result = AgentZeroDetector().detect()
-        assert result.details["restart_count"] == 3
-
-    def test_priority(self):
-        assert AgentZeroDetector().priority == 10
-
-    def test_name(self):
-        assert AgentZeroDetector().name == "Agent Zero"
 
 
 # ---------------------------------------------------------------------------
@@ -283,37 +176,3 @@ class TestHostDetectorRegistry:
         result = reg.detect()
         assert result.name == "Healthy"
         assert result.detected is True
-
-
-# ---------------------------------------------------------------------------
-# Integration: services snapshot
-# ---------------------------------------------------------------------------
-
-
-class TestServicesSnapshotIntegration:
-    def test_host_framework_in_snapshot(self):
-        """services() includes host_framework key."""
-        svc_mod = importlib.import_module("genesis.observability.snapshots.services")
-
-        p1, p2, p3 = _az_patches(
-            systemd={"ActiveState": "active"},
-            port=True,
-            dir_exists=True,
-        )
-        with (
-            patch("genesis.observability.service_status.query_systemd_unit", return_value={}),
-            p1,
-            p2,
-            p3,
-        ):
-            svc_mod._registry = None
-            try:
-                result = svc_mod.services()
-            finally:
-                svc_mod._registry = None
-
-        assert "host_framework" in result
-        assert result["host_framework"]["detected"] is True
-        assert result["host_framework"]["name"] == "Agent Zero"
-        assert result["host_framework"]["has_restart"] is True
-        assert "restart_cmd" not in result["host_framework"]

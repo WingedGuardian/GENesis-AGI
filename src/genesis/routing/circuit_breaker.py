@@ -111,6 +111,19 @@ class CircuitBreaker:
         if self._state != old:
             self._notify_change()
 
+    def probe_suspect(self) -> bool:
+        """Probe reported this provider may be down. Move to HALF_OPEN for verification.
+
+        Only downgrades: CLOSED → HALF_OPEN. Does not change OPEN (already worse)
+        or HALF_OPEN (already suspect). Returns True if state changed.
+        """
+        if self._state == ProviderState.CLOSED:
+            self._state = ProviderState.HALF_OPEN
+            self._consecutive_successes = 0
+            self._notify_change()
+            return True
+        return False
+
     def record_failure(self, category: ErrorCategory) -> bool:
         """Record a failed call. Returns True if this failure caused the breaker to trip OPEN."""
         self._last_failure_category = category

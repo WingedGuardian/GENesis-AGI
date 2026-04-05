@@ -72,6 +72,11 @@ async def init_guardian_monitoring(rt) -> None:
         rt._awareness_loop.set_credential_bridge(propagate_telegram_credentials)
         logger.info("Telegram credential bridge wired to awareness loop")
 
+        exporter = getattr(rt, "_autonomous_cli_policy_exporter", None)
+        if exporter is not None:
+            rt._awareness_loop.set_autonomous_cli_policy_exporter(exporter.export)
+            logger.info("Autonomous CLI policy exporter wired to awareness loop")
+
         # Write dynamic Guardian briefing to shared mount every tick
         from genesis.guardian.briefing import write_dynamic_guardian_briefing
         rt._awareness_loop.set_briefing_writer(write_dynamic_guardian_briefing)

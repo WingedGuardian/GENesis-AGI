@@ -314,15 +314,6 @@ PYEOF
     echo "    + .claude/docs/dual-repo.md templated"
 fi
 
-if [ -f "$OUTPUT_DIR/.claude/docs/agent-zero-integration.md" ]; then
-    # Remove Rebase Awareness section
-    sed -i '/^## Rebase Awareness/,/^## /{/^## Rebase/d;/^## /!d}' \
-        "$OUTPUT_DIR/.claude/docs/agent-zero-integration.md"
-    # Clean any trailing empty lines from section removal
-    sed -i '/^$/N;/^\n$/d' "$OUTPUT_DIR/.claude/docs/agent-zero-integration.md"
-    echo "    + .claude/docs/agent-zero-integration.md templated"
-fi
-
 # USER.md — replace with onboarding template for public release
 cat > "$OUTPUT_DIR/src/genesis/identity/USER.md" << 'USERMD'
 # User Profile
@@ -369,12 +360,9 @@ done
 # Replace YOUR_GITHUB_USER in scripts and docs (not already handled by CLAUDE.md step)
 find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.sh" -o -name "*.md" -o -name "*.service" \) \
     -exec grep -l "YOUR_GITHUB_USER" {} \; 2>/dev/null | while IFS= read -r f; do
-    # Replace private repo references but preserve shared public repos:
-    # - WingedGuardian/agent-zero is our shared AZ fork — all users clone it
-    # - WingedGuardian/GENesis-AGI is the public repo itself
-    # Strategy: replace YOUR_GITHUB_USER on all lines EXCEPT those containing
-    # agent-zero or GENesis-AGI (the two shared repos that must keep the name).
-    sed -i '/agent-zero\|GENesis-AGI/!s|WingedGuardian|YOUR_GITHUB_USER|g' "$f"
+    # Replace private repo references but preserve the public repo name.
+    # WingedGuardian/GENesis-AGI is the public repo itself — keep that as-is.
+    sed -i '/GENesis-AGI/!s|WingedGuardian|YOUR_GITHUB_USER|g' "$f"
     echo "    + $(basename "$f"): GitHub username templated"
 done
 

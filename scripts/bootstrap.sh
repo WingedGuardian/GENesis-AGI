@@ -186,23 +186,6 @@ touch "$HOME/.genesis/setup-complete"
 echo "  ~/.genesis/ initialized"
 echo
 
-# --- AZ plugin sync ---
-AZ_ROOT="$HOME/agent-zero"
-if [[ -d "$AZ_ROOT/usr/plugins" && -d "$GENESIS_ROOT/az_plugins/genesis" ]]; then
-    echo "--- Syncing AZ plugins ---"
-    if command -v rsync &>/dev/null; then
-        rsync -a --delete "$GENESIS_ROOT/az_plugins/genesis/" "$AZ_ROOT/usr/plugins/genesis/"
-    else
-        rm -rf "$AZ_ROOT/usr/plugins/genesis"
-        cp -r "$GENESIS_ROOT/az_plugins/genesis" "$AZ_ROOT/usr/plugins/"
-    fi
-    # Clear stale bytecode — Python caches by path and stale .pyc files
-    # cause silent import of old code after source updates
-    find "$AZ_ROOT/usr/plugins/genesis" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
-    echo "  AZ plugins synced and bytecode cleared"
-    echo
-fi
-
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
@@ -215,16 +198,10 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         [[ -f "$template" ]] || continue
         svc_name=$(basename "$template" .template)
 
-        # Skip agent-zero.service if AZ is not installed
-        if [[ "$svc_name" == "agent-zero.service" && ! -f "$AZ_ROOT/run_ui.py" ]]; then
-            continue
-        fi
-
         target="$SYSTEMD_USER_DIR/$svc_name"
         rendered=$(sed -e "s|__HOME__|$HOME|g" \
                        -e "s|__VENV__|$GENESIS_ROOT/.venv|g" \
                        -e "s|__REPO_DIR__|$GENESIS_ROOT|g" \
-                       -e "s|__AZ_ROOT__|$AZ_ROOT|g" \
                        "$template")
         if [[ -f "$target" ]]; then
             current=$(cat "$target")

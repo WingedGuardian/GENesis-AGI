@@ -44,9 +44,8 @@ async def test_all_tools_registered(tools):
 def test_load_watchlist():
     projects = _load_watchlist()
     assert isinstance(projects, list)
-    assert len(projects) >= 6
+    assert len(projects) >= 5
     names = [p["name"] for p in projects]
-    assert "Agent Zero" in names
     assert "Claude Code" in names
 
 
@@ -61,13 +60,13 @@ def test_load_watchlist_has_required_fields():
 
 async def test_recon_watchlist_returns_all(tools):
     result = await tools["recon_watchlist"].fn()
-    assert len(result) >= 6
+    assert len(result) >= 5
 
 
 async def test_recon_watchlist_filters_by_priority(tools):
     high = await tools["recon_watchlist"].fn(priority="high")
     assert all(p["priority"] == "high" for p in high)
-    assert len(high) >= 2
+    assert len(high) >= 1
 
 
 # ── findings CRUD ────────────────────────────────────────────────────────────

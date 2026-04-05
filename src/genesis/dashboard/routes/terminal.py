@@ -43,7 +43,7 @@ _MAX_SESSIONS = 3
 def register_terminal_ws(app: Flask) -> None:
     """Wire the WebSocket endpoint onto a Flask app.
 
-    Called from both standalone adapter and AZ bootstrap plugin.
+    Called from the standalone adapter during bootstrap.
     Must be called AFTER blueprint registration (the REST routes
     are on the blueprint; the WebSocket route is on the app).
     """
@@ -141,6 +141,22 @@ def terminal_status():
     })
 
 
+@blueprint.route("/vendor/xterm/<path:filename>")
+def vendor_xterm_static(filename):
+    """Serve xterm.js vendor assets for the terminal page.
+
+    Scoped to /vendor/xterm/ only — must NOT catch all /vendor/* requests
+    because AZ's Flask app serves its own vendor assets (Google icons, etc.)
+    from a different static directory.
+    """
+    from pathlib import Path
+
+    from flask import send_from_directory
+
+    xterm_dir = Path(__file__).resolve().parent.parent / "webui" / "vendor" / "xterm"
+    return send_from_directory(str(xterm_dir), filename)
+
+
 @blueprint.route("/genesis/terminal")
 def terminal_page():
     """Standalone terminal page — opened in a new window from the Chat tab."""
@@ -185,8 +201,8 @@ _TERMINAL_PAGE_HTML = """\
     ws.onopen = () => {
       const dims = fit.proposeDimensions();
       if (dims) ws.send(JSON.stringify({ resize: { rows: dims.rows, cols: dims.cols } }));
-      // Auto-start Claude Code after bash initializes
-      setTimeout(() => ws.send("claude --dangerously-skip-permissions\\n"), 500);
+      // Prefill Claude Code launch command; user chooses when to execute.
+      setTimeout(() => ws.send("claude --dangerously-skip-permissions"), 500);
     };
 
     ws.onmessage = (evt) => {

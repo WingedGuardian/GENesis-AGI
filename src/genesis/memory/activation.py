@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime
 
+from genesis.memory.classification import CLASS_WEIGHTS
 from genesis.memory.types import ActivationScore
 
 # Category-aware half-lives: different memory types have different relevance
@@ -49,6 +50,7 @@ def compute_activation(
     tags: list[str] | None = None,
     half_life_days: float | None = None,
     now: str | None = None,
+    memory_class: str = "fact",
 ) -> ActivationScore:
     """Compute activation score with category-aware decay.
 
@@ -57,6 +59,8 @@ def compute_activation(
             Used to select category-specific half-life.
         tags: Memory tags. Capitalized tags (entity names) get 2x half-life.
         half_life_days: Explicit override. If set, bypasses category routing.
+        memory_class: Classification (rule/fact/reference). Rules get 1.3x
+            boost, references get 0.7x weight.
     """
     now_dt = (
         datetime.fromisoformat(now) if now else datetime.now(UTC)
@@ -72,7 +76,8 @@ def compute_activation(
     recency = math.exp(-0.693 * age_days / effective_hl)
     access_freq = min(1.0, math.log(1 + retrieved_count) / math.log(1 + 20))
     connectivity = min(1.0, math.log(1 + link_count) / math.log(1 + 10))
-    final = confidence * recency * (0.5 + 0.3 * access_freq + 0.2 * connectivity)
+    class_weight = CLASS_WEIGHTS.get(memory_class, 1.0)
+    final = confidence * recency * (0.5 + 0.3 * access_freq + 0.2 * connectivity) * class_weight
 
     return ActivationScore(
         memory_id="",

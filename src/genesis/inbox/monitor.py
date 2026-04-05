@@ -14,6 +14,7 @@ from typing import Any
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.inbox.scanner import compute_hash, detect_changes, read_content, scan_folder
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.security import ContentSanitizer, ContentSource
@@ -130,10 +131,14 @@ class InboxMonitor:
         self._system_prompt: str | None = None
         self._check_lock = asyncio.Lock()
         self._triage_pipeline = triage_pipeline
+        self._autonomous_dispatcher = None
 
     @property
     def config(self) -> InboxConfig:
         return self._config
+
+    def set_autonomous_dispatcher(self, dispatcher: object) -> None:
+        self._autonomous_dispatcher = dispatcher
 
     async def start(self) -> None:
         """Start the inbox monitor scheduler."""
@@ -393,26 +398,6 @@ class InboxMonitor:
             # The PreToolUse hook in .claude/settings.json blocks dangerous
             # tool usage (e.g. WebFetch on YouTube URLs → redirects to yt-dlp).
 
-            # Create background CC session
-            try:
-                sess = await self._session_manager.create_background(
-                    session_type=SessionType.BACKGROUND_TASK,
-                    model=model,
-                    effort=effort,
-                    source_tag="inbox_evaluation",
-                )
-            except Exception as exc:
-                err = f"Session creation failed: {exc}"
-                errors.append(err)
-                logger.error(err, exc_info=True)
-                for item in batch:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="failed",
-                        error_message=err, processed_at=now_iso,
-                    )
-                continue
-
-            # Invoke CC
             invocation = CCInvocation(
                 prompt=prompt,
                 model=model,
@@ -424,27 +409,82 @@ class InboxMonitor:
                 working_dir=background_session_dir(),
             )
 
-            try:
-                output = await self._invoker.run(invocation)
-            except Exception as exc:
-                err = f"CC invocation failed: {exc}"
-                errors.append(err)
-                logger.error(err, exc_info=True)
-                await self._session_manager.fail(sess["id"], reason=err)
-                for item in batch:
-                    await inbox_items.update_status(
-                        self._db, item.id, status="failed",
-                        error_message=err, processed_at=now_iso,
+            output = None
+            used_cli = True
+            session_id: str | None = None
+            if self._autonomous_dispatcher is not None:
+                decision = await self._autonomous_dispatcher.route(
+                    AutonomousDispatchRequest(
+                        subsystem="inbox",
+                        policy_id="inbox_evaluation",
+                        action_label="inbox evaluation",
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": prompt},
+                        ],
+                        cli_invocation=invocation,
+                        api_call_site_id="contingency_inbox",
+                        cli_fallback_allowed=True,
+                        approval_required_for_cli=True,
+                        context={"batch_id": batch_id, "item_count": len(batch)},
+                    ),
+                )
+                if decision.mode == "blocked":
+                    err = f"CLI fallback blocked: {decision.reason}"
+                    errors.append(err)
+                    logger.warning(err)
+                    for item in batch:
+                        await inbox_items.update_status(
+                            self._db, item.id, status="failed",
+                            error_message=err, processed_at=now_iso,
+                        )
+                    continue
+                if decision.mode == "api":
+                    output = decision.output
+                    used_cli = False
+
+            if output is None:
+                try:
+                    sess = await self._session_manager.create_background(
+                        session_type=SessionType.BACKGROUND_TASK,
+                        model=model,
+                        effort=effort,
+                        source_tag="inbox_evaluation",
                     )
-                continue
+                    session_id = sess["id"]
+                except Exception as exc:
+                    err = f"Session creation failed: {exc}"
+                    errors.append(err)
+                    logger.error(err, exc_info=True)
+                    for item in batch:
+                        await inbox_items.update_status(
+                            self._db, item.id, status="failed",
+                            error_message=err, processed_at=now_iso,
+                        )
+                    continue
+
+                try:
+                    output = await self._invoker.run(invocation)
+                except Exception as exc:
+                    err = f"CC invocation failed: {exc}"
+                    errors.append(err)
+                    logger.error(err, exc_info=True)
+                    await self._session_manager.fail(session_id, reason=err)
+                    for item in batch:
+                        await inbox_items.update_status(
+                            self._db, item.id, status="failed",
+                            error_message=err, processed_at=now_iso,
+                        )
+                    continue
 
             if output.is_error:
                 err = f"CC error: {output.error_message}"
                 errors.append(err)
                 logger.error(err)
-                await self._session_manager.fail(
-                    sess["id"], reason=output.error_message,
-                )
+                if used_cli and session_id is not None:
+                    await self._session_manager.fail(
+                        session_id, reason=output.error_message,
+                    )
                 for item in batch:
                     await inbox_items.update_status(
                         self._db, item.id, status="failed",
@@ -477,7 +517,8 @@ class InboxMonitor:
                         processed_at=completed_at,
                         evaluated_content=full_content,
                     )
-                await self._session_manager.complete(sess["id"])
+                if used_cli and session_id is not None:
+                    await self._session_manager.complete(session_id)
 
                 try:
                     source_names = ", ".join(
@@ -575,7 +616,8 @@ class InboxMonitor:
                         )
 
             # Complete CC session
-            await self._session_manager.complete(sess["id"])
+            if used_cli and session_id is not None:
+                await self._session_manager.complete(session_id)
 
             # Write message_queue entry for foreground context
             try:

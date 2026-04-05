@@ -14,7 +14,6 @@ from urllib.parse import urlsplit, urlunsplit
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_DEFAULT_AZ_ROOT = Path.home() / "agent-zero"
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
@@ -25,18 +24,8 @@ def repo_root() -> Path:
     return Path(value).expanduser() if value else _REPO_ROOT
 
 
-def az_root() -> Path:
-    """Resolve Agent Zero root directory. Deprecated — used only by secrets_path() fallback."""
-    value = os.environ.get("AZ_ROOT")
-    return Path(value).expanduser() if value else _DEFAULT_AZ_ROOT
-
-
 def venv_path() -> Path:
-    """Resolve the Python venv used by Genesis services and MCP servers.
-
-    Default changed from AZ's venv to Genesis's own venv as part of
-    the AZ decoupling work.  Override with VENV_PATH env var.
-    """
+    """Resolve the Python venv used by Genesis services and MCP servers."""
     value = os.environ.get("VENV_PATH")
     if value:
         return Path(value).expanduser()
@@ -49,15 +38,9 @@ def secrets_path() -> Path:
         resolved = Path(value).expanduser()
         logger.debug("secrets_path: SECRETS_PATH override → %s", resolved)
         return resolved
-    # Primary: genesis repo root (new default)
     genesis_path = repo_root() / "secrets.env"
-    if genesis_path.exists():
-        logger.debug("secrets_path: genesis repo → %s", genesis_path)
-        return genesis_path
-    # Migration fallback: agent-zero location (pre-portability installs)
-    fallback = az_root() / "usr" / "secrets.env"
-    logger.debug("secrets_path: AZ fallback → %s", fallback)
-    return fallback
+    logger.debug("secrets_path: genesis repo → %s", genesis_path)
+    return genesis_path
 
 
 def genesis_db_path() -> Path:

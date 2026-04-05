@@ -75,6 +75,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=True,
         needs_restart=True,
     ),
+    "autonomy_rules": SettingsDomain(
+        name="autonomy_rules",
+        description="Data-driven autonomy decision rules (read-only — evaluated by RuleEngine)",
+        config_filename="autonomy_rules.yaml",
+        readonly=True,
+        needs_restart=False,
+    ),
     "content_sanitization": SettingsDomain(
         name="content_sanitization",
         description="Content sanitization injection detection patterns (read-only)",
@@ -139,6 +146,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         name="confidence_gates",
         description="Confidence gating thresholds for observations, memory, and reflection",
         config_filename="confidence_gates.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
+    "autonomous_cli_policy": SettingsDomain(
+        name="autonomous_cli_policy",
+        description="Autonomous Claude Code fallback policy (global fallback, approval, channel, shared export)",
+        config_filename="autonomous_cli_policy.yaml",
         readonly=False,
         needs_restart=False,
     ),
@@ -305,11 +319,52 @@ def _validate_ego(changes: dict) -> list[str]:
     return validate_ego_config(changes)
 
 
+def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
+    """Validate autonomous CLI policy changes."""
+    errors: list[str] = []
+    valid_top_keys = {
+        "autonomous_cli_fallback_enabled",
+        "manual_approval_required",
+        "reask_interval_hours",
+        "approval_channel",
+        "shared_export_enabled",
+    }
+    for key in changes:
+        if key not in valid_top_keys:
+            errors.append(
+                f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}",
+            )
+
+    for key in (
+        "autonomous_cli_fallback_enabled",
+        "manual_approval_required",
+        "shared_export_enabled",
+    ):
+        if key in changes and not isinstance(changes[key], bool):
+            errors.append(f"{key} must be a boolean")
+
+    if "reask_interval_hours" in changes:
+        try:
+            value = int(changes["reask_interval_hours"])
+            if value < 1 or value > 168:
+                errors.append("reask_interval_hours must be between 1 and 168")
+        except (TypeError, ValueError):
+            errors.append("reask_interval_hours must be an integer")
+
+    if "approval_channel" in changes:
+        channel = str(changes["approval_channel"] or "").strip().lower()
+        if channel not in {"telegram"}:
+            errors.append("approval_channel must currently be 'telegram'")
+
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,
     "ego": _validate_ego,
+    "autonomous_cli_policy": _validate_autonomous_cli_policy,
 }
 
 
@@ -443,7 +498,7 @@ async def _impl_settings_update(
         "needs_restart": entry.needs_restart,
     }
     if entry.needs_restart:
-        result["note"] = "Changes saved. Restart the bridge for them to take effect."
+        result["note"] = "Changes saved. Restart genesis-server for them to take effect."
 
     return result
 

@@ -53,7 +53,7 @@ async def outreach_send(
 ) -> str:
     """Queue a message for delivery. Returns outreach_id."""
     if not _pipeline:
-        # Standalone mode: queue for bridge to pick up
+        # Queue for genesis-server to pick up on next cycle
         if _db is not None:
             from genesis.db.crud import pending_outreach
 
@@ -67,7 +67,7 @@ async def outreach_send(
                 deliver_after=preferred_timing,
             )
             return json.dumps({
-                "status": "queued_for_bridge",
+                "status": "queued",
                 "pending_id": pending_id,
                 "deliver_after": preferred_timing,
             })

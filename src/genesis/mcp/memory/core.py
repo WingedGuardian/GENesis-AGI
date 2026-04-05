@@ -70,14 +70,20 @@ async def memory_store(
     memory_type: str = "episodic",
     tags: list[str] | None = None,
     confidence: float = 0.5,
+    memory_class: str | None = None,
 ) -> str:
-    """Store memory with source metadata and type tag. Returns memory_id."""
+    """Store memory with source metadata and type tag. Returns memory_id.
+
+    Args:
+        memory_class: Optional classification — "rule", "fact", or "reference".
+            Auto-classified from content if not provided.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
     return await memory_mod._store.store(
         content, source, memory_type=memory_type, tags=tags, confidence=confidence,
-        source_pipeline="conversation",
+        memory_class=memory_class, source_pipeline="conversation",
     )
 
 

@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.dispatch_gate import check_dispatch_preconditions
 from genesis.autonomy.types import ActionClass, ApprovalDecision, AutonomyCategory
 from genesis.awareness.types import Depth
@@ -98,6 +99,7 @@ class CCReflectionBridge:
         self._deferred_queue = deferred_queue
         self._context_assembler: ContextAssembler | None = None
         self._topic_manager = None
+        self._autonomous_dispatcher = None
 
     # ── Injection setters (for late binding) ──────────────────────────
 
@@ -120,6 +122,10 @@ class CCReflectionBridge:
     def set_topic_manager(self, manager: object) -> None:
         """Set TopicManager for routing output to forum topics."""
         self._topic_manager = manager
+
+    def set_autonomous_dispatcher(self, dispatcher: object) -> None:
+        """Set the API-first autonomous dispatch router."""
+        self._autonomous_dispatcher = dispatcher
 
     # ── Main reflection entry point ───────────────────────────────────
 
@@ -214,21 +220,7 @@ class CCReflectionBridge:
                     reason="No pending work for deep reflection",
                 )
 
-        # 1. Create background session
-        skill_tags = [f"{depth.value.lower()}-reflection"]
-        try:
-            sess = await self._session_manager.create_background(
-                session_type=SessionType.BACKGROUND_REFLECTION,
-                model=model,
-                effort=effort,
-                source_tag=f"reflection_{depth.value.lower()}",
-                skill_tags=skill_tags,
-            )
-        except Exception:
-            logger.exception("Failed to create background session for %s", depth.value)
-            return ReflectionResult(success=False, reason="Session creation failed")
-
-        # 2. Build prompt
+        # 1. Build prompt
         prompt = await build_reflection_prompt(
             depth, tick, db=db,
             context_gatherer=self._context_gatherer,
@@ -236,8 +228,20 @@ class CCReflectionBridge:
             prompt_dir=self._prompt_dir,
         )
 
-        # 3. Invoke CC
-        no_mcp = str(Path(__file__).resolve().parents[4] / "config" / "no_mcp.json")
+        # 2. Prepare CLI invocation
+        try:
+            from genesis.cc.session_config import SessionConfigBuilder
+
+            _mcp = SessionConfigBuilder()
+            if depth == Depth.LIGHT:
+                mcp_path = _mcp.build_mcp_config("none")
+            elif depth in (Depth.DEEP, Depth.STRATEGIC):
+                mcp_path = _mcp.build_mcp_config("reflection")
+            else:
+                mcp_path = None
+        except Exception:
+            logger.warning("MCP config generation failed, using defaults", exc_info=True)
+            mcp_path = None
         invocation = CCInvocation(
             prompt=prompt,
             model=model,
@@ -245,7 +249,7 @@ class CCReflectionBridge:
             timeout_s=_DEPTH_TIMEOUT_S.get(depth, 300),
             system_prompt=self._system_prompt_for_depth(depth),
             skip_permissions=True,
-            mcp_config=no_mcp if depth == Depth.LIGHT else None,
+            mcp_config=mcp_path,
             working_dir=background_session_dir(),
             stream_idle_timeout_ms=(
                 _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
@@ -253,10 +257,51 @@ class CCReflectionBridge:
                 else None
             ),
         )
-        output = await self._invoker.run(invocation)
+        output = None
+        used_cli = True
+        session_id = f"api:{depth.value.lower()}"
+        if self._autonomous_dispatcher is not None:
+            decision = await self._autonomous_dispatcher.route(
+                request=AutonomousDispatchRequest(
+                    subsystem="reflection",
+                    policy_id=f"reflection_{depth.value.lower()}",
+                    action_label=f"{depth.value.lower()} reflection",
+                    messages=[
+                        {"role": "system", "content": self._system_prompt_for_depth(depth)},
+                        {"role": "user", "content": prompt},
+                    ],
+                    cli_invocation=invocation,
+                    api_call_site_id=_DEPTH_CALL_SITE.get(depth),
+                    cli_fallback_allowed=True,
+                    approval_required_for_cli=True,
+                    context={"depth": depth.value},
+                ),
+            )
+            if decision.mode == "blocked":
+                return ReflectionResult(success=False, reason=decision.reason)
+            if decision.mode == "api":
+                output = decision.output
+                used_cli = False
+
+        if output is None:
+            skill_tags = [f"{depth.value.lower()}-reflection"]
+            try:
+                sess = await self._session_manager.create_background(
+                    session_type=SessionType.BACKGROUND_REFLECTION,
+                    model=model,
+                    effort=effort,
+                    source_tag=f"reflection_{depth.value.lower()}",
+                    skill_tags=skill_tags,
+                )
+                session_id = sess["id"]
+            except Exception:
+                logger.exception("Failed to create background session for %s", depth.value)
+                return ReflectionResult(success=False, reason="Session creation failed")
+
+            output = await self._invoker.run(invocation)
 
         # Model downgrade response (Layer 2)
-        if output.downgraded and depth == Depth.STRATEGIC:
+        if used_cli and output.downgraded and depth == Depth.STRATEGIC:
             logger.warning(
                 "Strategic reflection got downgraded model (%s -> %s), "
                 "retrying after %ds backoff",
@@ -281,7 +326,7 @@ class CCReflectionBridge:
                     retry_output.model_used,
                 )
                 output = retry_output
-        elif output.downgraded and depth == Depth.DEEP:
+        elif used_cli and output.downgraded and depth == Depth.DEEP:
             logger.info(
                 "Deep reflection model downgraded (%s -> %s), "
                 "proceeding (Sonnet adequate)",
@@ -292,24 +337,25 @@ class CCReflectionBridge:
             logger.error(
                 "CC %s reflection failed: %s", depth.value, output.error_message,
             )
-            await self._session_manager.fail(sess["id"], reason=output.error_message)
+            if used_cli:
+                await self._session_manager.fail(session_id, reason=output.error_message)
             return ReflectionResult(success=False, reason=output.error_message)
 
-        # 4. Complete session
-        await self._session_manager.complete(
-            sess["id"],
-            cost_usd=output.cost_usd,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
-        )
+        if used_cli:
+            await self._session_manager.complete(
+                session_id,
+                cost_usd=output.cost_usd,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+            )
 
-        await record_last_run(
-            db, _DEPTH_CALL_SITE.get(depth, f"cc_reflection_{depth.value.lower()}"),
-            provider="cc", model_id=output.model_used or str(model),
-            response_text=output.text,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
-        )
+            await record_last_run(
+                db, _DEPTH_CALL_SITE.get(depth, f"cc_reflection_{depth.value.lower()}"),
+                provider="cc", model_id=output.model_used or str(model),
+                response_text=output.text,
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+            )
 
         # 5. Route output
         if self._output_router and depth == Depth.DEEP:
@@ -325,13 +371,18 @@ class CCReflectionBridge:
             await store_reflection_output(depth, tick, output, db=db)
 
         # 6. Send to topic
-        await send_to_topic(sess["id"], depth, output, topic_manager=self._topic_manager)
+        await send_to_topic(session_id, depth, output, topic_manager=self._topic_manager)
 
         logger.info(
-            "CC %s reflection completed (cost=$%.4f, tokens=%d+%d)",
-            depth.value, output.cost_usd, output.input_tokens, output.output_tokens,
+            "%s %s reflection completed (cost=$%.4f, tokens=%d+%d)",
+            "CLI" if used_cli else "API",
+            depth.value,
+            output.cost_usd, output.input_tokens, output.output_tokens,
         )
-        return ReflectionResult(success=True, reason=f"CC {depth.value} reflection completed")
+        return ReflectionResult(
+            success=True,
+            reason=f"{'CLI' if used_cli else 'API'} {depth.value} reflection completed",
+        )
 
     # ── Weekly jobs ───────────────────────────────────────────────────
 

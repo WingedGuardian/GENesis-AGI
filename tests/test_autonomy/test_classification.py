@@ -96,7 +96,8 @@ class TestConfigLoading:
             "approval_timeouts:\n"
             "  outreach: 7200\n"
         )
-        c = ActionClassifier(config_path=cfg)
+        # Use missing rules_path to isolate config-only behavior (fallback path)
+        c = ActionClassifier(config_path=cfg, rules_path=tmp_path / "no_rules.yaml")
         # Custom policy: costly_reversible now maps to ACT
         assert c.classify(ActionClass.COSTLY_REVERSIBLE, 1) is ApprovalDecision.ACT
         # Custom timeout loaded
@@ -104,7 +105,7 @@ class TestConfigLoading:
 
     def test_missing_config_uses_defaults(self, tmp_path) -> None:
         missing = tmp_path / "does_not_exist.yaml"
-        c = ActionClassifier(config_path=missing)
+        c = ActionClassifier(config_path=missing, rules_path=tmp_path / "no_rules.yaml")
         # Should still produce V3 defaults
         assert c.classify(ActionClass.REVERSIBLE, 1) is ApprovalDecision.ACT
         assert c.classify(ActionClass.COSTLY_REVERSIBLE, 1) is ApprovalDecision.PROPOSE
@@ -113,7 +114,7 @@ class TestConfigLoading:
     def test_malformed_yaml_uses_defaults(self, tmp_path) -> None:
         cfg = tmp_path / "autonomy.yaml"
         cfg.write_text("{{{{not valid yaml at all::::")
-        c = ActionClassifier(config_path=cfg)
+        c = ActionClassifier(config_path=cfg, rules_path=tmp_path / "no_rules.yaml")
         # Falls back to V3 defaults
         assert c.classify(ActionClass.IRREVERSIBLE, 1) is ApprovalDecision.PROPOSE
         assert c.get_timeout("task_proposal") == 86400

@@ -7,13 +7,6 @@ from pathlib import Path
 _GENESIS_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
 
 
-def _az_skills_dir() -> Path:
-    """Lazy — avoids freezing AZ_ROOT at import time."""
-    from genesis.env import az_root
-
-    return az_root() / "usr" / "plugins" / "genesis" / "skills"
-
-
 def get_skill_path(skill_name: str) -> Path | None:
     """Return path to a skill's SKILL.md, or None if not found."""
     path = _GENESIS_SKILLS_DIR / skill_name / "SKILL.md"

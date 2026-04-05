@@ -10,6 +10,7 @@ from qdrant_client import QdrantClient
 from genesis.db.crud import memory as memory_crud
 from genesis.db.crud import memory_links as memory_links_crud
 from genesis.db.crud import pending_embeddings
+from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
 from genesis.observability.call_site_recorder import record_last_run
@@ -78,6 +79,7 @@ class MemoryStore:
         tags: list[str] | None = None,
         confidence: float | None = None,
         auto_link: bool = True,
+        memory_class: str | None = None,
         source_session_id: str | None = None,
         transcript_path: str | None = None,
         source_line_range: tuple[int, int] | None = None,
@@ -117,6 +119,13 @@ class MemoryStore:
         now_iso = datetime.now(UTC).isoformat()
         resolved_tags = tags or []
         resolved_collection = collection or _COLLECTION_MAP.get(memory_type, "episodic_memory")
+        resolved_class = memory_class or classify_memory(
+            content, source=source, source_pipeline=source_pipeline or "",
+        )
+        # Append class tag for FTS5 discoverability
+        class_tag = f"class:{resolved_class}"
+        if class_tag not in resolved_tags:
+            resolved_tags = [*resolved_tags, class_tag]
 
         embedding_ok = not force_fts5_only
         if embedding_ok:
@@ -141,6 +150,7 @@ class MemoryStore:
                         "retrieved_count": 0,
                         "source_type": "memory",
                         "scope": "external" if resolved_collection == "knowledge_base" else "user",
+                        "memory_class": resolved_class,
                     }
                     # Provenance fields — trace memory back to source conversation
                     if source_session_id:
@@ -200,10 +210,12 @@ class MemoryStore:
             collection=resolved_collection,
             confidence=confidence,
             embedding_status="embedded" if embedding_ok else "pending",
+            memory_class=resolved_class,
         )
 
         if not embedding_ok:
-            # Queue for later embedding
+            # Queue for later embedding — preserve provenance so the recovery
+            # worker can reconstruct the full Qdrant payload.
             await pending_embeddings.create(
                 self._db,
                 id=str(uuid.uuid4()),
@@ -213,6 +225,16 @@ class MemoryStore:
                 collection=resolved_collection,
                 created_at=now_iso,
                 tags=",".join(resolved_tags) if resolved_tags else None,
+                source=source,
+                confidence=confidence,
+                source_session_id=source_session_id,
+                transcript_path=transcript_path,
+                source_line_range=(
+                    f"{source_line_range[0]},{source_line_range[1]}"
+                    if source_line_range else None
+                ),
+                extraction_timestamp=extraction_timestamp,
+                source_pipeline=source_pipeline,
             )
             if self._event_bus:
                 await self._event_bus.emit(

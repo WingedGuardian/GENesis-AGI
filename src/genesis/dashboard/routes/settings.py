@@ -84,4 +84,6 @@ async def settings_update(domain_name: str):
 
 
 # Domains that get dedicated form UI on the dashboard
-_FORM_DOMAINS = frozenset({"tts", "ego", "inbox_monitor", "outreach"})
+_FORM_DOMAINS = frozenset({
+    "tts", "ego", "inbox_monitor", "outreach", "autonomous_cli_policy",
+})

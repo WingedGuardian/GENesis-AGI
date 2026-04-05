@@ -93,9 +93,33 @@ class TestLoadIdentityBlock:
         assert result == "You are Genesis, an autonomous AI agent."
 
 
-class TestGroundworkStubs:
-    def test_mcp_config_returns_none(self, builder):
+class TestBuildMcpConfig:
+    def test_full_returns_none(self, builder):
+        assert builder.build_mcp_config("full") is None
+
+    def test_default_is_full(self, builder):
         assert builder.build_mcp_config() is None
 
+    def test_none_returns_no_mcp_path(self, builder):
+        result = builder.build_mcp_config("none")
+        assert result is not None
+        assert result.endswith("no_mcp.json")
+
+    def test_reflection_generates_config(self, builder, tmp_path):
+        """Reflection profile should produce a config with only health + memory."""
+        import json
+
+        result = builder.build_mcp_config("reflection")
+        assert result is not None
+        with open(result) as f:
+            config = json.loads(f.read())
+        servers = set(config.get("mcpServers", {}).keys())
+        assert servers == {"genesis-health", "genesis-memory"}
+
+    def test_unknown_profile_returns_none(self, builder):
+        assert builder.build_mcp_config("nonexistent") is None
+
+
+class TestGroundworkStubs:
     def test_hook_config_returns_none(self, builder):
         assert builder.build_hook_config() is None

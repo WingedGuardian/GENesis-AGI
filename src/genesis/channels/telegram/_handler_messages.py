@@ -555,6 +555,18 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     if msg.reply_to_message:
         reply_to_id = str(msg.reply_to_message.message_id)
 
+        # Resolve autonomous CLI fallback approvals before generic reply waiters.
+        try:
+            from genesis.runtime import GenesisRuntime
+
+            rt = GenesisRuntime.instance()
+            gate = getattr(rt, "_autonomous_cli_approval_gate", None)
+            if gate is not None and await gate.resolve_from_reply(reply_to_id, msg.text):
+                log.info("Autonomous CLI approval resolved for delivery %s", reply_to_id)
+                return
+        except Exception:
+            log.warning("Failed to resolve approval reply", exc_info=True)
+
         # Record engagement if this is a reply to an outreach message
         if ctx.engagement_tracker and ctx.db:
             try:

@@ -1,0 +1,41 @@
+// OpenClaw config to use Genesis as the LLM provider.
+//
+// Usage:
+//   1. Start Genesis standalone: python -m genesis serve --port 5001
+//   2. Merge this into ~/.openclaw/openclaw.json (or use as the full config)
+//   3. Run: openclaw
+//
+// OpenClaw will route all channel messages (WhatsApp, Telegram, Slack, etc.)
+// through Genesis's /v1/chat/completions endpoint.  Genesis handles all
+// intelligence; OpenClaw handles all channel I/O.
+//
+// Adjust port to match --port used in `python -m genesis serve`.
+{
+  models: {
+    // "merge" keeps any existing providers (e.g. Anthropic direct) as fallbacks
+    mode: "merge",
+    providers: {
+      genesis: {
+        baseUrl: "http://127.0.0.1:5001/v1",
+        apiKey: "genesis-local",  // arbitrary — Genesis ignores auth for local requests
+        api: "openai-completions",
+        models: [
+          {
+            id: "genesis",
+            name: "Genesis",
+            reasoning: false,
+            input: ["text"],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 200000,
+            maxTokens: 8192,
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: { primary: "genesis/genesis" },
+    },
+  },
+}

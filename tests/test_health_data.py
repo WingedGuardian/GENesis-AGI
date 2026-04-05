@@ -201,6 +201,51 @@ class TestInfrastructure:
         assert snap["infrastructure"]["scheduler"]["status"] == "healthy"
 
 
+class TestProviderHealth:
+    """Test _provider_health helper and unified chain walk."""
+
+    def test_probe_reachable_is_up(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed", "probe_status": "reachable"}) == "up"
+
+    def test_probe_unreachable_is_down(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed", "probe_status": "unreachable"}) == "down"
+
+    def test_probe_rate_limited_is_suspect(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed", "probe_status": "rate_limited"}) == "suspect"
+
+    def test_no_probe_falls_back_to_cb_open(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "open"}) == "down"
+
+    def test_no_probe_falls_back_to_cb_half_open(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "half_open"}) == "suspect"
+
+    def test_no_probe_falls_back_to_cb_closed(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed"}) == "up"
+
+    def test_error_state_is_down(self):
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "error"}) == "down"
+
+    def test_probe_overrides_cb(self):
+        """Probe says unreachable but CB says closed — probe wins."""
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed", "probe_status": "unreachable"}) == "down"
+
+
 class TestCallSiteTripCount:
     """Verify trip_count is exposed in chain_health entries."""
 
