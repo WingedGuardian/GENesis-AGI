@@ -45,8 +45,8 @@ def main() -> None:
     try:
         result = json.loads(result_raw)
         # CC wraps Bash results — check for error indicators
-        stdout = result.get("stdout", "")
-        stderr = result.get("stderr", "")
+        _stdout = result.get("stdout", "")  # noqa: F841
+        _stderr = result.get("stderr", "")  # noqa: F841
         # A successful git commit prints to stdout with the branch and hash
         # A failed commit (e.g. pre-commit hook) has non-zero exit
         if "error" in result and result["error"]:
@@ -55,11 +55,9 @@ def main() -> None:
         pass  # Can't parse result — be conservative, invalidate anyway
 
     # Clear the review marker
-    if _STATE_FILE.exists():
-        try:
-            _STATE_FILE.unlink()
-        except OSError:
-            pass
+    import contextlib
+    with contextlib.suppress(OSError):
+        _STATE_FILE.unlink(missing_ok=True)
 
     sys.exit(0)
 

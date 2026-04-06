@@ -62,7 +62,12 @@ def main() -> None:
     sys.path.insert(0, script_dir)
 
     try:
-        from review_state import get_current_branch, has_code_changes, has_valid_review_marker, is_review_current
+        from review_state import (
+            get_current_branch,
+            has_code_changes,
+            has_valid_review_marker,
+            is_review_current,
+        )
     except ImportError:
         # If review_state.py is missing, fail open — don't block
         sys.exit(0)

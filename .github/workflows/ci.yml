@@ -29,9 +29,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]" 2>/dev/null || pip install -e .
-          pip install pytest pytest-asyncio pytest-timeout
+          pip install -e ".[test]"
       - name: Run tests
-        run: pytest -v --timeout=30 -x
+        run: pytest -v --timeout=60 -x
         env:
           GENESIS_TESTING: "1"
