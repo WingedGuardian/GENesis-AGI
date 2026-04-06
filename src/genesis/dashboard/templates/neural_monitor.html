@@ -1312,7 +1312,7 @@ function updateSidePanel(data) {
         if (bridge.uptime_seconds != null) {
             bridgeDetail += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
         }
-        svcEl.appendChild(sectionRow('Bridge', bridgeDetail, bridgeColor + ';font-weight:600'));
+        svcEl.appendChild(sectionRow('Server', bridgeDetail, bridgeColor + ';font-weight:600'));
 
         const timer = services.watchdog_timer || {};
         const timerState = timer.active_state || 'unknown';

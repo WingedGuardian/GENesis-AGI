@@ -59,6 +59,26 @@ follow-up across sessions, not to log every interaction.
 
 The user can also create tasks explicitly with `/task <description>`.
 
+## User Knowledge Signals
+
+When you learn something about the user during conversation — their interests,
+expertise, goals, active projects, or professional context — store it via
+`memory_store` so it feeds into the unified knowledge pipeline:
+
+- `source`: `"conversation"`
+- `memory_type`: `"episodic"`
+- `tags`: include `"user_signal"` plus relevant topic tags
+- `content`: what you learned (e.g., "User is exploring agent OS platforms",
+  "User has deep Go expertise but is new to React")
+
+**When to store:** When the user reveals something about themselves that would
+be valuable for future sessions to know. New interests, expertise areas, project
+context, professional role changes, decision principles.
+
+**When NOT to store:** Don't store every interaction. Don't store things already
+well-represented in USER.md. Don't store transient conversational context
+("user seems tired today"). Focus on durable knowledge about who the user is.
+
 ## Session Start
 
 On the FIRST message of a new session (not on resume), begin your response

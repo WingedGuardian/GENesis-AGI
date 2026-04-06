@@ -7,7 +7,8 @@ dependencies = [
     "aiohttp",
     "apscheduler>=3.11,<4",
     "python-telegram-bot>=21.0",
-    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware, do not upgrade without review
+    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware; CVE-2026-35030/35029 not exploitable
+                       # (Genesis uses acompletion/completion_cost only, no proxy server or OIDC)
     "qdrant-client",
     "pyyaml",
     "httpx",
@@ -18,7 +19,8 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=2.0,<3.0",  # 3.x requires mcp>=1.24 with breaking API changes
+    "fastmcp>=2.0,<3.0",  # 3.x has breaking API changes; CVE-2026-32871/27124/2025-64340 not exploitable
+                         # (Genesis uses stdio transport only, no OpenAPI/OAuth/CLI features)
 ]
 
 [project.optional-dependencies]

@@ -398,20 +398,22 @@ async def init(rt: GenesisRuntime) -> None:
                         result.version,
                         result.evidence_count,
                     )
-                    # DISABLED: USER.md auto-synthesis overwrites the hand-written
-                    # profile with unbounded auto-generated observations (745+ fields,
-                    # no dedup/pruning). Model evolution continues in DB — re-enable
-                    # write_user_md() once the pipeline has proper caps and dedup.
-                    # See memory: project_user_model_redesign.md
-                    #
-                    # identity_loader = getattr(rt, "_identity_loader", None)
-                    # if identity_loader is not None:
-                    #     try:
-                    #         identity_loader.write_user_md(
-                    #             result.model, evidence_count=result.evidence_count,
-                    #         )
-                    #     except Exception:
-                    #         logger.exception("Failed to synthesize USER.md")
+                    # USER.md auto-synthesis is PERMANENTLY DISABLED — USER.md
+                    # is user-edited only. Instead, synthesize USER_KNOWLEDGE.md
+                    # (structured cache with bounded sections). The knowledge file
+                    # is system-owned and safe to overwrite.
+                    identity_loader = getattr(rt, "_identity_loader", None)
+                    if identity_loader is not None:
+                        try:
+                            identity_loader.write_user_knowledge_md(
+                                result.model, evidence_count=result.evidence_count,
+                            )
+                        except Exception:
+                            logger.exception("Failed to synthesize USER_KNOWLEDGE.md")
+                    else:
+                        logger.warning(
+                            "identity_loader not available, skipping USER_KNOWLEDGE.md synthesis"
+                        )
                 rt.record_job_success("user_model_evolution")
             except Exception as exc:
                 rt.record_job_failure("user_model_evolution", str(exc))
