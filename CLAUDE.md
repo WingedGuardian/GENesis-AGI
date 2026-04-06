@@ -20,6 +20,9 @@ what they miss — that's part of your job.
 - **Host VM**: Configured in `~/.genesis/guardian_remote.yaml` (set by
   `install_guardian.sh`). Guardian runs here. SSH access is Guardian-only
   via the `guardian-gateway.sh` command dispatcher. NOT the Ollama server.
+- **Network**: Container and host IPs in `secrets.env`
+  (`GENESIS_CONTAINER_IPV4`, `GENESIS_HOST_IPV4`, `*_IPV6`, `*_TAILSCALE_*`).
+  Set by install scripts. Dashboard proxied from host:5000 → container:5000.
   only. Do NOT install locally. NOT the host VM.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: `YOUR_GITHUB_USER/Genesis`

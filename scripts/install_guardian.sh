@@ -134,15 +134,15 @@ fi
 
 # Claude CLI (optional)
 CLAUDE_PATH=$(command -v claude 2>/dev/null)
+CC_AUTHENTICATED=false
 if [ -n "$CLAUDE_PATH" ] && [ -f "$CLAUDE_PATH" ]; then
     echo "  OK    Claude CLI: $CLAUDE_PATH"
     CC_ENABLED=true
-    # Check auth status (report-only, non-interactive)
     if "$CLAUDE_PATH" auth status &>/dev/null; then
         echo "  OK    Claude Code: authenticated"
+        CC_AUTHENTICATED=true
     else
-        echo "  WARN  Claude Code: not authenticated — run 'claude login' on the host"
-        echo "        Guardian CC diagnosis requires authentication"
+        echo "  WARN  Claude Code: not authenticated (will prompt after prereqs)"
     fi
 else
     echo "  WARN  Claude CLI not found — CC diagnosis disabled"
@@ -160,6 +160,40 @@ else
     else
         echo "  WARN  Could not enable linger — Guardian timers will stop on logout"
         echo "        Run: sudo loginctl enable-linger $(whoami)"
+    fi
+fi
+
+# ── Claude Code login prompt (Guardian) ──────────────────────────
+# If CC is installed but not authenticated, prompt the user.
+if [ "$CC_ENABLED" = "true" ] && [ "$CC_AUTHENTICATED" = "false" ] && [ "$NON_INTERACTIVE" != "1" ] && [ -t 0 ]; then
+    echo ""
+    echo "  ── Claude Code Login (Guardian) ──────────────────────"
+    echo ""
+    echo "  The Guardian monitors Genesis from this host machine."
+    echo "  Basic health checks (ping, API, heartbeat) work without"
+    echo "  Claude Code, but autonomous diagnosis — where Guardian"
+    echo "  uses AI to investigate and fix problems — requires it."
+    echo ""
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        echo "  Since you're on a headless machine:"
+        echo "    1. It will print a URL — open it in YOUR browser"
+        echo "    2. Complete the OAuth flow in your browser"
+        echo "    3. Come back here — Claude Code will detect the login"
+    else
+        echo "  A browser window will open for OAuth login."
+    fi
+    echo ""
+    read -rp "  Log in now? [Y/n] " _cc_login
+    if [ "${_cc_login:-Y}" != "n" ] && [ "${_cc_login:-Y}" != "N" ]; then
+        if "$CLAUDE_PATH" login; then
+            CC_AUTHENTICATED=true
+            echo "  + Claude Code authenticated"
+        else
+            echo "  WARNING: Login failed or was skipped"
+            echo "  To log in later: claude login (from this host)"
+        fi
+    else
+        echo "  Skipped. To log in later: claude login (from this host)"
     fi
 fi
 
@@ -320,6 +354,21 @@ echo "[7/13] Generating CLAUDE.md for diagnostic CC..."
 # The gateway update command also copies this file after every git pull.
 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+
+    # Append per-machine network identity (no hardcoded IPs in the template)
+    _host_v4="${TS_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo '')}"
+    _host_v6="$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')"
+    {
+        echo ""
+        echo "## Network"
+        echo ""
+        echo "- **Container**: $CONTAINER_NAME at $CONTAINER_IP"
+        echo "- **Host VM**: $_host_v4 (this machine)"
+        [ -n "$_host_v6" ] && echo "- **Host IPv6**: $_host_v6"
+        echo "- **Dashboard**: http://$CONTAINER_IP:5000 (direct, container network)"
+        [ -n "$_host_v4" ] && echo "               http://$_host_v4:5000 (via proxy device)"
+    } >> "$INSTALL_DIR/CLAUDE.md"
+
     # Tell git to ignore local CLAUDE.md changes. The file is tracked but the
     # host uses guardian-claude.md instead. Without skip-worktree, git pull
     # tries to merge the repo's container CLAUDE.md over the Guardian version.
