@@ -157,6 +157,13 @@
         settingsEditing: null,    // domain being edited
         settingsSaving: false,
 
+        // ── Provider Keys state ──────────────────────────────────
+        secretsGroups: null,
+        secretsEditing: {},       // key_name → true when input open
+        secretsSaving: false,
+        secretsValues: {},        // key_name → input value during edit
+        secretsMessage: null,     // {type, text}
+
         fetchState: {
           health: { state: "idle", lastSuccess: null, error: null },
           activity: { state: "idle", lastSuccess: null, error: null },
@@ -251,7 +258,7 @@
               this._sessionsInterval = setInterval(() => this.fetchSessions(), 30000);
               break;
             case "config":
-              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); this.fetchAutonomousCliPolicy(); }
+              if (first) { this.fetchConfigFiles(); this.fetchBudgets(); this.fetchSettingsDomains(); this.fetchAutonomousCliPolicy(); this.fetchSecrets(); }
               break;
             case "chat":
               // Re-fit terminal on tab re-entry
@@ -696,19 +703,128 @@
           if (!this.settingsData[domain]) { this.fetchSettingsData(domain); }
           this.settingsEditing = domain;
         },
+
+        // ── Provider Keys methods ────────────────────────────────
+        async fetchSecrets() {
+          try {
+            const resp = await fetchApi("/api/genesis/secrets");
+            if (resp && resp.ok) { this.secretsGroups = (await resp.json()).groups; }
+          } catch (e) { console.warn("Secrets fetch failed:", e); }
+        },
+        toggleSecretEdit(keyName) {
+          this.secretsEditing = {...this.secretsEditing, [keyName]: !this.secretsEditing[keyName]};
+          if (!this.secretsEditing[keyName]) { delete this.secretsValues[keyName]; }
+        },
+        async saveSecret(keyName) {
+          const val = (this.secretsValues[keyName] || '').trim();
+          if (!val) { this.secretsMessage = {type: 'error', text: 'Value cannot be empty'}; return; }
+          this.secretsSaving = true;
+          try {
+            const resp = await fetchApi("/api/genesis/secrets", {
+              method: "PUT", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({keys: {[keyName]: val}}),
+            });
+            const d = await resp.json();
+            if (resp.ok) {
+              this.secretsEditing = {...this.secretsEditing, [keyName]: false};
+              delete this.secretsValues[keyName];
+              this.secretsMessage = {type: 'restart', text: `${keyName} saved. Restart required.`};
+              this.fetchSecrets();
+            } else {
+              this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
+            }
+          } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
+          this.secretsSaving = false;
+        },
+        secretStatusColor(status) {
+          if (status === 'validated') return '#4caf50';
+          if (status === 'configured') return '#f0ad4e';
+          return 'var(--color-text-secondary)';
+        },
+
         _SETTING_LABELS: {
+          // Autonomous CLI Policy
           autonomous_cli_fallback_enabled: 'CLI Fallback Enabled',
           manual_approval_required: 'Manual Approval Required',
           approval_channel: 'Approval Channel',
           reask_interval_hours: 'Re-ask Interval (hours)',
           shared_export_enabled: 'Shared Export',
+          // TTS
+          provider: 'TTS Provider', voice_id: 'Voice ID', model: 'Model',
+          stability: 'Stability', similarity_boost: 'Similarity Boost',
+          style: 'Style Expressiveness', speed: 'Speed',
+          use_speaker_boost: 'Speaker Boost', strip_markdown: 'Strip Markdown',
+          max_chars: 'Max Characters', block_background_sessions: 'Block Background TTS',
+          // Ego
+          enabled: 'Enabled', cadence_minutes: 'Cadence (minutes)',
+          activity_threshold_minutes: 'Activity Threshold (min)',
+          max_interval_minutes: 'Max Interval (min)', backoff_multiplier: 'Backoff Multiplier',
+          proposal_expiry_minutes: 'Proposal Expiry (min)', batch_digest: 'Batch Digest',
+          daily_budget_cap_usd: 'Daily Budget ($)',
+          morning_report_hour: 'Morning Report Hour', morning_report_minute: 'Morning Report Minute',
+          morning_report_timezone: 'Morning Report Timezone',
+          shadow_morning_report: 'Shadow Morning Report',
+          consecutive_failure_limit: 'Failure Limit', failure_backoff_minutes: 'Failure Backoff (min)',
+          // Inbox Monitor
+          watch_path: 'Watch Path', response_dir: 'Response Dir Pattern',
+          check_interval_seconds: 'Check Interval (sec)', batch_size: 'Batch Size',
+          effort: 'Effort Level', timeout_s: 'Timeout (sec)', timezone: 'Timezone',
+          // Outreach
+          start: 'Start Time', end: 'End Time',
+          default: 'Default Channel', blocker: 'Blocker Channel',
+          alert: 'Alert Channel', surplus: 'Surplus Channel', digest: 'Digest Channel',
+          max_daily: 'Max Daily Messages', surplus_daily: 'Surplus Daily Limit',
+          trigger_time: 'Trigger Time', timeout_hours: 'Timeout (hours)',
+          poll_interval_minutes: 'Poll Interval (min)',
         },
         _SETTING_DESCS: {
+          // Autonomous CLI Policy
           autonomous_cli_fallback_enabled: 'Allow background sessions to use Claude Code CLI when API routing fails',
           manual_approval_required: 'Require Telegram approval before dispatching background CC sessions',
           approval_channel: 'Channel for approval requests (must be configured and reachable)',
           reask_interval_hours: 'Hours between re-asking for approval on the same task',
           shared_export_enabled: 'Export policy to Guardian shared mount for host-side enforcement',
+          // TTS
+          provider: 'Active TTS provider. Requires restart to switch.',
+          stability: '0.0\u20131.0: higher = more consistent voice',
+          similarity_boost: '0.0\u20131.0: higher = closer to original voice',
+          style: '0.0\u20131.0: higher = more expressive delivery',
+          speed: '0.7\u20131.2: playback speed multiplier',
+          strip_markdown: 'Remove markdown formatting before synthesis',
+          max_chars: 'Maximum text length sent to TTS',
+          block_background_sessions: 'Prevent background sessions from triggering voice',
+          // Ego
+          cadence_minutes: 'Base interval between autonomous cycles',
+          activity_threshold_minutes: 'Min time since last user activity before running',
+          max_interval_minutes: 'Maximum backoff cap (prevents indefinite delays)',
+          backoff_multiplier: 'How much to increase interval on idle cycles',
+          daily_budget_cap_usd: 'Hard cap on daily ego session spending',
+          shadow_morning_report: 'Send reports to a test topic for 2 weeks',
+          consecutive_failure_limit: 'Consecutive failures before circuit breaker trips',
+          // Inbox Monitor
+          watch_path: 'Directory to watch for incoming files',
+          response_dir: 'Subdirectory pattern to exclude from scanning',
+          effort: 'Processing depth: low, medium, or high',
+          timeout_s: 'Max seconds per inbox item processing',
+          // Outreach
+          max_daily: 'Maximum outreach messages per day across all categories',
+          surplus_daily: 'Maximum surplus compute messages per day',
+        },
+        _SETTING_CHOICES: {
+          provider: ['elevenlabs', 'fish_audio', 'cartesia'],
+          model: ['opus', 'sonnet', 'haiku'],
+          effort: ['low', 'medium', 'high'],
+          approval_channel: ['telegram', 'email', 'dashboard'],
+          default: ['telegram', 'email', 'dashboard'],
+          blocker: ['telegram', 'email', 'dashboard'],
+          alert: ['telegram', 'email', 'dashboard'],
+          surplus: ['telegram', 'email', 'dashboard'],
+          digest: ['telegram', 'email', 'dashboard'],
+        },
+        _DOMAIN_LABELS: {
+          tts: 'Text-to-Speech', ego: 'Autonomous Ego',
+          inbox_monitor: 'Inbox Monitor', outreach: 'Outreach Pipeline',
+          autonomous_cli_policy: 'Autonomous CLI Policy',
         },
         _settingLabel(key) {
           return this._SETTING_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -4604,7 +4720,7 @@
               <div class="card" style="padding:1rem; margin-bottom:0.75rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
                   <div>
-                    <strong x-text="domain.name" style="text-transform:capitalize;"></strong>
+                    <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
                     <span style="font-size:0.75rem; color:var(--color-text-secondary); margin-left:0.5rem;" x-text="domain.description"></span>
                   </div>
                   <div style="display:flex; gap:0.5rem; align-items:center;">
@@ -4653,16 +4769,16 @@
                                    :value="val" step="any"
                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = parseFloat($event.target.value)">
                           </template>
-                          <template x-if="typeof val === 'string' && key === 'approval_channel'">
+                          <template x-if="typeof val === 'string' && $store.genesisDashboard._SETTING_CHOICES[key]">
                             <select style="font-size:0.78rem; padding:3px 6px; width:100%;"
                                     @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value"
                                     :value="val">
-                              <option value="telegram" :selected="val === 'telegram'">Telegram</option>
-                              <option value="email" :selected="val === 'email'">Email</option>
-                              <option value="dashboard" :selected="val === 'dashboard'">Dashboard</option>
+                              <template x-for="opt in $store.genesisDashboard._SETTING_CHOICES[key]" :key="opt">
+                                <option :value="opt" :selected="val === opt" x-text="opt"></option>
+                              </template>
                             </select>
                           </template>
-                          <template x-if="typeof val === 'string' && key !== 'approval_channel'">
+                          <template x-if="typeof val === 'string' && !$store.genesisDashboard._SETTING_CHOICES[key]">
                             <input type="text" style="font-size:0.78rem; padding:3px 6px; width:100%;"
                                    :value="val"
                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value">
@@ -4730,7 +4846,7 @@
                   <template x-for="domain in $store.genesisDashboard.settingsDomains" :key="domain.name">
                     <tr style="border-bottom:1px solid var(--color-border);">
                       <td style="padding:4px 8px;">
-                        <strong x-text="domain.name" style="text-transform:capitalize;"></strong>
+                        <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
                         <div style="font-size:0.7rem; color:var(--color-text-secondary);" x-text="domain.description"></div>
                       </td>
                       <td style="padding:4px 8px;">
@@ -4784,6 +4900,85 @@
                 </tbody>
               </table>
             </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Provider Keys [Tab: config] -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'config'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">key</span>
+        Provider Keys
+        <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px; margin-left:auto;">restart required</span>
+      </div>
+      <div class="panel-body">
+        <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.75rem;">
+          Manage API keys and credentials. Values are write-only &mdash; existing values are never displayed.
+        </div>
+        <!-- Message banner -->
+        <template x-if="$store.genesisDashboard.secretsMessage">
+          <div style="padding:0.5rem 0.75rem; border-radius:4px; margin-bottom:0.75rem; font-size:0.74rem;"
+               :style="{
+                 'background': $store.genesisDashboard.secretsMessage.type === 'error' ? 'rgba(217,83,79,0.12)' : 'rgba(255,193,7,0.12)',
+                 'color': $store.genesisDashboard.secretsMessage.type === 'error' ? '#d9534f' : '#856404',
+                 'border': $store.genesisDashboard.secretsMessage.type === 'error' ? '1px solid rgba(217,83,79,0.25)' : '1px solid rgba(255,193,7,0.25)'
+               }">
+            <span x-text="$store.genesisDashboard.secretsMessage.text"></span>
+            <template x-if="$store.genesisDashboard.secretsMessage.type === 'restart'">
+              <button style="margin-left:0.5rem; font-size:0.7rem; padding:2px 8px; border-radius:3px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                      @click="$store.genesisDashboard.restartBridge()">Restart Genesis</button>
+            </template>
+          </div>
+        </template>
+        <!-- Loading state -->
+        <template x-if="!$store.genesisDashboard.secretsGroups">
+          <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
+        </template>
+        <!-- Key groups -->
+        <template x-if="$store.genesisDashboard.secretsGroups">
+          <div>
+            <template x-for="group in $store.genesisDashboard.secretsGroups" :key="group.name">
+              <div style="margin-bottom:0.75rem;">
+                <div style="font-size:0.72rem; font-weight:600; color:var(--color-text-secondary); margin-bottom:0.35rem; text-transform:uppercase; letter-spacing:0.03em;" x-text="group.name"></div>
+                <template x-for="k in group.keys" :key="k.key">
+                  <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0; border-bottom:1px solid var(--color-border); font-size:0.78rem; flex-wrap:wrap;">
+                    <!-- Status dot -->
+                    <span class="status-dot" :style="`background:${$store.genesisDashboard.secretStatusColor(k.status)}`"></span>
+                    <!-- Label + env var -->
+                    <span style="font-weight:600; min-width:90px;" x-text="k.label"></span>
+                    <code style="font-size:0.65rem; color:var(--color-text-secondary);" x-text="k.key"></code>
+                    <!-- Status text -->
+                    <span style="margin-left:auto; min-width:70px; text-align:right;"
+                          :style="`color:${$store.genesisDashboard.secretStatusColor(k.status)}`"
+                          x-text="k.status === 'configured' ? 'configured' : k.status === 'validated' ? 'validated' : 'not set'"></span>
+                    <!-- Signup link -->
+                    <template x-if="k.signup_url && k.status === 'not_set'">
+                      <a :href="'https://' + k.signup_url" target="_blank" rel="noopener"
+                         style="font-size:0.65rem; color:var(--color-primary); text-decoration:none;"
+                         x-text="k.signup_url"></a>
+                    </template>
+                    <!-- Edit/Set button -->
+                    <button style="font-size:0.68rem; padding:2px 8px; border-radius:3px; border:1px solid var(--color-border); background:transparent; color:var(--color-text-secondary); cursor:pointer;"
+                            @click="$store.genesisDashboard.toggleSecretEdit(k.key)"
+                            x-text="$store.genesisDashboard.secretsEditing[k.key] ? 'Cancel' : (k.status === 'not_set' ? 'Set' : 'Edit')"></button>
+                    <!-- Inline edit row -->
+                    <template x-if="$store.genesisDashboard.secretsEditing[k.key]">
+                      <div style="width:100%; display:flex; gap:0.4rem; align-items:center; margin-top:0.25rem;">
+                        <input type="password" placeholder="Enter value..."
+                               style="flex:1; font-size:0.76rem; padding:4px 8px; border:1px solid var(--color-border); border-radius:4px; background:var(--color-background);"
+                               :value="$store.genesisDashboard.secretsValues[k.key] || ''"
+                               @input="$store.genesisDashboard.secretsValues = {...$store.genesisDashboard.secretsValues, [k.key]: $event.target.value}">
+                        <button style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                                :disabled="$store.genesisDashboard.secretsSaving"
+                                @click="$store.genesisDashboard.saveSecret(k.key)"
+                                x-text="$store.genesisDashboard.secretsSaving ? 'Saving...' : 'Save'"></button>
+                      </div>
+                    </template>
+                  </div>
+                </template>
+              </div>
+            </template>
           </div>
         </template>
       </div>
@@ -5117,7 +5312,7 @@
         <template x-if="$store.genesisDashboard.health.api_keys">
           <div>
             <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.75rem;">
-              Keys are read from environment variables. Edit <code>~/genesis/secrets.env</code> to configure.
+              Keys are read from environment variables. Configure in <a href="#" @click.prevent="$store.genesisDashboard.activeTab = 'config'; $store.genesisDashboard.fetchSecrets()" style="color:var(--color-primary);">Settings &rarr; Provider Keys</a>.
             </div>
             <template x-for="(info, name) in $store.genesisDashboard.health.api_keys" :key="name">
               <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border); font-size: 0.78rem; flex-wrap: wrap;">

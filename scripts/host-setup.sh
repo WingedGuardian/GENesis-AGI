@@ -362,8 +362,12 @@ incus exec "$CONTAINER_NAME" -- bash -c '
     apt-get update -qq || { echo "  FATAL: apt-get update failed — check container DNS"; exit 1; }
     apt-get install -y -q \
         git curl sudo \
-        python3 python3-pip python3.12-venv \
+        python3 python3-pip \
         nodejs npm || { echo "  FATAL: package install failed"; exit 1; }
+    # Install venv — try version-specific first (noble = 3.12), then generic
+    apt-get install -y -q python3.12-venv 2>/dev/null || \
+        apt-get install -y -q python3-venv || \
+        { echo "  FATAL: could not install python3-venv"; exit 1; }
 ' || {
     echo ""
     echo "  FATAL: Prerequisites installation failed inside container."
