@@ -112,7 +112,7 @@ class TestFocusNextWeekFromStrategic:
             trigger_reason=None,
         )
 
-        bridge = CCReflectionBridge(
+        CCReflectionBridge(
             session_manager=AsyncMock(),
             invoker=AsyncMock(),
             db=db,
@@ -155,7 +155,7 @@ class TestFocusNextWeekFromStrategic:
             trigger_reason=None,
         )
 
-        bridge = CCReflectionBridge(
+        CCReflectionBridge(
             session_manager=AsyncMock(),
             invoker=AsyncMock(),
             db=db,
@@ -201,7 +201,7 @@ class TestFocusNextWeekFromStrategic:
             trigger_reason=None,
         )
 
-        bridge = CCReflectionBridge(
+        CCReflectionBridge(
             session_manager=AsyncMock(),
             invoker=AsyncMock(),
             db=db,

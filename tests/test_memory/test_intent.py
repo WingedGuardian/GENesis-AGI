@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import pytest
-
 from genesis.memory.intent import (
     QueryIntent,
     TagCooccurrenceIndex,
+    _tokenize_query,
     classify_intent,
     compute_intent_affinity,
     rank_by_intent,
-    _tokenize_query,
 )
-
 
 # ---------------------------------------------------------------------------
 # Intent classification
