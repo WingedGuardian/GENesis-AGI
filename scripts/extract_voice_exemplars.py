@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 from statistics import stdev
 
+
 def _detect_transcripts_dir() -> Path:
     """Derive CC project directory from the genesis repo location."""
     # CC project IDs are the repo path with / replaced by -
