@@ -51,6 +51,36 @@ fi
 echo "  Dependencies synced"
 echo ""
 
+# ── Fix Network Identity (if unresolved template vars) ────
+_claude_md="$GENESIS_ROOT/CLAUDE.md"
+if grep -qE '\$\{|:-localhost\}' "$_claude_md" 2>/dev/null; then
+    echo "--- Fixing Network Identity in CLAUDE.md ---"
+    _c_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    _c_ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || true)
+    _host_ip=$("$VENV_DIR/bin/python" -c "
+import yaml, pathlib
+p = pathlib.Path.home() / '.genesis' / 'guardian_remote.yaml'
+if p.exists():
+    cfg = yaml.safe_load(p.read_text())
+    print(cfg.get('host_ip', ''))
+" 2>/dev/null || true)
+    [ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
+
+    sed -i '/^## Network Identity/,$d' "$_claude_md"
+    {
+        echo ""
+        echo "## Network Identity"
+        echo ""
+        printf -- "- **Container IP**: %s" "${_c_ip:-localhost}"
+        [ -n "$_c_ipv6" ] && printf " (v6: %s)" "$_c_ipv6"
+        echo ""
+        printf -- "- **Host VM IP**: %s\n" "${_host_ip:-localhost}"
+        printf -- "- **Dashboard**: http://%s:5000 (via proxy device)\n" "${_host_ip:-localhost}"
+    } >> "$_claude_md"
+    echo "  Network identity updated in CLAUDE.md"
+    echo ""
+fi
+
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 WERE_RUNNING=()

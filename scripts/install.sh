@@ -165,24 +165,42 @@ else
     echo "    WARN  'ss' not found — cannot check for port conflicts"
 fi
 
-# Python 3.12+
-if ! command -v python3 &>/dev/null; then
-    echo "    python3 not found — installing..."
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq python3 > /dev/null 2>&1
-    fi
-fi
-if command -v python3 &>/dev/null; then
+# Python 3.12+ — prefer explicit python3.12 binary
+if command -v python3.12 &>/dev/null; then
+    py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
+    echo "    OK    Python $py_version"
+elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
     if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
         echo "    OK    Python $py_version"
     else
-        echo "    FAIL  Python 3.12+ required, found $py_version"
-        PREFLIGHT_OK=0
+        # Try to install Python 3.12 explicitly
+        echo "    Python $py_version found but 3.12+ required — installing python3.12..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null
+        fi
+        if command -v python3.12 &>/dev/null; then
+            py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
+            echo "    OK    Python $py_version (installed)"
+        else
+            echo "    FAIL  Python 3.12+ required, found $py_version"
+            echo "    Install manually: sudo apt-get install python3.12 python3.12-venv"
+            PREFLIGHT_OK=0
+        fi
     fi
 else
-    echo "    FAIL  python3 not found and could not auto-install"
-    PREFLIGHT_OK=0
+    echo "    python3 not found — installing..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null || \
+            sudo apt-get install -y -qq python3 2>/dev/null
+    fi
+    if command -v python3.12 &>/dev/null || command -v python3 &>/dev/null; then
+        py_version=$( (python3.12 --version 2>&1 || python3 --version 2>&1) | grep -oP '\d+\.\d+' || echo "unknown")
+        echo "    OK    Python $py_version (installed)"
+    else
+        echo "    FAIL  python3 not found and could not auto-install"
+        PREFLIGHT_OK=0
+    fi
 fi
 
 if [ "$PREFLIGHT_OK" = "0" ]; then
@@ -255,10 +273,11 @@ else
     echo "    . Node.js $(node --version)"
 fi
 
-# Python venv
+# Python venv — prefer python3.12 for venv creation
+PYTHON_BIN=$(command -v python3.12 || command -v python3)
 if [ ! -d "$VENV_PATH" ]; then
-    echo "    Creating venv at $VENV_PATH..."
-    python3 -m venv "$VENV_PATH"
+    echo "    Creating venv at $VENV_PATH (using $PYTHON_BIN)..."
+    "$PYTHON_BIN" -m venv "$VENV_PATH"
     echo "    + venv created"
 fi
 
