@@ -3,6 +3,10 @@
 </p>
 
 <p align="center">
+  <img src="docs/images/genesis-dashboard.gif" alt="Genesis Neural Monitor — live subsystem health" width="720">
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
   <img src="https://img.shields.io/badge/LOC-72%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
@@ -15,22 +19,26 @@ We have the most capable AI models ever created, and we're using them like searc
 
 Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU configure the tools. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step. When something unexpected happens, it's on YOU to handle it.
 
-That's the entire industry. Brilliant in the moment. Blank slate the next.
-
 Genesis inverts this.
 
 YOU tell Genesis what to get done. IT figures out how: finding the tools, navigating the obstacles, asking only for what it genuinely can't determine on its own. Not "I tried, and stopped at the first obstacle" — a completed task and an explanation of what it did. And tomorrow, it's better at it than it was today.
 
-Genesis is a cognitive layer that sits between AI models and the real world and actually does the thinking. When the system handles the challenges and unexpected obstacles instead of outsourcing them back to you, something fundamental has changed. Genesis is building toward that shift, one cognitive layer at a time. The aspiration: everything digital, handled autonomously. A cognitive partner that does the work, grows more capable with every day it runs, and asks only when it has to. Not a tool YOU wield. A system that works FOR you. The system you're running on day 180 is fundamentally different from the one you installed — because it learned.
-
 **What it delivers today:**
-- **Persistent memory** — two vector databases that grow with every interaction, not conversation-scoped context that evaporates
-- **Self-learning** — outcome classification, causal attribution, and procedure refinement that runs automatically after every session
-- **Adaptive reasoning** — routes work across six model tiers from free local inference to frontier models, matching capability to complexity
+- **Persistent memory** — 4-depth memory system with two vector databases that grow with every interaction, not conversation-scoped context that evaporates
+- **Self-learning** — outcome classification, causal attribution, and procedure refinement that runs automatically after every session (plus automatic session management)
+- **Adaptive reasoning** — routes work across six model tiers from free local and cloud inference to frontier models, matching capability to complexity
 - **Background cognition** — research, audit, and self-improvement using free-tier compute during idle time
 - **Earned autonomy** — graduated trust per action category through demonstrated competence, not a global toggle
 - **Autonomous task execution** — a 9-phase pipeline that decomposes tasks, executes with adversarial self-review, verifies results, and delivers — not just "run this tool" but genuine multi-step autonomy
-- **Real-world integration** — Gmail monitoring with two-layer AI triage, an Obsidian-compatible inbox that evaluates anything you drop into a folder, and proactive Telegram notifications
+- **Real-world integration** — Gmail monitoring with two-layer AI triage, an Obsidian-compatible inbox that evaluates anything you drop into a folder (or Dropbox directly), and proactive Telegram notifications
+- **Portable across machines** — memory, learned procedures, and context travel with you; automatic backup runs every 6 hours
+
+The aspiration: everything digital, handled autonomously. A cognitive partner that does the work, grows more capable with every day it runs, and asks only when it has to. Not a tool YOU wield; a system that works FOR you. The system you're running on day 180 is fundamentally different from the one you installed — because it learned.
+
+Day 1 — a strong generalist with full cognitive infrastructure.
+Day 30 — a personalized specialist in every domain you've touched.
+Day 90 — anticipating needs you haven't articulated yet.
+Day 180 — evolving its own architecture to serve you better.
 
 V3 is the foundation that makes this possible. What's already here is a full cognitive copilot. What's on the [roadmap](#where-its-headed) — a cognitive cycle grounded in Global Workspace Theory and the LIDA architecture from consciousness research, autonomous codebase evolution, and a system that runs experiments on its own cognition — is where it gets ambitious enough that we'll need help building it.
 
@@ -42,16 +50,15 @@ Genesis is a cognitive architecture that aspires to *earn* the title of "AGI." N
 
 It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its reasoning engine — autonomous sessions, tool execution, multi-step reasoning. A (soon-to-be-optional) operational layer provides the dashboard and web interface, but the cognitive architecture is runtime-agnostic. Adapter patterns and generic interfaces mean the operational layer is swappable without touching the cognitive core. This is the core thesis of Genesis: AI and code that is fundamentally fluid and malleable and can adapt to any codebase, and any situation.
 
-Claude Code is the raw intelligence — but without memory, without learning, without identity, it starts from zero every session. Genesis is what it's been missing. The mind that remembers, reflects, learns, and decides.
+Genesis serves as a layer that sits between Claude Code (as well as other AI models) and the real world and produces the actual thinking. When the system handles challenges and unexpected obstacles autonomusly instead of outsourcing them back to you, something fundamental has changed. Genesis is building toward that shift, one cognitive layer at a time. Claude Code is the raw intelligence — but without memory, without learning, without self-reflection, it starts from zero every session. Genesis is what it's been missing. The mind that remembers, reflects, learns, and decides.
 
 <p align="center">
-  <!-- Tin Man getting his heart — recommend the classic Wizard of Oz scene where the Wizard hands him the heart-shaped clock/testimonial -->
-  <!-- Alt: animated gif of the Tin Man's face lighting up after receiving the heart -->
-  <br>
-  <i>"A heart is not judged by how much you love; but by how much you are loved by others." — The Wizard</i>
+  <img src="docs/images/tin-man.jpg" alt="The Tin Man" width="320">
+  <br><br>
+  <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-72,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Solo-developed from first commit to running production system.
+72,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Built to production by one person — which is exactly the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 ---
 
@@ -103,7 +110,7 @@ graph TB
 
 ## Memory 🗄️
 
-This isn't RAG bolted onto a chatbot. Genesis runs a hybrid memory architecture across two Qdrant vector collections, SQLite with FTS5 full-text search, and a knowledge graph — all working together.
+This isn't your uncle's RAG with a chatbot. Genesis runs a hybrid memory architecture across two Qdrant vector collections, SQLite with FTS5 full-text search, and a knowledge graph — all working together.
 
 **Dual vector collections:**
 
@@ -149,7 +156,7 @@ The key distinction: Genesis doesn't just learn *what* to do differently. It cla
 
 ## Earned autonomy 🔑
 
-Every other agent system handles autonomy with an on/off switch. That's the wrong model.
+Most other agent systems handle autonomy with an on/off switch. That's the wrong model.
 
 Genesis earns autonomy per category through demonstrated competence across seven levels:
 
@@ -207,25 +214,35 @@ Most agent systems go dark the moment you stop talking to them. Genesis doesn't.
 
 ## Compute routing ⚡
 
-Genesis routes work to the cheapest capable model — not the most expensive one. One example:
+Genesis prefers to route work to the most appropriate model, starting with the cheapest capable model — not the most expensive one. One example:
 
 | Tier | Use case | Cost |
 |---|---|---|
 | Local 3B (can even run on CPU) | Embeddings, extraction | Free |
-| Local 20-30B / Gemini Flash | Routine reasoning, light reflection | Free |
-| Free cloud APIs (Mistral, Groq, Openrouter) | Cloud fallback | Free |
+| Local 20-30B (eg gemma) | Routine reasoning, light reflection | Free |
+| Free cloud APIs (Mistral, Groq, Openrouter) | Surplus compute, cloud fallback | Free |
 | Sonnet-class | Deep reflection, judgment calls | $ |
-| Opus-class | Strategic reflection | $$ |
+| Opus-class | Strategic reflection, self-evolution | $$ |
 
 Circuit breakers and fallback chains handle failures at every tier. If a provider goes down, work routes around it automatically. The resilience layer tracks four independent failure axes — cloud availability, memory status, embedding status, and CC availability — each with its own degradation levels and recovery paths. A composite state machine maps partial availability to contingency strategies, with deferred work queues that hold tasks during outages and replay them on recovery. Most systems have binary health: up or down. Genesis maps the entire space in-between.
 
 ---
 
+## The Guardian 🏥
+
+Genesis runs inside a containerized environment watched by something called **the Guardian** — a separate process on the host VM with 5 independent health probes that spawns its own Claude Code session to diagnose and restore Genesis if it goes down. Even if Genesis nukes itself, Guardian detects it and gets it back up — full stop.
+
+But what if the Guardian itself fails?
+
+Genesis watches the Guardian right back. If the Guardian heartbeat goes stale, Genesis auto-restarts it over SSH. Guardian watches Genesis. Genesis watches Guardian. The loop closes itself. Deploy with `scripts/install_guardian.sh`. Escalation to you via Telegram happens only when it genuinely needs approval (in the current V3 Alpha, the Guardian will always wait for approval before taking any action--no accidental misfires).
+
+We believe that if something were truly worthy of the title of "AGI," you wouldn't have to fix it. Let Genesis fix Genesis. If it can't, the Guardian will. If the Guardian goes down, Genesis will handle it. The cognitive architecture never runs unprotected.
+
+---
+
 ## Resilience 🛡️
 
-Genesis was built infrastructure-first. Not "add error handling later" — the resilience layer was one of the earliest build phases because everything else depends on it.
-
-The system runs inside a containerized environment (Incus container on a host VM) with the host acting as a 'guardian angel' for the container. Even if Genesis nukes itself, the host detects it and gets it working again — full stop. More than a watchdog: the guardian runs its own Claude Code sessions, has 5 independent health probes, and can diagnose and recover from container failures autonomously. It escalates to you via Telegram when it needs approval for recovery actions. The premise is: you shouldn't have to fix Genesis. Let Genesis fix Genesis. The cognitive architecture never runs unprotected.
+Genesis was built infrastructure-first. Not "add error handling later" — the resilience layer was one of the earliest build phases because everything else depends on it. Resilience and auto-recovery is one of the fundamental principles of any truly 'intelligent' system.
 
 **Composite state machine** — Four independent failure axes, each with their own degradation levels and recovery paths:
 
@@ -255,17 +272,17 @@ Genesis doesn't just live in a terminal. It operates in the real world through m
 
 **Gmail monitor** — A two-layer AI triage system for email. The first layer (a fast, cheap model) reads every email, extracts findings, and scores relevance. The second layer (a capable model) reviews surviving briefs and makes final keep/discard decisions. Relevant findings get stored as recon with full provenance. Your inbox, processed by a paralegal and a judge — not a spam filter.
 
-**Obsidian inbox** — Drop a markdown file with URLs into a watched folder. Genesis picks it up, fetches every URL, evaluates the content through its domain knowledge lens, and stores findings as searchable recon. That article someone shared in Slack? That research paper you bookmarked at 2am? Drop it in the folder. Walk away. Genesis handles it.
+**Obsidian inbox** — Drop a markdown file with URLs, scattered thoughts, a todo list — anything — into a watched folder. Genesis picks it up, fetches every URL, evaluates the content and determines your intent, processes it through its entire system & domain knowledge lens, writes a response and then stores findings as searchable intel. That article someone shared in Slack? That research paper you bookmarked at 2am? Drop it in the folder. Walk away. Genesis sends you the deets 30 mins later (configurable).
 
 **Telegram** — Proactive notifications, morning digests, alert escalation, and conversational interaction. Genesis reaches out when it has something worth saying — findings from surplus research, health alerts, opportunities surfaced by capability modules. Not a notification firehose. Calibrated outreach based on measured engagement.
 
-**Task executor** — Give Genesis a complex, multi-step task and walk away. A 9-phase pipeline decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, synthesizes outcomes, and delivers. Not "call this API" — genuine autonomous task completion with built-in quality gates.
+**Task executor** — Give Genesis a complex, multi-step task or project (ie, build me a finalized website, find an appropriate domain and ask me which one I like, buy it, and then set everything up) and walk away. A 9-phase pipeline decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, synthesizes outcomes, and delivers. Not "call this API" — genuine autonomous task completion with built-in quality gates. You're only notified when it's finished, you ask it to wait, or it genuinly needs you. And each time, it learns everything it possibly can from that process — meaning, in the future, it needs you less and less, and gets better and better. 
 
 ---
 
 ## Modules 🔌
 
-Genesis has a pluggable capability module system — external programs and domain capabilities that run inside the cognitive architecture without modifying the core. And the best part is this: you can make most anything (open-source) into a module; just ask Genesis to turn it into one!
+Genesis has a pluggable capability module system — external programs and domain capabilities that run inside the cognitive architecture without modifying the core. And the best part is this: you can make most anything (open-source) into a module; just ask Genesis to turn it into one. The `/integrate-module` skill handles a 7-phase onboarding automatically — discovery, connection mapping, effort assessment, config generation, dashboard setup, verification, and documentation. You don't touch Genesis's code. You just ask.
 
 This isn't just another .MD file for an agent — we're talking whole programs under Genesis's direct cognitive control.
 
@@ -354,7 +371,7 @@ graph LR
 
 ---
 
-## Build phases
+## V3 Build phases (fully complete)
 
 Genesis was built in strict dependency order — each phase verified before the next begins.
 
@@ -384,7 +401,7 @@ V3 is the foundation — complete, tested, running in production. What comes nex
 V3 alpha is the cognitive copilot. Beta adds the pieces that make it a fully autonomous agent:
 
 - **Ego session** — an autonomous decision-making loop. Genesis proposes actions, gets approval, executes, and learns from the outcomes. The "missing ego" that gives the system coherent autonomous behavior instead of a collection of independent subsystems.
-- **Agent framework portability** — Genesis is standalone, pluggable into OpenClaw, Hermes Agent, or any agent framework. The cognitive layer is the brain; the runtime is the body. Swap bodies without touching the brain.
+- **Agent framework portability** — pluggable into OpenClaw, Hermes Agent, Agent Zero, or any agent framework via adapter interfaces. The cognitive layer is the brain; the runtime is the body. Swap bodies without touching the brain.
 - **Confidence calibration going live** — the shadow-mode calibration system graduates to active influence on decisions, reflection depth, and autonomy grants.
 
 ### V4 — Autonomous action
@@ -437,77 +454,81 @@ Nobody else is attempting this. Most agent frameworks are still building prompt 
 
 V5 requires months of V4 operational data. Every V5 feature is gated behind measured evidence that the simpler V4 version works. No premature complexity.
 
-### The trajectory
-
-Day 1 — a strong generalist with full cognitive infrastructure.
-Day 30 — a personalized specialist in every domain you've touched.
-Day 90 — anticipating needs you haven't articulated yet.
-Day 180 — evolving its own architecture to serve you better.
-
 <p align="center">
   <img src="docs/images/data-acceptable.jpg" alt="That is acceptable." width="280">
   <br>
-  <i>Think less Siri, more Data. Without the yellow eyes.</i>
+  <i>Data, probably, after hearing about Genesis.</i>
 </p>
 
 ---
 
 ## Getting started
 
-**Alpha release.** Genesis v3-alpha is feature-complete but actively stabilizing. Expect rough edges and bugs that you'll occasionally want to use Claude Code to diagnose and fix. The good news: you can tell Genesis to iron out its own kinks. If you're comfortable with a few bumps, you'll be fine. For a more polished experience, check back at beta.
+**Alpha release.** Genesis v3-alpha is feature-complete but actively stabilizing. Expect rough edges, configuration that assumes familiarity with the stack, and bugs that you'll occasionally want to use Genesis' CLI (Claude Code) to diagnose and fix. The good news is: you can simply tell Genesis to iron out its own kinks. If you're comfortable working with a few bumps for the time being, you'll be fine. If you want a more polished experience, check back when we hit beta.
 
-### Requirements
+### System requirements
 
-| What | Minimum |
-|---|---|
-| **Host machine** | Linux (Ubuntu 22.04+), 8GB RAM, 30GB disk |
-| **Execution access** | Claude Code access and/or API provider keys based on your workflow — [Claude Code install instructions](https://docs.anthropic.com/en/docs/claude-code/overview) |
+Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine or container.
 
-Everything else (Python, Qdrant, Node.js, systemd services) is installed automatically inside an isolated container.
+| Resource | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
+| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. |
+| **Disk** | 10 GB | 40 GB+ | Fresh install is ~400 MB. Qdrant data, logs, memory, and model caches grow steadily. Production uses 2-5 GB within weeks, more with active memory. |
+| **CPU** | 2 cores | 4-8 cores | Concurrent background tasks (awareness loop, reflection, outreach, triage) benefit from parallelism. |
+| **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
 
-### Installation
+These are the requirements for the **host VM** — the machine you run the installer on. Genesis itself runs inside a container that the installer creates with its own resource limits and security boundaries.
 
-Genesis runs inside an [Incus](https://linuxcontainers.org/incus/) container. The install script creates the container, installs all dependencies, and sets up a Guardian health monitor on the host.
+### Prerequisites
+
+The host VM needs `git` and `sudo`. That's it — the installer handles everything else, including Incus, the container, and all software inside it.
 
 ```bash
-git clone https://github.com/WingedGuardian/GENesis-AGI.git genesis-setup
-cd genesis-setup
+# Ubuntu/Debian
+sudo apt install git sudo
+```
+
+### Install
+
+One script sets up the entire infrastructure: creates an Incus container with resource limits (RAM, CPU, disk I/O), installs Genesis and all dependencies inside it, deploys the Guardian health monitor on the host, and configures bidirectional SSH between host and container.
+
+```bash
+git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis-setup
+cd ~/genesis-setup
 ./scripts/host-setup.sh
 ```
 
-The install takes 5-10 minutes. During the process:
+The installer is interactive by default — it will prompt for API keys, timezone, and preferences. Use `--non-interactive` for scripted/CI deployments.
 
-1. **Container creation** — Incus creates an Ubuntu 24.04 container with resource limits (8 CPUs, 24GB RAM, 30GB disk by default). Adjust with `--ram`, `--cpus`, `--disk` flags.
-2. **Dependency installation** — Python, Node.js, Qdrant, Claude Code, and systemd services are all installed inside the container.
-3. **Guardian setup** — A health monitor is installed on the host VM. Depending on your selected execution path, it may prompt you to log into Claude Code (you'll get a URL to open in your browser).
+**What you get after install:**
 
-### First launch
+| Component | Where | What it does |
+|---|---|---|
+| **Genesis container** | Incus container on host | Runs all Genesis services with resource limits and isolation |
+| **Genesis server** | Inside container, port 5000 | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
+| **Qdrant** | Inside container, port 6333 | Vector database for semantic memory |
+| **Guardian** | Host VM | Monitors container health every 30s, auto-recovers, alerts via Telegram |
+| **Claude Code** | Inside container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
 
-After installation completes, you'll see connection instructions. Connect to the container and start Claude Code:
+**After install, access the container:**
 
 ```bash
-incus exec genesis --user 1000 --env HOME=/home/ubuntu \
-    --env XDG_RUNTIME_DIR=/run/user/1000 \
-    --cwd ${HOME}/genesis -t -- bash -l
+incus exec genesis --user ubuntu -t -- bash
+cd ~/genesis
 claude
 ```
 
-Claude Code may prompt you to log in again (the container is a separate environment from the host). Once connected, **Genesis will automatically guide you through initial setup**: API keys, service verification, and configuration.
+### Optional components
 
-If onboarding doesn't start automatically, run `/setup` inside the Claude Code session.
-
-> **About host/container auth:** The host VM (Guardian) and the container (Genesis) are separate environments. If your selected path uses Claude Code login, each environment is authenticated separately.
-
-### What gets installed
-
-| Component | Location | Purpose |
+| Component | What it does | Install |
 |---|---|---|
-| Genesis | `~/genesis` | Core intelligence system (dashboard on port 5000) |
-| Qdrant | `/usr/local/bin/qdrant` | Vector database for memory |
-| Claude Code | `claude` (npm global) | CLI interface + hooks |
-| Systemd services | `~/.config/systemd/user/` | genesis-server, qdrant, watchdog |
+| **[Qdrant](https://qdrant.tech)** | Vector database for semantic memory search | `docker run -d -p 6333:6333 qdrant/qdrant` |
+| **[Ollama](https://ollama.com)** | Local embedding models (privacy, speed) | `curl -fsSL https://ollama.com/install.sh \| sh` |
 
-**Optional:** Local embedding models via [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai). Genesis adapts to what's available — cloud embedding APIs work out of the box.
+Without Qdrant, Genesis falls back to SQLite FTS5 full-text search for memory. Without Ollama, it uses cloud embedding APIs. Both optional components enhance performance but aren't required to get started.
+
+The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
 ---
 
@@ -525,13 +546,11 @@ The complete design lives in [`docs/architecture/`](docs/architecture/):
 
 ## Get involved 🤝
 
-Genesis is open source under the [MIT License](LICENSE).
-
 V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates — whether it's the memory architecture, the cognitive cycle, the autonomy model, or the audacity of building a self-evolving agent — there's work to do.
 
 <!-- **[Discord →](https://discord.gg/TODO)** — architecture discussions, contributor coordination, roadmap input -->
 
-Curious how it all fits together? Hell, have Claude read the architecture docs and give you the summary! The design is intentional and forward-thinking.
+Curious how it all fits together? Join our Discord server [https://discord.gg/jQ57c5f6Pc]. Or hell, have Claude read the architecture docs and give you it's analysis! The design is intentional and forward-thinking.
 
 ---
 
@@ -541,4 +560,4 @@ MIT License. See [LICENSE](LICENSE).
 
 ---
 
-<p align="center"><i>Claude Code already had the brain. We gave it the heart.</i></p>
+<p align="center"><i>Everything digital. Handled autonomously. That's the thesis.</i></p>
