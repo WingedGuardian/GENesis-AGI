@@ -99,14 +99,31 @@ echo ""
 
 echo "[1/13] Checking prerequisites..."
 
-# Python 3.12+
+# Python 3 (Guardian only needs pyyaml — 3.11+ works fine)
 PYTHON=$(command -v python3.12 || command -v python3 || true)
 if [ -z "$PYTHON" ]; then
-    echo "  FAIL  Python 3.12+ not found"
+    echo "  FAIL  Python 3 not found"
     exit 1
 fi
 PYTHON_VERSION=$($PYTHON --version 2>&1 | grep -oP '\d+\.\d+')
 echo "  OK    Python $PYTHON_VERSION"
+
+# python3-venv (required for venv creation — ensurepip ships in the venv package)
+if ! $PYTHON -c "import ensurepip" &>/dev/null; then
+    VENV_PKG="python${PYTHON_VERSION}-venv"
+    echo "  $VENV_PKG not found — installing..."
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq && sudo apt-get install -y -qq "$VENV_PKG" || {
+            echo "  FAIL  Could not install $VENV_PKG"
+            echo "  Install manually: sudo apt-get install $VENV_PKG"
+            exit 1
+        }
+        echo "  OK    $VENV_PKG installed"
+    else
+        echo "  FAIL  $VENV_PKG not installed and apt-get not available"
+        exit 1
+    fi
+fi
 
 # incus (already used above, so it exists)
 echo "  OK    incus: $(incus version 2>/dev/null || echo 'available')"
