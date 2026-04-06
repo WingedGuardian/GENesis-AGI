@@ -503,26 +503,39 @@ else
     echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
-# ── Persist network identity into container ───────────────────
-# Write detected IPs to secrets.env so Genesis knows its own network topology.
-# Also append to CLAUDE.md so CC sessions have this context.
+# ── Persist network identity into container CLAUDE.md ─────────
+# Append detected IPs to the container's CLAUDE.md so CC sessions know the
+# network topology. Idempotent: removes prior block before appending.
 echo ""
-echo "  Writing network identity into container..."
-incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- bash -c "
-    _secrets='/home/ubuntu/genesis/secrets.env'
-    # Ensure file exists with secure permissions
-    touch \"\$_secrets\" && chmod 600 \"\$_secrets\" 2>/dev/null || true
-    # Remove any prior network entries and re-add with current values
-    grep -v '^GENESIS_CONTAINER_IP\|^GENESIS_HOST_IP\|^GENESIS_HOST_TAILSCALE' \"\$_secrets\" > \"\${_secrets}.tmp\" 2>/dev/null || true
-    mv \"\${_secrets}.tmp\" \"\$_secrets\" 2>/dev/null || true
-    echo 'GENESIS_CONTAINER_IPV4=${CONTAINER_IPV4}' >> \"\$_secrets\"
-    echo 'GENESIS_CONTAINER_IPV6=${CONTAINER_IPV6}' >> \"\$_secrets\"
-    echo 'GENESIS_HOST_IPV4=${HOST_IPV4}' >> \"\$_secrets\"
-    echo 'GENESIS_HOST_IPV6=${HOST_IPV6}' >> \"\$_secrets\"
-    echo 'GENESIS_HOST_TAILSCALE_IPV4=${TS_IPV4}' >> \"\$_secrets\"
-    echo 'GENESIS_HOST_TAILSCALE_IPV6=${TS_IPV6}' >> \"\$_secrets\"
-" 2>/dev/null && echo "  + Network IPs written to container secrets.env" || \
-    echo "  WARN: Could not write network IPs to container"
+echo "  Writing network identity into container CLAUDE.md..."
+# Build the network block on the host side where all variables are available
+_NET_LINES="## Network Identity"
+_NET_LINES="${_NET_LINES}
+"
+_NET_LINES="${_NET_LINES}
+- **Container IP**: ${CONTAINER_IPV4}"
+[ -n "$CONTAINER_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${CONTAINER_IPV6})"
+_NET_LINES="${_NET_LINES}
+- **Host VM IP**: ${HOST_IPV4}"
+[ -n "$HOST_IPV6" ] && _NET_LINES="${_NET_LINES} (v6: ${HOST_IPV6})"
+[ -n "$TS_IPV4" ] && _NET_LINES="${_NET_LINES}
+- **Tailscale**: ${TS_IPV4}"
+_NET_LINES="${_NET_LINES}
+- **Dashboard**: http://${HOST_IPV4:-localhost}:5000 (via proxy device)"
+
+# Write into container via incus exec, piping the block through stdin
+echo "$_NET_LINES" | incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
+    --env "HOME=/home/ubuntu" -- bash -c '
+    _claude="/home/ubuntu/genesis/CLAUDE.md"
+    # Remove prior network identity block if present
+    if grep -q "^## Network Identity" "$_claude" 2>/dev/null; then
+        sed -i "/^## Network Identity/,\$d" "$_claude"
+    fi
+    # Append new block from stdin
+    echo "" >> "$_claude"
+    cat >> "$_claude"
+' 2>/dev/null && echo "  + Network identity written to container CLAUDE.md" || \
+    echo "  WARN: Could not write network identity to container CLAUDE.md"
 
 # ── Install Guardian on host ───────────────────────────────────
 # Reuse CONTAINER_IPV4 detected earlier; fall back to incus list if empty
@@ -562,6 +575,21 @@ else
     echo "  WARNING: Guardian install script not found at $_guardian_script"
 fi
 
+# ── Convenience alias on host ─────────────────────────────────
+# The full incus exec command is long and easy to get wrong. Add a 'genesis'
+# alias that sets HOME, XDG_RUNTIME_DIR, and cwd correctly.
+_alias_user="${SUDO_USER:-$(whoami)}"
+_alias_home=$(eval echo "~$_alias_user")
+_alias_bashrc="$_alias_home/.bashrc"
+if ! grep -q 'alias genesis=' "$_alias_bashrc" 2>/dev/null; then
+    cat >> "$_alias_bashrc" << ALIASEOF
+
+# Genesis container shell — full env for systemd + CC project discovery
+alias genesis='incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l'
+ALIASEOF
+    echo "  + Added 'genesis' alias to $_alias_bashrc"
+fi
+
 # ── Report ───────────────────────────────────────────────────
 
 # Check if Guardian CC was authenticated during install
@@ -577,10 +605,11 @@ echo "  ────────────────────────
 echo ""
 echo "  STEP 1 — Connect to Genesis:"
 echo ""
-echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID \\"
-echo "      --env HOME=/home/ubuntu \\"
-echo "      --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID \\"
-echo "      --cwd /home/ubuntu/genesis -t -- bash -l"
+echo "    genesis"
+echo ""
+echo "    (This is an alias for the full incus exec command with all"
+echo "    required environment variables. If 'genesis' isn't recognized,"
+echo "    open a new terminal or run: source ~/.bashrc)"
 echo ""
 echo "  STEP 2 — Start your first session:"
 echo ""
