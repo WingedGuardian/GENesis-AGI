@@ -36,6 +36,15 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
   Auto-cd to `~/genesis` on login fixes this
 - **Install final output** — removed stale "start services manually" step
   (services auto-start now), shows actual service status, simplified guidance
+- **Guardian stuck in CONFIRMED_DEAD** — state machine never checked if
+  signals recovered; container could be perfectly healthy while Guardian
+  reported it as dead indefinitely. Now auto-recovers when all signals
+  return to healthy
+- **Neural monitor false green for unconfigured providers** — health probe
+  hit unauthenticated `/models` endpoint for providers with `base_url` but
+  no API key (e.g., GLM5/Zenmux), getting HTTP 200 and reporting "reachable"
+- **CC auto-updater nag** — disabled for pinned versions via
+  `DISABLE_AUTOUPDATER` in project settings
 
 ---
 
