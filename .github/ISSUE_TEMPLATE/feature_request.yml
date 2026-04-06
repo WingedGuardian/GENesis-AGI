@@ -1,0 +1,29 @@
+name: Feature Request
+description: Suggest a feature or improvement
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or motivation
+      description: What problem does this solve? Why do you want it?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How should it work? Include examples if possible.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Memory
+        - Dashboard
+        - Runtime
+        - Guardian
+        - Autonomy
+        - Channels (Telegram, Gmail, etc.)
+        - Install / Setup
+        - Other

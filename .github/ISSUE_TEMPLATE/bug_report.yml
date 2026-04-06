@@ -1,0 +1,35 @@
+name: Bug Report
+description: Report a bug in Genesis
+labels: ["bug", "needs-triage"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, install method, etc.
+      placeholder: |
+        - OS: Ubuntu 24.04 (Incus container)
+        - Python: 3.12
+        - Genesis version: v3.0a2
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any error messages or log output
+      render: shell
