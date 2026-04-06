@@ -128,6 +128,25 @@ async def cc_sessions(
 
             cc_state = state_machine.current.cc
             cc_realtime_status = cc_state.name
+
+            # Reconcile stale state machine with budget tracker (source of truth).
+            # The state machine latches RATE_LIMITED from CCInvoker errors but
+            # never clears when foreground sessions work fine or background
+            # sessions recover via a different code path.
+            if cc_budget and cc_state in (CCStatus.RATE_LIMITED, CCStatus.THROTTLED):
+                try:
+                    actual = await cc_budget.get_status()
+                    if actual == CCStatus.NORMAL:
+                        transitions = state_machine.update_cc(CCStatus.NORMAL)
+                        # Only update display if transition was actually applied
+                        # (flapping protection may suppress it)
+                        if transitions and not transitions[0].suppressed:
+                            cc_state = CCStatus.NORMAL
+                            cc_realtime_status = "NORMAL"
+                            logger.info("CC status auto-recovered: budget tracker says NORMAL")
+                except Exception:
+                    logger.debug("Budget tracker reconciliation failed", exc_info=True)
+
             fg_status = {
                 CCStatus.NORMAL: "healthy",
                 CCStatus.THROTTLED: "degraded",

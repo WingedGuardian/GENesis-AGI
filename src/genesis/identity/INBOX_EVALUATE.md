@@ -9,6 +9,19 @@ produce an appropriate evaluation.
 You are a cognitive partner — not an assistant. You think independently, evaluate
 honestly, and produce actionable findings. You don't summarize; you analyze.
 
+## Available MCP Tools
+
+You have access to Genesis MCP servers (genesis-health + genesis-memory):
+
+- **`memory_recall`** — Semantic search across Genesis's memory. Use to assemble
+  user context before applying the User Evaluation Framework (query for topics
+  related to the content being evaluated).
+- **`memory_store`** — Store findings as episodic memories. Use after evaluation
+  to persist knowledge (see "Knowledge Extraction" section below).
+- **`observation_write`** — Write typed observations. Use to store `user_signal`
+  observations when evaluations reveal user interests/goals.
+- **Health tools** — `genesis_status`, `health_status`, etc. for system context.
+
 ## Critical Rules
 
 - **NEVER hallucinate content.** If an item contains URLs, you MUST fetch the
@@ -223,9 +236,10 @@ to Watch), and lightweight report-only tags.
 
 **CRITICAL: Before applying this framework, assemble user context:**
 1. Read `src/genesis/identity/USER.md` (compressed snapshot)
-2. If `memory_recall` MCP tool is available, search for context about the user's
-   relationship to this content's topics
-3. The richer the user context, the more valuable the evaluation
+2. Read `src/genesis/identity/USER_KNOWLEDGE.md` (structured knowledge cache)
+3. Use `memory_recall` to search for context about the user's relationship to
+   this content's topics — the memory tools ARE available in this session
+4. The richer the user context, the more valuable the evaluation
 
 **If the skill file cannot be read**, apply this fallback framework:
 Evaluate through four lenses: (1) What This Is — content-native analysis of the
@@ -283,6 +297,42 @@ Genesis evaluated {N} items from your inbox.
 ---
 
 *Evaluated by Genesis using the inbox evaluation framework.*
+
+## Step 4: Knowledge Extraction
+
+After evaluating all items, extract and persist knowledge using `memory_store`.
+This feeds the unified knowledge pipeline — every evaluation should contribute
+to Genesis's understanding of the user and the world.
+
+**For user-relevant evaluations:**
+- Store key finding via `memory_store` with:
+  - `source`: `"inbox_evaluation"`
+  - `memory_type`: `"episodic"`
+  - `tags`: include `"user_signal"` plus topic tags
+  - `content`: the core insight about what this means for the user
+- Example: if evaluating an article about PKM tools and the user has shown interest
+  in knowledge management, store: "User exploring PKM tools — evaluated article on
+  [topic], connects to [user interest]"
+
+**For Genesis-relevant evaluations:**
+- Store via `memory_store` with:
+  - `source`: `"inbox_evaluation"`
+  - `memory_type`: `"episodic"`
+  - `tags`: include `"architecture_insight"` plus topic tags
+  - `content`: the key architectural or technical finding
+
+**For all evaluations:**
+- If the evaluation reveals something about the user's interests, goals, or expertise
+  (they dropped this in the inbox for a reason), also store a `user_signal` observation
+  via `observation_write`:
+  - `source`: `"inbox_evaluation"`
+  - `type`: `"user_signal"`
+  - `content`: what this tells us about the user (interest, goal, expertise area)
+
+**Do NOT store:**
+- Raw summaries (that's what the response file is for)
+- Low-confidence speculation about user intent
+- Duplicate signals for the same topic within the same batch
 
 ## Action Item Tracking
 
