@@ -7,6 +7,17 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [3.0a2-hf1]
+
+### Fixed
+
+- **Terminal**: WebSocket compatibility with simple_websocket >=1.0 (returns
+  None on timeout instead of raising TimeoutError)
+- **CC invoker**: Handle missing claude CLI gracefully (FileNotFoundError)
+- **Dependencies**: Pin wsproto>=1.2 (flask-sock transitive dep)
+
+---
+
 ## [3.0a2]
 
 ### Changed

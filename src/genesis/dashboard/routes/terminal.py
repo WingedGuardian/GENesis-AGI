@@ -97,11 +97,13 @@ def register_terminal_ws(app: Flask) -> None:
                 try:
                     msg = ws.receive(timeout=1)
                 except TimeoutError:
+                    msg = None
+                if msg is None:
+                    # simple_websocket >=1.0 returns None on timeout
+                    # (older versions raised TimeoutError)
                     if not session.is_alive():
                         break
                     continue
-                if msg is None:
-                    break
                 if isinstance(msg, str):
                     try:
                         payload = json.loads(msg)

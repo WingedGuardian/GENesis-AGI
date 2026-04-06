@@ -1,5 +1,3 @@
-# Autonomous Claude Code fallback policy
-
 autonomous_cli_fallback_enabled: true
 manual_approval_required: true
 reask_interval_hours: 24
