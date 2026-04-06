@@ -87,6 +87,10 @@ echo "  Container: $CONTAINER_NAME"
 echo "  RAM: $RAM | Disk: $DISK | CPUs: $CPUS"
 echo "  Repo: $REPO_URL ($BRANCH)"
 echo ""
+echo "  TIP: This script is safe to re-run. If anything fails or you get"
+echo "  disconnected, just run it again. When asked \"Delete and recreate?\","
+echo "  answer \"no\" to keep existing data — only \"yes\" for a clean start."
+echo ""
 
 # ── Pre-flight (host level) ─────────────────────────────────
 echo "  Pre-flight checks..."
@@ -407,6 +411,62 @@ incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
     exit 1
 }
 
+# ── Dashboard port forwarding ──────────────────────────────────
+# Forward host:5000 → container:5000 so the dashboard is reachable from
+# the host's network interfaces (LAN, Tailscale, etc.), not just the
+# internal container IP.
+echo "  Setting up dashboard port forwarding..."
+if incus config device get "$CONTAINER_NAME" dashboard-proxy listen &>/dev/null; then
+    echo "  + Dashboard proxy already configured"
+else
+    if incus config device add "$CONTAINER_NAME" dashboard-proxy proxy \
+        listen=tcp:0.0.0.0:5000 connect=tcp:127.0.0.1:5000 2>/dev/null; then
+        echo "  + Dashboard proxy: host:5000 → container:5000"
+    else
+        echo "  WARN: Could not set up dashboard proxy — dashboard only reachable via container IP"
+    fi
+fi
+
+# ── Detect network topology ───────────────────────────────────
+# Figure out how the user will access the dashboard from their browser.
+# Capture all available IPs for the final report and CLAUDE.md injection.
+HOST_IPV4=""
+HOST_IPV6=""
+TS_IPV4=""
+TS_IPV6=""
+
+if command -v tailscale &>/dev/null; then
+    TS_IPV4=$(tailscale ip -4 2>/dev/null || echo "")
+    TS_IPV6=$(tailscale ip -6 2>/dev/null || echo "")
+fi
+
+LAN_IPV4=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
+LAN_IPV6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo "")
+
+# Prefer Tailscale for primary host IP (reachable from anywhere on tailnet)
+HOST_IPV4="${TS_IPV4:-$LAN_IPV4}"
+HOST_IPV6="${TS_IPV6:-$LAN_IPV6}"
+
+# Container IPs
+CONTAINER_IPV4=$(incus exec "$CONTAINER_NAME" -- hostname -I 2>/dev/null | awk '{print $1}' || echo "")
+CONTAINER_IPV6=$(incus exec "$CONTAINER_NAME" -- ip -6 addr show scope global 2>/dev/null \
+    | grep -oP 'inet6 \K[^ /]+' | head -1 || echo "")
+
+# Build dashboard URL for final report
+DASHBOARD_URL=""
+ACCESS_METHOD=""
+if [ -n "$TS_IPV4" ]; then
+    DASHBOARD_URL="http://$TS_IPV4:5000"
+    ACCESS_METHOD="tailscale"
+elif [ -n "$LAN_IPV4" ]; then
+    DASHBOARD_URL="http://$LAN_IPV4:5000"
+    ACCESS_METHOD="lan"
+fi
+
+if [ -n "$HOST_IPV4" ]; then
+    echo "  + Host IP: $HOST_IPV4 (dashboard: http://$HOST_IPV4:5000)"
+fi
+
 # ── Run install.sh inside container ──────────────────────────
 # Guard: only run if the repo actually exists
 if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -f /home/ubuntu/genesis/scripts/install.sh; then
@@ -416,7 +476,13 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     echo ""
 
     _install_flags=""
-    [ "$NON_INTERACTIVE" = "1" ] && _install_flags="--non-interactive"
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        _install_flags="--non-interactive"
+    fi
+    # Note: we do NOT pass --force-interactive here. incus exec -t allocates a
+    # pseudo-TTY, so install.sh's should_prompt ([ -t 0 ]) should work. If it
+    # doesn't on a specific platform, the user can re-run install.sh inside the
+    # container directly where TTY detection is reliable.
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
@@ -437,8 +503,30 @@ else
     echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
+# ── Persist network identity into container ───────────────────
+# Write detected IPs to secrets.env so Genesis knows its own network topology.
+# Also append to CLAUDE.md so CC sessions have this context.
+echo ""
+echo "  Writing network identity into container..."
+incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- bash -c "
+    _secrets='/home/ubuntu/genesis/secrets.env'
+    # Ensure file exists with secure permissions
+    touch \"\$_secrets\" && chmod 600 \"\$_secrets\" 2>/dev/null || true
+    # Remove any prior network entries and re-add with current values
+    grep -v '^GENESIS_CONTAINER_IP\|^GENESIS_HOST_IP\|^GENESIS_HOST_TAILSCALE' \"\$_secrets\" > \"\${_secrets}.tmp\" 2>/dev/null || true
+    mv \"\${_secrets}.tmp\" \"\$_secrets\" 2>/dev/null || true
+    echo 'GENESIS_CONTAINER_IPV4=${CONTAINER_IPV4}' >> \"\$_secrets\"
+    echo 'GENESIS_CONTAINER_IPV6=${CONTAINER_IPV6}' >> \"\$_secrets\"
+    echo 'GENESIS_HOST_IPV4=${HOST_IPV4}' >> \"\$_secrets\"
+    echo 'GENESIS_HOST_IPV6=${HOST_IPV6}' >> \"\$_secrets\"
+    echo 'GENESIS_HOST_TAILSCALE_IPV4=${TS_IPV4}' >> \"\$_secrets\"
+    echo 'GENESIS_HOST_TAILSCALE_IPV6=${TS_IPV6}' >> \"\$_secrets\"
+" 2>/dev/null && echo "  + Network IPs written to container secrets.env" || \
+    echo "  WARN: Could not write network IPs to container"
+
 # ── Install Guardian on host ───────────────────────────────────
-CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || echo "unknown")
+# Reuse CONTAINER_IPV4 detected earlier; fall back to incus list if empty
+CONTAINER_IP="${CONTAINER_IPV4:-$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || echo "unknown")}"
 
 echo ""
 echo "  Installing Guardian (host-side health monitor)..."
@@ -476,39 +564,72 @@ fi
 
 # ── Report ───────────────────────────────────────────────────
 
+# Check if Guardian CC was authenticated during install
+_guardian_cc_status="not authenticated"
+if command -v claude &>/dev/null && claude auth status &>/dev/null 2>&1; then
+    _guardian_cc_status="authenticated"
+fi
+
 echo ""
 echo "  ─────────────────────────────────────────"
 echo "  Genesis is ready."
 echo "  ─────────────────────────────────────────"
 echo ""
-echo "  What to do next:"
+echo "  STEP 1 — Connect to Genesis:"
 echo ""
-echo "    1. Connect to the Genesis container:"
+echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID \\"
+echo "      --env HOME=/home/ubuntu \\"
+echo "      --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID \\"
+echo "      --cwd /home/ubuntu/genesis -t -- bash -l"
 echo ""
-echo "       incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l"
+echo "  STEP 2 — Start your first session:"
 echo ""
-echo "    2. Run Claude Code (this is your first Genesis session):"
+echo "    Inside the container, run:  claude"
+echo "    Genesis will guide you through first-time setup"
+echo "    (API keys, user profile, channels — all interactive)."
+echo "    If onboarding doesn't start, run:  /setup"
 echo ""
-echo "       claude"
+echo "  STEP 3 — Dashboard:"
 echo ""
-echo "       Claude Code will prompt you to log in (headless OAuth — it prints"
-echo "       a URL to open in your browser). Once authenticated, Genesis will"
-echo "       guide you through initial setup automatically."
+if [ "$ACCESS_METHOD" = "tailscale" ]; then
+    echo "    $DASHBOARD_URL/genesis  (via Tailscale)"
+elif [ -n "$DASHBOARD_URL" ]; then
+    echo "    From this host:    http://localhost:5000/genesis"
+    echo "    From your network: $DASHBOARD_URL/genesis"
+    echo ""
+    echo "    Can't reach it from your browser? Two options:"
+    echo ""
+    echo "    a) SSH tunnel (quick, no install):"
+    echo "       ssh -L 5000:localhost:5000 <your-user>@$HOST_IPV4"
+    echo "       Then open: http://localhost:5000/genesis"
+    echo ""
+    echo "    b) Tailscale (recommended for ongoing access):"
+    echo "       curl -fsSL https://tailscale.com/install.sh | sh"
+    echo "       sudo tailscale up"
+    echo "       Then open: http://<tailscale-ip>:5000/genesis"
+else
+    echo "    http://$CONTAINER_IP:5000/genesis  (container IP — host only)"
+fi
 echo ""
-echo "       If onboarding doesn't start, run: /setup"
+echo "  GUARDIAN:"
 echo ""
-echo "    3. Dashboard (available after setup completes):"
-echo "       http://$CONTAINER_IP:5000/genesis"
+echo "    Status: systemctl --user status genesis-guardian.timer"
+if [ "$_guardian_cc_status" = "not authenticated" ]; then
+    echo "    AI diagnosis: not yet enabled"
+    echo "    To enable:    claude login  (run on this host, outside the container)"
+else
+    echo "    AI diagnosis: enabled (Claude Code authenticated)"
+fi
 echo ""
-echo "  ─────────────────────────────────────────"
-echo "  Note: Guardian (host-side health monitor) also needs Claude Code"
-echo "  authentication for autonomous diagnosis. Run 'claude login' on the"
-echo "  host when ready. This is optional — Guardian health checks work"
-echo "  without it, but CC-powered diagnosis requires authentication."
+echo "  NETWORK:"
 echo ""
-echo "  Reference"
+echo "    Container: $CONTAINER_NAME ($CONTAINER_IPV4)"
+[ -n "$CONTAINER_IPV6" ] && echo "                IPv6: $CONTAINER_IPV6"
+echo "    Host:      $HOST_IPV4"
+[ -n "$HOST_IPV6" ] && echo "                IPv6: $HOST_IPV6"
+[ -n "$TS_IPV4" ] && echo "    Tailscale: $TS_IPV4"
 echo ""
-echo "  Container IP: $CONTAINER_IP"
-echo "  Guardian:     systemctl --user status genesis-guardian.timer"
-echo "  Manage:       incus start|stop|restart $CONTAINER_NAME"
+echo "  MANAGE:"
+echo ""
+echo "    incus start|stop|restart $CONTAINER_NAME"
 echo ""

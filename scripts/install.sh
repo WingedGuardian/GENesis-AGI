@@ -87,6 +87,10 @@ echo "  Genesis v3 — Setup"
 echo "  ─────────────────────────────────────────"
 echo "  Mode: standalone"
 echo ""
+echo "  TIP: This script is safe to re-run at any point. If you get"
+echo "  disconnected or something fails, just run it again — it detects"
+echo "  what's already done and picks up where it left off."
+echo ""
 
 # ══════════════════════════════════════════════════════════════
 # Pre-flight checks — run BEFORE any mutations. Fail fast.
@@ -524,7 +528,6 @@ fi
 echo "  [11/$TOTAL_STEPS] Setting up systemd services..."
 
 # SYSTEMD_USER_DIR already created by Step 7 (template generation)
-SERVICES_CREATED=0
 
 # Qdrant user service — skip if a system-level service already exists and runs.
 # Qdrant stays inline (not template) because ExecStart depends on the
@@ -559,7 +562,6 @@ ReadWritePaths=%h
 WantedBy=default.target
 QDSERVICE
     echo "    + qdrant.service created"
-    SERVICES_CREATED=1
 elif [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
     echo "    . qdrant.service already exists"
 else
@@ -587,49 +589,51 @@ if command -v loginctl &>/dev/null; then
     fi
 fi
 
-# Reload and enable
-if [ "$SERVICES_CREATED" = "1" ] || [ "${SERVICES_GENERATED:-0}" = "1" ]; then
-    systemctl --user daemon-reload 2>/dev/null || true
+# Reload and enable/start services.
+# Always attempt enable+start, not just when services were freshly created —
+# on re-runs, services already exist but may be disabled or stopped.
+systemctl --user daemon-reload 2>/dev/null || true
 
-    if [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
-        if systemctl --user enable qdrant 2>/dev/null; then
-            echo "    + qdrant.service enabled"
+if [ -f "$SYSTEMD_USER_DIR/qdrant.service" ]; then
+    systemctl --user enable qdrant 2>/dev/null && \
+        echo "    + qdrant.service enabled" || true
+
+    # Start Qdrant if it isn't running
+    if ! curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
+        if systemctl --user start qdrant 2>/dev/null; then
+            echo "    + qdrant started"
+        else
+            echo "    WARNING: could not start qdrant"
         fi
-
-        # Start Qdrant now if it was just installed or isn't running
-        if ! curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
-            if systemctl --user start qdrant 2>/dev/null; then
-                echo "    + qdrant started"
-            else
-                echo "    WARNING: could not start qdrant"
+        # Wait for Qdrant to initialize (retry up to 30s)
+        _qdrant_ready=0
+        for _i in $(seq 1 15); do
+            if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
+                _qdrant_ready=1
+                echo "    + Qdrant ready"
+                break
             fi
-            # Wait for Qdrant to initialize (retry up to 30s)
-            _qdrant_ready=0
-            for _i in $(seq 1 15); do
-                if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
-                    _qdrant_ready=1
-                    echo "    + Qdrant ready"
-                    break
-                fi
-                sleep 2
-            done
-            if [ "$_qdrant_ready" = "0" ]; then
-                echo "    WARNING: Qdrant not responding after 30s — check: journalctl --user -u qdrant"
-            fi
+            sleep 2
+        done
+        if [ "$_qdrant_ready" = "0" ]; then
+            echo "    WARNING: Qdrant not responding after 30s — check: journalctl --user -u qdrant"
         fi
     fi
+fi
 
-    if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
-        if systemctl --user enable --now genesis-watchdog.timer 2>/dev/null; then
-            echo "    + genesis-watchdog.timer enabled + started"
-        fi
-    fi
+if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
+    systemctl --user enable --now genesis-watchdog.timer 2>/dev/null && \
+        echo "    + genesis-watchdog.timer enabled + started" || true
+fi
 
-    # Enable genesis-server (standalone)
-    if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
-        if systemctl --user enable genesis-server 2>/dev/null; then
-            echo "    + genesis-server.service enabled"
-        fi
+# Enable AND start genesis-server (standalone)
+if [ -f "$SYSTEMD_USER_DIR/genesis-server.service" ]; then
+    systemctl --user enable genesis-server 2>/dev/null && \
+        echo "    + genesis-server.service enabled" || true
+    if ! systemctl --user is-active --quiet genesis-server 2>/dev/null; then
+        systemctl --user start genesis-server 2>/dev/null && \
+            echo "    + genesis-server started" || \
+            echo "    WARNING: could not start genesis-server"
     fi
 fi
 
@@ -702,23 +706,27 @@ if should_prompt && command -v claude &>/dev/null; then
         echo "    . Claude Code already authenticated"
     else
         echo ""
-        echo "    Claude Code needs authentication."
+        echo "    ── Claude Code Login (Genesis) ──────────────────────"
+        echo ""
+        echo "    Claude Code powers Genesis's AI capabilities — autonomous"
+        echo "    reflection, learning, and the interactive setup that runs"
+        echo "    on your first session. Logging in now is strongly recommended."
+        echo ""
         if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
             # Headless environment
             echo "    Since you're on a headless machine:"
-            echo "      1. Run: cd ~/genesis && claude login"
-            echo "      2. It will print a URL — open it in YOUR browser"
-            echo "      3. Complete the OAuth flow in your browser"
-            echo "      4. Come back here — Claude Code will detect the login"
+            echo "      1. It will print a URL — open it in YOUR browser"
+            echo "      2. Complete the OAuth flow in your browser"
+            echo "      3. Come back here — Claude Code will detect the login"
         else
             echo "    A browser window will open for OAuth login."
         fi
         echo ""
-        read -rp "    Run 'claude login' now? [Y/n] " _cc_login
+        read -rp "    Log in now? (strongly recommended) [Y/n] " _cc_login
         if [ "${_cc_login:-Y}" != "n" ] && [ "${_cc_login:-Y}" != "N" ]; then
             claude login || echo "    WARNING: Login failed or was skipped"
         else
-            echo "    Skipped. Run 'claude login' later to enable Genesis hooks."
+            echo "    Skipped. To log in later: cd ~/genesis && claude login"
         fi
     fi
 fi
