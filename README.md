@@ -11,6 +11,7 @@
   <img src="https://img.shields.io/badge/LOC-72%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/status-v3%20alpha-orange" alt="Status">
+  <a href="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml"><img src="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
 </p>
 
 ---
@@ -50,7 +51,7 @@ Genesis is a cognitive architecture that aspires to *earn* the title of "AGI." N
 
 It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its reasoning engine — autonomous sessions, tool execution, multi-step reasoning. A (soon-to-be-optional) operational layer provides the dashboard and web interface, but the cognitive architecture is runtime-agnostic. Adapter patterns and generic interfaces mean the operational layer is swappable without touching the cognitive core. This is the core thesis of Genesis: AI and code that is fundamentally fluid and malleable and can adapt to any codebase, and any situation.
 
-Genesis serves as a layer that sits between Claude Code (as well as other AI models) and the real world and produces the actual thinking. When the system handles challenges and unexpected obstacles autonomusly instead of outsourcing them back to you, something fundamental has changed. Genesis is building toward that shift, one cognitive layer at a time. Claude Code is the raw intelligence — but without memory, without learning, without self-reflection, it starts from zero every session. Genesis is what it's been missing. The mind that remembers, reflects, learns, and decides.
+Genesis serves as a layer that sits between Claude Code (as well as other AI models) and the real world and produces the actual thinking. When the system handles challenges and unexpected obstacles autonomously instead of outsourcing them back to you, something fundamental has changed. Genesis is building toward that shift, one cognitive layer at a time. Claude Code is the raw intelligence — but without memory, without learning, without self-reflection, it starts from zero every session. Genesis is what it's been missing. The mind that remembers, reflects, learns, and decides.
 
 <p align="center">
   <img src="docs/images/tin-man.jpg" alt="The Tin Man" width="320">
@@ -276,7 +277,7 @@ Genesis doesn't just live in a terminal. It operates in the real world through m
 
 **Telegram** — Proactive notifications, morning digests, alert escalation, and conversational interaction. Genesis reaches out when it has something worth saying — findings from surplus research, health alerts, opportunities surfaced by capability modules. Not a notification firehose. Calibrated outreach based on measured engagement.
 
-**Task executor** — Give Genesis a complex, multi-step task or project (ie, build me a finalized website, find an appropriate domain and ask me which one I like, buy it, and then set everything up) and walk away. A 9-phase pipeline decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, synthesizes outcomes, and delivers. Not "call this API" — genuine autonomous task completion with built-in quality gates. You're only notified when it's finished, you ask it to wait, or it genuinly needs you. And each time, it learns everything it possibly can from that process — meaning, in the future, it needs you less and less, and gets better and better. 
+**Task executor** — Give Genesis a complex, multi-step task or project (ie, build me a finalized website, find an appropriate domain and ask me which one I like, buy it, and then set everything up) and walk away. A 9-phase pipeline decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, synthesizes outcomes, and delivers. Not "call this API" — genuine autonomous task completion with built-in quality gates. You're only notified when it's finished, you ask it to wait, or it genuinely needs you. And each time, it learns everything it possibly can from that process — meaning, in the future, it needs you less and less, and gets better and better. 
 
 ---
 
