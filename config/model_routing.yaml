@@ -175,6 +175,8 @@ call_sites:
     chain:
     - claude-sonnet
     - claude-opus
+    - gpt-5.4
+    - glm5
     default_paid: true
     retry_profile: background
   6_strategic_reflection:
@@ -233,10 +235,6 @@ call_sites:
     chain:
     - claude-opus
     default_paid: true
-  15_triage_calibration:
-    chain:
-    - openrouter-free
-    default_paid: true
   16_quality_calibration:
     chain:
     - claude-opus
@@ -250,20 +248,11 @@ call_sites:
     chain:
     - openrouter-free
     default_paid: true
-  19_outreach_draft:
-    chain:
-    - mistral-free
-    - groq-free
-    - gemini-free
-    - openrouter-free
   20_adversarial_counterargument:
     chain:
     - openrouter-free
     - claude-sonnet
     default_paid: true
-  21_embeddings:
-    chain:
-    - ollama-embedding
   22_tagging:
     chain:
     - ollama-3b
@@ -281,7 +270,6 @@ call_sites:
     default_paid: true
   29_retrospective_triage:
     chain:
-    - ollama-3b
     - groq-free
     - mistral-free
   30_triage_calibration:
@@ -345,13 +333,6 @@ call_sites:
     default_paid: true
     retry_profile: background
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
-  contingency_deep_reflection:
-    chain:
-    - gpt-5.4
-    - glm5
-    default_paid: true
-    retry_profile: background
-    description: "CC contingency \u2014 deep reflection via API when CC unavailable"
   contingency_foreground:
     chain:
     - kimi-k2.5

@@ -696,6 +696,26 @@
           if (!this.settingsData[domain]) { this.fetchSettingsData(domain); }
           this.settingsEditing = domain;
         },
+        _SETTING_LABELS: {
+          autonomous_cli_fallback_enabled: 'CLI Fallback Enabled',
+          manual_approval_required: 'Manual Approval Required',
+          approval_channel: 'Approval Channel',
+          reask_interval_hours: 'Re-ask Interval (hours)',
+          shared_export_enabled: 'Shared Export',
+        },
+        _SETTING_DESCS: {
+          autonomous_cli_fallback_enabled: 'Allow background sessions to use Claude Code CLI when API routing fails',
+          manual_approval_required: 'Require Telegram approval before dispatching background CC sessions',
+          approval_channel: 'Channel for approval requests (must be configured and reachable)',
+          reask_interval_hours: 'Hours between re-asking for approval on the same task',
+          shared_export_enabled: 'Export policy to Guardian shared mount for host-side enforcement',
+        },
+        _settingLabel(key) {
+          return this._SETTING_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        },
+        _settingDesc(key) {
+          return this._SETTING_DESCS[key] || '';
+        },
 
         async fetchRoutingConfig() {
           this.startFetch("routing");
@@ -4602,7 +4622,7 @@
                     <template x-if="$store.genesisDashboard.settingsData[domain.name]">
                       <div style="display:flex; flex-wrap:wrap; gap:0.5rem 1.5rem;">
                         <template x-for="[k, v] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k]) => !k.startsWith('_')).slice(0, 8)" :key="k">
-                          <span><span style="color:var(--color-text-secondary);" x-text="k + ': '"></span><span x-text="typeof v === 'object' ? '...' : v"></span></span>
+                          <span><span style="color:var(--color-text-secondary);" x-text="($store.genesisDashboard._settingLabel(k)) + ': '"></span><span x-text="typeof v === 'object' ? '...' : v"></span></span>
                         </template>
                       </div>
                     </template>
@@ -4617,7 +4637,9 @@
                     <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.5rem; margin-top:0.5rem;">
                       <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v !== 'object')" :key="key">
                         <div style="display:flex; flex-direction:column; gap:2px;">
-                          <label style="font-size:0.7rem; color:var(--color-text-secondary);" x-text="key"></label>
+                          <label style="font-size:0.7rem; color:var(--color-text-secondary);"
+                                 x-text="$store.genesisDashboard._settingLabel(key)"
+                                 :title="$store.genesisDashboard._settingDesc(key)"></label>
                           <template x-if="typeof val === 'boolean'">
                             <select style="font-size:0.78rem; padding:3px 6px;"
                                     @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value === 'true'"
@@ -4631,7 +4653,16 @@
                                    :value="val" step="any"
                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = parseFloat($event.target.value)">
                           </template>
-                          <template x-if="typeof val === 'string'">
+                          <template x-if="typeof val === 'string' && key === 'approval_channel'">
+                            <select style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value"
+                                    :value="val">
+                              <option value="telegram" :selected="val === 'telegram'">Telegram</option>
+                              <option value="email" :selected="val === 'email'">Email</option>
+                              <option value="dashboard" :selected="val === 'dashboard'">Dashboard</option>
+                            </select>
+                          </template>
+                          <template x-if="typeof val === 'string' && key !== 'approval_channel'">
                             <input type="text" style="font-size:0.78rem; padding:3px 6px; width:100%;"
                                    :value="val"
                                    @change="$store.genesisDashboard.settingsData[domain.name][key] = $event.target.value">
@@ -4642,11 +4673,13 @@
                     <!-- Nested objects (read-only display) -->
                     <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v === 'object' && v !== null)" :key="key">
                       <div style="margin-top:0.5rem;">
-                        <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:2px;" x-text="key"></div>
+                        <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:2px;" x-text="$store.genesisDashboard._settingLabel(key)"></div>
                         <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.5rem;">
                           <template x-for="[sk, sv] in Object.entries(val)" :key="sk">
                             <div style="display:flex; flex-direction:column; gap:2px;">
-                              <label style="font-size:0.7rem; color:var(--color-text-secondary);" x-text="sk"></label>
+                              <label style="font-size:0.7rem; color:var(--color-text-secondary);"
+                                     x-text="$store.genesisDashboard._settingLabel(sk)"
+                                     :title="$store.genesisDashboard._settingDesc(sk)"></label>
                               <template x-if="typeof sv === 'boolean'">
                                 <select style="font-size:0.78rem; padding:3px 6px;"
                                         @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value === 'true'"

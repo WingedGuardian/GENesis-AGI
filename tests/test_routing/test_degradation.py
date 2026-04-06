@@ -15,7 +15,6 @@ class TestShouldSkipCallSite:
 
     def test_l2_skips_surplus_outreach_morning(self):
         assert should_skip_call_site("12_surplus_brainstorm", DegradationLevel.REDUCED)
-        assert should_skip_call_site("19_outreach_draft", DegradationLevel.REDUCED)
         assert should_skip_call_site("13_morning_report", DegradationLevel.REDUCED)
 
     def test_l2_allows_micro_reflection(self):

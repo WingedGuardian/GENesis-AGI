@@ -166,8 +166,10 @@ class ProviderHealthChecker:
                 try:
                     cb = self._breakers.get(name)
                     cb.probe_suspect()
-                except KeyError:
-                    logger.debug("No CB for probed provider %s", name)
+                except (KeyError, OSError):
+                    logger.debug("CB sync failed for probed provider %s", name, exc_info=True)
+                except Exception:
+                    logger.debug("Unexpected CB sync error for %s", name, exc_info=True)
 
     async def _probe_one(self, cfg: ProviderConfig) -> ProviderProbeResult:
         """Probe a single provider's models endpoint."""

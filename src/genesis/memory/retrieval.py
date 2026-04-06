@@ -12,6 +12,7 @@ from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import classify_intent, expand_query, rank_by_intent
 from genesis.memory.types import RetrievalResult
+from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.provider_activity import track_operation
 from genesis.qdrant import collections as qdrant_ops
 
@@ -73,6 +74,11 @@ class HybridRetriever:
         vector = None
         try:
             vector = await self._embeddings.embed(query)
+            await record_last_run(
+                self._db, "21b_query_embedding",
+                provider="embedding", model_id="cloud-primary",
+                response_text=f"Query embed: {query[:60]}",
+            )
         except EmbeddingUnavailableError:
             embedding_available = False
             logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")

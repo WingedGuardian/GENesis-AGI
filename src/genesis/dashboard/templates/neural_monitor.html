@@ -32,7 +32,7 @@ body {
 .neural-map {
     position: relative; width: 100%;
     margin: 0 auto;
-    min-height: 600px;
+    min-height: 800px;
 }
 
 .dot {
@@ -42,14 +42,14 @@ body {
     display: flex; align-items: center; justify-content: center;
 }
 .dot:hover { transform: scale(1.5) translate(-33%, -33%); z-index: 10; }
-.dot-center { width: 32px; height: 32px; }
-.dot-inner { width: 20px; height: 20px; }
-.dot-outer { width: 14px; height: 14px; }
-.dot-periphery { width: 10px; height: 10px; }
+.dot-center { width: 36px; height: 36px; }
+.dot-inner { width: 24px; height: 24px; }
+.dot-outer { width: 16px; height: 16px; }
+.dot-periphery { width: 12px; height: 12px; }
 
 .dot-healthy { background: #4ade80; }
 .dot-active { background: #4ade80; }
-.dot-degraded { background: #fde047; }
+.dot-degraded { background: #ffe600; }
 .dot-down { background: #ef4444; }
 .dot-warning { background: #f59e0b; }
 .dot-idle { background: #888; }
@@ -166,7 +166,7 @@ body {
 }
 .status-healthy { background: #4ade80; }
 .status-active { background: #4ade80; }
-.status-degraded { background: #fde047; }
+.status-degraded { background: #ffe600; }
 .status-down { background: #ef4444; }
 .status-idle { background: #888; }
 .status-warning { background: #f59e0b; }
@@ -177,7 +177,7 @@ body {
     font-size: 10px; font-weight: 600;
 }
 .badge-normal { background: #166534; color: #4ade80; }
-.badge-warning { background: #854d0e; color: #fde047; }
+.badge-warning { background: #854d0e; color: #ffe600; }
 .badge-critical { background: #991b1b; color: #ef4444; }
 
 /* Category health summary */
@@ -399,56 +399,52 @@ const SITE_META = {
         name: 'G. Background', desc: 'Autonomous background sessions for reflections, inbox, and surplus tasks.',
         category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
     },
-    'embedding': {
-        name: 'Query Embed', desc: 'Read-path: embeds search queries via cloud provider (DeepInfra/DashScope) for Qdrant recall. Not yet instrumented as a call site.',
-        category: 'embedding', frequency: 'On recall', costPolicy: 'Cloud embedding API',
-    },
     // ── Routing call sites — name + category only (desc/frequency/costPolicy from backend) ──
     '3_micro_reflection': { name: 'Micro Reflect', category: 'reflection' },
     '4_light_reflection': { name: 'Light Reflect', category: 'reflection' },
     '5_deep_reflection': { name: 'Deep Reflect', category: 'reflection' },
-    '6_strategic_reflection': { name: 'Strategic', category: 'reflection' },
+    '6_strategic_reflection': { name: 'Strategic Reflect', category: 'reflection' },
     '9_fact_extraction': { name: 'Fact Extract', category: 'processing' },
-    '12_surplus_brainstorm': { name: 'Surplus', category: 'content' },
-    '14_weekly_self_assessment': { name: 'Weekly Self', category: 'reasoning' },
-    '16_quality_calibration': { name: 'Quality Cal', category: 'calibration' },
+    '12_surplus_brainstorm': { name: 'Brainstorm', category: 'content' },
+    '14_weekly_self_assessment': { name: 'Self Assessment', category: 'reasoning' },
+    '16_quality_calibration': { name: 'Output QA', category: 'calibration' },
     '21_embeddings': { name: 'Store Embed', category: 'embedding' },
+    '21b_query_embedding': { name: 'Query Embed', category: 'embedding' },
     '23_fresh_eyes_review': { name: 'Fresh Eyes', category: 'assessment' },
-    '29_retrospective_triage': { name: 'Retro Triage', category: 'classification' },
-    '30_triage_calibration': { name: 'Triage Cal', category: 'calibration' },
-    '31_outcome_classification': { name: 'Outcome', category: 'processing' },
-    '32_delta_assessment': { name: 'Delta', category: 'processing' },
+    '29_retrospective_triage': { name: 'Depth Classifier', category: 'classification' },
+    '30_triage_calibration': { name: 'Classifier Cal', category: 'calibration' },
+    '31_outcome_classification': { name: 'Outcome Class', category: 'processing' },
+    '32_delta_assessment': { name: 'State Delta', category: 'processing' },
     '35_content_draft': { name: 'Content', category: 'content' },
     '36_code_auditor': { name: 'Code Audit', category: 'surplus' },
     'cc_update_analysis': { name: 'CC Updates', category: 'processing' },
-    'email_triage': { name: 'Email Triage', category: 'classification' },
+    'email_triage': { name: 'Email Filter', category: 'classification' },
     '13_morning_report': { name: 'Morning Rpt', category: 'content' },
+    'bookmark_enrichment': { name: 'Bookmark Enrich', category: 'content' },
+    'embedding_recovery': { name: 'Embed Recovery', category: 'embedding' },
     // Partially wired
     '27_pre_execution_assessment': { name: 'Pre-Exec', category: 'reasoning' },
     '33_skill_refiner': { name: 'Skill Refine', category: 'content' },
     '38_procedure_extraction': { name: 'Procedure', category: 'content' },
-    'contingency_foreground': { name: 'Cont. FG', category: 'reasoning' },
-    'contingency_inbox': { name: 'Cont. Inbox', category: 'processing' },
+    'contingency_foreground': { name: 'CC Fallback (FG)', category: 'reasoning' },
+    'contingency_inbox': { name: 'CC Fallback (Inbox)', category: 'processing' },
     // Groundwork / disabled
     '2_triage': { name: 'Triage', category: 'classification' },
     '7_ego_cycle': { name: 'Ego Cycle (CC)', category: 'reasoning' },
     '7_ego_cycle_api': { name: 'Ego Cycle (API)', category: 'reasoning' },
     '7_task_retrospective': { name: 'Task Retro', category: 'processing' },
-    '8_memory_consolidation': { name: 'Memory', category: 'processing' },
+    '8_memory_consolidation': { name: 'Mem Compact', category: 'processing' },
     '10_cognitive_state': { name: 'Cog State', category: 'reasoning' },
     '11_user_model_synthesis': { name: 'User Model', category: 'reasoning' },
-    '15_triage_calibration': { name: 'Triage Cal (old)', category: 'calibration' },
     '17_fresh_eyes_review': { name: 'Fresh Eyes (exec)', category: 'assessment' },
     '18_meta_prompting': { name: 'Meta Prompt', category: 'calibration' },
-    '19_outreach_draft': { name: 'Outreach Draft', category: 'content' },
     '20_adversarial_counterargument': { name: 'Adversarial', category: 'assessment' },
     '22_tagging': { name: 'Tagging', category: 'classification' },
     '28_observation_sweep': { name: 'Obs Sweep', category: 'processing' },
-    '34_research_synthesis': { name: 'Research', category: 'content' },
+    '34_research_synthesis': { name: 'Research Synth', category: 'content' },
     '37_infrastructure_monitor': { name: 'Infra Monitor', category: 'surplus' },
     'outreach_fallback': { name: 'Outreach Retry', category: 'content' },
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
-    'contingency_deep_reflection': { name: 'Cont. Deep', category: 'reasoning' },
 };
 
 // ── Ring assignment — grouped by function ───────────────────────────────
@@ -462,17 +458,17 @@ const RING_ASSIGNMENT = {
     ],
     outer: [
         '2_triage', '7_task_retrospective', '8_memory_consolidation',
-        '9_fact_extraction', '15_triage_calibration', '18_meta_prompting',
+        '9_fact_extraction', '18_meta_prompting',
         '28_observation_sweep', '30_triage_calibration', '31_outcome_classification',
         '32_delta_assessment', 'cc_update_analysis',
     ],
     periphery: [
         '12_surplus_brainstorm', '13_morning_report', '17_fresh_eyes_review',
-        '19_outreach_draft', '20_adversarial_counterargument', '21_embeddings',
+        '20_adversarial_counterargument', '21_embeddings', '21b_query_embedding',
         '22_tagging', '23_fresh_eyes_review', '29_retrospective_triage',
         '33_skill_refiner', '34_research_synthesis', '35_content_draft',
         '36_code_auditor', '37_infrastructure_monitor', '38_procedure_extraction',
-        'email_triage', 'outreach_fallback', 'contingency_deep_reflection',
+        'email_triage', 'outreach_fallback', 'bookmark_enrichment', 'embedding_recovery',
         'contingency_foreground', 'contingency_inbox',
     ],
 };
@@ -561,102 +557,210 @@ function sectionRow(label, value, valueStyle) {
 
 // ── Neural Map ────────────────────────────────────────────────────────
 
+// ── Sector assignments for subsystem clustering ───────────────────────
+const SECTOR_ASSIGNMENT = {
+    reflection:  { start: 0,   end: 45,  color: 'rgba(129,140,248,0.05)' },
+    executor:    { start: 45,  end: 90,  color: 'rgba(167,139,250,0.05)' },
+    learning:    { start: 90,  end: 135, color: 'rgba(251,146,60,0.05)' },
+    memory:      { start: 135, end: 180, color: 'rgba(56,189,248,0.05)' },
+    surplus:     { start: 180, end: 225, color: 'rgba(74,222,128,0.05)' },
+    outreach:    { start: 225, end: 270, color: 'rgba(251,191,36,0.05)' },
+    contingency: { start: 270, end: 315, color: 'rgba(248,113,113,0.05)' },
+    utility:     { start: 315, end: 360, color: 'rgba(148,163,184,0.05)' },
+};
+
+function _buildSectorSVG(map, cx, cy, outerR) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
+    svg.setAttribute('viewBox', `0 0 ${map.clientWidth || 700} ${Math.max(map.clientHeight, 800)}`);
+
+    for (const [name, cfg] of Object.entries(SECTOR_ASSIGNMENT)) {
+        const startRad = (cfg.start - 90) * Math.PI / 180;
+        const endRad = (cfg.end - 90) * Math.PI / 180;
+        const r = outerR + 30;
+        const x1 = cx + r * Math.cos(startRad);
+        const y1 = cy + r * Math.sin(startRad);
+        const x2 = cx + r * Math.cos(endRad);
+        const y2 = cy + r * Math.sin(endRad);
+
+        // Sector arc fill
+        const path = document.createElementNS(ns, 'path');
+        path.setAttribute('d', `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2} Z`);
+        path.setAttribute('fill', cfg.color);
+        path.setAttribute('stroke', 'none');
+        svg.appendChild(path);
+
+        // Divider line (subtle)
+        const line = document.createElementNS(ns, 'line');
+        line.setAttribute('x1', String(cx));
+        line.setAttribute('y1', String(cy));
+        line.setAttribute('x2', String(x1));
+        line.setAttribute('y2', String(y1));
+        line.setAttribute('stroke', 'rgba(100,116,139,0.15)');
+        line.setAttribute('stroke-width', '1');
+        svg.appendChild(line);
+
+        // Sector label
+        const midRad = ((cfg.start + cfg.end) / 2 - 90) * Math.PI / 180;
+        const labelR = outerR + 50;
+        const lx = cx + labelR * Math.cos(midRad);
+        const ly = cy + labelR * Math.sin(midRad);
+        const label = document.createElementNS(ns, 'text');
+        label.setAttribute('x', String(lx));
+        label.setAttribute('y', String(ly));
+        label.setAttribute('text-anchor', 'middle');
+        label.setAttribute('dominant-baseline', 'middle');
+        label.setAttribute('fill', 'rgba(148,163,184,0.6)');
+        label.setAttribute('font-size', '11');
+        label.setAttribute('font-family', 'inherit');
+        label.textContent = (SUBSYSTEM_GROUPS[name] || {}).name || name;
+        svg.appendChild(label);
+    }
+
+    map.appendChild(svg);
+}
+
+function _makeDot(item, x, y, sizeClass) {
+    const meta = getMeta(item.id);
+    const dot = el('div', 'dot ' + sizeClass + ' ' + statusClass(item.status) + ' ' + catClass(meta.category));
+    dot.style.left = x + 'px';
+    dot.style.top = y + 'px';
+    dot.style.transform = 'translate(-50%, -50%)';
+    dot.style.zIndex = '1';
+    dot.addEventListener('click', () => showDetail(item));
+
+    // Tooltip
+    const tooltip = el('div', 'tooltip');
+    tooltip.appendChild(el('div', 'tt-name', meta.name));
+    tooltip.appendChild(el('div', 'tt-desc', item.data.description || meta.desc || ''));
+    if (item.status === 'idle') {
+        const disabledTag = el('span', 'tt-cat', 'Disabled');
+        disabledTag.style.background = 'rgba(136,136,136,0.2)';
+        disabledTag.style.color = '#888';
+        tooltip.appendChild(disabledTag);
+    } else {
+        tooltip.appendChild(el('span', 'tt-cat', meta.category));
+    }
+    if (item.data.active_provider) {
+        tooltip.appendChild(el('div', 'tt-row', 'Provider: ' + item.data.active_provider));
+    }
+    if (item.data.chain_health) {
+        const apiChain = item.data.chain_health.filter(c => !c.is_cc);
+        const ccChain = item.data.chain_health.filter(c => c.is_cc);
+        const apiUp = apiChain.filter(c => {
+            const ps = c.probe_status;
+            if (ps) return ps === 'reachable';
+            return c.state !== 'open';
+        }).length;
+        let chainSummary = apiUp + '/' + apiChain.length + ' API reachable';
+        if (ccChain.length > 0) {
+            const ccPs = ccChain[0].probe_status;
+            const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
+            chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
+        }
+        tooltip.appendChild(el('div', 'tt-row', chainSummary));
+    }
+    if (item.data.active !== undefined) {
+        tooltip.appendChild(el('div', 'tt-row', 'Active: ' + item.data.active));
+    }
+    if (item.data.hourly_budget) {
+        tooltip.appendChild(el('div', 'tt-row', 'Budget: ' + item.data.hourly_budget));
+    }
+    dot.appendChild(tooltip);
+    dot.appendChild(el('div', 'dot-label', meta.name));
+    return dot;
+}
+
 function buildNeuralMap(data) {
     const map = document.getElementById('neural-map');
     map.replaceChildren();
     map.style.display = 'block';
 
     const mapW = map.clientWidth || 700;
-    const mapH = Math.max(map.clientHeight, 600);
+    const mapH = Math.max(map.clientHeight, 800);
     const cx = mapW / 2;
     const cy = mapH / 2;
 
     const minDim = Math.min(mapW, mapH);
     const radii = {
-        center: minDim * 0.06,
-        inner: minDim * 0.18,
-        outer: minDim * 0.30,
-        periphery: minDim * 0.42,
+        center: minDim * 0.07,
+        inner: minDim * 0.20,
+        outer: minDim * 0.33,
+        periphery: minDim * 0.45,
     };
 
-    const rings = { center: [], inner: [], outer: [], periphery: [] };
+    // Build sector SVG backgrounds + dividers + labels
+    _buildSectorSVG(map, cx, cy, radii.periphery);
 
-    // CC sessions → center
+    // ── Center ring: CC sessions (not sector-clustered) ──
     const ccSessions = data.cc_sessions || {};
-    const fgStatus = (ccSessions.foreground || {}).status || 'unknown';
-    const bgStatus = (ccSessions.background || {}).status || 'unknown';
-    rings.center.push({ id: 'cc_foreground', status: fgStatus, data: ccSessions.foreground || {} });
-    rings.center.push({ id: 'cc_background', status: bgStatus, data: ccSessions.background || {} });
-
-    // Call sites → rings by RING_ASSIGNMENT (skip cc_foreground/cc_background — already placed above)
-    const explicitCenter = new Set(['cc_foreground', 'cc_background']);
-    for (const [siteId, info] of Object.entries(data.call_sites || {})) {
-        if (explicitCenter.has(siteId)) continue;
-        const ring = getRing(siteId);
-        rings[ring].push({ id: siteId, status: info.status, data: info });
+    const centerItems = [
+        { id: 'cc_foreground', status: (ccSessions.foreground || {}).status || 'unknown', data: ccSessions.foreground || {} },
+        { id: 'cc_background', status: (ccSessions.background || {}).status || 'unknown', data: ccSessions.background || {} },
+    ];
+    for (let i = 0; i < centerItems.length; i++) {
+        const angle = (i / centerItems.length) * 2 * Math.PI - Math.PI / 2;
+        const x = cx + radii.center * Math.cos(angle);
+        const y = cy + radii.center * Math.sin(angle);
+        map.appendChild(_makeDot(centerItems[i], x, y, DOT_SIZES.center));
     }
 
-    for (const [ringName, items] of Object.entries(rings)) {
-        const radius = radii[ringName];
-        const sizeClass = DOT_SIZES[ringName];
+    // ── Sector-clustered rings ──
+    // Build a map of siteId → {ring, item}
+    const callSites = data.call_sites || {};
+    const siteItems = {};
+    for (const [siteId, info] of Object.entries(callSites)) {
+        if (siteId === 'cc_foreground' || siteId === 'cc_background') continue;
+        siteItems[siteId] = { id: siteId, status: info.status, data: info };
+    }
 
-        for (let i = 0; i < items.length; i++) {
-            const item = items[i];
-            const meta = getMeta(item.id);
-            const angle = (i / items.length) * 2 * Math.PI - Math.PI / 2;
+    // Place sites by sector
+    const placed = new Set();
+    for (const [sectorName, sectorCfg] of Object.entries(SECTOR_ASSIGNMENT)) {
+        const group = SUBSYSTEM_GROUPS[sectorName];
+        if (!group) continue;
+
+        // Get sites in this sector that have data
+        const sectorSites = group.sites
+            .filter(id => siteItems[id] && !placed.has(id))
+            .map(id => ({ ...siteItems[id], ring: getRing(id) }));
+
+        if (sectorSites.length === 0) continue;
+
+        // Sort by ring for visual coherence (inner → outer)
+        const ringOrder = { center: 0, inner: 1, outer: 2, periphery: 3 };
+        sectorSites.sort((a, b) => (ringOrder[a.ring] || 3) - (ringOrder[b.ring] || 3));
+
+        const startRad = (sectorCfg.start - 90) * Math.PI / 180;
+        const endRad = (sectorCfg.end - 90) * Math.PI / 180;
+        // Pad 5% from sector edges to avoid dots on divider lines
+        const padRad = (endRad - startRad) * 0.08;
+        const usableStart = startRad + padRad;
+        const usableEnd = endRad - padRad;
+
+        for (let i = 0; i < sectorSites.length; i++) {
+            const site = sectorSites[i];
+            const radius = radii[site.ring] || radii.periphery;
+            const angle = usableStart + (i + 0.5) / sectorSites.length * (usableEnd - usableStart);
             const x = cx + radius * Math.cos(angle);
             const y = cy + radius * Math.sin(angle);
+            map.appendChild(_makeDot(site, x, y, DOT_SIZES[site.ring] || DOT_SIZES.periphery));
+            placed.add(site.id);
+        }
+    }
 
-            const dot = el('div', 'dot ' + sizeClass + ' ' + statusClass(item.status) + ' ' + catClass(meta.category));
-            dot.style.left = x + 'px';
-            dot.style.top = y + 'px';
-            dot.style.transform = 'translate(-50%, -50%)';
-            dot.addEventListener('click', () => showDetail(item));
-
-            // Tooltip — enriched with description and category
-            const tooltip = el('div', 'tooltip');
-            tooltip.appendChild(el('div', 'tt-name', meta.name));
-            tooltip.appendChild(el('div', 'tt-desc', item.data.description || meta.desc || ''));
-            if (item.status === 'idle') {
-                const disabledTag = el('span', 'tt-cat', 'Disabled');
-                disabledTag.style.background = 'rgba(136,136,136,0.2)';
-                disabledTag.style.color = '#888';
-                tooltip.appendChild(disabledTag);
-            } else {
-                tooltip.appendChild(el('span', 'tt-cat', meta.category));
-            }
-            if (item.data.active_provider) {
-                tooltip.appendChild(el('div', 'tt-row', 'Provider: ' + item.data.active_provider));
-            }
-            if (item.data.chain_health) {
-                const apiChain = item.data.chain_health.filter(c => !c.is_cc);
-                const ccChain = item.data.chain_health.filter(c => c.is_cc);
-                // Use probe_status for tooltip summary (display authority)
-                const apiUp = apiChain.filter(c => {
-                    const ps = c.probe_status;
-                    if (ps) return ps === 'reachable';
-                    return c.state !== 'open';
-                }).length;
-                let chainSummary = apiUp + '/' + apiChain.length + ' API reachable';
-                if (ccChain.length > 0) {
-                    const ccPs = ccChain[0].probe_status;
-                    const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
-                    chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
-                }
-                tooltip.appendChild(el('div', 'tt-row', chainSummary));
-            }
-            if (item.data.active !== undefined) {
-                tooltip.appendChild(el('div', 'tt-row', 'Active: ' + item.data.active));
-            }
-            if (item.data.hourly_budget) {
-                tooltip.appendChild(el('div', 'tt-row', 'Budget: ' + item.data.hourly_budget));
-            }
-            dot.appendChild(tooltip);
-
-            // Labels on ALL rings
-            dot.appendChild(el('div', 'dot-label', meta.name));
-
-            map.appendChild(dot);
+    // ── Unassigned sites (not in any subsystem group) → distribute evenly ──
+    const unassigned = Object.values(siteItems).filter(item => !placed.has(item.id));
+    if (unassigned.length > 0) {
+        for (let i = 0; i < unassigned.length; i++) {
+            const item = unassigned[i];
+            const ring = getRing(item.id);
+            const radius = radii[ring] || radii.periphery;
+            const angle = (i / unassigned.length) * 2 * Math.PI - Math.PI / 2;
+            const x = cx + radius * Math.cos(angle);
+            const y = cy + radius * Math.sin(angle);
+            map.appendChild(_makeDot(item, x, y, DOT_SIZES[ring] || DOT_SIZES.periphery));
         }
     }
 
@@ -712,7 +816,7 @@ function showDetail(item) {
     }
 
     // Status + disabled banner
-    const STATUS_COLORS = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#fde047', down: '#ef4444', idle: '#888' };
+    const STATUS_COLORS = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#ffe600', down: '#ef4444', idle: '#888' };
     const statusColor = STATUS_COLORS[item.status] || '#888';
     const statusLabel = item.status === 'idle' ? 'Disabled' : item.status;
     content.appendChild(sectionRow('Status', statusLabel, 'color:' + statusColor));
@@ -749,9 +853,9 @@ function showDetail(item) {
             // Dot color from probe status (display authority); CB state as fallback
             const ps = c.probe_status;
             const dotColor = ps === 'unreachable' ? '#ef4444'
-                : ps === 'rate_limited' ? '#fde047'
+                : ps === 'rate_limited' ? '#ffe600'
                 : ps === 'reachable' ? '#4ade80'
-                : (c.state === 'open' ? '#ef4444' : c.state === 'half_open' ? '#fde047' : '#4ade80');
+                : (c.state === 'open' ? '#ef4444' : c.state === 'half_open' ? '#ffe600' : '#4ade80');
             const chainItem = el('div', 'chain-item');
             const dot = el('span', 'status-dot');
             dot.style.background = dotColor;
@@ -910,16 +1014,32 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             return;
         }
 
+        // Build chain: API providers + CC entry if dispatch=cc/dual
+        const editorChain = [...site.chain];
+        const dispatch = site.dispatch || null;
+        const ccModel = site.cc_model || null;
+        if ((dispatch === 'cc' || dispatch === 'dual') && ccModel) {
+            const ccPos = site.cc_position;
+            const ccEntry = 'CC/' + ccModel;
+            if (ccPos != null && ccPos >= 0 && ccPos <= editorChain.length) {
+                editorChain.splice(ccPos, 0, ccEntry);
+            } else {
+                editorChain.push(ccEntry);
+            }
+        }
+
         _editorState = {
             callSiteId,
-            chain: [...site.chain],
-            originalChain: [...site.chain],
+            chain: editorChain,
+            originalChain: [...editorChain],
             allProviders: cfg.providers,
             cbStates: cfg.cb_states || {},
             default_paid: site.default_paid,
             never_pays: site.never_pays,
             original_dp: site.default_paid,
             original_np: site.never_pays,
+            originalDispatch: dispatch,
+            originalCcModel: ccModel,
         };
 
         dpCheck.checked = site.default_paid;
@@ -969,31 +1089,66 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
     }
 }
 
+function _isCC(prov) { return prov.startsWith('CC/'); }
+function _ccModelFromEntry(prov) { return prov.replace('CC/', ''); }
+
 function _renderChainList(listEl) {
     while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
     _editorState.chain.forEach((prov, idx) => {
         const li = document.createElement('li');
         li.className = 'chain-editor-item';
+        const isCC = _isCC(prov);
 
-        // CB health dot — uses CB state from routing config API
-        const dot = document.createElement('span');
-        dot.className = 'cb-dot';
-        const cbState = _editorState.cbStates[prov] || 'closed';
-        dot.style.background = cbState === 'open' ? '#ef4444' : cbState === 'half_open' ? '#fde047' : '#4ade80';
-        dot.title = 'CB: ' + cbState;
-        li.appendChild(dot);
+        if (isCC) {
+            // CC entry — blue badge + model dropdown
+            const dot = document.createElement('span');
+            dot.className = 'cb-dot';
+            dot.style.background = '#818cf8';
+            dot.title = 'Claude Code dispatch';
+            li.appendChild(dot);
 
-        // Free badge — display name uses anthropic- rename for consistency with Provider Chain
-        const provCfg = _editorState.allProviders[prov];
-        const edDisplayName = prov.startsWith('claude-') ? prov.replace('claude-', 'anthropic-') : prov;
-        const nameText = edDisplayName + (provCfg?.free ? ' [free]' : '');
-        const nameSpan = el('span', 'provider-name', nameText);
-        if (provCfg?.free) nameSpan.style.color = '#4ade80';
-        li.appendChild(nameSpan);
-        if (provCfg?.model) {
-            const modelSpan = el('span', null, provCfg.model);
-            modelSpan.style.cssText = 'color:#64748b;font-size:10px;margin-left:6px;';
-            li.appendChild(modelSpan);
+            const badge = el('span', null, 'CC');
+            badge.style.cssText = 'background:#818cf8;color:#fff;padding:1px 5px;border-radius:3px;font-size:10px;font-weight:600;margin-right:4px;';
+            li.appendChild(badge);
+
+            const select = document.createElement('select');
+            select.style.cssText = 'font-size:11px;padding:1px 4px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:3px;';
+            ['Haiku', 'Sonnet', 'Opus'].forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                if (_ccModelFromEntry(prov) === m) opt.selected = true;
+                select.appendChild(opt);
+            });
+            select.onchange = () => {
+                _editorState.chain[idx] = 'CC/' + select.value;
+                const editor = listEl.closest('.config-editor');
+                if (editor) {
+                    const btns = editor.querySelectorAll('.editor-actions button');
+                    _updateDirtyState(btns[btns.length - 2], btns[btns.length - 1]);
+                }
+            };
+            li.appendChild(select);
+        } else {
+            // API provider entry
+            const dot = document.createElement('span');
+            dot.className = 'cb-dot';
+            const cbState = _editorState.cbStates[prov] || 'closed';
+            dot.style.background = cbState === 'open' ? '#ef4444' : cbState === 'half_open' ? '#ffe600' : '#4ade80';
+            dot.title = 'CB: ' + cbState;
+            li.appendChild(dot);
+
+            const provCfg = _editorState.allProviders[prov];
+            const edDisplayName = prov.startsWith('claude-') ? prov.replace('claude-', 'anthropic-') : prov;
+            const nameText = edDisplayName + (provCfg?.free ? ' [free]' : '');
+            const nameSpan = el('span', 'provider-name', nameText);
+            if (provCfg?.free) nameSpan.style.color = '#4ade80';
+            li.appendChild(nameSpan);
+            if (provCfg?.model) {
+                const modelSpan = el('span', null, provCfg.model);
+                modelSpan.style.cssText = 'color:#64748b;font-size:10px;margin-left:6px;';
+                li.appendChild(modelSpan);
+            }
         }
 
         // Move up
@@ -1071,6 +1226,16 @@ function _populateAddSelect(selectEl) {
             selectEl.appendChild(opt);
         }
     }
+    // CC dispatch options (only if no CC entry already in chain)
+    const hasCC = _editorState.chain.some(_isCC);
+    if (!hasCC) {
+        for (const model of ['Haiku', 'Sonnet', 'Opus']) {
+            const opt = document.createElement('option');
+            opt.value = 'CC/' + model;
+            opt.textContent = 'CC/' + model + ' (Claude Code)';
+            selectEl.appendChild(opt);
+        }
+    }
 }
 
 function _updateDirtyState(saveBtn, revertBtn) {
@@ -1087,14 +1252,22 @@ async function _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn) {
     saveBtn.textContent = 'Saving...';
     feedbackEl.style.display = 'none';
 
+    // Separate API chain from CC entry
+    const apiChain = _editorState.chain.filter(p => !_isCC(p));
+    const ccEntry = _editorState.chain.find(_isCC);
+    const ccModel = ccEntry ? _ccModelFromEntry(ccEntry) : null;
+    const ccPosition = ccEntry ? _editorState.chain.indexOf(ccEntry) : null;
+
     try {
         const resp = await fetch('/api/genesis/routing/config/' + encodeURIComponent(_editorState.callSiteId), {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
-                chain: _editorState.chain,
+                chain: apiChain,
                 default_paid: _editorState.default_paid,
                 never_pays: _editorState.never_pays,
+                cc_model: ccModel,
+                cc_position: ccPosition,
             }),
         });
         const data = await resp.json();
@@ -1148,15 +1321,15 @@ function updateSidePanel(data) {
 
         const wd = services.watchdog || {};
         if (wd.consecutive_failures > 0) {
-            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#fde047;font-weight:600'));
+            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#ffe600;font-weight:600'));
         }
         if (wd.in_backoff) {
-            svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#fde047'));
+            svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#ffe600'));
         }
 
         const tmpfs = (data.infrastructure || {}).tmpfs || {};
         if (tmpfs.free_pct != null) {
-            const tmpColor = tmpfs.free_pct > 20 ? 'color:#4ade80' : tmpfs.free_pct > 10 ? 'color:#fde047' : 'color:#ef4444';
+            const tmpColor = tmpfs.free_pct > 20 ? 'color:#4ade80' : tmpfs.free_pct > 10 ? 'color:#ffe600' : 'color:#ef4444';
             svcEl.appendChild(sectionRow('/tmp', Math.round(tmpfs.free_mb) + 'MB free (' + Math.round(tmpfs.free_pct) + '%)', tmpColor));
         }
     }
@@ -1230,7 +1403,7 @@ function updateSidePanel(data) {
     if (awarenessEl) {
         awarenessEl.replaceChildren();
         const aStatus = awareness.status || 'unknown';
-        const aColor = aStatus === 'healthy' ? 'color:#4ade80' : aStatus === 'stale' ? 'color:#fde047' : 'color:#6b7280';
+        const aColor = aStatus === 'healthy' ? 'color:#4ade80' : aStatus === 'stale' ? 'color:#ffe600' : 'color:#6b7280';
         awarenessEl.appendChild(sectionRow('Status', aStatus, aColor + ';font-weight:600'));
         if (awareness.ticks_24h !== undefined) awarenessEl.appendChild(sectionRow('Ticks/24h', String(awareness.ticks_24h)));
         if (awareness.time_since_last_tick_seconds !== undefined) {
@@ -1238,7 +1411,7 @@ function updateSidePanel(data) {
             awarenessEl.appendChild(sectionRow('Last tick', secs < 120 ? secs + 's ago' : Math.round(secs / 60) + 'm ago'));
         }
         if (awareness.critical_bypasses_24h) {
-            awarenessEl.appendChild(sectionRow('Critical bypasses', String(awareness.critical_bypasses_24h), 'color:#fde047'));
+            awarenessEl.appendChild(sectionRow('Critical bypasses', String(awareness.critical_bypasses_24h), 'color:#ffe600'));
         }
     }
 
@@ -1247,7 +1420,7 @@ function updateSidePanel(data) {
     if (resEl) {
         resEl.replaceChildren();
         const resState = data.resilience || 'not configured';
-        const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#fde047';
+        const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#ffe600';
         resEl.appendChild(sectionRow('State', String(resState), rColor + ';font-weight:600'));
 
         // Provider summary: X/Y call sites healthy
@@ -1256,7 +1429,7 @@ function updateSidePanel(data) {
         const totalSites = siteIds.length;
         const healthySites = siteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active' || sites[id].status === 'warning').length;
         if (totalSites > 0) {
-            const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#fde047' : 'color:#ef4444';
+            const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#ffe600' : 'color:#ef4444';
             resEl.appendChild(sectionRow('Call sites', healthySites + '/' + totalSites + ' healthy', summaryColor));
         }
 
@@ -1282,7 +1455,7 @@ function updateSidePanel(data) {
                 const row = el('div', 'cat-health');
                 const nameSpan = el('span', 'cat-name', cat);
                 const countSpan = el('span', 'cat-count', c.healthy + '/' + c.total);
-                countSpan.style.color = c.healthy === c.total ? '#4ade80' : '#fde047';
+                countSpan.style.color = c.healthy === c.total ? '#4ade80' : '#ffe600';
                 row.appendChild(nameSpan);
                 row.appendChild(countSpan);
                 resEl.appendChild(row);
@@ -1317,7 +1490,7 @@ function updateSidePanel(data) {
         }
         if (typeof val !== 'number') continue;
         const label = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        const color = val > 0 ? 'color:#fde047' : 'color:#4ade80';
+        const color = val > 0 ? 'color:#ffe600' : 'color:#4ade80';
         qEl.appendChild(sectionRow(label, String(val), color));
     }
     // Show pending deferred item details
@@ -1437,7 +1610,7 @@ function updateSurplus(data) {
     const content = document.getElementById('surplus-content');
     content.replaceChildren();
 
-    const color = surplus.status === 'idle' ? '#4ade80' : surplus.status === 'dispatching' ? '#fde047' : '#6b7280';
+    const color = surplus.status === 'idle' ? '#4ade80' : surplus.status === 'dispatching' ? '#ffe600' : '#6b7280';
     content.appendChild(sectionRow('Status', surplus.status, 'color:' + color + ';font-weight:600'));
     if (surplus.queue_depth !== undefined) content.appendChild(sectionRow('Queue Depth', String(surplus.queue_depth)));
     if (surplus.last_dispatch) {
@@ -1462,16 +1635,15 @@ const SUBSYSTEM_GROUPS = {
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
-        sites: ['8_memory_consolidation', '9_fact_extraction', '21_embeddings', 'embedding'],
+        sites: ['8_memory_consolidation', '9_fact_extraction', '21_embeddings', '21b_query_embedding', 'embedding_recovery'],
     },
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
-        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor'],
+        sites: ['12_surplus_brainstorm', '36_code_auditor', '37_infrastructure_monitor', 'bookmark_enrichment'],
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
-        sites: ['13_morning_report', '19_outreach_draft', '23_fresh_eyes_review',
-                'outreach_fallback'],
+        sites: ['13_morning_report', '23_fresh_eyes_review', 'outreach_fallback'],
     },
     executor: {
         name: 'Executor', domId: 'sub-executor',
@@ -1481,13 +1653,13 @@ const SUBSYSTEM_GROUPS = {
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
-        sites: ['2_triage', '15_triage_calibration', '29_retrospective_triage',
+        sites: ['2_triage', '29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
                 '33_skill_refiner', '38_procedure_extraction'],
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
-        sites: ['contingency_deep_reflection', 'contingency_foreground', 'contingency_inbox'],
+        sites: ['contingency_foreground', 'contingency_inbox'],
     },
     utility: {
         name: 'Utility', domId: 'sub-utility',
@@ -1508,7 +1680,7 @@ function aggregateStatus(statuses) {
 }
 
 function statusDotColor(status) {
-    const c = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#fde047', down: '#ef4444', idle: '#888' };
+    const c = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#ffe600', down: '#ef4444', idle: '#888' };
     return c[status] || '#888';
 }
 
@@ -1580,7 +1752,7 @@ function updateSubsystemGrid(data) {
         if (key === 'surplus') {
             const s = data.surplus || {};
             if (s.status && s.status !== 'unknown') {
-                const c = s.status === 'idle' ? '#4ade80' : s.status === 'dispatching' ? '#fde047' : '#888';
+                const c = s.status === 'idle' ? '#4ade80' : s.status === 'dispatching' ? '#ffe600' : '#888';
                 box.appendChild(sectionRow('Scheduler', s.status, 'color:' + c));
             }
             if (s.queue_depth !== undefined) box.appendChild(sectionRow('Queue', String(s.queue_depth)));
@@ -1595,13 +1767,13 @@ function updateSubsystemGrid(data) {
         if (key === 'contingency') {
             const cc = data.cc_sessions || {};
             if (cc.realtime_status) {
-                const c = cc.realtime_status === 'NORMAL' ? '#4ade80' : '#fde047';
+                const c = cc.realtime_status === 'NORMAL' ? '#4ade80' : '#ffe600';
                 box.appendChild(sectionRow('CC Status', cc.realtime_status, 'color:' + c));
             }
         }
         if (key === 'learning') {
             // Show last calibration from call site data
-            const calSite = callSites['15_triage_calibration'] || {};
+            const calSite = callSites['30_triage_calibration'] || {};
             if (calSite.last_run_at) {
                 const age = Math.round((Date.now() - new Date(calSite.last_run_at).getTime()) / 1000);
                 box.appendChild(sectionRow('Last Calibration', formatAge(age) + ' ago'));
