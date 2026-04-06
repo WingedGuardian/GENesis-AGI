@@ -71,6 +71,24 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
                 # Regenerate Guardian CLAUDE.md from template (never use repo version)
                 if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
                     cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+                    # Append per-machine network identity from guardian.yaml
+                    _cfg="$INSTALL_DIR/config/guardian.yaml"
+                    if [ -f "$_cfg" ]; then
+                        _cname=$(grep 'container_name:' "$_cfg" | awk '{print $2}' | tr -d '"')
+                        _cip=$(grep 'container_ip:' "$_cfg" | awk '{print $2}' | tr -d '"')
+                        _hip=$(grep 'host_ip:' "$_cfg" | awk '{print $2}' | tr -d '"')
+                        _hv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')
+                        {
+                            echo ""
+                            echo "## Network"
+                            echo ""
+                            echo "- **Container**: ${_cname} at ${_cip}"
+                            echo "- **Host VM**: ${_hip} (this machine)"
+                            [ -n "$_hv6" ] && echo "- **Host IPv6**: $_hv6"
+                            echo "- **Dashboard**: http://${_cip}:5000 (direct, container network)"
+                            [ -n "$_hip" ] && echo "               http://${_hip}:5000 (via proxy device)"
+                        } >> "$INSTALL_DIR/CLAUDE.md"
+                    fi
                 fi
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
                 printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"

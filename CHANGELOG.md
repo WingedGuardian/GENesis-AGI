@@ -7,6 +7,38 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [3.0a2-hf2]
+
+### Added
+
+- **Install UX overhaul** — welcome/recovery banners, contextual CC login
+  prompts (explains Genesis vs Guardian purpose), `genesis` shell alias for
+  convenient container access from host
+- **Dashboard accessibility** — Incus proxy device forwarding host:5000 →
+  container:5000, network topology detection (IPv4/IPv6/Tailscale), SSH
+  tunnel and Tailscale guidance in post-install report
+- **Network identity** — container and host IPs (v4 + v6) persisted in
+  CLAUDE.md for both Genesis and Guardian; guardian-gateway appends network
+  section on code updates
+- **Guardian onboarding** — interactive CC login prompt during install,
+  network section in Guardian CLAUDE.md
+- **Uninstall script** — `scripts/uninstall.sh` for clean removal
+
+### Fixed
+
+- **Services not starting after install** — `genesis-server` was enabled but
+  never started; service gate blocked enable/start on re-runs. Now
+  unconditionally enables and starts both services
+- **Dashboard unreachable from browser** — container IP not routable from
+  external network; proxy device now forwards host port
+- **`/setup` not found on new installs** — CC discovers slash commands from
+  project root; users landing in `~` couldn't find `.claude/commands/`.
+  Auto-cd to `~/genesis` on login fixes this
+- **Install final output** — removed stale "start services manually" step
+  (services auto-start now), shows actual service status, simplified guidance
+
+---
+
 ## [3.0a2-hf1]
 
 ### Added
