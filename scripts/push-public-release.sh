@@ -22,10 +22,10 @@ PUBLIC_REPO="WingedGuardian/GENesis-AGI"
 WORK_DIR="$(mktemp -d)/genesis-agi-push"
 
 # Files where the PUBLIC repo version is authoritative.
-# NOTE: README.md was previously here but removed 2026-04-05 — the private
-# README is now the canonical source (AZ references cleaned, LOC updated).
-# Add files here only if the public repo has content that doesn't exist in private.
+# The public README is hand-crafted separately from the private repo.
+# NEVER let the private README overwrite it.
 PUBLIC_AUTHORITATIVE=(
+    "README.md"
 )
 
 # ── Argument parsing ───────────────────────────────────────
