@@ -259,6 +259,15 @@ class ConfirmationStateMachine:
                 reason=f"waiting for Genesis self-heal: {self._state.dialogue_action}",
             )
         elif old_state == GuardianState.CONFIRMED_DEAD:
+            if snapshot.all_alive:
+                # Container recovered on its own (services restarted,
+                # slow boot, independent fix, etc.)
+                self._reset_to_healthy(now)
+                return Transition(
+                    old_state=old_state,
+                    new_state=GuardianState.HEALTHY,
+                    reason="all signals healthy — auto-recovered from confirmed_dead",
+                )
             return Transition(
                 old_state=old_state,
                 new_state=GuardianState.CONFIRMED_DEAD,

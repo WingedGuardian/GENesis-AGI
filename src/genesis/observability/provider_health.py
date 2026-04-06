@@ -241,6 +241,8 @@ class ProviderHealthChecker:
 
         # Providers with explicit base_url in config
         if cfg.base_url:
+            if ptype != "ollama" and not _resolve_api_key(ptype):
+                return None  # no API key configured, skip probe
             return f"{cfg.base_url.rstrip('/')}/models"
 
         # Google uses query-param auth

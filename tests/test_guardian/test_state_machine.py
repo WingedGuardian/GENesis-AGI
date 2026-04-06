@@ -158,6 +158,19 @@ class TestRecoveryStates:
         assert t.new_state == GuardianState.CONFIRMED_DEAD
         assert t.action_needed is True
 
+    def test_confirmed_dead_auto_recovers_when_healthy(self, sm: ConfirmationStateMachine) -> None:
+        sm._state.current_state = GuardianState.CONFIRMED_DEAD
+        sm._state.consecutive_failures = 19
+        sm._state.first_failure_at = "2026-04-06T18:24:58+00:00"
+        sm._state.recovery_attempts = 2
+        t = sm.process(_healthy_snapshot())
+        assert t.new_state == GuardianState.HEALTHY
+        assert "auto-recovered" in t.reason
+        # Verify failure tracking was fully reset
+        assert sm.state.consecutive_failures == 0
+        assert sm.state.first_failure_at is None
+        assert sm.state.recovery_attempts == 0
+
     def test_recovered_verifies_healthy(self, sm: ConfirmationStateMachine) -> None:
         sm._state.current_state = GuardianState.RECOVERED
         t = sm.process(_healthy_snapshot())
