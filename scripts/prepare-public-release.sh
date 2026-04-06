@@ -417,6 +417,18 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o
     echo "    + $(basename "$f"): Container IP templated"
 done
 
+# Scrub known IPv6 ULA addresses (container + host)
+find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+    -exec grep -l '${CONTAINER_IPV6:-not configured}' {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|${CONTAINER_IPV6:-not configured}|${CONTAINER_IPV6:-not configured}|g' "$f"
+    echo "    + $(basename "$f"): Container IPv6 templated"
+done
+find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+    -exec grep -l '${HOST_IPV6:-not configured}' {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|${HOST_IPV6:-not configured}|${HOST_IPV6:-not configured}|g' "$f"
+    echo "    + $(basename "$f"): Host IPv6 templated"
+done
+
 # Catch-all: any remaining 192.168.50.x private subnet references
 find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
     -exec grep -l '192\.168\.50\.' {} \; 2>/dev/null | while IFS= read -r f; do

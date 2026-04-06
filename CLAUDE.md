@@ -20,9 +20,8 @@ what they miss — that's part of your job.
 - **Host VM**: Configured in `~/.genesis/guardian_remote.yaml` (set by
   `install_guardian.sh`). Guardian runs here. SSH access is Guardian-only
   via the `guardian-gateway.sh` command dispatcher. NOT the Ollama server.
-- **Network**: Container and host IPs in `secrets.env`
-  (`GENESIS_CONTAINER_IPV4`, `GENESIS_HOST_IPV4`, `*_IPV6`, `*_TAILSCALE_*`).
-  Set by install scripts. Dashboard proxied from host:5000 → container:5000.
+- **Network**: See `## Network Identity` section at bottom of this file.
+  Set by install scripts. Dashboard proxied host:5000 → container:5000.
   only. Do NOT install locally. NOT the host VM.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: `YOUR_GITHUB_USER/Genesis`
@@ -316,3 +315,9 @@ Never guess SQLite column names — use `db_schema` first. The DB has 60+ tables
   bootstrap manifest. This writes to `~/.genesis/capabilities.json` which
   the SessionStart hook reads. Without registration, foreground sessions
   won't know the feature exists — and if it fails, they won't know it's broken.
+
+## Network Identity
+
+- **Container IP**: ${CONTAINER_IP:-localhost} (v6: ${CONTAINER_IPV6:-not configured})
+- **Host VM IP**: ${VM_HOST:-localhost}
+- **Dashboard**: http://${VM_HOST:-localhost}:5000 (via proxy device)

@@ -320,6 +320,15 @@ done
 
 mkdir -p ~/.genesis 2>/dev/null || true
 
+# Auto-cd to genesis on login so Claude Code finds the project (slash
+# commands, hooks, .claude/settings.json all depend on cwd = project root)
+if ! grep -q 'cd ~/genesis' "$HOME/.bashrc" 2>/dev/null; then
+    echo '' >> "$HOME/.bashrc"
+    echo '# Auto-cd to Genesis project on login' >> "$HOME/.bashrc"
+    echo '[ -d ~/genesis ] && cd ~/genesis' >> "$HOME/.bashrc"
+    echo "    + Auto-cd to ~/genesis on login"
+fi
+
 # Enable Genesis CC hooks on first launch. Without this flag,
 # SessionStart hook exits immediately → no identity injection,
 # no onboarding detection. The /genesis slash command toggles it.
@@ -968,20 +977,21 @@ _final_keys=$(grep -cE '^(API_KEY_|ANTHROPIC_API_KEY|GOOGLE_API_KEY|OPENAI_API_K
 
 echo ""
 echo "  Next steps:"
-echo "    1. Start Genesis:  systemctl --user start genesis-server"
-echo "    2. Run:  cd ~/genesis && claude"
-echo "       Genesis will guide you through setup on first launch."
+echo "    Run:  claude"
+echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
-    echo "       (API keys, user profile, channels — all handled interactively)"
+    echo "    (API keys, user profile, channels — all handled interactively)"
 fi
-echo "    3. Web UI: http://localhost:5000"
 echo ""
-echo "  Manage services:"
-echo "    systemctl --user start|stop|restart genesis-server"
-echo "    systemctl --user start|stop|restart qdrant"
-echo "    journalctl --user -u genesis-server -f    # live logs"
+echo "  Services (auto-started):"
+_gs_status="stopped"
+_qd_status="stopped"
+systemctl --user is-active --quiet genesis-server 2>/dev/null && _gs_status="running"
+systemctl --user is-active --quiet qdrant 2>/dev/null && _qd_status="running"
+echo "    genesis-server: $_gs_status"
+echo "    qdrant:         $_qd_status"
+echo "    journalctl --user -u genesis-server -f   # live logs"
 echo ""
-echo "  Documentation:"
-echo "    CLAUDE.md            — conventions & commands"
-echo "    docs/architecture/   — system design"
+echo "  Dashboard: http://localhost:5000"
+echo "    (Access from your browser via host IP — see host setup output)"
 echo ""
