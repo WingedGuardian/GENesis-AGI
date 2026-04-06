@@ -7,7 +7,7 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
-## [Unreleased]
+## [3.0a2]
 
 ### Changed
 
