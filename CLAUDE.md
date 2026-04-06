@@ -244,18 +244,16 @@ Never guess SQLite column names — use `db_schema` first. The DB has 60+ tables
 
 ## Rules
 
-- **Verify before claiming done**: `ruff check . && pytest -v` minimum.
-  If you can't prove it works, it's not done.
-- **Test the outcome, not just the code.** Unit tests passing is necessary
-  but NOT sufficient. After tests pass, verify the actual end-to-end
-  outcome the change delivers. For wiring changes: verify the init/bootstrap
-  order passes the right values at runtime, not just that parameters exist.
-  For notification changes: verify the notification actually arrives. Ask:
-  "If the system restarts right now, will this actually work?" If you can't
-  answer yes with evidence, you're not done. This was learned the hard way
-  on 2026-03-26: 34 tests passed, live API test passed, but a code review
-  caught an init ordering bug that would have silently broken the primary
-  runtime path.
+- **Verify the outcome, not just the tests.** `ruff check . && pytest -v` is
+  the minimum bar, not the finish line. After tests pass, verify the actual
+  end-to-end outcome the change delivers. Diff behavior between main and your
+  changes when relevant. For wiring changes: verify the init/bootstrap order
+  passes the right values at runtime, not just that parameters exist. For
+  notification changes: verify the notification actually arrives. Ask: "If the
+  system restarts right now, will this actually work?" If you can't answer yes
+  with evidence, you're not done. Learned the hard way on 2026-03-26: 34 tests
+  passed, live API test passed, but a code review caught an init ordering bug
+  that would have silently broken the primary runtime path.
 - **Built ≠ wired. Wired ≠ verified.** Every component you build MUST have at
   least one call site in the actual runtime path — not just a unit test that
   mocks its callers. Before marking any component "done," answer three questions:
@@ -281,17 +279,34 @@ Never guess SQLite column names — use `db_schema` first. The DB has 60+ tables
 - **Check procedures before multi-step tasks**: use `procedure_recall` if relevant.
   Applies when a task involves external services, has failed before, or
   requires multi-step tool use.
-- **Plan execution**: proceed through batches without pausing unless something
-  goes sideways. If it does — STOP and re-plan immediately. Don't push
-  through a broken approach hoping it resolves itself.
+- **Plan mode by default.** Enter plan mode for any task with 3+ steps or
+  architectural decisions. Plan verification steps, not just build steps. If
+  something goes sideways mid-execution — STOP and re-plan immediately. Don't
+  push through a broken approach hoping it resolves itself.
+- **Use subagents to keep main context clean.** Offload research, exploration,
+  and parallel analysis to subagents. One concern per subagent for focused
+  execution. For complex problems, throw more compute at it rather than
+  cramming everything into the main context window.
 - Do NOT modify `docs/history/` unless correcting factual errors
 - Architecture docs in `docs/architecture/` are the single source of truth
 - **NEVER `rm -rf` the working directory.** Never run destructive commands
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending, what
   was learned. If it's not committed, it doesn't exist.
+- **No laziness.** Find root causes. No temporary fixes. No "good enough"
+  shortcuts. No skipping steps because the answer seems obvious. Hold yourself
+  to senior developer standards — if you wouldn't approve it in a code review,
+  don't write it. When you feel the pull to take a shortcut, that's the moment
+  to slow down and do it properly.
+- **Read before writing.** Never modify code you haven't fully read. Don't
+  assume what a function does based on its name — read the implementation.
+  Don't edit a file based on a grep match — read the surrounding context.
+  Wrong assumptions from skimming produce wrong fixes.
 - **Self-correction loop**: when the user corrects a mistake, persist the lesson
-  as a concrete rule.
+  as a concrete rule — one that PREVENTS the mistake, not just documents it.
+  Ruthlessly iterate on these lessons until the mistake rate drops. Review
+  relevant lessons at session start (the memory system surfaces these
+  automatically — read them, don't skip them).
 - **Register new capabilities**: When building a new subsystem or feature,
   register it in `GenesisRuntime.bootstrap()` by adding an entry to
   `_CAPABILITY_DESCRIPTIONS` and ensuring the init step is recorded in the

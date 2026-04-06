@@ -34,6 +34,8 @@ _FIELD_CLUSTERS = {
 }
 
 # USER.md auto-synthesis — maps user model fields to profile sections.
+# NOTE: write_user_md() is DISABLED — USER.md is user-edited only.
+# These maps are retained for reference but not actively used.
 _USER_MD_SECTION_ORDER = [
     "Identity", "Goals", "Expertise", "Observed Patterns",
 ]
@@ -48,6 +50,56 @@ _FIELD_SECTION_MAP = {
     "expertise": "Expertise",
     "domains": "Expertise",
     "learning_areas": "Expertise",
+}
+
+# USER_KNOWLEDGE.md synthesis — bounded sections with max item counts.
+# "Recent Themes" currently has no mapped fields — it populates when
+# interaction_theme observations are picked up by the evolver pipeline
+# or a future enhancement reads them directly into the synthesis.
+_KNOWLEDGE_SECTION_ORDER = [
+    "Interests & Active Curiosity",
+    "Active Projects",
+    "Expertise Map",
+    "Goals & Priorities",
+    "Interaction Patterns",
+    "Recent Themes",
+]
+
+_KNOWLEDGE_SECTION_LIMITS = {
+    "Interests & Active Curiosity": 15,
+    "Active Projects": 10,
+    "Expertise Map": 20,
+    "Goals & Priorities": 10,
+    "Interaction Patterns": 10,
+    "Recent Themes": 10,
+}
+
+_KNOWLEDGE_FIELD_MAP = {
+    # Interest signals
+    "interests": "Interests & Active Curiosity",
+    "curiosity": "Interests & Active Curiosity",
+    "exploring": "Interests & Active Curiosity",
+    "learning_areas": "Interests & Active Curiosity",
+    # Projects
+    "projects": "Active Projects",
+    "active_work": "Active Projects",
+    "current_focus": "Active Projects",
+    # Expertise
+    "expertise": "Expertise Map",
+    "domains": "Expertise Map",
+    "skills": "Expertise Map",
+    "background": "Expertise Map",
+    "role": "Expertise Map",
+    # Goals
+    "goals": "Goals & Priorities",
+    "motivations": "Goals & Priorities",
+    "priorities": "Goals & Priorities",
+    "project_vision": "Goals & Priorities",
+    # Patterns
+    "communication": "Interaction Patterns",
+    "decision": "Interaction Patterns",
+    "autonomy": "Interaction Patterns",
+    "operational": "Interaction Patterns",
 }
 
 
@@ -192,6 +244,88 @@ class IdentityLoader:
         logger.info(
             "USER.md synthesized with %d fields (%d content lines)",
             len(model), content_lines,
+        )
+
+    def write_user_knowledge_md(
+        self, model: dict, *, evidence_count: int = 0,
+    ) -> None:
+        """Render user model dict into USER_KNOWLEDGE.md (structured cache).
+
+        Unlike write_user_md() (which targets USER.md and is disabled),
+        this writes the system-owned knowledge cache with bounded sections.
+        Each section has a max item count; lowest-signal items are pruned.
+        """
+        sections: dict[str, list[str]] = defaultdict(list)
+        unmapped: list[str] = []
+
+        for field, value in model.items():
+            section = _KNOWLEDGE_FIELD_MAP.get(field)
+            rendered = self._render_value(value)
+            display = field.replace("_", " ").title()
+
+            if section:
+                truncated = rendered[:120] if len(rendered) > 120 else rendered
+                sections[section].append(f"- **{display}**: {truncated}")
+            else:
+                # Check cluster match for common prefixes
+                cluster_label = self._cluster_for(field)
+                if cluster_label is not None:
+                    # Map cluster labels to nearest knowledge section
+                    target = "Interaction Patterns"
+                    sections[target].append(
+                        f"- **{cluster_label}**: {rendered[:80]}"
+                    )
+                else:
+                    unmapped.append(f"- **{display}**: {rendered}")
+
+        # Build output
+        now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        lines = [
+            "# User Knowledge Base",
+            "",
+            f"> Auto-synthesized from Genesis memory system. Last updated: {now}.",
+            "> Source of truth: memory system (Qdrant + SQLite). "
+            "This file is a materialized cache.",
+            "> Do not hand-edit — changes will be overwritten by next synthesis cycle.",
+            "",
+        ]
+
+        for section_name in _KNOWLEDGE_SECTION_ORDER:
+            limit = _KNOWLEDGE_SECTION_LIMITS.get(section_name, 10)
+            items = sections.get(section_name, [])
+
+            lines.append(f"## {section_name}")
+            lines.append("")
+            if items:
+                for entry in items[:limit]:
+                    lines.append(entry)
+            else:
+                lines.append(f"_(no data yet — max {limit} items)_")
+            lines.append("")
+
+        # Append unmapped fields if any, under a catch-all
+        if unmapped:
+            lines.append("## Other Observations")
+            lines.append("")
+            for entry in unmapped[:10]:
+                lines.append(entry)
+            lines.append("")
+
+        lines.append("---")
+        lines.append("")
+        lines.append(
+            f"*Synthesized from {evidence_count} evidence points. "
+            f"Last updated: {now}.*"
+        )
+        lines.append("")
+
+        path = self._dir / "USER_KNOWLEDGE.md"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        self._cache.pop("USER_KNOWLEDGE.md", None)
+        logger.info(
+            "USER_KNOWLEDGE.md synthesized with %d fields (%d sections populated)",
+            len(model),
+            sum(1 for s in _KNOWLEDGE_SECTION_ORDER if sections.get(s)),
         )
 
     @staticmethod

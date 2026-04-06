@@ -254,11 +254,11 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "11_user_model_synthesis": {
-        "description": "Disabled. User preference/behavior model synthesis. User model redesign pending.",
+        "description": "User knowledge synthesis. Writes USER_KNOWLEDGE.md from user_model_cache evidence.",
         "category": "reasoning",
-        "frequency": "Weekly",
+        "frequency": "Every 48h (via user_model_evolution job)",
         "model_tier": "frontier",
-        "wired": False,
+        "wired": True,
     },
     "17_fresh_eyes_review": {
         "description": "Cross-vendor quality review of executor deliverables (Gate 2). Wired into executor pipeline. Activates when executor goes live.",

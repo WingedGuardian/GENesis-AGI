@@ -208,6 +208,11 @@ class CircuitBreakerRegistry:
                         cb._opened_at = cb._clock()
                     cb._consecutive_failures = info.get("consecutive_failures", 0)
                     cb._trip_count = info.get("trip_count", 0)
+                    # Cap backoff on restart — escalating backoff is for consecutive
+                    # failures within a session, not across restarts spanning weeks.
+                    # Cap=3 → max backoff = min(120*2^2, 1800) = 480s (8 min).
+                    if saved_state == "OPEN":
+                        cb._trip_count = min(cb._trip_count, 3)
                     saved_cat = info.get("last_failure_category")
                     cb._last_failure_category = ErrorCategory(saved_cat) if saved_cat else None
             logger.info("Circuit breaker state restored from %s", self._state_file)
@@ -219,7 +224,7 @@ class CircuitBreakerRegistry:
         cloud_providers = [
             name
             for name, cfg in self._providers.items()
-            if cfg.provider_type != "ollama"
+            if cfg.provider_type != "ollama" and not cfg.is_free
         ]
         ollama_providers = [
             name

@@ -427,3 +427,87 @@ class ContextGatherer:
             return []
 
         return turns[-10:]  # Last 10 user turns
+
+    async def gather_evaluation_context(self, db: aiosqlite.Connection) -> dict:
+        """Gather cross-interaction signals for deep reflection synthesis.
+
+        Queries:
+        - Recent ``user_signal`` observations (from inbox, conversation, etc.)
+        - Recent ``architecture_insight`` observations
+        - Recent ``interaction_theme`` observations (from previous synthesis)
+        - Inbox-sourced observations for pattern extraction
+
+        Results are time-bounded to 14 days to prevent stale signals from
+        polluting cross-interaction synthesis.
+
+        Returns a dict suitable for injection into the deep reflection prompt.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+
+        # User signals from any channel
+        user_signals = await observations.query(
+            db, type="user_signal", limit=30,
+        )
+        user_signals = [o for o in user_signals if o.get("created_at", "") >= cutoff]
+
+        # Architecture insights
+        arch_insights = await observations.query(
+            db, type="architecture_insight", limit=20,
+        )
+        arch_insights = [o for o in arch_insights if o.get("created_at", "") >= cutoff]
+
+        # Previous interaction themes (from earlier synthesis runs)
+        themes = await observations.query(
+            db, type="interaction_theme", limit=10,
+        )
+        themes = [o for o in themes if o.get("created_at", "") >= cutoff]
+
+        # Inbox-sourced observations specifically
+        inbox_obs = await observations.query(
+            db, source="inbox_evaluation", limit=20,
+        )
+        inbox_obs = [o for o in inbox_obs if o.get("created_at", "") >= cutoff]
+
+        # Deduplicate: inbox-sourced user_signals appear in both lists
+        user_signal_ids = {o.get("id") for o in user_signals if o.get("id")}
+        inbox_obs = [o for o in inbox_obs if o.get("id") not in user_signal_ids]
+
+        return {
+            "user_signals": [
+                {
+                    "content": o.get("content", "")[:300],
+                    "source": o.get("source", ""),
+                    "created_at": o.get("created_at", ""),
+                }
+                for o in user_signals
+            ],
+            "architecture_insights": [
+                {
+                    "content": o.get("content", "")[:300],
+                    "source": o.get("source", ""),
+                    "created_at": o.get("created_at", ""),
+                }
+                for o in arch_insights
+            ],
+            "interaction_themes": [
+                {
+                    "content": o.get("content", "")[:300],
+                    "created_at": o.get("created_at", ""),
+                }
+                for o in themes
+            ],
+            "inbox_findings": [
+                {
+                    "content": o.get("content", "")[:300],
+                    "type": o.get("type", ""),
+                    "created_at": o.get("created_at", ""),
+                }
+                for o in inbox_obs
+            ],
+            "signal_counts": {
+                "user_signals": len(user_signals),
+                "architecture_insights": len(arch_insights),
+                "interaction_themes": len(themes),
+                "inbox_findings": len(inbox_obs),
+            },
+        }

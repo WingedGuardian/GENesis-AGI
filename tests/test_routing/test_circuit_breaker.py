@@ -15,12 +15,12 @@ from genesis.routing.types import (
 )
 
 
-def _provider(name: str = "test", ptype: str = "openai") -> ProviderConfig:
+def _provider(name: str = "test", ptype: str = "openai", is_free: bool = False) -> ProviderConfig:
     return ProviderConfig(
         name=name,
         provider_type=ptype,
         model_id="m",
-        is_free=False,
+        is_free=is_free,
         rpm_limit=None,
         open_duration_s=120,
     )
@@ -360,5 +360,49 @@ def test_trip_count_survives_save_load(tmp_path):
         reg2 = CircuitBreakerRegistry(providers, clock=lambda: 0)
         cb2 = reg2.get("x")
         assert cb2._trip_count == 2
+    finally:
+        cb_mod._STATE_FILE = original_path
+
+
+def test_free_provider_down_does_not_degrade():
+    """Free-tier providers being OPEN should not affect degradation level."""
+    providers = {
+        "paid1": _provider("paid1"),
+        "paid2": _provider("paid2"),
+        "free1": _provider("free1", is_free=True),
+    }
+    reg = CircuitBreakerRegistry(providers, clock=lambda: 0)
+    # Trip the free provider
+    for _ in range(3):
+        reg.get("free1").record_failure(ErrorCategory.TRANSIENT)
+    assert reg.get("free1").state == ProviderState.OPEN
+    # Degradation should still be L0 — free providers don't count
+    assert reg.compute_degradation_level() == DegradationLevel.NORMAL
+
+
+def test_trip_count_capped_on_restore(tmp_path):
+    """Trip count should be capped to 3 when restoring OPEN state."""
+    import json
+
+    import genesis.routing.circuit_breaker as cb_mod
+
+    original_path = cb_mod._STATE_FILE
+    cb_mod._STATE_FILE = tmp_path / "cb_state.json"
+    try:
+        # Write state with high trip_count (simulating weeks of restarts)
+        state = {
+            "x": {
+                "state": "OPEN",
+                "trip_count": 90,
+                "consecutive_failures": 5,
+            }
+        }
+        (tmp_path / "cb_state.json").write_text(json.dumps(state))
+
+        providers = {"x": _provider("x")}
+        reg = CircuitBreakerRegistry(providers, clock=lambda: 0)
+        cb = reg.get("x")
+        assert cb._state == ProviderState.OPEN
+        assert cb._trip_count == 3  # capped from 90
     finally:
         cb_mod._STATE_FILE = original_path

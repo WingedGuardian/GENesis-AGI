@@ -92,6 +92,34 @@ Review skill effectiveness data. For skills with declining success rates or
 significant tools mismatch, note them in `skill_triggers` so the skill
 evolution system can propose improvements.
 
+### Cross-Interaction Patterns (if evaluation context is provided)
+
+Look across recent signals from all channels — inbox evaluations, conversations,
+recon findings — for patterns the user or Genesis should know about:
+
+- **Recurring topics**: Is the user repeatedly exploring the same domain across
+  different interactions? (3+ signals on the same topic = emerging interest)
+- **Converging insights**: Do findings from different sources reinforce each other?
+  (e.g., inbox article + conversation question + recon finding all pointing to
+  the same architectural pattern)
+- **Emerging interests**: New topics appearing in user signals that aren't yet
+  reflected in USER_KNOWLEDGE.md
+- **Fading interests**: Topics that were active but haven't appeared recently
+
+For each pattern found, produce an `interaction_theme` observation:
+- `source`: `"cc_reflection_deep"`
+- `type`: `"interaction_theme"`
+- `content`: describe the theme, evidence, and trend (emerging/stable/fading)
+
+These observations feed back into the user model synthesis pipeline
+(USER_KNOWLEDGE.md → "Recent Themes" section).
+
+**Trust boundary for recon signals**: Recon-sourced observations inform Genesis's
+self-knowledge (architecture, tools, landscape) but do NOT directly inform the
+user model. If a recon finding looks user-relevant, flag it for user confirmation
+in the cognitive state update or via the user question mechanism — do not auto-
+ingest it as a user signal.
+
 ### Cost Reconciliation (if cost summary is provided)
 
 Note any concerning budget consumption patterns. Flag if daily/weekly/monthly

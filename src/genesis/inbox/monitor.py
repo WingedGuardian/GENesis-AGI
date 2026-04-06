@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
+from genesis.cc.session_config import SessionConfigBuilder
 from genesis.inbox.scanner import compute_hash, detect_changes, read_content, scan_folder
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.security import ContentSanitizer, ContentSource
@@ -367,6 +368,10 @@ class InboxMonitor:
         # 4. Batch and dispatch
         batches_dispatched = 0
         batch_size = self._config.batch_size
+        # Reflection MCP profile gives inbox sessions memory access
+        # (genesis-health + genesis-memory) so evaluations can query
+        # and store user signals via memory_recall / memory_store.
+        mcp_path = SessionConfigBuilder().build_mcp_config("reflection")
 
         for i in range(0, len(pending_items), batch_size):
             batch = pending_items[i : i + batch_size]
@@ -407,6 +412,7 @@ class InboxMonitor:
                 skip_permissions=True,
                 disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
                 working_dir=background_session_dir(),
+                mcp_config=mcp_path,
             )
 
             output = None

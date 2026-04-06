@@ -312,6 +312,42 @@ async def build_enriched_prompt(
             + "\n".join(conv_lines)
         )
 
+    # Cross-interaction evaluation context for pattern synthesis
+    try:
+        eval_ctx = await context_gatherer.gather_evaluation_context(db)
+        counts = eval_ctx.get("signal_counts", {})
+        has_signals = any(counts.get(k, 0) > 0 for k in counts)
+        if has_signals:
+            ctx_parts = ["\n## Cross-Interaction Signals (for pattern synthesis)"]
+            ctx_parts.append(
+                f"Signal counts: {json.dumps(counts)}"
+            )
+            if eval_ctx["user_signals"]:
+                ctx_parts.append("\n### User Signals")
+                for sig in eval_ctx["user_signals"][:10]:
+                    ctx_parts.append(
+                        f"- [{sig['source']}] {sig['content']}"
+                    )
+            if eval_ctx["architecture_insights"]:
+                ctx_parts.append("\n### Architecture Insights")
+                for ins in eval_ctx["architecture_insights"][:10]:
+                    ctx_parts.append(
+                        f"- [{ins['source']}] {ins['content']}"
+                    )
+            if eval_ctx["interaction_themes"]:
+                ctx_parts.append("\n### Previous Interaction Themes")
+                for theme in eval_ctx["interaction_themes"]:
+                    ctx_parts.append(f"- {theme['content']}")
+            if eval_ctx["inbox_findings"]:
+                ctx_parts.append("\n### Recent Inbox Findings")
+                for finding in eval_ctx["inbox_findings"][:10]:
+                    ctx_parts.append(
+                        f"- [{finding['type']}] {finding['content']}"
+                    )
+            parts.append("\n".join(ctx_parts))
+    except Exception:
+        logger.error("Failed to gather evaluation context for deep reflection", exc_info=True)
+
     parts.append(build_data_pointers())
     return "\n".join(parts)
 
