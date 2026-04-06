@@ -1,8 +1,8 @@
 #!/bin/bash
 # Push a prepared public release to the GENesis-AGI repo.
-# Merges into the existing repo (preserving public-only files like README).
-# Optionally tags the release and creates a GitHub Release.
-# NEVER force pushes.
+# Creates a PR (branch protection on main). Preserves public-only files like README.
+# Optionally tags the release and creates a GitHub Release after merge.
+# NEVER force pushes. NEVER pushes directly to main.
 #
 # Usage:
 #   ./scripts/push-public-release.sh <staging-dir> [--version vX.Y] [commit-message]
@@ -153,7 +153,7 @@ for f in "${PRESERVE_FILES[@]}"; do
 done
 echo
 
-# ── Commit and push ───────────────────────────────────────
+# ── Commit and create PR ──────────────────────────────────
 echo "--- Committing ---"
 git add -A
 CHANGES=$(git diff --cached --stat)
@@ -167,6 +167,15 @@ if [[ -z "$CHANGES" ]]; then
         exit 0
     fi
 else
+    # Branch name: release/<version> or release/<date>
+    if [[ -n "$VERSION" ]]; then
+        BRANCH="release/$VERSION"
+    else
+        BRANCH="release/$(date +%Y%m%d-%H%M%S)"
+    fi
+
+    git checkout -b "$BRANCH"
+
     echo "$CHANGES" | tail -3
 
     git commit -m "$COMMIT_MSG
@@ -176,42 +185,78 @@ Source: $SOURCE_COMMIT
 Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
 
     echo
-    echo "--- Pushing (normal push, never force) ---"
-    if ! git push origin main 2>&1; then
-        echo
-        echo "ERROR: Push failed. Remote has commits not in this staging."
-        echo "       Resolve manually: cd $WORK_DIR && git pull --rebase origin main && git push"
-        exit 1
-    fi
+    echo "--- Pushing branch $BRANCH ---"
+    git push -u origin "$BRANCH"
+
+    echo
+    echo "--- Creating pull request ---"
+    PR_BODY="## Release Update
+
+Source commit: \`$SOURCE_COMMIT\`
+Files preserved: ${#PRESERVE_FILES[@]}
+
+$(if [[ -n "$VERSION" ]]; then echo "**Version: $VERSION**"; fi)
+
+### Changes
+\`\`\`
+$CHANGES
+\`\`\`"
+
+    PR_URL=$(gh pr create \
+        --repo "$PUBLIC_REPO" \
+        --base main \
+        --head "$BRANCH" \
+        --title "$COMMIT_MSG" \
+        --body "$PR_BODY")
+
+    echo "  PR created: $PR_URL"
+    echo
+    echo "  To merge:  gh pr merge $PR_URL --merge --delete-branch"
 fi
 
 # ── Tag and GitHub Release ────────────────────────────────
+# Tags and releases are created AFTER the PR is merged.
+# When --version is specified and the PR hasn't been merged yet,
+# print instructions instead of tagging.
 if [[ -n "$VERSION" ]]; then
     echo
-    echo "--- Creating release $VERSION ---"
+    echo "--- Release $VERSION ---"
 
-    # Annotated tag — idempotent: check remote (fresh clone has no local tags)
+    # Check if tag already exists (from a previous run)
     if git ls-remote --tags origin "$VERSION" | grep -q .; then
-        echo "  Tag $VERSION already exists on remote — skipping tag creation"
+        echo "  Tag $VERSION already exists on remote"
     else
-        git tag -a "$VERSION" -m "Genesis $VERSION"
-        git push origin "$VERSION"
-        echo "  Tag pushed: $VERSION"
+        # Check if PR was just created (changes exist) — defer tagging
+        if [[ -n "$CHANGES" ]]; then
+            echo "  Tag $VERSION will be created after PR is merged."
+            echo "  Run after merge:"
+            echo "    cd $WORK_DIR && git checkout main && git pull origin main"
+            echo "    git tag -a $VERSION -m 'Genesis $VERSION' && git push origin $VERSION"
+            echo "  Or use gh:"
+            echo "    gh release create $VERSION --repo $PUBLIC_REPO --title 'Genesis $VERSION' --notes-file <notes>"
+        else
+            # No changes — we can tag main directly
+            git tag -a "$VERSION" -m "Genesis $VERSION"
+            git push origin "$VERSION"
+            echo "  Tag pushed: $VERSION"
+        fi
     fi
 
     # GitHub Release — idempotent: skip if already exists
-    NOTES_FILE="$(mktemp)"
-    trap 'rm -f "$NOTES_FILE"' EXIT
-    printf '%s\n' "$CHANGELOG_NOTES" > "$NOTES_FILE"
+    if [[ -z "$CHANGES" ]]; then
+        NOTES_FILE="$(mktemp)"
+        trap 'rm -f "$NOTES_FILE"' EXIT
+        printf '%s\n' "$CHANGELOG_NOTES" > "$NOTES_FILE"
 
-    if gh release view "$VERSION" --repo "$PUBLIC_REPO" &>/dev/null; then
-        echo "  GitHub Release $VERSION already exists — skipping"
-    else
-        gh release create "$VERSION" \
-            --repo "$PUBLIC_REPO" \
-            --title "Genesis $VERSION" \
-            --notes-file "$NOTES_FILE"
-        echo "  GitHub Release created: https://github.com/$PUBLIC_REPO/releases/tag/$VERSION"
+        if gh release view "$VERSION" --repo "$PUBLIC_REPO" &>/dev/null; then
+            echo "  GitHub Release $VERSION already exists — skipping"
+        else
+            gh release create "$VERSION" \
+                --repo "$PUBLIC_REPO" \
+                --title "Genesis $VERSION" \
+                --notes-file "$NOTES_FILE"
+            echo "  GitHub Release created: https://github.com/$PUBLIC_REPO/releases/tag/$VERSION"
+        fi
     fi
 fi
 

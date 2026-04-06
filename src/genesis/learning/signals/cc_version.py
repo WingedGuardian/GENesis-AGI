@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import shutil
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -114,8 +115,9 @@ class CCVersionCollector:
         both process creation and communication.
         """
         async def _run() -> str:
+            claude_bin = shutil.which("claude") or "claude"
             proc = await asyncio.create_subprocess_exec(
-                "claude", "--version",
+                claude_bin, "--version",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

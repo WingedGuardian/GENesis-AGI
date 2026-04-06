@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import signal
 import time
 from collections.abc import Awaitable, Callable
@@ -50,6 +51,18 @@ class CCInvoker:
         self._last_was_error = False
         self._status_lock = asyncio.Lock()
         self._protected_paths = protected_paths
+
+        # Advisory check — warn early if the CLI binary is not findable.
+        resolved = shutil.which(claude_path)
+        if resolved:
+            logger.info("Claude CLI resolved to: %s", resolved)
+        else:
+            logger.warning(
+                "Claude CLI %r not found on PATH. CC invocations will fail. "
+                "Ensure @anthropic-ai/claude-code is installed via npm and "
+                "~/.npm-global/bin is on PATH.",
+                claude_path,
+            )
 
     @property
     def working_dir(self) -> str | None:
@@ -226,6 +239,17 @@ class CCInvoker:
                 proc.communicate(input=invocation.prompt.encode()),
                 timeout=invocation.timeout_s,
             )
+        except FileNotFoundError:
+            logger.error(
+                "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
+                "is installed via npm and ~/.npm-global/bin is on PATH.",
+                self._claude_path,
+            )
+            raise CCProcessError(
+                f"Claude CLI not found at '{self._claude_path}'. "
+                f"Ensure @anthropic-ai/claude-code is installed via npm "
+                f"and ~/.npm-global/bin is on PATH."
+            ) from None
         except TimeoutError:
             elapsed_s = time.monotonic() - start
             logger.error(
@@ -294,16 +318,28 @@ class CCInvoker:
             prompt_preview,
         )
 
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
-            env=env,
-            cwd=invocation.working_dir or self._working_dir,
-            preexec_fn=os.setpgrp,
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=1_048_576,  # 1MB — CC stream-json lines can exceed 64KB default
+                env=env,
+                cwd=invocation.working_dir or self._working_dir,
+                preexec_fn=os.setpgrp,
+            )
+        except FileNotFoundError:
+            logger.error(
+                "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
+                "is installed via npm and ~/.npm-global/bin is on PATH.",
+                self._claude_path,
+            )
+            raise CCProcessError(
+                f"Claude CLI not found at '{self._claude_path}'. "
+                f"Ensure @anthropic-ai/claude-code is installed via npm "
+                f"and ~/.npm-global/bin is on PATH."
+            ) from None
         self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
         # Feed prompt via stdin, then close to signal EOF
