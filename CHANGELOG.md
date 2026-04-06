@@ -23,7 +23,11 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 ### Added
 
 - **Neural monitor overhaul** — provider probes, subsystem grouping, circuit
-  breaker wiring, detail panel with live backend data, warning severity color
+  breaker wiring, detail panel with live backend data, warning severity color,
+  subsystem sector clustering, visual redesign (larger diagram, refined colors),
+  call site triage with naming consistency
+- **Settings UX** — human-readable labels, tooltips, channel dropdown
+- **Chain editor** — CC entries editable, repositionable, and removable
 - **Autonomy enforcement** — data-driven RuleEngine with graduated enforcement
   spectrum (inform → guide → guard → block), SteerMessage abstraction
 - **Anti-vision identity boundaries** — selective MCP loading, executor plan
@@ -47,7 +51,9 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 - **host-setup.sh**: Enable IP forwarding and bridge NAT before container
   creation; show progress during package installation
 - **Dashboard**: uptime counter timezone bug, restart button self-restart,
-  post-AZ-removal regressions, probe override guard, detail panel staleness
+  post-AZ-removal regressions, probe override guard, detail panel staleness,
+  degraded status color visibility
+- **Routing**: CC-only model saves silently dropped + input validation missing
 - **update.sh**: Use `--rebase` to avoid divergent-branch errors on pull
 - **Terminal**: Prefill CC command without auto-executing (user chooses when)
 - **push-public-release.sh**: Create tag and GitHub Release even when content

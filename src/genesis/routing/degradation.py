@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from genesis.resilience.state import ResilienceStateMachine
 
 # L2 (Reduced) skips these call sites
-_L2_SKIP = {"12_surplus_brainstorm", "19_outreach_draft", "13_morning_report"}
+_L2_SKIP = {"12_surplus_brainstorm", "13_morning_report"}
 
 # L3 (Essential) only keeps these call sites
 _L3_KEEP = {"2_triage", "3_micro_reflection", "21_embeddings", "22_tagging"}

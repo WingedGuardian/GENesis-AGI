@@ -56,9 +56,10 @@ class ReflectionEngine:
         *,
         db: aiosqlite.Connection,
         prior_context: str | None = None,
+        call_site_override: str | None = None,
     ) -> ReflectionResult:
         depth_str = depth.value
-        call_site = _CALL_SITE_MAP.get(depth)
+        call_site = call_site_override or _CALL_SITE_MAP.get(depth)
         if call_site is None:
             return ReflectionResult(
                 success=False,

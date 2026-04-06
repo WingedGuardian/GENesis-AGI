@@ -140,6 +140,8 @@ def update_call_site_in_yaml(
     chain: list[str] | None = None,
     default_paid: bool | None = None,
     never_pays: bool | None = None,
+    cc_model: str | None = None,
+    cc_position: int | None = None,
 ) -> RoutingConfig:
     """Update a single call site in the YAML config file.
 
@@ -158,7 +160,7 @@ def update_call_site_in_yaml(
     providers = raw.get("providers") or {}
 
     # Early return if nothing to change
-    if chain is None and default_paid is None and never_pays is None:
+    if chain is None and default_paid is None and never_pays is None and cc_model is None and cc_position is None:
         return load_config(path)
 
     if chain is not None:
@@ -179,6 +181,28 @@ def update_call_site_in_yaml(
 
     if never_pays is not None:
         cs["never_pays"] = never_pays
+
+    # CC dispatch metadata (stored in YAML, read by dashboard)
+    _VALID_CC_MODELS = {"Haiku", "Sonnet", "Opus"}
+    if cc_model is not None and cc_model not in _VALID_CC_MODELS:
+        msg = f"Invalid CC model: {cc_model!r}. Must be one of {_VALID_CC_MODELS}"
+        raise ValueError(msg)
+    if cc_position is not None:
+        cc_position = int(cc_position)
+        if cc_position < 0:
+            cc_position = None
+    if cc_model is not None:
+        cs["cc_model"] = cc_model
+        cs["dispatch"] = "dual" if chain else cs.get("dispatch", "cc")
+        if cc_position is not None:
+            cs["cc_position"] = cc_position
+        else:
+            cs.pop("cc_position", None)
+    elif chain is not None and cc_model is None:
+        # Explicit removal: cc_model sent as None with a chain update = API-only
+        cs.pop("cc_model", None)
+        cs.pop("dispatch", None)
+        cs.pop("cc_position", None)
 
     # Validate: never_pays sites must have at least one free provider
     if cs.get("never_pays"):

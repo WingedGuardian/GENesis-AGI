@@ -65,7 +65,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
     },
     "12_surplus_brainstorm": {
-        "description": "Creative exploration during idle compute windows. Generates ideas, research questions, and insights using free models only.",
+        "description": "Brainstorm sessions during idle compute. Uses reflection pipeline (Depth.LIGHT) with free APIs. Tracks separately from light reflections.",
         "category": "content",
         "frequency": "Opportunistic",
         "cost_policy": "Free only (never pays)",
@@ -100,6 +100,13 @@ _CALL_SITE_META: dict[str, dict] = {
         "category": "embedding",
         "frequency": "On memory store",
         "cost_policy": "Free (local)",
+        "model_tier": "embedding",
+    },
+    "21b_query_embedding": {
+        "description": "Read-path: embeds search queries via cloud provider for Qdrant recall. DeepInfra-primary, DashScope/Ollama fallback.",
+        "category": "embedding",
+        "frequency": "On memory recall",
+        "cost_policy": "Cloud embedding API",
         "model_tier": "embedding",
     },
     "23_fresh_eyes_review": {
@@ -163,6 +170,18 @@ _CALL_SITE_META: dict[str, dict] = {
         "cost_policy": "Free only (never pays)",
         "model_tier": "slm",
     },
+    "bookmark_enrichment": {
+        "description": "Generates rich summaries of shelved sessions for bookmarks. Routes through 33_skill_refiner chain (free APIs). Runs during surplus idle time.",
+        "category": "content",
+        "frequency": "On bookmark enrichment",
+        "model_tier": "slm",
+    },
+    "embedding_recovery": {
+        "description": "Drains pending FTS5-only memories to Qdrant when embedding provider recovers. Background recovery worker.",
+        "category": "embedding",
+        "frequency": "On provider recovery",
+        "model_tier": "embedding",
+    },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
         "description": "Sanity-checks proposed task execution plans before committing resources. Triggers from autonomous executor.",
@@ -221,7 +240,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "7_task_retrospective": {
-        "description": "Disabled. Root-cause classification of completed tasks. Executor not yet active.",
+        "description": "Root-cause classification of completed executor tasks. Retrospective phase wired in executor. Activates when executor goes live.",
         "category": "processing",
         "frequency": "Per task",
         "model_tier": "slm",
@@ -241,15 +260,8 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "frontier",
         "wired": False,
     },
-    "15_triage_calibration": {
-        "description": "Disabled. Superseded by 30_triage_calibration (Phase 6, Mar 9). Pending cleanup.",
-        "category": "calibration",
-        "frequency": "Weekly",
-        "model_tier": "slm",
-        "wired": False,
-    },
     "17_fresh_eyes_review": {
-        "description": "Disabled. Cross-vendor autonomy executor review. Code exists in executor but never triggered.",
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2). Wired into executor pipeline. Activates when executor goes live.",
         "category": "assessment",
         "frequency": "Per major decision",
         "model_tier": "frontier",
@@ -262,15 +274,8 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
         "wired": False,
     },
-    "19_outreach_draft": {
-        "description": "Disabled. Outreach message drafting. Outreach uses ContentDrafter (35_content_draft) directly.",
-        "category": "content",
-        "frequency": "Per outreach",
-        "model_tier": "slm",
-        "wired": False,
-    },
     "20_adversarial_counterargument": {
-        "description": "Disabled. Devil's advocate cross-vendor review. Function defined but never called.",
+        "description": "Devil's advocate review of executor deliverables (Gate 3). Wired into executor pipeline. Activates when executor goes live.",
         "category": "assessment",
         "frequency": "Per major decision",
         "model_tier": "frontier",
@@ -298,23 +303,15 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "outreach_fallback": {
-        "description": "Deferred outreach delivery retry. Enqueued when primary outreach pipeline fails.",
+        "description": "Deferred outreach delivery retry. Enqueue path active (pipeline.py:335), but consumer NOT BUILT — deferred messages silently marked completed without retry. CRITICAL BUG: needs consumer implementation.",
         "category": "content",
         "frequency": "On outreach failure",
         "model_tier": "slm",
-        "wired": False,
     },
     "autonomous_executor_reasoning": {
-        "description": "Disabled. Non-tooling reasoning for autonomous executor. Executor inert until beta.",
+        "description": "Non-tooling reasoning for autonomous executor steps. Wired into executor engine. Activates when executor goes live.",
         "category": "reasoning",
         "frequency": "Per executor step",
-        "model_tier": "frontier",
-        "wired": False,
-    },
-    "contingency_deep_reflection": {
-        "description": "Disabled. API-based deep reflection fallback when CC unavailable. Never triggered.",
-        "category": "reasoning",
-        "frequency": "On CC unavailability",
         "model_tier": "frontier",
         "wired": False,
     },

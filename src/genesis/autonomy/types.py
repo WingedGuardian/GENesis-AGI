@@ -241,7 +241,6 @@ class TaskModelConfig:
 DEFAULT_TASK_MODEL_MAP: dict[str, TaskModelConfig] = {
     "deep_reflection": TaskModelConfig("deep_reflection", "sonnet", "high"),
     "strategic_reflection": TaskModelConfig("strategic_reflection", "opus", "high"),
-    "surplus_brainstorm": TaskModelConfig("surplus_brainstorm", "sonnet", "medium"),
     "inbox_evaluation": TaskModelConfig("inbox_evaluation", "sonnet", "medium"),
     "research": TaskModelConfig("research", "sonnet", "high"),
     "code_modification": TaskModelConfig("code_modification", "opus", "high"),

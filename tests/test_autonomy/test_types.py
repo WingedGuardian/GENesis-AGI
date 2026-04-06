@@ -222,15 +222,10 @@ class TestTaskModelConfig:
     def test_default_map_coverage(self):
         """Default map covers the expected task types."""
         expected = {
-            "deep_reflection", "strategic_reflection", "surplus_brainstorm",
+            "deep_reflection", "strategic_reflection",
             "inbox_evaluation", "research", "code_modification",
         }
         assert set(DEFAULT_TASK_MODEL_MAP.keys()) == expected
 
     def test_strategic_uses_opus(self):
         assert DEFAULT_TASK_MODEL_MAP["strategic_reflection"].model == "opus"
-
-    def test_surplus_uses_sonnet_medium(self):
-        cfg = DEFAULT_TASK_MODEL_MAP["surplus_brainstorm"]
-        assert cfg.model == "sonnet"
-        assert cfg.effort == "medium"

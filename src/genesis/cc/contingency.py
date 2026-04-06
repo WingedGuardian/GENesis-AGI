@@ -108,7 +108,7 @@ class CCContingencyDispatcher:
         call_site = _CONTINGENCY_CALL_SITES.get(depth)
         if call_site is None:
             logger.warning("Unexpected depth %s in contingency — falling back to deep chain", depth)
-            call_site = "contingency_deep_reflection"
+            call_site = "5_deep_reflection"
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},

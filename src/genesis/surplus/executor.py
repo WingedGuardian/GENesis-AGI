@@ -46,6 +46,15 @@ class StubExecutor:
         )
 
 
+# Task type → call site override (routes surplus tasks to their own call sites)
+_CALL_SITE_OVERRIDE: dict[TaskType, str] = {
+    TaskType.BRAINSTORM_USER: "12_surplus_brainstorm",
+    TaskType.BRAINSTORM_SELF: "12_surplus_brainstorm",
+    TaskType.META_BRAINSTORM: "12_surplus_brainstorm",
+    TaskType.CODE_AUDIT: "36_code_auditor",
+    TaskType.INFRASTRUCTURE_MONITOR: "37_infrastructure_monitor",
+}
+
 # Task type → reflection depth mapping
 _DEPTH_MAP: dict[TaskType, Depth] = {
     TaskType.BRAINSTORM_USER: Depth.LIGHT,
@@ -154,6 +163,7 @@ class ReflectionBasedSurplusExecutor:
         try:
             result = await self._engine.reflect(
                 depth, tick, db=self._db, prior_context=prior_context,
+                call_site_override=_CALL_SITE_OVERRIDE.get(task.task_type),
             )
         except Exception as exc:
             logger.error(

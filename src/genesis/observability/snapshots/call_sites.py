@@ -5,7 +5,10 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import yaml
 
 from genesis.observability._call_site_meta import _CALL_SITE_META
 from genesis.routing.types import ProviderState
@@ -203,10 +206,23 @@ async def call_sites(
         except (AttributeError, ImportError):
             pass
 
+    # ── Read YAML CC overrides (dashboard saves cc_model/position here) ──
+    yaml_cc_overrides: dict[str, dict] = {}
+    try:
+        _yaml_path = Path(__file__).parent.parent.parent.parent / "config" / "model_routing.yaml"
+        if _yaml_path.exists():
+            _raw = yaml.safe_load(_yaml_path.read_text()) or {}
+            for _csn, _csraw in (_raw.get("call_sites") or {}).items():
+                if isinstance(_csraw, dict) and (_csraw.get("cc_model") or _csraw.get("cc_position") is not None):
+                    yaml_cc_overrides[_csn] = _csraw
+    except Exception:
+        logger.debug("Failed to read CC overrides from YAML", exc_info=True)
+
     # ── Overlay probe_status + append CC entries + unified chain walk ──
     for sid, site_data in result.items():
         meta = _CALL_SITE_META.get(sid)
-        dispatch = meta.get("dispatch") if meta else None
+        yaml_ov = yaml_cc_overrides.get(sid, {})
+        dispatch = yaml_ov.get("dispatch") or (meta.get("dispatch") if meta else None)
         chain = site_data.get("chain_health", [])
 
         # 1. Overlay probe_status on each API chain entry
@@ -222,9 +238,9 @@ async def call_sites(
                 else:
                     entry["probe_status"] = "reachable"
 
-        # 2. Append CC entry for dual/cc dispatch sites
-        if dispatch in ("dual", "cc") and meta:
-            cc_model = meta.get("cc_model", "?")
+        # 2. Insert CC entry for dual/cc dispatch sites
+        if dispatch in ("dual", "cc"):
+            cc_model = yaml_ov.get("cc_model") or (meta.get("cc_model", "?") if meta else "?")
             cc_entry: dict = {
                 "provider": f"CC/{cc_model}",
                 "state": cc_cb_state,
@@ -233,7 +249,12 @@ async def call_sites(
             }
             if cc_probe_status is not None:
                 cc_entry["probe_status"] = cc_probe_status
-            chain.append(cc_entry)
+            # Insert at saved position, or append at end
+            cc_pos = yaml_ov.get("cc_position")
+            if cc_pos is not None and 0 <= cc_pos <= len(chain):
+                chain.insert(cc_pos, cc_entry)
+            else:
+                chain.append(cc_entry)
             site_data["chain_health"] = chain
 
         # 3. Unified chain walk for site-level status
