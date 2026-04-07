@@ -216,6 +216,13 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 echo "  [0/$TOTAL_STEPS] Installing prerequisites..."
 
+# Update package index once before any installs — fresh EC2/VM instances often
+# have a stale or uninitialized apt cache that causes all installs to fail.
+if command -v apt-get &>/dev/null; then
+    echo "    Updating package index..."
+    sudo apt-get update -qq 2>&1 | tail -1 || true
+fi
+
 # pip
 if ! python3 -m pip --version &>/dev/null; then
     echo "    python3-pip not found — installing..."
@@ -259,6 +266,16 @@ if ! command -v curl &>/dev/null; then
     echo "    + curl installed"
 fi
 
+# jq (safety hook JSON parsing — required for PreToolUse hooks)
+if ! command -v jq &>/dev/null; then
+    echo "    jq not found — installing..."
+    sudo apt-get install -y -qq jq 2>/dev/null || {
+        echo "    ERROR: jq required (safety hooks depend on it). Install manually."
+        exit 1
+    }
+    echo "    + jq installed"
+fi
+
 # Node.js (optional but recommended)
 if ! command -v node &>/dev/null; then
     echo "    Node.js not found — installing..."
@@ -272,6 +289,50 @@ if ! command -v node &>/dev/null; then
 else
     echo "    . Node.js $(node --version)"
 fi
+
+# sqlite3 CLI (DB dumps in backup.sh, ad-hoc debugging)
+if ! command -v sqlite3 &>/dev/null; then
+    echo "    sqlite3 not found — installing..."
+    sudo apt-get install -y -qq sqlite3 2>/dev/null || \
+        echo "    WARNING: Could not install sqlite3. Ad-hoc DB queries will require Python."
+fi
+
+# gh (GitHub CLI — recon gatherer, release workflow, onboarding)
+if ! command -v gh &>/dev/null; then
+    echo "    gh not found — installing..."
+    sudo apt-get install -y -qq gh 2>/dev/null || \
+        echo "    WARNING: Could not install gh. GitHub release tracking will be unavailable."
+fi
+
+# ripgrep (portability checks, code search)
+if ! command -v rg &>/dev/null; then
+    echo "    ripgrep not found — installing..."
+    sudo apt-get install -y -qq ripgrep 2>/dev/null || \
+        echo "    WARNING: Could not install ripgrep."
+fi
+
+# rclone (inbox sync via Dropbox)
+if ! command -v rclone &>/dev/null; then
+    echo "    rclone not found — installing..."
+    sudo apt-get install -y -qq rclone 2>/dev/null || \
+        echo "    WARNING: Could not install rclone. Inbox sync will be unavailable."
+fi
+
+# ffmpeg (video processing skill)
+if ! command -v ffmpeg &>/dev/null; then
+    echo "    ffmpeg not found — installing..."
+    sudo apt-get install -y -qq ffmpeg 2>/dev/null || \
+        echo "    WARNING: Could not install ffmpeg. Video processing will be unavailable."
+fi
+
+# Utility tools
+for tool in unzip htop tmux tree; do
+    if ! command -v "$tool" &>/dev/null; then
+        echo "    $tool not found — installing..."
+        sudo apt-get install -y -qq "$tool" 2>/dev/null || \
+            echo "    WARNING: Could not install $tool."
+    fi
+done
 
 # Python venv — prefer python3.12 for venv creation
 PYTHON_BIN=$(command -v python3.12 || command -v python3)
