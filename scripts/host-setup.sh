@@ -347,6 +347,34 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
     echo "  + Container ready"
 fi
 
+# ── Split-disk: ensure container home has adequate space ─────────────────────
+# If /home is on a separate larger disk but the Incus pool was initialized on
+# root (common when Incus was pre-installed before host-setup.sh ran, e.g. on
+# GCP VMs with a 10GB root + 40GB /home), the container only sees the root
+# disk's free space (~1-2GB) — not enough for Genesis's venv and dependencies.
+# Fix: bind-mount a directory from the larger disk into the container's home.
+if [ "$root_dev" != "$home_dev" ] && [ "${home_avail_kb:-0}" -gt "${root_avail_kb:-0}" ]; then
+    _container_home_kb=$(incus exec "$CONTAINER_NAME" -- df --output=avail /home/ubuntu 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+    if [ "${_container_home_kb:-0}" -lt 10485760 ]; then  # < 10GB free in container home
+        echo ""
+        echo "  Split disk: /home disk has more space than root ($(df -h /home | tail -1 | awk '{print $4}') vs $(df -h / | tail -1 | awk '{print $4}') free)."
+        echo "  Container home has only $(( ${_container_home_kb:-0} / 1048576 ))GB free — binding larger disk in..."
+        _home_bind_src="/home/genesis-home"
+        sudo mkdir -p "$_home_bind_src"
+        # Unprivileged Incus containers shift UIDs: container UID N → host UID (1000000 + N).
+        # The container's ubuntu user (UID 1000) maps to host UID 1001000.
+        _ubuntu_uid=$(incus exec "$CONTAINER_NAME" -- id -u ubuntu 2>/dev/null || echo "1000")
+        _host_mapped_uid=$((1000000 + _ubuntu_uid))
+        sudo chown "$_host_mapped_uid:$_host_mapped_uid" "$_home_bind_src"
+        incus config device remove "$CONTAINER_NAME" homedisk 2>/dev/null || true
+        incus config device add "$CONTAINER_NAME" homedisk disk source="$_home_bind_src" path=/home/ubuntu
+        incus restart "$CONTAINER_NAME"
+        sleep 3
+        _post_kb=$(incus exec "$CONTAINER_NAME" -- df --output=avail /home/ubuntu 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+        echo "  + Home disk bound ($(( ${_post_kb:-0} / 1048576 ))GB now free in container home)"
+    fi
+fi
+
 # ── Verify container networking ──────────────────────────────
 # DHCP can be slow, especially on first boot or after UFW rules are freshly added.
 # Actively kick the DHCP client if needed rather than just waiting and hoping.
