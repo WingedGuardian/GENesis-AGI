@@ -56,6 +56,13 @@ def register_terminal_ws(app: Flask) -> None:
     @sock.route("/ws/terminal")
     def terminal_ws(ws: WebSocket) -> None:
         """WebSocket handler — bridges xterm.js to a PTY session."""
+        # Auth check — WebSocket runs in request context, can access session
+        from genesis.dashboard.auth import get_dashboard_password, is_authenticated
+
+        if get_dashboard_password() and not is_authenticated():
+            ws.close(message="Authentication required")
+            return
+
         session_id = str(id(ws))
         with _session_lock:
             if len(_active_sessions) >= _MAX_SESSIONS:
