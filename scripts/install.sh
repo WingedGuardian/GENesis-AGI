@@ -280,8 +280,8 @@ fi
 if ! command -v node &>/dev/null; then
     echo "    Node.js not found — installing..."
     if command -v apt-get &>/dev/null; then
-        sudo apt-get install -y -qq nodejs > /dev/null 2>&1 && \
-            echo "    + Node.js installed ($(node --version))" || \
+        sudo apt-get install -y -qq nodejs npm > /dev/null 2>&1 && \
+            echo "    + Node.js installed ($(node --version), npm $(npm --version))" || \
             echo "    WARNING: Could not install Node.js. Some features may not work."
     else
         echo "    WARNING: Node.js not found. Install manually for full functionality."
