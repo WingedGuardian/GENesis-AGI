@@ -136,7 +136,7 @@ fi
 if ! command -v node &>/dev/null; then
     echo "  Node.js not found — installing..."
     if [[ "$PKG_MGR" == "apt" ]]; then
-        install_pkg nodejs || echo "  WARNING: Could not install Node.js. Some features may not work."
+        install_pkg nodejs npm || echo "  WARNING: Could not install Node.js. Some features may not work."
     else
         install_pkg nodejs || echo "  WARNING: Could not install Node.js. Some features may not work."
     fi
