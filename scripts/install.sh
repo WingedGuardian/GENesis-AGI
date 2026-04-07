@@ -114,6 +114,23 @@ home_avail_kb=$(df --output=avail "$HOME" 2>/dev/null | tail -1 | tr -d ' ')
 if [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt "$_MIN_DISK_KB" ] 2>/dev/null; then
     home_avail_h=$(df -h "$HOME" | tail -1 | awk '{print $4}')
     echo "    FAIL  Disk: need >= 5GB free on \$HOME, only $home_avail_h available"
+    # Check if running inside a container with a separate larger disk on the host
+    if [ -f /run/incus_config/config.toml ] || grep -q 'container\|lxc' /proc/1/environ 2>/dev/null || \
+       [ -f /.dockerenv ] || grep -qE '^(lxc|incus)' /proc/1/cgroup 2>/dev/null; then
+        _root_dev=$(df --output=source / 2>/dev/null | tail -1)
+        _home_dev=$(df --output=source "$HOME" 2>/dev/null | tail -1)
+        if [ "$_root_dev" = "$_home_dev" ]; then
+            echo ""
+            echo "    Running in a container on a split-disk host (e.g. GCP with /home on a"
+            echo "    separate disk)? Re-run host-setup.sh on the host — it will automatically"
+            echo "    bind the larger disk into the container's home directory."
+            echo "    Manual fix on the host:"
+            echo "      sudo mkdir -p /home/genesis-home"
+            echo "      sudo chown 1001000:1001000 /home/genesis-home   # for ubuntu UID 1000"
+            echo "      incus config device add genesis homedisk disk source=/home/genesis-home path=/home/ubuntu"
+            echo "      incus restart genesis"
+        fi
+    fi
     PREFLIGHT_OK=0
 elif [ -n "$home_avail_kb" ] && [ "$home_avail_kb" -lt "$_WARN_DISK_KB" ] 2>/dev/null; then
     echo "    WARN  Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free (10GB+ recommended)"
