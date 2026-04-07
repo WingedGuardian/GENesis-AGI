@@ -194,6 +194,23 @@ _install_python312() {
     elif command -v yum &>/dev/null; then
         sudo yum install -y python3.12 2>/dev/null && return 0
     fi
+    # Universal fallback: uv downloads a pre-built Python 3.12 binary (no compilation).
+    # Works on Debian 12, RHEL, and any Linux where the package manager lacks python3.12.
+    echo "    Trying uv (pre-built Python 3.12 binary — no compilation needed)..."
+    if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null; then
+        local uv_bin="${HOME}/.local/bin/uv"
+        if [[ -x "$uv_bin" ]] && "$uv_bin" python install 3.12 --quiet 2>/dev/null; then
+            local py_path
+            py_path=$("$uv_bin" python find 3.12 2>/dev/null) || true
+            if [[ -n "$py_path" && -x "$py_path" ]]; then
+                # Symlink into /usr/local/bin so 'python3.12' is discoverable system-wide
+                sudo ln -sf "$py_path" /usr/local/bin/python3.12 2>/dev/null || \
+                    ln -sf "$py_path" "${HOME}/.local/bin/python3.12" 2>/dev/null || true
+                export PATH="${HOME}/.local/bin:$PATH"
+                command -v python3.12 &>/dev/null && return 0
+            fi
+        fi
+    fi
     return 1
 }
 
