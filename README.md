@@ -469,7 +469,7 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
 
 ### System requirements
 
-Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine or container.
+Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine.
 
 | Resource | Minimum | Recommended | Notes |
 |---|---|---|---|
@@ -525,7 +525,7 @@ claude
 | Component | What it does | Install |
 |---|---|---|
 | **[Qdrant](https://qdrant.tech)** | Vector database for semantic memory search | `docker run -d -p 6333:6333 qdrant/qdrant` |
-| **[Ollama](https://ollama.com)** | Local embedding models (privacy, speed) | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[Ollama](https://ollama.com)** / **LMstudio** | Local embedding models (privacy, speed) | `curl -fsSL https://ollama.com/install.sh \| sh` |
 
 Without Qdrant, Genesis falls back to SQLite FTS5 full-text search for memory. Without Ollama, it uses cloud embedding APIs. Both optional components enhance performance but aren't required to get started.
 
