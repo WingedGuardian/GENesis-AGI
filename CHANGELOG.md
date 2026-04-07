@@ -7,6 +7,35 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [3.0a2-hf3]
+
+### Added
+
+- **Provider Keys panel** — write-only secrets management in Settings tab.
+  Shows configured/not_set status for all 39 API keys across 7 groups parsed
+  from `secrets.env.example`. Values are never returned by the API. Atomic
+  file writes (tempfile + os.replace), chmod 600, immediate env reload.
+- **Config tab UX** — human-readable labels, tooltips, dropdowns for enum
+  settings (provider, model, effort, channels), proper domain name display.
+  Replaced all underscore identifiers and free-text fields that need exact values.
+
+### Fixed
+
+- **Install portability** — `install_guardian.sh` now auto-detects host Python
+  version and installs the matching `python3.X-venv` package if missing.
+  Supports Debian 12 (Python 3.11) — Guardian only needs pyyaml, no 3.12
+  requirement on the host VM.
+- **Container venv** — `host-setup.sh` tries `python3.12-venv` first, falls
+  back to `python3-venv` for distros that don't package them separately.
+- **Network identity in CLAUDE.md** — `update.sh` now detects and rewrites
+  unresolved template variables (`${CONTAINER_IP:-localhost}` etc.) with
+  real IPs from the running container and guardian_remote.yaml.
+- **Pre-commit hook** — `secrets.env.example` was blocked by the secrets
+  file filter (regex matched `secrets\.env` before the `.example` suffix).
+  Now explicitly allows `.example` files through.
+
+---
+
 ## [3.0a2-hf2]
 
 ### Added
