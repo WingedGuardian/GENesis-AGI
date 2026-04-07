@@ -11,6 +11,10 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ### Added
 
+- **Dashboard authentication** — optional password-based access control for the
+  dashboard. Set `DASHBOARD_PASSWORD` in secrets.env to enable. Cookie-based
+  30-day sessions, rate-limited login (5 attempts/5-min lockout), logout button.
+  When no password is set, dashboard works as before (backward compatible).
 - **Install UX overhaul** — welcome/recovery banners, contextual CC login
   prompts (explains Genesis vs Guardian purpose), `genesis` shell alias for
   convenient container access from host

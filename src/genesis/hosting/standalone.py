@@ -223,6 +223,30 @@ class StandaloneAdapter:
             static_url_path="/",
         )
 
+        # ── Auth: secret key + session config ─────────────────────
+        from datetime import timedelta
+
+        from genesis.dashboard.auth import get_or_create_secret_key
+
+        app.secret_key = get_or_create_secret_key()
+        app.config["SESSION_COOKIE_HTTPONLY"] = True
+        app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+        app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+
+        # Login page (on app, not blueprint — must be reachable before auth)
+        @app.route("/genesis/login")
+        def genesis_login_page():
+            from genesis.dashboard.auth import (
+                get_dashboard_password,
+                login_page_html,
+            )
+
+            if not get_dashboard_password():
+                from flask import redirect
+
+                return redirect("/genesis")
+            return login_page_html()
+
         # /genesis/monitor — standalone-only convenience alias.
         # /genesis, /genesis/logs, /genesis/errors are registered by the
         # dashboard blueprint (api.py, routes/events.py) — no duplication.

@@ -829,6 +829,25 @@ else
 fi
 echo ""
 
+# ── Dashboard password (optional) ────────────────────────────
+if should_prompt && ! grep -q "^DASHBOARD_PASSWORD=." "$SECRETS_FILE" 2>/dev/null; then
+    echo ""
+    echo "    ── Dashboard Password (optional) ───────────────────────"
+    echo ""
+    echo "    The dashboard is accessible from your network."
+    echo "    Set a password to protect it from unauthorized access."
+    echo "    Leave empty to skip (can set later in Provider Keys panel)."
+    echo ""
+    read -rsp "    Dashboard password (or Enter to skip): " _dash_pw
+    echo ""
+    if [ -n "$_dash_pw" ]; then
+        set_secret "DASHBOARD_PASSWORD" "$_dash_pw" "$SECRETS_FILE"
+        echo "    + Dashboard password saved"
+    else
+        echo "    - Skipped (dashboard will be open)"
+    fi
+    echo ""
+fi
 
 # ══════════════════════════════════════════════════════════════
 #  Timezone configuration
