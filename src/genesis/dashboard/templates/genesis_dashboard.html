@@ -157,6 +157,9 @@
         settingsEditing: null,    // domain being edited
         settingsSaving: false,
 
+        // ── Auth state ────────────────────────────────────────────
+        authEnabled: false,
+
         // ── Provider Keys state ──────────────────────────────────
         secretsGroups: null,
         secretsEditing: {},       // key_name → true when input open
@@ -297,6 +300,9 @@
 
         // Lifecycle
         async onOpen() {
+          // Check auth status (non-blocking, best-effort)
+          this.checkAuth();
+
           // Always fetch: health, errors, pause (needed on all tabs)
           await Promise.all([
             this.fetchHealth(),
@@ -740,6 +746,25 @@
           if (status === 'validated') return '#4caf50';
           if (status === 'configured') return '#f0ad4e';
           return 'var(--color-text-secondary)';
+        },
+
+        // ── Auth methods ─────────────────────────────────────────
+        async checkAuth() {
+          try {
+            const resp = await fetchApi("/api/genesis/auth/status");
+            if (resp && resp.ok) {
+              const d = await resp.json();
+              this.authEnabled = d.enabled;
+            }
+          } catch (e) { /* auth check is best-effort */ }
+        },
+        async logout() {
+          try {
+            await fetchApi("/api/genesis/auth/logout", {
+              method: "POST", credentials: "same-origin",
+            });
+          } catch (e) { /* ignore */ }
+          window.location.href = "/genesis/login";
         },
 
         _SETTING_LABELS: {
@@ -2624,6 +2649,13 @@
           <span class="material-symbols-outlined" style="font-size:1rem">terminal</span>
           Terminal
         </a>
+        <template x-if="$store.genesisDashboard.authEnabled">
+          <button @click="$store.genesisDashboard.logout()"
+                  title="Logout"
+                  style="font-size: 0.7rem; padding: 3px 8px; background: transparent; color: var(--color-text-secondary); border: 1px solid var(--color-border); border-radius: 4px; cursor: pointer;">
+            <span class="material-symbols-outlined" style="font-size:0.9rem; vertical-align:middle;">logout</span>
+          </button>
+        </template>
       </span>
     </h1>
 

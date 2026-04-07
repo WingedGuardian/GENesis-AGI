@@ -29,10 +29,15 @@ export async function callJsonApi(endpoint, data) {
 
 /**
  * Fetch wrapper for Genesis APIs.
+ * Redirects to login on 401 (expired/missing session).
  * @param {string} url - The URL to fetch
  * @param {Object} [request] - The fetch request options
  * @returns {Promise<Response>} The fetch response
  */
 export async function fetchApi(url, request) {
-  return await fetch(url, request || {});
+  const resp = await fetch(url, request || {});
+  if (resp.status === 401 && !url.includes("/auth/")) {
+    window.location.href = "/genesis/login";
+  }
+  return resp;
 }
