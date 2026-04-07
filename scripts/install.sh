@@ -22,6 +22,9 @@
 #   GENESIS_ENABLE_OLLAMA  — Enable local Ollama (default: false; cloud is default)
 #   QDRANT_VERSION         — Qdrant version to install if missing (default: 1.14.0)
 #   CC_VERSION             — Claude Code version to install (default: 2.1.87)
+#   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
+#   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
+#   NODE_MAJOR             — Node.js major version (default: 20)
 
 set -euo pipefail
 
@@ -292,6 +295,45 @@ _install_pkg() {
     fi
 }
 
+# Helper: download a binary from a GitHub release tarball
+# Usage: _install_github_binary <org/repo> <version> <url_template> <binary_name> [strip_components]
+# URL template tokens: {version}, {arch} (x86_64/aarch64), {arch_alt} (amd64/arm64)
+_install_github_binary() {
+    local repo="$1" version="$2" url_tmpl="$3" bin_name="$4" strip="${5:-0}"
+    local arch; arch=$(uname -m)
+    local arch_alt="$arch"
+    [ "$arch_alt" = "x86_64" ] && arch_alt="amd64"
+    [ "$arch_alt" = "aarch64" ] && arch_alt="arm64"
+    local url="${url_tmpl//\{version\}/$version}"
+    url="${url//\{arch\}/$arch}"
+    url="${url//\{arch_alt\}/$arch_alt}"
+    local tmp_dir; tmp_dir=$(mktemp -d)
+    local tarball="$tmp_dir/release.tar.gz"
+    if ! curl -fsSL "$url" -o "$tarball" 2>/dev/null; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    local strip_args=""
+    [ "$strip" -gt 0 ] && strip_args="--strip-components=$strip"
+    # shellcheck disable=SC2086
+    tar -xf "$tarball" -C "$tmp_dir" $strip_args 2>/dev/null || { rm -rf "$tmp_dir"; return 1; }
+    local bin_path; bin_path=$(find "$tmp_dir" -type f -name "$bin_name" | head -1)
+    if [ -z "$bin_path" ]; then
+        rm -rf "$tmp_dir"
+        return 1
+    fi
+    chmod +x "$bin_path"
+    if sudo mv "$bin_path" "/usr/local/bin/$bin_name" 2>/dev/null; then
+        true
+    else
+        mkdir -p "${HOME}/.local/bin"
+        mv "$bin_path" "${HOME}/.local/bin/$bin_name"
+        export PATH="${HOME}/.local/bin:$PATH"
+    fi
+    rm -rf "$tmp_dir"
+    command -v "$bin_name" &>/dev/null
+}
+
 # Update package index once before any installs — fresh EC2/VM instances often
 # have a stale or uninitialized apt cache that causes all installs to fail.
 echo "    Updating package index..."
@@ -365,22 +407,63 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js (required for Claude Code)
-if ! command -v node &>/dev/null; then
-    echo "    Node.js not found — installing..."
+# Node.js version check — returns 0 if installed version >= 18
+_node_version_ok() {
+    command -v node &>/dev/null || return 1
+    local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
+    [ "${ver:-0}" -ge 18 ] 2>/dev/null
+}
+
+# Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm
+_install_node() {
+    # 1. Package manager
     if [[ "$_PKG_MGR" == "apt" ]]; then
-        sudo apt-get install -y -qq nodejs npm > /dev/null 2>&1 && \
-            echo "    + Node.js installed ($(node --version), npm $(npm --version))" || \
-            echo "    WARNING: Could not install Node.js. Some features may not work."
+        sudo apt-get install -y -qq nodejs npm 2>/dev/null && _node_version_ok && return 0
     elif [[ "$_PKG_MGR" == "dnf" || "$_PKG_MGR" == "yum" ]]; then
-        sudo "$_PKG_MGR" install -y nodejs npm > /dev/null 2>&1 && \
-            echo "    + Node.js installed ($(node --version), npm $(npm --version))" || \
-            echo "    WARNING: Could not install Node.js. Some features may not work."
-    else
-        echo "    WARNING: Node.js not found. Install manually for full functionality."
+        sudo "$_PKG_MGR" install -y nodejs npm 2>/dev/null && _node_version_ok && return 0
     fi
-else
+    # 2. NodeSource (official — always ships current LTS)
+    echo "    Trying NodeSource (Node.js ${NODE_MAJOR}.x)..."
+    if [[ "$_PKG_MGR" == "apt" ]]; then
+        if curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" 2>/dev/null | sudo -E bash - 2>/dev/null; then
+            sudo apt-get install -y -qq nodejs 2>/dev/null && _node_version_ok && return 0
+        fi
+    elif [[ "$_PKG_MGR" == "dnf" || "$_PKG_MGR" == "yum" ]]; then
+        if curl -fsSL "https://rpm.nodesource.com/setup_${NODE_MAJOR}.x" 2>/dev/null | sudo bash - 2>/dev/null; then
+            sudo "$_PKG_MGR" install -y nodejs 2>/dev/null && _node_version_ok && return 0
+        fi
+    fi
+    # 3. nvm (cross-distro, no sudo required)
+    echo "    Trying nvm..."
+    local nvm_dir="${HOME}/.nvm"
+    if curl -o- "https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh" 2>/dev/null | bash 2>/dev/null; then
+        export NVM_DIR="$nvm_dir"
+        # shellcheck disable=SC1091
+        [ -s "$nvm_dir/nvm.sh" ] && \. "$nvm_dir/nvm.sh"
+        if command -v nvm &>/dev/null; then
+            nvm install "$NODE_MAJOR" 2>/dev/null && nvm use "$NODE_MAJOR" 2>/dev/null && _node_version_ok && return 0
+        fi
+    fi
+    return 1
+}
+
+# Node.js (REQUIRED — Claude Code will not run without it)
+NODE_MAJOR="${NODE_MAJOR:-20}"
+if _node_version_ok; then
     echo "    . Node.js $(node --version)"
+else
+    echo "    Node.js not found or too old — installing..."
+    if _install_node; then
+        echo "    + Node.js installed ($(node --version))"
+    else
+        echo ""
+        echo "    ERROR: Node.js ${NODE_MAJOR}.x install failed by all methods."
+        echo "    Claude Code requires Node.js >= 18. Install manually, then re-run:"
+        echo "      Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash - && sudo apt-get install -y nodejs"
+        echo "      AL2023/RHEL:   curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash - && sudo dnf install -y nodejs"
+        echo "      Universal:     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
+        exit 1
+    fi
 fi
 
 # sqlite3 CLI (DB dumps in backup.sh, ad-hoc debugging)
@@ -388,35 +471,90 @@ fi
 if ! command -v sqlite3 &>/dev/null; then
     echo "    sqlite3 not found — installing..."
     _install_pkg sqlite3 sqlite 2>/dev/null || \
-        echo "    WARNING: Could not install sqlite3. Ad-hoc DB queries will require Python."
+        echo "    NOTE: sqlite3 CLI unavailable — ad-hoc DB queries will require Python"
 fi
 
 # gh (GitHub CLI — recon gatherer, release workflow, onboarding)
+GH_VERSION="${GH_VERSION:-2.65.0}"
 if ! command -v gh &>/dev/null; then
     echo "    gh not found — installing..."
-    _install_pkg gh 2>/dev/null || \
-        echo "    WARNING: Could not install gh. GitHub release tracking will be unavailable."
+    if ! _install_pkg gh 2>/dev/null; then
+        echo "    Trying gh binary download (v${GH_VERSION})..."
+        if ! _install_github_binary "cli/cli" "$GH_VERSION" \
+            "https://github.com/cli/cli/releases/download/v{version}/gh_{version}_linux_{arch_alt}.tar.gz" \
+            "gh" 2; then
+            echo "    NOTE: gh unavailable — GitHub release tracking and repo recon will be limited"
+        else
+            echo "    + gh installed ($(gh --version | head -1))"
+        fi
+    else
+        echo "    + gh installed ($(gh --version | head -1))"
+    fi
 fi
 
 # ripgrep (portability checks, code search)
+RIPGREP_VERSION="${RIPGREP_VERSION:-14.1.1}"
 if ! command -v rg &>/dev/null; then
     echo "    ripgrep not found — installing..."
-    _install_pkg ripgrep 2>/dev/null || \
-        echo "    WARNING: Could not install ripgrep."
+    if ! _install_pkg ripgrep 2>/dev/null; then
+        echo "    Trying ripgrep binary download (v${RIPGREP_VERSION})..."
+        if ! _install_github_binary "BurntSushi/ripgrep" "$RIPGREP_VERSION" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/{version}/ripgrep-{version}-{arch}-unknown-linux-musl.tar.gz" \
+            "rg" 1; then
+            echo "    NOTE: ripgrep unavailable — code search will use grep (slower)"
+        else
+            echo "    + ripgrep installed"
+        fi
+    fi
 fi
 
 # rclone (inbox sync via Dropbox)
 if ! command -v rclone &>/dev/null; then
     echo "    rclone not found — installing..."
-    _install_pkg rclone 2>/dev/null || \
-        echo "    WARNING: Could not install rclone. Inbox sync will be unavailable."
+    if ! _install_pkg rclone 2>/dev/null; then
+        echo "    Trying rclone official installer..."
+        if curl -sfL https://rclone.org/install.sh 2>/dev/null | sudo bash 2>/dev/null && command -v rclone &>/dev/null; then
+            echo "    + rclone installed ($(rclone --version 2>/dev/null | head -1))"
+        else
+            echo "    NOTE: rclone unavailable — Dropbox inbox sync will not work"
+        fi
+    else
+        echo "    + rclone installed"
+    fi
 fi
 
 # ffmpeg (video processing skill)
 if ! command -v ffmpeg &>/dev/null; then
     echo "    ffmpeg not found — installing..."
-    _install_pkg ffmpeg 2>/dev/null || \
-        echo "    WARNING: Could not install ffmpeg. Video processing will be unavailable."
+    if ! _install_pkg ffmpeg 2>/dev/null; then
+        echo "    Trying ffmpeg static build (BtbN)..."
+        _ffmpeg_arch="linux64"
+        [ "$(uname -m)" = "aarch64" ] && _ffmpeg_arch="linuxarm64"
+        _ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${_ffmpeg_arch}-gpl.tar.xz"
+        _ffmpeg_tmp=$(mktemp -d)
+        if curl -fsSL "$_ffmpeg_url" -o "$_ffmpeg_tmp/ffmpeg.tar.xz" 2>/dev/null && \
+           tar -xf "$_ffmpeg_tmp/ffmpeg.tar.xz" -C "$_ffmpeg_tmp" --strip-components=2 2>/dev/null; then
+            _ffmpeg_bin=$(find "$_ffmpeg_tmp" -type f -name "ffmpeg" | head -1)
+            if [ -n "$_ffmpeg_bin" ]; then
+                chmod +x "$_ffmpeg_bin"
+                if sudo mv "$_ffmpeg_bin" /usr/local/bin/ffmpeg 2>/dev/null; then
+                    echo "    + ffmpeg installed (static build)"
+                else
+                    mkdir -p "${HOME}/.local/bin"
+                    mv "$_ffmpeg_bin" "${HOME}/.local/bin/ffmpeg"
+                    export PATH="${HOME}/.local/bin:$PATH"
+                    echo "    + ffmpeg installed (static build, ~/.local/bin)"
+                fi
+            else
+                echo "    NOTE: ffmpeg unavailable — video processing skill will not work"
+            fi
+        else
+            echo "    NOTE: ffmpeg unavailable — video processing skill will not work"
+        fi
+        rm -rf "$_ffmpeg_tmp"
+    else
+        echo "    + ffmpeg installed"
+    fi
 fi
 
 # Utility tools
@@ -424,7 +562,7 @@ for tool in unzip htop tmux tree; do
     if ! command -v "$tool" &>/dev/null; then
         echo "    $tool not found — installing..."
         _install_pkg "$tool" 2>/dev/null || \
-            echo "    WARNING: Could not install $tool."
+            echo "    NOTE: $tool unavailable (optional convenience tool)"
     fi
 done
 
@@ -1067,6 +1205,15 @@ if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
     SMOKE_PASS=$((SMOKE_PASS + 1))
 else
     echo "    FAIL  Qdrant not reachable at $QDRANT_URL"
+    SMOKE_FAIL=$((SMOKE_FAIL + 1))
+fi
+
+# Node.js version
+if _node_version_ok; then
+    echo "    PASS  Node.js $(node --version)"
+    SMOKE_PASS=$((SMOKE_PASS + 1))
+else
+    echo "    FAIL  Node.js missing or < v18 (Claude Code will not function)"
     SMOKE_FAIL=$((SMOKE_FAIL + 1))
 fi
 
