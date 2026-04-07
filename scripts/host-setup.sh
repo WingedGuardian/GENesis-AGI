@@ -49,6 +49,7 @@ CPUS="8"
 REPO_URL=""
 BRANCH="main"
 NON_INTERACTIVE=0
+INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
 _ORIG_ARGS="$*"
 
 # ── Parse args ───────────────────────────────────────────────
@@ -112,14 +113,30 @@ else
     echo "    WARN  Cannot determine OS (continuing anyway)"
 fi
 
-# Disk space on host
-host_avail_kb=$(df --output=avail /home 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
-host_avail_h=$(df -h /home 2>/dev/null | tail -1 | awk '{print $4}')
-if [ "$host_avail_kb" -lt 5242880 ] 2>/dev/null; then
-    echo "    FAIL  Need >= 5GB free on /home, only $host_avail_h available"
+# Disk space on host — Incus stores containers on / by default.
+# On GCP and other cloud VMs, /home may be on a larger separate disk.
+# We detect this and route Incus storage accordingly.
+root_avail_kb=$(df --output=avail / 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+home_avail_kb=$(df --output=avail /home 2>/dev/null | tail -1 | tr -d ' ' || echo "0")
+root_dev=$(df --output=source / 2>/dev/null | tail -1)
+home_dev=$(df --output=source /home 2>/dev/null | tail -1)
+if [ "$root_dev" != "$home_dev" ] && [ "${home_avail_kb:-0}" -gt "${root_avail_kb:-0}" ]; then
+    # /home is on a separate, larger disk — Incus should store data there
+    INCUS_POOL_DIR="/home/incus-data"
+    check_avail_kb="$home_avail_kb"
+    check_avail_h=$(df -h /home 2>/dev/null | tail -1 | awk '{print $4}')
+    echo "    INFO  Split disk: root=$(df -h / | tail -1 | awk '{print $4}') free, /home=${check_avail_h} free"
+    echo "          Incus storage will use /home/incus-data (larger disk)"
+else
+    INCUS_POOL_DIR=""
+    check_avail_kb="$root_avail_kb"
+    check_avail_h=$(df -h / 2>/dev/null | tail -1 | awk '{print $4}')
+fi
+if [ "${check_avail_kb:-0}" -lt 15728640 ] 2>/dev/null; then  # 15GB minimum
+    echo "    FAIL  Need >= 15GB free for Incus storage, only ${check_avail_h} available"
     PREFLIGHT_OK=0
 else
-    echo "    OK    Disk: $host_avail_h free"
+    echo "    OK    Disk: ${check_avail_h} free"
 fi
 
 # RAM
@@ -169,9 +186,42 @@ else
     fi
     echo "  + Incus installed"
 
-    echo "  Initializing Incus (minimal)..."
-    sudo incus admin init --minimal
-    echo "  + Incus initialized"
+    echo "  Initializing Incus..."
+    if [ -n "${INCUS_POOL_DIR:-}" ]; then
+        # Use a custom pool dir on the larger disk to avoid filling the root partition.
+        sudo mkdir -p "$INCUS_POOL_DIR"
+        sudo incus admin init --preseed << PRESEED
+config: {}
+networks:
+- config:
+    ipv4.address: auto
+    ipv4.nat: "true"
+    ipv6.address: none
+  name: incusbr0
+  type: bridge
+storage_pools:
+- config:
+    source: $INCUS_POOL_DIR
+  driver: dir
+  name: default
+profiles:
+- config: {}
+  devices:
+    eth0:
+      name: eth0
+      network: incusbr0
+      type: nic
+    root:
+      path: /
+      pool: default
+      type: disk
+  name: default
+PRESEED
+        echo "  + Incus initialized (pool: $INCUS_POOL_DIR)"
+    else
+        sudo incus admin init --minimal
+        echo "  + Incus initialized"
+    fi
 
     # Add current user to incus-admin group if not root.
     # The re-exec below handles activating the group immediately.
