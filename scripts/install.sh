@@ -166,6 +166,37 @@ else
 fi
 
 # Python 3.12+ — prefer explicit python3.12 binary
+_install_python312() {
+    # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq 2>/dev/null || true
+        if sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null; then
+            return 0
+        fi
+        # Not in default repos — try OS-specific backport source
+        if grep -qi 'ubuntu' /etc/os-release 2>/dev/null; then
+            echo "    Trying deadsnakes PPA (Ubuntu)..."
+            sudo apt-get install -y -qq software-properties-common 2>/dev/null || true
+            sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
+            sudo apt-get update -qq 2>/dev/null || true
+            sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null && return 0
+        elif grep -qi 'debian' /etc/os-release 2>/dev/null; then
+            echo "    Trying bookworm-backports (Debian 12)..."
+            if ! grep -rq 'backports' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null; then
+                echo "deb http://deb.debian.org/debian bookworm-backports main" | \
+                    sudo tee /etc/apt/sources.list.d/backports.list > /dev/null
+            fi
+            sudo apt-get update -qq 2>/dev/null || true
+            sudo apt-get install -y -qq -t bookworm-backports python3.12 python3.12-venv 2>/dev/null && return 0
+        fi
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y python3.12 2>/dev/null && return 0
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y python3.12 2>/dev/null && return 0
+    fi
+    return 1
+}
+
 if command -v python3.12 &>/dev/null; then
     py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
     echo "    OK    Python $py_version"
@@ -176,24 +207,25 @@ elif command -v python3 &>/dev/null; then
     else
         # Try to install Python 3.12 explicitly
         echo "    Python $py_version found but 3.12+ required — installing python3.12..."
-        if command -v apt-get &>/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null
-        fi
+        _install_python312 || true
         if command -v python3.12 &>/dev/null; then
             py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
             echo "    OK    Python $py_version (installed)"
         else
             echo "    FAIL  Python 3.12+ required, found $py_version"
-            echo "    Install manually: sudo apt-get install python3.12 python3.12-venv"
+            if command -v apt-get &>/dev/null; then
+                echo "    Install manually:"
+                echo "      Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get install python3.12 python3.12-venv"
+                echo "      Debian: sudo apt-get install -t bookworm-backports python3.12 python3.12-venv"
+            else
+                echo "    Install manually: sudo dnf install python3.12"
+            fi
             PREFLIGHT_OK=0
         fi
     fi
 else
     echo "    python3 not found — installing..."
-    if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv 2>/dev/null || \
-            sudo apt-get install -y -qq python3 2>/dev/null
-    fi
+    _install_python312 || true
     if command -v python3.12 &>/dev/null || command -v python3 &>/dev/null; then
         py_version=$( (python3.12 --version 2>&1 || python3 --version 2>&1) | grep -oP '\d+\.\d+' || echo "unknown")
         echo "    OK    Python $py_version (installed)"
@@ -216,40 +248,80 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 echo "  [0/$TOTAL_STEPS] Installing prerequisites..."
 
-# Update package index once before any installs — fresh EC2/VM instances often
-# have a stale or uninitialized apt cache that causes all installs to fail.
+# Detect package manager
 if command -v apt-get &>/dev/null; then
-    echo "    Updating package index..."
-    sudo apt-get update -qq 2>&1 | tail -1 || true
+    _PKG_MGR="apt"
+elif command -v dnf &>/dev/null; then
+    _PKG_MGR="dnf"
+elif command -v yum &>/dev/null; then
+    _PKG_MGR="yum"
+else
+    _PKG_MGR=""
 fi
 
-# pip
-if ! python3 -m pip --version &>/dev/null; then
-    echo "    python3-pip not found — installing..."
-    if command -v apt-get &>/dev/null; then
+# Helper: install a package, with optional different names per package manager
+# Usage: _install_pkg <pkg> [<pkg-for-dnf/yum>]
+_install_pkg() {
+    local pkg_apt="$1"
+    local pkg_dnf="${2:-$1}"
+    if [[ "$_PKG_MGR" == "apt" ]]; then
+        sudo apt-get install -y -qq "$pkg_apt" 2>/dev/null
+    elif [[ "$_PKG_MGR" == "dnf" ]]; then
+        sudo dnf install -y "$pkg_dnf" 2>/dev/null
+    elif [[ "$_PKG_MGR" == "yum" ]]; then
+        sudo yum install -y "$pkg_dnf" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Update package index once before any installs — fresh EC2/VM instances often
+# have a stale or uninitialized apt cache that causes all installs to fail.
+echo "    Updating package index..."
+if [[ "$_PKG_MGR" == "apt" ]]; then
+    sudo apt-get update -qq 2>&1 | tail -1 || true
+elif [[ "$_PKG_MGR" == "dnf" ]]; then
+    sudo dnf check-update -q 2>/dev/null; true  # returns 100 when updates available — not an error
+elif [[ "$_PKG_MGR" == "yum" ]]; then
+    sudo yum check-update -q 2>/dev/null; true
+fi
+
+# pip — check on python3.12 first (installed in pre-flight), then fall back to python3
+_PIP_BIN=$(command -v python3.12 || command -v python3)
+if ! "$_PIP_BIN" -m pip --version &>/dev/null; then
+    echo "    pip not found — installing..."
+    if [[ "$_PKG_MGR" == "apt" ]]; then
         sudo apt-get install -y -qq python3-pip 2>/dev/null || {
             echo "    ERROR: Could not install python3-pip. Install manually:"
             echo "      sudo apt-get install python3-pip"
             exit 1
         }
         echo "    + python3-pip installed"
+    elif [[ "$_PKG_MGR" == "dnf" || "$_PKG_MGR" == "yum" ]]; then
+        # On dnf/yum systems pip comes bundled with python3.12 package installed in pre-flight
+        # Try explicit install as fallback
+        _install_pkg python3-pip python3-pip 2>/dev/null || true
     else
-        echo "    ERROR: python3-pip not found and apt-get not available."
+        echo "    ERROR: pip not found and no package manager available."
         exit 1
     fi
 fi
 
 # venv module — check ensurepip, not just "import venv" (the venv module ships
-# with base Python but ensurepip requires the python3.XX-venv package)
-_PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)')
-if ! python3 -c "import ensurepip" &>/dev/null; then
+# with base Python but ensurepip requires the python3.XX-venv package on apt systems)
+_CHECK_PY=$(command -v python3.12 || command -v python3)
+_PY_MINOR=$("$_CHECK_PY" -c 'import sys; print(sys.version_info.minor)')
+if ! "$_CHECK_PY" -c "import ensurepip" &>/dev/null; then
     echo "    python3.${_PY_MINOR}-venv not found — installing..."
-    if command -v apt-get &>/dev/null; then
+    if [[ "$_PKG_MGR" == "apt" ]]; then
         sudo apt-get install -y -qq "python3.${_PY_MINOR}-venv" 2>/dev/null || {
             echo "    ERROR: Could not install python3.${_PY_MINOR}-venv."
             exit 1
         }
         echo "    + python3.${_PY_MINOR}-venv installed"
+    elif [[ "$_PKG_MGR" == "dnf" || "$_PKG_MGR" == "yum" ]]; then
+        # On dnf/yum, venv is bundled with the Python package — no separate install needed
+        echo "    NOTE: venv module should be bundled with python3.12 on this system"
     else
         echo "    ERROR: python3.${_PY_MINOR}-venv not found. Install manually."
         exit 1
@@ -259,7 +331,7 @@ fi
 # curl
 if ! command -v curl &>/dev/null; then
     echo "    curl not found — installing..."
-    sudo apt-get install -y -qq curl 2>/dev/null || {
+    _install_pkg curl || {
         echo "    ERROR: curl required. Install manually."
         exit 1
     }
@@ -269,18 +341,22 @@ fi
 # jq (safety hook JSON parsing — required for PreToolUse hooks)
 if ! command -v jq &>/dev/null; then
     echo "    jq not found — installing..."
-    sudo apt-get install -y -qq jq 2>/dev/null || {
+    _install_pkg jq || {
         echo "    ERROR: jq required (safety hooks depend on it). Install manually."
         exit 1
     }
     echo "    + jq installed"
 fi
 
-# Node.js (optional but recommended)
+# Node.js (required for Claude Code)
 if ! command -v node &>/dev/null; then
     echo "    Node.js not found — installing..."
-    if command -v apt-get &>/dev/null; then
+    if [[ "$_PKG_MGR" == "apt" ]]; then
         sudo apt-get install -y -qq nodejs npm > /dev/null 2>&1 && \
+            echo "    + Node.js installed ($(node --version), npm $(npm --version))" || \
+            echo "    WARNING: Could not install Node.js. Some features may not work."
+    elif [[ "$_PKG_MGR" == "dnf" || "$_PKG_MGR" == "yum" ]]; then
+        sudo "$_PKG_MGR" install -y nodejs npm > /dev/null 2>&1 && \
             echo "    + Node.js installed ($(node --version), npm $(npm --version))" || \
             echo "    WARNING: Could not install Node.js. Some features may not work."
     else
@@ -291,37 +367,38 @@ else
 fi
 
 # sqlite3 CLI (DB dumps in backup.sh, ad-hoc debugging)
+# Package name differs: "sqlite3" on apt, "sqlite" on dnf/yum
 if ! command -v sqlite3 &>/dev/null; then
     echo "    sqlite3 not found — installing..."
-    sudo apt-get install -y -qq sqlite3 2>/dev/null || \
+    _install_pkg sqlite3 sqlite 2>/dev/null || \
         echo "    WARNING: Could not install sqlite3. Ad-hoc DB queries will require Python."
 fi
 
 # gh (GitHub CLI — recon gatherer, release workflow, onboarding)
 if ! command -v gh &>/dev/null; then
     echo "    gh not found — installing..."
-    sudo apt-get install -y -qq gh 2>/dev/null || \
+    _install_pkg gh 2>/dev/null || \
         echo "    WARNING: Could not install gh. GitHub release tracking will be unavailable."
 fi
 
 # ripgrep (portability checks, code search)
 if ! command -v rg &>/dev/null; then
     echo "    ripgrep not found — installing..."
-    sudo apt-get install -y -qq ripgrep 2>/dev/null || \
+    _install_pkg ripgrep 2>/dev/null || \
         echo "    WARNING: Could not install ripgrep."
 fi
 
 # rclone (inbox sync via Dropbox)
 if ! command -v rclone &>/dev/null; then
     echo "    rclone not found — installing..."
-    sudo apt-get install -y -qq rclone 2>/dev/null || \
+    _install_pkg rclone 2>/dev/null || \
         echo "    WARNING: Could not install rclone. Inbox sync will be unavailable."
 fi
 
 # ffmpeg (video processing skill)
 if ! command -v ffmpeg &>/dev/null; then
     echo "    ffmpeg not found — installing..."
-    sudo apt-get install -y -qq ffmpeg 2>/dev/null || \
+    _install_pkg ffmpeg 2>/dev/null || \
         echo "    WARNING: Could not install ffmpeg. Video processing will be unavailable."
 fi
 
@@ -329,7 +406,7 @@ fi
 for tool in unzip htop tmux tree; do
     if ! command -v "$tool" &>/dev/null; then
         echo "    $tool not found — installing..."
-        sudo apt-get install -y -qq "$tool" 2>/dev/null || \
+        _install_pkg "$tool" 2>/dev/null || \
             echo "    WARNING: Could not install $tool."
     fi
 done
