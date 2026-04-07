@@ -73,6 +73,56 @@ if ! command -v git &>/dev/null; then
 fi
 echo "  git: $(git --version | head -1)"
 
+# curl (health checks, backups, API calls)
+if ! command -v curl &>/dev/null; then
+    echo "  curl not found — installing..."
+    install_pkg curl || { echo "ERROR: Could not install curl."; exit 1; }
+fi
+
+# jq (safety hook JSON parsing — required for PreToolUse hooks)
+if ! command -v jq &>/dev/null; then
+    echo "  jq not found — installing..."
+    install_pkg jq || { echo "ERROR: Could not install jq."; exit 1; }
+fi
+
+# sqlite3 CLI (DB dumps in backup.sh, ad-hoc debugging)
+if ! command -v sqlite3 &>/dev/null; then
+    echo "  sqlite3 not found — installing..."
+    install_pkg sqlite3 || echo "  WARNING: Could not install sqlite3. Ad-hoc DB queries will require Python."
+fi
+
+# gh (GitHub CLI — recon gatherer, release workflow, onboarding)
+if ! command -v gh &>/dev/null; then
+    echo "  gh not found — installing..."
+    install_pkg gh || echo "  WARNING: Could not install gh. GitHub release tracking will be unavailable."
+fi
+
+# ripgrep (portability checks, code search)
+if ! command -v rg &>/dev/null; then
+    echo "  ripgrep not found — installing..."
+    install_pkg ripgrep || echo "  WARNING: Could not install ripgrep."
+fi
+
+# rclone (inbox sync via Dropbox)
+if ! command -v rclone &>/dev/null; then
+    echo "  rclone not found — installing..."
+    install_pkg rclone || echo "  WARNING: Could not install rclone. Inbox sync will be unavailable."
+fi
+
+# ffmpeg (video processing skill)
+if ! command -v ffmpeg &>/dev/null; then
+    echo "  ffmpeg not found — installing..."
+    install_pkg ffmpeg || echo "  WARNING: Could not install ffmpeg. Video processing will be unavailable."
+fi
+
+# Utility tools
+for tool in unzip htop tmux tree; do
+    if ! command -v "$tool" &>/dev/null; then
+        echo "  $tool not found — installing..."
+        install_pkg "$tool" || echo "  WARNING: Could not install $tool."
+    fi
+done
+
 # Git identity (required for commits on fresh installs)
 if ! git -C "$GENESIS_ROOT" config user.name &>/dev/null; then
     git -C "$GENESIS_ROOT" config user.name "Genesis"
