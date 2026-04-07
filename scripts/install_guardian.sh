@@ -248,6 +248,15 @@ echo "[3/13] Creating virtual environment..."
 if [ ! -d "$VENV_DIR" ]; then
     $PYTHON -m venv "$VENV_DIR"
 fi
+
+# Debian creates venvs without pip even when ensurepip imports (ensurepip
+# is present but non-functional on Debian). Bootstrap pip if missing.
+if [ ! -f "$VENV_DIR/bin/pip" ]; then
+    echo "  pip not in venv — bootstrapping..."
+    "$VENV_DIR/bin/python" -m ensurepip --upgrade 2>/dev/null || \
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py | "$VENV_DIR/bin/python"
+fi
+
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet pyyaml
 echo "  venv: $VENV_DIR"

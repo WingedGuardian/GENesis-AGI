@@ -7,6 +7,21 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [3.0a2-hf4]
+
+### Fixed
+
+- **GCP split-disk install** — on cloud VMs where `/home` is a separate
+  larger disk than `/`, Incus now stores container data under
+  `/home/incus-data` instead of the root partition. Disk check validates
+  the actual Incus storage location and requires 15GB free.
+- **Guardian pip bootstrap** — Debian creates venvs without pip even when
+  `ensurepip` imports successfully (module is present but non-functional).
+  Guardian now detects missing pip post-venv and bootstraps via
+  `ensurepip --upgrade` or `get-pip.py`.
+
+---
+
 ## [3.0a2-hf3]
 
 ### Added
