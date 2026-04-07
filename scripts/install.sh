@@ -1170,10 +1170,17 @@ _final_keys=$(grep -cE '^(API_KEY_|ANTHROPIC_API_KEY|GOOGLE_API_KEY|OPENAI_API_K
 
 echo ""
 echo "  Next steps:"
-echo "    Run:  claude"
+echo "    cd $REPO_DIR && claude"
 echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "    (API keys, user profile, channels — all handled interactively)"
+fi
+# Clarify what the skipped smoke tests mean so new users aren't confused
+if [ "${SMOKE_SKIP:-0}" -gt 0 ] && [ "${SMOKE_FAIL:-0}" = "0" ]; then
+    echo ""
+    echo "  The $SMOKE_SKIP skipped item(s) above are expected:"
+    echo "    • API keys — configured on first run of 'claude'"
+    echo "    • Embedding test — runs automatically once keys are set"
 fi
 echo ""
 echo "  Services (auto-started):"
@@ -1187,4 +1194,14 @@ echo "    journalctl --user -u genesis-server -f   # live logs"
 echo ""
 echo "  Dashboard: http://localhost:5000"
 echo "    (Access from your browser via host IP — see host setup output)"
+# Show a note on non-Ubuntu-24 systems — Genesis is developed on Ubuntu 24.04;
+# install works on other distros but runtime behaviour is not guaranteed.
+_os_name=$(grep -oP '^PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "")
+if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
+    echo ""
+    echo "  OS note: Genesis is developed and tested on Ubuntu 24.04."
+    echo "  This install ran on: $_os_name"
+    echo "  Installation completed but runtime behaviour may vary on this OS."
+    echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"
+fi
 echo ""
