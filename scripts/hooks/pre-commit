@@ -25,8 +25,8 @@ if [ "$current_branch" = "main" ] || [ "$current_branch" = "master" ]; then
     fi
 fi
 
-# Block .env and secrets files
-if git diff --cached --name-only | grep -qE '\.env$|\.env\.|secrets\.env|secrets\.json'; then
+# Block .env and secrets files (allow .example templates)
+if git diff --cached --name-only | grep -vE '\.example$' | grep -qE '\.env$|\.env\.|secrets\.env|secrets\.json'; then
     echo "BLOCKED: Secrets/env file staged for commit. Remove with: git reset HEAD <file>"
     exit 1
 fi
