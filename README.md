@@ -481,6 +481,17 @@ Genesis is a full system, not a pip package. It runs best on a dedicated Linux m
 
 These are the requirements for the **host VM** — the machine you run the installer on. Genesis itself runs inside a container that the installer creates with its own resource limits and security boundaries.
 
+### Before you start
+
+Two accounts — both free to create, one has a paid tier:
+
+| What you need | Why | Where |
+|---|---|---|
+| **Claude Pro** ($20/mo+) | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
+| **Tailscale** (free) | Remote dashboard access from any device — no port-forwarding | [tailscale.com](https://tailscale.com) |
+
+Create both accounts before running the installer. The installer walks you through connecting them.
+
 ### Prerequisites
 
 The host VM needs `git` and `sudo`. That's it — the installer handles everything else, including Incus, the container, and all software inside it.
@@ -510,14 +521,14 @@ The installer is interactive by default — it will prompt for API keys, timezon
 | **Genesis server** | Inside container, port 5000 | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
 | **Qdrant** | Inside container, port 6333 | Vector database for semantic memory |
 | **Guardian** | Host VM | Monitors container health every 30s, auto-recovers, alerts via Telegram |
-| **Claude Code** | Inside container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
+| **Claude Code** | Host VM + container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
 
 **After install, access the container:**
 
 ```bash
-incus exec genesis --user ubuntu -t -- bash
+genesis   # shortcut alias the installer adds (runs incus exec with the right env)
 cd ~/genesis
-claude
+claude    # start your first session
 ```
 
 ### Optional components
