@@ -13,19 +13,26 @@ body {
     background: var(--color-background, #0f172a);
     color: var(--color-text, #e2e8f0);
     font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-    font-size: 13px;
+    font-size: 14px;
+    line-height: 1.5;
 }
 .header {
     display: flex; justify-content: space-between; align-items: center;
     padding: 16px 24px; border-bottom: 1px solid var(--color-border, #1e293b);
 }
-.header h1 { font-size: 16px; font-weight: 600; letter-spacing: 2px; color: var(--color-text-secondary); }
-.header .meta { color: var(--color-text-secondary); font-size: 12px; }
+.header h1 { font-size: 18px; font-weight: 600; letter-spacing: 2.5px; color: var(--color-text-secondary); }
+.header .meta { color: var(--color-text-secondary); font-size: 12px; display: flex; align-items: center; gap: 16px; }
+.header-badge {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+    border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+}
+.header-badge .hb-dot { width: 6px; height: 6px; border-radius: 50%; }
 .container { display: flex; min-height: calc(100vh - 92px); }
 .main-panel { flex: 1; padding: 24px; overflow-y: auto; }
 .side-panel {
-    width: 300px; min-width: 300px; border-left: 1px solid var(--color-border, #1e293b);
-    padding: 16px; overflow-y: auto;
+    width: 380px; min-width: 380px; border-left: 1px solid var(--color-border, #1e293b);
+    padding: 18px; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: #334155 transparent;
 }
 
 /* Neural Map — radial layout using polar coordinates */
@@ -47,25 +54,36 @@ body {
 .dot-outer { width: 16px; height: 16px; }
 .dot-periphery { width: 12px; height: 12px; }
 
-.dot-healthy { background: #4ade80; }
-.dot-active { background: #4ade80; }
-.dot-degraded { background: #ffe600; }
-.dot-down { background: #ef4444; }
-.dot-warning { background: #f59e0b; }
-.dot-idle { background: #888; }
-.dot-unknown { background: #888; }
+.dot-healthy { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
+.dot-active { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
+.dot-degraded { background: #facc15; box-shadow: 0 0 6px rgba(250,204,21,0.6), 0 0 14px rgba(250,204,21,0.2); }
+.dot-down { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.7), 0 0 20px rgba(239,68,68,0.3); animation: pulse-alert 1.5s ease-in-out infinite; }
+.dot-warning { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.5), 0 0 14px rgba(245,158,11,0.2); }
+.dot-idle { background: #555; opacity: 0.7; }
+.dot-unknown { background: #555; opacity: 0.7; }
 
-/* Category border colors */
-.dot-cat-reflection { box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.6); }
-.dot-cat-reasoning { box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.6); }
-.dot-cat-processing { box-shadow: 0 0 0 2px rgba(251, 146, 60, 0.5); }
-.dot-cat-calibration { box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.5); }
-.dot-cat-content { box-shadow: 0 0 0 2px rgba(52, 211, 153, 0.4); }
-.dot-cat-embedding { box-shadow: 0 0 0 2px rgba(34, 211, 238, 0.6); }
-.dot-cat-classification { box-shadow: 0 0 0 2px rgba(148, 163, 184, 0.5); }
-.dot-cat-assessment { box-shadow: 0 0 0 2px rgba(244, 114, 182, 0.5); }
-.dot-cat-core { box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.5); }
-.dot-cat-surplus { box-shadow: 0 0 0 2px rgba(163, 230, 53, 0.5); }
+@keyframes pulse {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.06); opacity: 0.9; }
+}
+@keyframes pulse-alert {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.12); opacity: 0.85; }
+}
+/* Override pulse on hover (hover has its own transform) */
+.dot:hover { animation: none; }
+
+/* Category border colors — layered with status glow via outline */
+.dot-cat-reflection { outline: 2px solid rgba(129, 140, 248, 0.5); outline-offset: 1px; }
+.dot-cat-reasoning { outline: 2px solid rgba(167, 139, 250, 0.5); outline-offset: 1px; }
+.dot-cat-processing { outline: 2px solid rgba(251, 146, 60, 0.4); outline-offset: 1px; }
+.dot-cat-calibration { outline: 2px solid rgba(251, 191, 36, 0.4); outline-offset: 1px; }
+.dot-cat-content { outline: 2px solid rgba(52, 211, 153, 0.35); outline-offset: 1px; }
+.dot-cat-embedding { outline: 2px solid rgba(34, 211, 238, 0.5); outline-offset: 1px; }
+.dot-cat-classification { outline: 2px solid rgba(148, 163, 184, 0.4); outline-offset: 1px; }
+.dot-cat-assessment { outline: 2px solid rgba(244, 114, 182, 0.4); outline-offset: 1px; }
+.dot-cat-core { outline: 2px solid rgba(96, 165, 250, 0.5); outline-offset: 1px; }
+.dot-cat-surplus { outline: 2px solid rgba(163, 230, 53, 0.4); outline-offset: 1px; }
 
 /* CC badge — standard visual language: CC/ entries across chain panels, tooltips, subsystem boxes */
 .cc-badge {
@@ -87,17 +105,19 @@ body {
 .tooltip .tt-row { color: var(--color-text-secondary); }
 .tooltip .tt-cat { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-bottom: 4px; background: rgba(255,255,255,0.08); }
 
-/* Dot labels — all rings get labels */
+/* Dot labels — center/inner always visible, outer/periphery on hover */
 .dot-label {
-    position: absolute; top: calc(100% + 2px); left: 50%;
-    transform: translateX(-50%); font-size: 8px; color: var(--color-text-secondary);
+    position: absolute; top: calc(100% + 3px); left: 50%;
+    transform: translateX(-50%); font-size: 9px; color: var(--color-text-secondary);
     white-space: nowrap; pointer-events: none; text-align: center;
-    max-width: 60px; overflow: hidden; text-overflow: ellipsis;
+    max-width: 70px; overflow: hidden; text-overflow: ellipsis;
+    transition: opacity 0.2s;
 }
-.dot-center .dot-label { font-size: 10px; max-width: 80px; }
-.dot-inner .dot-label { font-size: 8px; max-width: 65px; }
-.dot-outer .dot-label { font-size: 7px; max-width: 55px; }
-.dot-periphery .dot-label { font-size: 6px; max-width: 50px; }
+.dot-center .dot-label { font-size: 11px; max-width: 90px; font-weight: 600; }
+.dot-inner .dot-label { font-size: 9px; max-width: 80px; }
+.dot-outer .dot-label { font-size: 8px; max-width: 60px; opacity: 0; }
+.dot-periphery .dot-label { font-size: 8px; max-width: 60px; opacity: 0; }
+.dot:hover .dot-label { opacity: 1; }
 
 /* Surplus box (legacy — kept for backward compat) */
 .surplus-box {
@@ -114,7 +134,7 @@ body {
 }
 .subsystem-box {
     background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
-    border-radius: 8px; padding: 12px 16px;
+    border-radius: 8px; padding: 14px 18px; border-left: 3px solid #475569;
 }
 .subsystem-box .sub-header {
     display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
@@ -130,8 +150,11 @@ body {
 .subsystem-box .mini-dots { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
 .subsystem-box .mini-dot {
     width: 8px; height: 8px; border-radius: 50%; cursor: pointer;
-    transition: transform 0.15s;
+    transition: transform 0.15s, box-shadow 0.3s;
 }
+.subsystem-box .mini-dot-healthy { box-shadow: 0 0 4px rgba(74,222,128,0.5); }
+.subsystem-box .mini-dot-down { box-shadow: 0 0 4px rgba(239,68,68,0.6); }
+.subsystem-box .mini-dot-degraded { box-shadow: 0 0 4px rgba(250,204,21,0.5); }
 .subsystem-box .mini-dot:hover { transform: scale(1.5); }
 .subsystem-box .mini-dot-label {
     font-size: 9px; color: var(--color-text-secondary); display: flex;
@@ -141,8 +164,8 @@ body {
 
 /* Legend */
 .legend {
-    display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
-    margin-top: 16px; padding: 8px; font-size: 10px; color: var(--color-text-secondary);
+    display: flex; gap: 14px; flex-wrap: wrap; justify-content: center;
+    margin-top: 16px; padding: 10px; font-size: 11px; color: var(--color-text-secondary);
 }
 .legend-item { display: flex; align-items: center; gap: 4px; }
 .legend-dot {
@@ -151,14 +174,19 @@ body {
 }
 
 /* Side panel sections */
-.section { margin-bottom: 20px; }
-.section h3 {
-    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
-    color: var(--color-text-secondary); margin-bottom: 8px; padding-bottom: 4px; border-bottom: 1px solid var(--color-border, #1e293b);
+.section {
+    margin-bottom: 20px; padding: 10px 12px; border-radius: 6px;
+    background: rgba(30, 41, 59, 0.3); border: 1px solid rgba(51, 65, 85, 0.3);
 }
-.section-row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; }
-.section-row .label { color: var(--color-text-secondary); }
-.section-row .value { font-weight: 600; }
+.section h3 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--color-text-secondary); margin-bottom: 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--color-border, #1e293b);
+    border-left: 3px solid var(--color-accent, #27875e); padding-left: 8px;
+}
+.section-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+.section-row .label { color: var(--color-text-secondary); font-size: 13px; }
+.section-row .value { font-weight: 600; font-size: 13px; }
 
 .status-dot {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -318,7 +346,12 @@ body {
 
 <div class="header">
     <h1>GENESIS NEURAL MONITOR</h1>
-    <div class="meta">Last update: <span id="last-update">--</span></div>
+    <div class="meta">
+        <span id="hb-resilience" class="header-badge" style="display:none;"><span class="hb-dot"></span><span class="hb-text"></span></span>
+        <span id="hb-cc" class="header-badge" style="display:none;"><span class="hb-dot"></span><span class="hb-text"></span></span>
+        <span id="hb-sites" class="header-badge" style="display:none;"><span class="hb-text"></span></span>
+        <span>Last update: <span id="last-update">--</span></span>
+    </div>
 </div>
 
 <div class="container">
@@ -326,10 +359,7 @@ body {
         <div id="loading" class="loading">Connecting...</div>
         <div id="neural-map" class="neural-map" style="display:none;"></div>
         <div id="legend" class="legend" style="display:none;"></div>
-        <div id="surplus-box" class="surplus-box" style="display:none;">
-            <h3>Surplus Compute</h3>
-            <div id="surplus-content"></div>
-        </div>
+        <!-- Surplus box removed — data shown in Surplus subsystem box -->
         <div id="subsystem-grid" class="subsystem-grid" style="display:none;">
             <div id="sub-reflection" class="subsystem-box"></div>
             <div id="sub-memory" class="subsystem-box"></div>
@@ -559,21 +589,36 @@ function sectionRow(label, value, valueStyle) {
 
 // ── Sector assignments for subsystem clustering ───────────────────────
 const SECTOR_ASSIGNMENT = {
-    reflection:  { start: 0,   end: 45,  color: 'rgba(129,140,248,0.05)' },
-    executor:    { start: 45,  end: 90,  color: 'rgba(167,139,250,0.05)' },
-    learning:    { start: 90,  end: 135, color: 'rgba(251,146,60,0.05)' },
-    memory:      { start: 135, end: 180, color: 'rgba(56,189,248,0.05)' },
-    surplus:     { start: 180, end: 225, color: 'rgba(74,222,128,0.05)' },
-    outreach:    { start: 225, end: 270, color: 'rgba(251,191,36,0.05)' },
-    contingency: { start: 270, end: 315, color: 'rgba(248,113,113,0.05)' },
-    utility:     { start: 315, end: 360, color: 'rgba(148,163,184,0.05)' },
+    reflection:  { start: 0,   end: 45,  color: 'rgba(129,140,248,0.07)' },
+    executor:    { start: 45,  end: 90,  color: 'rgba(167,139,250,0.07)' },
+    learning:    { start: 90,  end: 135, color: 'rgba(251,146,60,0.06)' },
+    memory:      { start: 135, end: 180, color: 'rgba(56,189,248,0.06)' },
+    surplus:     { start: 180, end: 225, color: 'rgba(74,222,128,0.06)' },
+    outreach:    { start: 225, end: 270, color: 'rgba(251,191,36,0.06)' },
+    contingency: { start: 270, end: 315, color: 'rgba(248,113,113,0.06)' },
+    utility:     { start: 315, end: 360, color: 'rgba(148,163,184,0.06)' },
 };
 
-function _buildSectorSVG(map, cx, cy, outerR) {
+function _buildSectorSVG(map, cx, cy, outerR, ringRadii) {
     const ns = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(ns, 'svg');
     svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
-    svg.setAttribute('viewBox', `0 0 ${map.clientWidth || 700} ${Math.max(map.clientHeight, 800)}`);
+    const vw = map.clientWidth || 700;
+    const vh = Math.max(map.clientHeight, 800);
+    svg.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+
+    // Concentric ring guides
+    for (const rr of ringRadii) {
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('cx', String(cx));
+        circle.setAttribute('cy', String(cy));
+        circle.setAttribute('r', String(rr));
+        circle.setAttribute('fill', 'none');
+        circle.setAttribute('stroke', 'rgba(100,116,139,0.07)');
+        circle.setAttribute('stroke-width', '1');
+        circle.setAttribute('stroke-dasharray', '4 8');
+        svg.appendChild(circle);
+    }
 
     for (const [name, cfg] of Object.entries(SECTOR_ASSIGNMENT)) {
         const startRad = (cfg.start - 90) * Math.PI / 180;
@@ -591,14 +636,15 @@ function _buildSectorSVG(map, cx, cy, outerR) {
         path.setAttribute('stroke', 'none');
         svg.appendChild(path);
 
-        // Divider line (subtle)
+        // Divider line (subtle dashed)
         const line = document.createElementNS(ns, 'line');
         line.setAttribute('x1', String(cx));
         line.setAttribute('y1', String(cy));
         line.setAttribute('x2', String(x1));
         line.setAttribute('y2', String(y1));
-        line.setAttribute('stroke', 'rgba(100,116,139,0.15)');
+        line.setAttribute('stroke', 'rgba(100,116,139,0.08)');
         line.setAttribute('stroke-width', '1');
+        line.setAttribute('stroke-dasharray', '3 6');
         svg.appendChild(line);
 
         // Sector label
@@ -611,9 +657,10 @@ function _buildSectorSVG(map, cx, cy, outerR) {
         label.setAttribute('y', String(ly));
         label.setAttribute('text-anchor', 'middle');
         label.setAttribute('dominant-baseline', 'middle');
-        label.setAttribute('fill', 'rgba(148,163,184,0.6)');
-        label.setAttribute('font-size', '11');
+        label.setAttribute('fill', 'rgba(148,163,184,0.7)');
+        label.setAttribute('font-size', '13');
         label.setAttribute('font-family', 'inherit');
+        label.setAttribute('font-weight', '500');
         label.textContent = (SUBSYSTEM_GROUPS[name] || {}).name || name;
         svg.appendChild(label);
     }
@@ -690,8 +737,8 @@ function buildNeuralMap(data) {
         periphery: minDim * 0.45,
     };
 
-    // Build sector SVG backgrounds + dividers + labels
-    _buildSectorSVG(map, cx, cy, radii.periphery);
+    // Build sector SVG backgrounds + dividers + ring guides + labels
+    _buildSectorSVG(map, cx, cy, radii.periphery, [radii.inner, radii.outer, radii.periphery]);
 
     // ── Center ring: CC sessions (not sector-clustered) ──
     const ccSessions = data.cc_sessions || {};
@@ -1603,26 +1650,7 @@ async function clearDiscardedItem(itemId) {
 // ── Surplus — enriched ──────────────────────────────────────────────
 
 function updateSurplus(data) {
-    const surplus = data.surplus || {};
-    const box = document.getElementById('surplus-box');
-    if (surplus.status === 'unknown') { box.style.display = 'none'; return; }
-    box.style.display = 'block';
-    const content = document.getElementById('surplus-content');
-    content.replaceChildren();
-
-    const color = surplus.status === 'idle' ? '#4ade80' : surplus.status === 'dispatching' ? '#ffe600' : '#6b7280';
-    content.appendChild(sectionRow('Status', surplus.status, 'color:' + color + ';font-weight:600'));
-    if (surplus.queue_depth !== undefined) content.appendChild(sectionRow('Queue Depth', String(surplus.queue_depth)));
-    if (surplus.last_dispatch) {
-        const dispAge = Math.round((Date.now() - new Date(surplus.last_dispatch).getTime()) / 1000);
-        content.appendChild(sectionRow('Last Dispatch', formatAge(dispAge) + ' ago'));
-    }
-    if (surplus.tasks_pending !== undefined) content.appendChild(sectionRow('Tasks Pending', String(surplus.tasks_pending)));
-    if (surplus.idle_since) {
-        const idleSince = new Date(surplus.idle_since);
-        const ago = Math.round((Date.now() - idleSince.getTime()) / 60000);
-        content.appendChild(sectionRow('Idle Since', ago + 'm ago'));
-    }
+    // Standalone surplus box removed — data shown in Surplus subsystem box
 }
 
 // ── Subsystem group boxes ────────────────────────────────────────────
@@ -1684,10 +1712,17 @@ function statusDotColor(status) {
     return c[status] || '#888';
 }
 
-function renderSubsystemBox(group, data) {
+const SUBSYSTEM_BORDER_COLORS = {
+    reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80', outreach: '#fbbf24',
+    executor: '#a78bfa', learning: '#fb923c', contingency: '#f87171', utility: '#94a3b8',
+};
+
+function renderSubsystemBox(group, data, groupKey) {
     const box = document.getElementById(group.domId);
     if (!box) return;
     box.replaceChildren();
+    const bColor = SUBSYSTEM_BORDER_COLORS[groupKey] || '#475569';
+    box.style.borderLeftColor = bColor;
     const callSites = data.call_sites || {};
 
     // Collect member statuses
@@ -1710,8 +1745,12 @@ function renderSubsystemBox(group, data) {
         const meta = getMeta(siteId);
         const label = el('span', 'mini-dot-label');
         const dot = el('span', 'mini-dot');
-        dot.style.background = statusDotColor(siteData.status || 'unknown');
-        dot.title = meta.name + ' — ' + (siteData.status || 'unknown');
+        const _st = siteData.status || 'unknown';
+        dot.style.background = statusDotColor(_st);
+        if (_st === 'healthy' || _st === 'active') dot.classList.add('mini-dot-healthy');
+        else if (_st === 'down') dot.classList.add('mini-dot-down');
+        else if (_st === 'degraded' || _st === 'warning') dot.classList.add('mini-dot-degraded');
+        dot.title = meta.name + ' — ' + _st;
         dot.addEventListener('click', () => showDetail({ id: siteId, status: siteData.status || 'unknown', data: siteData }));
         label.appendChild(dot);
         label.appendChild(document.createTextNode(meta.name));
@@ -1729,7 +1768,7 @@ function updateSubsystemGrid(data) {
     const callSites = data.call_sites || {};
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
-        const box = renderSubsystemBox(group, data);
+        const box = renderSubsystemBox(group, data, key);
         if (!box) continue;
 
         // Subsystem-specific enrichment from snapshot data
@@ -1789,6 +1828,43 @@ function tickUpdateTimer() {
     document.getElementById('last-update').textContent = elapsed + 's ago';
 }
 
+function updateHeaderBadges(data) {
+    // Resilience badge
+    const hbRes = document.getElementById('hb-resilience');
+    if (hbRes) {
+        const res = data.resilience || 'unknown';
+        const isOk = res === 'L0' || res === 'normal' || res === 'not configured';
+        hbRes.style.display = 'inline-flex';
+        hbRes.style.background = isOk ? 'rgba(22,101,52,0.5)' : 'rgba(133,77,14,0.5)';
+        hbRes.querySelector('.hb-dot').style.background = isOk ? '#4ade80' : '#facc15';
+        hbRes.querySelector('.hb-text').textContent = res;
+        hbRes.querySelector('.hb-text').style.color = isOk ? '#4ade80' : '#facc15';
+    }
+    // CC status badge
+    const hbCc = document.getElementById('hb-cc');
+    if (hbCc && data.cc_sessions) {
+        const ccSt = data.cc_sessions.realtime_status || 'unknown';
+        const ccOk = ccSt === 'NORMAL';
+        hbCc.style.display = 'inline-flex';
+        hbCc.style.background = ccOk ? 'rgba(22,101,52,0.5)' : 'rgba(133,77,14,0.5)';
+        hbCc.querySelector('.hb-dot').style.background = ccOk ? '#4ade80' : '#facc15';
+        hbCc.querySelector('.hb-text').textContent = 'CC ' + ccSt;
+        hbCc.querySelector('.hb-text').style.color = ccOk ? '#4ade80' : '#facc15';
+    }
+    // Call sites health summary
+    const hbSites = document.getElementById('hb-sites');
+    if (hbSites && data.call_sites) {
+        const sites = Object.values(data.call_sites);
+        const healthy = sites.filter(s => s.status === 'healthy' || s.status === 'active').length;
+        const total = sites.length;
+        const allOk = healthy === total;
+        hbSites.style.display = 'inline-flex';
+        hbSites.style.background = allOk ? 'rgba(22,101,52,0.4)' : 'rgba(30,41,59,0.6)';
+        hbSites.querySelector('.hb-text').textContent = healthy + '/' + total + ' sites';
+        hbSites.querySelector('.hb-text').style.color = allOk ? '#4ade80' : 'var(--color-text-secondary)';
+    }
+}
+
 async function fetchHealth() {
     try {
         const resp = await fetch('/api/genesis/health');
@@ -1801,6 +1877,7 @@ async function fetchHealth() {
         updateSidePanel(lastData);
         updateSurplus(lastData);
         updateSubsystemGrid(lastData);
+        updateHeaderBadges(lastData);
     } catch (e) {
         console.error('Health fetch failed:', e);
         document.getElementById('loading').textContent = 'Connection error \u2014 retrying...';

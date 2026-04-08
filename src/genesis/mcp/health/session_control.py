@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
+from pathlib import Path
 
 from genesis.mcp.health import mcp  # noqa: E402
 
@@ -10,6 +13,35 @@ logger = logging.getLogger(__name__)
 
 _VALID_MODELS = {"sonnet", "opus", "haiku"}
 _VALID_EFFORTS = {"low", "medium", "high", "max"}
+_SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
+
+
+def _persist_session_config(*, model: str | None = None, effort: str | None = None) -> None:
+    """Write current model/effort to disk for the SessionStart hook to read."""
+    import os
+    import tempfile
+
+    try:
+        data: dict = {}
+        if _SESSION_CONFIG.exists():
+            data = json.loads(_SESSION_CONFIG.read_text())
+        if model is not None:
+            data["model"] = model
+        if effort is not None:
+            data["effort"] = effort
+        _SESSION_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=_SESSION_CONFIG.parent, suffix=".tmp")
+        try:
+            os.write(fd, json.dumps(data).encode())
+            os.close(fd)
+            os.replace(tmp, _SESSION_CONFIG)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+                os.unlink(tmp)
+            raise
+    except Exception:
+        logger.debug("Failed to persist session config", exc_info=True)
 
 
 async def _impl_session_set_model(session_id: str, model: str) -> dict:
@@ -32,6 +64,7 @@ async def _impl_session_set_model(session_id: str, model: str) -> dict:
         )
         if not updated:
             return {"error": f"Session '{session_id}' not found"}
+        _persist_session_config(model=model)
         return {"success": True, "model": model, "note": "Takes effect on your next response."}
     except Exception as exc:
         logger.error("session_set_model failed for %s: %s", session_id[:8], exc, exc_info=True)
@@ -58,6 +91,7 @@ async def _impl_session_set_effort(session_id: str, effort: str) -> dict:
         )
         if not updated:
             return {"error": f"Session '{session_id}' not found"}
+        _persist_session_config(effort=effort)
         return {"success": True, "effort": effort, "note": "Takes effect on your next response."}
     except Exception as exc:
         logger.error("session_set_effort failed for %s: %s", session_id[:8], exc, exc_info=True)

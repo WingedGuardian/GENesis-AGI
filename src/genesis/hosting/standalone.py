@@ -328,14 +328,8 @@ class StandaloneAdapter:
     async def _start_telegram(self) -> None:
         """Load and start Telegram adapter if configured.
 
-        Reuses the loading logic from bridge.py without extracting it
-        (keeping bridge.py as the authoritative Telegram startup path
-        for now — this is a thin caller).
-
-        NOTE: TopicManager wiring (forum topic routing) is not yet
-        supported in standalone mode.  If TELEGRAM_FORUM_CHAT_ID is set,
-        forum routing will not work.  bridge.py remains the authoritative
-        path for full Telegram features.
+        Reuses the loading logic from bridge.py, including TopicManager
+        wiring for forum topic routing (reflection, outreach, awareness).
         """
         try:
             from genesis.channels.bridge import _load_bridge_config
@@ -427,6 +421,40 @@ class StandaloneAdapter:
 
             await adapter.start()
             logger.info("Telegram adapter started")
+
+            # TopicManager wiring — forum topic routing for reflections,
+            # outreach, and awareness.  Ported from channels/bridge.py.
+            if config.get("forum_chat_id") and adapter._app:
+                from genesis.channels.telegram.topics import TopicManager
+
+                topic_manager = TopicManager(
+                    adapter._app.bot,
+                    config["forum_chat_id"],
+                    db=rt.db,
+                )
+                await topic_manager.load_persisted()
+
+                for cat in (
+                    "conversation", "morning_report", "alert",
+                    "reflection_micro", "reflection_light",
+                    "reflection_deep", "reflection_strategic",
+                    "surplus", "recon",
+                ):
+                    await topic_manager.get_or_create_persistent(cat)
+
+                if rt.cc_reflection_bridge:
+                    rt.cc_reflection_bridge.set_topic_manager(topic_manager)
+                if rt.outreach_pipeline:
+                    rt.outreach_pipeline.set_topic_manager(topic_manager)
+                    rt.outreach_pipeline.set_forum_chat_id(config["forum_chat_id"])
+                if rt.awareness_loop:
+                    rt.awareness_loop.set_topic_manager(topic_manager)
+
+                logger.info(
+                    "Forum topics enabled (chat_id=%s) — %d categories",
+                    config["forum_chat_id"],
+                    len(topic_manager._persistent_topics),
+                )
 
         except Exception:
             logger.exception("Failed to start Telegram adapter")

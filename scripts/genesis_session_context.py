@@ -44,6 +44,7 @@ _SETUP_COMPLETE = Path.home() / ".genesis" / "setup-complete"
 _IDENTITY_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "identity"
 _IDENTITY_FILES = ["SOUL.md", "USER.md", "CONVERSATION.md", "STEERING.md"]
 _SESSION_START_FILE = Path.home() / ".genesis" / "session_start"
+_SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "src" / "genesis" / "skills"
 
 
@@ -69,6 +70,21 @@ def main() -> None:
         # (bridge manages its own session tracking)
         _SESSION_START_FILE.parent.mkdir(parents=True, exist_ok=True)
         _SESSION_START_FILE.write_text(datetime.now(UTC).isoformat())
+
+        # 0.5. Session Configuration — inject last-known model/effort so
+        # the LLM can display an accurate header. Updated by the
+        # session_set_model / session_set_effort MCP tools.
+        if _SESSION_CONFIG.exists():
+            import json
+
+            try:
+                cfg = json.loads(_SESSION_CONFIG.read_text())
+                model = cfg.get("model", "unknown")
+                effort = cfg.get("effort", "unknown")
+                _emit(f"## Session Configuration\n\nmodel: {model}\neffort: {effort}\n")
+                first = False
+            except Exception as exc:
+                print(f"[session_context] Failed to read session config: {exc}", file=sys.stderr)
 
         # 1. Identity files (disk, always available, no external deps)
         for name in _IDENTITY_FILES:

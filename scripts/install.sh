@@ -424,11 +424,12 @@ if ! command -v jq &>/dev/null; then
     echo "    + jq installed"
 fi
 
-# Node.js version check — returns 0 if installed version >= 18
+# Node.js version check — returns 0 if installed version >= 20
+# Node 18 EOL'd Sep 2025. Node 20 is current LTS.
 _node_version_ok() {
     command -v node &>/dev/null || return 1
     local ver; ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${ver:-0}" -ge 18 ] 2>/dev/null
+    [ "${ver:-0}" -ge 20 ] 2>/dev/null
 }
 
 # Install Node.js with full fallback chain: pkg-mgr → NodeSource → nvm
@@ -475,7 +476,7 @@ else
     else
         echo ""
         echo "    ERROR: Node.js ${NODE_MAJOR}.x install failed by all methods."
-        echo "    Claude Code requires Node.js >= 18. Install manually, then re-run:"
+        echo "    Claude Code requires Node.js >= 20. Install manually, then re-run:"
         echo "      Ubuntu/Debian: curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | sudo -E bash - && sudo apt-get install -y nodejs"
         echo "      AL2023/RHEL:   curl -fsSL https://rpm.nodesource.com/setup_${NODE_MAJOR}.x | sudo bash - && sudo dnf install -y nodejs"
         echo "      Universal:     curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.1/install.sh | bash"
