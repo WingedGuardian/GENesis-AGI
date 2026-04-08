@@ -537,8 +537,8 @@ These add local embedding support (privacy, speed). Without them, Genesis uses c
 
 | Component | What it does | Install |
 |---|---|---|
-| **[Ollama](https://ollama.com)** | Local embedding models on Linux/Mac | `curl -fsSL https://ollama.com/install.sh \| sh` |
-| **[LM Studio](https://lmstudio.ai)** | Local embedding models with a GUI (Windows/Mac/Linux) | Download from [lmstudio.ai](https://lmstudio.ai) |
+| **[Ollama](https://ollama.com)** | Local embedding models on Windows/Linux/Mac. Can run on same machine or seperatly. | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[LM Studio](https://lmstudio.ai)** | Local embedding models with a GUI (Windows/Mac/Linux). Can run on same machine or seperatly. | Download from [lmstudio.ai](https://lmstudio.ai) |
 
 The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
