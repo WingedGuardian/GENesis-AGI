@@ -27,6 +27,33 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_MEMORY_STAT_PATH = "/sys/fs/cgroup/memory.stat"
+
+
+def _read_memory_stat() -> dict:
+    """Parse cgroup memory.stat into anon/file/kernel breakdown (GiB).
+
+    Returns empty dict if unavailable — callers merge safely via .update().
+    """
+    try:
+        stats: dict[str, int] = {}
+        with open(_MEMORY_STAT_PATH) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in ("anon", "file", "kernel"):
+                    stats[parts[0]] = int(parts[1])
+        if not stats:
+            return {}
+        to_gb = 1 / (1024**3)
+        return {
+            "anon_gb": round(stats.get("anon", 0) * to_gb, 2),
+            "file_gb": round(stats.get("file", 0) * to_gb, 2),
+            "kernel_gb": round(stats.get("kernel", 0) * to_gb, 2),
+        }
+    except (OSError, ValueError):
+        return {}
+
+
 # Module-level state for delta-based CPU reading (no blocking sleep)
 _last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
 
@@ -157,12 +184,16 @@ async def infrastructure(
         if mem and mem[1] > 0:
             current, limit = mem
             pct = current / limit
-            infra["container_memory"] = {
+            mem_info: dict = {
                 "status": "healthy" if pct < 0.85 else ("degraded" if pct < 0.95 else "down"),
                 "current_gb": round(current / (1024**3), 1),
                 "limit_gb": round(limit / (1024**3), 1),
                 "used_pct": round(pct * 100, 1),
             }
+            # Decompose into anon/file/kernel — "83% memory" is meaningless
+            # without knowing what's reclaimable (incident 2026-04-08)
+            mem_info.update(_read_memory_stat())
+            infra["container_memory"] = mem_info
         else:
             infra["container_memory"] = {"status": "unavailable"}
     except Exception as exc:

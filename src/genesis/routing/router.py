@@ -187,15 +187,29 @@ class Router:
                     )
 
             if result.success:
-                # Record cost
-                if result.cost_usd > 0:
+                # Record cost — always record when cost is known positive,
+                # AND when cost is unknown (so blind spending is visible).
+                if result.cost_usd > 0 or not result.cost_known:
                     try:
-                        await self.cost_tracker.record(call_site_id, provider_name, result)
+                        await self.cost_tracker.record(
+                            call_site_id, provider_name, result,
+                            cost_known=result.cost_known,
+                        )
                     except Exception:
                         logger.warning(
                             "Cost recording failed for %s/%s ($%.4f)",
                             call_site_id, provider_name, result.cost_usd, exc_info=True,
                         )
+                # Alert on unknown-cost calls with real output
+                if not result.cost_known and result.output_tokens > 0 and self._event_bus:
+                    await self._event_bus.emit(
+                        Subsystem.ROUTING, Severity.WARNING,
+                        "provider.cost_unknown",
+                        f"Call site {call_site_id}: {provider_name} returned "
+                        f"{result.output_tokens} tokens but cost is unknown",
+                        call_site=call_site_id,
+                        provider=provider_name,
+                    )
                 cb.record_success()
 
                 # Emit fallback event when primary provider was skipped

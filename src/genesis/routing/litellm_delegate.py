@@ -81,16 +81,24 @@ class LiteLLMDelegate:
             )
             content = response.choices[0].message.content
             usage = getattr(response, "usage", None)
+            cost_known = True
             try:
                 cost = litellm.completion_cost(completion_response=response)
             except Exception:
                 cost = 0.0
+                cost_known = False
+                if _should_log_failure(provider):
+                    logger.warning(
+                        "Cost calculation failed for %s/%s — recording as $0.00",
+                        provider, model_string, exc_info=True,
+                    )
             return CallResult(
                 success=True,
                 content=content,
                 input_tokens=usage.prompt_tokens if usage else 0,
                 output_tokens=usage.completion_tokens if usage else 0,
                 cost_usd=cost,
+                cost_known=cost_known,
             )
         except litellm.RateLimitError as e:
             if _should_log_failure(provider):

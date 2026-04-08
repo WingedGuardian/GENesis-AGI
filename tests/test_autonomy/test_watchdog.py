@@ -319,22 +319,24 @@ class TestYamlLoading:
 
 
 class TestPageCacheReclaim:
-    def test_reclaim_succeeds_when_path_exists(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = type("R", (), {"returncode": 0})()
+    def test_reclaim_succeeds_when_path_exists(self, tmp_path: Path):
+        reclaim_file = tmp_path / "memory.reclaim"
+        reclaim_file.write_text("")
+        with patch("genesis.autonomy.watchdog.Path", return_value=reclaim_file):
+            # "1G" gets capped to "256M"
             assert reclaim_page_cache("1G") is True
-            mock_run.assert_called_once()
-            args = mock_run.call_args
-            assert "memory.reclaim" in str(args)
+            assert reclaim_file.read_text() == "256M"
 
     def test_reclaim_fails_gracefully(self):
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = type("R", (), {"returncode": 1, "stderr": "denied"})()
-            with patch("genesis.autonomy.watchdog.Path.exists", return_value=True):
-                assert reclaim_page_cache() is False
+        with patch("genesis.autonomy.watchdog.Path") as mock_path:
+            mock_reclaim = mock_path.return_value
+            mock_reclaim.exists.return_value = True
+            mock_reclaim.write_text.side_effect = OSError("Permission denied")
+            assert reclaim_page_cache() is False
 
     def test_reclaim_missing_path(self):
-        with patch("genesis.autonomy.watchdog.Path.exists", return_value=False):
+        with patch("genesis.autonomy.watchdog.Path") as mock_path:
+            mock_path.return_value.exists.return_value = False
             assert reclaim_page_cache() is False
 
 

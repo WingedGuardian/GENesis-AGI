@@ -27,7 +27,10 @@ class CostTracker:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._event_bus = event_bus
 
-    async def record(self, call_site_id: str, provider: str, result: CallResult) -> None:
+    async def record(
+        self, call_site_id: str, provider: str, result: CallResult,
+        *, cost_known: bool = True,
+    ) -> None:
         """Record an LLM call as a cost event."""
         await cost_events_crud.create(
             self.db,
@@ -38,6 +41,7 @@ class CostTracker:
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
             cost_usd=result.cost_usd,
+            cost_known=cost_known,
             metadata={"call_site": call_site_id},
             created_at=self._clock().isoformat(),
         )

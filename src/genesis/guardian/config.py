@@ -50,6 +50,8 @@ class ConfirmationConfig:
     required_failed_signals: int = 2
     bootstrap_grace_s: int = 300
     pause_reminder_hours: int = 24
+    confirmed_dead_timeout_s: int = 600  # Auto-reset after 10min stuck
+    max_auto_resets: int = 3  # Prevent infinite reset oscillation
 
 
 @dataclass

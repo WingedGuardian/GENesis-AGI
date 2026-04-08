@@ -341,7 +341,7 @@ async def _collect_disk(config: GuardianConfig) -> list[DiskInfo]:
 async def _collect_services(config: GuardianConfig) -> list[ServiceInfo]:
     """Collect systemd service status."""
     services = []
-    for svc in ["genesis-bridge", "genesis-watchdog.timer", "qdrant"]:
+    for svc in ["genesis-server", "genesis-watchdog.timer", "qdrant"]:
         try:
             is_user = svc != "qdrant"
             if is_user:
