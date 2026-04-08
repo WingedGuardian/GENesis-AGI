@@ -15,6 +15,9 @@
 #   --branch NAME          Branch to clone (default: main)
 #   --non-interactive      Skip all prompts
 #   -h, --help             Show this help
+#
+# Environment variables:
+#   TAILSCALE_AUTH_KEY  Pre-auth key for headless/CI installs (skips interactive prompt)
 
 set -euo pipefail
 
@@ -509,6 +512,54 @@ else
     fi
 fi
 
+# ── Tailscale (remote dashboard access) ──────────────────────────────────────
+# Most Genesis installs are headless VMs. Tailscale gives immediate remote access
+# to the dashboard from any device without port-forwarding or firewall changes.
+if ! command -v tailscale &>/dev/null; then
+    echo ""
+    echo "  Installing Tailscale (remote dashboard access)..."
+    if curl -fsSL https://tailscale.com/install.sh 2>/dev/null | sh 2>/dev/null; then
+        echo "  + Tailscale installed"
+    else
+        echo "  WARN: Tailscale install failed — dashboard will require SSH tunnel"
+        echo "        Manual install: https://tailscale.com/download"
+    fi
+fi
+
+if command -v tailscale &>/dev/null && ! tailscale ip -4 &>/dev/null; then
+    # Installed but not authenticated
+    if [ -n "${TAILSCALE_AUTH_KEY:-}" ]; then
+        sudo tailscale up --authkey "$TAILSCALE_AUTH_KEY" 2>/dev/null
+    elif [ "$NON_INTERACTIVE" = "0" ]; then
+        echo ""
+        echo "  ┌──────────────────────────────────────────────────────────────┐"
+        echo "  │  TAILSCALE: Authenticate to enable remote dashboard access.  │"
+        echo "  │  Visit the URL below in your browser.                        │"
+        echo "  │  (Free account at https://tailscale.com if you need one)     │"
+        echo "  └──────────────────────────────────────────────────────────────┘"
+        echo ""
+        # tailscale up prints the auth URL directly to the terminal
+        sudo tailscale up &
+        _ts_pid=$!
+        # Poll for auth completion (up to 120s)
+        _ts_i=0
+        while [ "$_ts_i" -lt 40 ]; do
+            sleep 3
+            _ts_i=$((_ts_i + 1))
+            tailscale ip -4 &>/dev/null && break
+        done
+        wait "$_ts_pid" 2>/dev/null || true
+        if tailscale ip -4 &>/dev/null; then
+            echo "  + Tailscale authenticated: $(tailscale ip -4)"
+        else
+            echo "  WARN: Tailscale auth timed out. Run 'sudo tailscale up' later."
+        fi
+    else
+        echo "  Tailscale installed but not authenticated (non-interactive mode)."
+        echo "  Run 'sudo tailscale up' after setup to enable remote dashboard access."
+    fi
+fi
+
 # ── Detect network topology ───────────────────────────────────
 # Figure out how the user will access the dashboard from their browser.
 # Capture all available IPs for the final report and CLAUDE.md injection.
@@ -644,17 +695,75 @@ if [ -f "$_guardian_script" ]; then
             XDG_RUNTIME_DIR="/run/user/$_guardian_uid" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_guardian_uid/bus" \
             bash "$_guardian_script" $_guardian_flags || {
-            echo "  WARNING: Guardian installation failed."
-            echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
+            echo ""
+            echo "  ┌──────────────────────────────────────────────────────────────┐"
+            echo "  │  Guardian installation FAILED.                               │"
+            echo "  │  Guardian is a core Genesis subsystem (health monitoring,    │"
+            echo "  │  diagnosis, and recovery). Fix the error above and re-run:   │"
+            echo "  └──────────────────────────────────────────────────────────────┘"
+            echo "    bash $_guardian_script --container-name $CONTAINER_NAME"
+            echo ""
         }
     else
         bash "$_guardian_script" $_guardian_flags || {
-            echo "  WARNING: Guardian installation failed."
-            echo "  Run manually later: bash $_guardian_script --container-name $CONTAINER_NAME"
+            echo ""
+            echo "  ┌──────────────────────────────────────────────────────────────┐"
+            echo "  │  Guardian installation FAILED.                               │"
+            echo "  │  Guardian is a core Genesis subsystem (health monitoring,    │"
+            echo "  │  diagnosis, and recovery). Fix the error above and re-run:   │"
+            echo "  └──────────────────────────────────────────────────────────────┘"
+            echo "    bash $_guardian_script --container-name $CONTAINER_NAME"
+            echo ""
         }
     fi
 else
     echo "  WARNING: Guardian install script not found at $_guardian_script"
+fi
+
+# ── Node.js + Claude Code on host ─────────────────────────────
+# Claude Code is installed inside the container by install.sh, but users also
+# need it on the host VM for Guardian CC sessions and direct interaction.
+# Node.js >= 18 is required by Claude Code.
+echo ""
+echo "  Setting up Claude Code on the host..."
+
+_host_node_ok=0
+if command -v node &>/dev/null; then
+    _node_ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
+    [ "${_node_ver:-0}" -ge 18 ] 2>/dev/null && _host_node_ok=1
+fi
+
+if [ "$_host_node_ok" = "0" ]; then
+    echo "  Installing Node.js 20.x on host..."
+    if command -v apt-get &>/dev/null; then
+        if curl -fsSL https://deb.nodesource.com/setup_20.x 2>/dev/null | sudo -E bash - 2>/dev/null; then
+            sudo apt-get install -y -qq nodejs 2>/dev/null
+        fi
+    elif command -v dnf &>/dev/null; then
+        if curl -fsSL https://rpm.nodesource.com/setup_20.x 2>/dev/null | sudo bash - 2>/dev/null; then
+            sudo dnf install -y nodejs 2>/dev/null
+        fi
+    fi
+    if command -v node &>/dev/null; then
+        echo "  + Node.js $(node --version) installed on host"
+    else
+        echo "  WARNING: Could not install Node.js on host."
+        echo "  Claude Code won't be available on the host (still works inside the container)."
+    fi
+fi
+
+CC_VERSION="${CC_VERSION:-2.1.87}"
+if ! command -v claude &>/dev/null; then
+    echo "  Installing Claude Code v${CC_VERSION} on host..."
+    if command -v npm &>/dev/null; then
+        sudo npm install -g "@anthropic-ai/claude-code@${CC_VERSION}" 2>/dev/null && \
+            echo "  + Claude Code $(claude --version 2>/dev/null || echo "$CC_VERSION") installed on host" || \
+            echo "  WARNING: npm install of Claude Code failed."
+    else
+        echo "  WARNING: npm not found — cannot install Claude Code on host."
+    fi
+else
+    echo "  . Claude Code already on host ($(claude --version 2>/dev/null))"
 fi
 
 # ── Convenience alias on host ─────────────────────────────────
@@ -722,14 +831,14 @@ else
     echo "    http://$CONTAINER_IP:5000/genesis  (container IP — host only)"
 fi
 echo ""
-echo "  GUARDIAN:"
+echo "  GUARDIAN (host-side health monitor — always running):"
 echo ""
 echo "    Status: systemctl --user status genesis-guardian.timer"
+echo "    Logs:   journalctl --user -u genesis-guardian -f"
 if [ "$_guardian_cc_status" = "not authenticated" ]; then
-    echo "    AI diagnosis: not yet enabled"
-    echo "    To enable:    claude login  (run on this host, outside the container)"
-else
-    echo "    AI diagnosis: enabled (Claude Code authenticated)"
+    echo ""
+    echo "    Agentic diagnosis: run 'claude login' on this host to enable"
+    echo "    (Guardian monitors and alerts without it — diagnosis is an add-on)"
 fi
 echo ""
 echo "  NETWORK:"
