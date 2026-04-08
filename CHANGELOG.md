@@ -7,6 +7,29 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a2-hf5] - 2026-04-07
+
+### Added
+
+- **Tailscale in host setup** — `host-setup.sh` now installs Tailscale and
+  prompts for authentication during setup. Headless server users get an
+  immediately usable dashboard URL on their tailnet without SSH tunneling.
+  Supports `TAILSCALE_AUTH_KEY` env var for CI/unattended installs.
+- **Node.js + Claude Code on host VM** — `host-setup.sh` now installs
+  Node.js 20.x and Claude Code on the host VM (not just inside the
+  container), enabling Guardian CC diagnosis sessions and direct host
+  interaction from day one.
+
+### Changed
+
+- **Guardian framing** — Guardian is no longer framed as optional. Install
+  failures now show a prominent box identifying Guardian as a core subsystem
+  (health monitoring, diagnosis, recovery) that must be fixed. Final setup
+  report reworded: Guardian is "always running"; Claude Code auth enables
+  agentic diagnosis as an add-on, not as the thing that "enables" Guardian.
+
+---
+
 ## [3.0a2-hf4]
 
 ### Fixed
