@@ -21,6 +21,9 @@
 
 set -euo pipefail
 
+# Clear re-exec guard from parent environment (prevents sudo -E leak)
+unset _GENESIS_REEXEC 2>/dev/null || true
+
 # ── Error handling ──────────────────────────────────────────
 # Print the failing line and command on any error so debugging
 # doesn't require back-and-forth guesswork.
@@ -54,6 +57,8 @@ BRANCH="main"
 NON_INTERACTIVE=0
 INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
 _ORIG_ARGS="$*"
+_install_ok=1      # tracks install.sh success
+_guardian_ok=1     # tracks Guardian install success
 
 # ── Parse args ───────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -239,7 +244,13 @@ fi
 # Rather than asking the user to log out/in or run newgrp manually, re-exec
 # the entire script under `sg incus-admin` which activates the group immediately.
 if [ "$(id -u)" != "0" ] && ! id -Gn | grep -qw "incus-admin"; then
+    if [ "${_GENESIS_REEXEC:-}" = "1" ]; then
+        echo "  FATAL: incus-admin group activation failed after re-exec."
+        echo "  Log out and back in, then re-run this script."
+        exit 1
+    fi
     echo "  Activating incus-admin group (re-running script)..."
+    export _GENESIS_REEXEC=1
     exec sg incus-admin -c "\"$(realpath "$0")\" $_ORIG_ARGS"
 fi
 
@@ -318,16 +329,16 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
     _container_state=$(incus info "$CONTAINER_NAME" 2>/dev/null | grep -oP 'Status: \K\w+' || echo "unknown")
 
     if [ "$_container_state" = "RUNNING" ]; then
-        # Check critical paths
-        incus exec "$CONTAINER_NAME" -- test -w /tmp 2>/dev/null || {
+        # Check critical paths (timeout prevents hang on unresponsive containers)
+        timeout 10 incus exec "$CONTAINER_NAME" -- test -w /tmp 2>/dev/null || {
             _container_healthy=0
             _container_issues="${_container_issues}    - /tmp is missing or not writable\n"
         }
-        incus exec "$CONTAINER_NAME" -- test -d /home/ubuntu/genesis 2>/dev/null || {
+        timeout 10 incus exec "$CONTAINER_NAME" -- test -d /home/ubuntu/genesis 2>/dev/null || {
             _container_healthy=0
             _container_issues="${_container_issues}    - Genesis repo not found\n"
         }
-        incus exec "$CONTAINER_NAME" -- test -x /home/ubuntu/genesis/.venv/bin/python 2>/dev/null || {
+        timeout 10 incus exec "$CONTAINER_NAME" -- test -x /home/ubuntu/genesis/.venv/bin/python 2>/dev/null || {
             _container_healthy=0
             _container_issues="${_container_issues}    - Python venv missing or broken\n"
         }
@@ -454,7 +465,7 @@ if [ -z "$_CONTAINER_IP" ]; then
     # This handles the case where DHCP failed on boot (e.g. UFW was blocking it
     # and we just added the allow rules above).
     incus exec "$CONTAINER_NAME" -- networkctl reconfigure eth0 2>/dev/null || true
-    for _i in 1 2 3 4 5 6; do
+    for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
         sleep 2
         _CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' | head -1 || true)
         [ -n "$_CONTAINER_IP" ] && break
@@ -462,7 +473,7 @@ if [ -z "$_CONTAINER_IP" ]; then
 fi
 
 if [ -z "$_CONTAINER_IP" ]; then
-    echo "  FATAL: Container has no IPv4 address after 12s."
+    echo "  FATAL: Container has no IPv4 address after 30s."
     echo ""
     echo "  This usually means the host firewall is blocking DHCP (UDP:67) on the"
     echo "  Incus bridge. UFW 'deny (incoming)' default drops DHCP Discover packets"
@@ -689,6 +700,7 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
         -t --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
+        _install_ok=0
         echo "  WARNING: install.sh exited with errors."
         echo "  Connect to the container to debug:"
         echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID --cwd /home/ubuntu/genesis -t -- bash -l"
@@ -711,28 +723,28 @@ _smoke_ok=0
 _smoke_fail=""
 
 # 1. /tmp exists and is writable
-if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
+if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n"
 fi
 
 # 2. Python works
-if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
+if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n"
 fi
 
 # 3. Genesis venv is intact
-if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
+if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n"
 fi
 
 # 4. Qdrant is reachable
-if incus exec "$CONTAINER_NAME" -- curl -sf http://localhost:6333/collections &>/dev/null; then
+if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n"
@@ -742,7 +754,7 @@ fi
 _server_tries=0
 _server_ok=0
 while [ "$_server_tries" -lt 5 ]; do
-    if incus exec "$CONTAINER_NAME" -- curl -sf http://localhost:5000/api/genesis/health &>/dev/null; then
+    if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:5000/api/genesis/health &>/dev/null; then
         _server_ok=1
         break
     fi
@@ -830,6 +842,7 @@ if [ -f "$_guardian_script" ]; then
             XDG_RUNTIME_DIR="/run/user/$_guardian_uid" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$_guardian_uid/bus" \
             bash "$_guardian_script" $_guardian_flags || {
+            _guardian_ok=0
             echo ""
             echo "  ┌──────────────────────────────────────────────────────────────┐"
             echo "  │  Guardian installation FAILED.                               │"
@@ -841,6 +854,7 @@ if [ -f "$_guardian_script" ]; then
         }
     else
         bash "$_guardian_script" $_guardian_flags || {
+            _guardian_ok=0
             echo ""
             echo "  ┌──────────────────────────────────────────────────────────────┐"
             echo "  │  Guardian installation FAILED.                               │"
@@ -926,7 +940,15 @@ fi
 
 echo ""
 echo "  ─────────────────────────────────────────"
-echo "  Genesis is ready."
+if [ "$_install_ok" = "0" ]; then
+    echo "  Genesis setup INCOMPLETE — install.sh had errors (see above)."
+elif [ "$_guardian_ok" = "0" ]; then
+    echo "  Genesis is ready (Guardian failed — see above)."
+elif [ -n "${_smoke_fail:-}" ]; then
+    echo "  Genesis setup completed with issues (see smoke test above)."
+else
+    echo "  Genesis is ready."
+fi
 echo "  ─────────────────────────────────────────"
 echo ""
 echo "  STEP 1 — Connect to Genesis:"

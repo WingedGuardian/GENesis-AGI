@@ -444,7 +444,7 @@ async def _proceed_to_diagnosis(
     # CC-driven recovery: if CC already resolved the issue, verify and report
     if diagnosis.outcome == "resolved":
         logger.info("CC resolved the issue — verifying recovery")
-        await _handle_cc_resolved(config, sm, dispatcher, diagnosis)
+        await _handle_cc_resolved(config, sm, dispatcher, diagnosis, recovery_engine)
         return
 
     sm.set_confirmed_dead()
@@ -459,12 +459,14 @@ async def _handle_cc_resolved(
     sm: ConfirmationStateMachine,
     dispatcher: AlertDispatcher,
     diagnosis: object,
+    recovery_engine: RecoveryEngine | None = None,
 ) -> None:
     """CC already fixed the problem — verify and report.
 
     When the agentic CC session resolves the issue itself (investigation +
     recovery + verification), we skip the approval flow and just confirm
-    health has returned.
+    health has returned. If verification fails, falls through to approval-
+    gated recovery (never exits passively).
     """
     # Verify by re-checking signals
     await asyncio.sleep(config.recovery.verification_delay_s)
@@ -489,14 +491,25 @@ async def _handle_cc_resolved(
             "CC reported resolved but signals still failing — "
             "falling back to approval-based recovery",
         )
-        await dispatcher.send(Alert(
-            severity=AlertSeverity.WARNING,
-            title="CC recovery did not fully resolve — escalating",
-            body=f"CC reported: {diagnosis.likely_cause}\n"
-                 f"Actions taken: {actions_str}\n"
-                 f"But health signals still show failure. "
-                 f"Manual investigation may be needed.",
-        ))
+        if recovery_engine is not None:
+            # Ensure state is CONFIRMED_DEAD before approval flow —
+            # may still be in SURVEYING if called from _proceed_to_diagnosis
+            if sm.current_state != GuardianState.CONFIRMED_DEAD:
+                sm.set_confirmed_dead()
+            # Route to approval gate — never exit passively
+            await _execute_recovery_with_approval(
+                config, sm, dispatcher, recovery_engine, diagnosis,
+            )
+        else:
+            # Defensive: should not happen (callers pass recovery_engine),
+            # but send alert rather than silently dropping
+            await dispatcher.send(Alert(
+                severity=AlertSeverity.CRITICAL,
+                title="CC recovery failed — manual intervention required",
+                body=f"CC reported: {diagnosis.likely_cause}\n"
+                     f"Actions taken: {actions_str}\n"
+                     f"Signals still failing. Approval gate unavailable.",
+            ))
 
 
 async def _handle_confirmed_dead(
@@ -522,15 +535,15 @@ async def _handle_confirmed_dead(
     # Track CC availability transitions
     if diagnosis.source == "cc_unavailable":
         sm.set_cc_unavailable()
-        # Throttle CC-unavailable alerts to once per 24h
-        if not sm.cc_unavailable_alert_due():
-            logger.warning(
-                "CC still unavailable, Genesis still down — next reminder in <24h (since %s)",
-                sm.state.cc_unavailable_since,
-            )
-            return
         sm.record_cc_unavailable_alert()
-        logger.warning("CC unavailable — sending daily reminder alert")
+        logger.warning(
+            "CC unavailable — routing through approval gate with fallback diagnosis",
+        )
+        # Don't return early — fall through to approval gate. The approval
+        # server blocks for token_expiry_s (default 86400s = 24h), and the
+        # Guardian is a oneshot service so the timer won't overlap. This
+        # effectively throttles to one approval cycle per token_expiry_s.
+        # NOTE: if token_expiry_s is changed, this implicit throttle changes too.
     elif diagnosis.source == "cc":
         if sm.state.cc_unavailable_since:
             logger.info("CC recovered — proceeding with CC diagnosis")
@@ -539,7 +552,7 @@ async def _handle_confirmed_dead(
     # CC-driven recovery: if CC already resolved, verify and report
     if diagnosis.outcome == "resolved":
         logger.info("CC resolved the issue on re-diagnosis — verifying")
-        await _handle_cc_resolved(config, sm, dispatcher, diagnosis)
+        await _handle_cc_resolved(config, sm, dispatcher, diagnosis, recovery_engine)
         return
 
     if sm.should_escalate():
@@ -571,6 +584,10 @@ async def _execute_recovery_with_approval(
     from genesis.guardian.diagnosis import RecoveryAction
 
     if diagnosis.recommended_action == RecoveryAction.ESCALATE:
+        # ESCALATE is not an automated action — it means "all automated
+        # recovery options exhausted, alert the user." No approval gate
+        # needed because there's nothing to approve. The recovery engine
+        # sends a clear alert asking for manual intervention.
         await recovery_engine.execute(diagnosis)
         return
 

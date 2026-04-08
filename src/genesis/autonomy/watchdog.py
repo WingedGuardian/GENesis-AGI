@@ -401,13 +401,13 @@ _last_reclaim_time: float = 0.0
 
 
 def reclaim_page_cache(target_bytes: str = "128M") -> bool:
-    """Reclaim file-backed page cache from user.slice cgroup.
+    """Reclaim file-backed page cache via cgroup v2 memory.reclaim.
 
-    Uses cgroup v2 memory.reclaim in small, guarded increments.
-    Large reclaims (>256M) cause I/O storms in I/O-limited containers
-    because evicted active pages are immediately re-faulted from disk,
-    saturating the cgroup I/O budget and creating a death spiral
-    (incident 2026-03-16).
+    Uses the user-owned cgroup path (no sudo needed). Small, guarded
+    increments only — large reclaims (>256M) cause I/O storms in
+    I/O-limited containers because evicted active pages are immediately
+    re-faulted from disk, saturating the cgroup I/O budget and creating
+    a death spiral (incident 2026-03-16).
     """
     global _last_reclaim_time
 
@@ -422,30 +422,23 @@ def reclaim_page_cache(target_bytes: str = "128M") -> bool:
         )
         target_bytes = "256M"
 
-    reclaim_path = Path("/sys/fs/cgroup/user.slice/memory.reclaim")
-    if not reclaim_path.exists() and "unittest.mock" not in type(subprocess.run).__module__:
+    # Use the user-owned cgroup path — writable without sudo.
+    # The user.slice/memory.reclaim path requires root (--w------- root),
+    # but the user@1000.service path is owned by ubuntu (incident 2026-04-08).
+    reclaim_path = Path(
+        "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/memory.reclaim"
+    )
+    if not reclaim_path.exists():
         logger.warning("memory.reclaim not available — skipping page cache reclaim")
         return False
 
     try:
-        result = subprocess.run(
-            ["sudo", "tee", str(reclaim_path)],
-            input=target_bytes, capture_output=True, text=True,
-            timeout=5,  # Short timeout — if reclaim stalls, bail out
-        )
-        if result.returncode == 0:
-            _last_reclaim_time = now
-            logger.info("Page cache reclaim succeeded (requested %s)", target_bytes)
-            return True
-        logger.warning("Page cache reclaim failed: %s", result.stderr.strip())
-        return False
-    except subprocess.TimeoutExpired:
-        logger.error(
-            "Page cache reclaim TIMED OUT after 5s — I/O system may be saturated"
-        )
-        return False
-    except (FileNotFoundError, OSError):
-        logger.warning("Page cache reclaim unavailable", exc_info=True)
+        reclaim_path.write_text(target_bytes)
+        _last_reclaim_time = now
+        logger.info("Page cache reclaim succeeded (requested %s)", target_bytes)
+        return True
+    except OSError as exc:
+        logger.warning("Page cache reclaim failed: %s", exc)
         return False
 
 

@@ -68,6 +68,7 @@ class StateData:
     dialogue_action: str | None = None
     cc_unavailable_since: str | None = None
     last_cc_unavailable_alert_at: str | None = None
+    auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +88,7 @@ class StateData:
             "dialogue_action": self.dialogue_action,
             "cc_unavailable_since": self.cc_unavailable_since,
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
+            "auto_reset_count": self.auto_reset_count,
         }
 
     @classmethod
@@ -112,6 +114,7 @@ class StateData:
             dialogue_action=data.get("dialogue_action"),
             cc_unavailable_since=data.get("cc_unavailable_since"),
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
+            auto_reset_count=data.get("auto_reset_count", 0),
         )
 
 
@@ -263,11 +266,45 @@ class ConfirmationStateMachine:
                 # Container recovered on its own (services restarted,
                 # slow boot, independent fix, etc.)
                 self._reset_to_healthy(now)
+                self._state.auto_reset_count = 0  # Genuine recovery clears oscillation guard
                 return Transition(
                     old_state=old_state,
                     new_state=GuardianState.HEALTHY,
                     reason="all signals healthy — auto-recovered from confirmed_dead",
                 )
+
+            # Auto-reset timeout: if stuck in confirmed_dead too long,
+            # reset to HEALTHY to re-evaluate from scratch. Prevents
+            # permanent stuck state when the root cause (e.g., auth
+            # blocking probes) has been fixed but a secondary signal
+            # remains flaky.
+            timeout_s = self._config.confirmation.confirmed_dead_timeout_s
+            max_resets = self._config.confirmation.max_auto_resets
+            if (
+                self._state.first_failure_at
+                and self._state.auto_reset_count < max_resets
+            ):
+                try:
+                    first = datetime.fromisoformat(self._state.first_failure_at)
+                    stuck_s = (datetime.now(UTC) - first).total_seconds()
+                except (ValueError, TypeError):
+                    stuck_s = 0.0
+                if stuck_s > timeout_s:
+                    self._state.auto_reset_count += 1
+                    logger.warning(
+                        "confirmed_dead timeout (%.0fs > %ds, reset %d/%d) — "
+                        "auto-resetting to re-evaluate",
+                        stuck_s, timeout_s,
+                        self._state.auto_reset_count, max_resets,
+                    )
+                    self._reset_to_healthy(now)
+                    return Transition(
+                        old_state=old_state,
+                        new_state=GuardianState.HEALTHY,
+                        reason=f"auto-reset after {stuck_s:.0f}s in confirmed_dead "
+                               f"(reset {self._state.auto_reset_count}/{max_resets})",
+                    )
+
             return Transition(
                 old_state=old_state,
                 new_state=GuardianState.CONFIRMED_DEAD,
@@ -357,6 +394,10 @@ class ConfirmationStateMachine:
         """Transition from HEALTHY state."""
         if snapshot.all_alive:
             self._state.last_healthy_at = now
+            # Clear auto-reset oscillation guard — system has been healthy
+            # for a full check cycle, so any prior incident is resolved.
+            if self._state.auto_reset_count > 0:
+                self._state.auto_reset_count = 0
             return Transition(
                 old_state=GuardianState.HEALTHY,
                 new_state=GuardianState.HEALTHY,
@@ -581,17 +622,6 @@ class ConfirmationStateMachine:
     def record_cc_unavailable_alert(self) -> None:
         """Record that we sent a CC-unavailable alert."""
         self._state.last_cc_unavailable_alert_at = datetime.now(UTC).isoformat()
-
-    def cc_unavailable_alert_due(self) -> bool:
-        """Check if a CC-unavailable reminder alert is due (24h interval)."""
-        if not self._state.last_cc_unavailable_alert_at:
-            return True  # Never alerted — first alert is always due
-        try:
-            last = datetime.fromisoformat(self._state.last_cc_unavailable_alert_at)
-            hours = (datetime.now(UTC) - last).total_seconds() / 3600
-            return hours >= 24
-        except (ValueError, TypeError):
-            return True
 
     def should_escalate(self) -> bool:
         """Check if we've exceeded max recovery attempts."""

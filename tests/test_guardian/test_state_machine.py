@@ -362,23 +362,6 @@ class TestCCUnavailabilityTracking:
         assert sm.state.cc_unavailable_since is None
         assert sm.state.last_cc_unavailable_alert_at is None
 
-    def test_alert_due_on_first_occurrence(self, sm: ConfirmationStateMachine) -> None:
-        """First alert is always due."""
-        assert sm.cc_unavailable_alert_due() is True
-
-    def test_alert_not_due_after_recent_alert(
-        self, sm: ConfirmationStateMachine,
-    ) -> None:
-        sm.record_cc_unavailable_alert()
-        assert sm.cc_unavailable_alert_due() is False
-
-    def test_alert_due_after_24h(self, sm: ConfirmationStateMachine) -> None:
-        from datetime import UTC, datetime, timedelta
-
-        old = (datetime.now(UTC) - timedelta(hours=25)).isoformat()
-        sm._state.last_cc_unavailable_alert_at = old
-        assert sm.cc_unavailable_alert_due() is True
-
     def test_reset_to_healthy_clears_cc_state(
         self, sm: ConfirmationStateMachine,
     ) -> None:

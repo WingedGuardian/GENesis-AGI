@@ -227,7 +227,32 @@ class AutonomousCliApprovalGate:
                 "Resolved autonomous CLI approval %s as %s via %s reply",
                 request_id, decision, self._policy().approval_channel,
             )
+            # Batch: when user approves one, approve ALL other pending requests
+            if decision == "approved":
+                batch_count = await self.approve_all_pending(
+                    resolved_by=f"{self._policy().approval_channel}:batch",
+                )
+                if batch_count > 0:
+                    logger.info("Batch-approved %d additional pending requests", batch_count)
         return ok
+
+    async def approve_all_pending(self, *, resolved_by: str) -> int:
+        """Approve all pending CLI-fallback approval requests. Returns count.
+
+        Scoped to ``autonomous_cli_fallback`` action type only — does NOT
+        touch approval requests from other subsystems (ego, modules, etc.).
+        """
+        pending = await self._approval_manager.get_pending()
+        count = 0
+        for req in pending:
+            if req.get("action_type") != "autonomous_cli_fallback":
+                continue
+            ok = await self._approval_manager.resolve(
+                req["id"], status="approved", resolved_by=resolved_by,
+            )
+            if ok:
+                count += 1
+        return count
 
     async def resolve_request(
         self, request_id: str, *, decision: str, resolved_by: str,

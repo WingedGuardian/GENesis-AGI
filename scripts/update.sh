@@ -47,7 +47,14 @@ if [[ ! -f "$VENV_DIR/bin/pip" ]]; then
     echo "  Venv not found — run ./scripts/bootstrap.sh first."
     exit 1
 fi
-"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet
+"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1 || true
+if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+    echo "  FAIL: pip install completed but Genesis is not importable."
+    echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
+    # Attempt to restart services before exiting — they may have been stopped
+    systemctl --user start genesis-server 2>/dev/null || true
+    exit 1
+fi
 echo "  Dependencies synced"
 echo ""
 
