@@ -533,12 +533,12 @@ claude    # start your first session
 
 ### Optional components
 
+These add local embedding support (privacy, speed). Without them, Genesis uses cloud embedding APIs.
+
 | Component | What it does | Install |
 |---|---|---|
-| **[Qdrant](https://qdrant.tech)** | Vector database for semantic memory search | `docker run -d -p 6333:6333 qdrant/qdrant` |
-| **[Ollama](https://ollama.com)** / **LMstudio** | Local embedding models (privacy, speed) | `curl -fsSL https://ollama.com/install.sh \| sh` |
-
-Without Qdrant, Genesis falls back to SQLite FTS5 full-text search for memory. Without Ollama, it uses cloud embedding APIs. Both optional components enhance performance but aren't required to get started.
+| **[Ollama](https://ollama.com)** | Local embedding models on Linux/Mac | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[LM Studio](https://lmstudio.ai)** | Local embedding models with a GUI (Windows/Mac/Linux) | Download from [lmstudio.ai](https://lmstudio.ai) |
 
 The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
