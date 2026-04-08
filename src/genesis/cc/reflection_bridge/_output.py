@@ -266,6 +266,10 @@ async def _store_reflection_summary(output, *, source: str, now: str, db) -> Non
 async def send_to_topic(session_id: str, depth, output, *, topic_manager) -> None:
     """Send a reflection summary to the depth-specific topic."""
     if not topic_manager:
+        logger.warning(
+            "send_to_topic: topic_manager not set — skipping %s topic send",
+            depth.value,
+        )
         return
     category = f"reflection_{depth.value.lower()}"
     summary = (
