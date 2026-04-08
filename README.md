@@ -487,7 +487,7 @@ Two accounts — both free to create, one has a paid tier:
 
 | What you need | Why | Where |
 |---|---|---|
-| **Claude Pro** ($20/mo+) | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
+| **Claude account** | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
 | **Tailscale** (free) | Remote dashboard access from any device — no port-forwarding | [tailscale.com](https://tailscale.com) |
 
 Create both accounts before running the installer. The installer walks you through connecting them.
