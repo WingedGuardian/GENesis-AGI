@@ -262,6 +262,7 @@ TABLES = {
             input_tokens     INTEGER,
             output_tokens    INTEGER,
             cost_usd         REAL NOT NULL DEFAULT 0.0,
+            cost_known       INTEGER NOT NULL DEFAULT 1,  -- 0 if litellm couldn't price
             metadata         TEXT,               -- JSON
             created_at       TEXT NOT NULL
         )

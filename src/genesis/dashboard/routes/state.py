@@ -66,6 +66,21 @@ async def resolve_approval(request_id: str):
     return jsonify({"id": request_id, "status": decision})
 
 
+@blueprint.route("/api/genesis/approvals/approve-all", methods=["POST"])
+@_async_route
+async def approve_all_approvals():
+    """Approve all pending approval requests at once."""
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    gate = getattr(rt, "_autonomous_cli_approval_gate", None)
+    if not rt.is_bootstrapped or gate is None:
+        return jsonify({"error": "Approval gate unavailable"}), 503
+
+    count = await gate.approve_all_pending(resolved_by="dashboard:batch")
+    return jsonify({"approved": count})
+
+
 @blueprint.route("/api/genesis/autonomous-cli-policy")
 @_async_route
 async def autonomous_cli_policy():

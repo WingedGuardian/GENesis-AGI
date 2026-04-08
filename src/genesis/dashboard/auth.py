@@ -90,12 +90,7 @@ def check_password(input_password: str) -> bool:
     return hmac.compare_digest(input_password.encode(), pw.encode())
 
 
-# ── Auth-exempt paths ────────────────────────────────────────────────
-
-_AUTH_EXEMPT_PREFIXES = (
-    "/api/genesis/auth/",
-    "/api/genesis/health",
-)
+# ── Static assets (needed by login page before auth) ────────────────
 
 _STATIC_PREFIXES = (
     "/index.css",
@@ -111,13 +106,23 @@ _STATIC_PREFIXES = (
 
 @blueprint.before_request
 def _check_auth():
-    """Gate dashboard routes behind password auth when configured."""
+    """Gate the dashboard web UI behind password auth when configured.
+
+    Auth scope: browser-facing HTML pages ONLY. The dashboard is
+    reachable from any IP (proxied through the host VM), so this
+    auth gate protects against unauthorized browser access.
+
+    API and programmatic endpoints (/api/*, /v1/*) pass through
+    freely — Guardian probes, OpenClaw, MCP tools, and any machine
+    caller should never be blocked. Auth is a door on the web
+    dashboard, not a lockdown on Genesis's API surface.
+    """
     # Auth disabled — no password set
     if not get_dashboard_password():
         return None
 
-    # Auth endpoints and health are always open
-    if any(request.path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+    # All API/programmatic routes are open — auth gates the web UI only
+    if request.path.startswith("/api/") or request.path.startswith("/v1/"):
         return None
 
     # Static assets needed by login page
@@ -131,9 +136,7 @@ def _check_auth():
     if is_authenticated():
         return None
 
-    # Unauthenticated: API calls get 401, pages get redirected
-    if request.path.startswith("/api/"):
-        return jsonify({"error": "Authentication required"}), 401
+    # Unauthenticated page request → redirect to login
     return redirect("/genesis/login")
 
 

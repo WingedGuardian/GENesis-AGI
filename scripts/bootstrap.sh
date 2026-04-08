@@ -9,6 +9,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# HOME may be unset in some container environments; derive from passwd
+if [[ -z "${HOME:-}" ]]; then
+    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    export HOME
+fi
+
 echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
@@ -44,7 +50,7 @@ install_pkg() {
 # Update package index once before any installs
 echo "  Updating package index..."
 if [[ "$PKG_MGR" == "apt" ]]; then
-    sudo apt-get update -qq 2>&1 | tail -1 || true
+    timeout 120 sudo apt-get update -qq 2>/dev/null || true
 elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
     sudo "$PKG_MGR" check-update -q 2>/dev/null; true
 fi
@@ -168,12 +174,18 @@ echo
 # --- Python venv ---
 echo "--- Setting up Python venv ---"
 VENV_DIR="$GENESIS_ROOT/.venv"
-if [[ ! -d "$VENV_DIR" ]]; then
+if [[ ! -d "$VENV_DIR" ]] || [[ ! -x "$VENV_DIR/bin/python" ]] || [[ ! -x "$VENV_DIR/bin/pip" ]]; then
+    [[ -d "$VENV_DIR" ]] && { echo "  Existing venv is broken — recreating..."; rm -rf "$VENV_DIR"; }
     echo "  Creating venv (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
 echo "  Syncing dependencies..."
-"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet
+"$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1 || true
+if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+    echo "  FAIL: pip install completed but Genesis is not importable."
+    echo "  Re-run: $VENV_DIR/bin/pip install -e $GENESIS_ROOT --verbose"
+    exit 1
+fi
 echo
 
 # --- Secrets ---

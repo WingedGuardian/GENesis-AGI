@@ -355,7 +355,7 @@ _install_github_binary() {
 # have a stale or uninitialized apt cache that causes all installs to fail.
 echo "    Updating package index..."
 if [[ "$_PKG_MGR" == "apt" ]]; then
-    sudo apt-get update -qq 2>&1 | tail -1 || true
+    timeout 120 sudo apt-get update -qq 2>/dev/null || true
 elif [[ "$_PKG_MGR" == "dnf" ]]; then
     sudo dnf check-update -q 2>/dev/null; true  # returns 100 when updates available — not an error
 elif [[ "$_PKG_MGR" == "yum" ]]; then
@@ -586,10 +586,22 @@ done
 
 # Python venv — prefer python3.12 for venv creation
 PYTHON_BIN=$(command -v python3.12 || command -v python3)
-if [ ! -d "$VENV_PATH" ]; then
+if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PATH/bin/pip" ]; then
+    # Remove broken venv before recreating
+    if [ -d "$VENV_PATH" ]; then
+        echo "    Existing venv is broken (missing python or pip) — recreating..."
+        rm -rf "$VENV_PATH"
+    fi
     echo "    Creating venv at $VENV_PATH (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_PATH"
     echo "    + venv created"
+    # Verify venv Python is 3.12+ (defense-in-depth — pre-flight should catch this)
+    _venv_pyver=$("$VENV_PATH/bin/python" --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
+    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
+        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
+        echo "    Install Python 3.12 and re-run this script."
+        SETUP_WARNINGS=1
+    fi
 fi
 
 # secrets.env
@@ -704,7 +716,14 @@ if [ -d "$VENV_PATH" ]; then
         echo "    Use PYTHONPATH=$REPO_DIR/src instead, or run from the main checkout."
     else
         "$VENV_PATH/bin/pip" install -e "$REPO_DIR" --quiet 2>&1 | tail -1 || true
-        echo "    + Genesis installed in editable mode"
+        # Validate pip actually installed Genesis (|| true above masks pip failures)
+        if "$VENV_PATH/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+            echo "    + Genesis installed in editable mode"
+        else
+            echo "    FAIL  pip install completed but Genesis is not importable."
+            echo "    Re-run with verbose output: $VENV_PATH/bin/pip install -e $REPO_DIR --verbose"
+            SETUP_WARNINGS=1
+        fi
     fi
 else
     echo "    WARNING: venv not found at $VENV_PATH — skipping pip install"
@@ -799,7 +818,13 @@ QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 QDRANT_VERSION="${QDRANT_VERSION:-1.14.0}"
 if curl -sf "$QDRANT_URL/collections" >/dev/null 2>&1; then
     qdrant_ver=$(curl -sf "$QDRANT_URL" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('version','unknown'))" 2>/dev/null || echo "unknown")
-    echo "    . Qdrant reachable at $QDRANT_URL (v${qdrant_ver})"
+    if [ "$qdrant_ver" = "unknown" ]; then
+        echo "    WARNING: Port 6333 responds but doesn't look like Qdrant"
+        echo "    Another service may be using this port."
+        SETUP_WARNINGS=1
+    else
+        echo "    . Qdrant reachable at $QDRANT_URL (v${qdrant_ver})"
+    fi
 elif command -v qdrant &>/dev/null; then
     echo "    . Qdrant binary found but not running"
     SETUP_WARNINGS=1
@@ -1022,7 +1047,7 @@ else
     if [ "$(id -u)" != "0" ] && command -v sudo &>/dev/null; then
         _npm_cmd="sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
     fi
-    if $_npm_cmd; then
+    if timeout 300 $_npm_cmd; then
         cc_ver=$(claude --version 2>/dev/null || echo "unknown")
         echo "    + Claude Code installed ($cc_ver)"
     else
@@ -1030,6 +1055,18 @@ else
         echo "    Install manually: sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
         SETUP_WARNINGS=1
     fi
+fi
+
+# Genesis wrapper — lets users type 'genesis' from anywhere inside the container
+# to launch Claude Code in the right directory with all hooks/MCP active.
+if [ ! -f /usr/local/bin/genesis ]; then
+    sudo tee /usr/local/bin/genesis >/dev/null <<'WRAPPER'
+#!/bin/bash
+cd ~/genesis 2>/dev/null || { echo "Genesis repo not found at ~/genesis"; exit 1; }
+exec claude "$@"
+WRAPPER
+    sudo chmod +x /usr/local/bin/genesis
+    echo "    + genesis command installed (/usr/local/bin/genesis)"
 fi
 
 # Suppress CC native installer nag — Genesis uses npm for version control
@@ -1231,7 +1268,7 @@ if _node_version_ok; then
     echo "    PASS  Node.js $(node --version)"
     SMOKE_PASS=$((SMOKE_PASS + 1))
 else
-    echo "    FAIL  Node.js missing or < v18 (Claude Code will not function)"
+    echo "    FAIL  Node.js missing or < v20 (Claude Code will not function)"
     SMOKE_FAIL=$((SMOKE_FAIL + 1))
 fi
 

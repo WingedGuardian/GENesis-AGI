@@ -473,6 +473,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("Orphaned memory_links cleanup skipped", exc_info=True)
 
+    # Cost tracking: cost_known flag on cost_events
+    await _try_alter(db,
+        "ALTER TABLE cost_events ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
+        "cost_events.cost_known")
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.
