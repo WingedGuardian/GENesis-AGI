@@ -483,7 +483,7 @@ These are the requirements for the **host VM** — the machine you run the insta
 
 ### Before you start
 
-Two accounts — both free to create, one has a paid tier:
+Two accounts to create before running the installer:
 
 | What you need | Why | Where |
 |---|---|---|
