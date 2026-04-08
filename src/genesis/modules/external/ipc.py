@@ -60,7 +60,10 @@ class HttpIPCAdapter:
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             resp.raise_for_status()
-            return resp.json()
+            result = resp.json()
+            if not isinstance(result, dict):
+                return {"data": result}
+            return result
         except httpx.HTTPStatusError as exc:
             logger.warning("HTTP %s %s returned %d", method, path, exc.response.status_code)
             return {"error": str(exc), "status_code": exc.response.status_code}
@@ -123,7 +126,10 @@ class StdioIPCAdapter:
             )
             if not line:
                 return {"error": "process closed stdout"}
-            return json.loads(line.decode().strip())
+            result = json.loads(line.decode().strip())
+            if not isinstance(result, dict):
+                return {"data": result}
+            return result
         except TimeoutError:
             return {"error": "timeout waiting for response"}
         except json.JSONDecodeError as exc:
