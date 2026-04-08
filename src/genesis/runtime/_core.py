@@ -266,6 +266,30 @@ class GenesisRuntime:
         self._persist_pause_state()
         logger.info("Genesis %s%s", "PAUSED" if paused else "RESUMED",
                      f" — {reason}" if reason else "")
+        # Record pause/resume in events table for historical visibility
+        if self._event_bus is not None:
+            import asyncio
+
+            async def _emit() -> None:
+                try:
+                    from genesis.observability.types import Severity, Subsystem
+
+                    await self._event_bus.emit(
+                        subsystem=Subsystem.RUNTIME,
+                        event_type="pause" if paused else "resume",
+                        message=reason or ("Paused" if paused else "Resumed"),
+                        severity=Severity.INFO,
+                    )
+                except Exception:
+                    logger.debug("Failed to emit pause event", exc_info=True)
+
+            try:
+                asyncio.get_running_loop()
+                from genesis.util.tasks import tracked_task
+
+                tracked_task(_emit(), name="pause-event-emit")
+            except RuntimeError:
+                pass  # No event loop — skip (startup/shutdown edge)
 
     def _persist_pause_state(self) -> None:
         try:

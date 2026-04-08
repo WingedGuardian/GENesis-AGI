@@ -311,20 +311,85 @@ fi
 if incus info "$CONTAINER_NAME" &>/dev/null; then
     echo ""
     echo "  Container '$CONTAINER_NAME' already exists."
-    if [ "$NON_INTERACTIVE" = "1" ]; then
-        echo "  Continuing with existing container."
+
+    # Quick health check on existing container to detect damage
+    _container_healthy=1
+    _container_issues=""
+    _container_state=$(incus info "$CONTAINER_NAME" 2>/dev/null | grep -oP 'Status: \K\w+' || echo "unknown")
+
+    if [ "$_container_state" = "RUNNING" ]; then
+        # Check critical paths
+        incus exec "$CONTAINER_NAME" -- test -w /tmp 2>/dev/null || {
+            _container_healthy=0
+            _container_issues="${_container_issues}    - /tmp is missing or not writable\n"
+        }
+        incus exec "$CONTAINER_NAME" -- test -d /home/ubuntu/genesis 2>/dev/null || {
+            _container_healthy=0
+            _container_issues="${_container_issues}    - Genesis repo not found\n"
+        }
+        incus exec "$CONTAINER_NAME" -- test -x /home/ubuntu/genesis/.venv/bin/python 2>/dev/null || {
+            _container_healthy=0
+            _container_issues="${_container_issues}    - Python venv missing or broken\n"
+        }
+    elif [ "$_container_state" = "STOPPED" ]; then
+        echo "  Container is stopped — will start it."
+        incus start "$CONTAINER_NAME" 2>/dev/null || true
+        sleep 3
     else
-        read -rp "  Delete and recreate? [y/N] " _recreate
-        if [ "${_recreate:-N}" = "y" ] || [ "${_recreate:-N}" = "Y" ]; then
+        _container_healthy=0
+        _container_issues="${_container_issues}    - Container in unexpected state: $_container_state\n"
+    fi
+
+    if [ "$_container_healthy" = "0" ]; then
+        echo ""
+        echo "  ┌──────────────────────────────────────────────────────────────┐"
+        echo "  │  WARNING: Container appears damaged.                         │"
+        echo "  └──────────────────────────────────────────────────────────────┘"
+        echo ""
+        echo -e "$_container_issues"
+        echo "  Recreating will give you a clean install."
+        echo "  Continuing will attempt to repair in-place (may not work)."
+        echo ""
+    fi
+
+    if [ "$NON_INTERACTIVE" = "1" ]; then
+        if [ "$_container_healthy" = "0" ]; then
+            echo "  Container is damaged — recreating (non-interactive mode)."
             incus delete "$CONTAINER_NAME" --force
             echo "  + Old container deleted"
         else
             echo "  Continuing with existing container."
         fi
+    else
+        if [ "$_container_healthy" = "0" ]; then
+            read -rp "  Delete and recreate? [Y/n] " _recreate
+            if [ "${_recreate:-Y}" != "n" ] && [ "${_recreate:-Y}" != "N" ]; then
+                incus delete "$CONTAINER_NAME" --force
+                echo "  + Old container deleted"
+            else
+                echo "  Continuing with existing container (repair attempt)."
+            fi
+        else
+            read -rp "  Delete and recreate? [y/N] " _recreate
+            if [ "${_recreate:-N}" = "y" ] || [ "${_recreate:-N}" = "Y" ]; then
+                incus delete "$CONTAINER_NAME" --force
+                echo "  + Old container deleted"
+            else
+                echo "  Continuing with existing container."
+            fi
+        fi
     fi
 fi
 
 if ! incus info "$CONTAINER_NAME" &>/dev/null; then
+    # Reset Guardian state — stale state from a previous container causes
+    # "confirmed_dead" to persist even after a fresh container is created.
+    _guardian_state="$HOME/.local/state/genesis-guardian/state.json"
+    if [ -f "$_guardian_state" ]; then
+        echo '{}' > "$_guardian_state"
+        echo "  + Guardian state reset (stale from previous container)"
+    fi
+
     echo "  Creating container '$CONTAINER_NAME'..."
     # images:ubuntu/noble — the images: remote is always available after incus admin init
     incus launch images:ubuntu/noble "$CONTAINER_NAME"
@@ -636,6 +701,76 @@ else
     echo "    incus exec $CONTAINER_NAME --user $UBUNTU_UID --env HOME=/home/ubuntu --env XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID -t --cwd /home/ubuntu/genesis -- bash scripts/install.sh"
 fi
 
+# ── Container smoke test ──────────────────────────────────────
+# Verify the container is functional before proceeding to Guardian.
+# Catches corruption from partial installs, botched manual interventions,
+# or container filesystem issues (e.g., missing /tmp).
+echo ""
+echo "  Running container smoke test..."
+_smoke_ok=0
+_smoke_fail=""
+
+# 1. /tmp exists and is writable
+if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
+    _smoke_ok=$((_smoke_ok + 1))
+else
+    _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n"
+fi
+
+# 2. Python works
+if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
+    _smoke_ok=$((_smoke_ok + 1))
+else
+    _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n"
+fi
+
+# 3. Genesis venv is intact
+if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
+    _smoke_ok=$((_smoke_ok + 1))
+else
+    _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n"
+fi
+
+# 4. Qdrant is reachable
+if incus exec "$CONTAINER_NAME" -- curl -sf http://localhost:6333/collections &>/dev/null; then
+    _smoke_ok=$((_smoke_ok + 1))
+else
+    _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n"
+fi
+
+# 5. genesis-server responds
+_server_tries=0
+_server_ok=0
+while [ "$_server_tries" -lt 5 ]; do
+    if incus exec "$CONTAINER_NAME" -- curl -sf http://localhost:5000/api/genesis/health &>/dev/null; then
+        _server_ok=1
+        break
+    fi
+    sleep 2
+    _server_tries=$((_server_tries + 1))
+done
+if [ "$_server_ok" = "1" ]; then
+    _smoke_ok=$((_smoke_ok + 1))
+else
+    _smoke_fail="${_smoke_fail}    FAIL  genesis-server not responding on port 5000\n"
+fi
+
+if [ -z "$_smoke_fail" ]; then
+    echo "  + Smoke test passed ($_smoke_ok/5 checks)"
+else
+    echo ""
+    echo "  ┌──────────────────────────────────────────────────────────────┐"
+    echo "  │  Container smoke test: $_smoke_ok/5 checks passed.               │"
+    echo "  │  The container may be damaged from a partial install.        │"
+    echo "  │  Consider re-running with a fresh container:                 │"
+    echo "  │    sudo ./scripts/host-setup.sh  (answer 'y' to recreate)   │"
+    echo "  └──────────────────────────────────────────────────────────────┘"
+    echo ""
+    echo -e "$_smoke_fail"
+    echo ""
+    echo "  Continuing anyway — Guardian and remaining steps may still work."
+fi
+
 # ── Persist network identity into container CLAUDE.md ─────────
 # Append detected IPs to the container's CLAUDE.md so CC sessions know the
 # network topology. Idempotent: removes prior block before appending.
@@ -723,14 +858,14 @@ fi
 # ── Node.js + Claude Code on host ─────────────────────────────
 # Claude Code is installed inside the container by install.sh, but users also
 # need it on the host VM for Guardian CC sessions and direct interaction.
-# Node.js >= 18 is required by Claude Code.
+# Node.js >= 20 is required by Claude Code.
 echo ""
 echo "  Setting up Claude Code on the host..."
 
 _host_node_ok=0
 if command -v node &>/dev/null; then
     _node_ver=$(node --version 2>/dev/null | grep -oP '(?<=v)\d+' | head -1)
-    [ "${_node_ver:-0}" -ge 18 ] 2>/dev/null && _host_node_ok=1
+    [ "${_node_ver:-0}" -ge 20 ] 2>/dev/null && _host_node_ok=1
 fi
 
 if [ "$_host_node_ok" = "0" ]; then
