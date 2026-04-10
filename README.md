@@ -12,6 +12,7 @@
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/status-v3%20alpha-orange" alt="Status">
   <a href="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml"><img src="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
 
 ---
@@ -42,6 +43,8 @@ Day 90 — anticipating needs you haven't articulated yet.
 Day 180 — evolving its own architecture to serve you better.
 
 V3 is the foundation that makes this possible. What's already here is a full cognitive copilot. What's on the [roadmap](#where-its-headed) — a cognitive cycle grounded in Global Workspace Theory and the LIDA architecture from consciousness research, autonomous codebase evolution, and a system that runs experiments on its own cognition — is where it gets ambitious enough that we'll need help building it.
+
+**Where things stand today:** Genesis is architecturally complete — 72,000+ lines, 37 subsystems, all V3 phases built and tested. What it needs now is the last mile. Features that are 95% there but need edge-case hardening. Wiring that works in isolation but hasn't been stress-tested end-to-end. The kind of work that's genuinely interesting if you like digging into complex systems, and genuinely tedious to do alone. If you install Genesis today, you will hit rough edges. That's not a caveat — it's the opportunity. Every bug you find and fix makes the system better for everyone. This is an active build, and using it means participating in it. If that sounds like your kind of project, [come build with us](#get-involved).
 
 ---
 
@@ -465,7 +468,7 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
 
 ## Getting started
 
-**Alpha release.** Genesis v3-alpha is feature-complete but actively stabilizing. Expect rough edges, configuration that assumes familiarity with the stack, and bugs that you'll occasionally want to use Genesis' CLI (Claude Code) to diagnose and fix. The good news is: you can simply tell Genesis to iron out its own kinks. If you're comfortable working with a few bumps for the time being, you'll be fine. If you want a more polished experience, check back when we hit beta.
+**Alpha release — you're joining the build.** Genesis v3-alpha is architecturally complete but actively stabilizing. You will encounter experimental features, edge cases that need hardening, and subsystems that are 95% wired but need that last touch. This is by design — Genesis is being built in the open, and every person who installs it, hits a rough edge, and fixes it (or reports it) is making the system better. The good news: you can tell Genesis to diagnose and fix its own issues via Claude Code. If you're the kind of engineer who finds that exciting rather than frustrating, you're exactly who this project is for. If you want a polished turnkey experience, check back when we hit beta.
 
 ### System requirements
 
@@ -560,7 +563,14 @@ The complete design lives in [`docs/architecture/`](docs/architecture/):
 
 V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates — whether it's the memory architecture, the cognitive cycle, the autonomy model, or the audacity of building a self-evolving agent — there's work to do.
 
-Curious how it all fits together? Join our [Discord server](https://discord.gg/jQ57c5f6Pc). Or hell, have Claude read the architecture docs and give you its analysis! The design is intentional and forward-thinking.
+**What "contributing" looks like here:** Genesis isn't a library where you add a utility function and submit a PR. It's a living system. Install it, use it, hit the edges, fix what you find. The architecture is sound — what it needs is people who understand complex systems stress-testing the wiring, hardening the edge cases, and pushing subsystems from 95% to 100%. Every rough edge you smooth makes the system better for the next person.
+
+**What you get:** A genuinely interesting codebase to work in. 37 subsystems across cognitive, memory, intelligence, autonomy, and infrastructure layers. A system that uses itself to improve itself. And a front-row seat to building something that doesn't exist anywhere else yet.
+
+**Where to start:**
+- **[Discord](https://discord.gg/Zkc3XMQpJX)** — the hub. Ask questions, share what you're working on, see what's in progress
+- **[`docs/architecture/`](docs/architecture/)** — understand the design before diving into code. Or have Claude read them and give you its analysis
+- **[Issues](https://github.com/WingedGuardian/GENesis-AGI/issues)** — filed bugs and feature work. Good first issues are tagged
 
 ---
 
