@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Phase 6 — contribution pipeline trigger.
+#
+# Detects `fix:` commits and emits a pending-offer marker so Genesis can
+# offer to contribute the fix upstream on the next user prompt.
+#
+# Opt-out: use `fix(local):` scope to skip the offer.
+#
+# Failure semantics: fail-open. Any error inside this hook must NEVER block
+# the user's commit flow. All output goes to a log file, not stderr.
+
+set -u  # catch unset vars; deliberately NOT -e so errors don't block commits
+
+GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+LOG_FILE="$GENESIS_HOME/contribution-hook.log"
+PENDING_DIR="$GENESIS_HOME/pending-offers"
+
+_log() {
+    mkdir -p "$GENESIS_HOME" 2>/dev/null || return 0
+    printf '%s %s\n' "$(date -Iseconds 2>/dev/null || date)" "$*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+# Read the commit that just landed. --no-color avoids ANSI pollution.
+COMMIT_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+COMMIT_SUBJECT=$(git log -1 --format=%s HEAD 2>/dev/null || echo "")
+
+if [[ -z "$COMMIT_SHA" || -z "$COMMIT_SUBJECT" ]]; then
+    _log "skip: could not read HEAD (sha='$COMMIT_SHA' subject='$COMMIT_SUBJECT')"
+    exit 0
+fi
+
+# Match `fix:` OR `fix(scope):` BUT NOT `fix(local):`.
+# The conventional commits spec allows scopes in parens; we reject scope `local`
+# as the opt-out mechanism.
+if [[ ! "$COMMIT_SUBJECT" =~ ^fix(\([^\)]*\))?: ]]; then
+    exit 0  # not a fix commit, silently skip
+fi
+
+# Explicit opt-out: fix(local): ...
+if [[ "$COMMIT_SUBJECT" =~ ^fix\(local\): ]]; then
+    _log "skip opt-out: sha=$COMMIT_SHA subject=$COMMIT_SUBJECT"
+    exit 0
+fi
+
+# Write the marker file for the hot path.
+mkdir -p "$PENDING_DIR" 2>/dev/null || { _log "err: cannot mkdir $PENDING_DIR"; exit 0; }
+
+MARKER="$PENDING_DIR/${COMMIT_SHA}.json"
+# Use a temp file + atomic rename so a half-written marker is never observed.
+TMP_MARKER="$PENDING_DIR/.${COMMIT_SHA}.tmp"
+
+# JSON-encode the subject via python3. The previous sed-based escape
+# only handled backslash + double-quote, which broke on subjects with
+# control chars, embedded newlines (pre-commit hooks can rewrite the
+# subject line), tabs, or multi-byte characters — any of which would
+# produce an invalid JSON marker and be silently unreadable by the
+# consumer side. python3 is already a dependency of this hook (see the
+# emit_bugfix_audit.py invocation at the bottom) so this adds no cost.
+CREATED_AT=$(date -Iseconds 2>/dev/null || date)
+if ! MARKER_JSON=$(
+    COMMIT_SHA="$COMMIT_SHA" \
+    COMMIT_SUBJECT="$COMMIT_SUBJECT" \
+    CREATED_AT="$CREATED_AT" \
+    python3 -c '
+import json, os
+print(json.dumps({
+    "sha": os.environ["COMMIT_SHA"],
+    "subject": os.environ["COMMIT_SUBJECT"],
+    "created_at": os.environ["CREATED_AT"],
+}, indent=2))
+' 2>>"$LOG_FILE"); then
+    _log "err: python3 JSON encode failed (rc=$?), aborting marker write"
+    exit 0
+fi
+if [[ -z "$MARKER_JSON" ]]; then
+    _log "err: python3 returned empty output, aborting marker write"
+    exit 0
+fi
+printf '%s\n' "$MARKER_JSON" > "$TMP_MARKER"
+
+if [[ -s "$TMP_MARKER" ]]; then
+    mv "$TMP_MARKER" "$MARKER" 2>/dev/null || { _log "err: cannot rename marker"; rm -f "$TMP_MARKER"; exit 0; }
+    _log "marker written: sha=$COMMIT_SHA"
+else
+    _log "err: tmp marker empty, aborting"
+    rm -f "$TMP_MARKER"
+    exit 0
+fi
+
+# Fire-and-forget audit: write a bugfix_committed observation to the DB.
+# Uses a Python helper because sqlite from bash is annoying and we want UUIDs.
+SCRIPT_DIR=$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")
+AUDIT_HELPER="$SCRIPT_DIR/emit_bugfix_audit.py"
+
+if [[ -f "$AUDIT_HELPER" ]]; then
+    # Background it so commit is never blocked on DB I/O. Pipe log to the file.
+    python3 "$AUDIT_HELPER" "$COMMIT_SHA" "$COMMIT_SUBJECT" >> "$LOG_FILE" 2>&1 &
+    disown 2>/dev/null || true
+fi
+
+exit 0

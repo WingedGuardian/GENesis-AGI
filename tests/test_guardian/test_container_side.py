@@ -64,7 +64,13 @@ class TestProbeGuardian:
 
     @pytest.mark.asyncio
     async def test_missing_file(self, tmp_path: Path) -> None:
-        result = await probe_guardian(tmp_path / "nonexistent.json")
+        # Pass guardian_remote=None to skip the SSH fallback that
+        # probe_guardian auto-loads from guardian_remote.yaml when the
+        # heartbeat file is missing — we want to exercise the local
+        # "file missing + no remote" path.
+        result = await probe_guardian(
+            tmp_path / "nonexistent.json", guardian_remote=None,
+        )
         assert result.status == ProbeStatus.DOWN
         assert "not found" in result.message
 

@@ -22,12 +22,18 @@ why the user is worth responding to.
 
 ## Voice Loading
 
-Read voice exemplars and anti-slop rules before drafting:
-- `../voice-master/references/exemplars/professional.md`
-- `../voice-master/references/anti-slop.md`
+Load the user's voice via voice-master's overlay resolution before drafting:
 
-If the exemplar file is empty or has no good matches, also read:
-- `../voice-master/references/voice-dimensions.md`
+1. Read `../voice-master/SKILL.md` and follow its **User Calibration
+   Overlay** section to load exemplars and voice-dimensions from the
+   out-of-repo overlay (or template fallback with warning if no overlay).
+2. This skill's medium is `professional`. Select professional-medium
+   exemplars from whatever voice-master loads.
+3. Read `../voice-master/references/anti-slop.md` — apply the **Universal**
+   and **Professional / LinkedIn** sections.
+
+If no overlay is present, voice-master falls back to generic voice guidance
+and warns — note this in your output.
 
 DMs are the most personal LinkedIn format — sounding templated here is
 fatal. One bad outreach message can permanently close a door.
@@ -142,6 +148,6 @@ rationale: |
 
 ## References
 
-- `../voice-master/references/exemplars/professional.md` — Professional voice exemplars
-- `../voice-master/references/anti-slop.md` — AI-tell avoidance rules
+- `../voice-master/SKILL.md` — Voice authority; follow its User Calibration Overlay section to load professional exemplars from the user overlay
+- `../voice-master/references/anti-slop.md` — Universal + Professional/LinkedIn anti-slop rules
 - `../prospect-researcher/SKILL.md` — Deep research on outreach targets

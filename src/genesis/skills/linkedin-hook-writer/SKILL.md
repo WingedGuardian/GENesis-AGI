@@ -22,14 +22,19 @@ it promises something the post actually delivers.
 
 ## Voice Loading
 
-Read the voice-master anti-slop rules — especially the "Banned Openers" section.
-This skill's entire value depends on producing hooks that are NOT on that list.
+This skill's entire value depends on producing hooks that are NOT on the
+anti-slop banned-openers list.
 
-- `../voice-master/references/anti-slop.md`
-- `../voice-master/references/exemplars/social.md`
+1. Read `../voice-master/references/anti-slop.md` — apply the **Universal**
+   and **Professional / LinkedIn** sections. The **Banned Openers** subsection
+   under Professional / LinkedIn is the hard constraint for this skill.
+2. Load the user's voice via voice-master: read `../voice-master/SKILL.md`
+   and follow its **User Calibration Overlay** section. Voice-master loads
+   social-medium exemplars from the user overlay (or template fallback
+   with warning if no overlay).
 
-If the exemplar file is empty or has no good matches, also read:
-- `../voice-master/references/voice-dimensions.md`
+If no overlay is present, voice-master falls back to generic voice guidance
+and warns — note this in your output.
 
 ## How LinkedIn Hooks Work
 
@@ -136,6 +141,6 @@ and wants to know what happened.
 
 ## References
 
-- `../voice-master/references/anti-slop.md` — Banned openers and AI-tell patterns
-- `../voice-master/references/exemplars/social.md` — Social media voice exemplars
+- `../voice-master/references/anti-slop.md` — Banned openers and AI-tell patterns (Universal + Professional/LinkedIn sections)
+- `../voice-master/SKILL.md` — Voice authority; follow its User Calibration Overlay section to load social exemplars from the user overlay
 - `../linkedin-post-writer/SKILL.md` — Post types and writing process

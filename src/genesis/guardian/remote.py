@@ -8,7 +8,7 @@ script via an authorized_keys ``command=`` directive — even if this code
 tried to run arbitrary commands, the host would reject them. OpenSSH
 enforces this restriction, not our code.
 
-Six operations: restart-timer, pause, resume, status, version, update.
+Seven operations: restart-timer, pause, resume, status, reset-state, version, update.
 """
 
 from __future__ import annotations
@@ -70,6 +70,12 @@ class GuardianRemote:
             output = stdout.decode().strip() or stderr.decode().strip()
             return proc.returncode == 0, output
         except TimeoutError:
+            # Kill the orphaned SSH process to prevent accumulation
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
             logger.warning(
                 "SSH to %s@%s timed out after %.0fs",
                 self._host_user, self._host_ip, self._timeout,
@@ -123,6 +129,22 @@ class GuardianRemote:
                 logger.warning("Guardian version returned non-JSON: %s", output[:200])
                 return {"cc_version": "unknown", "raw": output[:200]}
         return {"cc_version": "unreachable", "error": output[:200]}
+
+    async def reset_state(self) -> dict:
+        """Reset Guardian state to HEALTHY when stuck in confirmed_dead.
+
+        The gateway only allows reset from stuck states (confirmed_dead,
+        recovering, recovered). Returns the previous state on success.
+        """
+        ok, output = await self._ssh_command("reset-state")
+        if ok:
+            try:
+                return json.loads(output)
+            except json.JSONDecodeError:
+                logger.warning("Guardian reset-state returned non-JSON: %s", output[:200])
+                return {"ok": True, "raw": output[:200]}
+        logger.error("Guardian reset-state failed: %s", output[:200])
+        return {"ok": False, "error": output[:200]}
 
     async def update(self) -> dict:
         """Pull latest code on the host. Returns old/new commit hashes."""

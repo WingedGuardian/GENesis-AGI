@@ -97,6 +97,9 @@ class StandaloneHealthDataService:
             logger.debug("Service status collection failed", exc_info=True)
             result["services"] = {}
 
+        # MCP server crash status — surface failed-to-start servers
+        result["mcp_servers"] = _load_mcp_crash_status()
+
         return result
 
     async def _enrich_from_db(self, result: dict) -> None:
@@ -165,3 +168,33 @@ class StandaloneHealthDataService:
             result["infrastructure"] = await infra_snap(self._db, None, None, None)
         except Exception:
             logger.warning("Infrastructure snapshot failed in standalone mode", exc_info=True)
+
+
+_MCP_CRASH_DIR = Path.home() / ".genesis" / "mcp_crashes"
+_EXPECTED_SERVERS = ("health", "memory", "outreach", "recon")
+
+
+def _load_mcp_crash_status() -> dict:
+    """Load MCP server crash status from per-server crash files.
+
+    Returns a dict of server_name → {status, error?, crashed_at?} for all
+    expected servers. Servers without crash files are reported as "up".
+    """
+    servers: dict[str, dict] = {}
+
+    for name in _EXPECTED_SERVERS:
+        crash_file = _MCP_CRASH_DIR / f"{name}.json"
+        if crash_file.exists():
+            try:
+                info = json.loads(crash_file.read_text())
+                servers[name] = {
+                    "status": "crashed",
+                    "error": info.get("error", "unknown"),
+                    "crashed_at": info.get("timestamp", ""),
+                }
+            except (json.JSONDecodeError, OSError):
+                servers[name] = {"status": "crashed", "error": "unreadable crash file"}
+        else:
+            servers[name] = {"status": "up"}
+
+    return servers

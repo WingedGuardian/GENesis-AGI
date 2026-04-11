@@ -168,7 +168,8 @@ TABLES = {
             signal_type         TEXT NOT NULL,
             topic               TEXT NOT NULL,
             category            TEXT NOT NULL CHECK (category IN (
-                'blocker', 'alert', 'finding', 'insight', 'opportunity', 'digest', 'surplus'
+                'blocker', 'alert', 'finding', 'insight', 'opportunity',
+                'digest', 'surplus', 'approval'
             )),
             salience_score      REAL NOT NULL,
             channel             TEXT NOT NULL,
@@ -939,7 +940,10 @@ SIGNAL_WEIGHTS_SEED = [
     ("task_completion_quality", "genesis", 0.50, 0.50, 0.0, 1.0, '["Micro","Light"]'),
     ("outreach_engagement_data", "outreach_mcp", 0.45, 0.45, 0.0, 1.0, '["Micro","Deep"]'),
     ("recon_findings_pending", "recon_mcp", 0.35, 0.35, 0.0, 1.0, '["Light","Deep"]'),
-    ("unprocessed_memory_backlog", "memory_mcp", 0.30, 0.30, 0.0, 1.0, '["Deep"]'),
+    # (Removed 2026-04-11) unprocessed_memory_backlog — retrieval-coverage
+    # metric was being misread as reflection urgency by the Deep scorer.
+    # Signal collectors and cognitive-state flag removed in the same sweep.
+    # Existing rows cleaned up by _migrate_add_columns() on next boot.
     ("budget_pct_consumed", "health_mcp", 0.40, 0.40, 0.0, 1.0, '["Light","Deep"]'),
     ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro","Light"]'),
     ("critical_failure", "health_mcp", 0.90, 0.90, 0.0, 1.0, '["Light"]'),

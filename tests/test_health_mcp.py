@@ -115,8 +115,10 @@ class TestHealthAlerts:
 
     @pytest.mark.asyncio
     async def test_down_call_site_generates_critical(self):
+        # Must use a wired call site — health_alerts now skips groundwork
+        # sites (meta.wired=False) to prevent ghost-down spam.
         svc = _mock_service({
-            "call_sites": {"2_triage": {"status": "down"}},
+            "call_sites": {"3_micro_reflection": {"status": "down"}},
             "queues": {},
             "cc_sessions": {},
         })
@@ -124,12 +126,12 @@ class TestHealthAlerts:
         result = await _impl_health_alerts()
         criticals = [a for a in result if a["severity"] == "CRITICAL"]
         assert len(criticals) == 1
-        assert "2_triage" in criticals[0]["message"]
+        assert "3_micro_reflection" in criticals[0]["message"]
 
     @pytest.mark.asyncio
     async def test_degraded_call_site_generates_warning(self):
         svc = _mock_service({
-            "call_sites": {"2_triage": {"status": "degraded", "active_provider": "b"}},
+            "call_sites": {"3_micro_reflection": {"status": "degraded", "active_provider": "b"}},
             "queues": {},
             "cc_sessions": {},
         })
@@ -137,6 +139,47 @@ class TestHealthAlerts:
         result = await _impl_health_alerts()
         warnings = [a for a in result if a["severity"] == "WARNING"]
         assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_groundwork_call_site_alert_suppressed(self):
+        """Regression for the call-site-11 spam loop.
+
+        Sites with meta.wired=False (groundwork — config exists but no
+        runtime invocation) MUST NOT emit alerts. Their "down" status is
+        meaningless because nothing exercises them.
+        """
+        svc = _mock_service({
+            "call_sites": {"2_triage": {"status": "down"}},  # wired=False
+            "queues": {},
+            "cc_sessions": {},
+        })
+        health_mcp.init_health_mcp(svc)
+        result = await _impl_health_alerts()
+        site_alerts = [a for a in result if a.get("id", "").startswith("call_site:")]
+        assert site_alerts == []
+
+    @pytest.mark.asyncio
+    async def test_disabled_call_site_alert_suppressed(self):
+        """Sites with status='disabled' (no API key) MUST NOT emit alerts.
+
+        This is the root-cause fix for the Sentinel spam loop: Anthropic
+        providers without ANTHROPIC_API_KEY → call site marked disabled
+        (config state, not outage) → no alert → no Sentinel wake.
+        """
+        svc = _mock_service({
+            "call_sites": {
+                "3_micro_reflection": {  # wired site
+                    "status": "disabled",
+                    "disabled_reason": "no_api_keys_configured",
+                },
+            },
+            "queues": {},
+            "cc_sessions": {},
+        })
+        health_mcp.init_health_mcp(svc)
+        result = await _impl_health_alerts()
+        site_alerts = [a for a in result if a.get("id", "").startswith("call_site:")]
+        assert site_alerts == []
 
     @pytest.mark.asyncio
     async def test_high_queue_depth_generates_warning(self):

@@ -41,9 +41,6 @@ async def init(rt: GenesisRuntime) -> None:
                 CriticalFailureCollector,
             )
             from genesis.learning.signals.error_spike import ErrorSpikeCollector
-            from genesis.learning.signals.memory_backlog import (
-                MemoryBacklogCollector,
-            )
             from genesis.learning.signals.micro_cascade import MicroCascadeCollector
             from genesis.learning.signals.outreach_engagement import (
                 OutreachEngagementCollector,
@@ -68,13 +65,13 @@ async def init(rt: GenesisRuntime) -> None:
             ]
 
             from genesis.learning.signals.cc_version import CCVersionCollector
+            from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
             collectors = [
                 ConversationCollector(rt._db),
                 TaskQualityCollector(rt._db),
                 OutreachEngagementCollector(rt._db),
                 ReconFindingsCollector(rt._db),
-                MemoryBacklogCollector(rt._db),
                 BudgetCollector(rt._db),
                 ErrorSpikeCollector(rt._db),
                 CriticalFailureCollector(probes),
@@ -86,6 +83,10 @@ async def init(rt: GenesisRuntime) -> None:
                     rt._db, router=rt._router,
                     pipeline_getter=lambda: rt._outreach_pipeline,
                     memory_store_getter=lambda: rt._memory_store,
+                ),
+                GenesisVersionCollector(
+                    rt._db,
+                    pipeline_getter=lambda: rt._outreach_pipeline,
                 ),
             ]
             rt._awareness_loop.replace_collectors(collectors)
@@ -400,20 +401,50 @@ async def init(rt: GenesisRuntime) -> None:
                     )
                     # USER.md auto-synthesis is PERMANENTLY DISABLED — USER.md
                     # is user-edited only. Instead, synthesize USER_KNOWLEDGE.md
-                    # (structured cache with bounded sections). The knowledge file
-                    # is system-owned and safe to overwrite.
+                    # (system-owned cache, safe to overwrite).
+                    #
+                    # Synthesis path: try call site 11 (LLM narrative via the
+                    # router's free chain) first. If that fails (all free
+                    # providers exhausted, malformed response), fall back to
+                    # the rules-based dict rendering. Either way the file
+                    # gets refreshed.
                     identity_loader = getattr(rt, "_identity_loader", None)
-                    if identity_loader is not None:
+                    if identity_loader is None:
+                        logger.warning(
+                            "identity_loader not available, skipping "
+                            "USER_KNOWLEDGE.md synthesis",
+                        )
+                    else:
+                        narrative: str | None = None
+                        if rt._router is not None:
+                            try:
+                                narrative = await user_model_evolver.synthesize_narrative(
+                                    rt._router,
+                                    evidence_count=result.evidence_count,
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "synthesize_narrative raised — falling "
+                                    "back to rules-based rendering",
+                                )
                         try:
                             identity_loader.write_user_knowledge_md(
-                                result.model, evidence_count=result.evidence_count,
+                                result.model,
+                                evidence_count=result.evidence_count,
+                                narrative=narrative,
                             )
+                            if narrative:
+                                logger.info(
+                                    "USER_KNOWLEDGE.md updated via LLM "
+                                    "synthesis (call site 11)",
+                                )
+                            else:
+                                logger.info(
+                                    "USER_KNOWLEDGE.md updated via rules "
+                                    "fallback (no narrative available)",
+                                )
                         except Exception:
                             logger.exception("Failed to synthesize USER_KNOWLEDGE.md")
-                    else:
-                        logger.warning(
-                            "identity_loader not available, skipping USER_KNOWLEDGE.md synthesis"
-                        )
                 rt.record_job_success("user_model_evolution")
             except Exception as exc:
                 rt.record_job_failure("user_model_evolution", str(exc))
@@ -568,5 +599,5 @@ async def init(rt: GenesisRuntime) -> None:
         logger.warning("genesis.learning not available")
     except Exception as exc:
         logger.exception("Failed to initialize learning")
-        from genesis.runtime._core import record_init_degradation
+        from genesis.runtime._degradation import record_init_degradation
         await record_init_degradation(rt._db, rt._event_bus, "learning", "learning_scheduler", str(exc), severity="error")

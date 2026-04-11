@@ -229,3 +229,98 @@ class TestFlappingProtection:
         assert sm.current.memory == MemoryStatus.FTS_ONLY
         sm.update_memory(MemoryStatus.NORMAL)
         assert sm.current.memory == MemoryStatus.NORMAL
+
+
+class TestCCFlappingOptOut:
+    """Part 9a — CC axis must opt out of flapping protection.
+
+    CC rate limits are transient API events that can bounce 4+ times in 15
+    min under normal load. The flapping protection designed for cascading
+    provider failures (cloud/memory/embedding) latches RATE_LIMITED for
+    10 min when triggered, blocking recovery signals and causing
+    downstream false alarms (see Part 9 false-alarm incident). For the
+    CC axis, all transitions must apply unconditionally.
+    """
+
+    def _make_clock(self, start: datetime | None = None):
+        current = [start or datetime(2026, 3, 11, 12, 0, 0, tzinfo=UTC)]
+        def clock():
+            return current[0]
+        def advance(seconds: int):
+            current[0] += timedelta(seconds=seconds)
+        return clock, advance
+
+    def test_cc_recovery_never_suppressed(self):
+        """Force a rapid burst of CC transitions including the recovery
+        transition. With flapping protection opted out, the recovery
+        must apply with suppressed=False.
+        """
+        clock, advance = self._make_clock()
+        sm = ResilienceStateMachine(clock=clock)
+        # 5 transitions in 5 seconds — would trigger flapping on any
+        # protected axis, holding the worse state.
+        sm.update_cc(CCStatus.RATE_LIMITED)
+        advance(1)
+        sm.update_cc(CCStatus.NORMAL)
+        advance(1)
+        sm.update_cc(CCStatus.RATE_LIMITED)
+        advance(1)
+        sm.update_cc(CCStatus.NORMAL)
+        advance(1)
+        sm.update_cc(CCStatus.RATE_LIMITED)
+        advance(1)
+        # The recovery MUST apply.
+        transitions = sm.update_cc(CCStatus.NORMAL)
+        assert len(transitions) == 1
+        assert transitions[0].suppressed is False
+        assert transitions[0].new_value == "NORMAL"
+        assert sm.current.cc == CCStatus.NORMAL
+
+    def test_cc_no_stabilization_lockout(self):
+        """The CC axis must never enter a stabilization hold — flapping
+        protection is bypassed entirely, so stabilize_until stays None
+        regardless of transition burst.
+        """
+        clock, advance = self._make_clock()
+        sm = ResilienceStateMachine(clock=clock)
+        for _ in range(10):
+            sm.update_cc(CCStatus.RATE_LIMITED)
+            advance(1)
+            sm.update_cc(CCStatus.NORMAL)
+            advance(1)
+        assert sm._flap["cc"].stabilize_until is None
+
+    def test_cloud_recovery_still_suppressed_during_stabilization(self):
+        """Regression guard: the other axes MUST still get flapping
+        protection. Removing the opt-out for cloud/memory/embedding would
+        silently undo the protection for genuinely cascading failures.
+        """
+        clock, advance = self._make_clock()
+        sm = ResilienceStateMachine(clock=clock)
+        # Trigger flapping on cloud
+        sm.update_cloud(CloudStatus.FALLBACK)
+        advance(30)
+        sm.update_cloud(CloudStatus.NORMAL)
+        advance(30)
+        sm.update_cloud(CloudStatus.FALLBACK)
+        advance(30)
+        sm.update_cloud(CloudStatus.NORMAL)  # 4th → enters stabilization
+        advance(60)
+        # Recovery suppressed
+        transitions = sm.update_cloud(CloudStatus.NORMAL)
+        assert len(transitions) == 1
+        assert transitions[0].suppressed is True
+        assert sm.current.cloud == CloudStatus.FALLBACK
+
+    def test_cc_transitions_still_recorded(self):
+        """Even with flapping off, every transition should append to the
+        state.transitions log for observability.
+        """
+        clock, advance = self._make_clock()
+        sm = ResilienceStateMachine(clock=clock)
+        sm.update_cc(CCStatus.RATE_LIMITED)
+        advance(1)
+        sm.update_cc(CCStatus.NORMAL)
+        cc_transitions = [t for t in sm.current.transitions if t.axis == "cc"]
+        assert len(cc_transitions) == 2
+        assert all(t.suppressed is False for t in cc_transitions)

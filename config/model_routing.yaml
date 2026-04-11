@@ -16,19 +16,30 @@ providers:
     enabled: ${GENESIS_ENABLE_OLLAMA:-true}
     keep_alive: -1
     open_duration_s: 60
-  mistral-free:
+  mistral-large-free:
     type: mistral
     model: mistral-large-latest
     profile: mistral-large-3
     free: true
-    rpm_limit: 2
+    # Raised 2→4 on 2026-04-11 after a data-grounded review of observed
+    # usage (memory/project_mistral_large_review.md). Actual call sizes
+    # average ~3k tokens (not the 13k/call figure the earlier 2-rpm cap
+    # was based on), so 4 rpm × ~5k worst-case ≈ 20k tokens/min leaves
+    # ~60% headroom under the stated 50k tokens/min ceiling. The live
+    # TPM header has NOT been reprobed in this pass — if observed usage
+    # grows or call patterns shift above ~6k/call sustained, revisit
+    # before going higher.
+    rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:
     type: mistral
     model: mistral-small-latest
     profile: mistral-small
     free: true
-    rpm_limit: 2
+    # Mistral free tier publishes 60 req/min + 375k tokens/min for
+    # mistral-small-latest (verified 2026-04-11 via x-ratelimit-limit-req-minute
+    # header on a live probe). Setting to 30 leaves 50% headroom.
+    rpm_limit: 30
     open_duration_s: 120
   groq-free:
     type: groq
@@ -114,13 +125,6 @@ providers:
     base_url: https://api.minimaxi.com/v1
     free: false
     open_duration_s: 120
-  mistral-large:
-    type: mistral
-    model: mistral-large-latest
-    profile: mistral-large-3
-    free: false
-    rpm_limit: 60
-    open_duration_s: 120
   openrouter-nemo:
     type: openrouter
     model: mistralai/mistral-nemo
@@ -152,20 +156,20 @@ call_sites:
   2_triage:
     chain:
     - ollama-3b
-    - mistral-free
+    - mistral-small-free
     - groq-free
     - openrouter-free
   3_micro_reflection:
     chain:
     - mistral-small-free
-    - mistral-free
     - groq-free
+    - mistral-large-free
     - gemini-free
     - openrouter-free
     retry_profile: background
   4_light_reflection:
     chain:
-    - mistral-free
+    - mistral-large-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -179,6 +183,10 @@ call_sites:
     - glm5
     default_paid: true
     retry_profile: background
+    never_pays: false
+    cc_model: Sonnet
+    dispatch: dual
+    cc_position: 2
   6_strategic_reflection:
     chain:
     - claude-opus
@@ -190,20 +198,20 @@ call_sites:
     - claude-opus
     default_paid: true
     retry_profile: background
-    description: "Autonomous ego cycle reasoning via API"
+    description: Autonomous ego cycle reasoning via API
   7_task_retrospective:
     chain:
     - openrouter-free
     default_paid: true
-  8_memory_consolidation:
+  8_ego_compaction:
     chain:
-    - mistral-free
+    - mistral-large-free
     - groq-free
     - gemini-free
     - openrouter-free
   9_fact_extraction:
     chain:
-    - mistral-free
+    - mistral-large-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -213,21 +221,29 @@ call_sites:
     - claude-sonnet
     default_paid: true
   11_user_model_synthesis:
+    # LLM-narrative synthesis of the user model. Wired in
+    # runtime/init/learning.py — every 48h the user_model_evolver job calls
+    # router.call("11_user_model_synthesis", ...) with the current model dict
+    # plus recent delta evidence, and writes the result to USER_KNOWLEDGE.md.
+    # Free-first chain — synthesis is summary-quality work that does not
+    # require frontier models. On all-free-exhausted, learning.py falls back
+    # to Python dict rendering as graceful degradation.
     chain:
-    - claude-sonnet
-    - claude-opus
-    default_paid: true
+    - mistral-small-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
     retry_profile: background
   12_surplus_brainstorm:
     chain:
-    - mistral-free
-    - groq-free
     - gemini-free
+    - mistral-large-free
+    - groq-free
     - openrouter-free
     never_pays: true
   13_morning_report:
     chain:
-    - mistral-free
+    - mistral-large-free
     - groq-free
     - gemini-free
     - openrouter-free
@@ -256,7 +272,7 @@ call_sites:
   22_tagging:
     chain:
     - ollama-3b
-    - mistral-free
+    - mistral-small-free
     - groq-free
   27_pre_execution_assessment:
     chain:
@@ -271,23 +287,24 @@ call_sites:
   29_retrospective_triage:
     chain:
     - groq-free
-    - mistral-free
+    - mistral-large-free
+    - openrouter-nemo  # cheap paid tail — prevents DLQ storm when both free providers trip (mirrors 37_infrastructure_monitor)
   30_triage_calibration:
     chain:
     - lmstudio-30b
-    - mistral-large
+    - mistral-large-free
     default_paid: true
     retry_profile: background
   31_outcome_classification:
     chain:
     - glm5
-    - mistral-large
+    - mistral-large-free
     default_paid: true
     never_pays: false
   32_delta_assessment:
     chain:
     - glm5
-    - mistral-large
+    - mistral-large-free
     default_paid: true
     never_pays: false
   33_skill_refiner:
@@ -299,25 +316,26 @@ call_sites:
     chain:
     - gemini-free
     - groq-free
-    - mistral-free
+    - mistral-large-free
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
     - groq-free
-    - mistral-free
+    - mistral-large-free
     - gemini-free
     description: Extract reusable procedures from interaction outcomes
   35_content_draft:
     chain:
     - gemini-free
     - groq-free
-    - mistral-free
+    - mistral-large-free
+    - openrouter-free  # 4th free provider for resilience (same failure shape as site 29)
     description: Draft content for various platforms
   23_fresh_eyes_review:
     chain:
     - gemini-free
     - groq-free
-    - mistral-free
+    - mistral-large-free
   36_code_auditor:
     chain:
     - kimi-k2.5
@@ -328,7 +346,7 @@ call_sites:
   37_infrastructure_monitor:
     chain:
     - groq-free
-    - mistral-free
+    - mistral-large-free
     - openrouter-nemo
     default_paid: true
     retry_profile: background
@@ -340,24 +358,24 @@ call_sites:
     default_paid: true
     retry_profile: user_facing
     description: "CC contingency \u2014 foreground conversation via API when CC unavailable"
-  contingency_inbox:
+  contingency_micro:
     chain:
-    - mistral-free
+    - mistral-small-free
     - gemini-free
     - groq-free
     never_pays: true
     retry_profile: background
-    description: "CC contingency \u2014 inbox evaluation via free API when CC unavailable"
+    description: "CC contingency \u2014 Micro reflection via free API when CC unavailable (cheap periodic ticks, quality not critical)"
   autonomous_executor_reasoning:
     chain:
     - claude-sonnet
     - gpt-5.4
     default_paid: true
     retry_profile: background
-    description: "Autonomous executor non-tooling reasoning via API"
+    description: Autonomous executor non-tooling reasoning via API
   cc_update_analysis:
     chain:
-    - mistral-free
+    - mistral-large-free
     - groq-free
     - gemini-free
     default_paid: true
@@ -365,10 +383,11 @@ call_sites:
   email_triage:
     chain:
     - gemini-free
-    - mistral-free
+    - mistral-small-free
     - groq-free
     never_pays: true
-    description: "Email triage — Gemini-primary light filter for weekly email batch"
+    description: "Email triage \u2014 Gemini-primary light filter for weekly email\
+      \ batch"
 retry:
   default:
     max_retries: 3

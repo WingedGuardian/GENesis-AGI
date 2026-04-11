@@ -113,7 +113,7 @@ async def init(rt: GenesisRuntime) -> None:
         except Exception as exc:
             rt._model_profile_registry = None
             logger.warning("Failed to load model profile registry", exc_info=True)
-            from genesis.runtime._core import record_init_degradation
+            from genesis.runtime._degradation import record_init_degradation
             await record_init_degradation(rt._db, rt._event_bus, "cc_relay", "model_profile_registry", str(exc))
 
         if rt._router is not None:
@@ -129,7 +129,7 @@ async def init(rt: GenesisRuntime) -> None:
             except Exception as exc:
                 rt._contingency_dispatcher = None
                 logger.warning("Failed to initialize CC contingency dispatcher", exc_info=True)
-                from genesis.runtime._core import record_init_degradation
+                from genesis.runtime._degradation import record_init_degradation
                 await record_init_degradation(rt._db, rt._event_bus, "cc_relay", "contingency_dispatcher", str(exc))
         else:
             logger.warning("Router unavailable — CC contingency dispatcher disabled")

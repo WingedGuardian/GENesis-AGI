@@ -5,7 +5,6 @@ from genesis.awareness.signals import (
     ConversationCollector,
     CriticalFailureCollector,
     ErrorSpikeCollector,
-    MemoryBacklogCollector,
     OutreachEngagementCollector,
     ReconFindingsCollector,
     StrategicTimerCollector,
@@ -15,8 +14,8 @@ from genesis.awareness.signals import (
 from genesis.awareness.types import SignalReading
 
 
-async def test_stub_collector_returns_zero():
-    """Phase 1 stub collectors return 0.0."""
+async def test_bootstrap_placeholder_returns_zero():
+    """Bootstrap placeholder collectors return 0.0 before learning init swap."""
     c = ConversationCollector()
     reading = await c.collect()
     assert isinstance(reading, SignalReading)
@@ -31,7 +30,6 @@ async def test_all_collectors_have_correct_signal_names():
         "task_completion_quality",
         "outreach_engagement_data",
         "recon_findings_pending",
-        "unprocessed_memory_backlog",
         "budget_pct_consumed",
         "software_error_spike",
         "critical_failure",
@@ -42,7 +40,6 @@ async def test_all_collectors_have_correct_signal_names():
         TaskQualityCollector(),
         OutreachEngagementCollector(),
         ReconFindingsCollector(),
-        MemoryBacklogCollector(),
         BudgetCollector(),
         ErrorSpikeCollector(),
         CriticalFailureCollector(),
@@ -52,20 +49,19 @@ async def test_all_collectors_have_correct_signal_names():
     assert names == expected
 
 
-async def test_collect_all_returns_nine_readings():
+async def test_collect_all_returns_all_readings():
     collectors = [
         ConversationCollector(),
         TaskQualityCollector(),
         OutreachEngagementCollector(),
         ReconFindingsCollector(),
-        MemoryBacklogCollector(),
         BudgetCollector(),
         ErrorSpikeCollector(),
         CriticalFailureCollector(),
         StrategicTimerCollector(),
     ]
     readings = await collect_all(collectors)
-    assert len(readings) == 9
+    assert len(readings) == len(collectors)
     assert all(isinstance(r, SignalReading) for r in readings)
 
 

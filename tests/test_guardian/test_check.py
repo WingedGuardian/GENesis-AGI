@@ -76,26 +76,24 @@ class TestWriteGuardianHeartbeat:
 class TestHandleHealthy:
 
     @pytest.mark.asyncio
-    async def test_writes_heartbeat_and_skips_prune(self, config: GuardianConfig) -> None:
+    async def test_does_not_write_heartbeat_directly(self, config: GuardianConfig) -> None:
+        """_handle_healthy must NOT call the heartbeat — run_check owns it."""
         snapshots = MagicMock()
         snapshots.prune = AsyncMock(return_value=0)
 
         with patch(
             "genesis.guardian.check._write_guardian_heartbeat",
             AsyncMock(),
-        ):
+        ) as mock_hb:
             await _handle_healthy(config, snapshots)
+        mock_hb.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_prunes_when_due(self, config: GuardianConfig) -> None:
         snapshots = MagicMock()
         snapshots.prune = AsyncMock(return_value=2)
 
-        with patch(
-            "genesis.guardian.check._write_guardian_heartbeat",
-            AsyncMock(),
-        ):
-            await _handle_healthy(config, snapshots)
+        await _handle_healthy(config, snapshots)
         # Should attempt prune (no marker file exists = overdue)
         snapshots.prune.assert_called_once()
 
@@ -118,6 +116,66 @@ class TestRunCheck:
         # State file should exist after run
         state_file = config.state_path / "state.json"
         assert state_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_writes_heartbeat_on_healthy(self, config: GuardianConfig) -> None:
+        """Successful HEALTHY check cycle writes heartbeat once."""
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_healthy_snapshot()),
+            ),
+            patch(
+                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+            ) as mock_hb,
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+        mock_hb.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_writes_heartbeat_on_signal_dropped(self, config: GuardianConfig) -> None:
+        """SIGNAL_DROPPED is still a successful cycle — heartbeat fires."""
+        dead_snapshot = HealthSnapshot(
+            signals={
+                "container_exists": SignalResult("container_exists", False, 1.0, "down", "t"),
+                "icmp_reachable": SignalResult("icmp_reachable", False, 1.0, "down", "t"),
+                "health_api": SignalResult("health_api", True, 1.0, "ok", "t"),
+                "heartbeat_canary": SignalResult("heartbeat_canary", True, 1.0, "ok", "t"),
+                "log_freshness": SignalResult("log_freshness", True, 1.0, "ok", "t"),
+            },
+            pause_state=PauseState(paused=False),
+        )
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=dead_snapshot),
+            ),
+            patch(
+                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+            ) as mock_hb,
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+        ):
+            await run_check(config)
+        mock_hb.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_does_not_write_heartbeat_on_crash(self, config: GuardianConfig) -> None:
+        """If _check_cycle raises, heartbeat must NOT fire — Guardian failure
+        should be visible to Genesis-side monitoring."""
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+            patch(
+                "genesis.guardian.check._write_guardian_heartbeat", AsyncMock(),
+            ) as mock_hb,
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            pytest.raises(RuntimeError, match="boom"),
+        ):
+            await run_check(config)
+        mock_hb.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_state_persists_across_runs(self, config: GuardianConfig) -> None:

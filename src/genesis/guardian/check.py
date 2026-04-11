@@ -47,12 +47,45 @@ _STARTED_AT = datetime.now(UTC)
 
 
 def _setup_logging() -> None:
-    """Configure logging for Guardian — journald-friendly format."""
+    """Configure logging for Guardian — journald + persistent file.
+
+    File log survives host reboots and journald rotation. Critical for
+    post-mortem analysis (incident 2026-04-08: CC failure evidence lost).
+    """
+    import sys
+    from logging.handlers import RotatingFileHandler
+    from pathlib import Path
+
+    log_format = "%(asctime)s [guardian] %(levelname)s %(name)s: %(message)s"
+    datefmt = "%Y-%m-%dT%H:%M:%S"
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [guardian] %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
+        format=log_format,
+        datefmt=datefmt,
     )
+
+    # Skip file handler during tests to avoid polluting filesystem
+    if "pytest" in sys.modules or "_pytest" in sys.modules:
+        return
+
+    log_dir = Path("~/.local/state/genesis-guardian").expanduser()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "guardian.log",
+            maxBytes=1_000_000,   # 1 MB
+            backupCount=3,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(log_format, datefmt=datefmt))
+        logging.getLogger().addHandler(file_handler)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Cannot create Guardian log file in %s — file logging disabled",
+            log_dir,
+        )
 
 
 def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
@@ -158,6 +191,13 @@ async def run_check(config: GuardianConfig | None = None) -> None:
 
     try:
         await _check_cycle(config, sm, dispatcher, snapshots, diagnosis_engine, recovery_engine)
+        # Heartbeat means "Guardian process is alive and watching" —
+        # NOT "Genesis container is healthy". Any successful check cycle
+        # (regardless of resulting state) should refresh liveness. A
+        # crashed _check_cycle raises out before reaching here, which
+        # correctly withholds the heartbeat — that is a real Guardian
+        # failure that Genesis-side monitoring should see.
+        await _write_guardian_heartbeat(config)
     finally:
         # Always save state, even on error
         sm.save_state(state_path)
@@ -239,7 +279,8 @@ async def _handle_healthy(
     snapshots: SnapshotManager,
 ) -> None:
     """Actions when all probes are healthy."""
-    await _write_guardian_heartbeat(config)
+    # Heartbeat is written by run_check after each successful check cycle,
+    # regardless of state outcome, so HEALTHY no longer needs a direct call.
 
     # Periodic snapshot pruning (don't prune every check — too expensive)
     prune_marker = config.state_path / ".last_prune"
@@ -485,7 +526,8 @@ async def _handle_cc_resolved(
                  f"Actions: {actions_str}\n"
                  f"Outcome: {diagnosis.outcome}",
         ))
-        await _write_guardian_heartbeat(config)
+        # Heartbeat is now written in run_check after the full cycle; no
+        # redundant write here.
     else:
         logger.warning(
             "CC reported resolved but signals still failing — "
@@ -503,12 +545,23 @@ async def _handle_cc_resolved(
         else:
             # Defensive: should not happen (callers pass recovery_engine),
             # but send alert rather than silently dropping
+            cname = config.container_name
             await dispatcher.send(Alert(
                 severity=AlertSeverity.CRITICAL,
-                title="CC recovery failed — manual intervention required",
-                body=f"CC reported: {diagnosis.likely_cause}\n"
-                     f"Actions taken: {actions_str}\n"
-                     f"Signals still failing. Approval gate unavailable.",
+                title="Genesis down — CC fix did not hold",
+                body=(
+                    f"CC diagnosed: {diagnosis.likely_cause}\n"
+                    f"CC actions taken: {actions_str}\n"
+                    "Post-fix health check: FAILED (signals still down)\n"
+                    "Approval-gated recovery pipeline unavailable.\n\n"
+                    "IMMEDIATE ACTION REQUIRED:\n"
+                    "1. SSH to host VM\n"
+                    "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
+                    "3. Review latest diagnosis: ls -t "
+                    "~/.local/state/genesis-guardian/shared/findings/ | head -1\n"
+                    f"4. Manual restart: incus exec {cname} -- "
+                    f"su - ubuntu -c 'systemctl --user restart genesis-server'"
+                ),
             ))
 
 
@@ -566,6 +619,7 @@ async def _handle_confirmed_dead(
             reasoning=f"Max recovery attempts ({sm.state.recovery_attempts}) exceeded. "
                       + diagnosis.reasoning,
             source=diagnosis.source,
+            cc_failure_reason=diagnosis.cc_failure_reason,
         )
 
     await _execute_recovery_with_approval(
@@ -627,11 +681,29 @@ async def _execute_recovery_with_approval(
             await recovery_engine.execute(diagnosis)
         else:
             logger.warning("Recovery approval timed out — no action taken")
+            failed_desc = ", ".join(failed_signals) if failed_signals else "unknown"
+            timeout_h = config.approval.token_expiry_s // 3600
+            cname = config.container_name
             await dispatcher.send(Alert(
                 severity=AlertSeverity.WARNING,
-                title="Recovery approval timed out",
-                body="No action was taken. Genesis remains down. "
-                     "Guardian will re-check on next cycle.",
+                title="Recovery approval expired — Genesis still down",
+                body=(
+                    f"Proposed action: {diagnosis.recommended_action.value}\n"
+                    f"Cause: {diagnosis.likely_cause}\n"
+                    f"Failed signals: {failed_desc}\n"
+                    f"Approval link expired after {timeout_h}h with no response.\n\n"
+                    "No automated recovery was performed.\n"
+                    "Guardian will re-diagnose on next timer cycle.\n\n"
+                    "If you want to act now:\n"
+                    f"1. incus exec {cname} -- su - ubuntu -c "
+                    f"'systemctl --user restart genesis-server'\n"
+                    "2. Or re-trigger Guardian: systemctl --user restart "
+                    "genesis-guardian.timer"
+                ),
+                failed_probes=failed_signals,
+                duration_s=duration,
+                likely_cause=diagnosis.likely_cause,
+                proposed_action=diagnosis.recommended_action.value,
             ))
     finally:
         approval.stop()

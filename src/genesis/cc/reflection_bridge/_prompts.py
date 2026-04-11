@@ -105,11 +105,13 @@ def _format_observations_json(observations: list[dict], *, max_count: int = _OBS
 
 def build_data_pointers() -> str:
     """Build a section pointing reflections to raw data they can access."""
+    from genesis.env import cc_project_dir
+    project_id = cc_project_dir()
     return (
         "\n## Available Data Sources\n\n"
         "You have full tool access. Use these to investigate claims and "
         "gather context beyond what's provided above:\n\n"
-        "- **Session transcripts**: `~/.claude/projects/-home-ubuntu-genesis/*.jsonl` "
+        f"- **Session transcripts**: `~/.claude/projects/{project_id}/*.jsonl` "
         "(JSONL, one per session)\n"
         "- **Database**: `~/genesis/data/genesis.db` — use `db_schema` MCP tool "
         "to discover tables before querying\n"

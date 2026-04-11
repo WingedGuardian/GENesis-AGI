@@ -58,6 +58,7 @@ async def test_store_dedup_no_match_proceeds_normally(store, embedding_provider)
          patch("genesis.memory.store.upsert_point"):
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
         result = await store.store("new content", "src")
 
     assert isinstance(result, str)
@@ -75,6 +76,7 @@ async def test_store_dedup_check_failure_continues(store, embedding_provider):
             side_effect=RuntimeError("FTS5 unavailable"),
         )
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
         result = await store.store("content", "src")
 
     assert isinstance(result, str)

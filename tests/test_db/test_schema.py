@@ -89,7 +89,8 @@ async def test_no_unexpected_tables(db):
 async def test_signal_weights_seeded(db):
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
     count = (await cursor.fetchone())[0]
-    assert count == 11
+    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
+    assert count == 10
 
 
 async def test_signal_weights_values(db):
@@ -102,6 +103,53 @@ async def test_signal_weights_values(db):
     assert row[1] == 0.90
     depths = json.loads(row[2])
     assert "Light" in depths
+
+
+async def test_unprocessed_memory_backlog_migration_removes_existing_row(db):
+    """Migration must clear stale unprocessed_memory_backlog rows on upgrade.
+
+    Fresh-DB seeding never inserts this row (removed 2026-04-11), so the
+    standard seed/idempotent tests cover only the new-install path. This
+    test simulates the upgrade path: a DB that already has the row from a
+    pre-cleanup install, then runs the migration, and asserts the row is
+    gone. Also verifies idempotency by running the migration twice.
+    """
+    from genesis.db.schema._migrations import _migrate_add_columns
+
+    # Inject the legacy row exactly as it appeared in pre-2026-04-11 seeds.
+    await db.execute(
+        "INSERT OR REPLACE INTO signal_weights "
+        "(signal_name, source_mcp, current_weight, initial_weight, "
+        " min_weight, max_weight, feeds_depths) "
+        "VALUES ('unprocessed_memory_backlog', 'memory_mcp', "
+        "        0.30, 0.30, 0.0, 1.0, '[\"Deep\"]')"
+    )
+    await db.commit()
+
+    # Sanity check: row exists before migration runs.
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM signal_weights "
+        "WHERE signal_name = 'unprocessed_memory_backlog'"
+    )
+    assert (await cur.fetchone())[0] == 1
+
+    # Run migration once — row should be removed.
+    await _migrate_add_columns(db)
+    await db.commit()
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM signal_weights "
+        "WHERE signal_name = 'unprocessed_memory_backlog'"
+    )
+    assert (await cur.fetchone())[0] == 0
+
+    # Run migration again — must be idempotent (no error, still zero).
+    await _migrate_add_columns(db)
+    await db.commit()
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM signal_weights "
+        "WHERE signal_name = 'unprocessed_memory_backlog'"
+    )
+    assert (await cur.fetchone())[0] == 0
 
 
 # ─── Drive weights seed data ─────────────────────────────────────────────────
@@ -244,7 +292,8 @@ async def test_seed_is_idempotent(db):
     await seed_data(db)
     await db.commit()
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
-    assert (await cursor.fetchone())[0] == 11
+    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
+    assert (await cursor.fetchone())[0] == 10
     cursor = await db.execute("SELECT COUNT(*) FROM drive_weights")
     assert (await cursor.fetchone())[0] == 4
 

@@ -1,0 +1,20 @@
+# Phase 6 — versioned hook history.
+#
+# Lists sha256 hashes of every Genesis hook version that's been shipped.
+# scripts/hooks/sync-hooks.sh uses this to distinguish "stale Genesis
+# install that needs updating" (hash is a known prior version → safe to
+# overwrite) from "user-modified hook" (unknown hash → leave alone).
+#
+# Format: <hook-name>:<sha256>
+#
+# Release discipline: every commit that touches scripts/hooks/{post-commit,
+# pre-commit, pre-push} MUST also append the new hash to this file.
+# Enforced by scripts/check_hook_versions.sh run from pre-commit.
+#
+# To regenerate entries for the current tree:
+#   scripts/update_hook_versions.sh
+
+post-commit:6455a4c321117b7b5411377b282bd9fbc8607936c8537f055563a5b29eaffef5
+pre-commit:8f47265ab05db4d4675e7ed03977f61694ba93c60e2ef4efddc6d2ef8fecdd90
+pre-push:3c5ea87a0c5918dce1e5f555ca64647e9d406ac26508f063a9cddc02a73e26e3
+pre-commit:23aef73d8aed5717279a77b029d3ce1cc65f107588dcf4d26b34a29dfe4e6f1c

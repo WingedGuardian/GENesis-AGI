@@ -32,6 +32,7 @@ _READONLY_DISALLOWED = [
 # Module-level constant (immutable intent), consistent with _READONLY_DISALLOWED.
 _MCP_PROFILES: dict[str, list[str]] = {
     "reflection": ["genesis-health", "genesis-memory"],
+    "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
 }
 
 

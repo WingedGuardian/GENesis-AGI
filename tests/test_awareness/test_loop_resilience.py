@@ -23,14 +23,6 @@ class _FailingReflectionEngine:
         raise RuntimeError("reflection boom")
 
 
-async def test_status_writer_called_after_tick(db):
-    """Status writer's write() is called after each tick."""
-    sw = AsyncMock()
-    loop = AwarenessLoop(db, [_HotSignal()], status_writer=sw)
-    await loop._on_tick()
-    sw.write.assert_awaited_once()
-
-
 async def test_reflection_failure_enqueues_deferred_work(db):
     """When reflection fails and deferred_queue is available, work is enqueued."""
     dq = AsyncMock()
@@ -70,25 +62,12 @@ async def test_late_binding_setters(db):
 
     sm = MagicMock()
     dq = AsyncMock()
-    sw = AsyncMock()
 
     loop.set_resilience_state_machine(sm)
     loop.set_deferred_queue(dq)
-    loop.set_status_writer(sw)
 
     assert loop._resilience_state_machine is sm
     assert loop._deferred_queue is dq
-    assert loop._status_writer is sw
-
-
-async def test_status_writer_failure_does_not_crash_tick(db):
-    """If status writer fails, the tick still completes."""
-    sw = AsyncMock()
-    sw.write.side_effect = RuntimeError("disk full")
-    loop = AwarenessLoop(db, [_HotSignal()], status_writer=sw)
-    # Should not raise
-    await loop._on_tick()
-    sw.write.assert_awaited_once()
 
 
 # ── LIGHT → CC Haiku (primary) ───────────────────────────────────────────

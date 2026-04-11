@@ -187,30 +187,62 @@ async def probe_container_exists(config: GuardianConfig) -> SignalResult:
 
 
 async def probe_icmp_reachable(config: GuardianConfig) -> SignalResult:
-    """Check container is reachable via ICMP ping."""
+    """Check container is reachable via ICMP ping.
+
+    A single ping on the Incus bridge occasionally loses to an ARP race —
+    the kernel has no neighbor entry yet, the first packet gets dropped
+    during resolution, and the probe reports the container dead when it
+    is actually fine. A single retry closes that window.
+
+    Each attempt has its own ``probes.probe_timeout_s`` budget, so the
+    worst-case total is roughly ``2 * probe_timeout_s + 0.5s`` (the
+    inter-attempt sleep). With default ``probe_timeout_s=10`` that's
+    ~20.5s — still well under the Guardian check interval.
+    """
     name = "icmp_reachable"
     t0 = datetime.now(UTC)
-    try:
-        rc, stdout, stderr = await _run_subprocess(
-            "ping",
-            f"-c{config.probes.ping_count}",
-            f"-W{config.probes.ping_timeout_s}",
-            config.container_ip,
-            timeout=config.probes.probe_timeout_s,
-        )
-        latency = (datetime.now(UTC) - t0).total_seconds() * 1000
-        alive = rc == 0
-        detail = "reachable" if alive else f"unreachable: {stderr or stdout}"
-        return SignalResult(
-            name=name, alive=alive, latency_ms=latency,
-            detail=detail[:200], collected_at=t0.isoformat(),
-        )
-    except Exception as exc:
-        latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+    last_stderr = ""
+    last_stdout = ""
+    last_exc: Exception | None = None
+    retry_used = False
+
+    for attempt in range(2):
+        try:
+            rc, stdout, stderr = await _run_subprocess(
+                "ping",
+                f"-c{config.probes.ping_count}",
+                f"-W{config.probes.ping_timeout_s}",
+                config.container_ip,
+                timeout=config.probes.probe_timeout_s,
+            )
+            if rc == 0:
+                latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+                detail = "reachable (retry)" if retry_used else "reachable"
+                return SignalResult(
+                    name=name, alive=True, latency_ms=latency,
+                    detail=detail, collected_at=t0.isoformat(),
+                )
+            last_stdout = stdout
+            last_stderr = stderr
+        except Exception as exc:
+            last_exc = exc
+
+        if attempt == 0:
+            retry_used = True
+            await asyncio.sleep(0.5)
+
+    latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+    if last_exc is not None:
         return SignalResult(
             name=name, alive=False, latency_ms=latency,
-            detail=f"exception: {exc}", collected_at=t0.isoformat(),
+            detail=f"exception: {last_exc}"[:200],
+            collected_at=t0.isoformat(),
         )
+    detail = f"unreachable (retry): {last_stderr or last_stdout}"
+    return SignalResult(
+        name=name, alive=False, latency_ms=latency,
+        detail=detail[:200], collected_at=t0.isoformat(),
+    )
 
 
 async def probe_health_api(config: GuardianConfig) -> SignalResult:

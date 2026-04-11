@@ -64,4 +64,12 @@ if [ -n "$staged_py" ]; then
     fi
 fi
 
+# Phase 6 — verify tracked hook changes are recorded in .genesis-hook-versions
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/scripts/check_hook_versions.sh" ]; then
+    if ! "$REPO_ROOT/scripts/check_hook_versions.sh"; then
+        exit 1
+    fi
+fi
+
 exit 0

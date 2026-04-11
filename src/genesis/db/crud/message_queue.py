@@ -118,12 +118,19 @@ async def expire_older_than(
     max_age_hours: int = 168,
     expired_at: str,
 ) -> int:
-    """Expire pending messages older than max_age_hours (default 7 days)."""
+    """Expire pending messages older than max_age_hours (default 7 days).
+
+    ``expired_at`` is used BOTH as the reference clock (cutoff = expired_at
+    minus max_age_hours) AND as the stamp written to each expired row. This
+    makes the function deterministic and testable. In production the caller
+    passes ``datetime.now(UTC).isoformat()`` so behavior matches a "wall
+    clock minus max_age_hours" cutoff.
+    """
     cursor = await db.execute(
         """UPDATE message_queue SET expired_at = ?
            WHERE responded_at IS NULL AND expired_at IS NULL
-             AND created_at < datetime('now', ? || ' hours')""",
-        (expired_at, f"-{max_age_hours}"),
+             AND created_at < datetime(?, ? || ' hours')""",
+        (expired_at, expired_at, f"-{max_age_hours}"),
     )
     await db.commit()
     return cursor.rowcount

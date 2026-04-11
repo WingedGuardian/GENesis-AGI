@@ -13,7 +13,6 @@ of raw DOM or screenshots by default.
 
 from __future__ import annotations
 
-import atexit
 import logging
 from pathlib import Path
 
@@ -27,7 +26,7 @@ _PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 _playwright = None
 _context = None
 _page = None
-_stealth_cm = None  # Camoufox context manager (for proper __exit__)
+_stealth_cm = None  # Camoufox context manager (for proper __aexit__)
 _stealth_browser = None
 _stealth_page = None
 _active_page = None  # Tracks whichever page was last navigated (standard or stealth)
@@ -35,26 +34,26 @@ _active_page = None  # Tracks whichever page was last navigated (standard or ste
 _SCREENSHOT_DIR = Path.home() / "tmp"
 
 
-def _cleanup():
-    """Shut down browser on process exit."""
+async def async_cleanup():
+    """Shut down browser. Called from MCP lifespan or manually."""
     global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
     _active_page = None
     if _context is not None:
         try:
-            _context.close()
+            await _context.close()
         except Exception:
             logger.debug("Browser context cleanup failed", exc_info=True)
         _context = None
         _page = None
     if _playwright is not None:
         try:
-            _playwright.stop()
+            await _playwright.stop()
         except Exception:
             logger.debug("Playwright cleanup failed", exc_info=True)
         _playwright = None
     if _stealth_cm is not None:
         try:
-            _stealth_cm.__exit__(None, None, None)
+            await _stealth_cm.__aexit__(None, None, None)
         except Exception:
             logger.debug("Camoufox cleanup failed", exc_info=True)
         _stealth_cm = None
@@ -62,10 +61,7 @@ def _cleanup():
         _stealth_page = None
 
 
-atexit.register(_cleanup)
-
-
-def _ensure_browser():
+async def _ensure_browser():
     """Lazily initialize the Playwright browser with persistent profile.
 
     Returns the active page. Raises ImportError if playwright is not installed.
@@ -75,23 +71,23 @@ def _ensure_browser():
     if _page is not None:
         return _page
 
-    from playwright.sync_api import sync_playwright
+    from playwright.async_api import async_playwright
 
     _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-    _playwright = sync_playwright().start()
-    _context = _playwright.chromium.launch_persistent_context(
+    _playwright = await async_playwright().start()
+    _context = await _playwright.chromium.launch_persistent_context(
         user_data_dir=str(_PROFILE_DIR),
         headless=True,
         executable_path="/usr/bin/google-chrome",
         args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
     )
-    _page = _context.pages[0] if _context.pages else _context.new_page()
+    _page = _context.pages[0] if _context.pages else await _context.new_page()
     logger.info("Browser launched with persistent profile at %s", _PROFILE_DIR)
     return _page
 
 
-def _ensure_stealth_browser():
+async def _ensure_stealth_browser():
     """Lazily initialize Camoufox for anti-detection browsing.
 
     Returns the active stealth page. Raises ImportError if camoufox is not installed.
@@ -101,30 +97,30 @@ def _ensure_stealth_browser():
     if _stealth_page is not None:
         return _stealth_page
 
-    from camoufox.sync_api import Camoufox
+    from camoufox.async_api import AsyncCamoufox
 
-    _stealth_cm = Camoufox(headless=True)
-    _stealth_browser = _stealth_cm.__enter__()
-    _stealth_page = _stealth_browser.new_page()
+    _stealth_cm = AsyncCamoufox(headless=True)
+    _stealth_browser = await _stealth_cm.__aenter__()
+    _stealth_page = await _stealth_browser.new_page()
     logger.info("Camoufox stealth browser launched")
     return _stealth_page
 
 
-def _get_page(stealth: bool = False):
+async def _get_page(stealth: bool = False):
     """Get the appropriate browser page based on mode.
 
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
     use whichever browser was last navigated.
     """
     global _active_page
-    _active_page = _ensure_stealth_browser() if stealth else _ensure_browser()
+    _active_page = await _ensure_stealth_browser() if stealth else await _ensure_browser()
     return _active_page
 
 
-def _snapshot_page(page) -> str:
+async def _snapshot_page(page) -> str:
     """Get accessibility tree snapshot of the current page."""
     try:
-        return page.locator("body").aria_snapshot()
+        return await page.locator("body").aria_snapshot()
     except Exception as e:
         return f"(snapshot unavailable: {e})"
 
@@ -137,16 +133,16 @@ def _snapshot_page(page) -> str:
 async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
     """Navigate to a URL and return the page snapshot."""
     try:
-        page = _get_page(stealth)
+        page = await _get_page(stealth)
     except ImportError as e:
         return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
 
     try:
-        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        snapshot = _snapshot_page(page)
+        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        snapshot = await _snapshot_page(page)
         return {
             "url": page.url,
-            "title": page.title(),
+            "title": await page.title(),
             "snapshot": snapshot,
         }
     except Exception as e:
@@ -159,8 +155,8 @@ async def _impl_browser_click(selector: str) -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
-        _active_page.click(selector, timeout=10000)
-        snapshot = _snapshot_page(_active_page)
+        await _active_page.click(selector, timeout=10000)
+        snapshot = await _snapshot_page(_active_page)
         return {"clicked": selector, "url": _active_page.url, "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Click failed on '{selector}': {e}"}
@@ -171,7 +167,7 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
-        _active_page.fill(selector, value, timeout=10000)
+        await _active_page.fill(selector, value, timeout=10000)
         return {"filled": selector, "url": _active_page.url}
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
@@ -184,11 +180,11 @@ async def _impl_browser_screenshot() -> dict:
     try:
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         screenshot_path = _SCREENSHOT_DIR / "genesis_browser_screenshot.png"
-        _active_page.screenshot(path=str(screenshot_path))
+        await _active_page.screenshot(path=str(screenshot_path))
         return {
             "path": str(screenshot_path),
             "url": _active_page.url,
-            "title": _active_page.title(),
+            "title": await _active_page.title(),
         }
     except Exception as e:
         return {"error": f"Screenshot failed: {e}"}
@@ -199,8 +195,8 @@ async def _impl_browser_snapshot() -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
-        snapshot = _snapshot_page(_active_page)
-        return {"url": _active_page.url, "title": _active_page.title(), "snapshot": snapshot}
+        snapshot = await _snapshot_page(_active_page)
+        return {"url": _active_page.url, "title": await _active_page.title(), "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Snapshot failed: {e}"}
 
@@ -215,7 +211,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
         return {"error": "No page open. Call browser_navigate first."}
     try:
         logger.info("browser_run_js: %s", expression[:200])
-        result = _active_page.evaluate(expression)
+        result = await _active_page.evaluate(expression)
         return {"result": result, "url": _active_page.url}
     except Exception as e:
         return {"error": f"JS execution failed: {e}"}

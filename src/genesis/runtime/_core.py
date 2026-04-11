@@ -16,9 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import sqlite3
-from datetime import UTC, datetime
-from pathlib import Path
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -54,98 +52,25 @@ if TYPE_CHECKING:
     from genesis.surplus.idle_detector import IdleDetector
     from genesis.surplus.scheduler import SurplusScheduler
 
+from genesis.runtime._capabilities import write_capabilities_file
+from genesis.runtime._degradation import record_init_degradation
+from genesis.runtime._init_delegates import _InitDelegatesMixin
 from genesis.runtime._job_health import (
+    load_persisted_job_health,
+    persist_job_health,
     record_job_failure,
     record_job_success,
     register_channel,
 )
-from genesis.runtime.init import (
-    autonomy,
-    awareness,
-    cc_relay,
-    db,
-    health_data,
-    inbox,
-    learning,
-    mail,
-    memory,
-    modules,
-    observability,
-    outreach,
-    perception,
-    pipeline,
-    providers,
-    reflection,
-    router,
-    secrets,
-    surplus,
-    tasks,
-)
+from genesis.runtime._pause_state import _PauseStateMixin
+from genesis.runtime._properties import _RuntimeProperties
+
+__all__ = ["GenesisRuntime", "record_init_degradation"]
 
 logger = logging.getLogger("genesis.runtime")
 
 
-async def record_init_degradation(
-    db,
-    event_bus,
-    subsystem: str,
-    component: str,
-    error: str,
-    *,
-    severity: str = "warning",
-) -> None:
-    """Record a subsystem init degradation as an observation + event.
-
-    Called from init modules when a non-critical component fails to wire.
-    Creates an observation (visible in dashboard/morning report) and emits
-    an event (visible in event bus/logs).
-    """
-    priority = "high" if severity == "error" else "medium"
-    content_text = f"[{subsystem}] {component}: {error}"
-    if db is not None:
-        try:
-            import uuid
-
-            from genesis.db.crud import observations
-
-            # Dedup: skip if an unresolved init_degradation for this component exists
-            existing = await db.execute(
-                "SELECT 1 FROM observations WHERE source = 'bootstrap' "
-                "AND type = 'init_degradation' AND content = ? "
-                "AND resolved_at IS NULL LIMIT 1",
-                (content_text,),
-            )
-            if await existing.fetchone():
-                logger.debug("Init degradation already recorded for %s.%s", subsystem, component)
-            else:
-                await observations.create(
-                    db,
-                    id=str(uuid.uuid4()),
-                    source="bootstrap",
-                    type="init_degradation",
-                    content=content_text,
-                    priority=priority,
-                    created_at=datetime.now(UTC).isoformat(),
-                    category="infrastructure",
-                )
-        except Exception:
-            logger.warning("Failed to record init degradation observation", exc_info=True)
-    if event_bus is not None:
-        try:
-            from genesis.observability.types import Severity, Subsystem
-
-            sev = Severity.ERROR if severity == "error" else Severity.WARNING
-            await event_bus.emit(
-                Subsystem.INFRA,
-                sev,
-                f"init.{subsystem}.degraded",
-                f"{component}: {error}",
-            )
-        except Exception:
-            logger.warning("Failed to emit init degradation event", exc_info=True)
-
-
-class GenesisRuntime:
+class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
     """Singleton that owns all Genesis infrastructure references."""
 
     _instance: GenesisRuntime | None = None
@@ -157,9 +82,88 @@ class GenesisRuntime:
         return cls._instance
 
     @classmethod
+    def peek(cls) -> GenesisRuntime | None:
+        """Return the current singleton or None without ever constructing one.
+
+        Use this from read-only observability paths where lazy-constructing
+        a blank singleton would mask real bootstrap failures elsewhere.
+        :meth:`instance` is the correct constructor for production code;
+        :meth:`peek` is the correct read for code that only wants to
+        observe whether a runtime exists.
+        """
+        return cls._instance
+
+    @classmethod
     def reset(cls) -> None:
-        """Clear singleton state.  For tests only."""
+        """Clear singleton state.  For tests only.
+
+        This is the sync fast-path for tests that never bootstrap the
+        runtime. It does NOT close resources on the prior instance — if
+        the singleton was bootstrapped (real DB connection, background
+        tasks, schedulers), use :meth:`ashutdown` instead so those
+        resources get torn down cleanly.
+        """
         cls._instance = None
+
+    @classmethod
+    async def ashutdown(cls) -> None:
+        """Async-safe singleton teardown for in-process restarts.
+
+        Calls :meth:`shutdown` on the current instance (closes the DB,
+        stops schedulers, cancels background tasks, unloads modules) then
+        clears the singleton reference so ``instance()`` produces a
+        fresh object on its next call. Prefer this over :meth:`reset`
+        when the prior instance was bootstrapped.
+
+        **Ordering matters.** :meth:`shutdown` is awaited *before*
+        ``cls._instance`` is cleared. If the order were reversed, a
+        coroutine calling :meth:`instance` while teardown was in flight
+        would observe ``_instance is None`` and construct a brand-new
+        runtime that silently races the dying one. Clearing the
+        reference last means a concurrent :meth:`instance` call during
+        teardown still sees the instance being torn down — degraded
+        but consistent with the rest of the in-flight work — rather
+        than a fresh unbootstrapped object.
+
+        :meth:`shutdown` is wrapped in ``try/finally`` so the singleton
+        reference is *always* cleared even when ``shutdown()`` raises.
+        Otherwise a partially wired runtime could leave the class-level
+        pointer dangling at a defunct instance, defeating the purpose
+        of :meth:`reset` calls that follow.
+
+        Primary use cases are in-process teardown where singleton reuse
+        matters: pytest fixtures that exercise bootstrap across tests,
+        REPL sessions, and hot-reload scenarios. Production process-exit
+        paths (``channels/bridge.py``, ``hosting/standalone.py``,
+        ``cc/terminal.py``) continue to call the instance
+        ``shutdown()`` directly because the process is about to exit
+        and the dangling class-level reference is moot.
+
+        No-op when no singleton exists. Safe on non-bootstrapped
+        singletons — :meth:`shutdown` returns early when
+        ``_bootstrapped is False``, and the reference is still cleared.
+        """
+        if cls._instance is None:
+            return
+        inst = cls._instance
+        try:
+            await inst.shutdown()
+        except Exception:
+            # Log at ERROR per observability rules — a teardown failure
+            # is an operational failure worth surfacing. ``shutdown()``
+            # already logs per-subsystem failures internally; this
+            # catches anything outside the subsystem loop (e.g., a bug
+            # in the approval-timeout-task cancellation path).
+            logger.error(
+                "ashutdown: inst.shutdown() raised during teardown",
+                exc_info=True,
+            )
+        finally:
+            # Always clear the reference, even if shutdown() raised.
+            # A dangling defunct singleton is a worse outcome than a
+            # fresh one; the next instance() call will rebuild from
+            # scratch.
+            cls._instance = None
 
     _CRITICAL_SUBSYSTEMS: frozenset[str] = frozenset({"db", "observability", "router"})
 
@@ -213,6 +217,7 @@ class GenesisRuntime:
         self._autonomous_dispatcher: object | None = None
         self._autonomous_cli_policy_exporter: object | None = None
         self._approval_timeout_task: asyncio.Task | None = None
+        self._status_writer_task: asyncio.Task | None = None
         self._findings_bridge: object | None = None
         self._idle_detector: IdleDetector | None = None
         self._surplus_queue: object | None = None
@@ -234,97 +239,6 @@ class GenesisRuntime:
         self._job_health: dict[str, dict] = {}
         self._job_retry_registry = None
 
-    # ── Pause / kill switch ──────────────────────────────────
-
-    _PAUSE_FILE = Path.home() / ".genesis" / "paused.json"
-
-    @property
-    def paused(self) -> bool:
-        # Check file on disk so cross-process pause (dashboard → bridge) works.
-        # Only reads file when in-memory state is unpaused (cheap fast path).
-        if not self._paused and self._PAUSE_FILE.exists():
-            self._restore_pause_state()
-        elif self._paused and not self._PAUSE_FILE.exists():
-            # Unpaused from another process (dashboard or Telegram)
-            self._paused = False
-            self._pause_reason = None
-            self._paused_since = None
-        return self._paused
-
-    @property
-    def pause_reason(self) -> str | None:
-        return self._pause_reason
-
-    @property
-    def paused_since(self) -> datetime | None:
-        return self._paused_since
-
-    def set_paused(self, paused: bool, reason: str | None = None) -> None:
-        self._paused = paused
-        self._pause_reason = reason if paused else None
-        self._paused_since = datetime.now(UTC) if paused else None
-        self._persist_pause_state()
-        logger.info("Genesis %s%s", "PAUSED" if paused else "RESUMED",
-                     f" — {reason}" if reason else "")
-        # Record pause/resume in events table for historical visibility
-        if self._event_bus is not None:
-            import asyncio
-
-            async def _emit() -> None:
-                try:
-                    from genesis.observability.types import Severity, Subsystem
-
-                    await self._event_bus.emit(
-                        subsystem=Subsystem.RUNTIME,
-                        event_type="pause" if paused else "resume",
-                        message=reason or ("Paused" if paused else "Resumed"),
-                        severity=Severity.INFO,
-                    )
-                except Exception:
-                    logger.debug("Failed to emit pause event", exc_info=True)
-
-            try:
-                asyncio.get_running_loop()
-                from genesis.util.tasks import tracked_task
-
-                tracked_task(_emit(), name="pause-event-emit")
-            except RuntimeError:
-                pass  # No event loop — skip (startup/shutdown edge)
-
-    def _persist_pause_state(self) -> None:
-        try:
-            if self._paused:
-                import json as _json
-
-                self._PAUSE_FILE.parent.mkdir(parents=True, exist_ok=True)
-                self._PAUSE_FILE.write_text(_json.dumps({
-                    "paused": True,
-                    "reason": self._pause_reason,
-                    "since": self._paused_since.isoformat() if self._paused_since else None,
-                }))
-            else:
-                self._PAUSE_FILE.unlink(missing_ok=True)
-        except OSError:
-            logger.warning("Failed to persist pause state", exc_info=True)
-
-    def _restore_pause_state(self) -> None:
-        try:
-            if self._PAUSE_FILE.exists():
-                import json as _json
-
-                data = _json.loads(self._PAUSE_FILE.read_text())
-                self._paused = data.get("paused", False)
-                self._pause_reason = data.get("reason")
-                since_raw = data.get("since")
-                self._paused_since = datetime.fromisoformat(since_raw) if since_raw else None
-                if self._paused:
-                    logger.warning(
-                        "Genesis starting in PAUSED state (since %s: %s)",
-                        self._paused_since, self._pause_reason,
-                    )
-        except (OSError, ValueError):
-            logger.warning("Failed to restore pause state", exc_info=True)
-
     # ── Core properties ───────────────────────────────────────
 
     @property
@@ -335,202 +249,6 @@ class GenesisRuntime:
     def bootstrap_mode(self) -> str:
         return getattr(self, "_bootstrap_mode", "not_bootstrapped")
 
-    @property
-    def db(self) -> aiosqlite.Connection | None:
-        return self._db
-
-    @property
-    def event_bus(self) -> GenesisEventBus | None:
-        return self._event_bus
-
-    @property
-    def awareness_loop(self) -> AwarenessLoop | None:
-        return self._awareness_loop
-
-    @property
-    def router(self) -> Router | None:
-        return self._router
-
-    @property
-    def reflection_engine(self) -> object | None:
-        return self._reflection_engine
-
-    @property
-    def cc_invoker(self) -> CCInvoker | None:
-        return self._cc_invoker
-
-    @property
-    def session_manager(self) -> SessionManager | None:
-        return self._session_manager
-
-    @property
-    def checkpoint_manager(self) -> CheckpointManager | None:
-        return self._checkpoint_manager
-
-    @property
-    def cc_reflection_bridge(self) -> CCReflectionBridge | None:
-        return self._cc_reflection_bridge
-
-    @property
-    def memory_store(self) -> MemoryStore | None:
-        return self._memory_store
-
-    @property
-    def triage_pipeline(self) -> TriagePipeline | None:
-        return self._triage_pipeline
-
-    @property
-    def learning_scheduler(self) -> object | None:
-        return self._learning_scheduler
-
-    @property
-    def inbox_monitor(self) -> InboxMonitor | None:
-        return self._inbox_monitor
-
-    @property
-    def surplus_scheduler(self) -> SurplusScheduler | None:
-        return self._surplus_scheduler
-
-    @property
-    def reflection_scheduler(self) -> ReflectionScheduler | None:
-        return self._reflection_scheduler
-
-    @property
-    def stability_monitor(self) -> LearningStabilityMonitor | None:
-        return self._stability_monitor
-
-    @property
-    def task_executor(self) -> object | None:
-        return self._task_executor
-
-    @property
-    def autonomous_dispatcher(self) -> object | None:
-        return self._autonomous_dispatcher
-
-    @property
-    def provider_registry(self) -> ProviderRegistry | None:
-        return self._provider_registry
-
-    @property
-    def module_registry(self) -> ModuleRegistry | None:
-        return self._module_registry
-
-    @property
-    def pipeline_orchestrator(self) -> object | None:
-        return self._pipeline_orchestrator
-
-    @property
-    def research_orchestrator(self) -> ResearchOrchestrator | None:
-        return self._research_orchestrator
-
-    @property
-    def hybrid_retriever(self) -> HybridRetriever | None:
-        return self._hybrid_retriever
-
-    @property
-    def context_injector(self) -> ContextInjector | None:
-        return self._context_injector
-
-    @property
-    def circuit_breakers(self) -> CircuitBreakerRegistry | None:
-        return self._circuit_breakers
-
-    @property
-    def cost_tracker(self) -> CostTracker | None:
-        return self._cost_tracker
-
-    @property
-    def dead_letter_queue(self) -> DeadLetterQueue | None:
-        return self._dead_letter_queue
-
-    @property
-    def deferred_work_queue(self) -> DeferredWorkQueue | None:
-        return self._deferred_work_queue
-
-    @property
-    def cc_budget_tracker(self) -> CCBudgetTracker | None:
-        return self._cc_budget_tracker
-
-    @property
-    def health_data(self) -> HealthDataService | None:
-        return self._health_data
-
-    @property
-    def outreach_pipeline(self) -> OutreachPipeline | None:
-        return self._outreach_pipeline
-
-    @property
-    def outreach_scheduler(self) -> OutreachScheduler | None:
-        return self._outreach_scheduler
-
-    @property
-    def engagement_tracker(self):
-        return self._engagement_tracker
-
-    @property
-    def activity_tracker(self) -> ProviderActivityTracker | None:
-        return self._activity_tracker
-
-    @property
-    def job_retry_registry(self):
-        return self._job_retry_registry
-
-    @property
-    def autonomy_manager(self) -> object | None:
-        return self._autonomy_manager
-
-    @property
-    def action_classifier(self) -> object | None:
-        return self._action_classifier
-
-    @property
-    def task_verifier(self) -> object | None:
-        return self._task_verifier
-
-    @property
-    def protected_paths(self) -> object | None:
-        return self._protected_paths
-
-    @property
-    def resilience_state_machine(self) -> object | None:
-        return self._resilience_state_machine
-
-    @property
-    def status_writer(self) -> object | None:
-        return self._status_writer
-
-    @property
-    def recovery_orchestrator(self) -> object | None:
-        return self._recovery_orchestrator
-
-    @property
-    def approval_manager(self) -> object | None:
-        return self._approval_manager
-
-    @property
-    def idle_detector(self) -> IdleDetector | None:
-        return self._idle_detector
-
-    @property
-    def findings_bridge(self) -> object | None:
-        return self._findings_bridge
-
-    @property
-    def model_profile_registry(self) -> object | None:
-        return self._model_profile_registry
-
-    @property
-    def contingency_dispatcher(self) -> object | None:
-        return self._contingency_dispatcher
-
-    @property
-    def bootstrap_manifest(self) -> dict[str, str]:
-        return dict(self._bootstrap_manifest)
-
-    @property
-    def job_health(self) -> dict[str, dict]:
-        return dict(self._job_health)
-
     def record_job_success(self, job_name: str) -> None:
         record_job_success(self, job_name)
 
@@ -538,32 +256,9 @@ class GenesisRuntime:
         record_job_failure(self, job_name, error)
 
     async def _load_persisted_job_health(self) -> None:
-        if self._db is None:
-            return
-        try:
-            import aiosqlite
-
-            async with self._db.execute(
-                "SELECT job_name, last_run, last_success, last_failure, "
-                "last_error, consecutive_failures FROM job_health"
-            ) as cur:
-                for row in await cur.fetchall():
-                    self._job_health[row[0]] = {
-                        "last_run": row[1],
-                        "last_success": row[2],
-                        "last_failure": row[3],
-                        "last_error": row[4],
-                        "consecutive_failures": row[5],
-                    }
-            if self._job_health:
-                logger.info("Loaded %d persisted job health entries", len(self._job_health))
-        except aiosqlite.OperationalError as exc:
-            if "no such table" in str(exc):
-                logger.debug("job_health table not yet available — will be created on first write")
-            else:
-                logger.error("Failed to load persisted job health", exc_info=True)
-        except Exception:
-            logger.error("Failed to load persisted job health", exc_info=True)
+        # Thin wrapper: preserves the class-level patch surface for tests
+        # that mock this method via patch.object / patch.GenesisRuntime._*
+        await load_persisted_job_health(self)
 
     def _wire_job_retry_registry(self) -> None:
         try:
@@ -588,62 +283,9 @@ class GenesisRuntime:
             logger.error("Failed to wire JobRetryRegistry", exc_info=True)
 
     def _persist_job_health(self, job_name: str, entry: dict, now: str) -> None:
-        if self._db is None:
-            return
-        # Check for a running event loop BEFORE creating the coroutine.
-        # Creating it eagerly (as argument to tracked_task) and then catching
-        # RuntimeError leaks an unawaited coroutine → RuntimeWarning every 60s.
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            logger.debug("No event loop — job health for %s persisted in-memory only", job_name)
-            return
-
-        from genesis.util.tasks import tracked_task
-
-        snapshot = dict(entry)
-
-        async def _write() -> None:
-            try:
-                await self._db.execute(
-                    """INSERT INTO job_health
-                       (job_name, last_run, last_success, last_failure, last_error,
-                        consecutive_failures, total_runs, total_successes,
-                        total_failures, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-                       ON CONFLICT(job_name) DO UPDATE SET
-                           last_run = excluded.last_run,
-                           last_success = COALESCE(excluded.last_success, last_success),
-                           last_failure = COALESCE(excluded.last_failure, last_failure),
-                           last_error = COALESCE(excluded.last_error, last_error),
-                           consecutive_failures = excluded.consecutive_failures,
-                           total_runs = total_runs + 1,
-                           total_successes = total_successes + CASE WHEN excluded.last_success IS NOT NULL THEN 1 ELSE 0 END,
-                           total_failures = total_failures + CASE WHEN excluded.last_failure IS NOT NULL THEN 1 ELSE 0 END,
-                           updated_at = excluded.updated_at
-                    """,
-                    (
-                        job_name,
-                        snapshot.get("last_run"),
-                        snapshot.get("last_success"),
-                        snapshot.get("last_failure"),
-                        snapshot.get("last_error"),
-                        snapshot.get("consecutive_failures", 0),
-                        1 if snapshot.get("last_success") else 0,
-                        1 if snapshot.get("last_failure") else 0,
-                        now,
-                    ),
-                )
-                await self._db.commit()
-            except sqlite3.Error:
-                logger.error("DB error persisting job health for %s", job_name, exc_info=True)
-            except Exception:
-                logger.error("Failed to persist job health for %s", job_name, exc_info=True)
-
-        try:
-            tracked_task(_write(), name=f"persist-job-health-{job_name}")
-        except Exception:
-            logger.error("Failed to schedule job health persistence for %s", job_name, exc_info=True)
+        # Thin wrapper: preserves the class-level patch surface for tests
+        # that mock this method via patch("genesis.runtime.GenesisRuntime._persist_job_health").
+        persist_job_health(self, job_name, entry, now)
 
     def register_channel(self, name: str, adapter: object, *, recipient: str | None = None) -> None:
         register_channel(self, name, adapter, recipient=recipient)
@@ -724,6 +366,9 @@ class GenesisRuntime:
                 "guardian_monitoring", self._init_guardian_monitoring,
             )
 
+        if _full:
+            await self._run_init_step_async("sentinel", self._init_sentinel)
+
         await self._load_persisted_job_health()
 
         self._wire_job_retry_registry()
@@ -746,102 +391,7 @@ class GenesisRuntime:
             if status != "ok":
                 logger.warning("Bootstrap: %s → %s", name, status)
 
-        self._write_capabilities_file()
-
-    _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
-        "secrets": "API key loader for external services (Gemini, Groq, Mistral, etc.)",
-        "db": "SQLite database (60+ tables) — use db_schema MCP tool to discover tables and columns before querying",
-        "tool_registry": "Registry of known tools available to CC sessions",
-        "observability": "Event bus, structured logging, and provider activity tracking",
-        "providers": "Provider registry — web search, STT, TTS, embeddings, health probes, research orchestrator",
-        "awareness": "Awareness loop — periodic signal collection ticks driving system health and perception",
-        "router": "LLM routing with circuit breakers, cost tracking, and dead-letter queue",
-        "perception": "Reflection engine — observation creation, pattern detection, signal processing",
-        "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
-        "memory": "Hybrid memory store — SQLite + Qdrant vector search for cross-session knowledge",
-        "surplus": "Surplus compute scheduler — uses idle time for brainstorms and enrichment tasks",
-        "learning": "Learning pipeline — triage, calibration, harvest, and procedural learning",
-        "inbox": "Inbox monitor — watches ~/inbox/ for markdown files with URLs, evaluates them in background CC sessions",
-        "mail": "Mail monitor — polls Gmail inbox weekly, two-layer triage (Gemini + CC), stores recon findings",
-        "reflection": "Reflection scheduler — deep and light cognitive reflection cycles",
-        "health_data": "Health data service — aggregates subsystem status for dashboard and MCP tools",
-        "outreach": "Outreach pipeline + scheduler — morning reports, alerts, proactive Telegram messages",
-        "autonomy": "Autonomy manager — task classification, protected paths, action verification, approval gates",
-        "modules": "Capability module registry — domain-specific add-on modules (prediction markets, crypto ops)",
-        "pipeline": "Pipeline orchestrator — signal collection, triage, and module dispatch cycles",
-        "memory_extraction": "Periodic cross-session memory extraction — entities, decisions, relationships from conversation transcripts",
-        "tasks": "Task executor — autonomous multi-step task execution with adversarial review, pause/resume/cancel",
-        "guardian": "External host VM guardian — container health monitoring, diagnosis, and recovery",
-        "guardian_monitoring": "Guardian bidirectional monitoring — detects stale Guardian heartbeat and auto-restarts via SSH",
-    }
-
-    def _write_capabilities_file(self) -> None:
-        import json
-        import os
-        import tempfile
-
-        capabilities: dict[str, dict[str, str]] = {}
-
-        existing: dict[str, dict[str, str]] = {}
-        if getattr(self, "_bootstrap_mode", "") == "readonly":
-            cap_file = Path.home() / ".genesis" / "capabilities.json"
-            if cap_file.exists():
-                try:
-                    existing = json.loads(cap_file.read_text())
-                except (json.JSONDecodeError, OSError) as exc:
-                    logger.warning("Failed to read existing capabilities.json: %s", exc)
-
-        for name, raw_status in self._bootstrap_manifest.items():
-            desc = self._CAPABILITY_DESCRIPTIONS.get(name, name)
-            if raw_status == "ok":
-                capabilities[name] = {"status": "active", "description": desc}
-            elif raw_status == "degraded":
-                capabilities[name] = {"status": "degraded", "description": desc}
-            else:
-                error_msg = raw_status.removeprefix("failed: ") if raw_status.startswith("failed:") else raw_status
-                capabilities[name] = {
-                    "status": "failed",
-                    "description": desc,
-                    "error": error_msg,
-                }
-
-        _module_descs = {
-            "prediction_markets": "Prediction market analysis — calibration-driven forecasting, market scanning, Kelly position sizing",
-            "crypto_ops": "Crypto token operations — narrative detection, launch monitoring, position health tracking",
-            "content_pipeline": "Content pipeline — idea capture, weekly planning, voice-calibrated script drafting, multi-platform publishing, analytics feedback loop",
-        }
-        if self._module_registry:
-            for mod_name in self._module_registry.list_modules():
-                mod = self._module_registry.get(mod_name)
-                if mod:
-                    capabilities[f"module:{mod_name}"] = {
-                        "status": "active" if mod.enabled else "disabled",
-                        "description": _module_descs.get(mod_name, mod_name),
-                    }
-
-        if existing:
-            for name, info in existing.items():
-                if name not in capabilities or (
-                    info.get("status") == "active"
-                    and capabilities[name].get("status") == "degraded"
-                ):
-                    capabilities[name] = info
-
-        cap_file = Path.home() / ".genesis" / "capabilities.json"
-        cap_file.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            fd, tmp_path = tempfile.mkstemp(dir=cap_file.parent, suffix=".tmp")
-            try:
-                with os.fdopen(fd, "w") as f:
-                    json.dump(capabilities, f, indent=2)
-                os.replace(tmp_path, cap_file)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_path)
-                raise
-            logger.info("Capabilities file written: %d entries", len(capabilities))
-        except OSError:
-            logger.error("Failed to write capabilities file", exc_info=True)
+        write_capabilities_file(self)
 
     async def shutdown(self) -> None:
         if not self._bootstrapped:
@@ -854,6 +404,12 @@ class GenesisRuntime:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._approval_timeout_task
             logger.info("Stopped approval timeout poller")
+
+        if self._status_writer_task is not None and not self._status_writer_task.done():
+            self._status_writer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_writer_task
+            logger.info("Stopped status writer loop")
 
         for name, component in [
             ("outreach_scheduler", self._outreach_scheduler),
@@ -947,97 +503,3 @@ class GenesisRuntime:
         else:
             self._bootstrap_manifest[name] = "ok"
 
-    def _load_secrets(self) -> None:
-        secrets.load(self)
-
-    async def _init_db(self) -> None:
-        await db.init(self)
-
-    async def _init_tool_registry(self) -> None:
-        await db.init_tool_registry(self)
-
-    def _init_observability(self) -> None:
-        observability.init(self)
-
-    def _init_providers(self) -> None:
-        providers.init(self)
-
-    async def _init_modules(self) -> None:
-        await modules.init(self)
-
-    async def _init_awareness(self) -> None:
-        await awareness.init(self)
-
-    def _init_router(self) -> None:
-        router.init(self)
-
-    def _init_perception(self) -> None:
-        perception.init(self)
-
-    async def _init_cc_relay(self) -> None:
-        await cc_relay.init(self)
-
-    async def _init_memory(self) -> None:
-        await memory.init(self)
-
-    async def _init_pipeline(self) -> None:
-        await pipeline.init(self)
-
-    async def _run_pipeline_cycle(self, profile_name: str) -> None:
-        await pipeline.run_pipeline_cycle(self, profile_name)
-
-    async def _init_surplus(self) -> None:
-        await surplus.init(self)
-
-    async def _init_learning(self) -> None:
-        await learning.init(self)
-
-    async def _init_reflection(self) -> None:
-        await reflection.init(self)
-
-    async def _init_inbox(self) -> None:
-        await inbox.init(self)
-
-    async def _init_mail(self) -> None:
-        await mail.init(self)
-
-    def _init_health_data(self) -> None:
-        health_data.init(self)
-
-    async def _init_outreach(self) -> None:
-        await outreach.init(self)
-
-    def _init_autonomy(self) -> None:
-        autonomy.init(self)
-
-    async def _init_tasks(self) -> None:
-        await tasks.init(self)
-
-    async def _init_guardian_monitoring(self) -> None:
-        from genesis.runtime.init.guardian import init_guardian_monitoring
-        await init_guardian_monitoring(self)
-
-    def _probe_guardian_status(self) -> None:
-        """Check if the Guardian is alive by reading its heartbeat file.
-
-        The Guardian runs on the host VM, not inside the container.
-        It writes ~/.genesis/guardian_heartbeat.json every check cycle.
-        This probe always succeeds — Guardian is optional infrastructure.
-        Actual staleness monitoring is handled by probe_guardian() in the
-        health data infrastructure snapshot.
-        """
-        import json
-        from datetime import UTC, datetime
-        heartbeat_path = Path.home() / ".genesis" / "guardian_heartbeat.json"
-        try:
-            data = json.loads(heartbeat_path.read_text())
-            ts_str = data.get("timestamp", "")
-            if ts_str:
-                staleness = (datetime.now(UTC) - datetime.fromisoformat(ts_str)).total_seconds()
-                logger.info("Guardian heartbeat: %.0fs ago", staleness)
-            else:
-                logger.info("Guardian heartbeat file exists but missing timestamp")
-        except FileNotFoundError:
-            logger.info("Guardian heartbeat not found (Guardian may not be installed)")
-        except (json.JSONDecodeError, ValueError, OSError) as exc:
-            logger.info("Guardian heartbeat unreadable: %s", exc)

@@ -33,7 +33,7 @@ _DEFER_DEPTHS = frozenset({Depth.STRATEGIC, Depth.DEEP, Depth.LIGHT})
 
 # Call site mapping for contingency routing (only Micro reaches this path)
 _CONTINGENCY_CALL_SITES = {
-    Depth.MICRO: "contingency_inbox",  # Micro uses free models — never expensive
+    Depth.MICRO: "contingency_micro",  # Micro uses free models — never expensive
 }
 
 
@@ -168,33 +168,3 @@ class CCContingencyDispatcher:
             reason=f"Contingency foreground failed: {result.error}",
         )
 
-    async def dispatch_inbox(
-        self,
-        prompt: str,
-        system_prompt: str,
-    ) -> ContingencyResult:
-        """Route inbox evaluation through API (free models only)."""
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-
-        try:
-            result = await self._router.route_call("contingency_inbox", messages)
-        except Exception:
-            logger.exception("Contingency inbox routing failed")
-            return ContingencyResult(
-                success=False,
-                reason="Contingency inbox routing failed",
-            )
-
-        if result.success:
-            return ContingencyResult(
-                success=True,
-                content=result.content or "",
-                model=result.provider_used or "",
-            )
-        return ContingencyResult(
-            success=False,
-            reason=f"Contingency inbox failed: {result.error}",
-        )

@@ -147,10 +147,30 @@ class ResilienceStateMachine:
         return self._update("embedding", status)
 
     def update_cc(self, status: CCStatus) -> list[StateTransition]:
-        return self._update("cc", status)
+        # CC rate limits are transient API events, not cascading provider
+        # failures. Flapping protection was designed for cloud/memory/embedding
+        # where genuine instability needs a stabilization hold. Applied to CC,
+        # it turns normal 429-recover-429-recover API behavior into a 10-minute
+        # lockout that latches RATE_LIMITED and blocks the display + emitters
+        # from honestly reporting recovery. Opt out. (See Part 9a in
+        # .claude/plans/fluttering-humming-bentley.md for the false-alarm
+        # incident that motivated this.)
+        return self._update("cc", status, apply_flapping_protection=False)
 
-    def _update(self, axis: str, new_status: int) -> list[StateTransition]:
-        """Update a single axis, applying flapping protection."""
+    def _update(
+        self,
+        axis: str,
+        new_status: int,
+        *,
+        apply_flapping_protection: bool = True,
+    ) -> list[StateTransition]:
+        """Update a single axis, applying flapping protection.
+
+        When ``apply_flapping_protection=False`` the stabilization window and
+        flap-detection threshold are bypassed: transitions apply unconditionally
+        and are never marked suppressed. Used for axes whose "failures" are
+        transient by design (e.g., CC API rate limits).
+        """
         now = self._clock()
         old_status = getattr(self._state, axis)
 
@@ -159,50 +179,51 @@ class ResilienceStateMachine:
 
         flap = self._flap[axis]
 
-        # Check if we're in stabilization period
-        if flap.stabilize_until is not None and now < flap.stabilize_until:
-            # During stabilization: only allow transitions to WORSE states
-            if new_status > old_status:  # Higher value = better
-                transition = StateTransition(
-                    axis=axis,
-                    old_value=old_status.name,
-                    new_value=type(old_status)(new_status).name,
-                    timestamp=now.isoformat(),
-                    suppressed=True,
-                )
-                self._state.transitions.append(transition)
-                logger.debug(
-                    "Flapping protection: suppressed %s %s→%s (stabilizing until %s)",
-                    axis, old_status.name, type(old_status)(new_status).name,
-                    flap.stabilize_until.isoformat(),
-                )
-                return [transition]
-            # Worse state during stabilization — accept and extend
-            flap.stabilize_until = now + _STABILIZE_DURATION
-        else:
-            # Not in stabilization — clear expired state
-            if flap.stabilize_until is not None:
-                flap.stabilize_until = None
-                flap.held_state = None
-                flap.transition_times.clear()
+        if apply_flapping_protection:
+            # Check if we're in stabilization period
+            if flap.stabilize_until is not None and now < flap.stabilize_until:
+                # During stabilization: only allow transitions to WORSE states
+                if new_status > old_status:  # Higher value = better
+                    transition = StateTransition(
+                        axis=axis,
+                        old_value=old_status.name,
+                        new_value=type(old_status)(new_status).name,
+                        timestamp=now.isoformat(),
+                        suppressed=True,
+                    )
+                    self._state.transitions.append(transition)
+                    logger.debug(
+                        "Flapping protection: suppressed %s %s→%s (stabilizing until %s)",
+                        axis, old_status.name, type(old_status)(new_status).name,
+                        flap.stabilize_until.isoformat(),
+                    )
+                    return [transition]
+                # Worse state during stabilization — accept and extend
+                flap.stabilize_until = now + _STABILIZE_DURATION
+            else:
+                # Not in stabilization — clear expired state
+                if flap.stabilize_until is not None:
+                    flap.stabilize_until = None
+                    flap.held_state = None
+                    flap.transition_times.clear()
 
-        # Record transition time for flap detection
-        cutoff = now - _FLAP_WINDOW
-        flap.transition_times = [t for t in flap.transition_times if t > cutoff]
-        flap.transition_times.append(now)
+            # Record transition time for flap detection
+            cutoff = now - _FLAP_WINDOW
+            flap.transition_times = [t for t in flap.transition_times if t > cutoff]
+            flap.transition_times.append(now)
 
-        # Check if flapping threshold exceeded
-        if len(flap.transition_times) > _FLAP_THRESHOLD:
-            # Enter stabilization: hold current (worse) state
-            worse = min(old_status, new_status)  # Lower value = worse
-            flap.stabilize_until = now + _STABILIZE_DURATION
-            flap.held_state = worse
-            new_status = type(old_status)(worse)
-            logger.warning(
-                "Flapping detected on %s (%d transitions in 15min), "
-                "holding %s for 10min stabilization",
-                axis, len(flap.transition_times), type(old_status)(worse).name,
-            )
+            # Check if flapping threshold exceeded
+            if len(flap.transition_times) > _FLAP_THRESHOLD:
+                # Enter stabilization: hold current (worse) state
+                worse = min(old_status, new_status)  # Lower value = worse
+                flap.stabilize_until = now + _STABILIZE_DURATION
+                flap.held_state = worse
+                new_status = type(old_status)(worse)
+                logger.warning(
+                    "Flapping detected on %s (%d transitions in 15min), "
+                    "holding %s for 10min stabilization",
+                    axis, len(flap.transition_times), type(old_status)(worse).name,
+                )
 
         # Apply the transition
         transition = StateTransition(

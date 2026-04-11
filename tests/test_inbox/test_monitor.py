@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import aiosqlite
 import pytest
 
+from genesis.autonomy.autonomous_dispatch import AutonomousDispatchDecision
 from genesis.cc.types import CCOutput
 from genesis.db.schema import create_all_tables
 from genesis.inbox.monitor import InboxMonitor, _extract_urls, _is_acknowledged
@@ -190,6 +192,69 @@ async def test_cc_exception_marks_items_failed(monitor, inbox_dir, mock_invoker)
     result = await monitor.check_once()
     assert len(result.errors) == 1
     assert "connection refused" in result.errors[0]
+
+
+@pytest.mark.asyncio
+async def test_empty_output_text_marks_failed_no_response_file(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """Regression: empty CCOutput.text must not produce a frontmatter-only
+    file. The blank files Genesis-4.genesis.md and "My todos &
+    musings.genesis.md" on 2026-04-06 / 2026-04-10 were produced exactly
+    this way — the upstream router returned success with empty content and
+    the monitor passed it straight to the writer."""
+    mock_invoker.run.return_value = _success_output(text="")
+    (inbox_dir / "blank.md").write_text("content to evaluate")
+    result = await monitor.check_once()
+
+    # No response file should exist
+    assert list(inbox_dir.glob("*.genesis.md")) == []
+
+    # Item should be marked failed with a clear error message
+    assert len(result.errors) == 1
+    assert "empty" in result.errors[0].lower()
+
+    from genesis.db.crud import inbox_items
+    pending = await inbox_items.query_pending(db)
+    assert len(pending) == 0  # not pending — moved to failed
+
+
+@pytest.mark.asyncio
+async def test_whitespace_only_output_text_marks_failed(
+    monitor, inbox_dir, mock_invoker,
+):
+    """Whitespace-only text is also empty for our purposes."""
+    mock_invoker.run.return_value = _success_output(text="   \n\n\t  \n")
+    (inbox_dir / "ws.md").write_text("something")
+    result = await monitor.check_once()
+
+    assert list(inbox_dir.glob("*.genesis.md")) == []
+    assert len(result.errors) == 1
+    assert "empty" in result.errors[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_empty_output_emits_error_event(monitor, inbox_dir, mock_invoker):
+    """Empty-output failures must fire an ERROR event so the dashboard
+    and Guardian can see them."""
+    from genesis.observability.types import Severity
+
+    event_bus = AsyncMock()
+    event_bus.emit = AsyncMock()
+    monitor._event_bus = event_bus
+    mock_invoker.run.return_value = _success_output(text="")
+
+    (inbox_dir / "silent.md").write_text("trigger silent failure")
+    await monitor.check_once()
+
+    # Find the empty_output event among all emitted events
+    empty_calls = [
+        c for c in event_bus.emit.call_args_list
+        if len(c.args) >= 3 and c.args[2] == "evaluation.empty_output"
+    ]
+    assert len(empty_calls) == 1
+    # Severity should be ERROR
+    assert empty_calls[0].args[1] == Severity.ERROR
 
 
 @pytest.mark.asyncio
@@ -534,3 +599,664 @@ async def test_no_hard_eval_limit(
     assert result.items_modified == 1
     assert result.batches_dispatched == 1
     mock_invoker.run.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Autonomous-CLI approval-gate blocked / resume tests
+# ---------------------------------------------------------------------------
+
+
+def _make_dispatcher(decision: AutonomousDispatchDecision):
+    """Build a mock autonomous dispatcher that returns a fixed decision."""
+    d = SimpleNamespace()
+    d.route = AsyncMock(return_value=decision)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_blocked_pending_keeps_row_as_processing_with_marker(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When the dispatcher returns blocked with a pending approval, the
+    row must stay in 'processing' state with an awaiting_approval marker
+    — NOT be marked failed (which would cause the scanner to re-detect
+    and create duplicate rows on every scan)."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="approval requested",
+        approval_request_id="req-abc-123",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(decision)
+
+    (inbox_dir / "pending.md").write_text("content needing approval")
+    result = await monitor.check_once()
+
+    # CC invoker should NOT have been called — we were blocked before CLI
+    mock_invoker.run.assert_not_called()
+    assert result.batches_dispatched == 0  # dispatch was blocked
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%pending.md'",
+    )).fetchall())]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "processing"
+    assert rows[0]["error_message"].startswith("awaiting_approval:")
+    assert "req-abc-123" in rows[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_blocked_rejected_marks_row_failed(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When the approval was previously rejected, the row must be
+    marked failed so it enters the normal permanent-failure flow."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="existing rejection found",
+        approval_request_id="req-rej-456",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(decision)
+
+    (inbox_dir / "rejected.md").write_text("rejected content")
+    await monitor.check_once()
+
+    mock_invoker.run.assert_not_called()
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%rejected.md'",
+    )).fetchall())]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    # Error message is the generic "CLI fallback blocked: ..." not the marker
+    assert "rejection" in rows[0]["error_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_blocked_policy_disabled_marks_row_failed(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When CLI fallback is disabled by policy (no approval_request_id),
+    mark failed as before."""
+    decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="CLI fallback disabled",
+        approval_request_id=None,
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(decision)
+
+    (inbox_dir / "disabled.md").write_text("policy disabled")
+    await monitor.check_once()
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%disabled.md'",
+    )).fetchall())]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_redispatches_awaiting_row(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """On the NEXT scan after a pending-approval block, the resume pass
+    must pick up the awaiting row, re-dispatch it, and — if the approval
+    is now approved — run CC and complete the item WITHOUT creating a
+    duplicate DB row."""
+    # First scan: blocked with pending approval
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="approval requested",
+        approval_request_id="req-resume-1",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(pending_decision)
+
+    (inbox_dir / "resume.md").write_text("content awaiting approval")
+    await monitor.check_once()
+
+    rows1 = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md'",
+    )).fetchall())]
+    assert len(rows1) == 1
+    assert rows1[0]["status"] == "processing"
+
+    # Second scan: dispatcher now returns cli_approved — simulates user
+    # having approved via Telegram.  Note: in the real dispatcher, an
+    # approved mode is "cli_approved" and output stays None so monitor
+    # falls through to CLI path.  We mock both the dispatcher and the
+    # invoker.run output.
+    approved_decision = AutonomousDispatchDecision(
+        mode="cli_approved",
+        reason="CLI fallback approved",
+        approval_request_id="req-resume-1",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(approved_decision)
+    mock_invoker.run.return_value = _success_output("resumed evaluation")
+
+    result2 = await monitor.check_once()
+    assert result2.batches_dispatched == 1
+    mock_invoker.run.assert_called_once()
+
+    # No duplicate rows were created — the same row id was reused
+    rows2 = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%resume.md' "
+        "ORDER BY created_at",
+    )).fetchall())]
+    assert len(rows2) == 1
+    assert rows2[0]["id"] == rows1[0]["id"]
+    assert rows2[0]["status"] == "completed"
+
+    # The response file was written
+    assert list(inbox_dir.glob("*resume*.genesis.md"))
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_invalidates_row_when_file_changed(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """If the user modifies the file while the approval is still pending,
+    the original approval is no longer valid for the new content.  The
+    resume pass must mark the awaiting row failed so the next scan can
+    create a fresh row (and fresh approval request) for the new content."""
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="approval requested",
+        approval_request_id="req-change-1",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(pending_decision)
+
+    f = inbox_dir / "changed.md"
+    f.write_text("original content")
+    await monitor.check_once()
+
+    # Modify the file before the next scan
+    f.write_text("modified content that is very different")
+
+    # Second scan — the resume pass should invalidate the old row AND
+    # the scanner should create a fresh row for the modified content.
+    await monitor.check_once()
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT id, status, error_message, content_hash "
+        "FROM inbox_items WHERE file_path LIKE '%changed.md' "
+        "ORDER BY created_at",
+    )).fetchall())]
+    # Must have exactly two rows: the invalidated original and a fresh one
+    assert len(rows) == 2, (
+        f"expected original (invalidated) + fresh row, got {len(rows)}: "
+        f"{rows}"
+    )
+    # First row: invalidated due to content change — status=failed with
+    # the approval_invalidated: prefix
+    assert rows[0]["status"] == "failed"
+    assert "approval_invalidated:" in (rows[0]["error_message"] or "")
+    assert "content changed" in (rows[0]["error_message"] or "")
+    # Second row: new row for the modified content, distinct content_hash
+    assert rows[1]["content_hash"] != rows[0]["content_hash"]
+    # The fresh row hits the dispatcher too → landed in processing state
+    # with a new awaiting_approval marker (mocked dispatcher still returns
+    # blocked-pending)
+    assert rows[1]["status"] == "processing"
+    assert (rows[1]["error_message"] or "").startswith(
+        "awaiting_approval:",
+    )
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_invalidates_row_when_file_vanishes(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """If the file is deleted while approval is pending, invalidate the
+    awaiting row."""
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked",
+        reason="approval requested",
+        approval_request_id="req-vanish-1",
+    )
+    monitor._autonomous_dispatcher = _make_dispatcher(pending_decision)
+
+    f = inbox_dir / "vanished.md"
+    f.write_text("content")
+    await monitor.check_once()
+
+    # Delete the file
+    f.unlink()
+    await monitor.check_once()
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT status, error_message FROM inbox_items "
+        "WHERE file_path LIKE '%vanished.md'",
+    )).fetchall())]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert "vanished" in (rows[0]["error_message"] or "")
+
+
+@pytest.mark.asyncio
+async def test_dispatch_request_omits_volatile_context(
+    monitor, inbox_dir, mock_invoker,
+):
+    """The dispatch request must pass context=None (or at least NOT
+    include batch_id/item_count) so the approval key is content-stable
+    across scans.  This regression test guards against reintroducing the
+    duplicate-Telegram-prompt bug."""
+    captured: list[object] = []
+
+    async def capture_route(request):
+        captured.append(request)
+        return AutonomousDispatchDecision(
+            mode="blocked",
+            reason="approval requested",
+            approval_request_id="req-ctx-1",
+        )
+
+    dispatcher = SimpleNamespace()
+    dispatcher.route = capture_route
+    monitor._autonomous_dispatcher = dispatcher
+
+    (inbox_dir / "ctx.md").write_text("content")
+    await monitor.check_once()
+
+    assert captured, "dispatcher.route was never called"
+    request = captured[0]
+    # api_call_site_id must be None (no free-SLM fallback)
+    assert request.api_call_site_id is None
+    # Context must not carry volatile fields that would destabilize
+    # the approval key across scans
+    if request.context is not None:
+        assert "batch_id" not in request.context
+        assert "item_count" not in request.context
+
+
+@pytest.mark.asyncio
+async def test_resume_produces_stable_dispatch_across_scans(
+    monitor, inbox_dir, mock_invoker,
+):
+    """Two scans against the same unchanged pending-approval item must
+    produce dispatch requests with identical prompts, messages, and
+    contexts — the inputs to ``_approval_key``.  This is what guarantees
+    ApprovalManager dedup finds the existing pending request on scan 2
+    and skips the Telegram resend.  Regression guard for the whole
+    fix-it-now motivation: no new Telegram per scan."""
+    captured: list[object] = []
+
+    async def capture_route(request):
+        captured.append(request)
+        return AutonomousDispatchDecision(
+            mode="blocked",
+            reason="approval requested",
+            approval_request_id="req-stable-1",
+        )
+
+    dispatcher = SimpleNamespace()
+    dispatcher.route = capture_route
+    monitor._autonomous_dispatcher = dispatcher
+
+    (inbox_dir / "stable.md").write_text("some content to evaluate")
+
+    # First scan: row created, dispatched, parked
+    await monitor.check_once()
+    # Second scan: resume pass picks up the same row, re-dispatches
+    await monitor.check_once()
+
+    assert len(captured) == 2, (
+        f"expected 2 dispatch calls, got {len(captured)}"
+    )
+    req1, req2 = captured[0], captured[1]
+
+    # The fields that feed _approval_key must be byte-identical between
+    # scans.  Any divergence would cause ApprovalManager._find_existing
+    # to miss the match and fire a fresh Telegram.
+    assert req1.subsystem == req2.subsystem
+    assert req1.policy_id == req2.policy_id
+    assert req1.action_label == req2.action_label
+    assert req1.messages == req2.messages
+    assert req1.cli_invocation.prompt == req2.cli_invocation.prompt
+    assert req1.cli_invocation.system_prompt == req2.cli_invocation.system_prompt
+    assert req1.cli_invocation.model == req2.cli_invocation.model
+    assert req1.cli_invocation.effort == req2.cli_invocation.effort
+    assert req1.context == req2.context  # both should be None or equal
+
+
+@pytest.mark.asyncio
+async def test_expire_stuck_processing_skips_awaiting_rows(db, inbox_dir):
+    """expire_stuck_processing must NOT expire rows that are parked
+    awaiting approval, even if they're older than 2h."""
+    import uuid as _uuid
+
+    from genesis.db.crud import inbox_items
+
+    # Create two stale processing rows: one with the awaiting marker,
+    # one without.
+    stale_created_at = "2020-01-01T00:00:00+00:00"
+    awaiting_id = str(_uuid.uuid4())
+    stuck_id = str(_uuid.uuid4())
+    await inbox_items.create(
+        db, id=awaiting_id, file_path=str(inbox_dir / "await.md"),
+        content_hash="h1", status="processing", created_at=stale_created_at,
+    )
+    await db.execute(
+        "UPDATE inbox_items SET error_message = ? WHERE id = ?",
+        ("awaiting_approval:req-xyz", awaiting_id),
+    )
+    await inbox_items.create(
+        db, id=stuck_id, file_path=str(inbox_dir / "stuck.md"),
+        content_hash="h2", status="processing", created_at=stale_created_at,
+    )
+    await db.commit()
+
+    expired = await inbox_items.expire_stuck_processing(db)
+
+    # Only the genuinely stuck row should be expired
+    assert expired == 1
+    awaiting_row = await inbox_items.get_by_id(db, awaiting_id)
+    stuck_row = await inbox_items.get_by_id(db, stuck_id)
+    assert awaiting_row["status"] == "processing"
+    assert stuck_row["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_get_awaiting_approval_returns_only_marked_rows(db, inbox_dir):
+    """get_awaiting_approval must return only processing rows with the
+    awaiting_approval: marker."""
+    import uuid as _uuid
+
+    from genesis.db.crud import inbox_items
+
+    # Row 1: awaiting approval (should appear)
+    id1 = str(_uuid.uuid4())
+    await inbox_items.create(
+        db, id=id1, file_path=str(inbox_dir / "a.md"), content_hash="h1",
+        status="processing", created_at="2026-04-10T00:00:00+00:00",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET error_message = ? WHERE id = ?",
+        ("awaiting_approval:req-1", id1),
+    )
+
+    # Row 2: processing, no marker (should NOT appear)
+    id2 = str(_uuid.uuid4())
+    await inbox_items.create(
+        db, id=id2, file_path=str(inbox_dir / "b.md"), content_hash="h2",
+        status="processing", created_at="2026-04-10T00:01:00+00:00",
+    )
+
+    # Row 3: failed (should NOT appear)
+    id3 = str(_uuid.uuid4())
+    await inbox_items.create(
+        db, id=id3, file_path=str(inbox_dir / "c.md"), content_hash="h3",
+        status="failed", created_at="2026-04-10T00:02:00+00:00",
+    )
+    await db.execute(
+        "UPDATE inbox_items SET error_message = ? WHERE id = ?",
+        ("awaiting_approval:req-3", id3),
+    )
+    await db.commit()
+
+    rows = await inbox_items.get_awaiting_approval(db)
+    assert len(rows) == 1
+    assert rows[0]["id"] == id1
+
+
+# ---------------------------------------------------------------------------
+# Wired approval-gate pre-check + state-transition resume tests
+# ---------------------------------------------------------------------------
+
+
+def _make_wired_dispatcher(
+    *,
+    decision: AutonomousDispatchDecision,
+    pending_sites: list[dict] | None = None,
+    approval_by_id: dict[str, dict] | None = None,
+):
+    """Build a mock dispatcher with a fully wired approval_gate.
+
+    Unlike ``_make_dispatcher`` (which only stubs ``.route``), this one
+    exposes ``.approval_gate.find_site_pending`` and
+    ``._approval_gate._approval_manager.get_by_id`` so the monitor's
+    pre-check and state-transition resume logic actually fire.
+    """
+    pending_sites = pending_sites or []
+    approval_by_id = approval_by_id or {}
+
+    async def _find_site_pending(*, subsystem: str, policy_id: str):
+        for row in pending_sites:
+            ctx = row.get("_context", {})
+            if (
+                ctx.get("subsystem") == subsystem
+                and ctx.get("policy_id") == policy_id
+            ):
+                return row
+        return None
+
+    async def _get_by_id(request_id: str):
+        return approval_by_id.get(request_id)
+
+    approval_manager = SimpleNamespace(get_by_id=_get_by_id)
+    # Use the PUBLIC accessor names: the resume pass walks
+    # dispatcher.approval_gate.approval_manager via public properties
+    # so wrappers/test doubles that only mirror the public API still
+    # work without silent fall-through.
+    approval_gate = SimpleNamespace(
+        find_site_pending=_find_site_pending,
+        approval_manager=approval_manager,
+    )
+    dispatcher = SimpleNamespace()
+    dispatcher.route = AsyncMock(return_value=decision)
+    dispatcher.approval_gate = approval_gate
+    return dispatcher
+
+
+@pytest.mark.asyncio
+async def test_precheck_skips_detection_when_site_blocked(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When an inbox_evaluation approval is already pending, detection
+    of new files must be skipped entirely — no new inbox_items rows,
+    no new Telegram prompt, no dispatch calls for the new file."""
+    # Simulate a pending approval for the inbox call site
+    pending_site_row = {
+        "id": "req-already-pending",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-already-pending",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+    )
+
+    # Drop a NEW file — normally this would create a row and dispatch
+    (inbox_dir / "new-while-blocked.md").write_text("fresh content")
+    result = await monitor.check_once()
+
+    # No row was created for the new file — creation was skipped entirely
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%new-while-blocked%'",
+    )).fetchall())]
+    assert len(rows) == 0, (
+        f"pre-check should have skipped row creation, got: {rows}"
+    )
+    # No dispatch happened (no resume items, detect_changes was skipped)
+    monitor._autonomous_dispatcher.route.assert_not_called()
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_dispatches_on_pending_to_approved_transition(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """With a wired approval manager, the resume pass dispatches an
+    awaiting row ONLY when the approval transitions from pending to
+    approved.  While pending, it must not dispatch."""
+    # Scan 1: wired dispatcher returns blocked-pending → row parked
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-transition-1",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,
+        approval_by_id={
+            "req-transition-1": {"id": "req-transition-1", "status": "pending"},
+        },
+    )
+    (inbox_dir / "transition.md").write_text("content to approve")
+    await monitor.check_once()
+
+    rows1 = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
+    )).fetchall())]
+    assert len(rows1) == 1
+    assert rows1[0]["status"] == "processing"
+    assert (rows1[0]["error_message"] or "").startswith("awaiting_approval:")
+
+    # Scan 2: approval still pending.  Wire dispatcher to have a pending
+    # site (pre-check will skip new detection) and approval_by_id to
+    # return pending (resume pass will skip dispatch).  The test asserts
+    # that NO dispatch happens this scan.
+    pending_site_row = {
+        "id": "req-transition-1", "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "_context": {
+            "subsystem": "inbox", "policy_id": "inbox_evaluation",
+        },
+    }
+    still_pending_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,
+        pending_sites=[pending_site_row],
+        approval_by_id={
+            "req-transition-1": {"id": "req-transition-1", "status": "pending"},
+        },
+    )
+    monitor._autonomous_dispatcher = still_pending_dispatcher
+    await monitor.check_once()
+    still_pending_dispatcher.route.assert_not_called()
+    mock_invoker.run.assert_not_called()
+
+    # Row still parked, not churned
+    rows2 = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md'",
+    )).fetchall())]
+    assert len(rows2) == 1
+    assert rows2[0]["id"] == rows1[0]["id"]
+    assert rows2[0]["status"] == "processing"
+
+    # Scan 3: approval now approved.  Resume pass should detect the
+    # transition, dispatch the item, and CC should run to completion.
+    approved_decision = AutonomousDispatchDecision(
+        mode="cli_approved", reason="CLI fallback approved",
+        approval_request_id="req-transition-1",
+    )
+    transition_dispatcher = _make_wired_dispatcher(
+        decision=approved_decision,
+        # No pending_sites — approval has resolved, find_site_pending
+        # returns None, so pre-check allows detection/dispatch.
+        approval_by_id={
+            "req-transition-1": {"id": "req-transition-1", "status": "approved"},
+        },
+    )
+    monitor._autonomous_dispatcher = transition_dispatcher
+    mock_invoker.run.return_value = _success_output("resumed eval")
+
+    result3 = await monitor.check_once()
+    assert result3.batches_dispatched == 1
+    mock_invoker.run.assert_called_once()
+
+    # Row completed with no duplicates
+    rows3 = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%transition.md' "
+        "ORDER BY created_at",
+    )).fetchall())]
+    assert len(rows3) == 1
+    assert rows3[0]["id"] == rows1[0]["id"]
+    assert rows3[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_marks_row_failed_on_rejected_transition(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When the wired approval manager reports the approval as rejected,
+    the resume pass must mark the inbox row failed (with a rejection
+    message) and not dispatch anything."""
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-rejected-1",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,
+        approval_by_id={
+            "req-rejected-1": {"id": "req-rejected-1", "status": "pending"},
+        },
+    )
+    (inbox_dir / "will-be-rejected.md").write_text("bad content")
+    await monitor.check_once()
+
+    # Second scan: approval now rejected
+    rejected_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,  # shouldn't be called
+        approval_by_id={
+            "req-rejected-1": {"id": "req-rejected-1", "status": "rejected"},
+        },
+    )
+    monitor._autonomous_dispatcher = rejected_dispatcher
+    await monitor.check_once()
+    rejected_dispatcher.route.assert_not_called()
+    mock_invoker.run.assert_not_called()
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%will-be-rejected%'",
+    )).fetchall())]
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert "reject" in (rows[0]["error_message"] or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_resume_pass_invalidates_row_on_missing_approval(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When the approval row is missing entirely (approval_manager
+    returns None), the inbox row must be invalidated with the
+    APPROVAL_INVALIDATED_PREFIX marker so the next scan re-detects the
+    file as new."""
+    from genesis.db.crud import inbox_items
+
+    pending_decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-gone-1",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,
+        approval_by_id={
+            "req-gone-1": {"id": "req-gone-1", "status": "pending"},
+        },
+    )
+    (inbox_dir / "gone.md").write_text("content")
+    await monitor.check_once()
+
+    # Second scan: approval_by_id is empty → get_by_id returns None
+    gone_dispatcher = _make_wired_dispatcher(
+        decision=pending_decision,
+        approval_by_id={},  # approval row vanished
+    )
+    monitor._autonomous_dispatcher = gone_dispatcher
+    await monitor.check_once()
+
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%gone.md'",
+    )).fetchall())]
+    # At least one row should be failed+invalidated.  The next scan may
+    # also have created a fresh row for the re-detected file.
+    failed = [r for r in rows if r["status"] == "failed"]
+    assert len(failed) >= 1
+    assert any(
+        (r["error_message"] or "").startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
+        for r in failed
+    )

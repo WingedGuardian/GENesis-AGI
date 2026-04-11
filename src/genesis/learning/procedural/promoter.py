@@ -8,9 +8,17 @@ Promotion thresholds:
   L3 → L2: success_count >= 5 AND confidence >= 0.75
   L2 → L1: success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
 
-Demotion:
-  3+ consecutive failures → tier - 1
-  confidence < 0.3 → quarantine
+Demotion is **evidence-driven only** — never metrics-based:
+  3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
+  confidence < 0.3 AND total samples >= 3                       → quarantine
+
+`_compute_tier` only PROMOTES. If a procedure's metrics no longer support
+its current tier (e.g., a seeded L3 with success_count=1, or a procedure
+that was created at a higher tier than its raw counts justify), it stays
+where it is until either (a) it earns enough successes to be promoted
+further, or (b) it accumulates real failures and trips `_check_demotion`
+or the quarantine guard. This prevents seeded and explicitly-taught
+procedures from being silently downgraded between hourly runs.
 """
 
 from __future__ import annotations
@@ -30,19 +38,36 @@ _RANK_TIER = {4: "L1", 3: "L2", 2: "L3", 1: "L4"}
 
 
 def _compute_tier(row: dict) -> str:
-    """Compute the target tier for a procedure based on its metrics."""
+    """Compute the target tier for a procedure based on its metrics.
+
+    Strict promote-only. Returns the highest tier the row's metrics
+    qualify for, then compares against the row's CURRENT tier and never
+    returns a lower rank — even if a lower-tier rule still matches. This
+    prevents one-failure metric drift (e.g., an L1 procedure whose conf
+    drifts from 0.86 → 0.83) from silently downgrading the tier.
+
+    Evidence-driven demotions are handled separately by `_check_demotion`
+    (failure history) and the quarantine guard in `promote_and_demote`
+    (confidence < 0.3 with sample floor).
+    """
     s = row["success_count"]
     conf = row["confidence"]
     spec = row.get("speculative", 1)
     has_trigger = bool(row.get("tool_trigger"))
+    current = row.get("activation_tier") or "L4"
 
+    qualified = "L4"
     if s >= 8 and conf >= 0.85 and has_trigger:
-        return "L1"
-    if s >= 5 and conf >= 0.75:
-        return "L2"
-    if s >= 3 and conf >= 0.65 and spec == 0:
-        return "L3"
-    return "L4"
+        qualified = "L1"
+    elif s >= 5 and conf >= 0.75:
+        qualified = "L2"
+    elif s >= 3 and conf >= 0.65 and spec == 0:
+        qualified = "L3"
+
+    # Promote-only: never demote via metrics drift.
+    if _TIER_RANK.get(qualified, 1) > _TIER_RANK.get(current, 1):
+        return qualified
+    return current
 
 
 def _check_demotion(row: dict) -> bool:

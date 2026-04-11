@@ -49,6 +49,49 @@ critical:
   - pattern: ".claude/settings.json"
     reason: "CC hooks enforce safety invariants"
 
+# Phase 6 — community contribution pipeline forbidden paths.
+# Any contribution diff touching these files is instantly rejected by
+# src/genesis/contribution/sanitize.py. This is STRICTER than `critical`
+# because we never want user-specific content reaching the public repo
+# via the contribution path, even if the user has CLI access locally.
+# If a path is critical, it usually also belongs here.
+contribution_forbidden:
+  # User-specific identity and knowledge
+  - pattern: "src/genesis/identity/USER.md"
+    reason: "Per-user profile — must never leak upstream"
+  - pattern: "src/genesis/identity/USER_KNOWLEDGE.md"
+    reason: "Auto-synthesized user knowledge — contains personal facts"
+  - pattern: "src/genesis/identity/*.md"
+    reason: "Identity files are user-tuned; contribution path is not the edit channel"
+  # Secrets
+  - pattern: "secrets.env"
+    reason: "Never commit secrets via contribution pipeline"
+  - pattern: "*/secrets.env"
+    reason: "Same — any path"
+  - pattern: ".env"
+    reason: "Local env overrides — must stay local"
+  # User-specific configs
+  - pattern: "config/research-profiles/**"
+    reason: "Private research interests"
+  - pattern: "config/external-modules/**"
+    reason: "User-specific module configs (private IPs etc)"
+  - pattern: "config/model_routing.yaml"
+    reason: "Routes contain private hostnames; overrides reach env vars in release pipeline"
+  # Private docs
+  - pattern: "docs/plans/**"
+    reason: "Internal planning documents"
+  - pattern: "docs/history/**"
+    reason: "Project history with internal refs, IPs, personas"
+  - pattern: "docs/gtm/**"
+    reason: "Internal go-to-market playbook"
+  - pattern: "docs/superpowers/**"
+    reason: "Internal product design specs"
+  # Voice-master user data (overlay expected out-of-repo)
+  - pattern: "src/genesis/skills/voice-master/references/exemplars/*"
+    reason: "User voice exemplars — overlay-only"
+  - pattern: "src/genesis/skills/voice-master/references/voice-dimensions.md"
+    reason: "User voice dimensions — overlay-only"
+
 sensitive:
   # Runtime core — changes affect all subsystems
   - pattern: "src/genesis/runtime.py"

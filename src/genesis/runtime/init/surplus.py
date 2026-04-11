@@ -13,7 +13,7 @@ logger = logging.getLogger("genesis.runtime")
 
 async def _degraded(rt: GenesisRuntime, component: str, error: str = "failed to wire") -> None:
     """Record a surplus init degradation."""
-    from genesis.runtime._core import record_init_degradation
+    from genesis.runtime._degradation import record_init_degradation
 
     await record_init_degradation(rt._db, rt._event_bus, "surplus", component, error)
 

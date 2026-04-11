@@ -2,10 +2,34 @@
 
 Each collector reads one signal source and returns a normalized 0.0–1.0 value.
 
-This module defines the SignalCollector protocol and base-layer stub/utility
-collectors (e.g. ContainerMemoryCollector, StrategicTimerCollector).  At startup,
-runtime._init_learning() replaces the default stubs with real implementations
-from genesis.learning.signals.* via awareness_loop.replace_collectors().
+==============================================================================
+⚠️  IMPORTANT — READ BEFORE DELETING ANYTHING HERE  ⚠️
+
+This module is the awareness loop's bootstrap-layer collector surface. It is
+loaded by ``runtime/init/awareness.py`` *before* ``runtime/init/learning.py``
+runs.  Several classes below are deliberate **bootstrap placeholders**
+(return ``value=0.0`` via ``_bootstrap_placeholder_reading``) that are
+**replaced at runtime** by the real implementations in
+``genesis.learning.signals.*`` via ``awareness_loop.replace_collectors()``.
+
+A placeholder class with a trivial ``collect()`` body is **NOT dead code**.
+It is part of the two-phase bootstrap contract: awareness starts with these
+placeholders so the loop can begin ticking immediately, then the learning
+init swap wires the real collectors in once their dependencies exist.
+
+Deleting a placeholder class without also removing its import+registration
+in ``runtime/init/awareness.py`` and its swap target in
+``runtime/init/learning.py`` will break bootstrap.
+
+Tagged with ``GROUNDWORK(signal-bootstrap)`` below for explicit protection.
+==============================================================================
+
+Note: Some collectors in this file are **real** implementations
+(``ErrorSpikeCollector``, ``CriticalFailureCollector``,
+``StrategicTimerCollector``, ``ContainerMemoryCollector``,
+``JobHealthCollector``). They use ``_bootstrap_placeholder_reading`` only
+as a graceful fallback when their own dependencies (registry, cgroup,
+runtime handle) are unavailable — not as their primary path.
 """
 
 from __future__ import annotations
@@ -33,54 +57,76 @@ class SignalCollector(Protocol):
     async def collect(self) -> SignalReading: ...
 
 
-def _stub_reading(name: str, source: str) -> SignalReading:
-    """Create a zero-value reading for Phase 1 stubs."""
+def _bootstrap_placeholder_reading(name: str, source: str) -> SignalReading:
+    """Create a zero-value signal reading.
+
+    Two distinct uses (both intentional — see module docstring):
+
+    1. **Pre-swap bootstrap placeholder** — used by the pure-placeholder
+       collectors below (``ConversationCollector``, ``TaskQualityCollector``,
+       etc.). These exist only so the awareness loop can boot; they are
+       replaced at runtime by real implementations from
+       ``genesis.learning.signals.*``.
+    2. **Graceful fallback in real collectors** — used by
+       ``ErrorSpikeCollector``, ``CriticalFailureCollector``,
+       ``StrategicTimerCollector``, etc. when their dependencies (registry,
+       runtime handle, cgroup) aren't available yet.
+
+    A zero reading means "this signal cannot be measured right now," not
+    "this signal is dead code." Do NOT delete collectors that call this
+    function without first tracing their registration and swap sites.
+    """
     return SignalReading(
         name=name, value=0.0, source=source,
         collected_at=datetime.now(UTC).isoformat(),
     )
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.conversation.ConversationCollector via
+# awareness_loop.replace_collectors() in runtime/init/learning.py. Do not
+# delete without updating both bootstrap sites.
 class ConversationCollector:
     signal_name = "conversations_since_reflection"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "genesis")
+        return _bootstrap_placeholder_reading(self.signal_name, "genesis")
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.task_quality.TaskQualityCollector.
 class TaskQualityCollector:
     signal_name = "task_completion_quality"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "genesis")
+        return _bootstrap_placeholder_reading(self.signal_name, "genesis")
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.outreach_engagement.OutreachEngagementCollector.
 class OutreachEngagementCollector:
     signal_name = "outreach_engagement_data"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "outreach_mcp")
+        return _bootstrap_placeholder_reading(self.signal_name, "outreach_mcp")
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.recon_findings.ReconFindingsCollector.
 class ReconFindingsCollector:
     signal_name = "recon_findings_pending"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "recon_mcp")
+        return _bootstrap_placeholder_reading(self.signal_name, "recon_mcp")
 
 
-class MemoryBacklogCollector:
-    signal_name = "unprocessed_memory_backlog"
-
-    async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "memory_mcp")
-
-
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.budget.BudgetCollector.
 class BudgetCollector:
     signal_name = "budget_pct_consumed"
 
     async def collect(self) -> SignalReading:
-        return _stub_reading(self.signal_name, "health_mcp")
+        return _bootstrap_placeholder_reading(self.signal_name, "health_mcp")
 
 
 class ErrorSpikeCollector:
@@ -91,7 +137,7 @@ class ErrorSpikeCollector:
 
     async def collect(self) -> SignalReading:
         if not self._registry or not self._registry._breakers:
-            return _stub_reading(self.signal_name, "health_mcp")
+            return _bootstrap_placeholder_reading(self.signal_name, "health_mcp")
         total = len(self._registry._breakers)
         open_count = sum(
             1 for cb in self._registry._breakers.values()
@@ -112,13 +158,13 @@ class CriticalFailureCollector:
 
     async def collect(self) -> SignalReading:
         if not self._registry or not self._registry._breakers:
-            return _stub_reading(self.signal_name, "health_mcp")
+            return _bootstrap_placeholder_reading(self.signal_name, "health_mcp")
         cloud_names = [
             name for name, cfg in self._registry._providers.items()
             if cfg.provider_type != "ollama"
         ]
         if not cloud_names:
-            return _stub_reading(self.signal_name, "health_mcp")
+            return _bootstrap_placeholder_reading(self.signal_name, "health_mcp")
         all_open = all(
             self._registry.get(name).state == ProviderState.OPEN
             for name in cloud_names
@@ -144,7 +190,7 @@ class StrategicTimerCollector:
 
     async def collect(self) -> SignalReading:
         if self._db is None:
-            return _stub_reading(self.signal_name, "clock")
+            return _bootstrap_placeholder_reading(self.signal_name, "clock")
 
         from genesis.db.crud import awareness_ticks as at_crud
 
@@ -180,7 +226,7 @@ class ContainerMemoryCollector:
 
         mem = get_container_memory()
         if mem is None or mem[1] == 0:
-            return _stub_reading(self.signal_name, "cgroup")
+            return _bootstrap_placeholder_reading(self.signal_name, "cgroup")
 
         current, limit = mem
         pct = current / limit  # 0.0–1.0
@@ -211,7 +257,7 @@ class JobHealthCollector:
 
     async def collect(self) -> SignalReading:
         if self._runtime is None:
-            return _stub_reading(self.signal_name, "runtime")
+            return _bootstrap_placeholder_reading(self.signal_name, "runtime")
 
         job_health = self._runtime.job_health
         if not job_health:

@@ -2,13 +2,45 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
+
+from genesis.util.tasks import tracked_task
+
+_STATUS_WRITE_INTERVAL_S = 60
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
 
 logger = logging.getLogger("genesis.runtime")
+
+
+async def run_status_writer_loop(
+    runtime: GenesisRuntime, interval_s: float = _STATUS_WRITE_INTERVAL_S,
+) -> None:
+    """Background loop that refreshes status.json on a fixed cadence.
+
+    Decoupled from the awareness tick so a slow tick (e.g. a long Light
+    reflection) cannot delay the status.json refresh and trip the watchdog
+    into a false restart. Reads ``runtime._status_writer`` on every iteration
+    so a future hot-swap picks up the new writer.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_s)
+            writer = runtime._status_writer
+            if writer is None:
+                continue
+            await writer.write()
+            runtime.record_job_success("status_writer_loop")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            runtime.record_job_failure("status_writer_loop", str(exc))
+            logger.error(
+                "Status writer loop iteration failed", exc_info=True,
+            )
 
 
 async def init(rt: GenesisRuntime) -> None:
@@ -95,9 +127,25 @@ async def init(rt: GenesisRuntime) -> None:
                 pending_embeddings_db=rt._db,
                 runtime=rt,
             )
-            if rt._awareness_loop is not None:
-                rt._awareness_loop.set_status_writer(rt._status_writer)
-            logger.info("StatusFileWriter created and injected into awareness loop")
+            logger.info("StatusFileWriter created")
+
+            # Write once immediately so status.json is fresh the moment the
+            # server comes up — don't wait a full interval before the watchdog
+            # sees a live heartbeat.
+            try:
+                await rt._status_writer.write()
+            except Exception:
+                logger.warning(
+                    "Initial status writer write failed", exc_info=True,
+                )
+
+            rt._status_writer_task = tracked_task(
+                run_status_writer_loop(rt), name="status-writer-loop",
+            )
+            logger.info(
+                "Status writer loop started (interval=%ds)",
+                _STATUS_WRITE_INTERVAL_S,
+            )
 
             from genesis.resilience.embedding_recovery import EmbeddingRecoveryWorker
             from genesis.resilience.recovery import RecoveryOrchestrator
@@ -125,12 +173,12 @@ async def init(rt: GenesisRuntime) -> None:
             "continuing without vector memory",
             exc_info=True,
         )
-        from genesis.runtime._core import record_init_degradation
+        from genesis.runtime._degradation import record_init_degradation
         await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
     except Exception as exc:
         logger.error(
             "MemoryStore creation failed — continuing without vector memory",
             exc_info=True,
         )
-        from genesis.runtime._core import record_init_degradation
+        from genesis.runtime._degradation import record_init_degradation
         await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")

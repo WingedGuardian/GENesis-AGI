@@ -27,6 +27,14 @@ from genesis.routing.types import (
 
 logger = logging.getLogger(__name__)
 
+# Sentinel error prefix returned by route_call() when the call_site_id does
+# not exist in the current routing config. The dead-letter replay loop uses
+# this to distinguish "stale call_site_id after config reload" (expire)
+# from ordinary provider-exhaustion failures (retry). Tested to stay in sync
+# between router and dead_letter — changing this string requires updating
+# dead_letter.redispatch() and the matching test.
+UNKNOWN_CALL_SITE_ERROR_PREFIX = "Unknown call site:"
+
 
 class Router:
     """Routes LLM calls through provider fallback chains with resilience."""
@@ -72,6 +80,12 @@ class Router:
         call sites but looks up providers from self.config. Ensure removed
         providers are not referenced by in-flight calls (practically safe
         since provider removal is rare and asyncio is cooperative).
+
+        This method is intentionally synchronous to preserve the existing
+        Flask sync-route contract. Callers that want the proactive DLQ
+        orphan scan (which complements the reactive call_site_id cleanup
+        inside ``DeadLetterQueue.redispatch``) should call
+        ``scan_dlq_orphans_after_reload()`` immediately after this.
         """
         old_sites = set(self.config.call_sites)
         new_sites = set(new_config.call_sites)
@@ -94,6 +108,29 @@ class Router:
         else:
             logger.info("Routing config reloaded: %d call sites", len(new_sites))
 
+    async def scan_dlq_orphans_after_reload(self) -> int:
+        """Proactively expire DLQ items whose target_provider was removed.
+
+        Thin async wrapper around ``DeadLetterQueue.scan_orphans_by_provider``
+        that scopes the scan to the current (post-reload) provider set.
+        Intended to be called immediately after ``reload_config()`` from
+        async contexts (dashboard async routes, scheduled jobs).
+
+        Complements the reactive call_site_id cleanup that already runs
+        inside ``DeadLetterQueue.redispatch``: that one catches items
+        whose *call_site_id* was renamed/removed; this one catches items
+        whose *target_provider* was removed. Different orphan key,
+        different trigger — both are needed.
+
+        Returns:
+            Count of orphans expired, or 0 if no DLQ is wired.
+        """
+        if self._dead_letter is None:
+            return 0
+        return await self._dead_letter.scan_orphans_by_provider(
+            self.config.providers.keys(),
+        )
+
     async def route_call(
         self,
         call_site_id: str,
@@ -109,7 +146,7 @@ class Router:
             return RoutingResult(
                 success=False,
                 call_site_id=call_site_id,
-                error=f"Unknown call site: {call_site_id}",
+                error=f"{UNKNOWN_CALL_SITE_ERROR_PREFIX} {call_site_id}",
             )
 
         # 2. Check degradation

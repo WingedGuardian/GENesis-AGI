@@ -14,7 +14,6 @@ from genesis.learning.signals import (
     BudgetCollector,
     CriticalFailureCollector,
     ErrorSpikeCollector,
-    MemoryBacklogCollector,
     TaskQualityCollector,
 )
 from genesis.learning.signals.recon_findings import ReconFindingsCollector
@@ -75,7 +74,7 @@ class TestProtocolConformance:
         """All 5 collectors satisfy SignalCollector protocol structurally."""
         # We just verify the class attributes exist; runtime_checkable
         # needs instances which need db — covered in functional tests.
-        for cls in (BudgetCollector, ErrorSpikeCollector, TaskQualityCollector, MemoryBacklogCollector):
+        for cls in (BudgetCollector, ErrorSpikeCollector, TaskQualityCollector):
             assert hasattr(cls, "signal_name")
         assert hasattr(CriticalFailureCollector, "signal_name")
 
@@ -242,43 +241,6 @@ class TestTaskQualityCollector:
 
     async def test_isinstance_protocol(self, db):
         assert isinstance(TaskQualityCollector(db), SignalCollector)
-
-
-# ── MemoryBacklogCollector ───────────────────────────────────────────────────
-
-class TestMemoryBacklogCollector:
-    async def test_no_observations_returns_zero(self, db):
-        r = await MemoryBacklogCollector(db).collect()
-        assert r.name == "unprocessed_memory_backlog"
-        assert r.value == 0.0
-
-    async def test_some_unprocessed(self, db):
-        for _ in range(50):
-            await _insert_observation(db, source="reflection", retrieved_count=0)
-        r = await MemoryBacklogCollector(db).collect()
-        assert r.value == pytest.approx(0.5)
-
-    async def test_ceiling_cap(self, db):
-        for _ in range(150):
-            await _insert_observation(db, source="reflection", retrieved_count=0)
-        r = await MemoryBacklogCollector(db).collect()
-        assert r.value == 1.0
-
-    async def test_retrieved_excluded(self, db):
-        for _ in range(50):
-            await _insert_observation(db, source="reflection", retrieved_count=1)
-        r = await MemoryBacklogCollector(db).collect()
-        assert r.value == 0.0
-
-    async def test_old_observations_excluded(self, db):
-        old = (datetime.now(UTC) - timedelta(days=10)).isoformat()
-        for _ in range(50):
-            await _insert_observation(db, source="reflection", retrieved_count=0, created_at=old)
-        r = await MemoryBacklogCollector(db).collect()
-        assert r.value == 0.0
-
-    async def test_isinstance_protocol(self, db):
-        assert isinstance(MemoryBacklogCollector(db), SignalCollector)
 
 
 # ── ReconFindingsCollector ───────────────────────────────────────────────────

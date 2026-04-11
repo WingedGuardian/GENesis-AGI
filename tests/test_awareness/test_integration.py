@@ -13,7 +13,6 @@ from genesis.awareness.signals import (
     ConversationCollector,
     CriticalFailureCollector,
     ErrorSpikeCollector,
-    MemoryBacklogCollector,
     OutreachEngagementCollector,
     ReconFindingsCollector,
     StrategicTimerCollector,
@@ -24,11 +23,11 @@ from genesis.db.crud import awareness_ticks, observations
 
 
 async def test_full_pipeline_quiet(db):
-    """All stub collectors (0.0 values) → nothing triggers."""
+    """All placeholder collectors (0.0 values) → nothing triggers."""
     collectors = [
         ConversationCollector(), TaskQualityCollector(),
         OutreachEngagementCollector(), ReconFindingsCollector(),
-        MemoryBacklogCollector(), BudgetCollector(),
+        BudgetCollector(),
         ErrorSpikeCollector(), CriticalFailureCollector(),
         StrategicTimerCollector(),
     ]
@@ -37,7 +36,7 @@ async def test_full_pipeline_quiet(db):
     # All signals are 0.0, but time multipliers are maxed (no prior ticks)
     # 0.0 * any_weight = 0.0, 0.0 * any_multiplier = 0.0 → nothing triggers
     assert result.classified_depth is None
-    assert len(result.signals) == 9
+    assert len(result.signals) == len(collectors)
     assert len(result.scores) == 4
 
     # Tick stored

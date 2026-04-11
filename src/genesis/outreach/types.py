@@ -12,6 +12,10 @@ class OutreachCategory(StrEnum):
     ALERT = "alert"
     SURPLUS = "surplus"
     DIGEST = "digest"
+    # Autonomous CLI approval prompts. Routed to the "Approvals" supergroup
+    # topic with inline ✅ buttons. Added via the outreach_history CHECK
+    # constraint migration in db/schema/_migrations.py (_migrate_add_columns).
+    APPROVAL = "approval"
 
 
 class OutreachStatus(StrEnum):

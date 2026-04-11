@@ -49,19 +49,16 @@ class GovernanceGate:
 
     async def check(self, request: OutreachRequest) -> GovernanceResult:
         if request.category in _BYPASS_CATEGORIES:
-            # Alerts/blockers bypass salience, quiet hours, rate limits —
-            # but still respect dedup to prevent the same alert re-sending
-            # every audit/awareness cycle.
-            if await self._is_duplicate(request):
-                return GovernanceResult(
-                    verdict=GovernanceVerdict.DENY,
-                    reason=f"duplicate {request.category.value} suppressed",
-                    checks_failed=["dedup"],
-                )
+            # BLOCKER and ALERT: fully bypass all governance including dedup.
+            # If a condition is being reported, it exists right now. If it's
+            # the same as 6 hours ago, that's information — the problem
+            # persists. Suppressing it hides persistence from the user.
+            # Dedup is for proactive outreach (morning reports, surplus
+            # insights). Reactive alerts should never be suppressed.
             return GovernanceResult(
                 verdict=GovernanceVerdict.BYPASS,
-                reason=f"{request.category.value} bypasses governance",
-                checks_passed=["category_bypass", "dedup"],
+                reason=f"{request.category.value} bypasses all governance",
+                checks_passed=["category_bypass"],
             )
 
         if request.signal_type == _MORNING_REPORT_SIGNAL:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -58,11 +58,15 @@ class TestSSHCommand:
     @pytest.mark.asyncio
     async def test_timeout(self, remote):
         mock_proc = AsyncMock()
+        mock_proc.pid = 12345
         mock_proc.communicate.side_effect = TimeoutError()
+        mock_proc.kill = MagicMock()  # kill() is sync on asyncio.Process
+        mock_proc.wait = AsyncMock()
         with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
             ok, output = await remote._ssh_command("status")
         assert ok is False
         assert output == "timeout"
+        mock_proc.kill.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_os_error(self, remote):

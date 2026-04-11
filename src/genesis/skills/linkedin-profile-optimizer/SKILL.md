@@ -21,12 +21,19 @@ Sound human. Sound like the user.
 
 ## Voice Loading
 
-Before writing any profile content, read voice exemplars and anti-slop rules:
-- `../voice-master/references/exemplars/professional.md`
-- `../voice-master/references/anti-slop.md`
+Before writing any profile content, load the user's voice via voice-master's
+overlay resolution:
 
-If the exemplar file is empty or has no good matches, also read:
-- `../voice-master/references/voice-dimensions.md`
+1. Read `../voice-master/SKILL.md` and follow its **User Calibration
+   Overlay** section to load the user's exemplars and voice-dimensions from
+   the out-of-repo overlay (or template fallback with warning if no overlay).
+2. This skill's medium is `professional`. Select professional-medium
+   exemplars from whatever voice-master loads.
+3. Read `../voice-master/references/anti-slop.md` — apply the **Universal**
+   and **Professional / LinkedIn** sections.
+
+If no overlay is present, voice-master falls back to the generic template
+and warns — note this in your output.
 
 Profile copy follows the same anti-slop rules as posts. A profile that reads
 like a ChatGPT template is worse than an outdated one.
@@ -128,5 +135,5 @@ sections_optimized:
 
 ## References
 
-- `../voice-master/references/exemplars/professional.md` — Professional voice exemplars
-- `../voice-master/references/anti-slop.md` — AI-tell avoidance rules
+- `../voice-master/SKILL.md` — Voice authority; follow its User Calibration Overlay section to load professional exemplars from the user overlay
+- `../voice-master/references/anti-slop.md` — Universal + Professional/LinkedIn anti-slop rules

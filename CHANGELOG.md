@@ -7,6 +7,245 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a3] - 2026-04-11
+
+Large release. Major new features: **community contribution pipeline**
+(Phase 6), **Sentinel** container-side guardian, **self-update infrastructure**,
+and a top-to-bottom overhaul of the install experience, Guardian recovery,
+approval UX, and the neural monitor dashboard. Also clears a long tail of
+runtime, routing, and observability issues accumulated since v3.0a2-hf5.
+
+### Added
+
+**Community contribution pipeline (Phase 6)**
+
+- **`genesis contribute <sha>` CLI** — one-shot pipeline that converts a
+  `fix:` commit into a draft PR against the public Genesis repo. Flow:
+  divergence check → version gate → sanitizer → adversarial review →
+  consent prompt → draft PR via `gh`. Pseudonymous by default
+  (`contributor-<id>@genesis.local`); `--identify` uses the user's real
+  git identity. MVP scope: bug fixes only (`--allow-non-fix` to override).
+- **Post-commit offer hook** — committing a `fix:` commit drops a marker
+  in `~/.genesis/pending-offers/`; the `contribution_offer_hook.py`
+  UserPromptSubmit hook injects a `[Contribution]` system-reminder on
+  the next prompt so Genesis can proactively offer to upstream the fix.
+  `fix(local):` scope opts out of the offer entirely.
+- **Fail-closed sanitizer** — refuses any diff containing secrets, personal
+  email addresses, hardcoded IPs, `/home/ubuntu` paths, or files on the
+  `contribution_forbidden` tier of `config/protected_paths.yaml`. Runs
+  `detect-secrets`, portability, and path-tier scanners.
+- **Adversarial review chain** — Codex CLI first, Claude Code subagent
+  fallback, Genesis-native reviewer last. First-success wins; result is
+  embedded in the PR body.
+- **PR body metadata** — every generated PR includes contributor install
+  version (`<version>@<short-sha>`), version drift status, pseudonymous
+  install ID, sanitizer finding count + scanners run, and review result.
+- **Branch-push flow** — contributions land on a fresh branch named by
+  commit sha, pushed to the contributor's fork. E2E CLI test covers the
+  full hook → sanitizer → review → branch-push path.
+
+**Sentinel (container-side guardian)**
+
+- **New package `src/genesis/sentinel/`** — container-side complement to
+  the host-side Guardian. Runs inside the container, monitors Genesis
+  infrastructure with the fire alarm taxonomy (WARN / DEGRADED / DOWN),
+  and triggers dormant remediations via the registry.
+- **Trigger sources + infrastructure monitor** — wires Qdrant, database,
+  memory, and process health into the Sentinel trigger pipeline.
+- **Runtime wiring + capability registration** — Sentinel registers as a
+  first-class capability, surfaces state in the dashboard Services card,
+  and its awareness is folded into Guardian briefings + diagnosis.
+- **V4 architecture §8.1/8.2 updated** with implementation status.
+
+**Self-update infrastructure**
+
+- **`GenesisVersionCollector`** — awareness-loop collector checks for
+  upstream updates every 6h (configurable), stores observations, sends
+  Telegram alerts, surfaces "update available" in the dashboard health
+  panel, and detects update failures.
+- **Update settings domain** — new `config/updates.yaml` with check
+  interval, notification channel, and auto-apply policy (opt-in only).
+  Configurable via `settings_update("updates", ...)` MCP tool.
+- **Schema migration framework** — `src/genesis/db/migrations/` with
+  `MigrationRunner`, CLI (`python -m genesis.db.migrations`), and
+  versioned migration files. Tracking table `schema_migrations` records
+  applied migrations. First migration: `update_history` table.
+- **Public release CI/CD** — `.github/workflows/public-release.yaml`
+  triggered on version tags. Runs `prepare-public-release.sh`, secret
+  scan, portability scan, and uploads sanitized artifact for maintainer
+  review.
+- **`detect-secrets` dependency** — added to `[release]` optional deps in
+  `pyproject.toml`, unblocking the secret scan step that was previously
+  silently skipping.
+
+**Install & host setup**
+
+- **13 resilience fixes from failure-mode audit** — hardens `install.sh`,
+  `bootstrap.sh`, and `update.sh` against partial failures, rerun damage,
+  missing preconditions, and silently-skipped steps.
+- **Container smoke test + damage detection on re-run** — re-running the
+  installer now detects a damaged previous run and either repairs or
+  fails loudly instead of silently producing a broken state.
+- **Tailscale in host setup** — `host-setup.sh` installs Tailscale and
+  prompts for authentication during setup (supports `TAILSCALE_AUTH_KEY`
+  for unattended installs).
+- **Node.js + Claude Code on host VM** — `host-setup.sh` installs Node.js
+  20.x and Claude Code on the host (not just the container), enabling
+  Guardian CC diagnosis sessions.
+- **Node.js ≥ 20** required (was 18); Guardian state reset on container
+  recreate.
+
+**Approval UX & autonomy**
+
+- **Approval UX redesign** — dedicated Telegram topic, inline buttons,
+  call-site gating so approvals are attributed to the caller, not the
+  model. Batch CLI approval flow.
+- **Autonomous CLI approval gate wired into standalone server** — gate +
+  `approvals` topic registered during standalone startup (previously
+  only wired in the AZ hosting mode, silently disabled standalone).
+- **Inbox approval-pending resume flow** — stable approval key + resume
+  path so restarts don't orphan in-flight approvals.
+
+**Dashboard & observability**
+
+- **Neural monitor visual overhaul** — glowing dots, cleaner layout,
+  proportional radial placement, constellation map layout option,
+  provider chain fixes. Dispatch mode toggle wired to runtime routing
+  with save-verify feedback.
+- **Sentinel state in Services card.**
+- **Config tab UX overhaul** — visibility, dropdowns, tooltips, health
+  indicators. Secret values gated behind auth.
+- **Dropped-tick events surfaced** from the awareness loop.
+- **Container memory decomposition** into anon/file/kernel components.
+- **`runtime.peek()`** — read-only runtime snapshot used by observability
+  callers that previously forced full runtime access.
+
+**Docs & conventions**
+
+- **No-silent-timeouts rule** added to `CLAUDE.md` — new timeouts on
+  reflections, CC calls, and long-thinking paths require explicit user
+  approval with evidence of a real failure mode.
+- **Never ignore a bug** rule — bugs encountered in any work must be
+  fixed inline or tracked as follow-ups; "out of scope" is not an option.
+- **V4 ego / infra self-monitor design** + incident report.
+
+### Changed
+
+- **`update.sh` overhaul** — pre-update backup via `backup.sh`, rollback
+  tags (`pre-update-{timestamp}`), idempotent `bootstrap.sh` post-pull
+  (replaces manual pip install), health verification with 3× retry,
+  automatic rollback on failure, CC-assisted recovery context file
+  (`~/.genesis/last_update_failure.json`).
+- **Mistral routing rationalization** — consolidated Mistral providers
+  and call sites, raised `mistral-large-free` rpm 2 → 4 and
+  `mistral-small-free` rpm 2 → 30 based on observed usage (previous
+  limits were ~5× over-conservative).
+- **Routing tail fallback** added for sites 29 and 35, stopping the
+  sentinel DOWN alarm from chain exhaustion.
+- **Proactive DLQ orphan scan** on routing config reload — expires DLQ
+  items whose `call_site_id` no longer exists instead of leaving them
+  stranded.
+- **Misinterpreted memory-backlog signal removed end-to-end** from the
+  awareness loop (was firing on normal state).
+- **Watchdog staleness threshold** 300s → 900s to stop false positives
+  during legitimate long-running ticks.
+- **`runtime/_core.py` split** under the 600 LOC soft target — converted
+  to `runtime/` package with 20 init modules. Extracted mixins:
+  `_properties.py`, `_pause_state.py`, `_init_delegates.py`,
+  `_degradation.py`, `_capabilities.py`, `_job_health.py`. Re-exported
+  from `__init__.py` for backward compatibility.
+- **`ashutdown`** async shutdown path + `job_health` envelope for MCP
+  health surfaces.
+- **`8_memory_consolidation`** call site renamed to `8_ego_compaction`
+  for clarity.
+- **Ego sessions** remain inert until beta — built but not registered
+  in bootstrap.
+
+### Fixed
+
+- **Guardian recovery hardening** — auth middleware was blocking
+  Guardian's own health probes, contributing to the 2026-04-08 memory
+  exhaustion incident. Auth now gates browser pages only; `/api/` and
+  `/v1/` routes are exempt. See `docs/incidents/2026-04-08-memory-exhaustion.md`.
+- **Broken page cache reclaim** — watchdog/Guardian collector service
+  name fix plus explicit reclaim trigger; container no longer drifts
+  toward OOM under sustained read load.
+- **Guardian heartbeat decoupled from HEALTHY state** — previously,
+  Guardian only emitted heartbeats while reporting HEALTHY, so DEGRADED
+  or DOWN states silently stopped the heartbeat stream.
+- **Guardian ICMP probe** retries once to absorb bridge ARP races that
+  were producing spurious DOWN readings on container recreate.
+- **Runtime status writer decoupled from awareness tick** — a slow tick
+  no longer blocks status writes, and a slow status write no longer
+  delays the next tick.
+- **`surplus.py` zombie runtime singleton** — the surplus worker was
+  spawning a parallel Genesis runtime in-process when the primary
+  runtime's observability snapshot asked for state. Fixed by routing
+  through `runtime.peek()`.
+- **Circular import crashing `genesis-memory` MCP** — resolved, with
+  loud failure reporting instead of the previous silent-skip behavior.
+- **Browser tools converted from Playwright sync → async API** —
+  sync-in-async-context was deadlocking the MCP server.
+- **`TopicManager` wired into standalone startup path** (was only
+  wired in AZ mode, silently missing in standalone).
+- **IPC non-dict response wrapping** — `module_call` no longer returns
+  a bare list when a module returns one; wrapped consistently so
+  callers don't need to handle both shapes.
+- **Inbox routing** — removed free-SLM routing path, kept approval gate,
+  fixed empty-content bug that was dropping messages.
+- **Autonomous DM silent fallback surfaced** — fallback path used to
+  silently succeed with no user visibility; now surfaces the fallback
+  and doesn't stall reask on fail.
+- **`update.sh` rollback correctness** — rollback used `git checkout <tag>`
+  which left the repo in detached HEAD. Now `git checkout main &&
+  git reset --hard <tag>` preserves the branch. Silent failure paths
+  (`|| true`) removed, ERR trap covers all mutating steps, health
+  endpoint + migration failures now trigger rollback. Added worktree
+  guard (refuses to run from `.claude/worktrees/`). `update_history`
+  rows written on both success and failure.
+- **Migration runner atomicity** — body + tracking row were committed
+  separately (risk of "applied but unrecorded"), and Python sqlite3
+  auto-commits before DDL when using `db.commit()`/`db.rollback()`.
+  Fixed with explicit `BEGIN IMMEDIATE` / `COMMIT` / `ROLLBACK` SQL
+  including DDL in the transaction. Regression test added.
+- **Public release CI secret scan** — `detect-secrets` failures were
+  silenced by `|| true`, bare `except: print(0)`, and `2>/dev/null`,
+  converting scanner crashes into "0 findings" (false PASS). Now fails
+  loudly.
+- **`GenesisVersionCollector`** — `_check_upstream` silently returned
+  `(0, "")` on git fetch failure. Now raises with stderr context.
+  Local update resolves prior `genesis_update_available` observations
+  so dashboard alert clears immediately. Failure file archived to
+  `.processed.json` after processing instead of being re-read every
+  awareness tick.
+- **Updates settings validator** — non-dict sections silently passed;
+  `auto_apply.allowed_impacts` accepted `action_needed` and `breaking`
+  despite config comment saying those always require manual approval.
+  Both now rejected.
+- **Observability** — `errors.py` data-returning paths now log at ERROR
+  with `exc_info=True` (dead letter query, circuit breaker check, event
+  log query, genesis update alert query). One wrong log message fixed.
+- **Health MCP** — hermetic cleanup rounds 2 + 3, transport smoke
+  canary expanded to full read-only matrix, heartbeat query error
+  raised DEBUG → ERROR, narrow error handling, tighter bootstrap
+  manifest messages, worktree test isolation fix in `conftest.py`.
+- **Test suite** — cleared 26 pre-existing test failures; root-caused
+  test pollution; added 31 new tests for version collector, migration
+  runner atomicity, and settings validator edge cases.
+- **`SMOKE_FAIL` unbound var** in install scripts.
+- **Integer pixel margins** for neural monitor periphery dots (were
+  rendering blurry on fractional values).
+
+### Known Limitations
+
+- **Phase 6 MVP is bug-fixes-only.** Feature contributions are blocked
+  by the version gate unless `--allow-non-fix` is passed explicitly.
+- **Ego sessions remain inert.** Built but not registered in bootstrap;
+  will be wired when the autonomous proposal pipeline is ready for
+  live use.
+
+---
+
 ## [v3.0a2-hf5] - 2026-04-07
 
 ### Added

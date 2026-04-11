@@ -50,7 +50,7 @@ def _parse(raw: dict) -> InboxConfig:
         timeout_s=int(section.get("timeout_s", 600)),
         max_retries=int(section.get("max_retries", 3)),
         recursive=bool(section.get("recursive", False)),
-        timezone=str(section.get("timezone", os.environ.get("USER_TIMEZONE", "America/New_York"))),
+        timezone=str(section.get("timezone", os.environ.get("USER_TIMEZONE", "UTC"))),
         evaluation_cooldown_seconds=int(
             section.get("evaluation_cooldown_seconds", 3600),
         ),

@@ -125,7 +125,7 @@ class CompactionEngine:
         db: aiosqlite.Connection,
         router: Router,
         window_size: int = DEFAULT_WINDOW_SIZE,
-        call_site_id: str = "8_memory_consolidation",
+        call_site_id: str = "8_ego_compaction",
     ) -> None:
         self._db = db
         self._router = router

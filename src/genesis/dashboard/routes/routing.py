@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 from flask import jsonify, request
 
-from genesis.dashboard._blueprint import blueprint
+from genesis.dashboard._blueprint import _async_route, blueprint
 from genesis.observability._call_site_meta import _CALL_SITE_META
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,8 @@ def routing_config_read():
 
 
 @blueprint.route("/api/genesis/routing/config/<call_site_id>", methods=["PUT"])
-def routing_config_update(call_site_id: str):
+@_async_route
+async def routing_config_update(call_site_id: str):
     """Update a single call site's chain/policy and reload config."""
     from genesis.routing.config import update_call_site_in_yaml
     from genesis.runtime import GenesisRuntime
@@ -95,6 +96,12 @@ def routing_config_update(call_site_id: str):
     never_pays = data.get("never_pays")
     cc_model = data.get("cc_model")  # str or None
     cc_position = data.get("cc_position")  # int or None
+    dispatch = data.get("dispatch")  # 'api' | 'cli' | 'dual' | None
+
+    logger.info(
+        "Routing config save: call_site=%s dispatch=%r cc_model=%r chain=%s",
+        call_site_id, dispatch, cc_model, chain,
+    )
 
     config_path = Path(__file__).parent.parent.parent.parent.parent / "config" / "model_routing.yaml"
     if not config_path.exists():
@@ -104,20 +111,44 @@ def routing_config_update(call_site_id: str):
         new_config = update_call_site_in_yaml(
             config_path, call_site_id,
             chain=chain, default_paid=default_paid, never_pays=never_pays,
-            cc_model=cc_model, cc_position=cc_position,
+            cc_model=cc_model, cc_position=cc_position, dispatch=dispatch,
         )
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
+        logger.error(
+            "Routing config save failed for %s: %s", call_site_id, e, exc_info=True,
+        )
         return jsonify({"error": f"Config update failed: {type(e).__name__}"}), 500
 
     rt.router.reload_config(new_config)
+    orphans_expired = await rt.router.scan_dlq_orphans_after_reload()
 
-    return jsonify({"ok": True, "call_site_id": call_site_id})
+    # F2 post-save observability: surface the new dispatch mode that the
+    # freshly-reloaded config resolved to.  Guards against a silent-loss
+    # class of bugs where the writer succeeded but the reader saw a
+    # different value (regression marker for the 2026-04-08 incident).
+    try:
+        new_cs = getattr(new_config, "call_sites", {}).get(call_site_id)
+        new_dispatch = getattr(new_cs, "dispatch", None) if new_cs else None
+    except Exception:
+        new_dispatch = None
+    logger.info(
+        "Routing config save OK: call_site=%s new dispatch=%r "
+        "(dlq orphans expired: %d)",
+        call_site_id, new_dispatch, orphans_expired,
+    )
+
+    return jsonify({
+        "ok": True,
+        "call_site_id": call_site_id,
+        "dlq_orphans_expired": orphans_expired,
+    })
 
 
 @blueprint.route("/api/genesis/routing/reload", methods=["POST"])
-def routing_config_reload():
+@_async_route
+async def routing_config_reload():
     """Re-read the YAML config from disk and reload the router."""
     from genesis.routing.config import load_config
     from genesis.runtime import GenesisRuntime
@@ -136,4 +167,5 @@ def routing_config_reload():
         return jsonify({"error": f"Config parse failed: {e}"}), 400
 
     rt.router.reload_config(new_config)
-    return jsonify({"ok": True})
+    orphans_expired = await rt.router.scan_dlq_orphans_after_reload()
+    return jsonify({"ok": True, "dlq_orphans_expired": orphans_expired})

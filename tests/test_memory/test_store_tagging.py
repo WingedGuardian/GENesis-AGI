@@ -44,6 +44,7 @@ async def test_store_with_source_pipeline_includes_in_payload(store):
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
         await store.store("test content", "src", source_pipeline="recon")
 
     payload = mock_upsert.call_args.kwargs["payload"]
@@ -57,6 +58,7 @@ async def test_store_without_source_pipeline_omits_from_payload(store):
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
         await store.store("test content", "src")
 
     payload = mock_upsert.call_args.kwargs["payload"]
@@ -71,6 +73,7 @@ async def test_store_source_pipeline_various_values(store):
              patch("genesis.memory.store.memory_crud") as mock_mem:
             mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
             mock_mem.upsert = AsyncMock(return_value="id")
+            mock_mem.create_metadata = AsyncMock(return_value=None)
             await store.store("test content", "src", source_pipeline=pipeline)
 
         payload = mock_upsert.call_args.kwargs["payload"]

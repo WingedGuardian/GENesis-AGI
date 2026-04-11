@@ -54,7 +54,7 @@ def cc_project_dir() -> str:
     """Claude Code project directory name, derived from repo root path.
 
     CC uses the absolute working directory path with / replaced by - as the
-    project identifier.  E.g. ${HOME}/genesis → -home-ubuntu-genesis.
+    project identifier.  E.g. ``/path/to/repo`` → ``-path-to-repo``.
     """
     override = os.environ.get("GENESIS_CC_PROJECT_ID")
     if override:

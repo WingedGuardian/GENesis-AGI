@@ -156,6 +156,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,
     ),
+    "updates": SettingsDomain(
+        name="updates",
+        description="Update checking, notification, and auto-apply settings",
+        config_filename="updates.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
 }
 
 
@@ -359,12 +366,78 @@ def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_updates(changes: dict) -> list[str]:
+    """Validate updates config changes."""
+    errors: list[str] = []
+    valid_top_keys = {"check", "notify", "auto_apply", "backup_before_update"}
+
+    for key in changes:
+        if key not in valid_top_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}")
+
+    if "check" in changes:
+        check = changes["check"]
+        if not isinstance(check, dict):
+            errors.append("check must be a mapping")
+        else:
+            if "enabled" in check and not isinstance(check["enabled"], bool):
+                errors.append("check.enabled must be a boolean")
+            if "interval_hours" in check:
+                try:
+                    val = int(check["interval_hours"])
+                    if val < 1 or val > 168:
+                        errors.append("check.interval_hours must be between 1 and 168")
+                except (TypeError, ValueError):
+                    errors.append("check.interval_hours must be an integer")
+
+    if "notify" in changes:
+        notify = changes["notify"]
+        if not isinstance(notify, dict):
+            errors.append("notify must be a mapping")
+        else:
+            if "enabled" in notify and not isinstance(notify["enabled"], bool):
+                errors.append("notify.enabled must be a boolean")
+            if "channel" in notify and notify["channel"] not in {"telegram"}:
+                errors.append("notify.channel must currently be 'telegram'")
+
+    if "auto_apply" in changes:
+        auto_apply = changes["auto_apply"]
+        if not isinstance(auto_apply, dict):
+            errors.append("auto_apply must be a mapping")
+        else:
+            if "enabled" in auto_apply and not isinstance(auto_apply["enabled"], bool):
+                errors.append("auto_apply.enabled must be a boolean")
+            # Only safe impacts can be auto-applied. action_needed and
+            # breaking ALWAYS require manual approval — enforced here so
+            # the validator matches the config comment, even if a user
+            # tries to override via settings_update.
+            safe_impacts = {"none", "informational"}
+            if "allowed_impacts" in auto_apply:
+                impacts = auto_apply["allowed_impacts"]
+                if not isinstance(impacts, list):
+                    errors.append("auto_apply.allowed_impacts must be a list")
+                else:
+                    for impact in impacts:
+                        if impact not in safe_impacts:
+                            errors.append(
+                                f"auto_apply.allowed_impacts: '{impact}' not allowed for "
+                                f"auto-apply. Only {sorted(safe_impacts)} may be auto-applied; "
+                                "action_needed and breaking always require manual approval."
+                            )
+
+    if "backup_before_update" in changes and not isinstance(changes["backup_before_update"], bool):
+        errors.append("backup_before_update must be a boolean")
+
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,
     "ego": _validate_ego,
     "autonomous_cli_policy": _validate_autonomous_cli_policy,
+    "updates": _validate_updates,
 }
 
 

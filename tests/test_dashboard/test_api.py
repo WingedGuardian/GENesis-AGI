@@ -491,7 +491,12 @@ def test_routing_config_read_includes_call_sites(client):
 
 def test_routing_config_update_endpoint(client):
     """Routing updates persist through the config helper and hot-reload the router."""
+    from unittest.mock import AsyncMock
+
     mock_router = MagicMock()
+    # scan_dlq_orphans_after_reload is awaited by the async route handler;
+    # it must be an AsyncMock returning an int so the `await` resolves.
+    mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
     mock_rt = MagicMock()
     mock_rt.is_bootstrapped = True
     mock_rt.router = mock_router
@@ -512,14 +517,22 @@ def test_routing_config_update_endpoint(client):
         )
 
     assert resp.status_code == 200
-    assert resp.get_json() == {"ok": True, "call_site_id": "2_triage"}
+    assert resp.get_json() == {
+        "ok": True,
+        "call_site_id": "2_triage",
+        "dlq_orphans_expired": 0,
+    }
     update_call_site.assert_called_once()
     mock_router.reload_config.assert_called_once_with(fake_config)
+    mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()
 
 
 def test_routing_config_reload_endpoint(client):
     """Routing reload reads config from disk and hot-reloads the router."""
+    from unittest.mock import AsyncMock
+
     mock_router = MagicMock()
+    mock_router.scan_dlq_orphans_after_reload = AsyncMock(return_value=0)
     mock_rt = MagicMock()
     mock_rt.is_bootstrapped = True
     mock_rt.router = mock_router
@@ -533,6 +546,7 @@ def test_routing_config_reload_endpoint(client):
         resp = client.post("/api/genesis/routing/reload")
 
     assert resp.status_code == 200
-    assert resp.get_json() == {"ok": True}
+    assert resp.get_json() == {"ok": True, "dlq_orphans_expired": 0}
     load_config.assert_called_once()
     mock_router.reload_config.assert_called_once_with(fake_config)
+    mock_router.scan_dlq_orphans_after_reload.assert_awaited_once()

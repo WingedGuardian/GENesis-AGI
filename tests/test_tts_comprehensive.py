@@ -646,5 +646,5 @@ class TestHandlerDictComplete:
         from genesis.channels.telegram.handlers_v2 import make_handlers_v2
 
         h = make_handlers_v2(loop=AsyncMock(), allowed_users=set(), whisper_model="base")
-        expected = {"start", "help", "new", "stop", "model", "effort", "status", "usage", "tts", "pause", "text", "voice", "photo", "document"}
+        expected = {"start", "help", "new", "stop", "model", "effort", "status", "usage", "tts", "pause", "text", "voice", "photo", "document", "callback_query"}
         assert set(h.keys()) == expected

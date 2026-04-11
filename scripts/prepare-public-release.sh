@@ -85,104 +85,52 @@ rm -f "$OUTPUT_DIR"/data/genesis.db
 
 echo "    + User-specific files removed"
 
-# ── 3. Template voice exemplars ──────────────────────────
-echo "  [3/9] Templating voice exemplars..."
+# ── 3. Voice-master sanity check ─────────────────────────
+# User voice data lives in the out-of-repo overlay at
+# ~/.claude/skills/voice-master/. The in-repo voice-master directory MUST
+# contain only generic template machinery — no exemplars, no voice-dimensions.
+# This check asserts the architecture guarantee and fails the release if
+# user data has accidentally landed back in the repo.
+echo "  [3/9] Voice-master sanity check..."
 
-EXEMPLAR_DIR="$OUTPUT_DIR/src/genesis/skills/voice-master/references/exemplars"
+VOICE_DIR="$OUTPUT_DIR/src/genesis/skills/voice-master"
+VOICE_REFS="$VOICE_DIR/references"
+EXEMPLAR_DIR="$VOICE_REFS/exemplars"
 
-for file in social.md professional.md longform.md; do
-    if [ -f "$EXEMPLAR_DIR/$file" ]; then
-        category="${file%.md}"
-        cat > "$EXEMPLAR_DIR/$file" << TEMPLATE
-# ${category^} Exemplars
-
-Each exemplar below was extracted from the user's real writing and curated
-during a calibration session. Use these as stylistic reference — match
-sentence structure, vocabulary level, and directness. Do NOT copy content.
-
-## Exemplar Format
-
-\`\`\`
-### Exemplar [N]: [brief label]
-- **Source:** transcript session [date] / inbox / manual / calibration
-- **Tone:** direct / reflective / persuasive / analytical / casual
-- **Formality:** 1-5 (1=casual, 5=formal)
-- **Topic domain:** [your domain]
-- **Why it's distinctive:** [1 sentence on what makes this "you"]
-
-> [The actual passage, 50-200 words]
-\`\`\`
-
----
-
-*No exemplars yet. Run \`/voice calibrate\` to populate.*
-TEMPLATE
-        echo "    + $file templated"
+# 3a. The in-repo exemplars dir must contain only README.md (no real samples).
+if [ -d "$EXEMPLAR_DIR" ]; then
+    stray=$(find "$EXEMPLAR_DIR" -maxdepth 1 -type f ! -name 'README.md' 2>/dev/null || true)
+    if [ -n "$stray" ]; then
+        echo "    FATAL: in-repo exemplars directory contains non-template files:"
+        echo "$stray" | sed 's|^|      |'
+        echo "    User voice data belongs in \$GENESIS_VOICE_OVERLAY (default"
+        echo "    ~/.claude/skills/voice-master/exemplars/), NOT in the repo."
+        echo "    Move the user data out of the repo and retry."
+        exit 1
     fi
-done
+    echo "    + exemplars dir clean (README.md only)"
+else
+    echo "    FATAL: $EXEMPLAR_DIR is missing — voice-master structure is broken"
+    exit 1
+fi
 
-# Template index
-cat > "$EXEMPLAR_DIR/index.md" << 'INDEX'
-# Voice Exemplar Index
+# 3b. voice-dimensions.md (user-specific) must NOT exist in the repo.
+if [ -f "$VOICE_REFS/voice-dimensions.md" ]; then
+    echo "    FATAL: $VOICE_REFS/voice-dimensions.md exists in the repo."
+    echo "    User voice data belongs in the overlay at"
+    echo "    ~/.claude/skills/voice-master/voice-dimensions.md."
+    echo "    The in-repo version must be voice-dimensions-TEMPLATE.md only."
+    exit 1
+fi
 
-This index lists all curated voice exemplars with metadata for selection.
-When generating content, scan this table to find exemplars whose tone,
-formality, and domain best match the current request, then read the
-appropriate file to get the full exemplar text.
+# 3c. voice-dimensions-TEMPLATE.md must exist (the public fallback).
+if [ ! -f "$VOICE_REFS/voice-dimensions-TEMPLATE.md" ]; then
+    echo "    FATAL: $VOICE_REFS/voice-dimensions-TEMPLATE.md is missing."
+    echo "    Voice-master requires a template fallback for users with no overlay."
+    exit 1
+fi
 
-## Selection Instructions
-
-1. Read the request: what medium, tone, formality level, and topic domain?
-2. Scan the table below for 3-5 best matches
-3. Read the file listed in the "File" column to get the full exemplar text
-4. Use matched exemplars as stylistic reference during generation
-
-## Exemplar Registry
-
-| # | Label | File | Tone | Formality (1-5) | Domain | Why Distinctive |
-|---|-------|------|------|------------------|--------|-----------------|
-
-*No exemplars registered yet. Run `/voice calibrate` or `/voice curate` to populate.*
-INDEX
-echo "    + index.md templated"
-
-# Template voice-dimensions.md to be generic
-cat > "$OUTPUT_DIR/src/genesis/skills/voice-master/references/voice-dimensions.md" << 'VOICEDIM'
-# Voice Dimensions
-
-Supplementary voice rules for edge cases the exemplars don't cover.
-
-**When exemplars conflict with these rules, the exemplars win.** Exemplars are
-the primary source of truth — they show what the user actually sounds like.
-These dimensions are fallback guidance.
-
----
-
-## Tone
-
-<!-- Describe your natural tone. Examples: direct, conversational,
-     technically grounded, formal, casual, etc. -->
-
-## Sentence Structure
-
-<!-- How do you naturally structure sentences? Short and punchy? Long and
-     flowing? Mix of both? Do you use fragments for emphasis? -->
-
-## Vocabulary
-
-<!-- What's your vocabulary register? Industry jargon or plain language?
-     Formal or casual? Any words/phrases you tend to use? -->
-
-## Perspective
-
-<!-- How do you frame ideas? First-person experience? Third-person analysis?
-     Do you take strong positions or acknowledge nuance? -->
-
-## Humor
-
-<!-- What's your humor style? Dry? Self-deprecating? None? -->
-VOICEDIM
-echo "    + voice-dimensions.md templated"
+echo "    + voice-master in-repo structure clean"
 
 # ── 4. Template LinkedIn skill content ───────────────────
 echo "  [4/9] Templating skill-specific content..."
@@ -449,11 +397,29 @@ find "$OUTPUT_DIR" -type f \( -name "*.md" -o -name "*.py" -o -name "*.sh" \) \
     echo "    + $(basename "$f"): install path templated"
 done
 
-# Replace user timezone with UTC default in config and source (not tests/docs)
-find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" "$OUTPUT_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" -o -name "*.example" \) \
+# Replace user timezone with UTC default in config and source.
+# IMPORTANT: -maxdepth here would previously cut recursion into src/genesis/
+# subdirectories (find applies -maxdepth to all starting paths). Drop it so
+# deep matches (e.g. src/genesis/ego/types.py, src/genesis/util/tz.py,
+# src/genesis/inbox/config.py) actually get replaced.
+# Skip tests/, docs/, and the release machinery itself (those files
+# legitimately contain the pattern as string literals in instructions and
+# don't need runtime replacement).
+find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" "$OUTPUT_DIR/scripts" -type f \
+    \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" -o -name "*.example" -o -name "*.sh" \) \
+    -not -path "*/tests/*" -not -path "*/test_*" \
+    -not -name "prepare-public-release.sh" \
+    -not -name "push-public-release.sh" \
+    -not -name "release-script-guarantees.md" \
     -exec grep -l "America/New_York" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|America/New_York|UTC|g' "$f"
-    echo "    + $(basename "$f"): timezone templated"
+    echo "    + ${f#$OUTPUT_DIR/}: timezone templated"
+done
+# Also pick up root-level files at depth 1
+find "$OUTPUT_DIR" -maxdepth 1 -type f \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" -o -name "*.example" \) \
+    -exec grep -l "America/New_York" {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|America/New_York|UTC|g' "$f"
+    echo "    + $(basename "$f"): timezone templated (root)"
 done
 
 # ── 5c. Clean hardware-specific references from reference docs ──
@@ -512,9 +478,58 @@ else
 fi
 
 # ── 8. Portability scan ──────────────────────────────────
+# Verify ripgrep is installed — the scan silently passes if rg is missing,
+# which would be a safety regression. Fail hard instead.
+if ! command -v rg >/dev/null 2>&1; then
+    echo "  [8/9] FATAL: ripgrep (rg) not installed. Cannot run portability scan."
+    exit 1
+fi
+
 echo "  [8/9] Running portability scan..."
+# Exclusion list: files that legitimately contain the patterns being
+# scanned. Three categories:
+#  (a) Scanner / release machinery — contain the patterns as string
+#      literals in scanner code, instructions, or audit docs.
+#  (b) Container install scripts — intentionally reference /home/ubuntu
+#      as container-internal paths (excluded from the ${HOME}/
+#      replacement pass at line 443-452 for the same reason).
+#  (c) User-facing UI text / generic docstrings — IANA timezone lists in
+#      dashboard dropdowns, EST/EDT as docstring examples of tz
+#      abbreviations, etc.
+#
+# ripgrep glob patterns must be basename-style (**/<name>) because
+# --glob paths are matched relative to the matching directory, not the
+# starting search path.
+SCAN_EXCLUDES=(
+    --glob '!**/.git/**'
+    # (a) scanner + release machinery
+    --glob '!**/prepare-public-release.sh'
+    --glob '!**/push-public-release.sh'
+    --glob '!**/public-release.yaml'
+    --glob '!**/release-script-guarantees.md'
+    # Contribution-pipeline sanitizer: its source defines the regex
+    # patterns used to detect machine-specific content in contributor
+    # diffs. The literals appearing here are scanner definitions, not
+    # leaks. Its tests mirror the same literals as fixtures.
+    --glob '!**/src/genesis/contribution/sanitize.py'
+    --glob '!**/tests/test_contribution/test_sanitize.py'
+    # (b) container install scripts — container-internal /home/ubuntu refs
+    --glob '!**/host-setup.sh'
+    --glob '!**/install.sh'
+    --glob '!**/install_guardian.sh'
+    --glob '!**/uninstall.sh'
+    # (c) generic docstrings / UI content
+    --glob '!**/src/genesis/util/tz.py'
+    --glob '!**/src/genesis/observability/service_status.py'
+    --glob '!**/src/genesis/dashboard/templates/genesis_dashboard.html'
+    # (d) vendored third-party code — not user-specific, may contain
+    # false-positive matches (e.g. EDT as an EDIFACT segment type in
+    # Ace editor's mode-edifact.js, not the timezone abbreviation).
+    --glob '!**/vendor/**'
+    --glob '!**/node_modules/**'
+)
 portability_hits=$(
-    rg -n --hidden --glob '!**/.git/**' \
+    rg -n --hidden "${SCAN_EXCLUDES[@]}" \
         -e '${HOME}/genesis' \
         -e '${HOME}/agent-zero' \
         -e '${HOME}/\.' \
@@ -522,9 +537,13 @@ portability_hits=$(
         -e '10\.176\.34\.199' \
         -e '10\.176\.34\.206' \
         -e '192\.168\.50\.' \
-        -e 'YOUR_GITHUB_USER' \
+        -e '\bYOUR_GITHUB_USER/(Genesis|genesis-backups)\b' \
         -e 'America/New_York' \
-        "$OUTPUT_DIR/src" "$OUTPUT_DIR/config" "$OUTPUT_DIR/scripts" \
+        -e '\b(EST|EDT)\b' \
+        -e '5070ti' \
+        -e 'fd42:e3ba' \
+        -e 'fd4d:77b8' \
+        "$OUTPUT_DIR/src" "$OUTPUT_DIR/config" "$OUTPUT_DIR/scripts" "$OUTPUT_DIR/.github" \
         $([ -f "$OUTPUT_DIR/env.example" ] && echo "$OUTPUT_DIR/env.example") \
         2>/dev/null || true
 )
@@ -532,12 +551,110 @@ if [ -n "$portability_hits" ]; then
     echo "    ! portability scan found machine-specific references:"
     echo "$portability_hits" | sed -n '1,40p'
     echo "    BLOCKING: remove or parameterize these before publishing."
+    exit 1
 else
     echo "    + portability scan: CLEAN"
 fi
 
-# ── 8b. CHANGELOG check ──────────────────────────────────
-echo "  [8b/9] Checking CHANGELOG..."
+# ── 8b. Fingerprint scan (belt-and-suspenders) ───────────
+# Loads user-defined fingerprint patterns from ~/.genesis/release-fingerprints.txt
+# (one pattern per line, blank lines and lines starting with # are ignored).
+# This catches persona names, personal handles, and any other user-defined
+# strings that should never appear in the public release.
+#
+# The fingerprint file lives OUTSIDE the repo on purpose: the whole point is
+# to scan FOR these strings, so they cannot themselves live in the tree being
+# scanned. Keep the file at ~/.genesis/release-fingerprints.txt (not backed
+# up by genesis-backups).
+#
+# A minimal generic scan also runs: personal-email-domain regex with an
+# allowlist for known-safe addresses (noreply, backup@genesis.local, etc.).
+echo "  [8b/9] Running fingerprint scan..."
+
+FINGERPRINT_FILE="${GENESIS_RELEASE_FINGERPRINTS:-$HOME/.genesis/release-fingerprints.txt}"
+fingerprint_hits=""
+
+# Fingerprint scan exclusions: extends the portability SCAN_EXCLUDES with
+# additional paths that legitimately contain email-shaped strings that are
+# not user identifiers:
+#  - tests/ use fake email fixtures (a@b.com, c@d.com) for mail handling
+#  - docs/reference/readme-legacy.md has placeholder examples like
+#    my-nanobot@gmail.com (should eventually be rewritten to use
+#    @example.com per RFC 2606, but not in this pass).
+FINGERPRINT_EXCLUDES=(
+    "${SCAN_EXCLUDES[@]}"
+    --glob '!**/tests/**'
+    --glob '!**/readme-legacy.md'
+)
+
+# User-defined fingerprints (exclusions mirror the portability scan)
+if [ -f "$FINGERPRINT_FILE" ]; then
+    fp_patterns=()
+    while IFS= read -r line; do
+        # Skip blank lines and comments
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        fp_patterns+=(-e "$line")
+    done < "$FINGERPRINT_FILE"
+
+    if [ ${#fp_patterns[@]} -gt 0 ]; then
+        fingerprint_hits=$(
+            rg -n --hidden "${FINGERPRINT_EXCLUDES[@]}" \
+                "${fp_patterns[@]}" \
+                "$OUTPUT_DIR" 2>/dev/null || true
+        )
+        # Each pattern produces 2 array entries (-e + value), so divide by 2 for the user-visible count.
+        pattern_count=$(( ${#fp_patterns[@]} / 2 ))
+        echo "    + loaded ${pattern_count} user-defined fingerprint pattern(s) from $FINGERPRINT_FILE"
+    fi
+else
+    echo "    . no user fingerprint file at $FINGERPRINT_FILE (optional)"
+fi
+
+# Generic email scan (allowlist model, not denylist).
+# Scan for any email address, then filter out known-safe patterns.
+# The allowlist approach catches personal emails across all providers, not
+# just the popular few (gmail/yahoo/etc.) — missing a provider in a denylist
+# creates a false-negative leak path; adding an entry to an allowlist only
+# creates a false-positive we can see and fix.
+#
+# Allowlist patterns must be ANCHORED so substring matches don't leak past:
+# - "noreply@" alone would allow "evil-noreply@gmail.com". Use "^[^@]*noreply@"
+#   (start of local-part or word boundary) or specific full addresses.
+email_regex='[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+generic_email_hits=$(
+    rg -n --hidden "${FINGERPRINT_EXCLUDES[@]}" \
+        -e "$email_regex" \
+        "$OUTPUT_DIR" 2>/dev/null | \
+    grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
+    grep -vE '(^|[^a-zA-Z0-9._+-])backup@genesis\.local\b' | \
+    grep -vE '(^|[^a-zA-Z0-9._+-])feedback@anthropic\.com\b' | \
+    grep -vE '(^|[^a-zA-Z0-9._+-])pr-bot@' | \
+    grep -vE '(^|[^a-zA-Z0-9._+-])support@anthropic\.com\b' | \
+    grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
+    grep -vE '@claude\.com\b' | \
+    grep -vE '@(github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
+    grep -vE 'user@[0-9]+\.service' | \
+    grep -vE '@[0-9]+\.service\b' \
+        || true
+)
+
+if [ -n "$fingerprint_hits" ] || [ -n "$generic_email_hits" ]; then
+    echo "    ! fingerprint scan found matches:"
+    [ -n "$fingerprint_hits" ] && echo "$fingerprint_hits" | sed -n '1,20p'
+    [ -n "$generic_email_hits" ] && {
+        echo "    (personal email domains)"
+        echo "$generic_email_hits" | sed -n '1,10p'
+    }
+    echo "    BLOCKING: these strings must not appear in the public release."
+    echo "    Either remove them from the source or add an exception to the"
+    echo "    allowlist in scripts/prepare-public-release.sh."
+    exit 1
+else
+    echo "    + fingerprint scan: CLEAN"
+fi
+
+# ── 8c. CHANGELOG check ──────────────────────────────────
+echo "  [8c/9] Checking CHANGELOG..."
 if [[ ! -f "$OUTPUT_DIR/CHANGELOG.md" ]]; then
     echo "    ! CHANGELOG.md missing from staging."
     echo "      Create it and commit before tagging a release."
@@ -576,7 +693,9 @@ echo "  Files: $file_count  Directories: $dir_count  Size: $size"
 echo ""
 echo "  Manual verification:"
 echo "    1. grep -r '10.176.34\|192.168.50\|YOUR_GITHUB_USER\|5070ti\|nanobot' $OUTPUT_DIR"
-echo "    2. Check exemplar files are empty templates"
-echo "    3. Check no product track plans remain"
-echo "    4. Verify docs/history/ and docs/superpowers/ are absent"
+echo "    2. Check voice-master/references/exemplars/ contains only README.md"
+echo "    3. Check voice-master/references/voice-dimensions-TEMPLATE.md is the only voice-dimensions file"
+echo "    4. Check no product track plans remain"
+echo "    5. Verify docs/history/, docs/superpowers/, docs/gtm/ are absent"
+echo "    6. Fingerprint file: \$GENESIS_RELEASE_FINGERPRINTS (default ~/.genesis/release-fingerprints.txt)"
 echo ""
