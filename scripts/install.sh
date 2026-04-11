@@ -1211,7 +1211,7 @@ if [ -z "$GENESIS_TIMEZONE" ]; then
     CURRENT_TZ=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
     if should_prompt; then
         echo "    Current timezone: $CURRENT_TZ"
-        read -rp "    Enter timezone (e.g. UTC) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
+        read -rp "    Enter timezone (e.g. America/New_York) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
         GENESIS_TIMEZONE="${INPUT_TZ:-$CURRENT_TZ}"
     else
         GENESIS_TIMEZONE="$CURRENT_TZ"

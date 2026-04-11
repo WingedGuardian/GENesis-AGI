@@ -7,6 +7,56 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a3-hf1] - 2026-04-11
+
+Hotfix immediately after v3.0a3 to restore Phase 6 functionality in the
+public release and clear a caplog-flakiness regression. Also rides along
+a small community security fix.
+
+### Fixed
+
+- **Release-pipeline templating was too broad.** `prepare-public-release.sh`'s
+  step 5b passes (`find + grep + sed -i`) rewrote the contribution
+  sanitizer's own regex patterns, the `tz.py` default timezone, and a
+  couple of test fixtures that legitimately hold these literals as data.
+  In the v3.0a3 public release this shipped a broken Phase 6 sanitizer —
+  patterns like `${HOME}/genesis` didn't parse as intended, `\bUTC\b` was
+  flagging the opposite of user-specific timezones, and the `tz.py` default
+  `_DEFAULT_TZ` was clobbered. Added inline `-not -path` exclusions to
+  every 5b templating pass for `src/genesis/contribution/sanitize.py`,
+  `tests/test_contribution/test_sanitize.py`, `src/genesis/util/tz.py`,
+  `tests/test_util/test_tz.py`, `tests/test_autonomy/test_protection.py`,
+  `tests/test_hooks/test_inline_hooks.py`, and `tests/conftest.py`.
+  Restores Phase 6 sanitizer correctness and clears 11 public CI failures.
+- **Flaky `caplog` assertion in `test_dispatch_unknown_falls_back_to_dual`.**
+  Commit `0ad9567` had previously removed the exact same assertion
+  because caplog's logger-name filter interacts with other tests' logger
+  configuration under the full suite; commit `3bbae15` re-introduced it
+  in the F1 dispatch routing wiring. Dropped the log-message sniff again;
+  kept the behavioural fallback assertion.
+- **Telegram adapter refuses to start with empty / invalid
+  `TELEGRAM_ALLOWED_USERS`.** Cherry-picked from community PR
+  `WingedGuardian/GENesis-AGI#29`. Previously the bot would start silently
+  and allow messages from **all** users when `allowed_users` was empty or
+  contained only invalid UIDs (e.g. someone pasting a bot token into the
+  wrong field). Dashboard `PUT /api/genesis/secrets` now rejects values
+  containing `:` (looks like a bot token) or non-numeric IDs with a clear
+  error pointing to `@userinfobot`. `secrets.env.example` documents the
+  expected format for each Telegram field.
+
+### Known Issues (tracked as follow-ups, not blocking this hotfix)
+
+- `tests/test_runtime/test_runtime_retriever.py::test_retriever_created_after_bootstrap`
+  fails only in GH Actions CI (passes locally on 2026-04-11) — suspected
+  test isolation / mock state pollution under the full suite. Filed as a
+  follow-up investigation; does not affect runtime behaviour.
+- `tests/test_qdrant/test_collections.py` has no `skipif` fixture and
+  errors (not fails) when Qdrant isn't running on `localhost:6333`.
+  Separate hotfix will add a module-level fixture that pings the port and
+  skips the suite with a clear message on `ConnectionError`.
+
+---
+
 ## [v3.0a3] - 2026-04-11
 
 Large release. Major new features: **community contribution pipeline**

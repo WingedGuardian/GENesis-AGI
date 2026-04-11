@@ -137,7 +137,7 @@ def test_portability_ip_blocks():
     diff = (
         "diff --git a/config.py b/config.py\n"
         "--- a/config.py\n+++ b/config.py\n@@ -1 +1 @@\n"
-        "+OLLAMA_URL = 'http://${OLLAMA_URL:-localhost:11434}'\n"
+        "+OLLAMA_URL = 'http://10.176.34.199:11434'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -148,7 +148,7 @@ def test_portability_home_path_blocks():
     diff = (
         "diff --git a/x.py b/x.py\n"
         "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n"
-        "+path = '${HOME}/genesis/data/genesis.db'\n"
+        "+path = '/home/ubuntu/genesis/data/genesis.db'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -240,7 +240,7 @@ def test_multi_file_diff_all_scanned():
     diff = (
         "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n+ok_line\n"
         "diff --git a/b.py b/b.py\n--- a/b.py\n+++ b/b.py\n@@ -1 +1 @@\n"
-        "+IP = '${OLLAMA_HOST:-localhost}'\n"
+        "+IP = '10.176.34.199'\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -251,7 +251,7 @@ def test_multi_file_diff_all_scanned():
 def test_wingedguardian_blocks():
     diff = (
         "diff --git a/x.md b/x.md\n"
-        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see YOUR_GITHUB_USER/Genesis for more\n"
+        "--- a/x.md\n+++ b/x.md\n@@ -1 +1 @@\n+see WingedGuardian/Genesis for more\n"
     )
     r = sanitize.scan_diff(diff)
     assert r.ok is False
@@ -300,7 +300,7 @@ def test_parse_diff_dev_null_target():
 def test_findings_include_severity():
     diff = (
         "diff --git a/x.py b/x.py\n"
-        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=${OLLAMA_HOST:-localhost}\n"
+        "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+ip=10.176.34.199\n"
     )
     r = sanitize.scan_diff(diff)
     assert all(f.severity == Severity.BLOCK for f in r.blocking())

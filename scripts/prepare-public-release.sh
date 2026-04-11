@@ -179,7 +179,7 @@ fi
 
 # inbox_monitor.yaml — replace hardcoded path
 if [ -f "$OUTPUT_DIR/config/inbox_monitor.yaml" ]; then
-    sed -i 's|${HOME}/inbox|${GENESIS_INBOX_PATH:-~/inbox}|g' \
+    sed -i 's|/home/ubuntu/inbox|${GENESIS_INBOX_PATH:-~/inbox}|g' \
         "$OUTPUT_DIR/config/inbox_monitor.yaml"
     echo "    + inbox_monitor.yaml templated"
 fi
@@ -326,8 +326,48 @@ echo "    + USER_KNOWLEDGE.md templated"
 # ── 5b. Broad IP/username replacement across all files ────
 echo "  [5b/9] Replacing hardcoded IPs and usernames globally..."
 
+# Files that legitimately contain these literal patterns as DATA, not as
+# user-config leakage. Templating them mangles the sanitizer's own regex
+# patterns, the tz.py default timezone constant, and test fixtures that
+# assert on these exact strings. Mirrors the SCAN_EXCLUDES list below but
+# uses find-compatible `-path` syntax.
+#
+# Category:
+#   (a) Contribution sanitizer — its source defines the patterns used to
+#       detect machine-specific content in contributor diffs. Templating
+#       would convert regexes like `/home/ubuntu/genesis` into broken
+#       `${HOME}/genesis` (where $ is a regex anchor).
+#   (b) Test fixtures + conftest — assert on literal paths/IPs/timezones
+#       as part of what they're testing.
+#   (c) Timezone util — `_DEFAULT_TZ = "America/New_York"` is the
+#       module's default, not a user config leak.
+#   (d) Install / setup scripts — already handled by the existing
+#       `-not -name` clauses on the /home/ubuntu pass. Included here for
+#       symmetry so every pass shares the same exclusion set.
+TEMPLATE_EXCLUDES=(
+    # (a) contribution sanitizer
+    -not -path "*/src/genesis/contribution/sanitize.py"
+    -not -path "*/tests/test_contribution/test_sanitize.py"
+    # (b) test fixtures + conftest
+    -not -path "*/tests/test_autonomy/test_protection.py"
+    -not -path "*/tests/test_hooks/test_inline_hooks.py"
+    -not -path "*/tests/conftest.py"
+    # (c) tz util + its tests
+    -not -path "*/src/genesis/util/tz.py"
+    -not -path "*/tests/test_util/test_tz.py"
+    # (d) install/setup scripts (mirror the /home/ubuntu pass)
+    -not -name "host-setup.sh"
+    -not -name "install_guardian.sh"
+    -not -name "install.sh"
+    -not -name "uninstall.sh"
+    # Release machinery — defined in SCAN_EXCLUDES too
+    -not -name "prepare-public-release.sh"
+    -not -name "push-public-release.sh"
+    -not -name "release-script-guarantees.md"
+)
+
 # Replace Ollama IP in all files
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
     -exec grep -l "10\.176\.34\.199" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|10\.176\.34\.199:11434|${OLLAMA_URL:-localhost:11434}|g' "$f"
     sed -i 's|10\.176\.34\.199|${OLLAMA_HOST:-localhost}|g' "$f"
@@ -335,7 +375,7 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o
 done
 
 # Replace LM Studio IP
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" \) \
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" \) \
     -exec grep -l "192\.168\.50\.100" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|192\.168\.50\.100:1234|${LM_STUDIO_HOST:-localhost:1234}|g' "$f"
     sed -i 's|192\.168\.50\.100|${LM_STUDIO_HOST:-localhost}|g' "$f"
@@ -343,15 +383,15 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o
 done
 
 # Replace VM IP
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
     -exec grep -l "192\.168\.50\.77" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|192\.168\.50\.77|${VM_HOST:-localhost}|g' "$f"
     echo "    + $(basename "$f"): VM IP templated"
 done
 
-# Replace YOUR_GITHUB_USER in scripts and docs (not already handled by CLAUDE.md step)
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.sh" -o -name "*.md" -o -name "*.service" \) \
-    -exec grep -l "YOUR_GITHUB_USER" {} \; 2>/dev/null | while IFS= read -r f; do
+# Replace WingedGuardian in scripts and docs (not already handled by CLAUDE.md step)
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.sh" -o -name "*.md" -o -name "*.service" \) \
+    -exec grep -l "WingedGuardian" {} \; 2>/dev/null | while IFS= read -r f; do
     # Replace private repo references but preserve the public repo name.
     # WingedGuardian/GENesis-AGI is the public repo itself — keep that as-is.
     sed -i '/GENesis-AGI/!s|WingedGuardian|YOUR_GITHUB_USER|g' "$f"
@@ -359,58 +399,52 @@ find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.sh" -o -name "*.md" -o -n
 done
 
 # Replace container IP
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" \) \
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" \) \
     -exec grep -l "10\.176\.34\.206" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|10\.176\.34\.206|${CONTAINER_IP:-localhost}|g' "$f"
     echo "    + $(basename "$f"): Container IP templated"
 done
 
 # Scrub known IPv6 ULA addresses (container + host)
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
-    -exec grep -l '${CONTAINER_IPV6:-not configured}' {} \; 2>/dev/null | while IFS= read -r f; do
-    sed -i 's|${CONTAINER_IPV6:-not configured}|${CONTAINER_IPV6:-not configured}|g' "$f"
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+    -exec grep -l 'fd42:e3ba:1142:18bb:216:3eff:fe93:5e04' {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|fd42:e3ba:1142:18bb:216:3eff:fe93:5e04|${CONTAINER_IPV6:-not configured}|g' "$f"
     echo "    + $(basename "$f"): Container IPv6 templated"
 done
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
-    -exec grep -l '${HOST_IPV6:-not configured}' {} \; 2>/dev/null | while IFS= read -r f; do
-    sed -i 's|${HOST_IPV6:-not configured}|${HOST_IPV6:-not configured}|g' "$f"
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+    -exec grep -l 'fd4d:77b8:b157:7fdf:be24:11ff:feab:89f5' {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|fd4d:77b8:b157:7fdf:be24:11ff:feab:89f5|${HOST_IPV6:-not configured}|g' "$f"
     echo "    + $(basename "$f"): Host IPv6 templated"
 done
 
 # Catch-all: any remaining 192.168.50.x private subnet references
-find "$OUTPUT_DIR" -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" -o -name "*.md" -o -name "*.sh" \) \
     -exec grep -l '192\.168\.50\.' {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|192\.168\.50\.[0-9]\+:[0-9]\+|${LOCAL_HOST:-localhost:8080}|g' "$f"
     sed -i 's|192\.168\.50\.[0-9]\+|${LOCAL_HOST:-localhost}|g' "$f"
     echo "    + $(basename "$f"): remaining private subnet IPs templated"
 done
 
-# Replace hardcoded ${HOME}/ install path in docs and source
-# EXCLUDE host-setup.sh, install_guardian.sh, install.sh — these reference
-# the container's internal /home/ubuntu path, not the host user's home.
-find "$OUTPUT_DIR" -type f \( -name "*.md" -o -name "*.py" -o -name "*.sh" \) \
-    -not -name "host-setup.sh" \
-    -not -name "install_guardian.sh" \
-    -not -name "install.sh" \
-    -exec grep -l "${HOME}/" {} \; 2>/dev/null | while IFS= read -r f; do
-    sed -i 's|${HOME}/|${HOME}/|g' "$f"
+# Replace hardcoded /home/ubuntu/ install path in docs and source
+# TEMPLATE_EXCLUDES already covers host-setup.sh, install_guardian.sh,
+# install.sh, uninstall.sh — these reference the container's internal
+# /home/ubuntu path, not the host user's home.
+find "$OUTPUT_DIR" -type f "${TEMPLATE_EXCLUDES[@]}" \( -name "*.md" -o -name "*.py" -o -name "*.sh" \) \
+    -exec grep -l "/home/ubuntu/" {} \; 2>/dev/null | while IFS= read -r f; do
+    sed -i 's|/home/ubuntu/|${HOME}/|g' "$f"
     echo "    + $(basename "$f"): install path templated"
 done
 
 # Replace user timezone with UTC default in config and source.
 # IMPORTANT: -maxdepth here would previously cut recursion into src/genesis/
 # subdirectories (find applies -maxdepth to all starting paths). Drop it so
-# deep matches (e.g. src/genesis/ego/types.py, src/genesis/util/tz.py,
-# src/genesis/inbox/config.py) actually get replaced.
-# Skip tests/, docs/, and the release machinery itself (those files
-# legitimately contain the pattern as string literals in instructions and
-# don't need runtime replacement).
-find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" "$OUTPUT_DIR/scripts" -type f \
+# deep matches (e.g. src/genesis/ego/types.py, src/genesis/inbox/config.py)
+# actually get replaced. TEMPLATE_EXCLUDES now protects util/tz.py from
+# being templated — its `_DEFAULT_TZ = "America/New_York"` constant is a
+# module default, not a user config leak.
+find "$OUTPUT_DIR/config" "$OUTPUT_DIR/src" "$OUTPUT_DIR/scripts" -type f "${TEMPLATE_EXCLUDES[@]}" \
     \( -name "*.yaml" -o -name "*.yml" -o -name "*.py" -o -name "*.example" -o -name "*.sh" \) \
     -not -path "*/tests/*" -not -path "*/test_*" \
-    -not -name "prepare-public-release.sh" \
-    -not -name "push-public-release.sh" \
-    -not -name "release-script-guarantees.md" \
     -exec grep -l "America/New_York" {} \; 2>/dev/null | while IFS= read -r f; do
     sed -i 's|America/New_York|UTC|g' "$f"
     echo "    + ${f#$OUTPUT_DIR/}: timezone templated"
@@ -491,7 +525,7 @@ echo "  [8/9] Running portability scan..."
 #  (a) Scanner / release machinery — contain the patterns as string
 #      literals in scanner code, instructions, or audit docs.
 #  (b) Container install scripts — intentionally reference /home/ubuntu
-#      as container-internal paths (excluded from the ${HOME}/
+#      as container-internal paths (excluded from the /home/ubuntu/
 #      replacement pass at line 443-452 for the same reason).
 #  (c) User-facing UI text / generic docstrings — IANA timezone lists in
 #      dashboard dropdowns, EST/EDT as docstring examples of tz
@@ -530,14 +564,14 @@ SCAN_EXCLUDES=(
 )
 portability_hits=$(
     rg -n --hidden "${SCAN_EXCLUDES[@]}" \
-        -e '${HOME}/genesis' \
-        -e '${HOME}/agent-zero' \
-        -e '${HOME}/\.' \
+        -e '/home/ubuntu/genesis' \
+        -e '/home/ubuntu/agent-zero' \
+        -e '/home/ubuntu/\.' \
         -e '-home-ubuntu-genesis' \
         -e '10\.176\.34\.199' \
         -e '10\.176\.34\.206' \
         -e '192\.168\.50\.' \
-        -e '\bYOUR_GITHUB_USER/(Genesis|genesis-backups)\b' \
+        -e '\bWingedGuardian/(Genesis|genesis-backups)\b' \
         -e 'America/New_York' \
         -e '\b(EST|EDT)\b' \
         -e '5070ti' \
@@ -692,7 +726,7 @@ echo "  Source: $source_commit"
 echo "  Files: $file_count  Directories: $dir_count  Size: $size"
 echo ""
 echo "  Manual verification:"
-echo "    1. grep -r '10.176.34\|192.168.50\|YOUR_GITHUB_USER\|5070ti\|nanobot' $OUTPUT_DIR"
+echo "    1. grep -r '10.176.34\|192.168.50\|WingedGuardian\|5070ti\|nanobot' $OUTPUT_DIR"
 echo "    2. Check voice-master/references/exemplars/ contains only README.md"
 echo "    3. Check voice-master/references/voice-dimensions-TEMPLATE.md is the only voice-dimensions file"
 echo "    4. Check no product track plans remain"
