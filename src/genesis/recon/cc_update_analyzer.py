@@ -376,7 +376,11 @@ class CCUpdateAnalyzer:
 
             from genesis.db.crud import knowledge as knowledge_crud
 
-            await knowledge_crud.insert(
+            # Use upsert so re-analysis of the same CC release version
+            # replaces the stale row instead of failing on the
+            # UNIQUE(project_type, domain, concept) constraint.  The concept
+            # is derived from summary[:200] which is stable per-version.
+            _uid, inserted = await knowledge_crud.upsert(
                 self._db,
                 project_type="genesis-infra",
                 domain="claude-code",
@@ -390,7 +394,10 @@ class CCUpdateAnalyzer:
                     self._memory_store._embeddings, "model_name", None,
                 ),
             )
-            logger.info("CC update %s ingested to knowledge base", new_version)
+            logger.info(
+                "CC update %s %s knowledge base",
+                new_version, "ingested to" if inserted else "refreshed in",
+            )
         except Exception:
             logger.warning(
                 "Failed to ingest CC update %s to knowledge base",

@@ -174,6 +174,127 @@ async def test_delete_nonexistent(db):
     assert not await knowledge.delete(db, "nonexistent")
 
 
+# ─── knowledge.find_by_unique_key ────────────────────────────────────────────
+
+
+async def test_find_by_unique_key_hit(db):
+    uid = await knowledge.insert(
+        db, project_type="reference", domain="reference.credentials",
+        source_doc="manual", concept="ScarletAndRage login",
+        body="forum creds",
+    )
+    row = await knowledge.find_by_unique_key(
+        db, project_type="reference", domain="reference.credentials",
+        concept="ScarletAndRage login",
+    )
+    assert row is not None
+    assert row["id"] == uid
+    assert row["body"] == "forum creds"
+
+
+async def test_find_by_unique_key_miss(db):
+    row = await knowledge.find_by_unique_key(
+        db, project_type="reference", domain="reference.credentials",
+        concept="nonexistent",
+    )
+    assert row is None
+
+
+# ─── knowledge.upsert ────────────────────────────────────────────────────────
+
+
+async def test_upsert_insert_path(db):
+    uid, inserted = await knowledge.upsert(
+        db, project_type="reference", domain="reference.urls",
+        source_doc="session-a", concept="ScarletAndRage forum",
+        body="https://forum.thescarletandrage.com — Ohio State fan forum",
+    )
+    assert inserted is True
+    assert uid
+    row = await knowledge.get(db, uid)
+    assert row is not None
+    assert row["body"] == "https://forum.thescarletandrage.com — Ohio State fan forum"
+
+
+async def test_upsert_update_path_preserves_id(db):
+    uid_a, inserted_a = await knowledge.upsert(
+        db, project_type="reference", domain="reference.network",
+        source_doc="session-a", concept="Container IP",
+        body="10.176.34.206",
+    )
+    assert inserted_a is True
+
+    # Re-upsert with same unique key but updated body
+    uid_b, inserted_b = await knowledge.upsert(
+        db, project_type="reference", domain="reference.network",
+        source_doc="session-b", concept="Container IP",
+        body="10.176.34.206 (Incus container running Genesis runtime)",
+    )
+    assert inserted_b is False
+    assert uid_b == uid_a  # stable id on conflict
+
+    row = await knowledge.get(db, uid_b)
+    assert row["body"] == "10.176.34.206 (Incus container running Genesis runtime)"
+    assert row["source_doc"] == "session-b"
+
+
+async def test_upsert_update_path_preserves_retrieved_count(db):
+    uid, _ = await knowledge.upsert(
+        db, project_type="reference", domain="reference.facts",
+        source_doc="m1", concept="fact A", body="body v1",
+    )
+    # Manually bump retrieved_count to simulate retrieval activity
+    await db.execute(
+        "UPDATE knowledge_units SET retrieved_count = 5 WHERE id = ?",
+        (uid,),
+    )
+    await db.commit()
+
+    await knowledge.upsert(
+        db, project_type="reference", domain="reference.facts",
+        source_doc="m1", concept="fact A", body="body v2",
+    )
+    row = await knowledge.get(db, uid)
+    assert row["retrieved_count"] == 5  # not reset on update
+    assert row["body"] == "body v2"
+
+
+async def test_upsert_fts_shadow_row_updated(db):
+    uid, _ = await knowledge.upsert(
+        db, project_type="reference", domain="reference.urls",
+        source_doc="m1", concept="test url",
+        body="first body text for full-text search",
+    )
+    results_before = await knowledge.search_fts(db, "first body")
+    assert any(r["unit_id"] == uid for r in results_before)
+
+    await knowledge.upsert(
+        db, project_type="reference", domain="reference.urls",
+        source_doc="m1", concept="test url",
+        body="replacement body content indexed fresh",
+    )
+    results_old = await knowledge.search_fts(db, "first body")
+    # Old content no longer indexed
+    assert not any(r["unit_id"] == uid for r in results_old)
+    results_new = await knowledge.search_fts(db, "replacement body")
+    assert any(r["unit_id"] == uid for r in results_new)
+
+
+async def test_upsert_unique_constraint_on_insert(db):
+    """Direct insert() should fail if a row already exists with the same unique key."""
+    import aiosqlite
+
+    await knowledge.insert(
+        db, project_type="reference", domain="reference.urls",
+        source_doc="m1", concept="already exists", body="first",
+    )
+    with pytest.raises(aiosqlite.IntegrityError):
+        await knowledge.insert(
+            db, project_type="reference", domain="reference.urls",
+            source_doc="m2", concept="already exists", body="second",
+        )
+
+
 # ─── evolution_proposals ─────────────────────────────────────────────────────
 
 

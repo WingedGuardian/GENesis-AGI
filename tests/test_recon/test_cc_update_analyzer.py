@@ -18,33 +18,16 @@ from genesis.recon.cc_update_analyzer import (
 
 @pytest.fixture()
 async def db():
-    """In-memory SQLite with observations and knowledge tables."""
+    """In-memory SQLite with the full production schema.
+
+    Uses ``create_all_tables`` instead of a hand-rolled subset so that schema
+    migrations (e.g. the UNIQUE constraint on knowledge_units that powers the
+    reference store upsert path) automatically flow into this fixture.
+    """
+    from genesis.db.schema import create_all_tables
+
     async with aiosqlite.connect(":memory:") as conn:
-        await conn.execute(
-            "CREATE TABLE observations ("
-            "  id TEXT PRIMARY KEY,"
-            "  source TEXT, type TEXT, category TEXT,"
-            "  content TEXT, priority TEXT, created_at TEXT,"
-            "  resolved_at TEXT, resolution_notes TEXT,"
-            "  content_hash TEXT"
-            ")"
-        )
-        await conn.execute(
-            "CREATE TABLE knowledge_units ("
-            "  id TEXT PRIMARY KEY,"
-            "  project_type TEXT, domain TEXT, source_doc TEXT,"
-            "  source_platform TEXT, section_title TEXT,"
-            "  concept TEXT, body TEXT, relationships TEXT,"
-            "  caveats TEXT, tags TEXT, confidence REAL,"
-            "  source_date TEXT, ingested_at TEXT,"
-            "  qdrant_id TEXT, embedding_model TEXT"
-            ")"
-        )
-        await conn.execute(
-            "CREATE VIRTUAL TABLE knowledge_fts USING fts5("
-            "  unit_id, concept, body, tags, domain, project_type"
-            ")"
-        )
+        await create_all_tables(conn)
         await conn.commit()
         yield conn
 

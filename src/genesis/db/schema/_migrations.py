@@ -486,6 +486,64 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE session_bookmarks ADD COLUMN source TEXT NOT NULL DEFAULT 'auto'",
         "session_bookmarks.source")
 
+    # Reference store: add UNIQUE(project_type, domain, concept) to knowledge_units.
+    # SQLite cannot ALTER constraints, so rebuild the table.  Idempotent via
+    # sql-text check for the UNIQUE fragment.  Pre-existing rows with duplicate
+    # (project_type, domain, concept) are deduplicated via INSERT OR IGNORE —
+    # the first row wins.
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='knowledge_units'"
+        )
+        row = await cursor.fetchone()
+        if row and "UNIQUE(project_type, domain, concept)" not in (row[0] or ""):
+            await db.execute("""
+                CREATE TABLE knowledge_units_new (
+                    id               TEXT PRIMARY KEY,
+                    project_type     TEXT NOT NULL,
+                    domain           TEXT NOT NULL,
+                    source_doc       TEXT NOT NULL,
+                    source_platform  TEXT,
+                    section_title    TEXT,
+                    concept          TEXT NOT NULL,
+                    body             TEXT NOT NULL,
+                    relationships    TEXT,
+                    caveats          TEXT,
+                    tags             TEXT,
+                    confidence       REAL DEFAULT 0.85,
+                    source_date      TEXT,
+                    ingested_at      TEXT NOT NULL,
+                    qdrant_id        TEXT,
+                    embedding_model  TEXT,
+                    retrieved_count  INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(project_type, domain, concept)
+                )
+            """)
+            await db.execute("""
+                INSERT OR IGNORE INTO knowledge_units_new
+                    (id, project_type, domain, source_doc, source_platform,
+                     section_title, concept, body, relationships, caveats, tags,
+                     confidence, source_date, ingested_at, qdrant_id,
+                     embedding_model, retrieved_count)
+                SELECT id, project_type, domain, source_doc, source_platform,
+                       section_title, concept, body, relationships, caveats, tags,
+                       confidence, source_date, ingested_at, qdrant_id,
+                       embedding_model, retrieved_count
+                FROM knowledge_units
+            """)
+            await db.execute("DROP TABLE knowledge_units")
+            await db.execute(
+                "ALTER TABLE knowledge_units_new RENAME TO knowledge_units"
+            )
+            await db.commit()
+            logger.info(
+                "knowledge_units table rebuilt with UNIQUE(project_type, domain, concept)"
+            )
+    except Exception:
+        logger.error(
+            "knowledge_units UNIQUE constraint migration failed", exc_info=True
+        )
+
     # Memory retrieval fix: add tags column to memory_fts (matches knowledge_fts).
     # FTS5 virtual tables can't be ALTERed — must rebuild via CREATE/COPY/DROP/RENAME.
     try:

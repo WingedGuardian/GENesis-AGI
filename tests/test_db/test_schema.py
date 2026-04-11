@@ -47,6 +47,7 @@ EXPECTED_TABLES = [
     "pending_outreach",
     "task_steps",
     "memory_metadata",
+    "credential_access_log",
 ]
 
 
