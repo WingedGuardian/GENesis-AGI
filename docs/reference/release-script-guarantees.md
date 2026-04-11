@@ -70,17 +70,17 @@ placeholders throughout `src/`, `config/`, `scripts/`, `docs/`, root files:
 
 | Pattern | Replaced with |
 |---|---|
-| `${OLLAMA_HOST:-localhost}` | `${OLLAMA_URL:-http://localhost:11434}` or `${OLLAMA_HOST:-localhost}` |
-| `${LM_STUDIO_HOST:-localhost}` | `${LM_STUDIO_HOST:-localhost:1234}` or `${LM_STUDIO_HOST:-localhost}` |
-| `${VM_HOST:-localhost}` | `${VM_HOST:-localhost}` |
+| `10.176.34.199` | `${OLLAMA_URL:-http://localhost:11434}` or `${OLLAMA_HOST:-localhost}` |
+| `192.168.50.100` | `${LM_STUDIO_HOST:-localhost:1234}` or `${LM_STUDIO_HOST:-localhost}` |
+| `192.168.50.77` | `${VM_HOST:-localhost}` |
 | `192.168.50.x` (any other) | `${LOCAL_HOST:-localhost}` |
-| `${CONTAINER_IP:-localhost}` | `${CONTAINER_IP:-localhost}` |
-| `${CONTAINER_IPV6:-not configured}` | `${CONTAINER_IPV6:-not configured}` |
-| `${HOST_IPV6:-not configured}` | `${HOST_IPV6:-not configured}` |
-| `${HOME}/` (except in install scripts) | `${HOME}/` |
+| `10.176.34.206` | `${CONTAINER_IP:-localhost}` |
+| `fd42:e3ba:1142:18bb:216:3eff:fe93:5e04` | `${CONTAINER_IPV6:-not configured}` |
+| `fd4d:77b8:b157:7fdf:be24:11ff:feab:89f5` | `${HOST_IPV6:-not configured}` |
+| `/home/ubuntu/` (except in install scripts) | `${HOME}/` |
 | `America/New_York` | `UTC` |
 | `5070ti` | `local GPU host` |
-| `YOUR_GITHUB_USER/Genesis` / `YOUR_GITHUB_USER/genesis-backups` | `YOUR_GITHUB_USER/...` |
+| `WingedGuardian/Genesis` / `WingedGuardian/genesis-backups` | `YOUR_GITHUB_USER/...` |
 
 **Enforced by**: the global replacement loops in `[5b/9]` and `[5c/9]`,
 and the portability scan in `[8/9]`.
@@ -203,7 +203,7 @@ Before shipping any change to `prepare-public-release.sh`:
 3. Grep the output for generic leakage patterns (adjust `<user-name>` to
    the actual user's first name before running):
    ```
-   rg -n '\b<user-name>\b|@gmail\.com|America/New_York|10\.176|YOUR_GITHUB_USER/Genesis' /tmp/test-release
+   rg -n '\b<user-name>\b|@gmail\.com|America/New_York|10\.176|WingedGuardian/Genesis' /tmp/test-release
    ```
 4. Inject a known fingerprint into a scratch doc and verify the script
    exits non-zero. Use a pattern that is actually in your local
@@ -224,7 +224,7 @@ The script does NOT:
   contain user data — the script only affects the output that will be
   pushed to GENesis-AGI.
 - Scrub CC session transcripts or backup data. Those are user-private
-  files backed up to the private `YOUR_GITHUB_USER/genesis-backups` repo,
+  files backed up to the private `WingedGuardian/genesis-backups` repo,
   not to the public GENesis-AGI.
 - Run offline. It requires `rg`, `detect-secrets`, `git`, and `python3`.
 - Validate that the staged output actually builds or runs. Only that it

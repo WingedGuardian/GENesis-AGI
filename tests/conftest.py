@@ -2,7 +2,7 @@
 
 # ── sys.path guard: tests must import from THIS worktree, not from main ──
 # The venv has an editable install (``pip install -e .``) whose ``.pth``
-# file adds ``${HOME}/genesis/src`` — the MAIN worktree's src — to
+# file adds ``/home/ubuntu/genesis/src`` — the MAIN worktree's src — to
 # ``sys.path`` at interpreter startup. Without this guard, running
 # ``pytest`` from a sibling worktree collects tests from the worktree's
 # ``tests/`` directory but imports ``genesis.*`` from main's source tree.

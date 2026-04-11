@@ -47,13 +47,13 @@ class TestBashHookPipEditable:
     def test_pip_install_e_absolute_worktree_blocked(
         self, bash_hook_command: str
     ) -> None:
-        """pip install -e ${HOME}/genesis/.claude/worktrees/my-branch -> BLOCKED."""
+        """pip install -e /home/ubuntu/genesis/.claude/worktrees/my-branch -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
             {
                 "command": (
                     "pip install -e "
-                    "${HOME}/genesis/.claude/worktrees/my-branch"
+                    "/home/ubuntu/genesis/.claude/worktrees/my-branch"
                 )
             },
         )
@@ -416,7 +416,7 @@ class TestBashHookBenignCommands:
             "source ~/genesis/.venv/bin/activate",
             "curl -s http://localhost:6333/collections",
             "echo hello world",
-            "cd ${HOME}/genesis && pytest -v",
+            "cd /home/ubuntu/genesis && pytest -v",
             "PYTHONPATH=.claude/worktrees/foo/src pytest tests/",
         ],
         ids=[
@@ -678,7 +678,7 @@ class TestWebFetchHookAllowedUrls:
         "url",
         [
             "https://example.com",
-            "https://github.com/YOUR_GITHUB_USER/Genesis",
+            "https://github.com/WingedGuardian/Genesis",
             "https://docs.python.org/3/library/asyncio.html",
             "https://api.openai.com/v1/models",
             "https://www.google.com/search?q=python",
