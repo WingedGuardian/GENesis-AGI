@@ -65,6 +65,14 @@ def _load_bridge_config() -> dict | None:
             elif uid:
                 log.warning("Invalid UID in TELEGRAM_ALLOWED_USERS: %r", uid)
 
+    if not allowed_users:
+        log.error(
+            "TELEGRAM_ALLOWED_USERS is empty or has no valid user IDs — "
+            "Telegram will not start. Set numeric user IDs "
+            "(get yours from @userinfobot on Telegram)"
+        )
+        return None
+
     # Optional forum chat ID for per-session topics
     forum_raw = secrets.get("TELEGRAM_FORUM_CHAT_ID", "")
     forum_chat_id = int(forum_raw) if forum_raw.strip().lstrip("-").isdigit() else None
