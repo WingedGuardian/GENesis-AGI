@@ -237,6 +237,25 @@ def secrets_update():
             errors.append(f"Value for {key} too long (max 500 chars)")
         if "\n" in val or "\x00" in val:
             errors.append(f"Value for {key} contains invalid characters")
+        # Telegram-specific: ALLOWED_USERS must be numeric IDs
+        if key == "TELEGRAM_ALLOWED_USERS":
+            for uid in val.split(","):
+                uid = uid.strip()
+                if not uid:
+                    continue
+                if ":" in uid:
+                    errors.append(
+                        "TELEGRAM_ALLOWED_USERS looks like a bot token — "
+                        "this field needs numeric user IDs "
+                        "(get yours from @userinfobot on Telegram)"
+                    )
+                    break
+                if not uid.isdigit():
+                    errors.append(
+                        f"TELEGRAM_ALLOWED_USERS: '{uid}' is not a valid "
+                        f"numeric user ID (get yours from @userinfobot)"
+                    )
+                    break
     if errors:
         return jsonify({"error": "Validation failed", "details": errors}), 422
 

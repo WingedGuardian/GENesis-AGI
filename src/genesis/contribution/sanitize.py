@@ -16,7 +16,7 @@ Scanners (all run when inputs are available):
    per finding.
 5. Secrets via `gitleaks detect` if binary is on PATH → BLOCK
    (optional second-layer, MVP-advisory).
-6. Portability patterns — IPs, ${HOME}/ paths, hardcoded
+6. Portability patterns — IPs, /home/ubuntu/ paths, hardcoded
    usernames, known private hostnames → BLOCK.
 7. Fingerprint scan — user-defined strings from
    ~/.genesis/release-fingerprints.txt → BLOCK.
@@ -77,15 +77,15 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
 # public-facing contribution. Copied from the release script's
 # phase 8 portability scan.
 _PORTABILITY_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"${HOME}/genesis", "absolute path ${HOME}/genesis"),
-    (r"${HOME}/agent-zero", "absolute path ${HOME}/agent-zero"),
-    (r"${HOME}/\.[A-Za-z]", "absolute path to user dotfile"),
+    (r"/home/ubuntu/genesis", "absolute path /home/ubuntu/genesis"),
+    (r"/home/ubuntu/agent-zero", "absolute path /home/ubuntu/agent-zero"),
+    (r"/home/ubuntu/\.[A-Za-z]", "absolute path to user dotfile"),
     (r"-home-ubuntu-genesis", "CC project dir slug"),
     (r"10\.176\.34\.199", "Ollama host IP"),
     (r"10\.176\.34\.206", "container IP"),
     (r"192\.168\.50\.\d+", "private subnet IP"),
-    (r"\bYOUR_GITHUB_USER/(Genesis|genesis-backups)\b", "private repo reference"),
-    (r"\bUTC\b", "hardcoded user timezone"),
+    (r"\bWingedGuardian/(Genesis|genesis-backups)\b", "private repo reference"),
+    (r"\bAmerica/New_York\b", "hardcoded user timezone"),
     (r"\bfd42:e3ba\b", "container IPv6 prefix"),
     (r"\bfd4d:77b8\b", "host IPv6 prefix"),
     (r"\b5070ti\b", "hardware reference"),

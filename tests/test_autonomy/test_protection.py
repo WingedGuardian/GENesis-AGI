@@ -162,7 +162,7 @@ class TestEdgeCases:
         """Absolute paths like /etc/passwd must be CRITICAL even with no rules."""
         registry = ProtectedPathRegistry(rules=[])
         assert registry.classify("/etc/passwd") is ProtectionLevel.CRITICAL
-        assert registry.classify("${HOME}/.ssh/authorized_keys") is ProtectionLevel.CRITICAL
+        assert registry.classify("/home/ubuntu/.ssh/authorized_keys") is ProtectionLevel.CRITICAL
 
     def test_classify_with_reason_dotdot(self):
         """classify_with_reason also catches traversal."""
