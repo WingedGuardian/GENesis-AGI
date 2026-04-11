@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -213,3 +213,104 @@ class TestRunExtractionCycle:
         )
         # Session skipped because no transcript found
         assert summary["sessions_processed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_summary_includes_references_captured_key(self):
+        """Summary dict must include references_captured for observability."""
+        db = AsyncMock()
+        cursor = AsyncMock()
+        cursor.description = [
+            ("id",), ("cc_session_id",), ("source_tag",),
+            ("last_extracted_at",), ("last_extracted_line",), ("started_at",),
+        ]
+        cursor.fetchall = AsyncMock(return_value=[])
+        db.execute = AsyncMock(return_value=cursor)
+
+        summary = await run_extraction_cycle(
+            db=db, store=AsyncMock(), router=AsyncMock(),
+        )
+        assert "references_captured" in summary
+        assert summary["references_captured"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reference_only_mode_skips_episodic_and_watermark(
+        self, tmp_path,
+    ):
+        """reference_only_mode: skip episodic store.store calls + watermark updates."""
+        import json as _json
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+
+        # Build a minimal JSONL transcript
+        jsonl = tmp_path / "mine-session.jsonl"
+        msgs = [
+            {
+                "type": "user",
+                "uuid": "u1",
+                "timestamp": "2026-04-11T12:00:00Z",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "login is 614Buckeye password is OhioState614!Bucks"},
+                ]},
+            },
+        ]
+        jsonl.write_text("\n".join(_json.dumps(m) for m in msgs) + "\n")
+
+        async with aiosqlite.connect(":memory:") as real_db:
+            await create_all_tables(real_db)
+            # Seed a session row pointing at the test transcript
+            await real_db.execute(
+                "INSERT INTO cc_sessions "
+                "(id, session_type, model, cc_session_id, source_tag, "
+                "started_at, last_activity_at, status, last_extracted_line) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("s-mine", "foreground", "claude-sonnet-4-6", "mine-session",
+                 "foreground", "2026-04-11T12:00:00+00:00",
+                 "2026-04-11T12:00:00+00:00", "active", 999),  # high watermark
+            )
+            await real_db.commit()
+
+            # Router returns a pre-built extraction result
+            router = AsyncMock()
+            router.route_call = AsyncMock(return_value=AsyncMock(
+                success=True,
+                content=(
+                    '```json\n{"extractions": [{"content": "ScarletAndRage '
+                    'login: username: 614Buckeye password: OhioState614!Bucks", '
+                    '"type": "entity", "confidence": 0.9, '
+                    '"entities": ["ScarletAndRage"]}]}\n```'
+                ),
+                call_site_id="9_fact_extraction",
+                error=None,
+            ))
+
+            store = AsyncMock()
+            store.store = AsyncMock(return_value="qdrant-ref")
+            store.delete = AsyncMock()
+            store._embeddings = MagicMock()
+            store._embeddings.model_name = "m"
+
+            summary = await run_extraction_cycle(
+                db=real_db, store=store, router=router,
+                transcript_dir=tmp_path,
+                reference_only_mode=True,
+                start_line_override=0,  # ignore watermark
+            )
+
+            # References were captured
+            assert summary["references_captured"] >= 1
+            # Episodic storage was NOT called (references don't count)
+            assert summary["entities_extracted"] == 0
+            # Watermark unchanged — reference_only_mode must not advance it
+            cursor = await real_db.execute(
+                "SELECT last_extracted_line FROM cc_sessions WHERE id='s-mine'",
+            )
+            assert (await cursor.fetchone())[0] == 999
+
+            # Verify reference row was actually written
+            cursor = await real_db.execute(
+                "SELECT COUNT(*) FROM knowledge_units "
+                "WHERE project_type='reference'",
+            )
+            assert (await cursor.fetchone())[0] >= 1

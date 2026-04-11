@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid
 from datetime import UTC, datetime
 
 from ..memory import mcp
@@ -82,15 +81,12 @@ async def _ingest_knowledge_unit(
     concept: str | None = None,
     tags_json: str | None = None,
 ) -> str:
-    """Core ingestion logic shared by ``knowledge_ingest`` and ``reference_store``.
+    """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
-    Handles upsert on ``(project, domain, concept)``, Qdrant dedup + stale
-    point cleanup, FTS5 shadow row update, and memory_class override. Returns
-    the stable unit_id (new or existing on conflict).
-
-    This is a plain async function, NOT an ``@mcp.tool`` — callers inside the
-    MCP server can invoke it directly without going through the FastMCP
-    dispatch surface.
+    Resolves the MCP server's live ``_store`` and ``_db`` globals and
+    delegates to the pure-Python helper in ``genesis.memory.knowledge_ingest``.
+    Keeps the MCP dispatch surface thin so the same ingestion pipeline can
+    run from non-MCP contexts (e.g. the extraction_job reference extractor).
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -98,78 +94,20 @@ async def _ingest_knowledge_unit(
     assert memory_mod._db is not None
     assert memory_mod._qdrant is not None
 
-    resolved_concept = concept if concept is not None else content[:200]
-    now_iso = datetime.now(UTC).isoformat()
-    source_doc = "manual"
-    if provenance and provenance.get("source_doc"):
-        source_doc = provenance["source_doc"]
+    from genesis.memory.knowledge_ingest import ingest_knowledge_unit
 
-    # Look up any existing row with the same (project, domain, concept) so we
-    # can reuse the unit ID and clean up the stale Qdrant point after we write
-    # the new one.
-    existing = await memory_mod.knowledge.find_by_unique_key(
-        memory_mod._db, project_type=project, domain=domain, concept=resolved_concept,
-    )
-    unit_id = existing["id"] if existing else str(uuid.uuid4())
-    old_qdrant_id = existing.get("qdrant_id") if existing else None
-
-    source_pipeline_val = (provenance or {}).get("source_pipeline", "recon")
-    source_session_id = (provenance or {}).get("session_id")
-    qdrant_memory_id = await memory_mod._store.store(
-        content,
-        f"knowledge:{project}/{domain}",
-        memory_type="knowledge",
-        collection="knowledge_base",
-        tags=[domain, project, authority],
-        confidence=0.85,
-        auto_link=False,
-        source_pipeline=source_pipeline_val,
-        memory_class=memory_class,
-        source_session_id=source_session_id,
-    )
-
-    # If we replaced an existing entry whose Qdrant point ID differs from the
-    # new one, the old point is now orphaned — delete it so Qdrant stays in
-    # sync with the knowledge_units row of record.  store.delete() handles
-    # metadata, FTS5, Qdrant (both collections), links, and pending_embeddings
-    # cascade.  No-op when IDs match (dedup path) or there's no old point.
-    if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
-        try:
-            await memory_mod._store.delete(old_qdrant_id)
-        except Exception:
-            logger.error(
-                "Failed to clean up stale Qdrant point %s while upserting "
-                "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
-            )
-
-    embedding_model = getattr(
-        memory_mod._store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16",
-    )
-    resolved_tags = tags_json or json.dumps([domain, project, authority])
-    actual_id, inserted = await memory_mod.knowledge.upsert(
-        memory_mod._db,
-        id=unit_id,
-        project_type=project,
+    return await ingest_knowledge_unit(
+        store=memory_mod._store,
+        db=memory_mod._db,
+        content=content,
+        project=project,
         domain=domain,
-        source_doc=source_doc,
-        concept=resolved_concept,
-        body=content,
-        tags=resolved_tags,
-        ingested_at=now_iso,
-        qdrant_id=qdrant_memory_id,
-        confidence=0.85,
-        source_platform=provenance.get("platform") if provenance else None,
-        section_title=provenance.get("section_title") if provenance else None,
-        source_date=provenance.get("source_date") if provenance else None,
-        embedding_model=embedding_model,
+        authority=authority,
+        provenance=provenance,
+        memory_class=memory_class,
+        concept=concept,
+        tags_json=tags_json,
     )
-
-    logger.info(
-        "Knowledge unit %s: %s (project=%s, domain=%s)",
-        "ingested" if inserted else "updated",
-        actual_id, project, domain,
-    )
-    return actual_id
 
 
 @mcp.tool()
