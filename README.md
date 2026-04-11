@@ -396,6 +396,8 @@ All phases complete. See [`docs/journey/`](docs/journey/) for the build story.
 
 ---
 
+<a id="where-its-headed"></a>
+
 ## Where it's headed 🗺️
 
 V3 is the foundation — complete, tested, running in production. What comes next is where it gets ambitious enough to need a community behind it.
@@ -558,6 +560,8 @@ The complete design lives in [`docs/architecture/`](docs/architecture/):
 - [`genesis-v3-resilience-architecture.md`](docs/architecture/genesis-v3-resilience-architecture.md) — Resilience layer design
 
 ---
+
+<a id="get-involved"></a>
 
 ## Get involved 🤝
 
