@@ -113,6 +113,39 @@ def init(rt: GenesisRuntime) -> None:
             rt._cc_invoker.set_protected_paths(rt._protected_paths)
             logger.info("ProtectedPathRegistry wired into CCInvoker")
 
+        # Remediation registry — mechanical reflex layer for health probes
+        try:
+            from genesis.autonomy.remediation import RemediationRegistry, register_defaults
+
+            outreach_fn = None
+            if hasattr(rt, "_outreach_pipeline") and rt._outreach_pipeline:
+                async def _outreach_submit(severity: str, title: str, body: str) -> None:
+                    from genesis.outreach.pipeline import OutreachCategory, OutreachRequest
+                    cat = {
+                        "critical": OutreachCategory.BLOCKER,
+                        "warning": OutreachCategory.ALERT,
+                    }.get(severity, OutreachCategory.ALERT)
+                    await rt._outreach_pipeline.submit(OutreachRequest(
+                        category=cat,
+                        topic=title,
+                        context=body,
+                        salience_score=0.9 if severity == "critical" else 0.6,
+                        signal_type="health_alert",
+                        source_id=f"remediation:{title}",
+                    ))
+                outreach_fn = _outreach_submit
+            rt._remediation_registry = RemediationRegistry(outreach_fn=outreach_fn)
+            register_defaults(rt._remediation_registry)
+            if rt._awareness_loop:
+                rt._awareness_loop.set_remediation_registry(rt._remediation_registry)
+            logger.info(
+                "Remediation registry initialized (%d actions, wired=%s)",
+                len(rt._remediation_registry.actions),
+                rt._awareness_loop is not None,
+            )
+        except Exception:
+            logger.warning("Failed to initialize remediation registry", exc_info=True)
+
         logger.info("Step 14: Autonomy subsystem initialized")
 
     except ImportError:

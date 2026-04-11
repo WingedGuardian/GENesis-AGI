@@ -24,7 +24,20 @@ async def procedure_store(
     context_tags: list[str],
     tool_trigger: list[str] | None = None,
 ) -> str:
-    """Store a learned procedure. Returns the procedure ID."""
+    """Store a learned procedure. Returns the procedure ID.
+
+    An MCP `procedure_store` call represents an *explicit teach* — the caller
+    is asserting the procedure works. We seed it as already-confirmed
+    (speculative=0) with one Laplace-equivalent success (success_count=1,
+    confidence=2/3), and place it at L3 so it is immediately recallable AND
+    eligible for SessionStart injection. Subsequent organic
+    successes/failures via `record_success`/`record_failure` continue to
+    update the row via Laplace smoothing.
+
+    The auto-extraction path (`learning.procedural.extractor`) keeps its
+    speculative=1 / success_count=0 / confidence=0.0 / L4 defaults — those
+    procedures are LLM-hypothesized and must earn trust.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -38,8 +51,10 @@ async def procedure_store(
         tools_used=tools_used,
         context_tags=context_tags,
         tool_trigger=tool_trigger,
-        activation_tier="L4",
-        speculative=1,
+        activation_tier="L3",
+        speculative=0,
+        success_count=1,
+        confidence=2 / 3,
     )
 
 

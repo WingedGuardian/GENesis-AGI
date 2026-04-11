@@ -69,6 +69,15 @@ class RemediationRegistry:
         self._consecutive_failures: dict[str, int] = {}  # name -> count
         self._lock = asyncio.Lock()
         self._outreach_fn = outreach_fn
+        self._escalation_callback = None
+
+    def set_escalation_callback(self, fn) -> None:
+        """Set callback for when remediation is exhausted.
+
+        Callback signature: async (trigger_source, tier, reason, context) -> Any
+        Used by the Sentinel to dispatch CC diagnosis when reflexes fail.
+        """
+        self._escalation_callback = fn
 
     @property
     def actions(self) -> list[RemediationAction]:
@@ -151,6 +160,19 @@ class RemediationRegistry:
                 except Exception:
                     logger.error(
                         "Failed to send outreach for exhausted remediation",
+                        exc_info=True,
+                    )
+            if self._escalation_callback:
+                try:
+                    await self._escalation_callback(
+                        trigger_source="remediation_exhausted",
+                        tier=3,
+                        reason=msg,
+                        context={"action_name": action.name, "probe_name": action.probe_name},
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to escalate exhausted remediation to Sentinel",
                         exc_info=True,
                     )
             return RemediationOutcome(

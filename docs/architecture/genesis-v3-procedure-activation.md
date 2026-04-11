@@ -1,6 +1,6 @@
 # Procedure Activation Architecture
 
-**Status:** Active | **Last updated:** 2026-03-18
+**Status:** Active | **Last updated:** 2026-04-09
 
 
 ## Problem
@@ -38,22 +38,46 @@ Reliability decreases as scope increases. Layers reinforce each other.
 ## Procedure Lifecycle
 
 ```
-New procedure (triage pipeline or MCP tool)
-  → L4 (speculative, advisory only)
-  → L3 (3+ successes, conf >= 0.65, non-speculative)
+Auto-extracted (triage / extractor pipeline):
+  → L4 (speculative=1, success_count=0, conf=0.0, advisory only)
+  → L3 (3+ successes, conf >= 0.65, speculative=0)
   → L2 (5+ successes, conf >= 0.75, embedded in skills)
   → L1 (8+ successes, conf >= 0.85, tool trigger set)
+
+Explicit user teach (procedure_store MCP tool):
+  → L3 (speculative=0, success_count=1, conf=2/3) — eligible for
+       SessionStart injection from the moment it is stored.
+       Earns further promotion to L2/L1 organically via record_success.
 ```
 
-Demotion: 3+ consecutive failures → tier - 1
-Quarantine: confidence < 0.3 → excluded from all layers
+Demotion is **evidence-driven only** — never metric drift:
+- 3+ failure-mode hits AND failure_count >= success_count + 3 → tier - 1
+- confidence < 0.3 AND total samples >= 3 → quarantine (excluded everywhere)
+
+The `_compute_tier` function in `promoter.py` is strict promote-only: it
+returns the highest tier the row's metrics qualify for, but never returns
+a lower rank than the row's current tier. A procedure whose confidence
+drifts (e.g., L1 dropping from 0.86 → 0.83) is held at its existing tier
+unless `_check_demotion` or quarantine fires. This prevents seed and
+explicit-teach procedures from being silently downgraded between hourly
+promoter runs.
 
 ## Ingestion Paths
 
 1. **Triage pipeline** — extracts procedures from APPROACH_FAILURE and
-   WORKAROUND_SUCCESS outcomes via LLM (call site 34)
-2. **MCP tool** — `procedure_store` for manual/retrospective creation
-3. **Seed script** — `scripts/seed_procedures.py` for battle-tested procedures
+   WORKAROUND_SUCCESS outcomes via LLM (call site 34). Defaults to L4 /
+   speculative=1 — the LLM hypothesis must earn trust through real
+   organic successes before promotion.
+2. **MCP tool** — `procedure_store` for explicit user teaching. Treated
+   as one Laplace-equivalent confirmed success — seeds at L3 with
+   speculative=0, success_count=1, confidence=2/3. The caller asserting
+   "this procedure works" is the evidence; the system trusts that
+   assertion enough to make the procedure immediately recallable and
+   eligible for SessionStart injection.
+3. **Seed script** — `scripts/seed_procedures.py` for battle-tested
+   procedures. Uses raw SQL upsert with hand-tuned counts and
+   confidence (e.g., success_count=10, confidence=0.92, L2). Bypasses
+   the operations / CRUD layer entirely.
 
 ## Key Files
 

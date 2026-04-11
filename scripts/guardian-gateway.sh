@@ -6,13 +6,14 @@
 #   pause          — pause guardian checks
 #   resume         — resume guardian checks
 #   status         — get current guardian state
+#   reset-state    — reset stuck state machine to healthy
 #   version        — report CC, code, and Node versions
-#   update         — pull latest code from git
+#   update         — pull latest code + self-update gateway script
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
 #   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
 #
-# This gives Genesis exactly 4 operations on the host. Nothing else.
+# This gives Genesis exactly 7 operations on the host. Nothing else.
 
 set -euo pipefail
 
@@ -34,6 +35,42 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         ;;
     status)
         cat "$STATE_DIR/state.json" 2>/dev/null || echo '{"current_state": "unknown"}'
+        ;;
+    reset-state)
+        # Reset Guardian state to HEALTHY when stuck in confirmed_dead/recovering/recovered.
+        # Safety: refuses to reset from active investigation states (healthy, confirming, surveying).
+        STATE_FILE="$STATE_DIR/state.json"
+        if [ ! -f "$STATE_FILE" ]; then
+            echo '{"ok": false, "error": "no state file"}' >&2
+            exit 1
+        fi
+        CURRENT=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('current_state','unknown'))" 2>/dev/null || echo "unknown")
+        case "$CURRENT" in
+            confirmed_dead|recovering|recovered)
+                # Read-modify-write: preserve any future fields added to state.json
+                python3 << PYEOF
+import json
+from datetime import datetime, timezone
+sf = "$STATE_FILE"
+with open(sf) as f:
+    d = json.load(f)
+prev = d.get("current_state", "unknown")
+now = datetime.now(timezone.utc).isoformat()
+d.update(current_state="healthy", consecutive_failures=0, recheck_count=0,
+         first_failure_at=None, recovery_attempts=0, last_healthy_at=now,
+         last_check_at=now, auto_reset_count=0, dialogue_sent_at=None,
+         dialogue_eta_s=0, dialogue_action=None, cc_unavailable_since=None,
+         last_cc_unavailable_alert_at=None)
+with open(sf, "w") as f:
+    json.dump(d, f, indent=2)
+print(json.dumps({"ok": True, "action": "reset-state", "previous_state": prev}))
+PYEOF
+                ;;
+            *)
+                printf '{"ok": false, "error": "state is %s, not stuck"}\n' "$CURRENT" >&2
+                exit 1
+                ;;
+        esac
         ;;
     version)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
@@ -90,6 +127,16 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
                         } >> "$INSTALL_DIR/CLAUDE.md"
                     fi
                 fi
+                # Self-update: copy gateway script from pulled repo to ~/.local/bin/
+                # Safe mid-execution: Linux preserves old inode while this process holds fd.
+                # Atomic rename ensures next SSH invocation picks up the new script.
+                if [ -f "$INSTALL_DIR/scripts/guardian-gateway.sh" ]; then
+                    cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new"
+                    chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
+                    mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
+                fi
+                # Restart timer so new check.py code takes effect immediately
+                systemctl --user restart genesis-guardian.timer 2>/dev/null || true
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
                 printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
             else

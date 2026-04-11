@@ -56,6 +56,17 @@ class CallSiteConfig:
     default_paid: bool = False
     never_pays: bool = False
     retry_profile: str = "default"
+    # Runtime dispatch mode, read by AutonomousDispatchRouter.route():
+    #   "dual" (default) — API chain first, CLI fallback on exhaustion
+    #   "cli"             — skip the API chain entirely, go straight to
+    #                       the CLI approval gate (user wants CC CLI)
+    #   "api"             — API-only; if the chain exhausts, return
+    #                       mode="blocked" instead of escalating to CLI
+    # Stored under ``call_sites.<id>.dispatch`` in model_routing.yaml.
+    # Legacy alias ``"cc"`` (written by earlier dashboard code before
+    # the three-state selector landed) is accepted at load time and
+    # normalized to ``"cli"`` — see ``config._normalize_dispatch``.
+    dispatch: str = "dual"
 
 
 @dataclass(frozen=True)

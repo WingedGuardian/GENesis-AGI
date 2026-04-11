@@ -61,10 +61,14 @@ def _approval_key(
 
 
 def _reply_decision(reply_text: str) -> str | None:
+    import re
+
     text = (reply_text or "").strip().lower()
     if not text:
         return None
-    first = text.split()[0]
+    first = re.sub(r"[^\w]", "", text.split()[0])
+    if not first:
+        return None
     if first in _APPROVE_WORDS:
         return "approved"
     if first in _REJECT_WORDS:
@@ -83,6 +87,14 @@ class AutonomousDispatchRequest:
     cli_fallback_allowed: bool = True
     approval_required_for_cli: bool = True
     context: dict[str, Any] | None = None
+    # Optional per-call override of the call site's runtime dispatch
+    # mode.  When ``None`` (default), ``AutonomousDispatchRouter.route``
+    # looks up ``CallSiteConfig.dispatch`` from the routing config for
+    # ``api_call_site_id``.  Explicit values "api" / "cli" / "dual"
+    # bypass the config lookup entirely — use sparingly, mostly for
+    # tests or targeted one-shot overrides.  See
+    # ``genesis.routing.config._VALID_DISPATCH_MODES``.
+    dispatch_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -113,6 +125,18 @@ class AutonomousCliApprovalGate:
     def _policy(self):
         return self._policy_loader()
 
+    @property
+    def approval_manager(self) -> Any:
+        """Public accessor for the underlying ApprovalManager.
+
+        Exposed so callers (specifically the inbox resume pass) can
+        look up approval rows by id without reaching into the private
+        ``_approval_manager`` attribute.  Using the public property
+        means wrappers / test doubles that only mirror public API
+        still work without silent fall-through.
+        """
+        return self._approval_manager
+
     async def ensure_approval(
         self,
         *,
@@ -140,7 +164,9 @@ class AutonomousCliApprovalGate:
             extra=extra_context,
         )
 
-        existing = await self._find_existing(approval_key)
+        existing = await self._find_existing(
+            approval_key, subsystem=subsystem, policy_id=policy_id,
+        )
         if existing is not None:
             status = str(existing.get("status") or "pending")
             request_id = str(existing["id"])
@@ -211,6 +237,22 @@ class AutonomousCliApprovalGate:
         return ("pending", request_id, "approval requested")
 
     async def resolve_from_reply(self, delivery_id: str, reply_text: str) -> bool:
+        """Resolve an approval from a Telegram quote-reply to a specific
+        message.
+
+        Legacy fallback for users who formally quote-reply to a specific
+        approval message.  The primary UX is inline ✅ buttons, and the
+        secondary UX is a bare "approve"/"reject" text in the Approvals
+        topic (handled separately in the Telegram handler, resolving the
+        most recent pending request).  This path stays for the minority
+        case of quote-reply to a specific historic message.
+
+        IMPORTANT: single-reply *no longer* auto-batches.  If the user
+        wants to approve multiple queued requests at once, they use the
+        explicit "✅✅ Approve all N pending" inline button.  Silent
+        batch-approve from a single reply was surprising and made it
+        impossible to approve one-out-of-many.
+        """
         request_id = self._delivery_to_request.get(str(delivery_id))
         if request_id is None:
             return False
@@ -227,14 +269,49 @@ class AutonomousCliApprovalGate:
                 "Resolved autonomous CLI approval %s as %s via %s reply",
                 request_id, decision, self._policy().approval_channel,
             )
-            # Batch: when user approves one, approve ALL other pending requests
-            if decision == "approved":
-                batch_count = await self.approve_all_pending(
-                    resolved_by=f"{self._policy().approval_channel}:batch",
-                )
-                if batch_count > 0:
-                    logger.info("Batch-approved %d additional pending requests", batch_count)
         return ok
+
+    async def resolve_most_recent_pending(
+        self, *, decision: str, resolved_by: str,
+    ) -> str | None:
+        """Resolve the most-recent pending autonomous_cli_fallback approval.
+
+        Used by the Telegram "bare approve/reject in Approvals topic"
+        handler so the user can type "approve" without having to quote-
+        reply to a specific message.  Returns the resolved request_id,
+        or ``None`` if no pending request exists.
+
+        Only considers ``action_type == 'autonomous_cli_fallback'`` so
+        unrelated approval requests (ego, modules, etc.) are not
+        accidentally touched.
+        """
+        if decision not in ("approved", "rejected"):
+            logger.warning(
+                "resolve_most_recent_pending called with invalid decision "
+                "%r (expected 'approved' or 'rejected') — no-op",
+                decision,
+            )
+            return None
+        pending = await self._approval_manager.get_pending()
+        # Most recent first (get_pending returns ordered by created_at ASC)
+        candidates = [
+            req for req in pending
+            if req.get("action_type") == "autonomous_cli_fallback"
+        ]
+        if not candidates:
+            return None
+        most_recent = candidates[-1]
+        request_id = str(most_recent["id"])
+        ok = await self._approval_manager.resolve(
+            request_id, status=decision, resolved_by=resolved_by,
+        )
+        if ok:
+            logger.info(
+                "Resolved most-recent autonomous CLI approval %s as %s via %s",
+                request_id, decision, resolved_by,
+            )
+            return request_id
+        return None
 
     async def approve_all_pending(self, *, resolved_by: str) -> int:
         """Approve all pending CLI-fallback approval requests. Returns count.
@@ -261,8 +338,27 @@ class AutonomousCliApprovalGate:
             request_id, status=decision, resolved_by=resolved_by,
         )
 
-    async def _find_existing(self, approval_key: str) -> dict[str, Any] | None:
+    async def _find_existing(
+        self, approval_key: str,
+        *,
+        subsystem: str | None = None,
+        policy_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Find an existing approval request that matches this call.
+
+        Primary match: content-stable ``approval_key`` (hits any status,
+        preserves "previously rejected" behaviour so a rejected row blocks
+        the dispatch instead of creating a duplicate).
+
+        Race-safety fallback: if no approval_key match and the caller
+        provided ``subsystem``/``policy_id``, also match any *pending* row
+        whose context has the same (subsystem, policy_id).  This catches
+        the case where two concurrent schedulers build slightly different
+        content hashes for the same call site and would otherwise each
+        create their own approval.
+        """
         recent = await self._approval_manager.get_recent(limit=200)
+        # Pass 1: exact content-key match (preserves status-sensitive behavior).
         for row in recent:
             context = _json_loads(row.get("context"))
             if (
@@ -270,7 +366,58 @@ class AutonomousCliApprovalGate:
                 and context.get("approval_key") == approval_key
             ):
                 return row
+        # Pass 2: race-safety fallback — pending rows for the same site.
+        if subsystem is None or policy_id is None:
+            return None
+        for row in recent:
+            if str(row.get("status") or "") != "pending":
+                continue
+            context = _json_loads(row.get("context"))
+            if (
+                context.get("kind") == "autonomous_cli_fallback"
+                and context.get("subsystem") == subsystem
+                and context.get("policy_id") == policy_id
+            ):
+                return row
         return None
+
+    async def find_site_pending(
+        self, *, subsystem: str, policy_id: str,
+    ) -> dict[str, Any] | None:
+        """Return the pending autonomous_cli_fallback approval for this
+        call site, or ``None`` if nothing is pending.
+
+        Used by callers to skip scheduling work while the call site is
+        gated on an approval.  Correctness invariant: the returned row
+        has ``status == 'pending'`` AND its context has matching
+        ``subsystem`` and ``policy_id``.  Approved/rejected rows are
+        *not* returned — their state has already been resolved and the
+        caller should dispatch normally (which will hit ``ensure_approval``
+        and get the resolved status).
+        """
+        pending = await self._approval_manager.get_pending()
+        for row in pending:
+            if row.get("action_type") != "autonomous_cli_fallback":
+                continue
+            context = _json_loads(row.get("context"))
+            if (
+                context.get("subsystem") == subsystem
+                and context.get("policy_id") == policy_id
+            ):
+                return row
+        return None
+
+    async def get_pending_count(self) -> int:
+        """Return the count of pending autonomous_cli_fallback approvals.
+
+        Used by ``_send_request`` to decide whether to include the
+        "✅✅ Approve all N pending" batch button in the inline keyboard.
+        """
+        pending = await self._approval_manager.get_pending()
+        return sum(
+            1 for req in pending
+            if req.get("action_type") == "autonomous_cli_fallback"
+        )
 
     async def _maybe_resend(
         self,
@@ -313,36 +460,133 @@ class AutonomousCliApprovalGate:
         invocation: CCInvocation,
         api_error: str | None,
     ) -> None:
-        delivery_id: str | None = None
-        adapter = None
-        recipient = ""
-        channel = self._policy().approval_channel
-        pipeline = getattr(self._runtime, "_outreach_pipeline", None)
-        if pipeline is not None:
-            adapter = getattr(pipeline, "_channels", {}).get(channel)
-            recipient = getattr(pipeline, "_recipients", {}).get(channel, "")
+        """Deliver an approval notification via the outreach pipeline.
 
-        if adapter is None or not recipient:
-            logger.warning(
-                "Approval request %s has no deliverable channel (%s); dashboard-only fallback",
-                request_id, channel,
+        Routes through ``OutreachPipeline.submit_raw`` with
+        ``OutreachCategory.APPROVAL``, so topic routing sends the message
+        to the "Approvals" supergroup topic.  Attaches an inline keyboard:
+
+        - One row with a single ✅ Approve button keyed to this
+          ``request_id``.
+        - A second row with "✅✅ Approve all N pending" *iff* at least
+          two ``autonomous_cli_fallback`` approvals are pending at send
+          time (including this one).
+
+        Fire-and-forget: the dispatcher stores the request in
+        ``approval_requests`` with ``status='pending'`` and relies on the
+        caller's next tick to notice resolution via ``find_site_pending``
+        / ``ensure_approval``.  Does NOT use ``submit_raw_and_wait`` —
+        that's Sentinel's blocking pattern and does not fit the gating
+        model.
+        """
+        delivery_id: str | None = None
+        pipeline = getattr(self._runtime, "_outreach_pipeline", None)
+
+        if pipeline is None:
+            # ERROR per observability rules: delivery failure of an approval
+            # request is an operational failure, not a recoverable degradation.
+            # The request row is still in approval_requests, so the dashboard
+            # approval API can resolve it manually.
+            logger.error(
+                "Approval request %s cannot be delivered: "
+                "outreach pipeline unavailable; dashboard-only fallback",
+                request_id,
             )
         else:
+            # Count BEFORE sending so we don't double-count the current
+            # request (which is already in 'pending' state by now).
+            try:
+                pending_count = await self.get_pending_count()
+            except Exception:
+                logger.warning(
+                    "Failed to count pending approvals for %s", request_id,
+                    exc_info=True,
+                )
+                pending_count = 1
+
             message = self._format_message(
                 request_id=request_id,
                 action_label=action_label,
                 invocation=invocation,
                 api_error=api_error,
+                pending_count=pending_count,
             )
-            delivery_id = str(await adapter.send_message(recipient, message))
-            self._delivery_to_request[delivery_id] = request_id
 
-        now = datetime.now(UTC)
+            # Build inline keyboard — lazy import to keep the module
+            # importable without python-telegram-bot installed (mirrors
+            # Sentinel's pattern at sentinel/dispatcher.py:387).
+            keyboard: object | None = None
+            try:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+                rows = [[InlineKeyboardButton(
+                    "✅ Approve",
+                    callback_data=f"cli_approve:{request_id}",
+                )]]
+                if pending_count >= 2:
+                    rows.append([InlineKeyboardButton(
+                        f"✅✅ Approve all {pending_count} pending",
+                        callback_data=f"cli_approve_all:{request_id}",
+                    )])
+                keyboard = InlineKeyboardMarkup(rows)
+            except ImportError:
+                logger.warning(
+                    "python-telegram-bot not installed; approval %s will "
+                    "deliver without inline buttons",
+                    request_id,
+                )
+
+            try:
+                from genesis.outreach.types import (
+                    OutreachCategory,
+                    OutreachRequest,
+                    OutreachStatus,
+                )
+
+                outreach_request = OutreachRequest(
+                    category=OutreachCategory.APPROVAL,
+                    topic=f"Approval: {action_label[:80]}",
+                    context=message,
+                    salience_score=1.0,
+                    signal_type="cli_approval",
+                    source_id=f"cli-approval:{request_id}",
+                )
+                result = await pipeline.submit_raw(
+                    message, outreach_request, reply_markup=keyboard,
+                )
+                if result.status == OutreachStatus.DELIVERED and result.delivery_id:
+                    delivery_id = str(result.delivery_id)
+                    # Populate the mapping so legacy quote-reply text
+                    # fallback still works for users who formally reply
+                    # to a specific message.
+                    self._delivery_to_request[delivery_id] = request_id
+                else:
+                    logger.error(
+                        "Approval request %s delivery did not complete "
+                        "(status=%s, error=%s); dashboard-only fallback",
+                        request_id, result.status, result.error,
+                    )
+            except Exception:
+                logger.error(
+                    "Failed to deliver approval request %s via outreach pipeline",
+                    request_id, exc_info=True,
+                )
+
+        # Record the delivery_id regardless (None means "not yet delivered"),
+        # but only advance the re-ask cadence when delivery actually
+        # succeeded.  If delivery failed (delivery_id is None), leave
+        # last_sent_at / next_reask_at alone so the NEXT scan tick can
+        # retry immediately via _maybe_resend instead of waiting the full
+        # reask_interval_hours (24h default).  The prior code bumped the
+        # reask window unconditionally, which made failed deliveries
+        # invisible for 24h even though the retry loop was ready to go.
         context["delivery_id"] = delivery_id
-        context["last_sent_at"] = now.isoformat()
-        context["next_reask_at"] = (
-            now + timedelta(hours=max(1, self._policy().reask_interval_hours))
-        ).isoformat()
+        if delivery_id is not None:
+            now = datetime.now(UTC)
+            context["last_sent_at"] = now.isoformat()
+            context["next_reask_at"] = (
+                now + timedelta(hours=max(1, self._policy().reask_interval_hours))
+            ).isoformat()
         await self._approval_manager.update_context(
             request_id, context=_context_dump(context),
         )
@@ -354,6 +598,7 @@ class AutonomousCliApprovalGate:
         action_label: str,
         invocation: CCInvocation,
         api_error: str | None,
+        pending_count: int = 1,
     ) -> str:
         lines = [
             "<b>Approval Needed</b>",
@@ -371,9 +616,14 @@ class AutonomousCliApprovalGate:
             ])
         lines.extend([
             "",
-            "Reply to this message with <code>approve</code> or <code>reject</code>.",
-            "You can also resolve it from the dashboard approvals API.",
+            "Tap ✅ below, or type <code>approve</code> in the Approvals "
+            "topic (bare message or quote-reply both work).",
         ])
+        if pending_count >= 2:
+            lines.append(
+                f"<i>{pending_count - 1} other approval(s) pending — "
+                f"use the batch button to resolve them together.</i>",
+            )
         return "\n".join(lines)
 
 
@@ -391,15 +641,102 @@ class AutonomousDispatchRouter:
         self._approval_gate = approval_gate
         self._policy_loader = policy_loader
 
+    @property
+    def approval_gate(self) -> AutonomousCliApprovalGate:
+        """Public accessor for the CLI approval gate.
+
+        Exposed so call sites (inbox, ego, reflection, executor) can
+        perform ``find_site_pending`` pre-checks to skip scheduling new
+        work when their call site is blocked on an in-flight approval.
+        """
+        return self._approval_gate
+
+    def _resolve_dispatch_mode(
+        self, request: AutonomousDispatchRequest,
+    ) -> str:
+        """Return the effective dispatch mode for a request.
+
+        Precedence:
+          1. ``request.dispatch_mode`` if set (explicit per-call override).
+          2. ``CallSiteConfig.dispatch`` from the routing config, looked
+             up via ``api_call_site_id``.
+          3. ``"dual"`` as a safe default when neither source resolves
+             (e.g. unknown call site id, router missing config).
+
+        Never raises — unknown values from either source fall through
+        to ``"dual"`` rather than blocking dispatch entirely.
+        """
+        if request.dispatch_mode is not None:
+            return request.dispatch_mode
+        call_site_id = request.api_call_site_id
+        if not call_site_id:
+            return "dual"
+        # Defensive lookup: the router's config is a dataclass in prod
+        # but tests routinely pass an ``AsyncMock`` as the router, whose
+        # attribute access returns ``AsyncMock`` instances that don't
+        # behave like a real mapping.  Require ``call_sites`` to quack
+        # like a ``Mapping`` before indexing into it; any mismatch
+        # defaults to "dual" so tests / misconfigured routers never
+        # throw here.  ``Mapping`` (not ``dict``) is deliberate: keeps
+        # the door open to read-only mapping types like
+        # ``types.MappingProxyType`` or frozen-dict subclasses.
+        from collections.abc import Mapping
+        try:
+            call_sites = self._router.config.call_sites
+        except AttributeError:
+            return "dual"
+        if not isinstance(call_sites, Mapping):
+            return "dual"
+        site = call_sites.get(call_site_id)
+        if site is None:
+            return "dual"
+        value = getattr(site, "dispatch", None)
+        if not isinstance(value, str) or not value:
+            return "dual"
+        return value
+
     async def route(
         self, request: AutonomousDispatchRequest,
     ) -> AutonomousDispatchDecision:
         api_error: str | None = None
+        dispatch_mode = self._resolve_dispatch_mode(request)
+
+        # CLI-only: skip the API chain entirely and go straight to the
+        # approval gate + CLI fallback.  Used when the user forces a
+        # call site onto the Claude Code subprocess path (e.g. to test
+        # the approval gate, or to work around an unusable API key).
+        # ``cli_fallback_allowed=False`` still wins here — a caller
+        # that explicitly disables CLI fallback should be respected
+        # even with dispatch=cli, so we return a dedicated ``blocked``
+        # mode rather than silently ignoring the flag.
+        if dispatch_mode == "cli":
+            if not request.cli_fallback_allowed:
+                return AutonomousDispatchDecision(
+                    mode="blocked",
+                    reason="dispatch=cli but CLI fallback disabled by caller",
+                )
+            logger.info(
+                "Autonomous dispatch %s: dispatch=cli, skipping API chain",
+                request.policy_id,
+            )
+            api_error = "Call site forced to CLI via dispatch=cli toggle"
+            return await self._cli_fallback_decision(
+                request, api_error=api_error,
+            )
+
         if request.api_call_site_id:
             result = await self._router.route_call(
                 request.api_call_site_id, request.messages,
             )
-            if result.success:
+            # Success is only a real success if the provider actually
+            # produced content.  Free-tier providers (notably gemini-free)
+            # can return HTTP 200 with empty/null content — the router
+            # sees that as success, but downstream consumers receive an
+            # empty CCOutput and silently produce blank artifacts (e.g.
+            # frontmatter-only inbox response files).  Treat empty
+            # content as a failed dispatch so we fall through to the
+            # CLI fallback path.
+            if result.success and (result.content or "").strip():
                 logger.info(
                     "Autonomous dispatch %s routed via API provider %s",
                     request.policy_id, result.provider_used,
@@ -419,12 +756,59 @@ class AutonomousDispatchRouter:
                         exit_code=0,
                     ),
                 )
-            api_error = result.error or "API route failed"
-            logger.warning(
-                "Autonomous dispatch %s API route failed: %s",
-                request.policy_id, api_error,
+            if result.success:
+                api_error = (
+                    f"provider {result.provider_used} returned empty content"
+                )
+                # ERROR not WARNING: a provider returning HTTP 200 with
+                # empty content is an operational API failure, not a
+                # recoverable degradation.  Per CLAUDE.md observability
+                # rules, API call failures log at ERROR.
+                logger.error(
+                    "Autonomous dispatch %s: provider %s returned empty "
+                    "content — treating as failure",
+                    request.policy_id, result.provider_used,
+                )
+            else:
+                api_error = result.error or "API route failed"
+                logger.warning(
+                    "Autonomous dispatch %s API route failed: %s",
+                    request.policy_id, api_error,
+                )
+
+        # API-only mode: if the API chain exhausted without a usable
+        # response, do NOT escalate to CLI.  Return ``mode="blocked"``
+        # with a clear reason so the caller (e.g. reflection bridge)
+        # can record a failed call-site run instead of silently
+        # triggering CC subprocess dispatch the operator said not to.
+        if dispatch_mode == "api":
+            return AutonomousDispatchDecision(
+                mode="blocked",
+                reason=(
+                    "dispatch=api: API chain exhausted, CLI escalation "
+                    "suppressed per call-site config"
+                ),
+                api_error=api_error,
             )
 
+        return await self._cli_fallback_decision(
+            request, api_error=api_error,
+        )
+
+    async def _cli_fallback_decision(
+        self,
+        request: AutonomousDispatchRequest,
+        *,
+        api_error: str | None,
+    ) -> AutonomousDispatchDecision:
+        """Run the CLI fallback approval / gate logic and return a decision.
+
+        Extracted from ``route`` so the ``dispatch=cli`` short-circuit
+        branch and the normal API-exhausted branch share the same code
+        path.  Honours the autonomous-CLI policy (fallback disabled →
+        ``blocked``) and the approval gate (pending / rejected →
+        ``blocked``).
+        """
         policy = self._policy_loader()
         if (
             not policy.autonomous_cli_fallback_enabled

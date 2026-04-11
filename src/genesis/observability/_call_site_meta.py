@@ -52,8 +52,8 @@ _CALL_SITE_META: dict[str, dict] = {
         "cc_model": "Opus",
         "model_tier": "cc",
     },
-    "8_memory_consolidation": {
-        "description": "Compresses and deduplicates ego cycle memories. Called by EgoCompactor during memory maintenance.",
+    "8_ego_compaction": {
+        "description": "Ego-internal rolling summary compactor. Folds old ego_cycles outputs into a single compacted_summary in ego_state so long-running ego memory stays bounded. NOT Genesis-wide memory consolidation — that pipeline (dream cycle) is not yet built. Only caller: ego/compaction.py (inert until ego sessions go live).",
         "category": "processing",
         "frequency": "Daily",
         "model_tier": "slm",
@@ -62,6 +62,12 @@ _CALL_SITE_META: dict[str, dict] = {
         "description": "Extracts structured facts (entities, dates, relationships) from unstructured input during ingestion.",
         "category": "processing",
         "frequency": "Per ingestion",
+        "model_tier": "slm",
+    },
+    "11_user_model_synthesis": {
+        "description": "LLM-narrative user knowledge synthesis. Every 48h the user_model_evolver job in runtime/init/learning.py calls router.route_call('11_user_model_synthesis', ...) with the current model dict + recent delta evidence, and writes the narrative to USER_KNOWLEDGE.md. Falls back to rules-based dict rendering when all free providers are exhausted.",
+        "category": "reasoning",
+        "frequency": "Every 48h (via user_model_evolution job)",
         "model_tier": "slm",
     },
     "12_surplus_brainstorm": {
@@ -207,8 +213,8 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "On CC rate limit",
         "model_tier": "frontier",
     },
-    "contingency_inbox": {
-        "description": "Free API-based inbox evaluation fallback when CC is rate-limited or unavailable.",
+    "contingency_micro": {
+        "description": "Free API-based Micro reflection fallback when CC is rate-limited or unavailable. Used only for cheap periodic awareness-loop ticks where free SLMs are acceptable.",
         "category": "processing",
         "frequency": "On CC rate limit",
         "cost_policy": "Free only (never pays)",
@@ -252,13 +258,6 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "Daily",
         "model_tier": "frontier",
         "wired": False,
-    },
-    "11_user_model_synthesis": {
-        "description": "User knowledge synthesis. Writes USER_KNOWLEDGE.md from user_model_cache evidence.",
-        "category": "reasoning",
-        "frequency": "Every 48h (via user_model_evolution job)",
-        "model_tier": "frontier",
-        "wired": True,
     },
     "17_fresh_eyes_review": {
         "description": "Cross-vendor quality review of executor deliverables (Gate 2). Wired into executor pipeline. Activates when executor goes live.",

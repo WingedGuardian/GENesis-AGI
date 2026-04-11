@@ -17,8 +17,6 @@ from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import track_operation
 from genesis.observability.types import Severity, Subsystem
-from genesis.perception.confidence import load_config as load_confidence_config
-from genesis.perception.confidence import should_gate
 from genesis.qdrant.collections import delete_point, upsert_point
 
 # Qdrant connection errors — broad catch for any transport/protocol failure
@@ -107,6 +105,10 @@ class MemoryStore:
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
+        # Deferred import to break circular: memory.store ↔ perception
+        from genesis.perception.confidence import load_config as load_confidence_config
+        from genesis.perception.confidence import should_gate
+
         force_fts5_only = False
         cfg = load_confidence_config()
         gated, gate_msg = should_gate(confidence, cfg.memory_upsertion)

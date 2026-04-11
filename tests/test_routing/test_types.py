@@ -62,6 +62,11 @@ def test_call_site_config_defaults():
     assert cs.default_paid is False
     assert cs.never_pays is False
     assert cs.retry_profile == "default"
+    # dispatch defaults to "dual" so every existing call site without
+    # an explicit value preserves the pre-F1 (API-first-then-CLI)
+    # behaviour.  Regression guard for the "absence of dispatch = no
+    # behaviour change" contract.
+    assert cs.dispatch == "dual"
 
 
 def test_retry_policy_defaults():

@@ -25,12 +25,15 @@ async def surplus_status(
 
     if surplus:
         try:
-            from genesis.runtime import GenesisRuntime
-            rt = GenesisRuntime.instance()
-            idle = rt.idle_detector or surplus._idle_detector
+            # Use peek() — never construct a zombie singleton from an
+            # observability call (would mask real bootstrap failures elsewhere).
+            from genesis.runtime._core import GenesisRuntime
+            rt = GenesisRuntime.peek()
+            idle = (rt.idle_detector if rt is not None else None) or surplus._idle_detector
             is_idle = idle.is_idle()
             status = "idle" if is_idle else "dispatching"
         except Exception:
+            logger.warning("Failed to determine surplus status", exc_info=True)
             status = "unknown"
 
         with contextlib.suppress(Exception):

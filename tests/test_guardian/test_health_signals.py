@@ -42,6 +42,22 @@ def _mock_subprocess(rc: int = 0, stdout: str = "", stderr: str = ""):
     return mock
 
 
+def _mock_subprocess_sequence(results: list[tuple[int, str, str]]):
+    """Create a mock for _run_subprocess that returns a different result per call.
+
+    Raises IndexError if called more times than results provides.
+    """
+    calls = {"n": 0}
+
+    async def mock(*args, **kwargs):
+        i = calls["n"]
+        calls["n"] += 1
+        return results[i]
+
+    mock.call_count = lambda: calls["n"]  # type: ignore[attr-defined]
+    return mock
+
+
 def _mock_http(status: int = 200, body: str = "{}"):
     """Create a mock for _http_get_async."""
     async def mock(url, timeout=10.0):
@@ -109,6 +125,9 @@ class TestProbeIcmpReachable:
             result = await probe_icmp_reachable(config)
         assert result.alive is True
         assert result.name == "icmp_reachable"
+        # First-call success must not be labelled "retry" — regression guard
+        # for the retry-loop refactor.
+        assert result.detail == "reachable"
 
     @pytest.mark.asyncio
     async def test_unreachable(self, config: GuardianConfig) -> None:
@@ -118,6 +137,37 @@ class TestProbeIcmpReachable:
         ):
             result = await probe_icmp_reachable(config)
         assert result.alive is False
+
+    @pytest.mark.asyncio
+    async def test_first_ping_fails_retry_succeeds(self, config: GuardianConfig) -> None:
+        """Bridge ARP race — first packet drops, second arrives."""
+        mock = _mock_subprocess_sequence([
+            (1, "", "100% packet loss"),
+            (0, "1 packet received", ""),
+        ])
+        with patch(
+            "genesis.guardian.health_signals._run_subprocess",
+            mock,
+        ):
+            result = await probe_icmp_reachable(config)
+        assert result.alive is True
+        assert "retry" in result.detail
+        assert mock.call_count() == 2
+
+    @pytest.mark.asyncio
+    async def test_both_attempts_fail(self, config: GuardianConfig) -> None:
+        """Two consecutive failures — container really is unreachable."""
+        mock = _mock_subprocess_sequence([
+            (1, "", "100% packet loss"),
+            (1, "", "100% packet loss"),
+        ])
+        with patch(
+            "genesis.guardian.health_signals._run_subprocess",
+            mock,
+        ):
+            result = await probe_icmp_reachable(config)
+        assert result.alive is False
+        assert mock.call_count() == 2
 
 
 # ── Health API Probe ────────────────────────────────────────────────────

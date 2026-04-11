@@ -71,7 +71,7 @@ async def test_memory_store_delegates(mock_deps, tools):
     assert result == "mem-123"
     memory_mcp._store.store.assert_awaited_once_with(
         "hello", "test", memory_type="episodic", tags=None, confidence=0.5,
-        source_pipeline="conversation",
+        memory_class=None, source_pipeline="conversation",
     )
 
 

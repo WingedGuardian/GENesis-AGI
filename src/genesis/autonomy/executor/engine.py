@@ -572,10 +572,45 @@ class CCSessionExecutor:
             api_call_site_id = "autonomous_executor_reasoning"
 
         if self._autonomous_dispatcher is not None:
+            # Call-site gating pre-check: if this executor step_type is
+            # already pending approval, return a blocked StepResult
+            # without creating a second approval request.  The checkpoint
+            # system persists the step state and the next resume will
+            # re-check (approved → dispatch, still pending → still blocked).
+            executor_policy_id = f"executor_{step_type.value}"
+            try:
+                pending = await (
+                    self._autonomous_dispatcher.approval_gate.find_site_pending(
+                        subsystem="task_executor",
+                        policy_id=executor_policy_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "find_site_pending failed for %s; proceeding without pre-check",
+                    executor_policy_id, exc_info=True,
+                )
+                pending = None
+            if pending is not None:
+                blocker = (
+                    f"awaiting approval {pending.get('id')} for "
+                    f"{step_type.value} step"
+                )
+                logger.info(
+                    "Task %s step %d skipped — call site blocked on approval %s",
+                    task_id, step_idx, pending.get("id"),
+                )
+                return StepResult(
+                    idx=step_idx,
+                    status="blocked",
+                    result=blocker,
+                    blocker_description=blocker,
+                )
+
             decision = await self._autonomous_dispatcher.route(
                 AutonomousDispatchRequest(
                     subsystem="task_executor",
-                    policy_id=f"executor_{step_type.value}",
+                    policy_id=executor_policy_id,
                     action_label=f"task step {step_idx} ({step_type.value})",
                     messages=[{"role": "user", "content": prompt}],
                     cli_invocation=invocation,

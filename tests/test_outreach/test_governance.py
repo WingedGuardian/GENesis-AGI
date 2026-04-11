@@ -273,8 +273,12 @@ async def test_expired_window_allows_resend(db):
 
 
 @pytest.mark.asyncio
-async def test_blocker_deduped_when_duplicate(db):
-    """Blocker should be denied if an identical record was sent recently."""
+async def test_blocker_bypasses_even_when_duplicate(db):
+    """Blocker should ALWAYS bypass — dedup does not apply to blockers.
+
+    If something is blocking, it's blocking. Suppressing it silently is worse
+    than sending it twice. Fix the firing frequency, not the gate.
+    """
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
     now = datetime.now(UTC).isoformat()
@@ -300,13 +304,13 @@ async def test_blocker_deduped_when_duplicate(db):
         signal_type="critical_failure",
     )
     result = await gate.check(req)
-    assert result.verdict == GovernanceVerdict.DENY
-    assert "dedup" in result.checks_failed
+    assert result.verdict == GovernanceVerdict.BYPASS
+    assert "category_bypass" in result.checks_passed
 
 
 @pytest.mark.asyncio
 async def test_blocker_bypasses_when_not_duplicate(db):
-    """Blocker should bypass governance (except dedup) when no prior exists."""
+    """Blocker should bypass governance when no prior exists."""
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
     req = OutreachRequest(
@@ -321,8 +325,12 @@ async def test_blocker_bypasses_when_not_duplicate(db):
 
 
 @pytest.mark.asyncio
-async def test_alert_deduped_when_duplicate(db):
-    """Alert should be denied if an identical record was sent recently."""
+async def test_alert_bypasses_even_when_duplicate(db):
+    """Alert should ALWAYS bypass — dedup does not apply to alerts.
+
+    Same reasoning as blockers: if a condition is being reported, it exists
+    right now. Suppressing it hides persistence from the user.
+    """
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
     now = datetime.now(UTC).isoformat()
@@ -348,13 +356,13 @@ async def test_alert_deduped_when_duplicate(db):
         signal_type="circuit_breaker",
     )
     result = await gate.check(req)
-    assert result.verdict == GovernanceVerdict.DENY
-    assert "dedup" in result.checks_failed
+    assert result.verdict == GovernanceVerdict.BYPASS
+    assert "category_bypass" in result.checks_passed
 
 
 @pytest.mark.asyncio
 async def test_alert_bypasses_when_not_duplicate(db):
-    """Alert should bypass governance (except dedup) when no prior exists."""
+    """Alert should bypass governance when no prior exists."""
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
     req = OutreachRequest(

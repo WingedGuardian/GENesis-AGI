@@ -96,6 +96,11 @@ async def call_sites(
             }
             if trips > 0:
                 entry["trip_count"] = trips
+            # Add provider type + model for dashboard display names
+            pcfg = routing_config.providers.get(provider_name)
+            if pcfg:
+                entry["type"] = pcfg.provider_type
+                entry["model"] = pcfg.model_id
             chain_health.append(entry)
 
             if state not in (ProviderState.OPEN, ProviderState.HALF_OPEN):
@@ -225,13 +230,19 @@ async def call_sites(
         dispatch = yaml_ov.get("dispatch") or (meta.get("dispatch") if meta else None)
         chain = site_data.get("chain_health", [])
 
-        # 1. Overlay probe_status on each API chain entry
+        # 1. Overlay probe_status on each API chain entry.
+        #    Distinguish "not_configured" (no API key — permanent config state)
+        #    from "unreachable" (transient outage). Conflating these causes
+        #    Sentinel to treat missing-key providers as infrastructure failures.
         if probe_results:
             for entry in chain:
                 probe = probe_results.get(entry["provider"])
                 if probe is None:
                     continue  # no probe data → frontend falls back to CB state
-                if not probe.reachable:
+                if not probe.configured:
+                    entry["probe_status"] = "not_configured"
+                    entry["probe_reason"] = "no_api_key"
+                elif not probe.reachable:
                     entry["probe_status"] = "unreachable"
                 elif probe.error == "rate limited":
                     entry["probe_status"] = "rate_limited"
@@ -263,8 +274,21 @@ async def call_sites(
         if site_data.get("status") == "idle" or not chain:
             continue
 
+        # Filter disabled providers (configured=False) before evaluating
+        # site health — a provider without an API key is permanently
+        # unavailable-by-config, not "down." It should not affect routing
+        # authority decisions.
+        active_chain = [c for c in chain if _provider_health(c) != "disabled"]
+
+        if not active_chain:
+            # Every provider in this chain is unconfigured. This is a
+            # deployment-time config state, NOT an infrastructure alert.
+            site_data["status"] = "disabled"
+            site_data["disabled_reason"] = "no_api_keys_configured"
+            continue
+
         prev_status = site_data.get("status")
-        first_health = _provider_health(chain[0])
+        first_health = _provider_health(active_chain[0])
         if first_health == "up":
             # Preserve "warning" — DB found recent failures even though chain looks ok
             site_data["status"] = "warning" if prev_status == "warning" else "healthy"
@@ -272,7 +296,7 @@ async def call_sites(
             site_data["status"] = "degraded"
         else:
             # First provider down — check fallbacks
-            if any(_provider_health(c) in ("up", "suspect") for c in chain[1:]):
+            if any(_provider_health(c) in ("up", "suspect") for c in active_chain[1:]):
                 site_data["status"] = "degraded"
             else:
                 site_data["status"] = "down"
@@ -281,21 +305,32 @@ async def call_sites(
 
 
 def _provider_health(entry: dict) -> str:
-    """Derive provider health from probe_status (preferred) or CB state (fallback).
+    """Most-negative-opinion of CB state and probe status wins.
 
-    Returns 'up', 'suspect', or 'down'.
+    CB is the routing authority (controls whether traffic flows).
+    Probe is the reachability check (can the endpoint respond?).
+    If either says down, the provider is effectively down.
+
+    Returns 'up', 'suspect', 'down', or 'disabled'.
+
+    'disabled' is distinct from 'down': it means the provider has no API
+    key configured in this deployment (permanent config state), not that
+    it crashed. Callers should filter disabled providers out of routing
+    decisions rather than treating them as failures.
     """
+    # Probe says "no API key" — provider is disabled by config, not broken
     ps = entry.get("probe_status")
-    if ps == "reachable":
-        return "up"
-    if ps == "rate_limited":
-        return "suspect"
-    if ps == "unreachable":
-        return "down"
-    # No probe data — fall back to CB state
+    if ps == "not_configured":
+        return "disabled"
+    # CB state checked first — router won't send traffic if CB is open
     state = entry.get("state", "closed")
     if state in ("open", "error"):
         return "down"
     if state == "half_open":
+        return "suspect"
+    # CB is closed — now check probe reachability
+    if ps == "unreachable":
+        return "down"
+    if ps == "rate_limited":
         return "suspect"
     return "up"

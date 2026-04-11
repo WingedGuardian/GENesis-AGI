@@ -1,11 +1,12 @@
-"""Tests for signal_weights CRUD (uses seed data: 9 rows)."""
+"""Tests for signal_weights CRUD (uses seed data: 10 rows)."""
 
 from genesis.db.crud import signal_weights
 
 
 async def test_list_all(db):
     rows = await signal_weights.list_all(db)
-    assert len(rows) == 11
+    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
+    assert len(rows) == 10
 
 
 async def test_get_existing(db):

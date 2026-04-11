@@ -3,3 +3,7 @@ manual_approval_required: true
 reask_interval_hours: 24
 approval_channel: telegram
 shared_export_enabled: true
+
+# Sentinel and Guardian CC sessions — separate approval toggle
+# Default: true (require approval before dispatching these autonomous actors)
+manual_approval_required_sentinel: true

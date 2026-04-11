@@ -11,12 +11,18 @@ channel_preferences:
   alert: telegram
   surplus: telegram
   digest: telegram
+  # Autonomous CLI approval prompts route to Telegram so the user can tap
+  # the inline ✅ button (or reply with "approve" in the Approvals topic).
+  approval: telegram
 
 thresholds:
   blocker: 0.0
   alert: 0.3
   surplus: 0.7
   digest: 0.0
+  # Approvals bypass the salience gate entirely — if the approval gate
+  # asked for confirmation, the user always needs to see it.
+  approval: 0.0
 
 rate_limits:
   max_daily: 5
@@ -35,6 +41,10 @@ engagement:
 # When forum_chat_id is not configured, "supergroup" degrades to DM.
 delivery_routing:
   default: supergroup
+  # Approvals deliver exclusively to the supergroup Approvals topic —
+  # never DM.  Grouping them in one topic keeps the inline-button UX
+  # coherent and makes the "approve all N pending" button meaningful.
+  approval: supergroup
 
 health_alerts:
   # Only these alert IDs go to Telegram (CRITICAL severity only).

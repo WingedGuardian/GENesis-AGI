@@ -170,6 +170,19 @@ async def main():
     from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2 as AdapterCls
     log.info("Starting Telegram adapter V2")
 
+    # Inject the autonomous CLI approval gate so handle_callback_query
+    # can resolve cli_approve/cli_approve_all inline buttons and the text
+    # handler can resolve bare approve/reject typed in the Approvals topic.
+    # If the gate is None (unusual — autonomy init failed), approvals
+    # still deliver but must be resolved via the dashboard approvals API.
+    autonomous_cli_gate = runtime.autonomous_cli_approval_gate
+    if autonomous_cli_gate is None:
+        log.warning(
+            "Telegram bridge: autonomous_cli_approval_gate is None — "
+            "inline approval buttons will not resolve. Dashboard-only "
+            "approval fallback is still available.",
+        )
+
     adapter = AdapterCls(
         token=config["token"],
         conversation_loop=conversation_loop,
@@ -179,6 +192,7 @@ async def main():
         config_loader=tts_config_loader,
         reply_waiter=reply_waiter,
         engagement_tracker=runtime.engagement_tracker,
+        autonomous_cli_gate=autonomous_cli_gate,
     )
 
     # Register adapter so outreach pipeline can deliver via Telegram
@@ -216,11 +230,13 @@ async def main():
         )
         await topic_manager.load_persisted()
 
-        # Pre-create persistent category topics
+        # Pre-create persistent category topics (including Approvals
+        # so bare-text approval resolution in that topic works from
+        # startup, not just after the first approval is delivered).
         for cat in (
             "conversation", "morning_report", "alert",
             "reflection_micro", "reflection_light", "reflection_deep", "reflection_strategic",
-            "surplus", "recon",
+            "surplus", "recon", "approvals",
         ):
             await topic_manager.get_or_create_persistent(cat)
 

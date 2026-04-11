@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""UserPromptSubmit hook: temporal awareness + urgent alerts + bookmark hints.
+"""UserPromptSubmit hook: temporal awareness + bookmark + shelve hints.
 
 Runs before each user message is processed. Three responsibilities:
 1. Inject absolute timestamps for temporal awareness (session clock)
 2. Buffer user messages for session bookmarks (rolling last 5)
-3. Check for urgent alerts (CRITICAL events, unread outreach)
-4. Detect /shelve or /unshelve and inject soft hint for LLM
+3. Detect /shelve or /unshelve and inject soft hint for LLM
+
+This hook does NOT inject alerts into the prompt. Alerts are delivered
+via the Telegram outreach pipeline; injecting them into the CC session
+prompt was a duplicate channel that caused identical alerts to flood
+every prompt. Removed 2026-04-09. Filename retained for now to avoid
+churn in .claude/settings.json — TODO: rename to genesis_session_state.py
+in a follow-up cleanup.
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}
@@ -16,7 +22,6 @@ the SessionStart hook). Falls back to a 10-minute lookback if file missing.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
@@ -38,7 +43,6 @@ if _SECRETS_PATH.is_file():
 _FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _SESSION_START_FILE = Path.home() / ".genesis" / "session_start"
 _GENESIS_DIR = Path.home() / ".genesis"
-_DEFAULT_DB = Path.home() / "genesis" / "data" / "genesis.db"
 _FALLBACK_LOOKBACK_MINUTES = 10
 _MAX_BUFFER_LINES = 5
 _MAX_MSG_LENGTH = 200
@@ -141,57 +145,6 @@ def _check_shelve_hint(prompt: str) -> None:
         sys.stdout.flush()
 
 
-async def _check_alerts(since: str) -> list[str]:
-    """Query DB for critical events and unread outreach since session start."""
-    import aiosqlite
-
-    if not _DEFAULT_DB.exists():
-        return []
-
-    alerts: list[str] = []
-    try:
-        db = await aiosqlite.connect(str(_DEFAULT_DB))
-        db.row_factory = aiosqlite.Row
-        try:
-            # 1. CRITICAL events since session start
-            cursor = await db.execute(
-                "SELECT subsystem, event_type, message, timestamp "
-                "FROM events WHERE severity = 'CRITICAL' AND timestamp > ? "
-                "ORDER BY timestamp DESC LIMIT 5",
-                (since,),
-            )
-            rows = await cursor.fetchall()
-            for row in rows:
-                alerts.append(
-                    f"CRITICAL [{row['subsystem']}] {row['message']} "
-                    f"({row['timestamp']})"
-                )
-
-            # 2. Unread outreach (delivered but user hasn't engaged)
-            # Exclude digests — scheduled reports are not urgent.
-            cursor = await db.execute(
-                "SELECT topic, category, channel, delivered_at "
-                "FROM outreach_history "
-                "WHERE engagement_outcome IS NULL AND delivered_at IS NOT NULL "
-                "AND delivered_at > ? "
-                "AND category != 'digest' "
-                "ORDER BY delivered_at DESC LIMIT 5",
-                (since,),
-            )
-            rows = await cursor.fetchall()
-            for row in rows:
-                alerts.append(
-                    f"Unread [{row['category']}] {row['topic']} "
-                    f"(sent via {row['channel']} at {row['delivered_at']})"
-                )
-        finally:
-            await db.close()
-    except Exception:
-        pass  # DB errors are not themselves alerts — fail silently
-
-    return alerts
-
-
 def main() -> None:
     # Skip if Genesis context is disabled
     if not _FLAG.exists():
@@ -223,24 +176,6 @@ def main() -> None:
     # 3. Shelve/unshelve hint
     if prompt:
         _check_shelve_hint(prompt)
-
-    # 4. Urgent alerts (original functionality)
-    since = _get_session_start()
-    alerts = asyncio.run(_check_alerts(since))
-
-    if not alerts:
-        return
-
-    lines = ["## Urgent Alerts", ""]
-    lines.append(
-        "The following items need your attention. "
-        "Mention them in your response to the user."
-    )
-    lines.append("")
-    for alert in alerts:
-        lines.append(f"- {alert}")
-
-    print("\n".join(lines))
 
 
 if __name__ == "__main__":

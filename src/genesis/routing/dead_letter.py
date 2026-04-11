@@ -6,6 +6,7 @@ import ast
 import json
 import logging
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
 import aiosqlite
@@ -14,7 +15,33 @@ from genesis.db.crud import dead_letter as dl_crud
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
 
+# Sentinel status-reason suffix used when the orphan scan marks an item
+# expired because its target_provider was dropped from config on reload.
+# Kept distinct from the 72h age-based expiry reason so operators can tell
+# the two apart in logs and audits.
+ORPHAN_REASON_PROVIDER_REMOVED = "provider_removed_on_reload"
+
 logger = logging.getLogger(__name__)
+
+
+def _is_unknown_call_site_error(error: str | None) -> bool:
+    """Return True when a RoutingResult.error signals an unknown call_site_id.
+
+    The router returns this error when ``route_call()`` is invoked with a
+    call_site_id that is not present in the current routing config. We use
+    it in redispatch() to expire stale DLQ items whose call_site_id was
+    renamed or removed (e.g., contingency_inbox → contingency_micro after
+    a config reload), instead of retrying them forever until expire_old()
+    cleans them up 72h later.
+
+    The sentinel string lives on :mod:`genesis.routing.router` as
+    ``UNKNOWN_CALL_SITE_ERROR_PREFIX``. Import locally to avoid a hard
+    import cycle (router already imports DeadLetterQueue).
+    """
+    if not error:
+        return False
+    from genesis.routing.router import UNKNOWN_CALL_SITE_ERROR_PREFIX
+    return error.startswith(UNKNOWN_CALL_SITE_ERROR_PREFIX)
 
 
 class DeadLetterQueue:
@@ -66,6 +93,53 @@ class DeadLetterQueue:
         for item in items:
             await dl_crud.update_status(self.db, item["id"], status="replayed")
         return len(items)
+
+    async def scan_orphans_by_provider(
+        self, active_providers: Iterable[str],
+    ) -> int:
+        """Expire pending items whose target_provider is no longer in config.
+
+        Proactive complement to ``redispatch()``'s reactive call_site_id
+        orphan cleanup. When routing config is hot-reloaded and a provider
+        is removed (contract ended, key rotated out, etc.), every pending
+        DLQ item targeting that provider will fail redispatch forever
+        until the 72h age-based ``expire_old`` sweep finally catches them.
+        This method short-circuits that wait: on every config reload, run
+        a single atomic SQL UPDATE that marks every pending item whose
+        ``target_provider`` is not in the active provider set as expired
+        in one round-trip, and returns the affected rows via ``RETURNING``.
+
+        The SQL-side filter is deliberate: paginating via ``query_pending``
+        would cap the scan at 50 items per call, silently leaving larger
+        orphan batches to wait 72h for ``expire_old``. That defeats the
+        whole purpose of the proactive feature.
+
+        Args:
+            active_providers: iterable of provider names currently in config.
+
+        Returns:
+            Count of orphans expired on this scan.
+        """
+        # Materialize once — used only for the SQL IN-list.
+        active = list(set(active_providers))
+        expired = await dl_crud.expire_orphans_by_provider(
+            self.db, active_providers=active,
+        )
+        for item_id, target in expired:
+            logger.info(
+                "Expired dead letter %s: target_provider %r no longer "
+                "in active config (%s)",
+                item_id, target, ORPHAN_REASON_PROVIDER_REMOVED,
+            )
+        if expired and self._event_bus:
+            await self._event_bus.emit(
+                Subsystem.ROUTING, Severity.INFO,
+                "dead_letter.orphans_expired",
+                f"Expired {len(expired)} DLQ orphan(s) after config reload",
+                count=len(expired), reason=ORPHAN_REASON_PROVIDER_REMOVED,
+                orphan_ids=[item_id for item_id, _ in expired],
+            )
+        return len(expired)
 
     async def expire_old(self, max_age_hours: int = 72) -> int:
         """Mark pending items older than max_age_hours as 'expired'. Returns count."""
@@ -134,6 +208,15 @@ class DeadLetterQueue:
                     succeeded += 1
                     logger.info(
                         "Re-dispatched dead letter %s for %s",
+                        item["id"], call_site_id,
+                    )
+                elif _is_unknown_call_site_error(result.error):
+                    # The call_site_id no longer exists in the current router
+                    # config (almost always: config reload renamed/removed it).
+                    # Retrying forever is pure waste — expire immediately.
+                    await dl_crud.update_status(self.db, item["id"], status="expired")
+                    logger.info(
+                        "Expired dead letter %s: call_site_id %r no longer exists in config",
                         item["id"], call_site_id,
                     )
                 else:

@@ -30,6 +30,10 @@ from genesis.guardian.config import GuardianConfig
 logger = logging.getLogger(__name__)
 
 
+class CCDiagnosisError(Exception):
+    """CC diagnosis failed with a specific, capturable reason."""
+
+
 class RecoveryAction(StrEnum):
     """Available recovery actions, in escalation order."""
 
@@ -53,6 +57,7 @@ class DiagnosisResult:
     outcome: str = "escalate"  # "resolved" | "partially_resolved" | "escalate"
     reasoning: str = ""
     source: str = "cc"  # "cc" or "cc_unavailable"
+    cc_failure_reason: str = ""  # Why CC was unavailable (empty = CC succeeded)
 
 
 _FAILURE_INVENTORY = """
@@ -93,12 +98,38 @@ service baselines, metric norms, and recent history that may help your diagnosis
 {briefing_context}
 """
 
+    # Check Sentinel state from shared filesystem
+    sentinel_section = ""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        sentinel_last = _Path.home() / ".genesis" / "shared" / "sentinel" / "last_run.json"
+        if sentinel_last.exists():
+            sdata = _json.loads(sentinel_last.read_text())
+            sentinel_section = f"""
+## Sentinel Status (Container-Side Guardian)
+
+Genesis has an internal health guardian called the Sentinel that runs inside
+the container. Before you act, check what the Sentinel already tried:
+
+Last Sentinel run: {sdata.get('timestamp', 'unknown')}
+Trigger: {sdata.get('trigger_source', 'unknown')} — {sdata.get('diagnosis', 'no diagnosis')}
+Actions taken: {', '.join(sdata.get('actions_taken', [])) or 'none'}
+Resolved: {sdata.get('resolved', 'unknown')}
+
+If the Sentinel already diagnosed and attempted to fix this problem, do NOT
+repeat the same actions. Either try something different or escalate.
+"""
+    except Exception:
+        logger.debug("Failed to read sentinel state for diagnosis prompt", exc_info=True)
+
     return f"""You are the Genesis Guardian — the system's last line of defense.
 Genesis appears to be down. You are running on the host VM with full tool access.
 Genesis runs inside the Incus container "{container_name}".
 
 Your job: investigate the root cause, attempt recovery, and verify the fix worked.
 You are the doctor — examine the patient, treat them, confirm the treatment worked.
+{sentinel_section}
 
 ## Initial Diagnostic Data
 
@@ -199,16 +230,20 @@ class DiagnosisEngine:
         Prime directive: first, do no harm. Without CC's judgment to
         cross-reference signals, no programmatic recovery is safe.
         """
+        cc_failure_reason = ""
+
         if self._config.cc.enabled:
             try:
-                result = await self._diagnose_with_cc(diagnostic, signal_summary)
-                if result is not None:
-                    return result
-                logger.warning("CC diagnosis returned None — escalating without action")
+                return await self._diagnose_with_cc(diagnostic, signal_summary)
             except Exception as exc:
+                cc_failure_reason = f"{type(exc).__name__}: {exc}"
                 logger.error("CC diagnosis failed: %s", exc, exc_info=True)
+        else:
+            cc_failure_reason = "CC diagnosis disabled in Guardian config"
 
-        return self._escalate_without_cc(diagnostic)
+        return self._escalate_without_cc(
+            diagnostic, cc_failure_reason=cc_failure_reason,
+        )
 
     async def _diagnose_with_cc(
         self,
@@ -265,26 +300,30 @@ class DiagnosisEngine:
                 proc.communicate(input=prompt.encode("utf-8")),
                 timeout=self._config.cc.timeout_s,
             )
-        except TimeoutError:
+        except TimeoutError as exc:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            logger.error(
-                "CC diagnosis timed out after %ds — this should not happen "
-                "during legitimate work. Possible hung process.",
-                self._config.cc.timeout_s,
-            )
-            return None
+            raise CCDiagnosisError(
+                f"CC timed out after {self._config.cc.timeout_s}s"
+            ) from exc
 
         if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="replace")[:300]
             logger.error(
                 "CC diagnosis exited with code %d: %s",
-                proc.returncode,
-                stderr.decode("utf-8", errors="replace")[:500],
+                proc.returncode, stderr_text,
             )
-            return None
+            raise CCDiagnosisError(
+                f"CC exited with code {proc.returncode}: {stderr_text}"
+            )
 
-        return self._parse_cc_response(stdout.decode("utf-8", errors="replace"))
+        result = self._parse_cc_response(stdout.decode("utf-8", errors="replace"))
+        if result is None:
+            raise CCDiagnosisError(
+                "No valid JSON diagnosis found in CC response"
+            )
+        return result
 
     def _parse_cc_response(self, raw: str) -> DiagnosisResult | None:
         """Parse the CC response into a DiagnosisResult.
@@ -390,7 +429,12 @@ class DiagnosisEngine:
 
         return None
 
-    def _escalate_without_cc(self, diagnostic: DiagnosticSnapshot) -> DiagnosisResult:
+    def _escalate_without_cc(
+        self,
+        diagnostic: DiagnosticSnapshot,
+        *,
+        cc_failure_reason: str = "",
+    ) -> DiagnosisResult:
         """CC unavailable — collect evidence and ESCALATE. No recovery actions.
 
         Prime directive: first, do no harm. Any single signal can lie.
@@ -425,10 +469,15 @@ class DiagnosisEngine:
             recommended_action=RecoveryAction.ESCALATE,
             actions_taken=[],
             outcome="escalate",
-            reasoning="Guardian's diagnostic brain (CC) is unavailable. "
-                      "Without intelligent cross-referencing of signals, any "
-                      "programmatic recovery risks acting on a false signal. "
-                      "Escalating to user with full diagnostic dump. "
-                      "Manual investigation required.",
+            reasoning=(
+                f"CC diagnosis failed: {cc_failure_reason or 'unknown'}. "
+                "Guardian collected diagnostic evidence (memory, disk, services, journal) "
+                "but cannot safely determine root cause without CC cross-referencing signals. "
+                f"ACTION REQUIRED: Check ~/.local/state/genesis-guardian/guardian.log, "
+                f"then container logs via "
+                f"'incus exec {self._config.container_name} -- "
+                f"su - ubuntu -c \"journalctl --user -n 200\"'."
+            ),
             source="cc_unavailable",
+            cc_failure_reason=cc_failure_reason,
         )

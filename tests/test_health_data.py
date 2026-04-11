@@ -245,6 +245,145 @@ class TestProviderHealth:
 
         assert _provider_health({"state": "closed", "probe_status": "unreachable"}) == "down"
 
+    def test_not_configured_returns_disabled(self):
+        """Provider with no API key returns 'disabled' (not down/up).
+
+        Regression for the call-site-11 spam loop: 'not_configured' is a
+        deployment-time config state, not an outage. Callers must filter
+        these providers out of routing decisions, not treat them as failures.
+        """
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        assert _provider_health({"state": "closed", "probe_status": "not_configured"}) == "disabled"
+
+    def test_not_configured_overrides_cb_state(self):
+        """not_configured wins over CB state — config absence is permanent."""
+        from genesis.observability.snapshots.call_sites import _provider_health
+
+        # Even if CB happens to be open, missing API key is the dominant truth
+        assert _provider_health({"state": "open", "probe_status": "not_configured"}) == "disabled"
+
+
+class TestDisabledChainSemantics:
+    """Disabled providers must be filtered, not treated as failures.
+
+    The bug this addresses: Anthropic providers (claude-sonnet, claude-opus,
+    claude-haiku) have no ANTHROPIC_API_KEY in this deployment because Genesis
+    accesses Claude only via Claude Code background sessions. The probe
+    correctly returned configured=False, but the call_sites snapshot then
+    treated them as "unreachable → down → CRITICAL alert → Sentinel wake."
+    The fix: filter disabled providers out of the chain walk, and if every
+    provider is disabled, mark the site itself "disabled" (config state, not
+    alert condition).
+    """
+
+    @pytest.mark.asyncio
+    async def test_chain_walk_filters_disabled_providers(self):
+        """A chain of [disabled, healthy] should report healthy, not degraded."""
+        from genesis.observability.provider_health import ProviderProbeResult
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {
+            "anthropic-direct": _make_provider("anthropic-direct"),
+            "openrouter-fallback": _make_provider("openrouter-fallback"),
+        }
+        config = _make_config(providers, {
+            "test_site": CallSiteConfig(
+                id="test_site",
+                chain=["anthropic-direct", "openrouter-fallback"],
+            ),
+        })
+        breakers = _mock_registry({
+            "anthropic-direct": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-fallback": _mock_breaker(ProviderState.CLOSED),
+        })
+        probe_results = {
+            "anthropic-direct": ProviderProbeResult(
+                provider_name="anthropic-direct",
+                reachable=False,
+                configured=False,
+                error="no API key configured",
+            ),
+            "openrouter-fallback": ProviderProbeResult(
+                provider_name="openrouter-fallback",
+                reachable=True,
+                configured=True,
+            ),
+        }
+        result = await call_sites(
+            db=None, routing_config=config, breakers=breakers,
+            probe_results=probe_results,
+        )
+        assert result["test_site"]["status"] == "healthy"
+
+    @pytest.mark.asyncio
+    async def test_all_disabled_chain_yields_disabled_status(self):
+        """A chain where every provider is unconfigured → site status='disabled'."""
+        from genesis.observability.provider_health import ProviderProbeResult
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {
+            "claude-sonnet": _make_provider("claude-sonnet"),
+            "claude-opus": _make_provider("claude-opus"),
+        }
+        config = _make_config(providers, {
+            "11_user_model_synthesis": CallSiteConfig(
+                id="11_user_model_synthesis",
+                chain=["claude-sonnet", "claude-opus"],
+            ),
+        })
+        breakers = _mock_registry({
+            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+            "claude-opus": _mock_breaker(ProviderState.CLOSED),
+        })
+        probe_results = {
+            "claude-sonnet": ProviderProbeResult(
+                provider_name="claude-sonnet",
+                reachable=False, configured=False,
+                error="no API key configured",
+            ),
+            "claude-opus": ProviderProbeResult(
+                provider_name="claude-opus",
+                reachable=False, configured=False,
+                error="no API key configured",
+            ),
+        }
+        result = await call_sites(
+            db=None, routing_config=config, breakers=breakers,
+            probe_results=probe_results,
+        )
+        site = result["11_user_model_synthesis"]
+        assert site["status"] == "disabled"
+        assert site["disabled_reason"] == "no_api_keys_configured"
+
+    @pytest.mark.asyncio
+    async def test_probe_overlay_marks_not_configured(self):
+        """Probe overlay sets probe_status='not_configured' + reason='no_api_key'."""
+        from genesis.observability.provider_health import ProviderProbeResult
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {"claude-sonnet": _make_provider("claude-sonnet")}
+        config = _make_config(providers, {
+            "test_site": CallSiteConfig(id="test_site", chain=["claude-sonnet"]),
+        })
+        breakers = _mock_registry({
+            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+        })
+        probe_results = {
+            "claude-sonnet": ProviderProbeResult(
+                provider_name="claude-sonnet",
+                reachable=False, configured=False,
+                error="no API key configured",
+            ),
+        }
+        result = await call_sites(
+            db=None, routing_config=config, breakers=breakers,
+            probe_results=probe_results,
+        )
+        chain = result["test_site"]["chain_health"]
+        assert chain[0]["probe_status"] == "not_configured"
+        assert chain[0]["probe_reason"] == "no_api_key"
+
 
 class TestCallSiteTripCount:
     """Verify trip_count is exposed in chain_health entries."""

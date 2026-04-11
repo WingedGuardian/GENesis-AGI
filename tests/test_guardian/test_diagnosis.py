@@ -212,12 +212,17 @@ class TestDiagnoseFlow:
         assert result.recommended_action == RecoveryAction.ESCALATE
 
     @pytest.mark.asyncio
-    async def test_cc_returns_none_escalates(self, engine: DiagnosisEngine) -> None:
-        with patch.object(engine, "_diagnose_with_cc", return_value=None):
+    async def test_cc_parse_failure_escalates(self, engine: DiagnosisEngine) -> None:
+        from genesis.guardian.diagnosis import CCDiagnosisError
+        with patch.object(
+            engine, "_diagnose_with_cc",
+            side_effect=CCDiagnosisError("No valid JSON diagnosis found"),
+        ):
             snap = _snap(container_status="Running")
             result = await engine.diagnose(snap)
         assert result.source == "cc_unavailable"
         assert result.recommended_action == RecoveryAction.ESCALATE
+        assert "CCDiagnosisError" in result.cc_failure_reason
 
 
 # ── RecoveryAction enum ──────────────────────────────────────────────────

@@ -30,6 +30,7 @@ from genesis.channels.telegram._handler_commands import (
 )
 from genesis.channels.telegram._handler_context import HandlerContext
 from genesis.channels.telegram._handler_messages import (
+    handle_callback_query,
     handle_document,
     handle_photo,
     handle_text,
@@ -60,6 +61,7 @@ def make_handlers_v2(
     db: aiosqlite.Connection | None = None,
     typing_breaker: TypingCircuitBreaker | None = None,
     dedupe: TelegramUpdateDedupe | None = None,
+    autonomous_cli_gate: object | None = None,
 ):
     """Return V2 handler callbacks."""
     draft_streaming_enabled = os.environ.get(
@@ -78,6 +80,7 @@ def make_handlers_v2(
         typing_breaker=typing_breaker,
         dedupe=dedupe,
         draft_streaming_enabled=draft_streaming_enabled,
+        autonomous_cli_gate=autonomous_cli_gate,
     )
 
     def _wrap(cmd_fn):
@@ -100,4 +103,5 @@ def make_handlers_v2(
         "voice": _wrap(handle_voice),
         "photo": _wrap(handle_photo),
         "document": _wrap(handle_document),
+        "callback_query": _wrap(handle_callback_query),
     }

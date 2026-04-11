@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0a1"
+version = "3.0.0a3"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
@@ -21,6 +21,7 @@ dependencies = [
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
     "fastmcp>=2.0,<3.0",  # 3.x has breaking API changes; CVE-2026-32871/27124/2025-64340 not exploitable
                          # (Genesis uses stdio transport only, no OpenAPI/OAuth/CLI features)
+    "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,7 @@ browser = [
     "playwright>=1.40",
     "camoufox>=0.4",
 ]
+release = []  # detect-secrets is now a core dep (see dependencies above)
 
 [build-system]
 requires = ["setuptools>=64"]

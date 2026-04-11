@@ -84,6 +84,17 @@ class OutreachPipeline:
         """Attach a TopicManager for routing outreach to forum topics."""
         self._topic_manager = topic_manager
 
+    @property
+    def topic_manager(self):
+        """Public accessor for the attached TopicManager, or None.
+
+        Exposed so handlers (e.g. the Telegram bare-text approval
+        resolver) can look up topic thread_ids via a stable public
+        API instead of reaching into the private ``_topic_manager``
+        attribute.
+        """
+        return self._topic_manager
+
     def set_forum_chat_id(self, chat_id: int) -> None:
         """Set the supergroup chat ID for forum topic delivery."""
         self._forum_chat_id = str(chat_id)
@@ -134,16 +145,19 @@ class OutreachPipeline:
 
     async def submit_raw(
         self, text: str, request: OutreachRequest,
+        *, reply_markup: object | None = None,
     ) -> OutreachResult:
         """Deliver pre-formatted text. Skips governance and LLM drafter.
 
         For urgent infrastructure alerts where speed matters more than prose.
+        ``reply_markup`` is forwarded to the adapter for inline keyboard buttons.
         """
         outreach_id = str(uuid.uuid4())
         channel = request.channel or self._select_channel(request.category)
         format_target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
         formatted = self._formatter.format(text, format_target)
-        return await self._deliver(outreach_id, channel, formatted, request, None)
+        return await self._deliver(outreach_id, channel, formatted, request, None,
+                                   reply_markup=reply_markup)
 
     async def submit_urgent(self, request: OutreachRequest) -> OutreachResult:
         outreach_id = str(uuid.uuid4())
@@ -182,6 +196,54 @@ class OutreachPipeline:
         )
         return result, reply
 
+    async def submit_raw_and_wait(
+        self,
+        text: str,
+        request: OutreachRequest,
+        *,
+        timeout_s: float = 300.0,
+        reply_markup: object | None = None,
+        waiter_key: str | None = None,
+    ) -> tuple[OutreachResult, str | None]:
+        """Submit pre-formatted text and wait for user reply.
+
+        Skips governance and LLM drafting. Supports inline keyboard buttons:
+        pass a pre-generated ``waiter_key`` (used in button callback_data) and
+        ``reply_markup`` (the InlineKeyboardMarkup). After send, delivery_id is
+        aliased to waiter_key so quote-reply also resolves the waiter.
+        """
+        if not self._reply_waiter:
+            logger.warning("submit_raw_and_wait called without reply_waiter")
+            result = await self.submit_raw(text, request, reply_markup=reply_markup)
+            return result, None
+
+        # Pre-register waiter if button key provided
+        if waiter_key:
+            self._reply_waiter.register(waiter_key)
+
+        result = await self.submit_raw(text, request, reply_markup=reply_markup)
+        if result.status != OutreachStatus.DELIVERED or not result.delivery_id:
+            if waiter_key:
+                self._reply_waiter.cancel(waiter_key)
+            return result, None
+
+        # Alias so quote-reply (by Telegram message_id) also resolves the waiter
+        actual_key = waiter_key or result.delivery_id
+        if waiter_key and result.delivery_id != waiter_key:
+            self._reply_waiter.add_alias(result.delivery_id, waiter_key)
+
+        try:
+            reply = await self._reply_waiter.wait_for_reply(
+                actual_key, timeout_s=timeout_s,
+            )
+        finally:
+            # Clean up both keys to prevent stale entries (resolve only
+            # pops one key; the counterpart would leak)
+            if waiter_key and result.delivery_id != waiter_key:
+                self._reply_waiter.remove(result.delivery_id, waiter_key)
+
+        return result, reply
+
     @staticmethod
     def _load_alert_prompt() -> str | None:
         """Load the alert drafting system prompt from OUTREACH_ALERT.md."""
@@ -207,6 +269,8 @@ class OutreachPipeline:
         formatted: FormattedContent,
         request: OutreachRequest,
         gov: object | None,
+        *,
+        reply_markup: object | None = None,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
         recipient = self._recipients.get(channel, "")
@@ -257,6 +321,7 @@ class OutreachPipeline:
 
         # Resolve forum topic for this outreach category
         thread_id = None
+        topic_cat: str | None = None
         if routing in ("supergroup", "both") and self._topic_manager is not None:
             topic_cat = self._topic_manager.resolve_outreach_category(
                 request.category.value,
@@ -268,14 +333,33 @@ class OutreachPipeline:
         if routing in ("supergroup", "both") and thread_id is not None and self._forum_chat_id:
             delivery_recipient = self._forum_chat_id
         else:
-            # DM delivery — never pass thread_id to non-forum chats
+            # DM delivery — never pass thread_id to non-forum chats.
+            # If we WANTED the topic but couldn't resolve a thread_id,
+            # surface the fallback so operators know messages are landing
+            # in DM instead of silently disappearing from the forum topic.
+            # (This is the "where did my approval go?" signal that was
+            # missing on 2026-04-10 when 7 approvals routed to DM.)
+            if (
+                routing in ("supergroup", "both")
+                and self._forum_chat_id
+                and self._topic_manager is not None
+            ):
+                logger.info(
+                    "outreach category=%s wanted supergroup topic "
+                    "routing but thread_id is None — falling back to DM "
+                    "(target category=%s); check earlier ERROR logs from "
+                    "TopicManager for the underlying cause",
+                    request.category.value, topic_cat or "?",
+                )
             thread_id = None
 
         try:
             delivery_id = await adapter.send_message(
-                delivery_recipient, formatted.text, message_thread_id=thread_id,
+                delivery_recipient, formatted.text,
+                message_thread_id=thread_id,
+                reply_markup=reply_markup,
             )
-            # Secondary DM copy for "both" mode
+            # Secondary DM copy for "both" mode (no buttons — primary only)
             if (routing == "both" and delivery_recipient != recipient
                     and self._forum_chat_id and thread_id is not None):
                 try:

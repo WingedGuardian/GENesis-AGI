@@ -17,7 +17,15 @@ _SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
 
 
 def _persist_session_config(*, model: str | None = None, effort: str | None = None) -> None:
-    """Write current model/effort to disk for the SessionStart hook to read."""
+    """Write current model/effort to disk for the SessionStart hook to read.
+
+    This is a best-effort cache write called AFTER the operational DB write
+    has already committed. Its only job is to keep the on-disk JSON in sync
+    so the SessionStart hook sees the new value on the next session. A
+    failure here is "recoverable degradation" (WARNING per observability
+    rules), not an operational write failure — the DB is already correct.
+    Swallowing the error keeps the caller's success path intact.
+    """
     import os
     import tempfile
 
@@ -40,8 +48,16 @@ def _persist_session_config(*, model: str | None = None, effort: str | None = No
                 os.close(fd)
                 os.unlink(tmp)
             raise
-    except Exception:
-        logger.debug("Failed to persist session config", exc_info=True)
+    except (OSError, json.JSONDecodeError, ValueError):
+        # OSError: filesystem issues (mkdir, mkstemp, write, replace).
+        # json.JSONDecodeError / ValueError: existing config file is
+        # corrupt — we'd rather log and move on than crash the caller.
+        # WARNING (not ERROR): the authoritative write (DB) already
+        # succeeded; this cache write is best-effort.
+        logger.warning(
+            "Failed to persist session config cache at %s",
+            _SESSION_CONFIG, exc_info=True,
+        )
 
 
 async def _impl_session_set_model(session_id: str, model: str) -> dict:

@@ -84,6 +84,7 @@ def _bootstrap_health() -> None:
         svc = StandaloneHealthDataService(status_path=_DEFAULT_STATUS, db=None)
         tracker = ProviderActivityTracker()
         init_health_mcp(svc, activity_tracker=tracker)
+        clear_mcp_crash("health")
         mcp.run(transport="stdio")
         return
 
@@ -105,8 +106,11 @@ def _bootstrap_health() -> None:
             tracker = ProviderActivityTracker()
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
+            clear_mcp_crash("health")
             yield
         finally:
+            from genesis.mcp.health.browser import async_cleanup as _browser_cleanup
+            await _browser_cleanup()
             await db.close()
 
     mcp._lifespan = _lifespan
@@ -140,6 +144,7 @@ def _bootstrap_memory() -> None:
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
             embedding = EmbeddingProvider()
             init(db=db, qdrant_client=qdrant, embedding_provider=embedding)
+            clear_mcp_crash("memory")
             yield
         finally:
             await db.close()
@@ -170,6 +175,7 @@ def _bootstrap_recon() -> None:
 
         try:
             init_recon_mcp(db=db)
+            clear_mcp_crash("recon")
             yield
         finally:
             await db.close()
@@ -207,6 +213,7 @@ def _bootstrap_outreach() -> None:
             # Standalone: pipeline=None means outreach_send returns "not initialized".
             # DB-only tools (outreach_queue, outreach_digest, outreach_engagement) work.
             init_outreach_mcp(pipeline=None, engagement=None, config=None, db=db)
+            clear_mcp_crash("outreach")
             yield
         finally:
             await db.close()
@@ -268,7 +275,49 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     bootstrapper = _BOOTSTRAPPERS[args.server]
-    bootstrapper()
+    try:
+        bootstrapper()
+    except Exception:
+        _record_mcp_crash(args.server)
+        raise
+
+
+# ── MCP crash reporting ───────────────────────────────────────────────
+# Per-server crash files under ~/.genesis/mcp_crashes/<server>.json.
+# Written on crash, cleared on successful lifespan init.
+# Read by SessionStart hook + health snapshot to surface failures loudly.
+
+_MCP_CRASH_DIR = Path.home() / ".genesis" / "mcp_crashes"
+
+
+def _record_mcp_crash(server_name: str) -> None:
+    """Write crash info so SessionStart hook and health snapshot can report it."""
+    import json
+    import traceback
+    from datetime import UTC, datetime
+
+    try:
+        _MCP_CRASH_DIR.mkdir(parents=True, exist_ok=True)
+        crash_file = _MCP_CRASH_DIR / f"{server_name}.json"
+        tb = traceback.format_exc()
+        crash_file.write_text(json.dumps({
+            "server": server_name,
+            "error": tb.splitlines()[-1] if tb.strip() else "unknown",
+            "traceback": "\n".join(tb.splitlines()[-15:]),
+            "timestamp": datetime.now(UTC).isoformat(),
+        }, indent=2))
+    except Exception:
+        pass  # Best-effort — don't mask the original crash
+
+
+def clear_mcp_crash(server_name: str) -> None:
+    """Remove crash file after successful startup."""
+    try:
+        crash_file = _MCP_CRASH_DIR / f"{server_name}.json"
+        if crash_file.exists():
+            crash_file.unlink()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

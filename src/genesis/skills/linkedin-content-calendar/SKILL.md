@@ -20,6 +20,26 @@ burning the user out. Produce concrete post ideas with angles — not vague
 topics. Balance content types to avoid monotony. Adapt to the user's actual
 capacity for posting.
 
+## Voice Loading
+
+Even though this skill plans rather than drafts, the generated post ideas
+(angles, hook suggestions) should be grounded in the user's voice and topic
+domains. Load voice context via voice-master's overlay resolution:
+
+1. Read `../voice-master/SKILL.md` and follow its **User Calibration
+   Overlay** section to load the user's voice-dimensions and exemplars
+   from the out-of-repo overlay (or the template fallback with warning
+   if no overlay exists).
+2. This skill's medium is `social`. Use the user's topic domains and
+   voice-dimensions to inform angle selection, not to draft post prose.
+3. Read `../voice-master/references/anti-slop.md` — apply the
+   **Universal** and **Professional / LinkedIn** sections when sanity-
+   checking hook suggestions.
+
+If no overlay is present, voice-master falls back to the template and
+warns — the calendar can still be generated but the angles will be
+generic. Surface this clearly in your output.
+
 ## Calendar Design Principles
 
 **Consistency over volume.** 2 posts/week every week beats 5 posts one week
@@ -104,6 +124,6 @@ When Genesis generates a content calendar during surplus compute:
 ## References
 
 - `../linkedin-post-writer/SKILL.md` — Post type definitions, writing process, topic areas
-- `../voice-master/references/exemplars/social.md` — Social media voice exemplars
-- `../voice-master/references/anti-slop.md` — AI-tell avoidance rules
+- `../voice-master/SKILL.md` — Voice authority; follow its User Calibration Overlay section to load social exemplars from the user overlay
+- `../voice-master/references/anti-slop.md` — Universal + Professional/LinkedIn anti-slop rules
 - `../linkedin-hook-writer/SKILL.md` — Hook generation for calendar ideas

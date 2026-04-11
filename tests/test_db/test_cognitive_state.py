@@ -334,8 +334,18 @@ async def test_compute_flags_memory_retrieval_ok(db):
     assert "MEMORY RETRIEVAL FAILURE" not in flags
 
 
-async def test_compute_flags_memory_backlog(db):
-    """Flag appears when too many observations in last 24h."""
+async def test_compute_flags_no_memory_backlog(db):
+    """Memory-backlog flag was removed 2026-04-11 — never appears now.
+
+    The flag was actionless (a starting session couldn't do anything with
+    it) and its message referred to a consolidation job that doesn't
+    exist. See commit history for the full removal rationale.
+
+    Important: this test must seed retrieved observations so the sibling
+    MEMORY RETRIEVAL FAILURE flag does NOT fire — otherwise this test
+    would pass for the wrong reason (a non-empty flags string from a
+    different flag).
+    """
     from datetime import UTC, datetime
 
     from genesis.db.crud import cognitive_state, observations
@@ -347,34 +357,12 @@ async def test_compute_flags_memory_backlog(db):
             content=f"Observation {i}", priority="medium",
             created_at=now,
         )
+        # Mark each as retrieved so MEMORY RETRIEVAL FAILURE does not fire.
+        await observations.increment_retrieved(db, f"obs-{i}")
 
     flags = await cognitive_state.compute_state_flags(db)
-    assert "MEMORY BACKLOG" in flags
-
-
-async def test_compute_flags_memory_backlog_excludes_resolved(db):
-    """Resolved observations should NOT count toward the backlog flag."""
-    from datetime import UTC, datetime
-
-    from genesis.db.crud import cognitive_state, observations
-
-    now = datetime.now(UTC).isoformat()
-    # Create 25 observations, then resolve 20 of them
-    for i in range(25):
-        await observations.create(
-            db, id=f"obs-resolved-{i}", source="test", type="test",
-            content=f"Resolved observation {i}", priority="medium",
-            created_at=now,
-        )
-    for i in range(20):
-        await observations.resolve(
-            db, id=f"obs-resolved-{i}",
-            resolved_at=now, resolution_notes="test cleanup",
-        )
-
-    # Only 5 unresolved remain — below the 20 threshold
-    flags = await cognitive_state.compute_state_flags(db)
-    assert "MEMORY BACKLOG" not in flags
+    # Whole flags string must be empty — no backlog flag, no other flag.
+    assert flags == "", f"Expected empty flags, got: {flags!r}"
 
 
 async def test_compute_flags_job_failure(db):

@@ -119,7 +119,7 @@ class TestReflectionDispatch:
         assert result.content == "Micro result"
         router.route_call.assert_called_once()
         call_args = router.route_call.call_args
-        assert call_args[0][0] == "contingency_inbox"
+        assert call_args[0][0] == "contingency_micro"
 
     @pytest.mark.asyncio
     async def test_micro_reflection_api_failure(self) -> None:
@@ -196,32 +196,6 @@ class TestConversationDispatch:
 
         messages = router.route_call.call_args[0][1]
         assert len(messages) == 4  # system + 3 history
-
-
-class TestInboxDispatch:
-    """Contingency inbox evaluation routing."""
-
-    @pytest.mark.asyncio
-    async def test_inbox_routes_through_free_api(self) -> None:
-        router = _make_router(content='{"items": []}')
-        dispatcher = CCContingencyDispatcher(router=router)
-
-        result = await dispatcher.dispatch_inbox(
-            "Evaluate these items", "Inbox system prompt",
-        )
-
-        assert result.success
-        call_args = router.route_call.call_args
-        assert call_args[0][0] == "contingency_inbox"
-
-    @pytest.mark.asyncio
-    async def test_inbox_failure(self) -> None:
-        router = _make_router(success=False, error="All free providers down")
-        dispatcher = CCContingencyDispatcher(router=router)
-
-        result = await dispatcher.dispatch_inbox("Evaluate", "System prompt")
-
-        assert not result.success
 
 
 class TestContingencyResult:

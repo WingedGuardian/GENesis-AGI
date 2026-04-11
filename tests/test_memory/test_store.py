@@ -57,6 +57,8 @@ async def test_store_returns_uuid(store):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         result = await store.store("test content", "test-source")
 
     assert isinstance(result, str)
@@ -68,6 +70,8 @@ async def test_store_calls_embed(store, embedding_provider):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("test content", "src")
 
     embedding_provider.embed.assert_awaited_once()
@@ -78,6 +82,8 @@ async def test_store_calls_qdrant_upsert(store):
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("test content", "src", tags=["tag1"])
 
     mock_upsert.assert_called_once()
@@ -85,7 +91,10 @@ async def test_store_calls_qdrant_upsert(store):
     payload = call_kwargs.kwargs["payload"]
     assert payload["content"] == "test content"
     assert payload["source"] == "src"
-    assert payload["tags"] == ["tag1"]
+    # store() auto-appends a class:{type} tag for FTS5 discoverability,
+    # so we assert containment rather than strict equality
+    assert "tag1" in payload["tags"]
+    assert any(t.startswith("class:") for t in payload["tags"])
     assert payload["source_type"] == "memory"
     assert payload["retrieved_count"] == 0
 
@@ -95,6 +104,8 @@ async def test_store_calls_fts5_upsert(store):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("test content", "src")
 
     mock_mem.upsert.assert_awaited_once()
@@ -108,6 +119,8 @@ async def test_store_auto_links(store, linker):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("test content", "src")
 
     linker.auto_link.assert_awaited_once()
@@ -118,6 +131,8 @@ async def test_store_skips_auto_link_when_disabled(store, linker):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("test content", "src", auto_link=False)
 
     linker.auto_link.assert_not_awaited()
@@ -128,6 +143,8 @@ async def test_store_works_without_linker(store_no_linker):
     with patch("genesis.memory.store.upsert_point"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         result = await store_no_linker.store("test content", "src")
 
     assert isinstance(result, str)
@@ -139,6 +156,8 @@ async def test_store_collection_override_bypasses_map(store):
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store(
             "domain fact", "knowledge:test/domain",
             memory_type="knowledge",
@@ -159,6 +178,8 @@ async def test_store_knowledge_type_defaults_to_episodic(store):
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("internal fact", "session_extraction", memory_type="knowledge")
 
     call_kwargs = mock_upsert.call_args
@@ -171,6 +192,8 @@ async def test_store_scope_tag_user_by_default(store):
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store("conversation fact", "src")
 
     payload = mock_upsert.call_args.kwargs["payload"]
@@ -183,6 +206,8 @@ async def test_store_scope_tag_external_for_knowledge_base(store):
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         await store.store(
             "domain fact", "knowledge:crypto/market",
             memory_type="knowledge",
@@ -200,6 +225,8 @@ async def test_store_falls_back_on_qdrant_connection_error(store):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.pending_embeddings") as mock_pending:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_pending.create = AsyncMock(return_value="id")
         result = await store.store("test content", "src")
 
@@ -215,6 +242,8 @@ async def test_store_falls_back_on_unexpected_error(store):
          patch("genesis.memory.store.memory_crud") as mock_mem, \
          patch("genesis.memory.store.pending_embeddings") as mock_pending:
         mock_mem.upsert = AsyncMock(return_value="id")
+        mock_mem.create_metadata = AsyncMock(return_value=None)
+        mock_mem.find_exact_duplicate = AsyncMock(return_value=None)
         mock_pending.create = AsyncMock(return_value="id")
         result = await store.store("test content", "src")
 

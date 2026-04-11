@@ -1449,6 +1449,22 @@ nav ul li a img {
   display: inline-block;
 }
 
+/* Secondary / cancel buttons — visible on dark backgrounds */
+.btn-secondary {
+  background: transparent;
+  border: 1px solid var(--color-text-secondary, #999);
+  color: var(--color-text, #fff);
+  cursor: pointer;
+  border-radius: 4px;
+  font-size: 0.78rem;
+  padding: 3px 10px;
+  transition: background 0.15s, border-color 0.15s;
+}
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: var(--color-text, #fff);
+}
+
 /* Dropdown trigger button */
 .dropdown-trigger {
   display: flex;

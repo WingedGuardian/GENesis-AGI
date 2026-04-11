@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from genesis.learning.procedural.matcher import find_best_match
+from genesis.learning.procedural.matcher import find_best_match, find_relevant
 from genesis.learning.procedural.maturity import get_maturity_stage
 from genesis.learning.procedural.operations import (
     record_failure,
@@ -282,3 +282,78 @@ async def test_find_best_match_returns_failure_modes_and_workarounds(db):
     assert match is not None
     assert len(match.failure_modes) == 1
     assert len(match.workarounds) == 1
+
+
+# ─── Explicit-teach store→recall round-trip ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_store_procedure_explicit_teach_defaults(db):
+    """Calling store_procedure with explicit-teach kwargs persists them."""
+    pid = await store_procedure(
+        db,
+        task_type="discourse-forum-registration",
+        principle="Browser is required; raw API returns fake success.",
+        steps=["navigate", "fill", "click", "verify"],
+        tools_used=["browser_navigate", "browser_fill", "browser_click"],
+        context_tags=["discourse", "forum", "registration"],
+        activation_tier="L3",
+        speculative=0,
+        success_count=1,
+        confidence=2 / 3,
+    )
+    cursor = await db.execute(
+        "SELECT speculative, success_count, confidence, activation_tier "
+        "FROM procedural_memory WHERE id = ?",
+        (pid,),
+    )
+    row = await cursor.fetchone()
+    assert row[0] == 0  # speculative
+    assert row[1] == 1  # success_count
+    assert abs(row[2] - 2 / 3) < 1e-9  # Laplace for 1 success
+    assert row[3] == "L3"  # activation_tier
+
+
+@pytest.mark.asyncio
+async def test_find_relevant_surfaces_explicit_teach(db):
+    """An explicit-teach procedure must be visible to procedure_recall.
+
+    Regression test for the bug where procedure_store wrote
+    speculative=1, confidence=0.0 — making the procedure invisible to
+    find_relevant's confidence>=0.3 filter.
+    """
+    await store_procedure(
+        db,
+        task_type="discourse-forum-registration",
+        principle="Use browser, not API.",
+        steps=["navigate", "fill", "click"],
+        tools_used=["browser_navigate"],
+        context_tags=["discourse", "forum", "registration"],
+        activation_tier="L3",
+        speculative=0,
+        success_count=1,
+        confidence=2 / 3,
+    )
+    matches = await find_relevant(db, ["discourse", "forum"], limit=3)
+    assert len(matches) >= 1
+    assert any(m.task_type == "discourse-forum-registration" for m in matches)
+
+
+@pytest.mark.asyncio
+async def test_find_relevant_still_hides_speculative_extractor_writes(db):
+    """Auto-extracted procedures (speculative=1, confidence=0.0) stay hidden.
+
+    Protects the extractor pipeline from regression — only explicit-teach
+    writes should bypass the speculative quarantine.
+    """
+    await store_procedure(
+        db,
+        task_type="auto-extracted-task",
+        principle="hypothetical procedure",
+        steps=["maybe-do-this"],
+        tools_used=["Bash"],
+        context_tags=["extracted", "hypothesis"],
+        # extractor defaults: speculative=1, success_count=0, confidence=0.0
+    )
+    matches = await find_relevant(db, ["extracted", "hypothesis"], limit=3)
+    assert all(m.task_type != "auto-extracted-task" for m in matches)

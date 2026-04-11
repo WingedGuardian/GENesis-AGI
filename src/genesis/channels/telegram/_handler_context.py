@@ -35,6 +35,16 @@ class HandlerContext:
     db: aiosqlite.Connection | None = None
     typing_breaker: TypingCircuitBreaker | None = None
     dedupe: TelegramUpdateDedupe | None = None
+    # Autonomous CLI approval gate — injected by the channels bridge so
+    # ``handle_callback_query`` can resolve ``cli_approve:{id}`` buttons
+    # and the text-message handler can resolve bare "approve"/"reject"
+    # typed into the Approvals topic.  Optional: if unset, approvals fall
+    # back to dashboard-only resolution.
+    autonomous_cli_gate: object | None = None
+    # Thread ID of the "Approvals" supergroup topic — needed so the text
+    # handler only resolves bare approve/reject messages *inside* that
+    # topic, not general conversation.  Set alongside autonomous_cli_gate.
+    approvals_thread_id: int | None = None
 
     draft_streaming_enabled: bool = True
     typing_breaker_instance: TypingCircuitBreaker = field(init=False)

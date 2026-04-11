@@ -1,0 +1,22 @@
+# Genesis Update Configuration
+#
+# Controls how Genesis checks for and applies its own updates.
+# Toggle check.enabled to control periodic update detection.
+# auto_apply is opt-in and requires explicit enablement.
+
+check:
+  enabled: true           # Periodically check for available upstream updates
+  interval_hours: 6       # How often to fetch from origin (awareness loop self-throttles)
+
+notify:
+  enabled: true           # Send Telegram alert when update available
+  channel: telegram       # Outreach channel for notifications
+
+auto_apply:
+  enabled: false          # Auto-apply updates (opt-in only, NEVER default)
+  allowed_impacts:        # Only auto-apply these impact levels
+    - none
+    - informational
+  # action_needed and breaking always require manual approval
+
+backup_before_update: true  # Always run backup.sh before applying updates

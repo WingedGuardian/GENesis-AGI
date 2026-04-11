@@ -3,13 +3,25 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import defaultdict
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from genesis.db.crud import observations, user_model
 from genesis.memory.types import UserModelSnapshot
+
+if TYPE_CHECKING:
+    from genesis.routing.router import Router
+
+logger = logging.getLogger(__name__)
+
+# Hard cap on evidence rows pulled into the synthesis prompt — keeps token
+# usage bounded so the free-chain providers (mistral-small, groq, gemini)
+# don't reject the request. Roughly ~3k input tokens at 20 entries × ~150 chars.
+_NARRATIVE_EVIDENCE_LIMIT = 20
 
 # Cluster prefixes — shared with identity.loader for consistent rendering.
 _FIELD_CLUSTERS = {
@@ -153,6 +165,146 @@ class UserModelEvolver:
         for field, value in snapshot.model.items():
             lines.append(f"- {field}: {value}")
         return "\n".join(lines)
+
+    async def synthesize_narrative(
+        self,
+        router: Router,
+        *,
+        evidence_count: int = 0,
+        call_site_id: str = "11_user_model_synthesis",
+    ) -> str | None:
+        """Use an LLM to synthesize a narrative summary of the user model.
+
+        Reads the current model dict from the cache, pulls a bounded sample
+        of recent ``user_model_delta`` observations as supporting evidence,
+        and asks the router for a structured narrative. Returns the narrative
+        text on success, or None when the call fails (all free providers
+        exhausted, malformed response, etc).
+
+        Callers must treat None as graceful degradation — fall back to the
+        rules-based dict rendering instead of raising.
+        """
+        snapshot = await self.get_current_model()
+        if snapshot is None or not snapshot.model:
+            return None
+
+        # Pull recent evidence (most recent resolved deltas) for context
+        try:
+            recent = await observations.query(
+                self._db,
+                type="user_model_delta",
+                resolved=True,
+                limit=_NARRATIVE_EVIDENCE_LIMIT,
+            )
+        except Exception:
+            logger.debug("Failed to fetch evidence for synthesis", exc_info=True)
+            recent = []
+
+        prompt = self._build_synthesis_prompt(
+            snapshot.model, recent, evidence_count=evidence_count,
+        )
+
+        try:
+            result = await router.route_call(
+                call_site_id,
+                [{"role": "user", "content": prompt}],
+            )
+        except Exception:
+            logger.warning(
+                "User-model synthesis call raised — falling back to "
+                "rules-based rendering",
+                exc_info=True,
+            )
+            return None
+
+        if not result or not result.success or not result.content:
+            logger.info(
+                "User-model synthesis failed (provider=%s, error=%s) — "
+                "falling back to rules-based rendering",
+                getattr(result, "provider_used", None),
+                getattr(result, "error", None),
+            )
+            return None
+
+        narrative = result.content.strip()
+        if not narrative:
+            return None
+
+        logger.info(
+            "User-model synthesis OK (provider=%s, in=%d, out=%d, cost=$%.4f)",
+            result.provider_used,
+            result.input_tokens,
+            result.output_tokens,
+            result.cost_usd,
+        )
+        return narrative
+
+    @staticmethod
+    def _build_synthesis_prompt(
+        model: dict,
+        recent_deltas: list[dict],
+        *,
+        evidence_count: int,
+    ) -> str:
+        """Construct the LLM prompt for narrative synthesis.
+
+        Kept simple and bounded: model dict (truncated values) + a short list
+        of recent evidence snippets. The prompt asks for a structured but
+        narrative summary, in first-person Genesis voice, suitable for
+        injection into USER_KNOWLEDGE.md.
+        """
+        # Render model dict as a compact key/value list, truncating long values
+        model_lines = []
+        for field in sorted(model):
+            value_str = str(model[field])
+            if len(value_str) > 240:
+                value_str = value_str[:237] + "..."
+            display = field.replace("_", " ")
+            model_lines.append(f"- {display}: {value_str}")
+        model_block = "\n".join(model_lines) if model_lines else "(empty)"
+
+        # Render recent evidence: parse the JSON content of each delta
+        evidence_lines = []
+        for delta in recent_deltas[:_NARRATIVE_EVIDENCE_LIMIT]:
+            try:
+                parsed = json.loads(delta.get("content", "{}"))
+            except (TypeError, ValueError):
+                continue
+            field = parsed.get("field", "?")
+            value = parsed.get("value", "?")
+            evidence = parsed.get("evidence", "")
+            value_str = str(value)
+            if len(value_str) > 80:
+                value_str = value_str[:77] + "..."
+            evidence_str = str(evidence)
+            if len(evidence_str) > 160:
+                evidence_str = evidence_str[:157] + "..."
+            evidence_lines.append(
+                f"- {field} = {value_str}  — {evidence_str}"
+            )
+        evidence_block = (
+            "\n".join(evidence_lines) if evidence_lines else "(no recent deltas)"
+        )
+
+        return (
+            "You are Genesis, synthesizing what you know about your user into a "
+            "structured knowledge file. Write in first person from Genesis's "
+            "perspective. Be concrete and specific. Avoid generic AI prose. "
+            "Group related fields into themes; do not just list raw key/value "
+            "pairs. Aim for 6-10 short paragraphs total, organized under "
+            "level-2 markdown headings (## Theme).\n"
+            "\n"
+            f"Current user model ({evidence_count} evidence points accumulated):\n"
+            f"{model_block}\n"
+            "\n"
+            "Recent supporting evidence (most recent first):\n"
+            f"{evidence_block}\n"
+            "\n"
+            "Output ONLY the markdown body — no preamble, no closing remarks. "
+            "Use H2 (##) section headings. Do not include a top-level H1 title; "
+            "the file already has one. Do not invent facts not supported by the "
+            "model or evidence above."
+        )
 
     @classmethod
     def consolidate_model(cls, model: dict) -> dict:

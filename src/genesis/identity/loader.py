@@ -247,14 +247,28 @@ class IdentityLoader:
         )
 
     def write_user_knowledge_md(
-        self, model: dict, *, evidence_count: int = 0,
+        self,
+        model: dict,
+        *,
+        evidence_count: int = 0,
+        narrative: str | None = None,
     ) -> None:
         """Render user model dict into USER_KNOWLEDGE.md (structured cache).
 
         Unlike write_user_md() (which targets USER.md and is disabled),
-        this writes the system-owned knowledge cache with bounded sections.
-        Each section has a max item count; lowest-signal items are pruned.
+        this writes the system-owned knowledge cache.
+
+        When ``narrative`` is provided, write LLM-synthesized prose as the
+        primary content (Genesis voice, structured by theme). The narrative
+        is the output of UserModelEvolver.synthesize_narrative() and replaces
+        the rules-based dict rendering. When ``narrative`` is None, fall
+        back to the rules-based rendering with bounded sections — used as
+        graceful degradation when the LLM synthesis chain is exhausted.
         """
+        if narrative is not None:
+            self._write_narrative_knowledge(model, narrative, evidence_count)
+            return
+
         sections: dict[str, list[str]] = defaultdict(list)
         unmapped: list[str] = []
 
@@ -323,9 +337,44 @@ class IdentityLoader:
         path.write_text("\n".join(lines), encoding="utf-8")
         self._cache.pop("USER_KNOWLEDGE.md", None)
         logger.info(
-            "USER_KNOWLEDGE.md synthesized with %d fields (%d sections populated)",
+            "USER_KNOWLEDGE.md synthesized via rules (%d fields, %d sections populated)",
             len(model),
             sum(1 for s in _KNOWLEDGE_SECTION_ORDER if sections.get(s)),
+        )
+
+    def _write_narrative_knowledge(
+        self, model: dict, narrative: str, evidence_count: int,
+    ) -> None:
+        """Write the LLM-synthesized narrative as USER_KNOWLEDGE.md.
+
+        Adds a header preamble identifying the synthesis mode + evidence
+        count, then the narrative body verbatim, then a footer timestamp.
+        """
+        now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+        lines = [
+            "# User Knowledge Base",
+            "",
+            f"> Synthesized by Genesis from {evidence_count} evidence points. "
+            f"Last updated: {now}.",
+            "> Source of truth: memory system (Qdrant + SQLite). "
+            "This file is a materialized cache.",
+            "> Do not hand-edit — changes will be overwritten by next synthesis cycle.",
+            "",
+            narrative.rstrip(),
+            "",
+            "---",
+            "",
+            f"*LLM-synthesized via call site 11_user_model_synthesis. "
+            f"Source model contains {len(model)} fields. Last updated: {now}.*",
+            "",
+        ]
+        path = self._dir / "USER_KNOWLEDGE.md"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        self._cache.pop("USER_KNOWLEDGE.md", None)
+        logger.info(
+            "USER_KNOWLEDGE.md synthesized via LLM narrative "
+            "(%d fields, narrative=%d chars)",
+            len(model), len(narrative),
         )
 
     @staticmethod

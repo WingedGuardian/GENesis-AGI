@@ -332,8 +332,10 @@ causing it to almost never escalate to micro/light/deep reflection. The
 system looks "idle" when it's actually blind.
 
 **Stub collectors** (return 0.0): ConversationCollector, TaskQualityCollector,
-OutreachEngagementCollector, ReconFindingsCollector, MemoryBacklogCollector,
-BudgetCollector, StrategicTimerCollector.
+OutreachEngagementCollector, ReconFindingsCollector, BudgetCollector,
+StrategicTimerCollector. (MemoryBacklogCollector removed 2026-04-11 — the
+retrieval-coverage metric was being misread as reflection urgency by the
+Deep depth scorer.)
 
 **Real collectors**: CCSessions (queries DB), ErrorSpike (queries circuit
 breakers), CriticalFailure (queries circuit breakers).
@@ -580,10 +582,11 @@ Dependencies: Phase 4, Phase 5.
     success data — nuance stripped at retrieval makes nuance in storage worthless.
   - No confidence decay in V3 (deferred to V4 — needs data to tune decay rate)
 - **Real signal collectors** (Phase 1 stubs → real data):
-  - BudgetCollector, ErrorSpikeCollector, CriticalFailureCollector, TaskQualityCollector,
-    MemoryBacklogCollector — produce programmatic signals (computed metrics with thresholds),
+  - BudgetCollector, ErrorSpikeCollector, CriticalFailureCollector, TaskQualityCollector
+    — produce programmatic signals (computed metrics with thresholds),
     not raw data for the LLM to parse. Follows Trackio pattern: domain knowledge embedded
     in collector code, LLM receives pre-interpreted signals.
+    (MemoryBacklogCollector removed 2026-04-11 — see note in Phase 1 stub list above.)
   - ConversationCollector, OutreachEngagementCollector, ReconFindingsCollector,
     StrategicTimerCollector — may remain stubs until their data sources exist (Phase 8).
 - **Null hypothesis with fixed maturity milestones** (DATA VOLUME, not time):

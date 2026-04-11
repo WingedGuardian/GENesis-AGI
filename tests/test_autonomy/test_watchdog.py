@@ -43,9 +43,9 @@ def fresh_status(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def stale_status(tmp_path: Path) -> Path:
-    """Write a stale status.json (10 minutes old)."""
+    """Write a stale status.json (20 minutes old — exceeds 900s prod threshold)."""
     status_file = tmp_path / "status.json"
-    old_time = datetime.now(UTC) - timedelta(minutes=10)
+    old_time = datetime.now(UTC) - timedelta(minutes=20)
     status_file.write_text(json.dumps({
         "timestamp": old_time.isoformat(),
         "resilience_state": {"cloud": "NORMAL"},
@@ -310,7 +310,7 @@ class TestYamlLoading:
         if not config_path.exists():
             pytest.skip("Config file not at expected path")
         checker = WatchdogChecker.from_yaml(config_path)
-        assert checker._staleness_threshold == 300
+        assert checker._staleness_threshold == 900
 
     def test_load_missing_file(self, tmp_path: Path):
         checker = WatchdogChecker.from_yaml(tmp_path / "nonexistent.yaml")

@@ -19,15 +19,43 @@ from genesis.autonomy.cli_policy import (
 )
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel
 from genesis.db.schema import create_all_tables
+from genesis.outreach.types import (
+    OutreachCategory,
+    OutreachRequest,
+    OutreachResult,
+    OutreachStatus,
+)
 
 
-class _FakeAdapter:
+class _FakePipeline:
+    """Minimal OutreachPipeline stub used by AutonomousCliApprovalGate tests.
+
+    Records the text / OutreachRequest / reply_markup that the gate
+    submitted and returns a successful ``OutreachResult`` with a unique
+    ``delivery_id`` per call so tests can target specific messages.
+    """
+
     def __init__(self) -> None:
-        self.sent: list[tuple[str, str]] = []
+        self.sent: list[tuple[str, OutreachRequest, object | None]] = []
+        # Tests that want to resolve "the first delivery" can use
+        # ``delivery-1`` as the key — for multi-request tests, look at
+        # ``self.delivery_ids`` in order.
+        self.delivery_ids: list[str] = []
 
-    async def send_message(self, recipient: str, text: str, **kwargs) -> str:
-        self.sent.append((recipient, text))
-        return "delivery-1"
+    async def submit_raw(
+        self, text: str, request: OutreachRequest,
+        *, reply_markup: object | None = None,
+    ) -> OutreachResult:
+        self.sent.append((text, request, reply_markup))
+        delivery_id = f"delivery-{len(self.sent)}"
+        self.delivery_ids.append(delivery_id)
+        return OutreachResult(
+            outreach_id=f"outreach-fake-{len(self.sent)}",
+            status=OutreachStatus.DELIVERED,
+            channel="telegram",
+            message_content=text,
+            delivery_id=delivery_id,
+        )
 
 
 @pytest.fixture
@@ -41,12 +69,8 @@ async def db():
 
 @pytest.fixture
 def runtime():
-    adapter = _FakeAdapter()
-    pipeline = SimpleNamespace(
-        _channels={"telegram": adapter},
-        _recipients={"telegram": "12345"},
-    )
-    return SimpleNamespace(_outreach_pipeline=pipeline, adapter=adapter)
+    pipeline = _FakePipeline()
+    return SimpleNamespace(_outreach_pipeline=pipeline, pipeline=pipeline)
 
 
 @pytest.fixture
@@ -87,7 +111,17 @@ async def test_approval_gate_requests_and_delivers(runtime, approval_gate, appro
     assert "requested" in reason
     row = await approval_manager.get_by_id(request_id)
     assert row is not None
-    assert runtime.adapter.sent
+    # The gate must have routed the message through the outreach pipeline
+    # (not directly into the adapter) so topic routing sends it to the
+    # "Approvals" supergroup topic.
+    assert runtime.pipeline.sent
+    sent_text, sent_request, sent_markup = runtime.pipeline.sent[0]
+    assert sent_request.category == OutreachCategory.APPROVAL
+    assert sent_request.signal_type == "cli_approval"
+    assert request_id in sent_request.source_id
+    # For a single pending request, only the single-approve button row is
+    # shown (no "approve all" batch button).
+    assert sent_markup is not None
 
 
 @pytest.mark.asyncio
@@ -136,6 +170,99 @@ async def test_dispatch_router_uses_api_first(approval_gate):
 
 
 @pytest.mark.asyncio
+async def test_dispatch_router_empty_content_is_not_success(approval_gate):
+    """Regression: provider returning HTTP 200 with empty content must
+    NOT be treated as successful API dispatch. This was the failure mode
+    where gemini-free returned empty on contingency_inbox and silently
+    produced frontmatter-only inbox response files."""
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(
+        success=True,
+        content="",  # empty content with success=True — the bug
+        provider_used="gemini-free",
+        model_id="gemini-1.5",
+        cost_usd=0.0,
+        input_tokens=5,
+        output_tokens=0,
+        error=None,
+    ))
+    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="inbox",
+        policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        messages=[{"role": "user", "content": "eval this"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="contingency_micro",  # any API call site works
+    ))
+
+    # Should NOT return mode="api" — empty content means the API path
+    # failed to produce usable output. Should fall through to the
+    # approval-gated CLI path (which will be blocked because nothing
+    # has approved yet, but the important thing is mode != "api").
+    assert decision.mode != "api"
+    assert decision.output is None
+    # The api_error must describe the empty-content failure so it
+    # flows into the Telegram approval prompt context for the user.
+    assert decision.api_error is not None
+    assert "empty content" in decision.api_error
+    assert "gemini-free" in decision.api_error
+
+
+@pytest.mark.asyncio
+async def test_dispatch_router_whitespace_content_is_not_success(approval_gate):
+    """Whitespace-only content is also empty for dispatch purposes."""
+    router = AsyncMock()
+    router.route_call = AsyncMock(return_value=SimpleNamespace(
+        success=True,
+        content="   \n\t  \n  ",
+        provider_used="mistral-large-free",
+        model_id="mistral-7b",
+        cost_usd=0.0,
+        input_tokens=5,
+        output_tokens=0,
+        error=None,
+    ))
+    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="ego",
+        policy_id="ego_cycle",
+        action_label="ego cycle",
+        messages=[{"role": "user", "content": "hi"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="7_ego_cycle_api",
+    ))
+
+    assert decision.mode != "api"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_router_skips_api_when_call_site_none(approval_gate):
+    """When api_call_site_id is None, the router must not call route_call
+    at all and should flow directly to the approval-gated CLI path. This
+    is the mode inbox uses — approval-gate-only, no API fallback."""
+    router = AsyncMock()
+    router.route_call = AsyncMock()  # should NOT be called
+    dispatch = AutonomousDispatchRouter(router=router, approval_gate=approval_gate)
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="inbox",
+        policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        messages=[{"role": "user", "content": "eval"}],
+        cli_invocation=_invocation(),
+        api_call_site_id=None,
+    ))
+
+    router.route_call.assert_not_called()
+    # Mode will be "blocked" because no approval has been given yet —
+    # but critically, it's not "api" and the router was not touched.
+    assert decision.mode != "api"
+
+
+@pytest.mark.asyncio
 async def test_dispatch_router_blocks_pending_cli_fallback(approval_gate):
     router = AsyncMock()
     router.route_call = AsyncMock(return_value=SimpleNamespace(
@@ -174,6 +301,343 @@ def test_load_autonomous_cli_policy_from_yaml(tmp_path: Path):
     assert policy.source.startswith("config:")
 
 
+@pytest.mark.asyncio
+async def test_find_site_pending_returns_matching_pending(
+    approval_gate, approval_manager,
+):
+    """find_site_pending returns a pending row whose context matches
+    the (subsystem, policy_id) tuple."""
+    # Create a pending approval for (reflection, reflection_deep)
+    await approval_gate.ensure_approval(
+        subsystem="reflection",
+        policy_id="reflection_deep",
+        action_label="deep reflection",
+        invocation=_invocation(),
+        api_call_site_id="5_deep_reflection",
+        api_error="api failed",
+    )
+
+    found = await approval_gate.find_site_pending(
+        subsystem="reflection", policy_id="reflection_deep",
+    )
+    assert found is not None
+    assert found["status"] == "pending"
+    assert found["action_type"] == "autonomous_cli_fallback"
+
+
+@pytest.mark.asyncio
+async def test_find_site_pending_returns_none_for_no_match(
+    approval_gate, approval_manager,
+):
+    """find_site_pending returns None when no matching pending row exists."""
+    # Create a pending approval for a DIFFERENT site
+    await approval_gate.ensure_approval(
+        subsystem="ego",
+        policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=_invocation(),
+        api_call_site_id="7_ego_cycle_api",
+        api_error="api failed",
+    )
+
+    # Look up a different site — no match
+    found = await approval_gate.find_site_pending(
+        subsystem="reflection", policy_id="reflection_deep",
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_find_site_pending_ignores_non_pending(
+    approval_gate, approval_manager,
+):
+    """find_site_pending skips rejected and approved rows — only pending counts."""
+    _, request_id, _ = await approval_gate.ensure_approval(
+        subsystem="inbox",
+        policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None,
+        api_error=None,
+    )
+    # Resolve the row as rejected
+    await approval_manager.resolve(
+        request_id, status="rejected", resolved_by="test",
+    )
+
+    found = await approval_gate.find_site_pending(
+        subsystem="inbox", policy_id="inbox_evaluation",
+    )
+    assert found is None
+
+
+@pytest.mark.asyncio
+async def test_get_pending_count_counts_only_cli_fallback(
+    approval_gate, approval_manager,
+):
+    """get_pending_count counts only autonomous_cli_fallback, not other
+    approval types."""
+    assert await approval_gate.get_pending_count() == 0
+
+    # Add two CLI fallback approvals
+    await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="different prompt",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle_api", api_error="api down",
+    )
+
+    assert await approval_gate.get_pending_count() == 2
+
+    # Add an unrelated approval request directly via the manager
+    # (valid action_class per DB CHECK: reversible|costly_reversible|irreversible)
+    await approval_manager.request_approval(
+        action_type="ego_proposal_review",
+        action_class="reversible",
+        description="unrelated",
+        context="{}",
+    )
+    # Count should remain 2 (not 3) — scoped to autonomous_cli_fallback
+    assert await approval_gate.get_pending_count() == 2
+
+
+@pytest.mark.asyncio
+async def test_find_existing_race_safety_fallback(
+    approval_gate, approval_manager,
+):
+    """_find_existing should also match pending rows by
+    (subsystem, policy_id) when the approval_key doesn't match.  Race
+    safety: two concurrent schedulers with slightly different content
+    hashes for the same call site should both find the first pending
+    row instead of creating duplicates."""
+    # First caller creates a pending approval with one prompt
+    _, first_id, _ = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+
+    # Second caller has a slightly different invocation (different
+    # prompt → different approval_key) but the same (subsystem, policy_id).
+    # Without the race-safety fallback, this would create a new
+    # approval request.  With it, _find_existing returns the first row.
+    different_invocation = CCInvocation(
+        prompt="race-safety: slightly different prompt content",
+        model=CCModel.SONNET, effort=EffortLevel.HIGH,
+        system_prompt="System",
+    )
+    status, second_id, reason = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=different_invocation,
+        api_call_site_id=None, api_error=None,
+    )
+    # The race-safety fallback returned the existing pending row
+    assert status == "pending"
+    assert second_id == first_id
+
+
+@pytest.mark.asyncio
+async def test_resolve_from_reply_no_longer_auto_batches(
+    approval_gate, approval_manager,
+):
+    """resolve_from_reply must resolve ONLY the keyed request.  The
+    old 'single approve batch-approves everything' behavior is removed;
+    batch approval is now explicit via the Approve-all button."""
+    # Create two pending approvals with different prompts
+    _, first_id, _ = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    _, second_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="different prompt for ego",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle_api", api_error="api down",
+    )
+    assert first_id != second_id
+    assert await approval_gate.get_pending_count() == 2
+
+    # Approve the first via reply — the second must remain pending
+    ok = await approval_gate.resolve_from_reply("delivery-1", "approve")
+    assert ok is True
+
+    first_row = await approval_manager.get_by_id(first_id)
+    second_row = await approval_manager.get_by_id(second_id)
+    assert first_row["status"] == "approved"
+    assert second_row["status"] == "pending", (
+        "single-reply approve must NOT auto-batch — the second "
+        "approval must remain pending"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_most_recent_pending_resolves_latest(
+    approval_gate, approval_manager,
+):
+    """resolve_most_recent_pending resolves the most recently created
+    pending autonomous_cli_fallback approval (used by the bare-text-
+    reply handler in the Approvals topic)."""
+    _, first_id, _ = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    _, second_id, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="the most recent request",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle_api", api_error="api down",
+    )
+
+    resolved = await approval_gate.resolve_most_recent_pending(
+        decision="approved", resolved_by="telegram:bare_text",
+    )
+    assert resolved == second_id
+
+    first_row = await approval_manager.get_by_id(first_id)
+    second_row = await approval_manager.get_by_id(second_id)
+    assert first_row["status"] == "pending"
+    assert second_row["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_send_request_builds_batch_button_when_two_pending(
+    runtime, approval_gate, approval_manager,
+):
+    """When pending_count >= 2 at send time, the inline keyboard must
+    include the 'Approve all N pending' batch row in addition to the
+    single-approve row."""
+    # Create the first approval (runs _send_request → single button)
+    await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    # Create a SECOND approval — now _send_request runs with
+    # pending_count == 2, so the batch button appears.
+    await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="second prompt for the batch test",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle_api", api_error="down",
+    )
+
+    assert len(runtime.pipeline.sent) == 2
+    first_markup = runtime.pipeline.sent[0][2]
+    second_markup = runtime.pipeline.sent[1][2]
+    # First send had pending_count=1 → single row only
+    assert len(first_markup.inline_keyboard) == 1
+    # Second send had pending_count=2 → two rows (single + batch)
+    assert len(second_markup.inline_keyboard) == 2
+    # The second row is the batch button with the "Approve all" callback prefix
+    batch_button = second_markup.inline_keyboard[1][0]
+    assert batch_button.callback_data.startswith("cli_approve_all:")
+
+
+@pytest.mark.asyncio
+async def test_failed_delivery_does_not_advance_reask_window(
+    runtime, approval_gate, approval_manager,
+):
+    """If the outreach pipeline fails to deliver, ``_send_request`` must
+    leave ``last_sent_at`` and ``next_reask_at`` unset so the very next
+    scan tick can retry via ``_maybe_resend``.
+
+    Regression guard for the silent-24h-stall bug: the prior code bumped
+    the reask cadence unconditionally after calling submit_raw, even on
+    exception or non-DELIVERED result.  That meant a single failed
+    delivery made the approval invisible for ``reask_interval_hours``
+    (24h default) because ``_maybe_resend`` short-circuited on the
+    fresh ``next_reask_at`` in the future.
+    """
+    import json as _json
+
+    # Force the pipeline to report FAILED (no delivery_id) on every call.
+    async def _fail_submit(text, request, *, reply_markup=None):
+        runtime.pipeline.sent.append((text, request, reply_markup))
+        return OutreachResult(
+            outreach_id="outreach-failed",
+            status=OutreachStatus.FAILED,
+            channel="telegram",
+            message_content=text,
+            error="simulated delivery failure",
+        )
+
+    runtime.pipeline.submit_raw = _fail_submit
+
+    status, request_id, reason = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "pending"
+    assert request_id is not None
+
+    row = await approval_manager.get_by_id(request_id)
+    assert row is not None
+    context = _json.loads(row["context"])
+    # delivery_id is recorded as None so the retry path can see "not delivered"
+    assert context["delivery_id"] is None
+    # Crucially, last_sent_at and next_reask_at must NOT be bumped —
+    # otherwise _maybe_resend would sleep on a future next_reask_at
+    # and never retry.
+    assert context["last_sent_at"] is None
+    assert context["next_reask_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_successful_delivery_advances_reask_window(
+    runtime, approval_gate, approval_manager,
+):
+    """Positive counterpart to the failed-delivery test: when delivery
+    succeeds, last_sent_at and next_reask_at must be populated so the
+    dedup logic in ``_maybe_resend`` can short-circuit until the reask
+    window elapses."""
+    import json as _json
+
+    status, request_id, _ = await approval_gate.ensure_approval(
+        subsystem="inbox", policy_id="inbox_evaluation",
+        action_label="inbox evaluation",
+        invocation=_invocation(),
+        api_call_site_id=None, api_error=None,
+    )
+    assert status == "pending"
+
+    row = await approval_manager.get_by_id(request_id)
+    context = _json.loads(row["context"])
+    assert context["delivery_id"] is not None
+    assert context["last_sent_at"] is not None
+    assert context["next_reask_at"] is not None
+
+
 def test_policy_exporter_writes_shared_mount_json(tmp_path: Path):
     shared_dir = tmp_path / "shared"
     exporter = AutonomousCliPolicyExporter(
@@ -189,3 +653,188 @@ def test_policy_exporter_writes_shared_mount_json(tmp_path: Path):
     status = exporter.status()
     assert status["last_export_path"] == str(out)
     assert status["effective_policy"]["manual_approval_required"] is True
+
+
+# ---------------------------------------------------------------------------
+# F1: dispatch mode honouring — config-driven + explicit override.
+#
+# These tests cover the per-call-site ``dispatch`` field on
+# ``CallSiteConfig`` and the matching explicit ``dispatch_mode`` override
+# on ``AutonomousDispatchRequest``.  They use a real ``RoutingConfig``
+# instance rather than an ``AsyncMock`` so the router's
+# ``_resolve_dispatch_mode`` path is exercised end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def _router_with_dispatch(call_site_id: str, dispatch: str) -> AsyncMock:
+    """Build a router stub whose ``config.call_sites[<id>].dispatch`` is set.
+
+    ``AutonomousDispatchRouter._resolve_dispatch_mode`` reads the field
+    via ``self._router.config.call_sites``, so the stub needs a real
+    dict containing a CallSiteConfig-like object (SimpleNamespace is
+    sufficient because we only read ``.dispatch``).
+    """
+    from genesis.routing.types import CallSiteConfig
+    site = CallSiteConfig(
+        id=call_site_id,
+        chain=["claude-sonnet"],
+        dispatch=dispatch,
+    )
+    router = AsyncMock()
+    router.config = SimpleNamespace(call_sites={call_site_id: site})
+    router.route_call = AsyncMock()
+    return router
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cli_skips_api_chain(approval_gate):
+    """dispatch=cli must bypass the API chain entirely and go straight to
+    the approval-gated CLI path.  This is the load-bearing fix: the user
+    wants to flip a call site to CLI from the neural monitor and have the
+    runtime actually honour it."""
+    router = _router_with_dispatch("5_deep_reflection", "cli")
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate,
+    )
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_deep",
+        action_label="deep reflection",
+        messages=[{"role": "user", "content": "reflect"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="5_deep_reflection",
+    ))
+
+    # Router's API path must NOT be called — the whole point is that
+    # "cli" bypasses it.
+    router.route_call.assert_not_called()
+    # Decision must surface an api_error explaining why CLI was forced,
+    # so the approval prompt tells the operator what's happening.
+    assert decision.api_error is not None
+    assert "cli" in decision.api_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_api_blocks_on_exhaustion(approval_gate):
+    """dispatch=api must NEVER escalate to CLI.  When the API chain
+    exhausts, return mode=blocked with a reason that references the
+    call-site config — not silently drop into CC subprocess dispatch
+    that the operator explicitly disabled."""
+    router = _router_with_dispatch("4_light_reflection", "api")
+    router.route_call = AsyncMock(return_value=SimpleNamespace(
+        success=False,
+        content=None,
+        provider_used="claude-sonnet",
+        model_id=None,
+        cost_usd=0.0,
+        input_tokens=0,
+        output_tokens=0,
+        error="authentication_error: x-api-key required",
+    ))
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate,
+    )
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_light",
+        action_label="light reflection",
+        messages=[{"role": "user", "content": "reflect"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="4_light_reflection",
+    ))
+
+    router.route_call.assert_called_once()
+    assert decision.mode == "blocked"
+    assert "dispatch=api" in decision.reason
+    # The API error must flow through so the caller can log / surface
+    # the actual root cause (auth error, rate limit, etc.).
+    assert decision.api_error is not None
+    assert "authentication_error" in decision.api_error
+
+
+@pytest.mark.asyncio
+async def test_dispatch_dual_default_preserves_existing_behavior(approval_gate):
+    """Call sites without an explicit dispatch field must behave
+    identically to the pre-F1 world: API chain first, CLI fallback on
+    failure.  This is the regression guard for every existing call site
+    that doesn't set ``dispatch`` in model_routing.yaml."""
+    router = _router_with_dispatch("4_light_reflection", "dual")
+    router.route_call = AsyncMock(return_value=SimpleNamespace(
+        success=True,
+        content="dual-mode api response",
+        provider_used="claude-sonnet",
+        model_id="claude-sonnet-4",
+        cost_usd=0.05,
+        input_tokens=10,
+        output_tokens=20,
+    ))
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate,
+    )
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_light",
+        action_label="light reflection",
+        messages=[{"role": "user", "content": "reflect"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="4_light_reflection",
+    ))
+
+    assert decision.mode == "api"
+    assert decision.output is not None
+    assert decision.output.text == "dual-mode api response"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_explicit_override_wins_over_config(approval_gate):
+    """A per-call ``dispatch_mode`` on the request bypasses the config
+    lookup.  Used for tests and targeted one-shot overrides (e.g. a
+    future '/reflect --force-cli' admin command)."""
+    # Config says dual, but the request overrides to cli.
+    router = _router_with_dispatch("4_light_reflection", "dual")
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate,
+    )
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_light",
+        action_label="light reflection",
+        messages=[{"role": "user", "content": "reflect"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="4_light_reflection",
+        dispatch_mode="cli",
+    ))
+
+    router.route_call.assert_not_called()
+    assert decision.api_error is not None
+    assert "cli" in decision.api_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_cli_honours_fallback_disabled_flag(approval_gate):
+    """dispatch=cli + cli_fallback_allowed=False must still return
+    blocked — a caller that explicitly disables CLI fallback (e.g. a
+    cost-sensitive call site) must not have that overridden by the
+    user-level dispatch toggle."""
+    router = _router_with_dispatch("5_deep_reflection", "cli")
+    dispatch = AutonomousDispatchRouter(
+        router=router, approval_gate=approval_gate,
+    )
+
+    decision = await dispatch.route(AutonomousDispatchRequest(
+        subsystem="reflection",
+        policy_id="reflection_deep",
+        action_label="deep reflection",
+        messages=[{"role": "user", "content": "reflect"}],
+        cli_invocation=_invocation(),
+        api_call_site_id="5_deep_reflection",
+        cli_fallback_allowed=False,
+    ))
+
+    router.route_call.assert_not_called()
+    assert decision.mode == "blocked"
+    assert "CLI fallback disabled" in decision.reason

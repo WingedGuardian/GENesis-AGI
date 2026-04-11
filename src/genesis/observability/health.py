@@ -455,6 +455,49 @@ async def probe_guardian(
         )
 
 
+async def collect_probe_results(
+    db=None,
+    *,
+    scheduler=None,
+    guardian_remote=_GUARDIAN_REMOTE_UNSET,
+) -> dict[str, ProbeResult]:
+    """Run all infrastructure probes and return results keyed by probe name.
+
+    Used by the remediation registry to check which probes are failing.
+    Each probe runs independently — a failure in one does not block others.
+    """
+    import asyncio
+
+    results: dict[str, ProbeResult] = {}
+
+    async def _safe(name: str, coro) -> None:
+        try:
+            results[name] = await asyncio.wait_for(coro, timeout=10.0)
+        except Exception as exc:
+            results[name] = ProbeResult(
+                name=name,
+                status=ProbeStatus.DOWN,
+                latency_ms=0,
+                message=f"Probe error: {exc}",
+                checked_at=datetime.now(UTC).isoformat(),
+            )
+
+    tasks = [
+        _safe("qdrant", probe_qdrant()),
+        _safe("ollama", probe_ollama()),
+        _safe("tmp_usage", probe_tmp()),
+        _safe("disk", probe_disk()),
+        _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
+    ]
+    if db is not None:
+        tasks.append(_safe("db", probe_db(db)))
+    if scheduler is not None:
+        tasks.append(_safe("awareness_tick", probe_scheduler(scheduler)))
+
+    await asyncio.gather(*tasks)
+    return results
+
+
 async def _probe_guardian_ssh(remote, latency_ms: float, clock) -> ProbeResult:
     """Probe Guardian health via SSH with a TTL cache.
 

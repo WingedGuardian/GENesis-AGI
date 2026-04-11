@@ -26,7 +26,7 @@ from genesis.ego.types import EgoCycle
 @dataclass(frozen=True)
 class _MockRoutingResult:
     success: bool
-    call_site_id: str = "8_memory_consolidation"
+    call_site_id: str = "8_ego_compaction"
     provider_used: str | None = "gemini-free"
     model_id: str | None = "gemini-3-flash"
     content: str | None = None
@@ -75,7 +75,7 @@ def failing_router():
         content=None,
         error="All providers exhausted",
         attempts=4,
-        failed_providers=("mistral-free", "groq-free", "gemini-free", "openrouter-free"),
+        failed_providers=("mistral-large-free", "groq-free", "gemini-free", "openrouter-free"),
     )
     return router
 
