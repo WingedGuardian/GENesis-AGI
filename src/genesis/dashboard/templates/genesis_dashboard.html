@@ -156,6 +156,7 @@
         settingsData: {},         // domain_name → config object
         settingsEditing: null,    // domain being edited
         settingsSaving: false,
+        settingsRestartMessage: null,
 
         // ── Auth state ────────────────────────────────────────────
         authEnabled: false,
@@ -697,7 +698,7 @@
               if (domain === "autonomous_cli_policy") {
                 this.fetchAutonomousCliPolicy();
               }
-              if (d.needs_restart) { alert("Settings saved. Some changes require a restart to take effect."); }
+              if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Restart to apply changes."; }
             } else {
               const err = await resp.json().catch(() => ({}));
               alert("Save failed: " + (err.details ? err.details.join(", ") : err.error || "Unknown error"));
@@ -734,7 +735,7 @@
             if (resp.ok) {
               this.secretsEditing = {...this.secretsEditing, [keyName]: false};
               delete this.secretsValues[keyName];
-              this.secretsMessage = {type: 'restart', text: `${keyName} saved. Restart required.`};
+              this.secretsMessage = {type: 'restart', text: `${keyName} saved. Restart to apply changes.`};
               this.fetchSecrets();
             } else {
               this.secretsMessage = {type: 'error', text: d.error || 'Save failed'};
@@ -742,9 +743,44 @@
           } catch (e) { this.secretsMessage = {type: 'error', text: e.message}; }
           this.secretsSaving = false;
         },
+        // Map env var names → provider_type values from model_routing.yaml.
+        // MAINTENANCE: update when adding new providers to config/model_routing.yaml.
+        _KEY_TO_PROVIDER_TYPES: {
+          API_KEY_GROQ: ['groq'],
+          API_KEY_MISTRAL: ['mistral'],
+          GOOGLE_API_KEY: ['google'],
+          API_KEY_OPENROUTER: ['openrouter'],
+          ANTHROPIC_API_KEY: ['anthropic'],
+          API_KEY_DEEPSEEK: ['deepseek'],
+          API_KEY_QWEN: ['qwen'],
+          API_KEY_ZENMUX: ['zenmux'],
+          API_KEY_MINIMAX: ['minimax'],
+          OPENAI_API_KEY: ['openai'],
+          API_KEY_XAI: ['xai'],
+          API_KEY_DEEPINFRA: ['deepinfra'],
+        },
+        secretHealthStatus(keyEntry) {
+          if (keyEntry.status === 'not_set') return 'not_set';
+          const provTypes = this._KEY_TO_PROVIDER_TYPES[keyEntry.key];
+          if (!provTypes || !this.routingConfig) return keyEntry.status;
+          const cbStates = this.routingConfig.cb_states || {};
+          const providers = this.routingConfig.providers || {};
+          // Find all routing providers that match this key's provider types
+          const matchedProviders = Object.keys(providers).filter(pname => {
+            const prov = providers[pname];
+            return provTypes.includes(prov.type);
+          });
+          if (matchedProviders.length === 0) return keyEntry.status;
+          const openCount = matchedProviders.filter(p => cbStates[p] === 'OPEN').length;
+          if (openCount === matchedProviders.length) return 'error';
+          if (openCount > 0) return 'degraded';
+          return 'healthy';
+        },
         secretStatusColor(status) {
-          if (status === 'validated') return '#4caf50';
-          if (status === 'configured') return '#f0ad4e';
+          if (status === 'validated' || status === 'healthy') return '#4caf50';
+          if (status === 'configured') return '#4caf50';
+          if (status === 'degraded') return '#f0ad4e';
+          if (status === 'error') return '#d9534f';
           return 'var(--color-text-secondary)';
         },
 
@@ -811,29 +847,52 @@
           shared_export_enabled: 'Export policy to Guardian shared mount for host-side enforcement',
           // TTS
           provider: 'Active TTS provider. Requires restart to switch.',
+          voice_id: 'Voice ID string from the TTS provider (e.g., ElevenLabs voice ID)',
+          model: 'LLM model for processing (opus = highest quality, haiku = fastest)',
           stability: '0.0\u20131.0: higher = more consistent voice',
           similarity_boost: '0.0\u20131.0: higher = closer to original voice',
           style: '0.0\u20131.0: higher = more expressive delivery',
           speed: '0.7\u20131.2: playback speed multiplier',
+          use_speaker_boost: 'Apply TTS provider speaker boost enhancement',
           strip_markdown: 'Remove markdown formatting before synthesis',
           max_chars: 'Maximum text length sent to TTS',
           block_background_sessions: 'Prevent background sessions from triggering voice',
           // Ego
+          enabled: 'Enable autonomous ego sessions (proposal pipeline)',
           cadence_minutes: 'Base interval between autonomous cycles',
           activity_threshold_minutes: 'Min time since last user activity before running',
           max_interval_minutes: 'Maximum backoff cap (prevents indefinite delays)',
           backoff_multiplier: 'How much to increase interval on idle cycles',
+          proposal_expiry_minutes: 'How long ego proposals remain valid before auto-expiring',
+          batch_digest: 'Bundle ego proposals into periodic digests instead of individual messages',
           daily_budget_cap_usd: 'Hard cap on daily ego session spending',
-          shadow_morning_report: 'Send reports to a test topic for 2 weeks',
+          morning_report_hour: 'Hour (0\u201323) to send the daily morning report',
+          morning_report_minute: 'Minute (0\u201359) for morning report delivery',
+          morning_report_timezone: 'Timezone for morning report scheduling',
+          shadow_morning_report: 'Send reports to a test topic for validation before going live',
           consecutive_failure_limit: 'Consecutive failures before circuit breaker trips',
+          failure_backoff_minutes: 'Cooldown period after consecutive failures before retrying',
           // Inbox Monitor
-          watch_path: 'Directory to watch for incoming files',
-          response_dir: 'Subdirectory pattern to exclude from scanning',
-          effort: 'Processing depth: low, medium, or high',
-          timeout_s: 'Max seconds per inbox item processing',
+          watch_path: 'Directory path monitored for incoming files',
+          response_dir: 'Subdirectory pattern where responses are written (excluded from scanning)',
+          check_interval_seconds: 'How often (in seconds) to scan the inbox directory for new files',
+          batch_size: 'Maximum files to process per scan cycle (1\u201310)',
+          effort: 'Processing depth: low (fast), medium (balanced), or high (thorough)',
+          timeout_s: 'Max seconds per inbox item processing before timeout',
+          timezone: 'Timezone for scheduling and timestamps',
           // Outreach
+          start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
+          end: 'Quiet hours end \u2014 outreach resumes after this time (e.g., 07:00)',
+          default: 'Channel for general outreach (morning reports, digests)',
+          blocker: 'Channel for blocking/critical alerts that need immediate attention',
+          alert: 'Channel for non-blocking alerts and notifications',
+          surplus: 'Channel for surplus compute outputs (brainstorms, enrichment)',
+          digest: 'Channel for periodic summary digests',
           max_daily: 'Maximum outreach messages per day across all categories',
           surplus_daily: 'Maximum surplus compute messages per day',
+          trigger_time: 'Daily time when digest/report delivery fires (e.g., 08:00)',
+          timeout_hours: 'Max hours to wait for outreach delivery confirmation',
+          poll_interval_minutes: 'How often (in minutes) to check for pending outreach items',
         },
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
@@ -845,6 +904,20 @@
           alert: ['telegram', 'email', 'dashboard'],
           surplus: ['telegram', 'email', 'dashboard'],
           digest: ['telegram', 'email', 'dashboard'],
+          timezone: [
+            'America/New_York', 'America/Chicago', 'America/Denver',
+            'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu',
+            'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
+            'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
+            'Australia/Sydney', 'Pacific/Auckland', 'UTC',
+          ],
+          morning_report_timezone: [
+            'America/New_York', 'America/Chicago', 'America/Denver',
+            'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu',
+            'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
+            'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
+            'Australia/Sydney', 'Pacific/Auckland', 'UTC',
+          ],
         },
         _DOMAIN_LABELS: {
           tts: 'Text-to-Speech', ego: 'Autonomous Ego',
@@ -1630,6 +1703,18 @@
           }
           if ((services?.watchdog?.consecutive_failures || 0) > 0) {
             return { state: "degraded", reason: "watchdog has recent consecutive failures" };
+          }
+          // Sentinel — container-side guardian. Below liveness checks above so a
+          // dead bridge/timer/host_framework still wins; an escalated Sentinel
+          // paints the card red, an in-flight investigation paints it degraded.
+          const sentinel = services?.sentinel;
+          if (sentinel?.enabled) {
+            if (sentinel.current_state === "escalated") {
+              return { state: "error", reason: "sentinel escalated — CC diagnosis failed" };
+            }
+            if (sentinel.current_state === "investigating" || sentinel.current_state === "remediating") {
+              return { state: "degraded", reason: `sentinel ${sentinel.current_state}` };
+            }
           }
           return { state: "healthy", reason: `${svcLabel} and watchdog services are active` };
         },
@@ -3092,6 +3177,35 @@
                     Watchdog
                     <span style="opacity: 0.6; font-size: 0.75rem"
                           x-text="($store.genesisDashboard.health.services?.watchdog?.consecutive_failures || 0) > 0 ? '(' + $store.genesisDashboard.health.services.watchdog.consecutive_failures + ' fails)' : ''"></span>
+                  </div>
+                  <!-- Sentinel (container-side guardian) -->
+                  <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
+                       :title="(() => {
+                         const s = $store.genesisDashboard.health.services?.sentinel;
+                         if (!s || !s.enabled) return 'Sentinel: unavailable';
+                         let tip = 'Sentinel: ' + s.current_state;
+                         if (s.is_active) tip += ' (running)';
+                         if (s.last_trigger_reason) tip += ' — last: ' + s.last_trigger_reason;
+                         return tip;
+                       })()">
+                    <span class="status-dot"
+                          :style="`background: ${(() => {
+                            const s = $store.genesisDashboard.health.services?.sentinel;
+                            if (!s || !s.enabled) return '#666';
+                            if (s.current_state === 'healthy') return '#4caf50';
+                            if (s.current_state === 'escalated') return '#d9534f';
+                            if (s.current_state === 'investigating' || s.current_state === 'remediating') return '#f0ad4e';
+                            return '#666';  // unknown/future state — gray, not yellow
+                          })()}`"></span>
+                    Sentinel
+                    <span style="opacity: 0.6; font-size: 0.75rem"
+                          x-text="(() => {
+                            const s = $store.genesisDashboard.health.services?.sentinel;
+                            if (!s || !s.enabled) return '';
+                            if (s.is_active) return '(running)';
+                            if (s.current_state !== 'healthy') return '(' + s.current_state + ')';
+                            return '';
+                          })()"></span>
                   </div>
                   <!-- /tmp is shown in Infrastructure card, not here -->
                 </div>
@@ -4742,6 +4856,16 @@
         Settings
       </div>
       <div class="panel-body">
+        <!-- Restart banner (shown after saving a setting that needs restart) -->
+        <template x-if="$store.genesisDashboard.settingsRestartMessage">
+          <div style="padding:0.5rem 0.75rem; border-radius:4px; margin-bottom:0.75rem; font-size:0.74rem; background:rgba(255,193,7,0.12); color:#856404; border:1px solid rgba(255,193,7,0.25); display:flex; align-items:center; gap:0.5rem;">
+            <span x-text="$store.genesisDashboard.settingsRestartMessage"></span>
+            <button style="font-size:0.7rem; padding:2px 8px; border-radius:3px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
+                    @click="$store.genesisDashboard.restartBridge(); $store.genesisDashboard.settingsRestartMessage = null;">Restart Genesis</button>
+            <button class="btn-secondary" style="font-size:0.7rem; padding:2px 8px;"
+                    @click="$store.genesisDashboard.settingsRestartMessage = null">Dismiss</button>
+          </div>
+        </template>
         <template x-if="!$store.genesisDashboard.settingsDomains">
           <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
         </template>
@@ -4757,13 +4881,19 @@
                   </div>
                   <div style="display:flex; gap:0.5rem; align-items:center;">
                     <template x-if="domain.needs_restart">
-                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;">restart required</span>
+                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">restart to apply</span>
                     </template>
                     <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
                       <button style="font-size:0.75rem; padding:2px 10px;" @click="$store.genesisDashboard.startEditSettings(domain.name)">Edit</button>
                     </template>
                   </div>
                 </div>
+                <!-- GROUNDWORK(ego-activation): Remove or gate on runtime state when ego pipeline goes live -->
+                <template x-if="domain.name === 'ego'">
+                  <div style="font-size:0.72rem; color:var(--color-text-secondary); background:rgba(255,255,255,0.04); border:1px solid var(--color-border); border-radius:4px; padding:0.4rem 0.6rem; margin-bottom:0.5rem;">
+                    Ego sessions are configured but <strong>not active</strong>. They will be enabled when the autonomous proposal pipeline is ready.
+                  </div>
+                </template>
                 <!-- Collapsed view: show key values -->
                 <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
                   <div style="font-size:0.78rem; color:var(--color-text-secondary);">
@@ -4818,7 +4948,7 @@
                         </div>
                       </template>
                     </div>
-                    <!-- Nested objects (read-only display) -->
+                    <!-- Nested objects -->
                     <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v === 'object' && v !== null)" :key="key">
                       <div style="margin-top:0.5rem;">
                         <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:2px;" x-text="$store.genesisDashboard._settingLabel(key)"></div>
@@ -4841,7 +4971,16 @@
                                        :value="sv" step="any"
                                        @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = parseFloat($event.target.value)">
                               </template>
-                              <template x-if="typeof sv === 'string'">
+                              <template x-if="typeof sv === 'string' && $store.genesisDashboard._SETTING_CHOICES[sk]">
+                                <select style="font-size:0.78rem; padding:3px 6px; width:100%;"
+                                        @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value"
+                                        :value="sv">
+                                  <template x-for="opt in $store.genesisDashboard._SETTING_CHOICES[sk]" :key="opt">
+                                    <option :value="opt" :selected="sv === opt" x-text="opt"></option>
+                                  </template>
+                                </select>
+                              </template>
+                              <template x-if="typeof sv === 'string' && !$store.genesisDashboard._SETTING_CHOICES[sk]">
                                 <input type="text" style="font-size:0.78rem; padding:3px 6px; width:100%;"
                                        :value="sv"
                                        @change="$store.genesisDashboard.settingsData[domain.name][key][sk] = $event.target.value">
@@ -4855,7 +4994,7 @@
                       <button @click="$store.genesisDashboard.saveSettings(domain.name)"
                               :disabled="$store.genesisDashboard.settingsSaving"
                               x-text="$store.genesisDashboard.settingsSaving ? 'Saving...' : 'Save'"></button>
-                      <button style="background:transparent; border:1px solid var(--color-border);"
+                      <button class="btn-secondary"
                               @click="$store.genesisDashboard.settingsEditing = null; $store.genesisDashboard.fetchSettingsData(domain.name)">Cancel</button>
                     </div>
                   </div>
@@ -4886,10 +5025,10 @@
                           <span style="color:#4caf50;">Form above</span>
                         </template>
                         <template x-if="!domain.has_form && !domain.readonly && domain.dedicated_tool">
-                          <span>Ask Genesis: <code x-text="domain.dedicated_tool" style="font-size:0.72rem;"></code></span>
+                          <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update my ' + domain.name.replace(/_/g, ' ') + '&quot;'"></em></span>
                         </template>
                         <template x-if="!domain.has_form && !domain.readonly && !domain.dedicated_tool">
-                          <span>Ask Genesis: <code style="font-size:0.72rem;" x-text="'settings_update(&quot;' + domain.name + '&quot;, {...})'"></code></span>
+                          <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update ' + domain.name.replace(/_/g, ' ') + ' settings&quot;'"></em></span>
                         </template>
                         <template x-if="domain.readonly">
                           <span style="color:var(--color-text-secondary);">Read-only</span>
@@ -4900,7 +5039,7 @@
                           <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px;">locked</span>
                         </template>
                         <template x-if="domain.needs_restart && !domain.readonly">
-                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;">restart</span>
+                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">restart to apply</span>
                         </template>
                         <template x-if="!domain.readonly && !domain.needs_restart">
                           <span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span>
@@ -4942,11 +5081,10 @@
       <div class="panel-header">
         <span class="material-symbols-outlined">key</span>
         Provider Keys
-        <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px; margin-left:auto;">restart required</span>
       </div>
       <div class="panel-body">
         <div style="font-size:0.74rem; color:var(--color-text-secondary); margin-bottom:0.75rem;">
-          Manage API keys and credentials. Values are write-only &mdash; existing values are never displayed.
+          Manage API keys and credentials for external providers.
         </div>
         <!-- Message banner -->
         <template x-if="$store.genesisDashboard.secretsMessage">
@@ -4975,15 +5113,16 @@
                 <div style="font-size:0.72rem; font-weight:600; color:var(--color-text-secondary); margin-bottom:0.35rem; text-transform:uppercase; letter-spacing:0.03em;" x-text="group.name"></div>
                 <template x-for="k in group.keys" :key="k.key">
                   <div style="display:flex; align-items:center; gap:0.5rem; padding:0.35rem 0; border-bottom:1px solid var(--color-border); font-size:0.78rem; flex-wrap:wrap;">
-                    <!-- Status dot -->
-                    <span class="status-dot" :style="`background:${$store.genesisDashboard.secretStatusColor(k.status)}`"></span>
+                    <!-- Status dot (health-aware) -->
+                    <span class="status-dot" :style="`background:${$store.genesisDashboard.secretStatusColor($store.genesisDashboard.secretHealthStatus(k))}`"></span>
                     <!-- Label + env var -->
                     <span style="font-weight:600; min-width:90px;" x-text="k.label"></span>
                     <code style="font-size:0.65rem; color:var(--color-text-secondary);" x-text="k.key"></code>
-                    <!-- Status text -->
+                    <!-- Status text (health-aware) -->
                     <span style="margin-left:auto; min-width:70px; text-align:right;"
-                          :style="`color:${$store.genesisDashboard.secretStatusColor(k.status)}`"
-                          x-text="k.status === 'configured' ? 'configured' : k.status === 'validated' ? 'validated' : 'not set'"></span>
+                          :style="`color:${$store.genesisDashboard.secretStatusColor($store.genesisDashboard.secretHealthStatus(k))}`"
+                          :title="$store.genesisDashboard.secretHealthStatus(k) === 'error' ? 'Circuit breaker OPEN — provider unreachable or failing' : $store.genesisDashboard.secretHealthStatus(k) === 'degraded' ? 'Some providers using this key have circuit breakers open' : ''"
+                          x-text="({healthy:'healthy', configured:'configured', validated:'validated', degraded:'degraded', error:'unreachable', not_set:'not set'})[$store.genesisDashboard.secretHealthStatus(k)] || 'not set'"></span>
                     <!-- Signup link -->
                     <template x-if="k.signup_url && k.status === 'not_set'">
                       <a :href="'https://' + k.signup_url" target="_blank" rel="noopener"
@@ -4991,15 +5130,15 @@
                          x-text="k.signup_url"></a>
                     </template>
                     <!-- Edit/Set button -->
-                    <button style="font-size:0.68rem; padding:2px 8px; border-radius:3px; border:1px solid var(--color-border); background:transparent; color:var(--color-text-secondary); cursor:pointer;"
+                    <button class="btn-secondary" style="font-size:0.68rem;"
                             @click="$store.genesisDashboard.toggleSecretEdit(k.key)"
                             x-text="$store.genesisDashboard.secretsEditing[k.key] ? 'Cancel' : (k.status === 'not_set' ? 'Set' : 'Edit')"></button>
                     <!-- Inline edit row -->
                     <template x-if="$store.genesisDashboard.secretsEditing[k.key]">
                       <div style="width:100%; display:flex; gap:0.4rem; align-items:center; margin-top:0.25rem;">
-                        <input type="password" placeholder="Enter value..."
-                               style="flex:1; font-size:0.76rem; padding:4px 8px; border:1px solid var(--color-border); border-radius:4px; background:var(--color-background);"
-                               :value="$store.genesisDashboard.secretsValues[k.key] || ''"
+                        <input type="text" placeholder="Enter value..."
+                               style="flex:1; font-size:0.76rem; padding:4px 8px; border:1px solid var(--color-border); border-radius:4px; background:var(--color-background); color:var(--color-text);"
+                               :value="$store.genesisDashboard.secretsValues[k.key] ?? k.value ?? ''"
                                @input="$store.genesisDashboard.secretsValues = {...$store.genesisDashboard.secretsValues, [k.key]: $event.target.value}">
                         <button style="font-size:0.7rem; padding:3px 10px; border-radius:4px; border:1px solid rgba(33,150,243,0.3); color:#2196F3; background:transparent; cursor:pointer;"
                                 :disabled="$store.genesisDashboard.secretsSaving"

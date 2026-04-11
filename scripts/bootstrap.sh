@@ -36,22 +36,43 @@ fi
 install_pkg() {
     local pkg_apt="$1"
     local pkg_dnf="${2:-$1}"
+    local output rc
     if [[ -z "$PKG_MGR" ]]; then
         echo "  ERROR: No package manager found. Install $pkg_apt manually."
         return 1
     fi
     if [[ "$PKG_MGR" == "apt" ]]; then
-        sudo apt-get install -y -qq "$pkg_apt" > /dev/null 2>&1
+        output=$(sudo apt-get install -y -qq "$pkg_apt" 2>&1)
     else
-        sudo "$PKG_MGR" install -y -q "$pkg_dnf" > /dev/null 2>&1
+        output=$(sudo "$PKG_MGR" install -y -q "$pkg_dnf" 2>&1)
     fi
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        # Show the last meaningful line of output for diagnostics
+        local last_line
+        last_line=$(echo "$output" | grep -v '^\s*$' | tail -1)
+        echo "  install failed (exit $rc): ${last_line:-no output}"
+    fi
+    return $rc
 }
+
+# TMPDIR management — /tmp may be a small tmpfs (512MB on containers).
+# pip needs space for large wheels; redirect to ~/tmp/ if /tmp is tight.
+_tmp_avail=$(df -BM /tmp 2>/dev/null | awk 'NR==2{gsub(/M/,"",$4); print $4}' || echo "0")
+if [[ "${_tmp_avail:-0}" -lt 2048 ]]; then
+    mkdir -p "$HOME/tmp"
+    export TMPDIR="$HOME/tmp"
+    echo "  /tmp is small (${_tmp_avail}MB free) — using $TMPDIR for pip downloads"
+fi
 
 # Update package index once before any installs
 echo "  Updating package index..."
 if [[ "$PKG_MGR" == "apt" ]]; then
-    timeout 120 sudo apt-get update -qq 2>/dev/null || true
+    if ! timeout 120 sudo apt-get update -qq 2>/dev/null; then
+        echo "  WARNING: Package index update failed — installs may use stale index"
+    fi
 elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
+    # check-update exits 100 when updates are available — not an error
     sudo "$PKG_MGR" check-update -q 2>/dev/null; true
 fi
 
@@ -112,10 +133,13 @@ if ! command -v sqlite3 &>/dev/null; then
     install_pkg sqlite3 sqlite || echo "  WARNING: Could not install sqlite3. Ad-hoc DB queries will require Python."
 fi
 
-# gh (GitHub CLI — recon gatherer, release workflow, onboarding)
+# gh (GitHub CLI — backup push, recon gatherer, release workflow, onboarding)
 if ! command -v gh &>/dev/null; then
     echo "  gh not found — installing..."
-    install_pkg gh || echo "  WARNING: Could not install gh. GitHub release tracking will be unavailable."
+    if ! install_pkg gh; then
+        echo "  WARNING: gh unavailable — backup push, release workflow, and GitHub recon will not work."
+        echo "           Install manually: https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
+    fi
 fi
 
 # ripgrep (portability checks, code search)
@@ -153,21 +177,31 @@ else
     echo "  Git identity: $(git -C "$GENESIS_ROOT" config user.name) <$(git -C "$GENESIS_ROOT" config user.email)>"
 fi
 
-# Node.js (optional but recommended)
-if ! command -v node &>/dev/null; then
-    echo "  Node.js not found — installing..."
-    if [[ "$PKG_MGR" == "apt" ]]; then
-        sudo apt-get install -y -qq nodejs npm > /dev/null 2>&1 || echo "  WARNING: Could not install Node.js. Some features may not work."
-    elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
-        sudo "$PKG_MGR" install -y nodejs npm > /dev/null 2>&1 || echo "  WARNING: Could not install Node.js. Some features may not work."
+# Node.js >= 20 (required for Claude Code)
+_node_version_ok() {
+    command -v node &>/dev/null || return 1
+    local ver
+    ver=$(node --version 2>/dev/null | sed 's/^v//')
+    local major="${ver%%.*}"
+    [[ "$major" -ge 20 ]] 2>/dev/null
+}
+if ! _node_version_ok; then
+    if command -v node &>/dev/null; then
+        echo "  Node.js $(node --version) is too old (need >= 20) — upgrading..."
     else
-        echo "  WARNING: Node.js not found. Install manually for full functionality."
+        echo "  Node.js not found — installing..."
+    fi
+    install_pkg nodejs || true
+    if ! _node_version_ok; then
+        echo "  WARNING: Node.js >= 20 not available. Claude Code will not work."
+        echo "           Install via: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -"
+        echo "                        sudo apt-get install -y nodejs"
     fi
 fi
-if command -v node &>/dev/null; then
+if _node_version_ok; then
     echo "  Node: $(node --version)"
 else
-    echo "  Node: not available (optional)"
+    echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
 fi
 echo
 
@@ -222,6 +256,40 @@ for launcher in "$GENESIS_ROOT/.claude/hooks/genesis-hook" "$GENESIS_ROOT/.claud
 done
 echo
 
+# --- Git hooks (worktree safety, push guards) ---
+echo "--- Installing git hooks ---"
+HOOKS_SRC="$GENESIS_ROOT/scripts/hooks"
+# Handle both regular repos (.git/hooks) and worktrees (.git is a file)
+GIT_COMMON_DIR=$(cd "$GENESIS_ROOT" && _gcd=$(git rev-parse --git-common-dir 2>/dev/null) && cd "$_gcd" && pwd || echo "")
+if [[ -n "$GIT_COMMON_DIR" ]] && [[ -d "$GIT_COMMON_DIR/hooks" ]]; then
+    HOOKS_DST="$GIT_COMMON_DIR/hooks"
+elif [[ -d "$GENESIS_ROOT/.git/hooks" ]]; then
+    HOOKS_DST="$GENESIS_ROOT/.git/hooks"
+else
+    echo "  WARNING: .git/hooks not found — skipping"
+    HOOKS_DST=""
+fi
+if [[ -n "$HOOKS_DST" ]]; then
+    # Phase 6: prefer sync-hooks.sh if available — it handles the
+    # full set (pre-commit, pre-push, post-commit) + helper scripts
+    # (emit_bugfix_audit.py) + version tracking via
+    # .genesis-hook-versions. Legacy loop remains as a fallback for
+    # very old installs that don't have sync-hooks.sh yet.
+    if [[ -x "$HOOKS_SRC/sync-hooks.sh" ]]; then
+        "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
+        echo "  + hooks synced via sync-hooks.sh"
+    else
+        for hook in pre-commit pre-push; do
+            if [[ -f "$HOOKS_SRC/$hook" ]]; then
+                cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
+                chmod +x "$HOOKS_DST/$hook"
+                echo "  + $hook"
+            fi
+        done
+    fi
+fi
+echo
+
 # --- Timezone ---
 echo "--- Configuring timezone ---"
 # Read from secrets.env if set, otherwise prompt
@@ -236,7 +304,7 @@ if [[ -z "$GENESIS_TIMEZONE" ]]; then
     if [[ -t 0 ]]; then
         # Interactive — ask the user
         echo "  Current timezone: $CURRENT_TZ"
-        read -rp "  Enter timezone (e.g. America/New_York) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
+        read -rp "  Enter timezone (e.g. UTC) or press Enter to keep [$CURRENT_TZ]: " INPUT_TZ
         GENESIS_TIMEZONE="${INPUT_TZ:-$CURRENT_TZ}"
     else
         # Non-interactive — use current or UTC

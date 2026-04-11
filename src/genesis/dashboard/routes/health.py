@@ -143,11 +143,36 @@ async def guardian_dialogue():
     except (ValueError, TypeError, AttributeError) as exc:
         logger.debug("Failed to parse Guardian concern payload: %s", exc, exc_info=True)
 
-    # V4 Step 1: Genesis has no self-heal logic yet — always need_help
+    # Dispatch Sentinel if available — container-side guardian handles it
+    sentinel = getattr(rt, "_sentinel", None)
+    if sentinel is not None and not sentinel.is_active:
+        try:
+            from genesis.sentinel import SentinelRequest
+            from genesis.util.tasks import tracked_task
+
+            tracked_task(
+                sentinel.dispatch(SentinelRequest(
+                    trigger_source="guardian_dialogue",
+                    trigger_reason=f"Guardian concern: signals_failing={failing}",
+                    tier=2,
+                    context=concern,
+                )),
+                name="sentinel-guardian-dialogue",
+            )
+            return jsonify({
+                "acknowledged": True,
+                "status": "handling",
+                "action": "sentinel_dispatched",
+                "eta_s": 300,
+                "context": "Sentinel dispatched to diagnose and fix",
+            }), 200
+        except Exception:
+            logger.warning("Sentinel dispatch failed — falling back to need_help", exc_info=True)
+
     return jsonify({
         "acknowledged": True,
         "status": "need_help",
         "action": "",
         "eta_s": 0,
-        "context": "Genesis acknowledges the concern but has no self-repair capability yet",
+        "context": "Genesis acknowledges the concern but cannot self-repair (Sentinel unavailable)",
     }), 200

@@ -261,10 +261,39 @@ class CCReflectionBridge:
         used_cli = True
         session_id = f"api:{depth.value.lower()}"
         if self._autonomous_dispatcher is not None:
+            # Call-site gating pre-check: if a reflection of this depth
+            # is already pending approval, skip scheduling a new one.
+            # Different depths are independently gated (deep/light/
+            # strategic each have their own policy_id), so light
+            # reflection continues even if deep is blocked.
+            reflection_policy_id = f"reflection_{depth.value.lower()}"
+            try:
+                pending = await (
+                    self._autonomous_dispatcher.approval_gate.find_site_pending(
+                        subsystem="reflection",
+                        policy_id=reflection_policy_id,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "find_site_pending failed for %s; proceeding without pre-check",
+                    reflection_policy_id, exc_info=True,
+                )
+                pending = None
+            if pending is not None:
+                logger.info(
+                    "%s reflection skipped — call site blocked on approval %s",
+                    depth.value.title(), pending.get("id"),
+                )
+                return ReflectionResult(
+                    success=False,
+                    reason=f"awaiting approval {pending.get('id')} for {depth.value} reflection",
+                )
+
             decision = await self._autonomous_dispatcher.route(
                 request=AutonomousDispatchRequest(
                     subsystem="reflection",
-                    policy_id=f"reflection_{depth.value.lower()}",
+                    policy_id=reflection_policy_id,
                     action_label=f"{depth.value.lower()} reflection",
                     messages=[
                         {"role": "system", "content": self._system_prompt_for_depth(depth)},

@@ -22,8 +22,17 @@ async def store_procedure(
     activation_tier: str = "L4",
     tool_trigger: list[str] | None = None,
     speculative: int = 1,
+    success_count: int = 0,
+    confidence: float = 0.0,
 ) -> str:
-    """Create a new procedure and return its ID."""
+    """Create a new procedure and return its ID.
+
+    Defaults match the extractor path (speculative=1, success_count=0,
+    confidence=0.0). Callers that represent explicit confirmations — e.g.,
+    user-driven `procedure_store` MCP writes — should pass non-default
+    values to seed the procedure as already-trusted (speculative=0,
+    success_count>=1, confidence via Laplace).
+    """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     await procedural.create(
@@ -38,6 +47,8 @@ async def store_procedure(
         activation_tier=activation_tier,
         tool_trigger=tool_trigger,
         speculative=speculative,
+        success_count=success_count,
+        confidence=confidence,
     )
     return proc_id
 

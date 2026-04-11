@@ -620,7 +620,201 @@ continues, action pauses, learning persists.
 
 ---
 
-## 8. References
+## 8. Outstanding Design Work
+
+### 8.1 Fire Alarm Taxonomy: What Wakes the Pilot
+
+**Status:** Implemented | **Added:** 2026-04-08 | **Implemented:** 2026-04-09
+
+The 2026-04-08 memory exhaustion incident had multiple fire alarms sounding
+simultaneously — watchdog reclaim failures, Guardian stuck in confirmed_dead,
+Guardian dialogue returning "need_help", CC unavailable for diagnosis — and
+nobody inside Genesis responded. This is now addressed by the **Sentinel** —
+Genesis's container-side guardian (see `src/genesis/sentinel/`).
+
+**Principle:** These are META-failures — not "a component is down" but "the
+system designed to detect and fix failures is itself broken." Individual
+component failures are handled by reflexes. When the reflexes fail, the
+pilot needs to know.
+
+**Tier 1: Defense mechanism failures** (the guards are down)
+- Watchdog reclaim fails — the OOM prevention mechanism is broken
+- Guardian stuck in confirmed_dead or surveying for >10min — external
+  monitor is blind
+- Guardian dialogue returns "need_help" for a condition reflexes COULD
+  handle — missed self-heal opportunity
+- CC unavailable for Guardian diagnosis — can't even think about the
+  problem (happened at 21:54 UTC during incident)
+- Auth/config blocking health probes — the monitoring system itself is
+  misconfigured
+
+**Tier 2: Cascading / compounding failures**
+- Multiple infrastructure components degraded simultaneously
+- Error spike coinciding with provider failures
+- Reflexes firing but conditions not improving (reclaim runs, memory
+  keeps climbing)
+
+**Tier 3: Persistent unresolved conditions**
+- Same reflex fires N times without resolving the underlying condition
+- An observation stays unresolved past a severity-appropriate threshold
+- A condition recurs after restart (the restart didn't fix root cause)
+
+**Response architecture: Two complementary roles**
+
+Two distinct actors, not competing but complementary:
+
+**First Responder (separate CC call):** Immediate, reactive, tactical. "Qdrant
+is down, fix it now." Spins up in seconds. No continuity, no strategic context,
+but fast. This is what the Guardian does from the host side — Genesis needs the
+same capability from INSIDE the container for conditions the Guardian can't see.
+The auth misconfiguration in the 2026-04-08 incident was invisible from outside
+because the Guardian's own probes were the thing being blocked. Only an internal
+first responder could have caught and fixed that.
+
+**Ego (incident commander):** Slower, strategic, contextual. "Qdrant has gone
+down 5 times this week — why? Is the underlying disk failing? Should we
+migrate?" Runs on its normal cadence. Sees the pattern across time. Makes
+decisions about root cause and systemic fixes.
+
+The first responder handles the immediate crisis. The ego reviews the incident
+after and decides what to change systemically. The first responder CREATES the
+observation that the ego later processes. They form a response chain:
+
+```
+Fire alarm → First Responder CC → immediate fix + observation
+                                          ↓
+              Ego (next cycle) ← observation: "Qdrant restarted 5x this week"
+                                          ↓
+              Ego proposes: "investigate disk health, consider migration"
+```
+
+**Trigger sources for the first responder CC call:**
+
+The first responder is a CC session dispatched by Genesis itself. It can be
+triggered by any of:
+
+1. **Fire alarm signals** — awareness loop detects a Tier 1/2 condition that
+   reflexes can't handle. Spawns the CC call directly.
+2. **Guardian comms** — the Guardian is already programmed to contact Genesis
+   and tell it to fix its problems before escalating. When the guardian-dialogue
+   handler receives a concern it can't reflexively fix, it dispatches a first
+   responder instead of immediately returning "need_help."
+3. **Reflection engine** — a reflection detects a pattern of failures that
+   warrants immediate investigation. Escalates to first responder.
+4. **Ego subagent** — the ego, during its cycle, identifies something that
+   needs immediate tactical attention. Dispatches a first responder as a
+   subagent rather than waiting for the next ego cycle.
+
+**Open questions:**
+- Should the ego cadence be overridden for Tier 1 events? ("Wake up NOW,
+  not in 60 minutes.") Or is the first responder CC call sufficient for
+  the immediate response, with the ego reviewing at its normal pace?
+- How many simultaneous Tier 1 signals before "drop everything"?
+- Does the first-responder CC call need continuity across invocations,
+  or is each call fresh context?
+- Where does this live architecturally? Awareness loop spawn? Remediation
+  registry escalation? New subsystem?
+- Model selection: first responder needs speed over depth. Sonnet? Or does
+  infrastructure diagnosis need Opus?
+
+---
+
+### 8.2 Ego Context Redesign: Pilot, Not Dashboard
+
+**Status:** Partially implemented | **Added:** 2026-04-08 | **Updated:** 2026-04-09
+
+The Sentinel implements the three-layer separation (EYES/REFLEXES/BRAIN) and
+the breathing metaphor for reflection integration. Sentinel events flow into
+the observation pipeline as low-priority items (resolved) or critical items
+(escalated). The ego context strip is deferred to ego wiring.
+
+The current `EgoContextBuilder` injects a full health snapshot (provider
+status, latency, resilience state, queue depths, session counts) into
+every ego cycle. This treats the ego as a reactive monitoring dashboard.
+The ego should be a **pilot** — an independent actor that decides where
+its own attention goes.
+
+**Core principle:** Everything we inject into the ego's context influences
+where its attention goes. A blanket health dump crowds out curiosity and
+strategic thinking. The ego should spend ~80% of its cycles on self-directed
+exploration and ~20% on mandatory items that only it can handle.
+
+**Architecture:**
+
+Three-layer separation:
+
+1. **Infrastructure Monitor (call site 37, free models) — EYES.** Observe,
+   detect anomalies, classify severity. Never act. Creates observations.
+
+2. **Mechanical Remediations (no LLM) — REFLEXES.** If/then rules for
+   known-safe conditions: memory reclaim, service restarts. These run in
+   the watchdog/awareness loop. When reflexes handle a condition, the
+   observation is resolved — the ego never sees it.
+
+3. **Ego — BRAIN.** Only receives:
+   - **Mandatory escalations**: CRITICAL observations that lower layers
+     explicitly escalated ("I tried, I failed, this needs judgment"). The
+     escalation itself is the signal.
+   - **Anomalies from reflections**: The reflection engine digests raw data
+     and surfaces surprising patterns, contradictions, or novel observations
+     as open questions — curiosity fuel, not conclusions.
+   - **Thread updates**: The ego's own follow-ups from previous cycles,
+     enriched by anything the reflection engine learned since.
+
+**The reflection engine is the ego's staff.** Reflections do the heavy lifting
+of reading, processing, synthesizing. The ego gets distilled insights ready
+for decision-making. Raw health data, routine observations, and resolved
+incidents never reach the ego.
+
+**Design decisions still open:**
+
+- **Urgency bypass:** Infrastructure conditions that jeopardize Genesis's
+  operations (the kind of cascading failure from 2026-04-08) should fast-path
+  directly to the ego's mandatory items, potentially skipping the reflection
+  digest. The trigger: reflexes failed AND the condition is system-threatening.
+
+- **Anomaly detection quality:** Reflections currently run on cheaper models
+  (Haiku for light, Sonnet for deep). Are these capable enough to produce
+  genuinely surprising anomalies? Bad anomaly detection is worse than none.
+  Model advancement may help — Genesis should track models.md and swap in
+  better anomaly detectors as they become available at similar cost.
+
+- **Structured follow-ups:** The ego's `follow_ups` field is freeform text.
+  Should this be a typed list of "open threads" with metadata (when started,
+  what's been tried, why it matters)? This would let the context builder
+  match threads to new information automatically rather than hoping the LLM
+  makes the connection.
+
+- **Curiosity architecture:** LLMs given an empty canvas satisfice. They
+  need hooks to pull on. The reflection engine should surface anomalies and
+  open questions as curiosity fuel. The ego's compacted history provides
+  momentum (continuing threads across cycles). Tension and contradiction
+  spark better thinking than status reports.
+
+- **What to strip from EgoContextBuilder:**
+  - Health snapshot (provider status, latency, resilience state)
+  - Routine observations (handled at lower levels)
+  - Queue depths, session counts, operational metrics
+  - Anything reflexes or the infrastructure monitor can handle
+
+- **What to keep/add:**
+  - Compacted history (continuity across cycles)
+  - Follow-ups from previous cycles (the ego's own agenda)
+  - Mandatory escalations (filtered, critical only)
+  - Anomalies from reflections (curiosity fuel)
+  - User context (who it's serving)
+
+- **The 80/20 split:** Enforce architecturally (context budget — cap mandatory
+  items to 20% of context tokens) or via prompt (tell the ego to prioritize
+  curiosity)? Probably both.
+
+**Implementation sequence:** Strip the health dump first (simplest, immediate
+improvement). Add escalation filtering. Then build the anomaly pipeline from
+reflections. Structured follow-ups last.
+
+---
+
+## 9. References
 
 ### Individual Feature Specifications
 

@@ -636,6 +636,7 @@ class TestReflectionHeartbeatEmission:
         loop._cc_reflection_bridge = None
         loop._deferred_queue = None
         loop._db = AsyncMock()
+        loop._topic_manager = None  # _dispatch_reflection reads this
 
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO

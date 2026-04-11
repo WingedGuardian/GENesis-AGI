@@ -38,7 +38,7 @@ regression:
 # Watchdog configuration
 watchdog:
   status_file: "~/.genesis/status.json"  # Reuse existing StatusFileWriter output
-  staleness_threshold_seconds: 300       # 5 minutes — if status.json older than this, bridge may be dead
+  staleness_threshold_seconds: 900       # 15 minutes — 3x awareness cadence (300s) headroom for slow ticks (Light reflection, etc.)
   check_interval_seconds: 60             # How often watchdog checks
   max_restart_attempts: 5                # Stop trying after this many consecutive failures
   backoff_initial_seconds: 10

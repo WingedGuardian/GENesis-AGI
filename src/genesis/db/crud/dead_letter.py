@@ -87,6 +87,46 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def expire_orphans_by_provider(
+    db: aiosqlite.Connection,
+    *,
+    active_providers: list[str],
+) -> list[tuple[str, str]]:
+    """Expire all pending items whose target_provider is not in the active list.
+
+    Single atomic UPDATE ... RETURNING — no pagination, no per-row round
+    trips, safe for DLQs of any size. Used by the config-reload orphan
+    scan to proactively clean up items targeting providers that were
+    removed from the routing config.
+
+    Args:
+        active_providers: provider names that ARE still in the active
+            config. An empty list means every pending item is an orphan.
+
+    Returns:
+        List of ``(id, target_provider)`` tuples that were expired.
+    """
+    if active_providers:
+        placeholders = ",".join("?" * len(active_providers))
+        sql = (
+            "UPDATE dead_letter SET status = 'expired' "
+            f"WHERE status = 'pending' AND target_provider NOT IN ({placeholders}) "
+            "RETURNING id, target_provider"
+        )
+        params: list = list(active_providers)
+    else:
+        sql = (
+            "UPDATE dead_letter SET status = 'expired' "
+            "WHERE status = 'pending' "
+            "RETURNING id, target_provider"
+        )
+        params = []
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    await db.commit()
+    return [(row[0], row[1]) for row in rows]
+
+
 async def query_recent(
     db: aiosqlite.Connection,
     *,

@@ -91,20 +91,78 @@ async def _apply_pending_settings(ctx: HandlerContext, user_id: int, tid: str | 
         log.error("Failed to apply pending settings for user %s", user_id, exc_info=True)
 
 
-async def _make_streamer(ctx: HandlerContext, msg) -> DraftStreamer | None:
-    """Create a draft streamer if conditions are met."""
-    if (
+_MODEL_PREFIX_GAP_S = 3600  # Show model/effort prefix after 1h of silence
+
+
+async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer | None:
+    """Create a draft streamer if conditions are met.
+
+    Seeds the streamer with a model/effort prefix and flushes immediately
+    so the user sees what model they're talking to before inference starts.
+    Only shows the prefix when >1h has elapsed since the user's last message
+    in this private chat (i.e. when coming back cold).
+    """
+    if not (
         ctx.draft_streaming_enabled
         and ctx.adapter and ctx.adapter._app
         and msg.chat.type == "private"
     ):
-        return DraftStreamer(
-            bot=ctx.adapter._app.bot,
-            chat_id=msg.chat.id,
-            draft_id=generate_draft_id(),
-            message_thread_id=msg.message_thread_id,
-        )
-    return None
+        return None
+
+    # Determine whether to show model/effort prefix based on message gap
+    prefix = ""
+    if ctx.db:
+        try:
+            from genesis.db.crud import cc_sessions
+
+            # Check time since last inbound message in this chat
+            show_prefix = False
+            row = await ctx.db.execute(
+                """SELECT timestamp FROM telegram_messages
+                   WHERE chat_id = ? AND direction = 'inbound'
+                   ORDER BY timestamp DESC LIMIT 1 OFFSET 1""",
+                (msg.chat.id,),
+            )
+            prev = await row.fetchone()
+            if prev is None:
+                # First message ever — show prefix
+                show_prefix = True
+            else:
+                from datetime import UTC, datetime
+                prev_ts = datetime.fromisoformat(prev[0])
+                now = datetime.now(UTC)
+                # Handle naive timestamps
+                if prev_ts.tzinfo is None:
+                    prev_ts = prev_ts.replace(tzinfo=UTC)
+                show_prefix = (now - prev_ts).total_seconds() >= _MODEL_PREFIX_GAP_S
+
+            if show_prefix:
+                session = await cc_sessions.get_active_foreground(
+                    ctx.db,
+                    user_id=f"tg-{user.id}",
+                    channel=str(ChannelType.TELEGRAM),
+                    thread_id=tid,
+                )
+                if session:
+                    model = (session.get("model") or "sonnet").title()
+                    effort = session.get("effort") or "medium"
+                    prefix = f"[{model} / {effort}]"
+        except Exception:
+            log.debug("Could not resolve model/effort prefix", exc_info=True)
+
+    streamer = DraftStreamer(
+        bot=ctx.adapter._app.bot,
+        chat_id=msg.chat.id,
+        draft_id=generate_draft_id(),
+        message_thread_id=msg.message_thread_id,
+        prefix=prefix,
+    )
+
+    # Flush immediately — user sees prefix before inference starts
+    if prefix:
+        await streamer.flush()
+
+    return streamer
 
 
 async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
@@ -115,7 +173,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
     ikey = (user.id, msg.chat.id)
     ctx.active_interrupts[ikey] = interrupt_event
 
-    streamer = await _make_streamer(ctx, msg)
+    streamer = await _make_streamer(ctx, msg, user, tid)
     on_event = ctx.make_on_event(interrupt_event, streamer)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
 
@@ -160,6 +218,8 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             # Always send text first — voice is additional, never a replacement
             if response:
                 response = response.lstrip("\n")
+                if streamer and streamer._prefix:
+                    response = streamer._prefix + "\n" + response
                 sent_msg = await _reply_formatted(msg, response)
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
@@ -248,7 +308,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
     ikey = (user.id, msg.chat.id)
     ctx.active_interrupts[ikey] = interrupt_event
 
-    streamer = await _make_streamer(ctx, msg)
+    streamer = await _make_streamer(ctx, msg, user, tid)
     on_event = ctx.make_on_event(interrupt_event, streamer)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
 
@@ -307,6 +367,8 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             # Send response first — voice and transcription echo follow separately
             if response:
                 response = response.lstrip("\n")
+                if streamer and streamer._prefix:
+                    response = streamer._prefix + "\n" + response
             sent_msg = await _reply_formatted(msg, response or "(no response)")
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
@@ -407,7 +469,7 @@ async def _handle_media_inner(
     ikey = (user.id, msg.chat.id)
     ctx.active_interrupts[ikey] = interrupt_event
 
-    streamer = await _make_streamer(ctx, msg)
+    streamer = await _make_streamer(ctx, msg, user, tid)
     on_event = ctx.make_on_event(interrupt_event, streamer)
     typing_ka = _TypingKeepAliveV2(msg.chat, ctx.typing_breaker_instance)
 
@@ -459,6 +521,8 @@ async def _handle_media_inner(
                 streamer.disable()
             if response:
                 response = response.lstrip("\n")
+                if streamer and streamer._prefix:
+                    response = streamer._prefix + "\n" + response
                 sent_msg = await _reply_formatted(msg, response)
 
         if response:
@@ -533,6 +597,106 @@ async def _handle_media_inner(
             log.warning("Failed to clean up temp media file %s", file_path, exc_info=True)
 
 
+_BARE_APPROVE_WORDS = frozenset({"approve", "approved", "ok", "yes", "lgtm"})
+_BARE_REJECT_WORDS = frozenset({"reject", "rejected", "deny", "denied", "no"})
+
+
+def _bare_decision(text: str) -> str | None:
+    """Return 'approved'/'rejected' iff the entire message is a single
+    bare approve/reject word.  Rejects anything that's not an exact
+    single-token match so general conversation never triggers."""
+    stripped = (text or "").strip().lower()
+    if not stripped:
+        return None
+    # Allow optional trailing punctuation on a single token.
+    import re
+    cleaned = re.sub(r"[^\w]", "", stripped) if " " not in stripped else stripped
+    if " " in cleaned:
+        return None
+    if cleaned in _BARE_APPROVE_WORDS:
+        return "approved"
+    if cleaned in _BARE_REJECT_WORDS:
+        return "rejected"
+    return None
+
+
+async def _try_bare_approval_resolution(
+    ctx: HandlerContext, msg, user,
+) -> bool:
+    """Resolve a bare 'approve'/'reject' typed into the Approvals topic.
+
+    Returns True if the message was consumed as an approval resolution
+    (caller should return early).  False if the message is not a bare
+    approval word, or is not inside the Approvals topic, or there is no
+    pending autonomous_cli_fallback request to resolve.
+
+    This is the fix for the "I typed 'approve' and nothing happened
+    because I didn't formally quote-reply" UX bug: in the Approvals
+    topic, a bare 'approve' resolves the most recent pending request.
+    """
+    if ctx.autonomous_cli_gate is None:
+        return False
+    decision = _bare_decision(msg.text)
+    if decision is None:
+        return False
+    # Must be inside a forum topic (not general chat or DM).
+    thread_id = getattr(msg, "message_thread_id", None)
+    if thread_id is None:
+        return False
+    # Must be the Approvals topic specifically.  Look up via the
+    # OutreachPipeline's public topic_manager property.  The pipeline
+    # is fetched from the runtime singleton because the topic_manager
+    # is created AFTER the Telegram adapter starts (it needs adapter.
+    # _app.bot), so we cannot wire it into HandlerContext at build time.
+    # Adding "approvals" to the pre-create list in bridge.py means the
+    # topic exists from startup and get_thread_id returns immediately.
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        pipeline = rt.outreach_pipeline
+        if pipeline is None:
+            return False
+        topic_manager = pipeline.topic_manager
+        if topic_manager is None:
+            return False
+        approvals_thread_id = topic_manager.get_thread_id("approvals")
+        if approvals_thread_id is None or approvals_thread_id != thread_id:
+            return False
+    except Exception:
+        log.warning(
+            "Topic manager lookup failed for bare approval resolution",
+            exc_info=True,
+        )
+        return False
+
+    try:
+        resolved_id = await ctx.autonomous_cli_gate.resolve_most_recent_pending(
+            decision=decision,
+            resolved_by=f"telegram:bare_text:{user.id}",
+        )
+    except Exception:
+        log.error("Failed to resolve bare approval", exc_info=True)
+        return False
+    if resolved_id is None:
+        log.debug(
+            "Bare %s in Approvals topic ignored — no pending requests",
+            decision,
+        )
+        return False
+    log.info(
+        "Bare %s in Approvals topic resolved request %s (user %s)",
+        decision, resolved_id, user.id,
+    )
+    try:
+        ack = "✅ Approved" if decision == "approved" else "❌ Rejected"
+        await msg.reply_text(f"{ack} request <code>{resolved_id}</code>",
+                             parse_mode="HTML")
+    except Exception:
+        log.debug("Failed to ack bare approval", exc_info=True)
+    return True
+
+
 async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not ctx.authorized(user.id):
@@ -552,20 +716,23 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
         reply_to=msg.reply_to_message.message_id if msg.reply_to_message else None,
     )
 
+    # Bare "approve"/"reject" typed into the Approvals topic — resolve
+    # the most recent pending autonomous CLI approval without requiring
+    # a formal Telegram quote-reply.  No-op for anything else.
+    if await _try_bare_approval_resolution(ctx, msg, user):
+        return
+
     if msg.reply_to_message:
         reply_to_id = str(msg.reply_to_message.message_id)
 
         # Resolve autonomous CLI fallback approvals before generic reply waiters.
-        try:
-            from genesis.runtime import GenesisRuntime
-
-            rt = GenesisRuntime.instance()
-            gate = getattr(rt, "_autonomous_cli_approval_gate", None)
-            if gate is not None and await gate.resolve_from_reply(reply_to_id, msg.text):
-                log.info("Autonomous CLI approval resolved for delivery %s", reply_to_id)
-                return
-        except Exception:
-            log.warning("Failed to resolve approval reply", exc_info=True)
+        if ctx.autonomous_cli_gate is not None:
+            try:
+                if await ctx.autonomous_cli_gate.resolve_from_reply(reply_to_id, msg.text):
+                    log.info("Autonomous CLI approval resolved for delivery %s", reply_to_id)
+                    return
+            except Exception:
+                log.warning("Failed to resolve approval reply", exc_info=True)
 
         # Record engagement if this is a reply to an outreach message
         if ctx.engagement_tracker and ctx.db:
@@ -584,6 +751,10 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
         if ctx.reply_waiter and ctx.reply_waiter.resolve(reply_to_id, msg.text):
             log.info("Outreach reply resolved for delivery %s", reply_to_id)
             return
+
+    # resolve_any_pending DISABLED — it conflates messages across chats/topics.
+    # A DM message resolved an alert-topic approval request. Use quote-reply
+    # or inline keyboard buttons instead. See plan: fluttering-humming-bentley.md
 
     # Record implicit engagement: user is active after receiving outreach
     if ctx.engagement_tracker and ctx.db:
@@ -606,6 +777,135 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     )
     async with chat_lock:
         await _handle_text_inner(ctx, msg, user, tid)
+
+
+async def handle_callback_query(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses (approval flows).
+
+    Recognized callback_data prefixes:
+
+    - ``approve:{waiter_key}`` / ``reject:{waiter_key}`` — Sentinel
+      blocking-approval flow; resolves a ``ReplyWaiter`` keyed by
+      ``waiter_key``.
+    - ``cli_approve:{request_id}`` — autonomous CLI fallback single-approve;
+      resolves the referenced request directly via
+      ``AutonomousCliApprovalGate.resolve_request``.  Bypasses ReplyWaiter.
+    - ``cli_approve_all:{request_id}`` — autonomous CLI fallback batch-
+      approve; resolves the triggering request first (for correct message
+      edit) then calls ``approve_all_pending`` to clear every remaining
+      pending ``autonomous_cli_fallback`` row.
+    """
+    query = update.callback_query
+    if not query:
+        return
+
+    user = update.effective_user
+    if not user or not ctx.authorized(user.id):
+        await query.answer("Not authorized", show_alert=True)
+        return
+
+    await query.answer()  # Dismiss spinner immediately
+
+    data = query.data or ""
+    parts = data.split(":", 1)
+    if len(parts) != 2:
+        return
+
+    action, key = parts[0], parts[1]
+
+    # --- Autonomous CLI fallback: single approve ---
+    if action == "cli_approve":
+        if ctx.autonomous_cli_gate is None:
+            log.error(
+                "cli_approve button pressed but autonomous_cli_gate is not "
+                "wired into HandlerContext — approval request %s not resolved",
+                key,
+            )
+            return
+        try:
+            ok = await ctx.autonomous_cli_gate.resolve_request(
+                key, decision="approved", resolved_by=f"telegram:button:{user.id}",
+            )
+        except Exception:
+            log.error(
+                "Failed to resolve cli_approve for request %s", key, exc_info=True,
+            )
+            return
+        label = "✅ Approved" if ok else "⚠️ Already resolved"
+        log.info("cli_approve %s → %s (user %s)", key, label, user.id)
+        try:
+            original = query.message.text_html or query.message.text or ""
+            await query.edit_message_text(
+                text=f"{original}\n\n<b>{label}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.debug("Failed to edit message after cli_approve", exc_info=True)
+        return
+
+    # --- Autonomous CLI fallback: batch approve ---
+    if action == "cli_approve_all":
+        if ctx.autonomous_cli_gate is None:
+            log.error(
+                "cli_approve_all button pressed but autonomous_cli_gate is not "
+                "wired into HandlerContext — request %s not resolved",
+                key,
+            )
+            return
+        try:
+            # Resolve the triggering request first so the message edit
+            # reflects the click, even if approve_all_pending re-resolves
+            # it as part of the batch sweep.
+            triggered_ok = await ctx.autonomous_cli_gate.resolve_request(
+                key, decision="approved",
+                resolved_by=f"telegram:batch:{user.id}",
+            )
+            batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
+                resolved_by=f"telegram:batch:{user.id}",
+            )
+        except Exception:
+            log.error(
+                "Failed to resolve cli_approve_all for %s", key, exc_info=True,
+            )
+            return
+        total = batch_count + (1 if triggered_ok else 0)
+        label = f"✅ Approved ({total} total)" if total else "⚠️ Already resolved"
+        log.info(
+            "cli_approve_all triggered by %s: triggered=%s batch=%d total=%d (user %s)",
+            key, triggered_ok, batch_count, total, user.id,
+        )
+        try:
+            original = query.message.text_html or query.message.text or ""
+            await query.edit_message_text(
+                text=f"{original}\n\n<b>{label}</b>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            log.debug("Failed to edit message after cli_approve_all", exc_info=True)
+        return
+
+    # --- Sentinel-style reply_waiter flow (existing behavior) ---
+    if action not in ("approve", "reject"):
+        log.warning("Unexpected callback action: %r", action)
+        return
+
+    if ctx.reply_waiter:
+        resolved = ctx.reply_waiter.resolve(key, action)
+        if resolved:
+            decision = "Approved" if action == "approve" else "Rejected"
+            log.info("Callback query resolved waiter %s: %s (user %s)", key, decision, user.id)
+            try:
+                original = query.message.text_html or query.message.text or ""
+                await query.edit_message_text(
+                    text=f"{original}\n\n<b>{decision}</b>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                log.debug("Failed to edit message after callback resolution", exc_info=True)
+        else:
+            # Don't edit if already processed (double-press would overwrite
+            # the "Approved"/"Rejected" label). Only log it.
+            log.info("Callback query for expired/processed waiter %s (user %s)", key, user.id)
 
 
 async def handle_voice(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):

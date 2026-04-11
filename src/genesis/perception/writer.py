@@ -7,17 +7,20 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import aiosqlite
 
 from genesis.awareness.types import Depth, TickResult
 from genesis.db.crud import observations
 from genesis.db.crud import surplus as surplus_crud
-from genesis.memory.store import MemoryStore
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
 from genesis.perception.confidence import load_config, should_gate
 from genesis.perception.types import MIN_DELTA_CONFIDENCE, LightOutput, MicroOutput
+
+if TYPE_CHECKING:
+    from genesis.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 

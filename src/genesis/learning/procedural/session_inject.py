@@ -15,7 +15,14 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-_MAX_PROCEDURES = 5
+# Soft cap on procedures considered for injection. The actual rendered list
+# is bounded by `_MAX_WORDS`, not this limit — `_MAX_PROCEDURES` is just the
+# SQL LIMIT to keep the query cheap. Set above the seed-procedure count so
+# that explicit-teach procedures (lower confidence than seeded ones, e.g.,
+# 0.667 from `procedure_store`) still enter the candidate pool and get a
+# fair shot at the word budget instead of being silently truncated by a
+# tight LIMIT clause.
+_MAX_PROCEDURES = 10
 _MAX_WORDS = 200
 
 

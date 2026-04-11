@@ -113,7 +113,7 @@ async def _restore_module_states(rt: GenesisRuntime) -> None:
         return
 
     from genesis.modules.persistence import load_all_module_states, save_module_state
-    from genesis.runtime._core import record_init_degradation
+    from genesis.runtime._degradation import record_init_degradation
 
     states = await load_all_module_states(rt._db)
 

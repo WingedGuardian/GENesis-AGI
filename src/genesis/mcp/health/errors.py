@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime
 
@@ -42,7 +43,7 @@ async def _impl_health_errors(
                         "timestamp": item.get("created_at", ""),
                     })
         except Exception:
-            logger.warning("Failed to query dead letter errors", exc_info=True)
+            logger.error("Failed to query dead letter errors", exc_info=True)
 
     if _service._breakers and _service._routing_config:
         from genesis.routing.types import ProviderState
@@ -58,7 +59,10 @@ async def _impl_health_errors(
                         "failures": cb.consecutive_failures,
                     })
             except Exception:
-                logger.debug("Dead letter timestamp parse failed", exc_info=True)
+                logger.error(
+                    "Circuit breaker state check failed for provider %s",
+                    name, exc_info=True,
+                )
 
     from datetime import timedelta as _td
 
@@ -93,7 +97,7 @@ async def _impl_health_errors(
                 })
             db_events_loaded = True
         except Exception:
-            logger.debug("Event log query failed", exc_info=True)
+            logger.error("Event log query failed", exc_info=True)
 
     if not db_events_loaded and _event_bus and hasattr(_event_bus, "recent_events"):
         from genesis.observability.types import Severity
@@ -137,9 +141,25 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     alerts: list[dict] = []
     current_ids: set[str] = set()
 
+    # Import lazily to avoid circular imports in hook/test paths
+    from genesis.observability._call_site_meta import _CALL_SITE_META
+
     for site_id, site_info in snap.get("call_sites", {}).items():
         status_val = site_info.get("status", "unknown")
         alert_id = f"call_site:{site_id}"
+
+        # Skip groundwork call sites — config exists but no code invokes
+        # the router with this call_site_id. These are not infrastructure
+        # alerts; they're placeholders for future wiring.
+        meta = _CALL_SITE_META.get(site_id, {})
+        if meta.get("wired") is False:
+            continue
+
+        # Skip disabled sites — every provider in the chain is unconfigured
+        # (no API key in this deployment). This is a config state, not an
+        # outage. Surfacing it as a CRITICAL alert caused Sentinel spam.
+        if status_val == "disabled":
+            continue
 
         if status_val == "down":
             alerts.append({
@@ -179,15 +199,44 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         })
         current_ids.add(alert_id)
 
+    # CC rate-limit / unavailability alert.
+    #
+    # Two design constraints shape this block:
+    #
+    # 1. The `realtime_status` comes from the resilience state machine,
+    #    which latches RATE_LIMITED on CCInvoker errors but has flapping
+    #    protection that can suppress the auto-recovery transition. Net
+    #    effect: the state machine can stay RATE_LIMITED for long periods
+    #    even when background sessions are healthy and the hourly budget
+    #    says otherwise. The background budget tracker (bg.status) is the
+    #    source of truth for actual throughput state. Cross-check before
+    #    emitting — if the budget tracker disagrees, the state machine is
+    #    stale, suppress the alert.
+    #
+    # 2. Severity is WARNING, not CRITICAL. Rationale: the Sentinel is
+    #    the only CRITICAL-alert responder, and the Sentinel's only tool
+    #    is dispatching a CC session. If CC is genuinely unavailable, a
+    #    diagnostic CC session cannot run. Waking the tool to fix the
+    #    tool is a self-defeating loop. WARNING routes to Tier 3
+    #    (reflexes only) per the classifier — the user still sees it on
+    #    the dashboard and via health_alerts, but Sentinel doesn't wake.
     cc_realtime = cc.get("realtime_status")
     if cc_realtime in ("UNAVAILABLE", "RATE_LIMITED"):
-        alert_id = "cc:quota_exhausted"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL",
-            "message": f"CC {cc_realtime.lower().replace('_', ' ')} — contingency mode active",
-        })
-        current_ids.add(alert_id)
+        bg_status = bg.get("status", "unknown")
+        if bg_status == "healthy":
+            logger.debug(
+                "Suppressing cc:quota_exhausted: realtime_status=%s but bg.status=healthy "
+                "(state machine is stale — budget tracker disagrees)",
+                cc_realtime,
+            )
+        else:
+            alert_id = "cc:quota_exhausted"
+            alerts.append({
+                "id": alert_id,
+                "severity": "WARNING",
+                "message": f"CC {cc_realtime.lower().replace('_', ' ')} — contingency mode active",
+            })
+            current_ids.add(alert_id)
 
     awareness = snap.get("awareness", {})
     tick_age = awareness.get("time_since_last_tick_seconds")
@@ -287,6 +336,37 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         })
         current_ids.add(alert_id)
 
+    # Guardian heartbeat — the host-side safety net
+    #
+    # The container-side GuardianWatchdog already tries SSH restart on
+    # heartbeat staleness, but it only escalates to Sentinel on the
+    # SECOND stage (Guardian stuck in confirmed_dead after reset-state
+    # fails). If the Guardian is heartbeat-stale AND SSH is unreachable
+    # (host down, network broken, auth drift), the Sentinel never sees
+    # the problem via the watchdog path.
+    #
+    # Emitting guardian:heartbeat_stale CRITICAL here closes that gap.
+    # Part 7's per-pattern backoff + 2-of-3 debounce prevents this from
+    # being spammy. The classifier treats this as Tier 1 (defense
+    # mechanism failure) so the Sentinel is woken promptly for diagnosis.
+    guardian_info = snap.get("infrastructure", {}).get("guardian", {})
+    guardian_status = guardian_info.get("status", "unknown")
+    if guardian_status == "down":
+        staleness = guardian_info.get("staleness_s")
+        stale_part = (
+            f" (stale {int(staleness)}s)" if isinstance(staleness, int | float) else ""
+        )
+        alert_id = "guardian:heartbeat_stale"
+        alerts.append({
+            "id": alert_id,
+            "severity": "CRITICAL",
+            "message": (
+                f"Guardian heartbeat not updating{stale_part} — "
+                f"host-side safety net is blind"
+            ),
+        })
+        current_ids.add(alert_id)
+
     ollama = snap.get("infrastructure", {}).get("ollama", {})
     missing_models = ollama.get("missing_models", [])
     if missing_models:
@@ -344,6 +424,49 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                     "message": f"Job {job_name} is quarantined (max retries exhausted, auto-unquarantine in ≤24h)",
                 })
                 current_ids.add(alert_id)
+
+    # ── Genesis update available ─────────────────────────────────────
+    if _service and _service._db:
+        try:
+            cursor = await _service._db.execute(
+                "SELECT content FROM observations "
+                "WHERE source = 'genesis_version' AND type = 'genesis_update_available' "
+                "AND resolved = 0 ORDER BY created_at DESC LIMIT 1",
+            )
+            row = await cursor.fetchone()
+            if row:
+                data = json.loads(row[0] if isinstance(row, tuple) else row["content"])
+                behind = data.get("commits_behind", "?")
+                tag = data.get("target_tag", "unknown")
+                alert_id = "genesis:update_available"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "WARNING",
+                    "message": f"Genesis update available: {tag} ({behind} commits behind)",
+                })
+                current_ids.add(alert_id)
+
+            # Check for update failure
+            cursor = await _service._db.execute(
+                "SELECT content FROM observations "
+                "WHERE source = 'genesis_version' AND type = 'genesis_update_failed' "
+                "AND resolved = 0 ORDER BY created_at DESC LIMIT 1",
+            )
+            row = await cursor.fetchone()
+            if row:
+                data = json.loads(row[0] if isinstance(row, tuple) else row["content"])
+                alert_id = "genesis:update_failed"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": (
+                        f"Genesis update to {data.get('new_tag', '?')} failed, "
+                        f"rolled back to {data.get('rollback_tag', '?')}"
+                    ),
+                })
+                current_ids.add(alert_id)
+        except Exception:
+            logger.error("Genesis update alert check failed", exc_info=True)
 
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):

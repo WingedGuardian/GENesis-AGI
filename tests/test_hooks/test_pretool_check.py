@@ -219,7 +219,7 @@ class TestSubprocessEdgeCases:
         """Blocked paths report the matching pattern in stderr."""
         result = _run_subprocess_json("config/autonomy.yaml")
         assert result.returncode == 2
-        assert "CRITICAL protected pattern" in result.stderr
+        assert "CRITICAL protected path" in result.stderr
         assert "relay/chat channel" in result.stderr
 
 

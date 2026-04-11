@@ -11,7 +11,7 @@ import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_DEFAULT_TZ = "America/New_York"
+_DEFAULT_TZ = "UTC"
 
 try:
     _USER_TZ = ZoneInfo(os.environ.get("USER_TIMEZONE", _DEFAULT_TZ))

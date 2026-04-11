@@ -36,6 +36,10 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     "surplus": "Surplus",
     "recon": "Recon",
     "ego_proposals": "Ego Proposals",
+    # Autonomous CLI approval prompts — inline ✅ buttons + optional
+    # "approve all N pending" batch button.  Bare "approve"/"reject"
+    # text messages in this topic resolve the most recent pending request.
+    "approvals": "Approvals",
 }
 
 
@@ -55,7 +59,6 @@ class TopicManager:
         self._db = db
         self._categories = categories or DEFAULT_CATEGORIES
         self._persistent_topics: dict[str, int] = {}  # category → thread_id
-        self._permission_warned: bool = False
         self._create_lock = asyncio.Lock()
 
     async def load_persisted(self) -> None:
@@ -118,12 +121,19 @@ class TopicManager:
                 )
                 return thread_id
             except Exception:
-                if not self._permission_warned:
-                    logger.warning(
-                        "Failed to create forum topic (bot may lack admin perms)",
-                        exc_info=True,
-                    )
-                    self._permission_warned = True
+                # Log every failure at ERROR, not warn-once at WARNING.
+                # The caller retries lazy-creation on every delivery, so a
+                # persistent failure (rate limit, perms regression, Telegram
+                # API flake) used to be invisible after the first hit and
+                # silently routed messages to DM fallback.  Logging every
+                # attempt makes the problem visible in health_errors MCP and
+                # the dashboard error feed immediately.
+                logger.error(
+                    "Failed to create forum topic for category '%s' "
+                    "(chat_id=%d, name=%r); caller will fall back to DM "
+                    "delivery",
+                    category, self._chat_id, name, exc_info=True,
+                )
                 return None
 
     def get_thread_id(self, category: str) -> int | None:
@@ -210,5 +220,9 @@ class TopicManager:
             "surplus": "surplus",
             "recon": "recon",
             "ego_proposals": "ego_proposals",
+            # Autonomous CLI approvals get their own topic so the inline
+            # button UX and "approve all N pending" semantics are clearly
+            # scoped — they don't mix with general alerts.
+            "approval": "approvals",
         }
         return mapping.get(outreach_category, "surplus")

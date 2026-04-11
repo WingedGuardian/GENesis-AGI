@@ -42,13 +42,12 @@ class TestCollectorReplacement:
         assert loop._collectors[0].signal_name == "real"
 
     def test_real_collectors_have_correct_signal_names(self):
-        """All 5 real collectors have the expected signal_name attribute."""
+        """Real learning-signal collectors have the expected signal_name."""
         from genesis.learning.signals.budget import BudgetCollector
         from genesis.learning.signals.critical_failure import (
             CriticalFailureCollector,
         )
         from genesis.learning.signals.error_spike import ErrorSpikeCollector
-        from genesis.learning.signals.memory_backlog import MemoryBacklogCollector
         from genesis.learning.signals.task_quality import TaskQualityCollector
 
         mock_db = MagicMock()
@@ -56,7 +55,6 @@ class TestCollectorReplacement:
         assert ErrorSpikeCollector(mock_db).signal_name == "software_error_spike"
         assert CriticalFailureCollector([]).signal_name == "critical_failure"
         assert TaskQualityCollector(mock_db).signal_name == "task_completion_quality"
-        assert MemoryBacklogCollector(mock_db).signal_name == "unprocessed_memory_backlog"
 
 
 class TestPipelineAssembly:

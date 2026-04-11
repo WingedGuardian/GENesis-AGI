@@ -22,12 +22,19 @@ are the highest-ROI LinkedIn activity for building network presence.
 
 ## Voice Loading
 
-Before writing comments, read voice exemplars and anti-slop rules:
-- `../voice-master/references/exemplars/social.md`
-- `../voice-master/references/anti-slop.md`
+Before writing comments, load the user's voice via voice-master's overlay
+resolution:
 
-If the exemplar file is empty or has no good matches, also read:
-- `../voice-master/references/voice-dimensions.md`
+1. Read `../voice-master/SKILL.md` and follow its **User Calibration
+   Overlay** section to load exemplars and voice-dimensions from the
+   out-of-repo overlay (or template fallback with warning if no overlay).
+2. This skill's medium is `social`. Select social-medium exemplars from
+   whatever voice-master loads.
+3. Read `../voice-master/references/anti-slop.md` — apply the **Universal**
+   and **Professional / LinkedIn** sections.
+
+If no overlay is present, voice-master falls back to generic voice guidance
+and warns — note this in your output.
 
 Comments follow the same voice rules as posts but in compressed form.
 
@@ -130,5 +137,5 @@ rationale: |
 
 ## References
 
-- `../voice-master/references/exemplars/social.md` — Social media voice exemplars
-- `../voice-master/references/anti-slop.md` — AI-tell avoidance rules
+- `../voice-master/SKILL.md` — Voice authority; follow its User Calibration Overlay section to load social exemplars from the user overlay
+- `../voice-master/references/anti-slop.md` — Universal + Professional/LinkedIn anti-slop rules

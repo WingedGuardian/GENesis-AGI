@@ -1,8 +1,8 @@
-"""Dashboard secrets routes — write-only API key management.
+"""Dashboard secrets routes — API key management.
 
 Parses secrets.env.example for the canonical key registry (groups, labels,
-descriptions, signup URLs). Reads secrets.env for status. Writes updates
-atomically. NEVER exposes actual key values through the API.
+descriptions, signup URLs). Reads secrets.env for status and current values.
+Writes updates atomically.
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from pathlib import Path
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
+from genesis.dashboard.auth import is_authenticated
 from genesis.env import repo_root, secrets_path
 
 logger = logging.getLogger(__name__)
@@ -122,11 +123,19 @@ _KNOWN_KEYS: frozenset[str] = frozenset(k.key for k in _KEY_REGISTRY)
 # ── Helpers ──────────────────────────────────────────────────────────
 
 def _key_status(key_name: str) -> str:
-    """Check if a key is configured in the environment. Never returns the value."""
+    """Check if a key is configured in the environment."""
     val = os.environ.get(key_name, "")
     if val and val not in ("None", "NA", ""):
         return "configured"
     return "not_set"
+
+
+def _key_value(key_name: str) -> str:
+    """Return the current value of a key from the environment, or empty string."""
+    val = os.environ.get(key_name, "")
+    if val in ("None", "NA"):
+        return ""
+    return val
 
 
 def _update_secrets_file(updates: dict[str, str]) -> None:
@@ -183,14 +192,20 @@ def _update_secrets_file(updates: dict[str, str]) -> None:
 
 @blueprint.route("/api/genesis/secrets")
 def secrets_list():
-    """Return grouped key registry with status. Never returns actual values."""
+    """Return grouped key registry with status and current values.
+
+    Values are only included for authenticated sessions. Unauthenticated
+    callers (monitoring tools, Guardian probes) see status but not values.
+    """
     groups: dict[str, list[dict]] = {}
+    include_values = is_authenticated()
 
     for kdef in _KEY_REGISTRY:
         entry = {
             "key": kdef.key,
             "label": kdef.label,
             "status": _key_status(kdef.key),
+            "value": _key_value(kdef.key) if include_values else "",
             "description": kdef.description,
             "signup_url": kdef.signup_url,
             "is_sensitive": kdef.is_sensitive,

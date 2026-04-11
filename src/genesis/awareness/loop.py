@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import aiosqlite
+from apscheduler.events import EVENT_JOB_MAX_INSTANCES, EVENT_JOB_MISSED
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -324,7 +325,6 @@ class AwarenessLoop:
         cc_reflection_bridge=None,
         resilience_state_machine=None,
         deferred_queue=None,
-        status_writer=None,
     ):
         self._db = db
         self._collectors = list(collectors)
@@ -336,10 +336,12 @@ class AwarenessLoop:
         self._cc_reflection_bridge = cc_reflection_bridge
         self._resilience_state_machine = resilience_state_machine
         self._deferred_queue = deferred_queue
-        self._status_writer = status_writer
         self._circuit_breakers: CircuitBreakerRegistry | None = None
+        self._tick_event_loop: asyncio.AbstractEventLoop | None = None
         self._topic_manager = None
         self._guardian_watchdog = None
+        self._remediation_registry = None
+        self._sentinel = None
         self._credential_bridge_fn = None
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
@@ -386,8 +388,65 @@ class AwarenessLoop:
             misfire_grace_time=60,
             next_run_time=datetime.now(UTC),
         )
+        # Surface dropped-tick events. APScheduler emits these synchronously
+        # on its own thread; bounce to our event loop via call_soon_threadsafe
+        # so we can await event_bus.emit safely.
+        try:
+            self._tick_event_loop = asyncio.get_running_loop()
+            self._scheduler.add_listener(
+                self._on_scheduler_job_event,
+                EVENT_JOB_MISSED | EVENT_JOB_MAX_INSTANCES,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to register scheduler job-event listener", exc_info=True,
+            )
         self._scheduler.start()
         logger.info("Awareness Loop started (interval=%dm, immediate first tick)", self._interval)
+
+    def _on_scheduler_job_event(self, event) -> None:
+        """APScheduler listener — runs in scheduler thread.
+
+        Hand the event off to the asyncio loop so async emit can run safely.
+        """
+        if getattr(event, "job_id", None) != "awareness_tick":
+            return
+        event_code = getattr(event, "code", None)
+        try:
+            loop = self._tick_event_loop
+            if loop is None or loop.is_closed():
+                return
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._emit_tick_drop_event(event_code)),
+            )
+        except Exception:
+            logger.warning("Failed to hand off scheduler event", exc_info=True)
+
+    async def _emit_tick_drop_event(self, event_code: int | None) -> None:
+        """Emit an observability event for a dropped / missed tick."""
+        if self._event_bus is None:
+            return
+        if event_code == EVENT_JOB_MAX_INSTANCES:
+            event_type = "tick.max_instances"
+            message = (
+                "Awareness tick dropped: previous tick still running "
+                "(max_instances=1)"
+            )
+        elif event_code == EVENT_JOB_MISSED:
+            event_type = "tick.missed"
+            message = "Awareness tick missed (past misfire grace time)"
+        else:
+            event_type = "tick.dropped"
+            message = f"Awareness tick dropped (code={event_code})"
+        try:
+            await self._event_bus.emit(
+                Subsystem.AWARENESS,
+                Severity.ERROR,
+                event_type,
+                message,
+            )
+        except Exception:
+            logger.warning("Failed to emit tick drop event", exc_info=True)
 
     async def stop(self) -> None:
         """Stop the scheduler, waiting for any running tick to finish."""
@@ -477,11 +536,10 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Resilience state update failed", exc_info=True)
 
-            if self._status_writer:
-                try:
-                    await self._status_writer.write()
-                except Exception:
-                    logger.warning("Status file write failed")
+            # Status file writes are handled by a dedicated loop in
+            # runtime/init/memory.py (status-writer-loop). Decoupled from
+            # the awareness tick so a slow tick (e.g. long Light reflection)
+            # does not cause the watchdog to see a stale status.json.
 
             # Guardian bidirectional monitoring — check heartbeat, auto-recover
             if self._guardian_watchdog:
@@ -489,6 +547,24 @@ class AwarenessLoop:
                     await self._guardian_watchdog.check_and_recover()
                 except Exception:
                     logger.warning("Guardian watchdog check failed", exc_info=True)
+
+            # Mechanical self-healing — run remediation registry against health probes
+            if self._remediation_registry:
+                try:
+                    from genesis.observability.health import collect_probe_results
+                    probe_results = await collect_probe_results(self._db)
+                    outcomes = await self._remediation_registry.check_and_remediate(
+                        probe_results,
+                    )
+                    acted = [o for o in outcomes if o.executed]
+                    if acted:
+                        logger.info(
+                            "Remediation tick: %d actions executed (%s)",
+                            len(acted),
+                            ", ".join(o.action.name for o in acted),
+                        )
+                except Exception:
+                    logger.warning("Remediation registry check failed", exc_info=True)
 
             # Propagate Telegram credentials to shared mount for Guardian
             if self._credential_bridge_fn:
@@ -518,6 +594,13 @@ class AwarenessLoop:
                         logger.info("Ingested %d Guardian findings", count)
                 except Exception:
                     logger.error("Guardian findings ingest failed", exc_info=True)
+
+            # Sentinel fire alarm check — evaluate conditions and dispatch if needed
+            if self._sentinel:
+                try:
+                    await self._sentinel.check_fire_alarms()
+                except Exception:
+                    logger.warning("Sentinel fire alarm check failed", exc_info=True)
 
         if result is None:
             return
@@ -772,10 +855,6 @@ class AwarenessLoop:
         """Inject deferred queue after construction."""
         self._deferred_queue = dq
 
-    def set_status_writer(self, sw) -> None:
-        """Inject status writer after construction."""
-        self._status_writer = sw
-
     def set_reflection_engine(self, engine) -> None:
         """Inject reflection engine after construction."""
         self._reflection_engine = engine
@@ -791,6 +870,14 @@ class AwarenessLoop:
     def set_guardian_watchdog(self, watchdog) -> None:
         """Inject Guardian watchdog for bidirectional host monitoring."""
         self._guardian_watchdog = watchdog
+
+    def set_remediation_registry(self, registry) -> None:
+        """Inject remediation registry for mechanical self-healing."""
+        self._remediation_registry = registry
+
+    def set_sentinel(self, sentinel) -> None:
+        """Inject Sentinel dispatcher for autonomous fire alarm response."""
+        self._sentinel = sentinel
 
     def set_credential_bridge(self, fn) -> None:
         """Inject credential bridge for Telegram credential propagation."""
@@ -809,7 +896,22 @@ class AwarenessLoop:
         self._findings_ingest_fn = fn
 
     def replace_collectors(self, collectors: list) -> None:
-        """Replace signal collectors (late-binding upgrade from stubs to real)."""
+        """Replace signal collectors (late-binding upgrade from stubs to real).
+
+        WARNING: this is a **full replacement**, not a superset merge. Any
+        collector registered by ``runtime/init/awareness.py`` that should
+        survive the swap MUST be re-added to the new ``collectors`` list
+        passed by ``runtime/init/learning.py``. Otherwise it is silently
+        dropped from the awareness loop and its signal stops being measured.
+
+        Currently both ``ContainerMemoryCollector`` and ``JobHealthCollector``
+        are registered in awareness init but NOT re-listed in the learning
+        swap, so their signals (`container_memory_pct`, `scheduled_job_health`)
+        are dropped post-bootstrap. This is functionally OK today because
+        neither has a corresponding ``signal_weights`` row, but adding such
+        a row in the future will silently produce 0.0 readings unless the
+        learning swap is updated to re-include them.
+        """
         self._collectors = list(collectors)
 
     # GROUNDWORK(category-2-rhythms): add_rhythm(name, interval, callback)

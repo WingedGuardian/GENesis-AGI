@@ -68,12 +68,14 @@ class DraftStreamer:
         draft_id: int,
         message_thread_id: int | None = None,
         throttle_s: float = _DEFAULT_THROTTLE_S,
+        prefix: str = "",
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
         self.draft_id = draft_id
         self.message_thread_id = message_thread_id
         self.throttle_s = throttle_s
+        self._prefix = prefix
 
         self._tool_lines: list[str] = []
         self._text = ""
@@ -143,6 +145,9 @@ class DraftStreamer:
     def _compose_draft(self) -> str:
         """Combine tool header and response body into draft text."""
         parts: list[str] = []
+
+        if self._prefix:
+            parts.append(self._prefix)
 
         if self._tool_lines:
             visible = self._tool_lines[-_MAX_TOOL_LINES:]

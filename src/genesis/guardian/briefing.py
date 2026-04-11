@@ -59,6 +59,7 @@ class BriefingContent:
     tick_count_1h: int = 0
     active_cc_sessions: list[dict[str, str]] = field(default_factory=list)
     recent_errors: list[dict[str, str]] = field(default_factory=list)
+    sentinel_state: dict[str, str] = field(default_factory=dict)
 
 
 def write_guardian_briefing(
@@ -206,6 +207,20 @@ async def build_dynamic_briefing(db) -> BriefingContent:
             })
     except Exception:
         logger.warning("Dynamic briefing: cc_sessions query failed", exc_info=True)
+
+    # Sentinel state — read from shared filesystem (the Sentinel writes here)
+    try:
+        sentinel_state_path = Path.home() / ".genesis" / "shared" / "sentinel" / "sentinel_state.json"
+        if sentinel_state_path.exists():
+            import json as _json
+            sentinel_data = _json.loads(sentinel_state_path.read_text())
+            content.sentinel_state = {
+                "current_state": sentinel_data.get("current_state", "unknown"),
+                "last_trigger": sentinel_data.get("last_trigger_reason", ""),
+                "last_dispatch": sentinel_data.get("last_cc_dispatch_at", ""),
+            }
+    except Exception:
+        logger.debug("Dynamic briefing: sentinel state read failed", exc_info=True)
 
     return content
 

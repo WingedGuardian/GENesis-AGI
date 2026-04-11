@@ -229,14 +229,29 @@ class RecoveryEngine:
 
     async def _escalate(self, diagnosis: DiagnosisResult) -> RecoveryResult:
         """Send escalation alert — no automated recovery."""
+        attempts = len(diagnosis.actions_taken)
+        actions_str = ", ".join(diagnosis.actions_taken) if diagnosis.actions_taken else "none"
+        cc_note = ""
+        if diagnosis.cc_failure_reason:
+            cc_note = f"CC failure: {diagnosis.cc_failure_reason}\n"
+        cname = self._config.container_name
+
         await self._dispatcher.send(Alert(
             severity=AlertSeverity.EMERGENCY,
-            title="Recovery escalated — manual intervention required",
-            body=f"Cause: {diagnosis.likely_cause}\n"
-                 f"Confidence: {diagnosis.confidence_pct}%\n"
-                 f"Reasoning: {diagnosis.reasoning}\n\n"
-                 "Automated recovery has been exhausted or confidence is too low. "
-                 "Manual investigation required.",
+            title="Genesis down — all automated recovery failed",
+            body=(
+                f"Cause: {diagnosis.likely_cause}\n"
+                f"Confidence: {diagnosis.confidence_pct}%\n"
+                f"{cc_note}"
+                f"Actions tried ({attempts}): {actions_str}\n\n"
+                "IMMEDIATE ACTION REQUIRED:\n"
+                "1. SSH to host VM\n"
+                "2. Check Guardian log: ~/.local/state/genesis-guardian/guardian.log\n"
+                f"3. Check container: incus exec {cname} -- "
+                f"su - ubuntu -c 'journalctl --user -n 200'\n"
+                f"4. Manual restart: incus exec {cname} -- "
+                f"su - ubuntu -c 'systemctl --user restart genesis-server'"
+            ),
             likely_cause=diagnosis.likely_cause,
             failed_probes=diagnosis.evidence,
         ))

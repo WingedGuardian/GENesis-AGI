@@ -4,6 +4,20 @@ from __future__ import annotations
 
 import aiosqlite
 
+# Marker prefix stored in inbox_items.error_message for rows that are parked
+# in 'processing' state waiting for a user reply to the autonomous-CLI
+# approval gate.  Using a constant rather than a magic string keeps the
+# monitor, expire_stuck_processing, and get_awaiting_approval in sync —
+# changing the prefix in one place without the others would silently break
+# the resume flow.
+AWAITING_APPROVAL_PREFIX = "awaiting_approval:"
+
+# Prefix for rows whose awaiting_approval state was invalidated before the
+# user replied (source file vanished, content changed, etc.).  Deliberately
+# distinct from AWAITING_APPROVAL_PREFIX so SQL LIKE filters won't confuse
+# invalidated-failed rows with still-awaiting rows.
+APPROVAL_INVALIDATED_PREFIX = "approval_invalidated:"
+
 
 async def create(
     db: aiosqlite.Connection,
@@ -43,6 +57,13 @@ async def get_by_file_path(db: aiosqlite.Connection, file_path: str) -> dict | N
 async def expire_stuck_processing(db: aiosqlite.Connection) -> int:
     """Expire items stuck in 'processing' for >2 hours to 'failed'.
 
+    Rows carrying an ``awaiting_approval:<request_id>`` marker in
+    ``error_message`` are deliberately excluded — they are not stuck, they
+    are legitimately waiting for a user to respond to the autonomous-CLI
+    approval gate, which can take arbitrarily long.  The inbox monitor's
+    resume pass re-dispatches these rows each scan cycle until the
+    approval resolves.
+
     Returns the number of items expired.
     """
     from datetime import UTC, datetime, timedelta
@@ -52,11 +73,37 @@ async def expire_stuck_processing(db: aiosqlite.Connection) -> int:
         """UPDATE inbox_items
            SET status = 'failed', error_message = 'processing_timeout_expired'
            WHERE status = 'processing'
-             AND created_at < ?""",
-        (cutoff,),
+             AND created_at < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')""",
+        (cutoff, AWAITING_APPROVAL_PREFIX),
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def get_awaiting_approval(db: aiosqlite.Connection) -> list[dict]:
+    """Return inbox items that are parked waiting for a user approval reply.
+
+    These are rows whose autonomous-CLI dispatch returned ``mode=blocked``
+    with an ``approval_request_id`` and a reason indicating the approval
+    is still pending (not rejected).  The monitor resume pass loads these
+    on each scan cycle and re-dispatches them through the normal batch
+    flow; the stable approval key ensures no duplicate Telegram prompts,
+    and the dispatcher resolves the batch once the approval status
+    changes (approved → CLI runs, rejected → row marked failed).
+    """
+    cursor = await db.execute(
+        """SELECT id, file_path, content_hash, batch_id, error_message,
+                  created_at
+           FROM inbox_items
+           WHERE status = 'processing'
+             AND error_message LIKE ? || '%'
+           ORDER BY created_at ASC""",
+        (AWAITING_APPROVAL_PREFIX,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(row) for row in rows]
 
 
 async def get_all_known(
@@ -110,9 +157,32 @@ async def update_status(
     processed_at: str | None = None,
     error_message: str | None = None,
     evaluated_content: str | None = None,
+    retry_count: int | None = None,
 ) -> bool:
-    if status == "failed":
-        # Increment retry_count on failure
+    """Update an inbox_items row's status and related fields.
+
+    If ``status == 'failed'`` the default behaviour is to increment
+    ``retry_count`` by 1 so retry-limited scanning eventually excludes
+    the file after ``max_retries`` consecutive failures.
+
+    Pass ``retry_count=<int>`` to SET the value directly (bypassing
+    the increment).  Used by the inbox resume pass on the rejection
+    path to permanently block a file the user explicitly rejected —
+    the retry_count is set in the SAME atomic UPDATE as the status
+    change, eliminating the race window where a concurrent reader
+    could see ``failed`` with ``retry_count < max_retries`` and
+    re-detect the file.
+    """
+    if retry_count is not None:
+        cursor = await db.execute(
+            """UPDATE inbox_items
+               SET status = ?, processed_at = ?, error_message = ?,
+                   retry_count = ?
+               WHERE id = ?""",
+            (status, processed_at, error_message, retry_count, id),
+        )
+    elif status == "failed":
+        # Increment retry_count on failure (default)
         cursor = await db.execute(
             """UPDATE inbox_items
                SET status = ?, processed_at = ?, error_message = ?,

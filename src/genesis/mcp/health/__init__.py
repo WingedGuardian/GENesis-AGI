@@ -66,6 +66,7 @@ from genesis.mcp.health import session_control as _session_control  # noqa: E402
 from genesis.mcp.health import settings as _settings  # noqa: E402
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
+from genesis.mcp.health import update_history as _update_history  # noqa: E402
 
 db_schema = _db_schema
 errors = _errors
@@ -75,6 +76,7 @@ session_control = _session_control
 settings = _settings
 status = _status
 task_tools = _task_tools
+update_history = _update_history
 
 _impl_db_schema = _db_schema._impl_db_schema
 _impl_health_errors = _errors._impl_health_errors
@@ -104,6 +106,7 @@ _impl_browser_snapshot = _browser._impl_browser_snapshot
 _impl_browser_run_js = _browser._impl_browser_run_js
 _impl_browser_sessions = _browser._impl_browser_sessions
 _impl_browser_clear_domain = _browser._impl_browser_clear_domain
+_impl_update_history_recent = _update_history._impl_update_history_recent
 
 # Re-export init function for runtime wiring
 init_task_tools = _task_tools.init_task_tools
@@ -143,6 +146,8 @@ __all__ = [
     "settings",
     "status",
     "task_tools",
+    "update_history",
+    "_impl_update_history_recent",
     "_browser",
     "_impl_browser_navigate",
     "_impl_browser_click",

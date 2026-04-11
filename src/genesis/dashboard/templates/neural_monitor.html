@@ -35,7 +35,7 @@ body {
     scrollbar-width: thin; scrollbar-color: #334155 transparent;
 }
 
-/* Neural Map — radial layout using polar coordinates */
+/* Neural Map — constellation map layout */
 .neural-map {
     position: relative; width: 100%;
     margin: 0 auto;
@@ -48,11 +48,10 @@ body {
     transition: background-color 0.3s, transform 0.15s, box-shadow 0.3s;
     display: flex; align-items: center; justify-content: center;
 }
-.dot:hover { transform: scale(1.5) translate(-33%, -33%); z-index: 10; }
-.dot-center { width: 36px; height: 36px; }
-.dot-inner { width: 24px; height: 24px; }
-.dot-outer { width: 16px; height: 16px; }
-.dot-periphery { width: 12px; height: 12px; }
+.dot:hover { transform: scale(1.5); z-index: 10; }
+.dot-inner { width: 16px; height: 16px; margin-left: -8px; margin-top: -8px; }
+.dot-outer { width: 16px; height: 16px; margin-left: -8px; margin-top: -8px; }
+.dot-periphery { width: 12px; height: 12px; margin-left: -6px; margin-top: -6px; }
 
 .dot-healthy { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
 .dot-active { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
@@ -105,18 +104,14 @@ body {
 .tooltip .tt-row { color: var(--color-text-secondary); }
 .tooltip .tt-cat { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-bottom: 4px; background: rgba(255,255,255,0.08); }
 
-/* Dot labels — center/inner always visible, outer/periphery on hover */
+/* Dot labels — all hover-only, sector labels provide orientation */
 .dot-label {
     position: absolute; top: calc(100% + 3px); left: 50%;
     transform: translateX(-50%); font-size: 9px; color: var(--color-text-secondary);
     white-space: nowrap; pointer-events: none; text-align: center;
-    max-width: 70px; overflow: hidden; text-overflow: ellipsis;
-    transition: opacity 0.2s;
+    max-width: 80px; overflow: hidden; text-overflow: ellipsis;
+    opacity: 0; transition: opacity 0.15s;
 }
-.dot-center .dot-label { font-size: 11px; max-width: 90px; font-weight: 600; }
-.dot-inner .dot-label { font-size: 9px; max-width: 80px; }
-.dot-outer .dot-label { font-size: 8px; max-width: 60px; opacity: 0; }
-.dot-periphery .dot-label { font-size: 8px; max-width: 60px; opacity: 0; }
 .dot:hover .dot-label { opacity: 1; }
 
 /* Surplus box (legacy — kept for backward compat) */
@@ -457,13 +452,13 @@ const SITE_META = {
     '33_skill_refiner': { name: 'Skill Refine', category: 'content' },
     '38_procedure_extraction': { name: 'Procedure', category: 'content' },
     'contingency_foreground': { name: 'CC Fallback (FG)', category: 'reasoning' },
-    'contingency_inbox': { name: 'CC Fallback (Inbox)', category: 'processing' },
+    'contingency_micro': { name: 'CC Fallback (Micro)', category: 'processing' },
     // Groundwork / disabled
     '2_triage': { name: 'Triage', category: 'classification' },
     '7_ego_cycle': { name: 'Ego Cycle (CC)', category: 'reasoning' },
     '7_ego_cycle_api': { name: 'Ego Cycle (API)', category: 'reasoning' },
     '7_task_retrospective': { name: 'Task Retro', category: 'processing' },
-    '8_memory_consolidation': { name: 'Mem Compact', category: 'processing' },
+    '8_ego_compaction': { name: 'Ego Compact', category: 'processing' },
     '10_cognitive_state': { name: 'Cog State', category: 'reasoning' },
     '11_user_model_synthesis': { name: 'User Model', category: 'reasoning' },
     '17_fresh_eyes_review': { name: 'Fresh Eyes (exec)', category: 'assessment' },
@@ -477,37 +472,59 @@ const SITE_META = {
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
 };
 
-// ── Ring assignment — grouped by function ───────────────────────────────
-const RING_ASSIGNMENT = {
-    center: ['cc_foreground', 'cc_background'],
-    inner: [
-        '3_micro_reflection', '4_light_reflection', '5_deep_reflection',
-        '6_strategic_reflection', '10_cognitive_state', '11_user_model_synthesis',
-        '14_weekly_self_assessment', '16_quality_calibration', '27_pre_execution_assessment',
-        '7_ego_cycle', '7_ego_cycle_api', 'autonomous_executor_reasoning',
-    ],
-    outer: [
-        '2_triage', '7_task_retrospective', '8_memory_consolidation',
-        '9_fact_extraction', '18_meta_prompting',
-        '28_observation_sweep', '30_triage_calibration', '31_outcome_classification',
-        '32_delta_assessment', 'cc_update_analysis',
-    ],
-    periphery: [
-        '12_surplus_brainstorm', '13_morning_report', '17_fresh_eyes_review',
-        '20_adversarial_counterargument', '21_embeddings', '21b_query_embedding',
-        '22_tagging', '23_fresh_eyes_review', '29_retrospective_triage',
-        '33_skill_refiner', '34_research_synthesis', '35_content_draft',
-        '36_code_auditor', '37_infrastructure_monitor', '38_procedure_extraction',
-        'email_triage', 'outreach_fallback', 'bookmark_enrichment', 'embedding_recovery',
-        'contingency_foreground', 'contingency_inbox',
-    ],
+// ── Constellation layout ────────────────────────────────────────────────
+const CONSTELLATION_ANCHORS = {
+    reflection:  { x: 0.30, y: 0.18 },
+    memory:      { x: 0.72, y: 0.20 },
+    learning:    { x: 0.50, y: 0.42 },
+    executor:    { x: 0.20, y: 0.50 },
+    contingency: { x: 0.16, y: 0.72 },
+    outreach:    { x: 0.80, y: 0.42 },
+    surplus:     { x: 0.76, y: 0.62 },
+    utility:     { x: 0.50, y: 0.80 },
 };
 
-// Ring labels for legend
-const RING_LABELS = {
-    center: 'Core', inner: 'Reflection & Reasoning',
-    outer: 'Processing & Calibration', periphery: 'Content & Utility',
+// Render order — contingency first to claim shared sites before executor
+const CONSTELLATION_ORDER = [
+    'contingency', 'reflection', 'executor', 'learning',
+    'memory', 'surplus', 'outreach', 'utility',
+];
+
+// Architectural connections between subsystems (faint dashed lines)
+const CONSTELLATION_CONNECTIONS = [
+    ['reflection', 'learning'],
+    ['reflection', 'memory'],
+    ['reflection', 'executor'],
+    ['learning', 'memory'],
+    ['executor', 'contingency'],
+    ['memory', 'surplus'],
+    ['executor', 'outreach'],
+];
+
+// Constellation label colors
+const CONSTELLATION_COLORS = {
+    reflection:  'rgba(129,140,248,0.6)',
+    executor:    'rgba(167,139,250,0.6)',
+    learning:    'rgba(251,146,60,0.5)',
+    memory:      'rgba(56,189,248,0.5)',
+    surplus:     'rgba(74,222,128,0.5)',
+    outreach:    'rgba(251,191,36,0.5)',
+    utility:     'rgba(148,163,184,0.5)',
+    contingency: 'rgba(167,139,250,0.4)',
 };
+
+// Core sites get 16px dots; everything else gets 12px
+const CORE_SITES = new Set([
+    '5_deep_reflection', '6_strategic_reflection',
+    '2_triage',
+    '8_ego_compaction', '21_embeddings',
+    '7_ego_cycle', 'autonomous_executor_reasoning',
+    '10_cognitive_state',
+    '12_surplus_brainstorm',
+    '13_morning_report',
+]);
+
+const GOLDEN_ANGLE = 137.508 * Math.PI / 180;
 
 // Category colors for legend
 const CAT_COLORS = {
@@ -517,7 +534,7 @@ const CAT_COLORS = {
     surplus: '#a3e635',
 };
 
-const DOT_SIZES = { center: 'dot-center', inner: 'dot-inner', outer: 'dot-outer', periphery: 'dot-periphery' };
+const DOT_SIZES = { inner: 'dot-inner', outer: 'dot-outer', periphery: 'dot-periphery' };
 
 let lastData = null;
 let lastFetchTime = 0;
@@ -528,13 +545,6 @@ function getMeta(siteId) {
     return SITE_META[siteId] || { name: siteId, desc: '', category: 'unknown', frequency: '', costPolicy: '' };
 }
 
-function getRing(siteId) {
-    for (const [ring, ids] of Object.entries(RING_ASSIGNMENT)) {
-        if (ids.includes(siteId)) return ring;
-    }
-    return 'periphery';
-}
-
 function statusClass(status) {
     if (status === 'healthy') return 'dot-healthy';
     if (status === 'active') return 'dot-active';
@@ -542,6 +552,7 @@ function statusClass(status) {
     if (status === 'down') return 'dot-down';
     if (status === 'warning') return 'dot-warning';
     if (status === 'idle') return 'dot-idle';
+    if (status === 'disabled') return 'dot-idle'; // Same gray as idle — config state, not failure
     return 'dot-unknown';
 }
 
@@ -587,81 +598,78 @@ function sectionRow(label, value, valueStyle) {
 
 // ── Neural Map ────────────────────────────────────────────────────────
 
-// ── Sector assignments for subsystem clustering ───────────────────────
-const SECTOR_ASSIGNMENT = {
-    reflection:  { start: 0,   end: 45,  color: 'rgba(129,140,248,0.07)' },
-    executor:    { start: 45,  end: 90,  color: 'rgba(167,139,250,0.07)' },
-    learning:    { start: 90,  end: 135, color: 'rgba(251,146,60,0.06)' },
-    memory:      { start: 135, end: 180, color: 'rgba(56,189,248,0.06)' },
-    surplus:     { start: 180, end: 225, color: 'rgba(74,222,128,0.06)' },
-    outreach:    { start: 225, end: 270, color: 'rgba(251,191,36,0.06)' },
-    contingency: { start: 270, end: 315, color: 'rgba(248,113,113,0.06)' },
-    utility:     { start: 315, end: 360, color: 'rgba(148,163,184,0.06)' },
-};
+// ── Constellation helpers ────────────────────────────────────────────
 
-function _buildSectorSVG(map, cx, cy, outerR, ringRadii) {
+function _spiralPositions(count, anchorX, anchorY, spacing) {
+    const positions = [];
+    for (let i = 0; i < count; i++) {
+        const angle = i * GOLDEN_ANGLE;
+        const radius = spacing * Math.sqrt(i + 1);
+        positions.push({
+            x: anchorX + radius * Math.cos(angle),
+            y: anchorY + radius * Math.sin(angle),
+        });
+    }
+    return positions;
+}
+
+function _buildConstellationSVG(map, w, h, anchors, constellationDots) {
     const ns = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(ns, 'svg');
     svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
-    const vw = map.clientWidth || 700;
-    const vh = Math.max(map.clientHeight, 800);
-    svg.setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
 
-    // Concentric ring guides
-    for (const rr of ringRadii) {
-        const circle = document.createElementNS(ns, 'circle');
-        circle.setAttribute('cx', String(cx));
-        circle.setAttribute('cy', String(cy));
-        circle.setAttribute('r', String(rr));
-        circle.setAttribute('fill', 'none');
-        circle.setAttribute('stroke', 'rgba(100,116,139,0.07)');
-        circle.setAttribute('stroke-width', '1');
-        circle.setAttribute('stroke-dasharray', '4 8');
-        svg.appendChild(circle);
+    // Inter-constellation connections (dashed, very faint)
+    for (const [from, to] of CONSTELLATION_CONNECTIONS) {
+        const a = anchors[from], b = anchors[to];
+        if (!a || !b) continue;
+        const line = document.createElementNS(ns, 'line');
+        line.setAttribute('x1', String(a.x)); line.setAttribute('y1', String(a.y));
+        line.setAttribute('x2', String(b.x)); line.setAttribute('y2', String(b.y));
+        line.setAttribute('stroke', 'rgba(148,163,184,0.06)');
+        line.setAttribute('stroke-width', '1');
+        line.setAttribute('stroke-dasharray', '4 8');
+        svg.appendChild(line);
     }
 
-    for (const [name, cfg] of Object.entries(SECTOR_ASSIGNMENT)) {
-        const startRad = (cfg.start - 90) * Math.PI / 180;
-        const endRad = (cfg.end - 90) * Math.PI / 180;
-        const r = outerR + 30;
-        const x1 = cx + r * Math.cos(startRad);
-        const y1 = cy + r * Math.sin(startRad);
-        const x2 = cx + r * Math.cos(endRad);
-        const y2 = cy + r * Math.sin(endRad);
+    // Intra-constellation connections (solid, chain pattern)
+    for (const [name, dots] of Object.entries(constellationDots)) {
+        if (dots.length < 2) continue;
+        for (let i = 0; i < dots.length - 1; i++) {
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', String(dots[i].x)); line.setAttribute('y1', String(dots[i].y));
+            line.setAttribute('x2', String(dots[i + 1].x)); line.setAttribute('y2', String(dots[i + 1].y));
+            line.setAttribute('stroke', 'rgba(148,163,184,0.10)');
+            line.setAttribute('stroke-width', '1');
+            svg.appendChild(line);
+        }
+        // Close the loop for clusters of 4+
+        if (dots.length >= 4) {
+            const line = document.createElementNS(ns, 'line');
+            line.setAttribute('x1', String(dots[dots.length - 1].x));
+            line.setAttribute('y1', String(dots[dots.length - 1].y));
+            line.setAttribute('x2', String(dots[0].x));
+            line.setAttribute('y2', String(dots[0].y));
+            line.setAttribute('stroke', 'rgba(148,163,184,0.10)');
+            line.setAttribute('stroke-width', '1');
+            svg.appendChild(line);
+        }
+    }
 
-        // Sector arc fill
-        const path = document.createElementNS(ns, 'path');
-        path.setAttribute('d', `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2} Z`);
-        path.setAttribute('fill', cfg.color);
-        path.setAttribute('stroke', 'none');
-        svg.appendChild(path);
-
-        // Divider line (subtle dashed)
-        const line = document.createElementNS(ns, 'line');
-        line.setAttribute('x1', String(cx));
-        line.setAttribute('y1', String(cy));
-        line.setAttribute('x2', String(x1));
-        line.setAttribute('y2', String(y1));
-        line.setAttribute('stroke', 'rgba(100,116,139,0.08)');
-        line.setAttribute('stroke-width', '1');
-        line.setAttribute('stroke-dasharray', '3 6');
-        svg.appendChild(line);
-
-        // Sector label
-        const midRad = ((cfg.start + cfg.end) / 2 - 90) * Math.PI / 180;
-        const labelR = outerR + 50;
-        const lx = cx + labelR * Math.cos(midRad);
-        const ly = cy + labelR * Math.sin(midRad);
+    // Constellation labels
+    for (const [name, anchor] of Object.entries(anchors)) {
+        const group = SUBSYSTEM_GROUPS[name];
+        if (!group) continue;
         const label = document.createElementNS(ns, 'text');
-        label.setAttribute('x', String(lx));
-        label.setAttribute('y', String(ly));
+        label.setAttribute('x', String(anchor.x));
+        label.setAttribute('y', String(anchor.y - 45));
         label.setAttribute('text-anchor', 'middle');
         label.setAttribute('dominant-baseline', 'middle');
-        label.setAttribute('fill', 'rgba(148,163,184,0.7)');
-        label.setAttribute('font-size', '13');
+        label.setAttribute('fill', CONSTELLATION_COLORS[name] || 'rgba(148,163,184,0.5)');
+        label.setAttribute('font-size', '11');
         label.setAttribute('font-family', 'inherit');
-        label.setAttribute('font-weight', '500');
-        label.textContent = (SUBSYSTEM_GROUPS[name] || {}).name || name;
+        label.setAttribute('letter-spacing', '1.5');
+        label.textContent = group.name.toUpperCase();
         svg.appendChild(label);
     }
 
@@ -673,7 +681,6 @@ function _makeDot(item, x, y, sizeClass) {
     const dot = el('div', 'dot ' + sizeClass + ' ' + statusClass(item.status) + ' ' + catClass(meta.category));
     dot.style.left = x + 'px';
     dot.style.top = y + 'px';
-    dot.style.transform = 'translate(-50%, -50%)';
     dot.style.zIndex = '1';
     dot.addEventListener('click', () => showDetail(item));
 
@@ -686,6 +693,16 @@ function _makeDot(item, x, y, sizeClass) {
         disabledTag.style.background = 'rgba(136,136,136,0.2)';
         disabledTag.style.color = '#888';
         tooltip.appendChild(disabledTag);
+    } else if (item.status === 'disabled') {
+        const disabledTag = el('span', 'tt-cat', 'No API key');
+        disabledTag.style.background = 'rgba(136,136,136,0.2)';
+        disabledTag.style.color = '#888';
+        tooltip.appendChild(disabledTag);
+        const reasonNote = el('div', 'tt-row',
+            'No API key configured for any provider in this chain.');
+        reasonNote.style.fontSize = '10px';
+        reasonNote.style.color = '#888';
+        tooltip.appendChild(reasonNote);
     } else {
         tooltip.appendChild(el('span', 'tt-cat', meta.category));
     }
@@ -726,35 +743,16 @@ function buildNeuralMap(data) {
 
     const mapW = map.clientWidth || 700;
     const mapH = Math.max(map.clientHeight, 800);
-    const cx = mapW / 2;
-    const cy = mapH / 2;
 
-    const minDim = Math.min(mapW, mapH);
-    const radii = {
-        center: minDim * 0.07,
-        inner: minDim * 0.20,
-        outer: minDim * 0.33,
-        periphery: minDim * 0.45,
-    };
-
-    // Build sector SVG backgrounds + dividers + ring guides + labels
-    _buildSectorSVG(map, cx, cy, radii.periphery, [radii.inner, radii.outer, radii.periphery]);
-
-    // ── Center ring: CC sessions (not sector-clustered) ──
-    const ccSessions = data.cc_sessions || {};
-    const centerItems = [
-        { id: 'cc_foreground', status: (ccSessions.foreground || {}).status || 'unknown', data: ccSessions.foreground || {} },
-        { id: 'cc_background', status: (ccSessions.background || {}).status || 'unknown', data: ccSessions.background || {} },
-    ];
-    for (let i = 0; i < centerItems.length; i++) {
-        const angle = (i / centerItems.length) * 2 * Math.PI - Math.PI / 2;
-        const x = cx + radii.center * Math.cos(angle);
-        const y = cy + radii.center * Math.sin(angle);
-        map.appendChild(_makeDot(centerItems[i], x, y, DOT_SIZES.center));
+    // Compute absolute anchor positions from percentages
+    const anchors = {};
+    for (const [name, pct] of Object.entries(CONSTELLATION_ANCHORS)) {
+        anchors[name] = { x: pct.x * mapW, y: pct.y * mapH };
     }
 
-    // ── Sector-clustered rings ──
-    // Build a map of siteId → {ring, item}
+    // CC sessions are NOT rendered on the map — shown in header badge + side panel only
+
+    // ── Build site items from call_sites data ──
     const callSites = data.call_sites || {};
     const siteItems = {};
     for (const [siteId, info] of Object.entries(callSites)) {
@@ -762,52 +760,49 @@ function buildNeuralMap(data) {
         siteItems[siteId] = { id: siteId, status: info.status, data: info };
     }
 
-    // Place sites by sector
+    // ── Place sites by constellation (golden-angle spiral from anchor) ──
     const placed = new Set();
-    for (const [sectorName, sectorCfg] of Object.entries(SECTOR_ASSIGNMENT)) {
-        const group = SUBSYSTEM_GROUPS[sectorName];
+    const constellationDots = {};
+
+    for (const name of CONSTELLATION_ORDER) {
+        const group = SUBSYSTEM_GROUPS[name];
         if (!group) continue;
+        const sites = group.sites.filter(id => siteItems[id] && !placed.has(id));
+        if (sites.length === 0) continue;
 
-        // Get sites in this sector that have data
-        const sectorSites = group.sites
-            .filter(id => siteItems[id] && !placed.has(id))
-            .map(id => ({ ...siteItems[id], ring: getRing(id) }));
+        const anchor = anchors[name];
+        if (!anchor) continue;
+        const positions = _spiralPositions(sites.length, anchor.x, anchor.y, 28);
+        const dots = [];
 
-        if (sectorSites.length === 0) continue;
+        for (let i = 0; i < sites.length; i++) {
+            const item = siteItems[sites[i]];
+            dots.push({ x: positions[i].x, y: positions[i].y, item });
+            placed.add(sites[i]);
+        }
+        constellationDots[name] = dots;
+    }
 
-        // Sort by ring for visual coherence (inner → outer)
-        const ringOrder = { center: 0, inner: 1, outer: 2, periphery: 3 };
-        sectorSites.sort((a, b) => (ringOrder[a.ring] || 3) - (ringOrder[b.ring] || 3));
+    // SVG layer (connection lines + labels) — rendered before dots
+    _buildConstellationSVG(map, mapW, mapH, anchors, constellationDots);
 
-        const startRad = (sectorCfg.start - 90) * Math.PI / 180;
-        const endRad = (sectorCfg.end - 90) * Math.PI / 180;
-        // Pad 5% from sector edges to avoid dots on divider lines
-        const padRad = (endRad - startRad) * 0.08;
-        const usableStart = startRad + padRad;
-        const usableEnd = endRad - padRad;
-
-        for (let i = 0; i < sectorSites.length; i++) {
-            const site = sectorSites[i];
-            const radius = radii[site.ring] || radii.periphery;
-            const angle = usableStart + (i + 0.5) / sectorSites.length * (usableEnd - usableStart);
-            const x = cx + radius * Math.cos(angle);
-            const y = cy + radius * Math.sin(angle);
-            map.appendChild(_makeDot(site, x, y, DOT_SIZES[site.ring] || DOT_SIZES.periphery));
-            placed.add(site.id);
+    // Render dots on top
+    for (const name of CONSTELLATION_ORDER) {
+        const dots = constellationDots[name];
+        if (!dots) continue;
+        for (const d of dots) {
+            const sz = CORE_SITES.has(d.item.id) ? DOT_SIZES.inner : DOT_SIZES.periphery;
+            map.appendChild(_makeDot(d.item, d.x, d.y, sz));
         }
     }
 
-    // ── Unassigned sites (not in any subsystem group) → distribute evenly ──
+    // ── Unassigned sites → scatter along bottom ──
     const unassigned = Object.values(siteItems).filter(item => !placed.has(item.id));
     if (unassigned.length > 0) {
         for (let i = 0; i < unassigned.length; i++) {
-            const item = unassigned[i];
-            const ring = getRing(item.id);
-            const radius = radii[ring] || radii.periphery;
-            const angle = (i / unassigned.length) * 2 * Math.PI - Math.PI / 2;
-            const x = cx + radius * Math.cos(angle);
-            const y = cy + radius * Math.sin(angle);
-            map.appendChild(_makeDot(item, x, y, DOT_SIZES[ring] || DOT_SIZES.periphery));
+            const x = (i + 1) / (unassigned.length + 1) * mapW;
+            const y = mapH - 40;
+            map.appendChild(_makeDot(unassigned[i], x, y, DOT_SIZES.periphery));
         }
     }
 
@@ -863,12 +858,21 @@ function showDetail(item) {
     }
 
     // Status + disabled banner
-    const STATUS_COLORS = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#ffe600', down: '#ef4444', idle: '#888' };
+    const STATUS_COLORS = { healthy: '#4ade80', active: '#4ade80', warning: '#f59e0b', degraded: '#ffe600', down: '#ef4444', idle: '#888', disabled: '#888' };
     const statusColor = STATUS_COLORS[item.status] || '#888';
-    const statusLabel = item.status === 'idle' ? 'Disabled' : item.status;
+    let statusLabel = item.status;
+    if (item.status === 'idle') statusLabel = 'Disabled (groundwork)';
+    else if (item.status === 'disabled') statusLabel = 'Disabled (no API key)';
     content.appendChild(sectionRow('Status', statusLabel, 'color:' + statusColor));
     if (item.status === 'idle') {
-        const banner = el('div', null, 'This call site is currently disabled.');
+        const banner = el('div', null, 'This call site is groundwork — config exists but no code invokes it yet.');
+        banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
+        content.appendChild(banner);
+    } else if (item.status === 'disabled') {
+        const reason = item.data.disabled_reason === 'no_api_keys_configured'
+            ? 'No API key configured for any provider in this chain. This is a deployment-time config state, not an outage. Add the relevant API keys to secrets.env to enable.'
+            : 'This call site is disabled.';
+        const banner = el('div', null, reason);
         banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
         content.appendChild(banner);
     }
@@ -897,29 +901,61 @@ function showDetail(item) {
         chainSection.appendChild(chainHead);
 
         for (const c of item.data.chain_health) {
-            // Dot color from probe status (display authority); CB state as fallback
+            // Most-negative-opinion: CB is routing authority, probe is reachability.
+            // 'not_configured' is a SEPARATE state from down/unreachable — it means
+            // no API key, which is a deployment config, not a failure.
+            const cbDown = c.state === 'open' || c.state === 'error';
+            const cbSuspect = c.state === 'half_open';
             const ps = c.probe_status;
-            const dotColor = ps === 'unreachable' ? '#ef4444'
-                : ps === 'rate_limited' ? '#ffe600'
-                : ps === 'reachable' ? '#4ade80'
-                : (c.state === 'open' ? '#ef4444' : c.state === 'half_open' ? '#ffe600' : '#4ade80');
+            const dotColor = ps === 'not_configured' ? '#888'
+                : cbDown ? '#ef4444'
+                : cbSuspect ? '#facc15'
+                : ps === 'unreachable' ? '#ef4444'
+                : ps === 'rate_limited' ? '#facc15'
+                : '#4ade80';
             const chainItem = el('div', 'chain-item');
             const dot = el('span', 'status-dot');
             dot.style.background = dotColor;
             chainItem.appendChild(dot);
-            // CC entries get a badge; API claude- entries display as anthropic-
+            // CC entries get a badge
             if (c.is_cc) {
                 chainItem.appendChild(el('span', 'cc-badge', 'CC'));
             }
-            const displayName = c.is_cc ? c.provider
-                : c.provider.startsWith('claude-') ? c.provider.replace('claude-', 'anthropic-') : c.provider;
+            // Display name with routing info
+            let displayName = c.provider;
+            if (!c.is_cc && c.provider.startsWith('claude-')) {
+                displayName = c.provider.replace('claude-', 'anthropic-');
+            } else if (c.type === 'openrouter') {
+                displayName = c.provider + ' (via OpenRouter)';
+            } else if (c.type === 'zenmux') {
+                displayName = c.provider + ' (via ZenMux)';
+            } else if (c.type === 'lmstudio') {
+                displayName = c.provider + ' (LM Studio)';
+            }
             const nameSpan = el('span', null, displayName);
             nameSpan.style.flex = '1';
             chainItem.appendChild(nameSpan);
-            // State text from CB (the routing system's belief)
-            const stateText = c.state + (c.failures > 0 ? ' (' + c.failures + ' fails)' : '');
+            // Model name (subtle, right-aligned)
+            if (c.model && !c.is_cc) {
+                const modelSpan = el('span', null, c.model);
+                modelSpan.style.color = '#64748b';
+                modelSpan.style.fontSize = '10px';
+                modelSpan.style.marginRight = '8px';
+                chainItem.appendChild(modelSpan);
+            }
+            // CB state text — colorized. 'not_configured' overrides display
+            // so users see "no API key" instead of a misleading "closed" state.
+            let stateText, stateColor;
+            if (c.probe_status === 'not_configured') {
+                stateText = 'no API key';
+                stateColor = '#888';
+            } else {
+                stateText = c.state + (c.failures > 0 ? ' (' + c.failures + ' fails)' : '');
+                stateColor = c.state === 'open' || c.state === 'error' ? '#ef4444'
+                    : c.state === 'half_open' ? '#facc15' : '#4ade80';
+            }
             const stateSpan = el('span', null, stateText);
-            stateSpan.style.color = '#64748b';
+            stateSpan.style.color = stateColor;
             stateSpan.style.fontSize = '11px';
             chainItem.appendChild(stateSpan);
             chainSection.appendChild(chainItem);
@@ -975,6 +1011,32 @@ function showDetail(item) {
         const edFrequency = item.data.frequency || SITE_META[item.id]?.frequency || 'unknown';
         editorDiv.appendChild(sectionRow('Cost Policy', edCostPolicy));
         editorDiv.appendChild(sectionRow('Frequency', edFrequency));
+
+        // Dispatch mode toggle — three-state: API / Auto / CLI
+        const modeRow = el('div', 'editor-mode-row');
+        modeRow.style.cssText = 'display:flex;align-items:center;gap:6px;margin:4px 0 6px;';
+        const modeLabel = el('span', null, 'Mode:');
+        modeLabel.style.cssText = 'font-size:11px;color:#94a3b8;';
+        modeRow.appendChild(modeLabel);
+        const modeSelect = document.createElement('select');
+        modeSelect.className = 'dispatch-mode-select';
+        modeSelect.style.cssText = 'font-size:11px;padding:2px 6px;background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:3px;';
+        [
+            ['api',  'API only'],
+            ['dual', 'Auto (dual)'],
+            ['cli',  'CLI only'],
+        ].forEach(([val, label]) => {
+            const opt = document.createElement('option');
+            opt.value = val;
+            opt.textContent = label;
+            modeSelect.appendChild(opt);
+        });
+        modeRow.appendChild(modeSelect);
+        const modeHint = el('span', null, '');
+        modeHint.className = 'mode-hint';
+        modeHint.style.cssText = 'font-size:10px;color:#64748b;margin-left:4px;';
+        modeRow.appendChild(modeHint);
+        editorDiv.appendChild(modeRow);
 
         // Chain editor placeholder — populated async
         const chainList = document.createElement('ul');
@@ -1037,7 +1099,7 @@ function showDetail(item) {
         content.appendChild(editorDiv);
 
         // Load config from API and populate editor
-        _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv);
+        _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv, modeSelect, modeHint);
     }
 }
 
@@ -1045,7 +1107,7 @@ function showDetail(item) {
 
 let _editorState = {};  // {chain, originalChain, allProviders, cbStates, default_paid, never_pays, original_dp, original_np}
 
-async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackEl) {
+async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackEl, modeSelect, modeHint) {
     try {
         const resp = await fetch('/api/genesis/routing/config');
         if (!resp.ok) throw new Error('API error');
@@ -1061,11 +1123,18 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             return;
         }
 
+        // Resolve current mode: 'api' / 'cli' / 'dual'. Legacy 'cc' maps to
+        // 'dual'; anything missing defaults to 'dual' (existing auto behavior).
+        const rawDispatch = site.dispatch || null;
+        let currentMode;
+        if (rawDispatch === 'api') currentMode = 'api';
+        else if (rawDispatch === 'cli') currentMode = 'cli';
+        else currentMode = 'dual';  // 'dual', 'cc', or null
+
         // Build chain: API providers + CC entry if dispatch=cc/dual
         const editorChain = [...site.chain];
-        const dispatch = site.dispatch || null;
         const ccModel = site.cc_model || null;
-        if ((dispatch === 'cc' || dispatch === 'dual') && ccModel) {
+        if ((rawDispatch === 'cc' || rawDispatch === 'dual' || rawDispatch === 'cli') && ccModel) {
             const ccPos = site.cc_position;
             const ccEntry = 'CC/' + ccModel;
             if (ccPos != null && ccPos >= 0 && ccPos <= editorChain.length) {
@@ -1085,9 +1154,21 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             never_pays: site.never_pays,
             original_dp: site.default_paid,
             original_np: site.never_pays,
-            originalDispatch: dispatch,
+            mode: currentMode,
+            originalMode: currentMode,
+            originalDispatch: rawDispatch,
             originalCcModel: ccModel,
         };
+
+        if (modeSelect) {
+            modeSelect.value = currentMode;
+            modeSelect.onchange = () => {
+                _editorState.mode = modeSelect.value;
+                _renderModeHint(modeHint, modeSelect.value);
+                _updateDirtyState(saveBtn, revertBtn);
+            };
+            _renderModeHint(modeHint, currentMode);
+        }
 
         dpCheck.checked = site.default_paid;
         npCheck.checked = site.never_pays;
@@ -1120,8 +1201,13 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             _editorState.chain = [..._editorState.originalChain];
             _editorState.default_paid = _editorState.original_dp;
             _editorState.never_pays = _editorState.original_np;
+            _editorState.mode = _editorState.originalMode;
             dpCheck.checked = _editorState.original_dp;
             npCheck.checked = _editorState.original_np;
+            if (modeSelect) {
+                modeSelect.value = _editorState.originalMode;
+                _renderModeHint(modeHint, _editorState.originalMode);
+            }
             _renderChainList(listEl);
             _populateAddSelect(selectEl);
             _updateDirtyState(saveBtn, revertBtn);
@@ -1138,6 +1224,17 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
 
 function _isCC(prov) { return prov.startsWith('CC/'); }
 function _ccModelFromEntry(prov) { return prov.replace('CC/', ''); }
+
+function _renderModeHint(hintEl, mode) {
+    if (!hintEl) return;
+    if (mode === 'api') {
+        hintEl.textContent = 'API chain only — no CC subprocess';
+    } else if (mode === 'cli') {
+        hintEl.textContent = 'CC subprocess only — API chain unused';
+    } else {
+        hintEl.textContent = 'Dispatcher auto-decides';
+    }
+}
 
 function _renderChainList(listEl) {
     while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
@@ -1289,7 +1386,8 @@ function _updateDirtyState(saveBtn, revertBtn) {
     const chainChanged = JSON.stringify(_editorState.chain) !== JSON.stringify(_editorState.originalChain);
     const dpChanged = _editorState.default_paid !== _editorState.original_dp;
     const npChanged = _editorState.never_pays !== _editorState.original_np;
-    const dirty = chainChanged || dpChanged || npChanged;
+    const modeChanged = _editorState.mode !== _editorState.originalMode;
+    const dirty = chainChanged || dpChanged || npChanged || modeChanged;
     saveBtn.disabled = !dirty;
     revertBtn.disabled = !dirty;
 }
@@ -1302,33 +1400,76 @@ async function _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn) {
     // Separate API chain from CC entry
     const apiChain = _editorState.chain.filter(p => !_isCC(p));
     const ccEntry = _editorState.chain.find(_isCC);
-    const ccModel = ccEntry ? _ccModelFromEntry(ccEntry) : null;
-    const ccPosition = ccEntry ? _editorState.chain.indexOf(ccEntry) : null;
+    let ccModel = ccEntry ? _ccModelFromEntry(ccEntry) : null;
+    let ccPosition = ccEntry ? _editorState.chain.indexOf(ccEntry) : null;
+    const mode = _editorState.mode || 'dual';
+
+    // API mode: drop any CC entry from the save payload.
+    if (mode === 'api') {
+        ccModel = null;
+        ccPosition = null;
+    }
+    // CLI mode: a CC entry is required. Preserve the last-known cc_model
+    // from originalCcModel if the user hasn't added one to the chain yet.
+    if (mode === 'cli' && !ccModel) {
+        ccModel = _editorState.originalCcModel || 'Sonnet';
+    }
 
     try {
+        const payload = {
+            chain: apiChain,
+            default_paid: _editorState.default_paid,
+            never_pays: _editorState.never_pays,
+            cc_model: ccModel,
+            cc_position: ccPosition,
+            dispatch: mode,
+        };
         const resp = await fetch('/api/genesis/routing/config/' + encodeURIComponent(_editorState.callSiteId), {
             method: 'PUT',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                chain: apiChain,
-                default_paid: _editorState.default_paid,
-                never_pays: _editorState.never_pays,
-                cc_model: ccModel,
-                cc_position: ccPosition,
-            }),
+            body: JSON.stringify(payload),
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || 'Save failed');
 
-        // Update original state
+        // Re-fetch the current config to verify the server actually applied
+        // our changes. This guards against silent save failures where the
+        // server returns 200 but the yaml state doesn't match what we sent.
+        const verifyResp = await fetch('/api/genesis/routing/config');
+        if (!verifyResp.ok) throw new Error('Post-save verify fetch failed');
+        const verifyCfg = await verifyResp.json();
+        const verifySite = (verifyCfg.call_sites || {})[_editorState.callSiteId];
+        if (!verifySite) throw new Error('Post-save verify: call site missing');
+        const verifyDispatch = verifySite.dispatch || 'dual';
+        if (verifyDispatch !== mode) {
+            throw new Error(
+                'Save reported success but dispatch mismatch: expected ' +
+                mode + ', got ' + verifyDispatch + '. Please retry.',
+            );
+        }
+
+        // Update original state to match what's now on disk
         _editorState.originalChain = [..._editorState.chain];
         _editorState.original_dp = _editorState.default_paid;
         _editorState.original_np = _editorState.never_pays;
+        _editorState.originalMode = mode;
+        _editorState.originalDispatch = mode;
+        _editorState.originalCcModel = ccModel;
 
-        feedbackEl.textContent = 'Saved + reloaded';
+        feedbackEl.textContent = 'Saved + verified (' + mode + ')';
         feedbackEl.className = 'editor-feedback feedback-ok';
         feedbackEl.style.display = 'block';
         setTimeout(() => feedbackEl.style.display = 'none', 3000);
+
+        // Refresh health data and re-show this call site's detail
+        await fetchHealth();
+        if (lastData) {
+            const cs = lastData.call_sites || {};
+            const siteData = cs[_editorState.callSiteId];
+            if (siteData) {
+                showDetail({ id: _editorState.callSiteId, status: siteData.status, data: siteData });
+            }
+        }
     } catch (e) {
         feedbackEl.textContent = e.message;
         feedbackEl.className = 'editor-feedback feedback-err';
@@ -1471,18 +1612,22 @@ function updateSidePanel(data) {
         resEl.appendChild(sectionRow('State', String(resState), rColor + ';font-weight:600'));
 
         // Provider summary: X/Y call sites healthy
+        // Excludes idle (groundwork) and disabled (no API key) sites — these
+        // are deployment config states, not infrastructure failures.
         const sites = data.call_sites || {};
         const siteIds = Object.keys(sites);
-        const totalSites = siteIds.length;
-        const healthySites = siteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active' || sites[id].status === 'warning').length;
+        const activeSiteIds = siteIds.filter(id => sites[id].status !== 'idle' && sites[id].status !== 'disabled');
+        const totalSites = activeSiteIds.length;
+        const healthySites = activeSiteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active' || sites[id].status === 'warning').length;
         if (totalSites > 0) {
             const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#ffe600' : 'color:#ef4444';
             resEl.appendChild(sectionRow('Call sites', healthySites + '/' + totalSites + ' healthy', summaryColor));
         }
 
-        // Per-category health
+        // Per-category health — also excludes idle/disabled
         const catHealth = {};
         for (const [siteId, info] of Object.entries(sites)) {
+            if (info.status === 'idle' || info.status === 'disabled') continue;
             const meta = getMeta(siteId);
             const cat = meta.category;
             if (!catHealth[cat]) catHealth[cat] = { total: 0, healthy: 0 };
@@ -1663,7 +1808,7 @@ const SUBSYSTEM_GROUPS = {
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
-        sites: ['8_memory_consolidation', '9_fact_extraction', '21_embeddings', '21b_query_embedding', 'embedding_recovery'],
+        sites: ['8_ego_compaction', '9_fact_extraction', '21_embeddings', '21b_query_embedding', 'embedding_recovery'],
     },
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
@@ -1677,7 +1822,8 @@ const SUBSYSTEM_GROUPS = {
         name: 'Executor', domId: 'sub-executor',
         sites: ['27_pre_execution_assessment', '17_fresh_eyes_review',
                 '20_adversarial_counterargument', 'autonomous_executor_reasoning',
-                '7_ego_cycle', '7_ego_cycle_api'],
+                '7_ego_cycle', '7_ego_cycle_api',
+                'contingency_foreground', 'contingency_micro'],
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
@@ -1687,7 +1833,7 @@ const SUBSYSTEM_GROUPS = {
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
-        sites: ['contingency_foreground', 'contingency_inbox'],
+        sites: ['contingency_foreground', 'contingency_micro'],
     },
     utility: {
         name: 'Utility', domId: 'sub-utility',
@@ -1698,9 +1844,14 @@ const SUBSYSTEM_GROUPS = {
 };
 
 function aggregateStatus(statuses) {
-    // Filter out idle/disabled sites — they don't affect subsystem health
-    const active = statuses.filter(s => s !== 'idle' && s !== 'unknown');
-    if (active.length === 0) return statuses.includes('idle') ? 'idle' : 'unknown';
+    // Filter out idle/disabled/unknown sites — these are config states, not
+    // operational health signals, and must not pull a subsystem down to red.
+    const active = statuses.filter(s => s !== 'idle' && s !== 'disabled' && s !== 'unknown');
+    if (active.length === 0) {
+        if (statuses.includes('disabled')) return 'idle';  // surface as gray
+        if (statuses.includes('idle')) return 'idle';
+        return 'unknown';
+    }
     if (active.includes('down')) return 'down';
     if (active.includes('degraded') || active.includes('warning')) return 'degraded';
     if (active.some(s => s === 'healthy' || s === 'active')) return 'healthy';

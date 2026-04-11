@@ -68,6 +68,67 @@ async def test_procedure_recall_registered():
     assert "procedure_recall" in tools
 
 
+async def test_procedure_store_recall_roundtrip():
+    """End-to-end regression test for the procedure_store→procedure_recall bug.
+
+    Pre-fix: procedure_store wrote speculative=1, success_count=0,
+    confidence=0.0 → find_relevant filtered it out → procedure_recall
+    returned []. This test stores a procedure and verifies it comes back.
+    """
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        real_db.row_factory = aiosqlite.Row
+        from genesis.db.schema import create_all_tables
+        await create_all_tables(real_db)
+        await real_db.commit()
+
+        old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+        try:
+            mod._store = MagicMock()
+            mod._db = real_db
+            mod._retriever = MagicMock()
+
+            tools = await _get_tools()
+            pid = await tools["procedure_store"].fn(
+                task_type="discourse-forum-registration",
+                principle="Browser is required; the raw API returns fake success.",
+                steps=["navigate to /signup", "fill form", "click submit", "verify"],
+                tools_used=["browser_navigate", "browser_fill", "browser_click"],
+                context_tags=["discourse", "forum", "registration", "browser"],
+            )
+            assert isinstance(pid, str) and len(pid) == 36
+
+            # Verify the row landed with explicit-teach defaults.
+            cursor = await real_db.execute(
+                "SELECT speculative, success_count, confidence, activation_tier "
+                "FROM procedural_memory WHERE id = ?",
+                (pid,),
+            )
+            row = await cursor.fetchone()
+            assert row[0] == 0  # speculative
+            assert row[1] == 1  # success_count
+            assert abs(row[2] - 2 / 3) < 1e-9  # Laplace
+            assert row[3] == "L3"  # activation_tier
+
+            # Now recall the procedure — must be visible.
+            results = await tools["procedure_recall"].fn(
+                task_description="register on discourse forum",
+                context_tags=["discourse", "forum", "registration"],
+            )
+            assert len(results) >= 1
+            assert any(
+                r.get("task_type") == "discourse-forum-registration"
+                for r in results
+            )
+        finally:
+            mod._store = old_store
+            mod._db = old_db
+            mod._retriever = old_retriever
+
+
 # ─── End-to-end knowledge_ingest test ────────────────────────────────────────
 
 

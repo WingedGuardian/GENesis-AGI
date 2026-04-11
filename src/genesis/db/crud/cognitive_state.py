@@ -264,21 +264,14 @@ async def compute_state_flags(db: aiosqlite.Connection) -> str:
                     "Cognitive feedback loop is broken."
                 )
 
-        # 2. Memory backlog: too many observations in last 24h.
-        cur = await db.execute(
-            "SELECT COUNT(*) FROM observations "
-            "WHERE created_at > strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', '-24 hours') "
-            "AND resolved = 0"
-        )
-        row = await cur.fetchone()
-        recent_count = row[0] if row else 0
-        if recent_count > 20:
-            flags.append(
-                f"- [WARNING] MEMORY BACKLOG: {recent_count} observations in last 24h. "
-                "Consolidation may not be keeping pace."
-            )
+        # (Removed 2026-04-11) Memory-backlog WARNING flag: the metric was
+        # actionless from a starting session's perspective, and its message
+        # ("consolidation may not be keeping pace") referred to a job that
+        # does not exist. The real retrieval-coverage signal was also
+        # removed from the awareness pipeline in the same sweep because it
+        # was being misinterpreted downstream as reflection urgency.
 
-        # 3. Job health: any scheduled job with consecutive failures.
+        # 2. Job health: any scheduled job with consecutive failures.
         try:
             cur = await db.execute(
                 "SELECT job_name, consecutive_failures, last_error "

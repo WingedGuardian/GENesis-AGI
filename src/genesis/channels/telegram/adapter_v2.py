@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -58,6 +59,7 @@ class TelegramAdapterV2(ChannelAdapter):
         config_loader: TTSConfigLoader | None = None,
         reply_waiter: object | None = None,
         engagement_tracker: object | None = None,
+        autonomous_cli_gate: object | None = None,
     ):
         self.token = token
         self.conversation_loop = conversation_loop
@@ -66,6 +68,7 @@ class TelegramAdapterV2(ChannelAdapter):
         self.tts_provider = tts_provider
         self._reply_waiter = reply_waiter
         self._engagement_tracker = engagement_tracker
+        self._autonomous_cli_gate = autonomous_cli_gate
         self._app = None
 
         # Transport layer components
@@ -122,6 +125,7 @@ class TelegramAdapterV2(ChannelAdapter):
             db=getattr(self.conversation_loop, "_db", None),
             typing_breaker=self._typing_breaker,
             dedupe=self._dedupe,
+            autonomous_cli_gate=self._autonomous_cli_gate,
         )
 
         self._app = (
@@ -158,6 +162,10 @@ class TelegramAdapterV2(ChannelAdapter):
         self._app.add_handler(
             MessageHandler(filters.Document.ALL, handlers["document"])
         )
+
+        # Inline keyboard button callback handler (approval flows)
+        if "callback_query" in handlers:
+            self._app.add_handler(CallbackQueryHandler(handlers["callback_query"]))
 
         # Watchdog activity tracker — fires on ALL updates (not just user messages)
         # so idle periods don't trigger false stall alarms
@@ -204,6 +212,7 @@ class TelegramAdapterV2(ChannelAdapter):
         self, channel_id: str, text: str, *,
         message_thread_id: int | None = None,
         parse_mode: str | None = None,
+        reply_markup: object | None = None,
     ) -> str:
         if not self._app:
             raise RuntimeError("Adapter not started")
@@ -214,6 +223,7 @@ class TelegramAdapterV2(ChannelAdapter):
             text,
             parse_mode=parse_mode or "HTML",
             message_thread_id=message_thread_id,
+            reply_markup=reply_markup,
         )
         if msg is None:
             raise RuntimeError("Failed to send message after retries")

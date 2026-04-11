@@ -54,10 +54,48 @@ def _emit(text: str) -> None:
     sys.stdout.flush()
 
 
+def _sync_genesis_hooks() -> None:
+    """Self-heal Genesis git hooks at session start.
+
+    Invokes scripts/hooks/sync-hooks.sh --quiet to bring $GIT_COMMON_DIR/hooks
+    into sync with scripts/hooks/*. This is how community users who `git pull`
+    Genesis updates (without re-running bootstrap.sh) pick up new or updated
+    hooks — the next CC session auto-installs them via this function.
+
+    Fail-open: any error is swallowed silently. Hook sync must NEVER block
+    session startup.
+
+    Cost: ~50-200ms for the subprocess. Negligible in the 5000ms SessionStart
+    budget. Runs once per session start.
+    """
+    import contextlib
+    import subprocess
+
+    sync_script = Path(__file__).resolve().parent / "hooks" / "sync-hooks.sh"
+    if not sync_script.is_file():
+        # sync-hooks.sh doesn't exist yet on very old Genesis installs —
+        # silently skip. The install was pre-Phase-6.
+        return
+    # Fail-open: any error here must NEVER block session startup. CC discards
+    # SessionStart stderr anyway, so silent skip is the right behavior.
+    with contextlib.suppress(subprocess.TimeoutExpired, OSError, FileNotFoundError):
+        subprocess.run(
+            [str(sync_script), "--quiet"],
+            check=False,  # exit 2 (user-modified) is fine, not a failure
+            capture_output=True,
+            timeout=3.0,
+        )
+
+
 def main() -> None:
     # Eject lever: flag file absent → no Genesis context
     if not _FLAG.exists():
         return
+
+    # Phase 6: self-heal Genesis git hooks before doing anything else.
+    # Runs on every session start so community installs auto-pick up hook
+    # updates without requiring a bootstrap.sh re-run.
+    _sync_genesis_hooks()
 
     # Bridge-dispatched sessions get identity via --system-prompt; skip those
     # sections but still inject procedures, temporal context, and capabilities.
@@ -221,6 +259,39 @@ def main() -> None:
             _emit(_mcp_fallback)
     else:
         _emit(_mcp_fallback)
+
+    # 6. MCP server crash warnings — loud alert when MCP servers failed to start
+    _mcp_crash_dir = Path.home() / ".genesis" / "mcp_crashes"
+    if _mcp_crash_dir.is_dir():
+        try:
+            import json as _json
+
+            crash_entries = []
+            for crash_file in sorted(_mcp_crash_dir.glob("*.json")):
+                try:
+                    info = _json.loads(crash_file.read_text())
+                    crash_entries.append(info)
+                except (ValueError, OSError):
+                    crash_entries.append({"server": crash_file.stem, "error": "unreadable crash file"})
+            if crash_entries:
+                _emit("\n\n---\n\n")
+                _emit("## GENESIS ALERT: MCP Server Crashes\n\n")
+                _emit(
+                    "The following MCP servers failed to start and their tools are "
+                    "**UNAVAILABLE** in this session:\n\n"
+                )
+                for info in crash_entries:
+                    srv = info.get("server", "unknown")
+                    err = info.get("error", "unknown error")
+                    ts = info.get("timestamp", "")
+                    ts_note = f" (at {ts})" if ts else ""
+                    _emit(f"- **genesis-{srv}**: `{err}`{ts_note}\n")
+                _emit(
+                    "\n**Impact:** Tools from crashed servers will not appear. "
+                    "Fix the root cause and restart the session.\n"
+                )
+        except Exception:
+            pass  # Crash reporting itself must not crash the hook
 
 
 def _load_last_session_data() -> dict | None:

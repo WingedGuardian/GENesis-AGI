@@ -85,7 +85,7 @@ class EgoConfig:
     daily_budget_cap_usd: float = 10.0  # max daily ego spend
     morning_report_hour: int = 8  # 24h format, local time
     morning_report_minute: int = 0
-    morning_report_timezone: str = "America/New_York"
+    morning_report_timezone: str = "UTC"
     consecutive_failure_limit: int = 3  # circuit breaker threshold
     failure_backoff_minutes: int = 60  # pause after N failures
     batch_digest: bool = True  # send proposals as daily batch

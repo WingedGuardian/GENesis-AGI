@@ -114,6 +114,66 @@ def test_noop_update_no_backup(config_file):
     assert not config_file.with_suffix(".yaml.bak.1").exists()
 
 
+def test_dispatch_api_mode_clears_cc_fields(config_file):
+    """dispatch='api' writes the mode and strips cc_model/cc_position.
+
+    cc_model / cc_position are stored in raw yaml (the dashboard route
+    reads them via ``yaml.safe_load``), NOT as typed fields on
+    ``CallSiteConfig``.  Assertions therefore round-trip through the
+    yaml file rather than the parsed dataclass.
+    """
+    import yaml as _y
+    # Seed with cc_model first
+    update_call_site_in_yaml(
+        config_file, "5_deep_reflection",
+        chain=["openrouter_sonnet"], cc_model="Sonnet", cc_position=0,
+    )
+    # Now switch to forced API mode
+    new_config = update_call_site_in_yaml(
+        config_file, "5_deep_reflection", dispatch="api",
+    )
+    assert new_config.call_sites["5_deep_reflection"].dispatch == "api"
+    raw = _y.safe_load(config_file.read_text())
+    site = raw["call_sites"]["5_deep_reflection"]
+    assert site.get("dispatch") == "api"
+    assert "cc_model" not in site
+    assert "cc_position" not in site
+
+
+def test_dispatch_cli_mode_preserves_cc_model(config_file):
+    """dispatch='cli' forces CLI execution while preserving cc_model."""
+    import yaml as _y
+    new_config = update_call_site_in_yaml(
+        config_file, "5_deep_reflection",
+        chain=["openrouter_sonnet"], cc_model="Opus", dispatch="cli",
+    )
+    assert new_config.call_sites["5_deep_reflection"].dispatch == "cli"
+    raw = _y.safe_load(config_file.read_text())
+    site = raw["call_sites"]["5_deep_reflection"]
+    assert site.get("dispatch") == "cli"
+    assert site.get("cc_model") == "Opus"
+
+
+def test_dispatch_dual_mode_is_auto(config_file):
+    """dispatch='dual' stores the explicit auto mode."""
+    import yaml as _y
+    new_config = update_call_site_in_yaml(
+        config_file, "5_deep_reflection",
+        chain=["openrouter_sonnet"], cc_model="Sonnet", dispatch="dual",
+    )
+    assert new_config.call_sites["5_deep_reflection"].dispatch == "dual"
+    raw = _y.safe_load(config_file.read_text())
+    site = raw["call_sites"]["5_deep_reflection"]
+    assert site.get("dispatch") == "dual"
+    assert site.get("cc_model") == "Sonnet"
+
+
+def test_dispatch_invalid_value_rejected(config_file):
+    """Invalid dispatch values raise ValueError before the file is touched."""
+    with pytest.raises(ValueError, match="Invalid dispatch mode"):
+        update_call_site_in_yaml(config_file, "5_deep_reflection", dispatch="bogus")
+
+
 def test_atomic_write_cleans_up_on_failure(config_file, monkeypatch):
     """If validation fails after writing .new, the .new file should be cleaned up."""
     # Corrupt the validation by monkeypatching load_config to fail

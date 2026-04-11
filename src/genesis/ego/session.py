@@ -136,6 +136,29 @@ class EgoSession:
         used_cli = True
         session_id: str | None = None
         if self._autonomous_dispatcher is not None:
+            # Call-site gating pre-check: if an ego_cycle approval is
+            # already pending, skip this cycle entirely.  No new approval
+            # request is created (no Telegram spam), and the next scheduler
+            # tick will re-check once the pending approval resolves.
+            try:
+                pending = await (
+                    self._autonomous_dispatcher.approval_gate.find_site_pending(
+                        subsystem="ego", policy_id="ego_cycle",
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "find_site_pending failed for ego_cycle; proceeding without pre-check",
+                    exc_info=True,
+                )
+                pending = None
+            if pending is not None:
+                logger.info(
+                    "Ego cycle skipped — call site blocked on approval %s",
+                    pending.get("id"),
+                )
+                return None
+
             decision = await self._autonomous_dispatcher.route(
                 AutonomousDispatchRequest(
                     subsystem="ego",

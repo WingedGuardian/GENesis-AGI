@@ -24,6 +24,20 @@ async def test_create_and_get(db):
     assert row["task_type"] == "deploy"
 
 
+async def test_create_with_initial_counts(db):
+    """Verify success_count and confidence kwargs are persisted on create."""
+    await procedural.create(
+        db, id="p_seed", success_count=1, confidence=2 / 3,
+        speculative=0, activation_tier="L3", **_COMMON,
+    )
+    row = await procedural.get_by_id(db, "p_seed")
+    assert row is not None
+    assert row["success_count"] == 1
+    assert abs(row["confidence"] - 2 / 3) < 1e-9
+    assert row["speculative"] == 0
+    assert row["activation_tier"] == "L3"
+
+
 async def test_get_nonexistent(db):
     assert await procedural.get_by_id(db, "nope") is None
 

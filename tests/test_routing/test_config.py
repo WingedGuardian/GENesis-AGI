@@ -121,11 +121,14 @@ def test_load_full_yaml(monkeypatch):
 
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
-    # lmstudio-30b disabled by default → 21 enabled providers
-    # (22 total - 1 disabled lmstudio-30b)
-    assert len(cfg.providers) == 21
+    # lmstudio-30b disabled by default → 20 enabled providers
+    # (21 total - 1 disabled lmstudio-30b; mistral-free + mistral-large
+    # consolidated into mistral-large-free)
+    assert len(cfg.providers) == 20
     assert "lmstudio-30b" not in cfg.providers
-    assert len(cfg.call_sites) == 39  # +contingency_*, +cc_update_analysis, +email_triage
+    # Call sites evolve — assert actual count matches config, and lock in
+    # a few load-bearing ids rather than chasing the total on every edit.
+    assert len(cfg.call_sites) == 37
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
@@ -134,18 +137,18 @@ def test_load_full_yaml(monkeypatch):
 
     # Phase 6 learning call sites
     assert cfg.call_sites["29_retrospective_triage"].chain == [
-        "ollama-3b", "groq-free", "mistral-free",
+        "groq-free", "mistral-large-free", "openrouter-nemo",
     ]
     assert cfg.call_sites["30_triage_calibration"].default_paid is True
-    # lmstudio-30b filtered out, only mistral-large remains
-    assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large"]
+    # lmstudio-30b filtered out, only mistral-large-free remains
+    assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
     assert cfg.call_sites["31_outcome_classification"].chain == [
-        "glm5", "mistral-large",
+        "glm5", "mistral-large-free",
     ]
 
-    # mistral-large provider
-    ml = cfg.providers["mistral-large"]
-    assert ml.is_free is False
+    # mistral-large-free provider (consolidated from mistral-free + mistral-large)
+    ml = cfg.providers["mistral-large-free"]
+    assert ml.is_free is True
     assert ml.model_id == "mistral-large-latest"
 
 
@@ -248,3 +251,74 @@ call_sites:
 """)
     assert "dead" not in cfg.call_sites
     assert "alive" not in cfg.call_sites
+
+
+# ---------------------------------------------------------------------------
+# F1: ``dispatch`` field parsing on CallSiteConfig.
+# ---------------------------------------------------------------------------
+
+_DISPATCH_YAML = """\
+providers:
+  p:
+    type: t
+    model: m
+    free: true
+call_sites:
+  default_site:
+    chain: [p]
+  dual_site:
+    chain: [p]
+    dispatch: dual
+  cli_site:
+    chain: [p]
+    dispatch: cli
+  api_site:
+    chain: [p]
+    dispatch: api
+  legacy_cc_site:
+    chain: [p]
+    dispatch: cc
+  unknown_site:
+    chain: [p]
+    dispatch: bogus
+  upper_site:
+    chain: [p]
+    dispatch: CLI
+"""
+
+
+def test_dispatch_default_is_dual_when_missing():
+    cfg = load_config_from_string(_DISPATCH_YAML)
+    assert cfg.call_sites["default_site"].dispatch == "dual"
+
+
+def test_dispatch_explicit_values_round_trip():
+    cfg = load_config_from_string(_DISPATCH_YAML)
+    assert cfg.call_sites["dual_site"].dispatch == "dual"
+    assert cfg.call_sites["cli_site"].dispatch == "cli"
+    assert cfg.call_sites["api_site"].dispatch == "api"
+
+
+def test_dispatch_legacy_cc_alias_normalises_to_cli():
+    """Earlier dashboard code wrote ``dispatch: cc`` before the three
+    mode selector landed.  The parser must map that to ``cli`` so old
+    yaml files keep working and the runtime router picks up the CLI
+    path automatically."""
+    cfg = load_config_from_string(_DISPATCH_YAML)
+    assert cfg.call_sites["legacy_cc_site"].dispatch == "cli"
+
+
+def test_dispatch_unknown_falls_back_to_dual(caplog):
+    """Typos in dispatch must never silently disable the CLI gate.
+    Falling back to 'dual' preserves safe default behaviour; the
+    WARNING log is the canary for a misconfiguration."""
+    import logging
+    caplog.set_level(logging.WARNING)
+    cfg = load_config_from_string(_DISPATCH_YAML)
+    assert cfg.call_sites["unknown_site"].dispatch == "dual"
+    assert any("unknown dispatch" in rec.message.lower() for rec in caplog.records)
+
+
+def test_dispatch_case_insensitive():
+    cfg = load_config_from_string(_DISPATCH_YAML)
+    assert cfg.call_sites["upper_site"].dispatch == "cli"

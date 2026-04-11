@@ -13,6 +13,7 @@ from genesis.routing.dead_letter import DeadLetterQueue
 @dataclass
 class _FakeRoutingResult:
     success: bool = True
+    error: str | None = None
 
 
 @pytest.fixture
@@ -128,6 +129,43 @@ async def test_redispatch_failure_increments_retry(dlq, db):
     row = await dl_crud.get_by_id(db, item_id)
     assert row["status"] == "pending"
     assert row["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_redispatch_expires_unknown_call_site(dlq, db):
+    """Items whose call_site_id no longer exists in config are expired, not retried.
+
+    Regression: two stuck DLQ entries for call_site_id `contingency_inbox`
+    sat at retry_count=15 for hours because redispatch() treated "unknown
+    call site" as just another failure instead of a permanent one.
+    Example scenario: config reload renames or removes a call site.
+    """
+    from genesis.routing.router import UNKNOWN_CALL_SITE_ERROR_PREFIX
+
+    payload = {"call_site_id": "ghost_call_site", "messages": []}
+    item_id = await dlq.enqueue(
+        "chain_exhausted:ghost_call_site", payload, "all", "exhausted",
+    )
+
+    calls: list[str] = []
+
+    async def dispatch_fn(call_site_id, messages, **kwargs):
+        calls.append(call_site_id)
+        return _FakeRoutingResult(
+            success=False,
+            error=f"{UNKNOWN_CALL_SITE_ERROR_PREFIX} {call_site_id}",
+        )
+
+    succeeded, failed = await dlq.redispatch(dispatch_fn)
+    # Expiry doesn't count as success OR failure — it's a terminal state.
+    assert succeeded == 0
+    assert failed == 0
+    assert calls == ["ghost_call_site"]  # dispatched exactly once
+
+    row = await dl_crud.get_by_id(db, item_id)
+    assert row["status"] == "expired"
+    # Retry count should NOT be incremented — we gave up, not retried.
+    assert row["retry_count"] == 0
 
 
 @pytest.mark.asyncio

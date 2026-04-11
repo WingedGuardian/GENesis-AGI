@@ -1,5 +1,6 @@
 """Tests for TopicManager — persistent category-based forum topics."""
 
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -89,15 +90,36 @@ async def test_name_truncation(manager, bot):
 
 
 @pytest.mark.asyncio
-async def test_permission_warning_once(bot):
-    """Permission error logs warning only on first failure."""
+async def test_create_failure_logs_every_time(bot, caplog):
+    """Every create_forum_topic failure must log at ERROR with category name.
+
+    Previously the TopicManager used a warn-once guard that hid persistent
+    failures after the first one — that made silent DM fallback invisible
+    on 2026-04-10 when 7 approvals ended up in DM without any recurring
+    log line.  The fix is: log every failure at ERROR so operators see it
+    in health_errors MCP / dashboard.  Returning None is still correct
+    behavior so callers can fall back to DM delivery.
+    """
     bot.create_forum_topic.side_effect = Exception("Forbidden")
     manager = TopicManager(bot, forum_chat_id=12345)
 
-    await manager.get_or_create_persistent("cat1")
-    await manager.get_or_create_persistent("cat2")
+    with caplog.at_level(logging.ERROR, logger="genesis.channels.telegram.topics"):
+        result1 = await manager.get_or_create_persistent("cat1")
+        result2 = await manager.get_or_create_persistent("cat2")
 
-    assert manager._permission_warned is True
+    assert result1 is None
+    assert result2 is None
+    error_records = [
+        r for r in caplog.records
+        if r.levelname == "ERROR"
+        and "Failed to create forum topic" in r.getMessage()
+    ]
+    assert len(error_records) == 2, (
+        "Each failed create must log at ERROR — not warn-once. "
+        f"Got {len(error_records)} ERROR records."
+    )
+    assert "cat1" in error_records[0].getMessage()
+    assert "cat2" in error_records[1].getMessage()
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,195 @@
+name: Public Release
+
+# Triggered by pushing a version tag (v3.0a3, v3.1, etc.)
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for git describe
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install detect-secrets pyyaml
+          sudo apt-get install -y ripgrep jq
+
+      - name: Prepare public release
+        run: |
+          mkdir -p /tmp/genesis-public-release
+          ./scripts/prepare-public-release.sh /tmp/genesis-public-release
+
+      - name: Run secret scan
+        run: |
+          set -euo pipefail
+          cd /tmp/genesis-public-release
+          # Write scan output to a file. Do NOT merge stderr into stdout
+          # (corrupts JSON). Do NOT use bare except. Do NOT swallow exit
+          # codes. Scanner failure or parse failure MUST fail the job —
+          # never silently report 0 findings.
+          if ! detect-secrets scan --all-files \
+              --exclude-files '\.git/' \
+              --exclude-files '__pycache__/' \
+              --exclude-files '\.pyc$' > /tmp/scan-results.json; then
+            echo "::error::detect-secrets scan failed (non-zero exit)"
+            exit 1
+          fi
+          if ! count=$(python3 -c "
+          import json
+          with open('/tmp/scan-results.json') as f:
+              d = json.load(f)
+          print(sum(len(v) for v in d.get('results', {}).values()))
+          "); then
+            echo "::error::Failed to parse detect-secrets JSON output"
+            head -20 /tmp/scan-results.json || true
+            exit 1
+          fi
+          if [ "$count" != "0" ]; then
+            echo "::error::Secret scan found $count potential secret(s)"
+            python3 -c "
+          import json
+          with open('/tmp/scan-results.json') as f:
+              d = json.load(f)
+          for fname, findings in d.get('results', {}).items():
+              for finding in findings:
+                  print(f'  {fname}:{finding.get(\"line_number\", \"?\")}: {finding.get(\"type\", \"?\")}')
+          "
+            exit 1
+          fi
+          echo "Secret scan: CLEAN (0 findings)"
+
+      - name: Run portability scan
+        # This step uses only literal string patterns — no ${{ github.event.* }}
+        # input, no untrusted data in run: commands. Safe against injection.
+        #
+        # Exclude files that legitimately contain scanned patterns (scanner
+        # source, workflow file, release-script-guarantees doc). Mirrors the
+        # SCAN_EXCLUDES array in scripts/prepare-public-release.sh.
+        run: |
+          cd /tmp/genesis-public-release
+          issues=0
+          RG_EXCLUDES=(
+            --glob '!scripts/prepare-public-release.sh'
+            --glob '!scripts/push-public-release.sh'
+            --glob '!.github/workflows/public-release.yaml'
+            --glob '!docs/reference/release-script-guarantees.md'
+          )
+          # Hardcoded IPs (container, host VM, Ollama, LM Studio, IPv6 ULAs)
+          for pattern in '10\.176\.34\.' '192\.168\.50\.' 'fd42:e3ba:' 'fd4d:77b8:'; do
+            if rg -l "${RG_EXCLUDES[@]}" "$pattern" --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+              echo "::warning::Found hardcoded IP pattern: $pattern"
+              issues=$((issues + 1))
+            fi
+          done
+          # Hardware / user-specific identifiers
+          for pattern in '5070ti' '\b(EST|EDT)\b' 'America/New_York'; do
+            if rg -l "${RG_EXCLUDES[@]}" "$pattern" --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+              echo "::warning::Found user-specific pattern: $pattern"
+              issues=$((issues + 1))
+            fi
+          done
+          # Hardcoded private-repo username references (word-boundary match
+          # so WingedGuardian/GENesis-AGI — the public repo — is preserved)
+          if rg -l "${RG_EXCLUDES[@]}" '\bWingedGuardian/(Genesis|genesis-backups)\b' --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+            echo "::warning::Found hardcoded private repo reference"
+            issues=$((issues + 1))
+          fi
+          # Hardcoded home path
+          if rg -l "${RG_EXCLUDES[@]}" '/home/ubuntu/' --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+            echo "::warning::Found hardcoded home path: /home/ubuntu/"
+            issues=$((issues + 1))
+          fi
+          # CC transcript project-id leak
+          if rg -l "${RG_EXCLUDES[@]}" -- '-home-ubuntu-genesis' --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+            echo "::warning::Found CC project-id leak: -home-ubuntu-genesis"
+            issues=$((issues + 1))
+          fi
+          # Other user home paths
+          for pattern in '/home/ubuntu/agent-zero' '/home/ubuntu/\.'; do
+            if rg -l "${RG_EXCLUDES[@]}" "$pattern" --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
+              echo "::warning::Found user home path: $pattern"
+              issues=$((issues + 1))
+            fi
+          done
+          if [ "$issues" -gt 0 ]; then
+            echo "::error::Portability scan found $issues issue(s)"
+            exit 1
+          fi
+          echo "Portability scan: CLEAN"
+
+      - name: Verify voice-master structure
+        # Safe against injection: operates only on filesystem paths, no
+        # ${{ github.event.* }} or other untrusted input.
+        run: |
+          cd /tmp/genesis-public-release
+          VOICE_DIR="src/genesis/skills/voice-master/references"
+          if [ ! -d "$VOICE_DIR/exemplars" ]; then
+            echo "::error::$VOICE_DIR/exemplars missing"
+            exit 1
+          fi
+          # In-repo exemplars dir must contain only README.md; user writing
+          # samples live in the out-of-repo overlay.
+          stray=$(find "$VOICE_DIR/exemplars" -maxdepth 1 -type f ! -name 'README.md')
+          if [ -n "$stray" ]; then
+            echo "::error::Non-template files in $VOICE_DIR/exemplars:"
+            echo "$stray"
+            exit 1
+          fi
+          if [ -f "$VOICE_DIR/voice-dimensions.md" ]; then
+            echo "::error::$VOICE_DIR/voice-dimensions.md contains user data and should not exist in the public release"
+            exit 1
+          fi
+          if [ ! -f "$VOICE_DIR/voice-dimensions-TEMPLATE.md" ]; then
+            echo "::error::$VOICE_DIR/voice-dimensions-TEMPLATE.md is missing"
+            exit 1
+          fi
+          echo "Voice-master structure: CLEAN (template only, no user data)"
+
+      - name: Build release summary
+        id: summary
+        run: |
+          cd /tmp/genesis-public-release
+          FILE_COUNT=$(find . -type f | wc -l)
+          DIR_COUNT=$(find . -type d | wc -l)
+          SIZE=$(du -sh . | cut -f1)
+          TAG="${GITHUB_REF_NAME}"
+
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "dir_count=$DIR_COUNT" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: genesis-public-release-${{ steps.summary.outputs.tag }}
+          path: /tmp/genesis-public-release/
+          retention-days: 30
+
+      - name: Summary
+        env:
+          TAG: ${{ steps.summary.outputs.tag }}
+          FILE_COUNT: ${{ steps.summary.outputs.file_count }}
+          SIZE: ${{ steps.summary.outputs.size }}
+        run: |
+          echo "## Public Release $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Secret scan: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Portability scan: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Voice-master structure: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Files: $FILE_COUNT" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Size: $SIZE" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Artifact uploaded. Review and push to GENesis-AGI manually." >> "$GITHUB_STEP_SUMMARY"

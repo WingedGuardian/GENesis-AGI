@@ -23,6 +23,23 @@ _MODULES_DIR = Path(__file__).resolve().parents[4] / "config" / "modules"
 _adapters: dict | None = None
 
 
+def _reset_adapter_cache() -> None:
+    """Clear the cached external-module adapter dict.
+
+    For test isolation only. The production ``_get_adapters()`` helper
+    lazily loads YAML configs from ``_MODULES_DIR`` once per process
+    and caches the result in the module-level ``_adapters`` global.
+    Tests that monkeypatch ``_MODULES_DIR`` (or that need to verify
+    the load path) must call this first, or they get stale state from
+    whichever test loaded the cache earliest.
+
+    No production callsite needs this — IPC adapter reloads require a
+    process restart. Tests only.
+    """
+    global _adapters
+    _adapters = None
+
+
 def _get_adapters() -> dict:
     """Lazily load external module configs and create adapters."""
     global _adapters

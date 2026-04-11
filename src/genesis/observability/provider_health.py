@@ -179,7 +179,7 @@ class ProviderHealthChecker:
                 provider_name=cfg.name,
                 reachable=False,
                 configured=False,
-                error="no probe URL or API key",
+                error="no API key configured",
                 checked_at=datetime.now(UTC).isoformat(),
             )
 

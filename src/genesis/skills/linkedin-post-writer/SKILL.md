@@ -21,15 +21,24 @@ a reader cannot distinguish this from the user having written it themselves.
 
 ## Voice Loading
 
-Before writing any post, read voice exemplars and anti-slop rules:
-- `../voice-master/references/exemplars/social.md`
-- `../voice-master/references/anti-slop.md`
+Before writing any post, load the user's voice via voice-master's overlay
+resolution:
 
-Select 3-5 exemplars matching this post's topic and tone. Use as stylistic
-reference — match sentence structure, vocabulary, directness. Do NOT copy.
+1. Read `../voice-master/SKILL.md` and follow its **User Calibration
+   Overlay** section. Voice-master will load the user's exemplars and
+   voice-dimensions from the out-of-repo overlay (or fall back to the
+   in-repo template with a warning if no overlay exists).
+2. This skill's medium is `social`. Select 3-5 social-medium exemplars
+   matching this post's topic and tone from whatever voice-master loads.
+3. Read `../voice-master/references/anti-slop.md` — apply the **Universal**
+   and **Professional / LinkedIn** sections (forum / long-form sections
+   do not apply here).
 
-If the exemplar file is empty or has no good matches, also read:
-- `../voice-master/references/voice-dimensions.md`
+Use exemplars as stylistic reference — match sentence structure, vocabulary,
+directness. Do NOT copy exemplar content.
+
+If no overlay is present, voice-master falls back to the template and emits
+a warning. Your output will be generic in that case; surface this clearly.
 
 Every post MUST comply with the anti-slop rules. Failure to follow these rules
 produces content that damages the user's professional reputation. Treat
@@ -143,8 +152,7 @@ genesis_notes: |
 -->
 ## References
 
-- `../voice-master/SKILL.md` — Voice authority (exemplars, anti-slop, calibration)
-- `../voice-master/references/exemplars/social.md` — Social media voice exemplars
-- `../voice-master/references/anti-slop.md` — AI-tell avoidance rules
+- `../voice-master/SKILL.md` — Voice authority. Follow its **User Calibration Overlay** section to load exemplars and voice-dimensions from the user overlay; exemplars themselves live outside the repo at `~/.claude/skills/voice-master/exemplars/`.
+- `../voice-master/references/anti-slop.md` — Universal + Professional/LinkedIn anti-slop rules
 - `../linkedin-content-calendar/SKILL.md` — Calendar planning
 - `../linkedin-hook-writer/SKILL.md` — Opening line generation

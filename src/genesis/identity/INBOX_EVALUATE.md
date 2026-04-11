@@ -118,19 +118,61 @@ Before classifying, gather ALL available context:
 1. **Notepad title** — the filename is the item's first signal, like an email
    subject line
 2. **Bracketed annotations** — `[This notepad is for genesis items]` or
-   `[This note is USER specific...]` are the STRONGEST classification signals.
-   They override title heuristics. Respect them.
+   `[This note is USER specific...]` are absolute classification
+   directives, not just heuristics. They are handled by Rule 1 in Step 2
+   below and override every other signal.
 3. **Content itself** — what the URLs/text actually contain after fetching
 4. **User commentary** — any notes the user left alongside items
 5. **Broader context** — patterns across the notepad, relationship between items
 
 ## Step 2: Classify Each Item
 
-Classification is judgment, not a flowchart. Use the categories below as a
-toolbox for common cases, but do not force content into a classification. If
-something doesn't fit neatly, handle it on its own terms.
+### Rule 1 (absolute, non-overridable): Bracket directives are not suggestions
+
+If the file content contains a bracketed classification directive —
+`[This note is USER specific ...]` or `[This notepad is for genesis items]`
+or any close variant — your classification for every item in that file is
+already decided. This is NOT a heuristic the content can override.
+
+**Decision procedure when a bracket directive is present:**
+
+1. Stop reasoning about whether the content "really" fits a different
+   category. Don't.
+2. Classify every item in that file according to the bracket:
+   - `[This note is USER specific ...]` → **User-relevant**, apply the
+     User evaluation framework.
+   - `[This notepad is for genesis items]` → **Genesis-relevant**, apply
+     the Genesis evaluation framework.
+3. Proceed to evaluation using the specified framework. Do NOT apply the
+   alternate framework "because the content seems to fit better." The
+   user chose the framework when they wrote the bracket.
+
+**Anti-pattern (exact failure mode this rule exists to prevent):**
+
+A file tagged `[This note is USER specific ...]` contains a URL to an
+article about Claude, Obsidian, agent architecture, or sales-pipeline
+automation. The content *appears* Genesis-adjacent. You feel the pull
+to classify it Genesis-relevant because "it's really about Genesis-like
+systems." **Don't.** The bracket is absolute. Genesis-adjacent content
+that the user flagged as personal is still personal. Apply the User
+framework anyway — the user's interest in Claude-for-sales tooling is
+a fact about *them*, not a fact about Genesis.
+
+The symmetric anti-pattern holds for `[This notepad is for genesis
+items]` — even if an individual item reads like a personal note, the
+user's intent was Genesis evaluation.
+
+**Only skip the bracket if the file has no real content to evaluate at
+all** — e.g., a note containing only the bracket itself with nothing
+else, which is pure meta-context and should be classified as
+**Acknowledged** (no response file) instead.
 
 ### Classification Categories
+
+With Rule 1 resolved (or no bracket present), classification is judgment,
+not a flowchart. Use the categories below as a toolbox for common cases,
+but do not force content into a classification. If something doesn't fit
+neatly, handle it on its own terms.
 
 - **Genesis-relevant** — Technology, tools, competitors, AI/ML, infrastructure,
   development patterns, agent architectures, anything that could inform how
@@ -163,31 +205,35 @@ something doesn't fit neatly, handle it on its own terms.
 - **Question** — The user is asking something or the intent is unclear.
   → Surface for foreground follow-up with initial context.
 
-- **Acknowledged** — Pure context, metadata, or FYI directed at Genesis that
-  does not require a response. Includes bracketed annotations about the note
-  itself, structural notes about how to treat the file, or information the user
-  wants Genesis to absorb without producing an evaluation.
+- **Acknowledged** — Pure context, metadata, or FYI with **no real content to
+  evaluate**. Examples: a file containing ONLY a bracket annotation like
+  `[This notepad is for genesis items]` with nothing else below it, or a note
+  that says "archiving this for context, no action needed" and nothing more.
   → No response file needed. When in doubt, do NOT acknowledge silently — if
   there's any ambiguity, produce a response or ask a clarifying question.
 
-### Classification Signals
+  **Important:** A bracket-tagged file WITH real content (URLs, text, ideas,
+  research material) is NOT Acknowledged — per Rule 1 above, it's
+  User-relevant or Genesis-relevant according to the bracket. Acknowledged is
+  only for files that are purely meta and have nothing to evaluate.
 
-**Bracketed annotations are the strongest signal.** If a notepad says
-`[This notepad is for genesis items]`, the vast majority of items should get the
-Genesis evaluation framework. Only skip it if an individual item is clearly
-inappropriate (404 page, obviously personal content in the wrong file, content
-that would be better served by the user evaluation framework).
+### Classification Signals (for files WITHOUT a bracket directive)
 
-Similarly, `[This note is USER specific...]` means most items should get the
-user evaluation framework.
+Rule 1 above handles files with bracket directives. The signals below
+apply only when no bracket directive is present.
 
 **When ambiguous** (no bracketed annotation, unclear title): default to
 user-relevant. Genesis-relevant is the specialized case, usually signaled
 explicitly by the user.
 
-**Content always has the final word.** A file titled "Meeting Notes" containing
-a detailed AI agent framework analysis should still get Genesis-relevant
-evaluation. A file titled "Genesis Review" about the Book of Genesis should not.
+**Content beats title.** A file titled "Meeting Notes" containing a
+detailed AI agent framework analysis should still get Genesis-relevant
+evaluation. A file titled "Genesis Review" about the Book of Genesis
+should not. Titles are weak signals — use them as a first hint, then
+check the actual content.
+
+Note: "Content beats title" does NOT mean "content beats bracket
+directive." See Rule 1 — bracket directives are absolute.
 
 ---
 

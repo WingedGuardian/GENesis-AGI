@@ -1,0 +1,134 @@
+{
+  "description": "Phase 6 version gate calibration fixtures. Each fixture represents a (user_fix, upstream_commits) pair with known ground truth for whether the user's fix is already present upstream. Used by scripts/spike_version_gate_calibrate.py to tune the LLM prompt and confidence threshold.",
+  "fixtures": [
+    {
+      "id": "tp-01-exact-same-fix",
+      "label": "TP",
+      "user_fix_subject": "fix(parser): handle empty input in tokenize()",
+      "user_fix_body": "When tokenize() was called with an empty string, it raised IndexError on line 42. Guard against empty input and return an empty list.",
+      "user_fix_diff": "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -40,6 +40,8 @@\n def tokenize(text: str) -> list[str]:\n+    if not text:\n+        return []\n     first = text[0]\n     return _split(text)",
+      "upstream_commits": [
+        {"sha": "a1b2c3d", "subject": "fix(parser): return empty list for empty input to tokenize()", "body": "tokenize() crashed with IndexError when called with an empty string. Adds a guard to return [] immediately."},
+        {"sha": "e4f5a6b", "subject": "docs: update README", "body": "Minor README edits."}
+      ],
+      "ground_truth_already_fixed": true,
+      "rationale": "Upstream commit a1b2c3d fixes the exact same bug in the exact same function with the same approach."
+    },
+    {
+      "id": "tp-02-same-bug-different-fix",
+      "label": "TP",
+      "user_fix_subject": "fix(auth): session cookie missing secure flag",
+      "user_fix_body": "Session cookies were issued without the Secure flag, making them visible over plain HTTP.",
+      "user_fix_diff": "--- a/src/auth/session.py\n+++ b/src/auth/session.py\n@@ -20,5 +20,5 @@\n def set_session_cookie(response, token):\n-    response.set_cookie('session', token, httponly=True)\n+    response.set_cookie('session', token, httponly=True, secure=True)",
+      "upstream_commits": [
+        {"sha": "b2c3d4e", "subject": "feat(auth): harden cookie security", "body": "Sets Secure, HttpOnly, and SameSite=Lax on all session cookies to close a CVE-2026-1234 disclosure channel. Refactors set_session_cookie to use a centralized CookieConfig."},
+        {"sha": "f5a6b7c", "subject": "chore: bump dependencies", "body": ""}
+      ],
+      "ground_truth_already_fixed": true,
+      "rationale": "Upstream commit b2c3d4e adds the Secure flag via a refactor. Different fix approach but same outcome — cookie now has Secure."
+    },
+    {
+      "id": "tp-03-changelog-entry",
+      "label": "TP",
+      "user_fix_subject": "fix(api): rate limiter off-by-one in sliding window",
+      "user_fix_body": "The sliding window rate limiter counted one request too few, allowing burst traffic to exceed the configured limit by 1.",
+      "user_fix_diff": "--- a/src/api/rate_limit.py\n+++ b/src/api/rate_limit.py\n@@ -50,7 +50,7 @@\n def is_allowed(self, key):\n     count = self._count_in_window(key)\n-    return count < self.limit\n+    return count <= self.limit - 1",
+      "upstream_commits": [
+        {"sha": "c3d4e5f", "subject": "fix(api): correct sliding window rate limiter off-by-one", "body": "Sliding window counted count < limit which permits limit+1 requests in the window. Changed to count < limit - 1 so exactly limit requests are allowed. Matches documented behavior."},
+        {"sha": "g6h7i8j", "subject": "test(api): add rate limiter sliding window tests", "body": ""}
+      ],
+      "ground_truth_already_fixed": true,
+      "rationale": "Upstream commit c3d4e5f is a direct fix for the same off-by-one bug. Different exact expression but identical semantics (both allow `limit` requests, not `limit+1`)."
+    },
+    {
+      "id": "tn-01-unrelated-upstream",
+      "label": "TN",
+      "user_fix_subject": "fix(memory): observation dedup missing content_hash",
+      "user_fix_body": "observation_write was not computing content_hash, so dedup on source+content_hash was never triggered.",
+      "user_fix_diff": "--- a/src/genesis/mcp/memory/observations.py\n+++ b/src/genesis/mcp/memory/observations.py\n@@ -15,6 +15,9 @@\n async def observation_write(content, source, obs_type, priority):\n+    chash = hashlib.sha256((source + content).encode()).hexdigest()\n     return await observations.create(\n-        content=content, source=source, type=obs_type, priority=priority\n+        content=content, source=source, type=obs_type, priority=priority,\n+        content_hash=chash\n     )",
+      "upstream_commits": [
+        {"sha": "d4e5f6a", "subject": "feat(dashboard): add cost tracking widget", "body": "New widget in the dashboard shows per-provider spend over the last 24h."},
+        {"sha": "h7i8j9k", "subject": "refactor(router): simplify provider selection", "body": "Removes the obsolete legacy_mode branch from RouterV2."},
+        {"sha": "l0m1n2o", "subject": "docs: update architecture diagrams", "body": ""}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "None of the upstream commits touch observations, dedup, or content_hash. Unrelated work."
+    },
+    {
+      "id": "tn-02-same-area-different-bug",
+      "label": "TN",
+      "user_fix_subject": "fix(parser): strip BOM from unicode input",
+      "user_fix_body": "Files with a UTF-8 BOM at the start caused tokenize() to emit a phantom first token. Strip the BOM before tokenizing.",
+      "user_fix_diff": "--- a/src/parser.py\n+++ b/src/parser.py\n@@ -38,6 +38,8 @@\n def tokenize(text: str) -> list[str]:\n+    if text.startswith('\\ufeff'):\n+        text = text[1:]\n     return _split(text)",
+      "upstream_commits": [
+        {"sha": "e5f6a7b", "subject": "fix(parser): handle trailing newline edge case in tokenize", "body": "tokenize() was emitting a trailing empty token when the input ended with \\n. Strip trailing whitespace before splitting."},
+        {"sha": "i8j9k0l", "subject": "test(parser): add tests for malformed input", "body": ""}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "Upstream fixed a DIFFERENT parser bug (trailing newline) in the same function. The BOM bug is still present — not addressed anywhere in the log."
+    },
+    {
+      "id": "tn-03-empty-upstream-log",
+      "label": "TN",
+      "user_fix_subject": "fix(db): migration runner locks on concurrent start",
+      "user_fix_body": "Two processes calling MigrationRunner.run() simultaneously caused a database is locked error because neither was using BEGIN IMMEDIATE.",
+      "user_fix_diff": "--- a/src/db/migration_runner.py\n+++ b/src/db/migration_runner.py\n@@ -80,7 +80,7 @@\n async def run(self):\n-    conn.execute('BEGIN')\n+    conn.execute('BEGIN IMMEDIATE')",
+      "upstream_commits": [],
+      "ground_truth_already_fixed": false,
+      "rationale": "User is already on upstream HEAD — no upstream commits since their version. Nothing to match."
+    },
+    {
+      "id": "edge-01-partial-fix-upstream",
+      "label": "TN_partial",
+      "user_fix_subject": "fix(router): DLQ orphan items on provider rename",
+      "user_fix_body": "When a provider is renamed, items in the DLQ referencing the old name are never cleaned up. This PR scans the DLQ on provider config reload AND on router startup.",
+      "user_fix_diff": "--- a/src/router/dlq.py\n+++ b/src/router/dlq.py\n@@ -100,4 +100,12 @@\n async def on_config_reload(self):\n+    await self._prune_orphan_items()\n+\n+async def on_startup(self):\n+    await self._prune_orphan_items()\n+\n+async def _prune_orphan_items(self):\n+    known = set(self._provider_registry.names())\n+    await self._db.execute('DELETE FROM dlq WHERE provider NOT IN (' + ','.join('?' * len(known)) + ')', list(known))",
+      "upstream_commits": [
+        {"sha": "f6a7b8c", "subject": "fix(router): DLQ orphan items after provider config reload", "body": "Adds orphan cleanup on config reload. Does NOT cover the startup case — a restart still sees orphan items from configs that changed while the router was down."},
+        {"sha": "j9k0l1m", "subject": "test(router): DLQ orphan cleanup integration test", "body": ""}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "Upstream fixed HALF the bug (config reload path only). The startup path is still broken. User's fix is strictly MORE complete — should be contributed. This is the tricky case: the LLM must recognize the scope difference."
+    },
+    {
+      "id": "edge-02-upstream-reverted-fix",
+      "label": "TN",
+      "user_fix_subject": "fix(cc_relay): session checkpoint race on concurrent writes",
+      "user_fix_body": "Two CC sessions writing checkpoints at the same time could corrupt the checkpoint file. Use a lock file.",
+      "user_fix_diff": "--- a/src/cc_relay/checkpoint.py\n+++ b/src/cc_relay/checkpoint.py\n@@ -45,3 +45,7 @@\n def save(self, data):\n+    with filelock.FileLock(self.path + '.lock'):\n         self.path.write_text(json.dumps(data))",
+      "upstream_commits": [
+        {"sha": "a7b8c9d", "subject": "fix(cc_relay): serialize checkpoint writes with filelock", "body": "Adds filelock around checkpoint.save to prevent concurrent-write corruption."},
+        {"sha": "k0l1m2n", "subject": "revert: \"fix(cc_relay): serialize checkpoint writes with filelock\"", "body": "Reverts a7b8c9d. The filelock import introduced a circular dependency with cc_relay.init and broke startup. Will be re-applied after the dependency is untangled."}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "Upstream applied AND reverted the fix. At upstream HEAD the bug is still present. The LLM should notice the revert and not cancel."
+    },
+    {
+      "id": "edge-03-different-bug-same-function",
+      "label": "TN",
+      "user_fix_subject": "fix(reflection): light cycle skips SOUL.md injection",
+      "user_fix_body": "LightReflection._build_prompt() was reading USER.md but not SOUL.md. Added SOUL.md to the identity file load loop.",
+      "user_fix_diff": "--- a/src/reflection/light.py\n+++ b/src/reflection/light.py\n@@ -30,5 +30,5 @@\n def _build_prompt(self):\n-    for name in ['USER.md', 'CONVERSATION.md']:\n+    for name in ['SOUL.md', 'USER.md', 'CONVERSATION.md']:\n         content = self._load_identity(name)",
+      "upstream_commits": [
+        {"sha": "b8c9d0e", "subject": "fix(reflection): light cycle uses wrong prompt template on retry", "body": "After a retry, LightReflection._build_prompt() was using the generic template instead of the light-specific template. Fixed to always use the light template."},
+        {"sha": "l1m2n3o", "subject": "chore: bump anthropic SDK", "body": ""}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "Upstream fixed a DIFFERENT bug in the same _build_prompt function (template selection on retry). The SOUL.md omission is still present. LLM must not confuse 'touched same function' with 'fixed same bug'."
+    },
+    {
+      "id": "edge-04-workaround-not-real-fix",
+      "label": "TN",
+      "user_fix_subject": "fix(ollama): embedding 400 on long input",
+      "user_fix_body": "Ollama embedding endpoint returned 400 when input exceeded the context window. Chunk the input and embed each chunk separately, then average the vectors.",
+      "user_fix_diff": "--- a/src/providers/ollama.py\n+++ b/src/providers/ollama.py\n@@ -60,3 +60,10 @@\n async def embed(self, text: str) -> list[float]:\n-    return await self._client.embed(text)\n+    if len(text) > self.MAX_INPUT_CHARS:\n+        chunks = self._chunk(text, self.MAX_INPUT_CHARS)\n+        vecs = await asyncio.gather(*[self._client.embed(c) for c in chunks])\n+        return self._average(vecs)\n+    return await self._client.embed(text)",
+      "upstream_commits": [
+        {"sha": "c9d0e1f", "subject": "fix(ollama): skip embedding when input is too long", "body": "Workaround for the 400 error on long inputs: return None instead of crashing. Callers now handle the None case by falling back to FTS5-only search. Proper chunking is a larger change for later."},
+        {"sha": "m2n3o4p", "subject": "test(providers): ollama long-input regression", "body": ""}
+      ],
+      "ground_truth_already_fixed": false,
+      "rationale": "Upstream did a WORKAROUND (return None, fall back to FTS5), not a real fix. User's fix is the proper chunking solution — should be contributed. This is another scope/completeness difference.",
+      "notes": "If the LLM is overly eager to match similar commit subjects, it might cancel this one wrongly."
+    }
+  ]
+}

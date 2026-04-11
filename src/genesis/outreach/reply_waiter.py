@@ -37,11 +37,57 @@ class ReplyWaiter:
         logger.info("Resolved reply waiter for delivery %s", delivery_id)
         return True
 
+    def add_alias(self, alias_id: str, canonical_id: str) -> None:
+        """Map *alias_id* to the same future as *canonical_id*.
+
+        Used so that both a pre-generated UUID (in button callback_data) and
+        the Telegram message_id (for quote-reply fallback) resolve the same
+        waiter.
+        """
+        future = self._waiters.get(canonical_id)
+        if future is not None:
+            self._waiters[alias_id] = future
+
+    def remove(self, *keys: str) -> None:
+        """Remove one or more keys from the registry without resolving."""
+        for key in keys:
+            self._waiters.pop(key, None)
+
     def cancel(self, delivery_id: str) -> None:
         """Cancel a pending waiter."""
         future = self._waiters.pop(delivery_id, None)
         if future and not future.done():
             future.cancel()
+
+    def resolve_any_pending(self, reply_text: str) -> bool:
+        """Resolve the most recent pending waiter with reply text.
+
+        Used when a user sends a standalone message (not a quote-reply)
+        and there's exactly one pending waiter — no ambiguity about which
+        message they're responding to. Returns True if a waiter was resolved.
+        """
+        pending = [
+            (did, f) for did, f in self._waiters.items() if not f.done()
+        ]
+        if len(pending) != 1:
+            return False  # Ambiguous or no waiters — don't resolve
+        delivery_id, future = pending[0]
+        self._waiters.pop(delivery_id, None)
+        future.set_result(reply_text)
+        logger.info(
+            "Resolved pending reply waiter %s via standalone message (no quote-reply)",
+            delivery_id,
+        )
+        return True
+
+    @property
+    def pending_count(self) -> int:
+        """Number of unresolved waiters.
+
+        Note: when aliases exist, this may overcount (same future counted
+        twice). This is acceptable since resolve_any_pending is disabled.
+        """
+        return sum(1 for f in self._waiters.values() if not f.done())
 
     async def wait_for_reply(
         self, delivery_id: str, *, timeout_s: float = 300.0,

@@ -1,9 +1,47 @@
 """Shared test fixtures for Genesis v3."""
 
-import os
+# ── sys.path guard: tests must import from THIS worktree, not from main ──
+# The venv has an editable install (``pip install -e .``) whose ``.pth``
+# file adds ``${HOME}/genesis/src`` — the MAIN worktree's src — to
+# ``sys.path`` at interpreter startup. Without this guard, running
+# ``pytest`` from a sibling worktree collects tests from the worktree's
+# ``tests/`` directory but imports ``genesis.*`` from main's source tree.
+# The tests silently lie: they report PASS/FAIL against the wrong code.
+#
+# This block inserts the current worktree's own ``src`` at ``sys.path``
+# position 0 before any test collects. pytest loads conftest.py during
+# the collection phase, before any test module runs, and before the
+# fixtures below import ``genesis.*``. Position 0 beats the editable
+# install's path.
+#
+# Safety:
+# - In the main worktree ``_WORKTREE_SRC`` resolves to the same directory
+#   as the editable install's ``.pth``-injected path. The guard removes
+#   and re-inserts that path at position 0 — a reorder, not a true no-op,
+#   but semantically equivalent because only one ``genesis/`` package
+#   exists on ``sys.path``. Import resolution is unchanged.
+# - In a sibling worktree it shadows the editable install so tests resolve
+#   against the worktree's source tree, which is what every test author
+#   expects.
+# - This is the structural fix for the 2026-04-10 worktree-test-isolation
+#   footgun: before this guard, every sibling-worktree test run needed an
+#   explicit ``PYTHONPATH=src`` prefix or it silently tested main instead.
+import sys
+from pathlib import Path
 
-import aiosqlite
-import pytest
+_WORKTREE_SRC = Path(__file__).resolve().parent.parent / "src"
+if _WORKTREE_SRC.is_dir():
+    _src_str = str(_WORKTREE_SRC)
+    if _src_str in sys.path:
+        # Already present but may not be at position 0 — move it to the
+        # front so it shadows anything the editable install injected.
+        sys.path.remove(_src_str)
+    sys.path.insert(0, _src_str)
+
+import os  # noqa: E402
+
+import aiosqlite  # noqa: E402
+import pytest  # noqa: E402
 
 # ── Safety: prevent os.killpg(1, ...) from killing all processes ─────────
 _real_killpg = os.killpg

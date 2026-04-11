@@ -23,18 +23,21 @@ async def create(
     version: int = 1,
     activation_tier: str = "L4",
     tool_trigger: list[str] | None = None,
+    success_count: int = 0,
+    confidence: float = 0.0,
 ) -> str:
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             speculative, attempted_workarounds, version, created_at,
-            activation_tier, tool_trigger)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            activation_tier, tool_trigger, success_count, confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
-         json.dumps(tool_trigger) if tool_trigger else None),
+         json.dumps(tool_trigger) if tool_trigger else None,
+         success_count, confidence),
     )
     await db.commit()
     return id
@@ -56,14 +59,23 @@ async def upsert(
     version: int = 1,
     activation_tier: str = "L4",
     tool_trigger: list[str] | None = None,
+    success_count: int = 0,
+    confidence: float = 0.0,
 ) -> str:
-    """Idempotent write: insert or update on conflict."""
+    """Idempotent write: insert or update on conflict.
+
+    Mirrors `create()`'s `success_count` / `confidence` plumbing so that
+    callers building idempotent seed/teach paths (e.g., batch seed scripts,
+    future explicit-teach upserters) can't accidentally land rows with the
+    invisible-to-recall (speculative=0, success_count=0, confidence=0.0)
+    profile that bit `procedure_store` before this fix.
+    """
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             speculative, attempted_workarounds, version, created_at,
-            activation_tier, tool_trigger)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            activation_tier, tool_trigger, success_count, confidence)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
@@ -72,12 +84,15 @@ async def upsert(
              attempted_workarounds = excluded.attempted_workarounds,
              version = excluded.version,
              activation_tier = excluded.activation_tier,
-             tool_trigger = excluded.tool_trigger""",
+             tool_trigger = excluded.tool_trigger,
+             success_count = excluded.success_count,
+             confidence = excluded.confidence""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
-         json.dumps(tool_trigger) if tool_trigger else None),
+         json.dumps(tool_trigger) if tool_trigger else None,
+         success_count, confidence),
     )
     await db.commit()
     return id

@@ -20,6 +20,43 @@ from genesis.routing.types import (
 logger = logging.getLogger(__name__)
 _ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::-(.*?))?\}")
 
+# Canonical set of runtime dispatch modes honoured by
+# ``AutonomousDispatchRouter.route()``.  Also used by
+# ``update_call_site_in_yaml`` to validate save payloads — keep in sync
+# with the dashboard neural-monitor selector and with
+# ``CallSiteConfig.dispatch``.
+_VALID_DISPATCH_MODES = frozenset({"api", "cli", "dual"})
+
+
+def _normalize_dispatch(raw: object, *, call_site_name: str) -> str:
+    """Return the canonical dispatch mode for a raw YAML value.
+
+    Missing / None → ``"dual"`` (current behaviour, zero-change default).
+    Legacy alias ``"cc"`` (written by earlier UI code before the three-
+    state selector landed) → ``"cli"``.  Unknown values are downgraded
+    to ``"dual"`` with a WARNING log so misconfiguration never silently
+    bypasses the CLI gate.
+    """
+    if raw is None:
+        return "dual"
+    if not isinstance(raw, str):
+        logger.warning(
+            "Call site '%s' has non-string dispatch value %r — defaulting to 'dual'",
+            call_site_name, raw,
+        )
+        return "dual"
+    value = raw.strip().lower()
+    if value == "cc":
+        return "cli"
+    if value in _VALID_DISPATCH_MODES:
+        return value
+    logger.warning(
+        "Call site '%s' has unknown dispatch mode %r — defaulting to 'dual'. "
+        "Valid values: %s",
+        call_site_name, raw, sorted(_VALID_DISPATCH_MODES),
+    )
+    return "dual"
+
 
 def load_config(path: str | Path) -> RoutingConfig:
     """Load routing config from a YAML file path."""
@@ -118,12 +155,15 @@ def _parse(raw: dict) -> RoutingConfig:
             )
             raise ValueError(msg)
 
+        dispatch = _normalize_dispatch(cs.get("dispatch"), call_site_name=name)
+
         call_sites[name] = CallSiteConfig(
             id=name,
             chain=chain,
             default_paid=cs.get("default_paid", False),
             never_pays=cs.get("never_pays", False),
             retry_profile=retry_profile,
+            dispatch=dispatch,
         )
 
     return RoutingConfig(
@@ -142,12 +182,19 @@ def update_call_site_in_yaml(
     never_pays: bool | None = None,
     cc_model: str | None = None,
     cc_position: int | None = None,
+    dispatch: str | None = None,
 ) -> RoutingConfig:
     """Update a single call site in the YAML config file.
 
     Uses atomic write (write .new, validate, rename) with rolling backups.
     Returns the newly loaded config if successful.
     Raises ValueError on validation failure.
+
+    ``dispatch`` is the user-controlled runtime mode:
+      - 'api'  → force API chain execution (hard fail if unavailable)
+      - 'cli'  → force CC subprocess execution
+      - 'dual' → auto (dispatcher picks; legacy behavior)
+      - None   → leave the existing yaml value unchanged
     """
     path = Path(path)
     raw = yaml.safe_load(path.read_text())
@@ -159,8 +206,19 @@ def update_call_site_in_yaml(
     cs = raw["call_sites"][call_site_id]
     providers = raw.get("providers") or {}
 
+    if dispatch is not None and dispatch not in _VALID_DISPATCH_MODES:
+        msg = f"Invalid dispatch mode: {dispatch!r}. Must be one of {_VALID_DISPATCH_MODES}"
+        raise ValueError(msg)
+
     # Early return if nothing to change
-    if chain is None and default_paid is None and never_pays is None and cc_model is None and cc_position is None:
+    if (
+        chain is None
+        and default_paid is None
+        and never_pays is None
+        and cc_model is None
+        and cc_position is None
+        and dispatch is None
+    ):
         return load_config(path)
 
     if chain is not None:
@@ -193,16 +251,29 @@ def update_call_site_in_yaml(
             cc_position = None
     if cc_model is not None:
         cs["cc_model"] = cc_model
-        cs["dispatch"] = "dual" if chain else cs.get("dispatch", "cc")
+        # Default to 'dual' when cc_model present with a chain, but defer to
+        # the explicit dispatch parameter (applied below) if the caller sent one.
+        if dispatch is None:
+            cs["dispatch"] = "dual" if chain else cs.get("dispatch", "cc")
         if cc_position is not None:
             cs["cc_position"] = cc_position
         else:
             cs.pop("cc_position", None)
-    elif chain is not None and cc_model is None:
-        # Explicit removal: cc_model sent as None with a chain update = API-only
+    elif chain is not None and cc_model is None and dispatch is None:
+        # Explicit removal: cc_model sent as None with a chain update and no
+        # explicit dispatch = API-only (legacy behavior).
         cs.pop("cc_model", None)
         cs.pop("dispatch", None)
         cs.pop("cc_position", None)
+
+    # Explicit dispatch mode wins over implicit logic above. When the caller
+    # sends dispatch='api', we remove CC-only fields; dispatch='cli' or 'dual'
+    # preserves cc_model but stores the new dispatch value.
+    if dispatch is not None:
+        cs["dispatch"] = dispatch
+        if dispatch == "api":
+            cs.pop("cc_model", None)
+            cs.pop("cc_position", None)
 
     # Validate: never_pays sites must have at least one free provider
     if cs.get("never_pays"):

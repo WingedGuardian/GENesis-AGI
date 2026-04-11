@@ -37,6 +37,10 @@ def main() -> None:
         help="Skip Telegram adapter even if configured",
     )
 
+    # Phase 6: genesis contribute <sha>
+    from genesis.contribution import cli as contrib_cli
+    contrib_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -49,6 +53,8 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
+    elif args.command == "contribute":
+        sys.exit(args.func(args))
     else:
         parser.print_help()
         sys.exit(1)
