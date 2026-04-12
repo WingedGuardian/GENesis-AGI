@@ -49,6 +49,29 @@ regression_risk: low | medium | high
 lesson: <what to remember to prevent recurrence>
 ```
 
+## Examples
+
+### Example: Hook fails in non-login shell
+
+**Trigger:** Post-commit hook throws `KeyError: 'HOME'` in CI-like environment.
+
+**Expected output:**
+
+```yaml
+issue: Post-commit hook crashes when HOME not set in non-login sessions
+date: 2026-04-06
+root_cause: Hook script reads os.environ["HOME"] but non-login shells
+  (systemd, cron) strip HOME from environment
+fix: Guard with os.environ.get("HOME", "/root") fallback + persist HOME
+  in /etc/environment during install
+files_modified:
+  - .claude/hooks/genesis-hook
+  - scripts/install_guardian.sh
+regression_risk: low
+lesson: Never assume HOME exists — non-login shells strip it. Always
+  use get() with fallback for environment variables in hook scripts.
+```
+
 ## References
 
 - `tests/` — Test suite for verification

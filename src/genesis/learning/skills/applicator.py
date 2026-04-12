@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from genesis.learning.skills.types import ChangeSize, SkillProposal
+from genesis.learning.skills.validator import SkillValidator
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -24,6 +25,7 @@ class SkillApplicator:
 
     def __init__(self, *, autonomy_level: int = _DEFAULT_AUTONOMY_LEVEL):
         self._autonomy_level = autonomy_level
+        self._validator = SkillValidator()
 
     async def apply(
         self,
@@ -31,15 +33,37 @@ class SkillApplicator:
         db: aiosqlite.Connection,
         *,
         router: object | None = None,
+        current_content: str | None = None,
     ) -> dict:
         """Apply or stage a skill proposal.
 
-        At L2: MINOR auto-applies, MODERATE+ staged for review.
+        At L2: MINOR auto-applies (if validation passes), MODERATE+ staged for review.
+
+        Args:
+            proposal: The skill proposal to apply or stage.
+            db: Database connection.
+            router: LLM router for MODERATE+ validation (optional).
+            current_content: Current SKILL.md content for consistency checking.
         """
         now = datetime.now(UTC).isoformat()
 
         if proposal.change_size == ChangeSize.MINOR and self._autonomy_level >= 2:  # noqa: PLR2004
-            # Auto-apply MINOR changes
+            # Validate before auto-applying
+            validation = self._validator.validate(proposal, current_content)
+
+            if not validation.passed:
+                logger.info(
+                    "MINOR proposal for %s failed validation (%s), staging for review",
+                    proposal.skill_name,
+                    validation.blocking_failures,
+                )
+                # Fall through to staging path
+                return await self._stage(
+                    proposal, db, validated=False, now=now,
+                    validation_detail=validation.test_results,
+                )
+
+            # Auto-apply MINOR changes that pass validation
             from genesis.learning.skills.wiring import get_skill_path
 
             path = get_skill_path(proposal.skill_name)
@@ -48,20 +72,24 @@ class SkillApplicator:
 
             path.write_text(proposal.proposed_content, encoding="utf-8")
 
-            # Log observation
+            # Log observation (include validation warnings if any)
             from genesis.db.crud import observations
+
+            obs_content = {
+                "skill_name": proposal.skill_name,
+                "change_size": proposal.change_size.value,
+                "rationale": proposal.rationale,
+                "confidence": proposal.confidence,
+            }
+            if validation.warnings:
+                obs_content["validation_warnings"] = validation.warnings
 
             await observations.create(
                 db,
                 id=str(uuid.uuid4()),
                 source="skill_evolution",
                 type="skill_evolution",
-                content=json.dumps({
-                    "skill_name": proposal.skill_name,
-                    "change_size": proposal.change_size.value,
-                    "rationale": proposal.rationale,
-                    "confidence": proposal.confidence,
-                }),
+                content=json.dumps(obs_content),
                 priority="medium",
                 created_at=now,
             )
@@ -71,42 +99,58 @@ class SkillApplicator:
 
         else:
             # Stage MODERATE+ for review (or any change if autonomy < 2)
-            validated = True
+            validated = False
             if proposal.change_size != ChangeSize.MINOR and router:
-                validated = await self.validate(proposal, router=router)
+                validated = await self._llm_validate(proposal, router=router)
 
-            from genesis.db.crud import observations
+            return await self._stage(proposal, db, validated=validated, now=now)
 
-            await observations.create(
-                db,
-                id=str(uuid.uuid4()),
-                source="skill_evolution",
-                type="skill_proposal",
-                content=json.dumps({
-                    "skill_name": proposal.skill_name,
-                    "change_size": proposal.change_size.value,
-                    "rationale": proposal.rationale,
-                    "confidence": proposal.confidence,
-                    "validated": validated,
-                    "proposed_content_preview": proposal.proposed_content[:500],
-                }),
-                priority="high" if proposal.change_size == ChangeSize.MAJOR else "medium",
-                created_at=now,
-            )
+    async def _stage(
+        self,
+        proposal: SkillProposal,
+        db: aiosqlite.Connection,
+        *,
+        validated: bool,
+        now: str,
+        validation_detail: dict[str, str] | None = None,
+    ) -> dict:
+        """Stage a proposal for user review."""
+        from genesis.db.crud import observations
 
-            logger.info(
-                "Staged %s skill proposal for %s (validated=%s)",
-                proposal.change_size.value,
-                proposal.skill_name,
-                validated,
-            )
-            return {
-                "action": "staged",
-                "skill_name": proposal.skill_name,
-                "validated": validated,
-            }
+        content = {
+            "skill_name": proposal.skill_name,
+            "change_size": proposal.change_size.value,
+            "rationale": proposal.rationale,
+            "confidence": proposal.confidence,
+            "validated": validated,
+            "proposed_content_preview": proposal.proposed_content[:500],
+        }
+        if validation_detail:
+            content["validation_detail"] = validation_detail
 
-    async def validate(self, proposal: SkillProposal, *, router: object) -> bool:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="skill_evolution",
+            type="skill_proposal",
+            content=json.dumps(content),
+            priority="high" if proposal.change_size == ChangeSize.MAJOR else "medium",
+            created_at=now,
+        )
+
+        logger.info(
+            "Staged %s skill proposal for %s (validated=%s)",
+            proposal.change_size.value,
+            proposal.skill_name,
+            validated,
+        )
+        return {
+            "action": "staged",
+            "skill_name": proposal.skill_name,
+            "validated": validated,
+        }
+
+    async def _llm_validate(self, proposal: SkillProposal, *, router: object) -> bool:
         """Validate a MODERATE+ proposal with a second LLM call."""
         prompt = (
             f"Review this skill change proposal and determine if it should be applied.\n\n"
@@ -126,5 +170,8 @@ class SkillApplicator:
             data = json.loads(result.text)
             return bool(data.get("approved", False))
         except Exception:
-            logger.warning("Validation LLM call failed, defaulting to not validated")
+            logger.warning(
+                "Validation LLM call failed, defaulting to not validated",
+                exc_info=True,
+            )
             return False
