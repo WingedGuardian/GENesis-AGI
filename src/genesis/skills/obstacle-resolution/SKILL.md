@@ -48,6 +48,35 @@ resolution: resolved | degraded | escalated
 resolution_detail: <how it was resolved>
 ```
 
+## Examples
+
+### Example: Embedding provider chain exhausted
+
+**Trigger:** memory_store fails with EmbeddingUnavailableError — Ollama timeout,
+DeepInfra 429, DashScope connection refused.
+
+**Expected output:**
+
+```yaml
+obstacle: All embedding providers exhausted during memory store
+date: 2026-03-20
+type: provider_failure
+chain_attempted:
+  - step: Ollama (local)
+    result: failure
+    detail: ReadTimeout after 60s — model not loaded
+  - step: DeepInfra (cloud)
+    result: failure
+    detail: HTTP 429 rate limit (RPM exceeded)
+  - step: DashScope (cloud)
+    result: failure
+    detail: ConnectionRefusedError — service unreachable
+resolution: degraded
+resolution_detail: Memory stored FTS5-only (no vector). Queued in
+  pending_embeddings for background recovery. Circuit breaker tripped
+  on DashScope (120s backoff).
+```
+
 ## References
 
 - `src/genesis/learning/fallback_chains.py` — Fallback chain definitions
