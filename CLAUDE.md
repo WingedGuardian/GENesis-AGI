@@ -238,18 +238,46 @@ For plans, fixes, architecture decisions, or any non-trivial change:
 
 Applies to both CC sessions and Genesis autonomy decisions.
 
-## Memory Retrieval
+## Memory System — Layer Model
 
-When searching for past information, sessions, or context — **don't grep
-transcripts first.** Genesis has a multi-layered memory system. Use in order:
+Genesis memory operates in 4 layers. Each has a role — use the lightest layer
+that answers your question before escalating.
 
-1. Check what the proactive memory hook injected (system-reminder `[Memory]` tags)
-2. Use `memory_recall` MCP for semantic search (Qdrant + FTS5 hybrid)
-3. Query SQLite `cc_sessions` for structured session data (topic, keywords)
-4. Use `db_schema` MCP to discover table schemas before any SQLite query
-5. **Grep transcripts is LAST RESORT** — only after 1-4 fail
+**L0 — Identity (always present, ~200 tokens):**
+SOUL.md + USER.md injected at session start. Who Genesis is, who the user is.
+You don't need to do anything — this is automatic.
 
-Never guess SQLite column names — use `db_schema` first. The DB has 60+ tables.
+**L1 — Essential Knowledge (always present, ~150-300 tokens):**
+`~/.genesis/essential_knowledge.md` injected at session start. Contains: active
+context, recent decisions, wing index. Regenerated after each foreground session.
+If this answers your question about "what are we working on" or "what was
+decided recently," you're done — don't burn a recall.
+
+**L2 — Proactive Recall (automatic per prompt):**
+The UserPromptSubmit hook searches FTS5 + Qdrant based on your prompt keywords
+and injects `[Memory]` tags. Check these first before doing explicit recall.
+Results are biased toward the active wing (domain) when detectable.
+
+**L3 — Deep Search (on demand):**
+Use `memory_recall` MCP for full hybrid retrieval (vector + FTS5 + RRF fusion
++ activation scoring + graph traversal). Use when L1-L2 don't answer the
+question. Query SQLite `cc_sessions` for structured session data. Use
+`db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
+**Grep transcripts is LAST RESORT** — only after all above fail.
+
+**When to store back:**
+If you synthesize an answer from multiple recalled memories — something that
+connects information in a new way — store it via `memory_store` with
+`tags: ["synthesis"]` and appropriate wing/room tags. This is how the memory
+system compounds over time. Don't store routine answers; store genuine syntheses
+that would be expensive to re-derive.
+
+**Wings (structural domains):**
+Memories are tagged with a `wing` (top-level domain) and optional `room`
+(specific topic). When searching, you can filter by wing for domain-specific
+recall. Current wings: memory, learning, routing, infrastructure, channels,
+autonomy. The proactive hook auto-detects your active wing from file paths
+and prompt keywords.
 
 ## Community Contribution Offers (Phase 6)
 
