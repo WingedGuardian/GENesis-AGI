@@ -71,12 +71,16 @@ async def memory_store(
     tags: list[str] | None = None,
     confidence: float = 0.5,
     memory_class: str | None = None,
+    wing: str | None = None,
+    room: str | None = None,
 ) -> str:
     """Store memory with source metadata and type tag. Returns memory_id.
 
     Args:
         memory_class: Optional classification — "rule", "fact", or "reference".
             Auto-classified from content if not provided.
+        wing: Structural domain (auto-classified if not provided).
+        room: Topic within the wing (auto-classified if not provided).
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -84,6 +88,7 @@ async def memory_store(
     return await memory_mod._store.store(
         content, source, memory_type=memory_type, tags=tags, confidence=confidence,
         memory_class=memory_class, source_pipeline="conversation",
+        wing=wing, room=room,
     )
 
 
