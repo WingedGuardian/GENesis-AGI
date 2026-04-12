@@ -1,6 +1,12 @@
 # Genesis: Versioned Build Plan — Safety-Ordered, Waterfall
 
-**Status:** Active | **Last updated:** 2026-03-22
+**Status:** V3 Feature Complete | **Last updated:** 2026-04-12
+
+> **V3 is feature complete.** All nine build phases (0-9) are done. The
+> phase-ordered waterfall served its purpose — safety-first scaffolding for
+> a system that now runs autonomously. Future work is scoped as V4 or V5,
+> not as additional V3 phases. This document is now historical reference
+> for the build sequence and design rationale.
 
 
 > **Ordering principle:** Build what's safest, most testable, and least likely to break first.
@@ -77,7 +83,7 @@ Phase 0: Data Foundation ✅
     │                         │
     │                    Phase 8: Basic Outreach ✅
     │                         │
-    │                    Phase 9: Basic Autonomy (needs Phase 6 + 8) ← NEXT
+    │                    Phase 9: Basic Autonomy ✅ (needs Phase 6 + 8)
 ```
 
 **Parallel tracks:** Phases 1, 2, and 3 can be built in parallel (all depend only on Phase 0).
@@ -1334,7 +1340,7 @@ needs it. This is pure instrumentation — zero LLM cost.
 
 ---
 
-## V3 Phase 9: Basic Autonomy
+## V3 Phase 9: Basic Autonomy ✅ COMPLETE
 
 **Risk: HIGH** — Permission errors = trust damage. Dependencies: Phase 6, Phase 8.
 
