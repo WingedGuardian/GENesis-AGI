@@ -47,3 +47,13 @@ class SkillProposal:
     change_size: ChangeSize
     confidence: float = 0.7
     failure_patterns_addressed: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """Result of structural validation of a skill proposal."""
+
+    passed: bool
+    test_results: dict[str, str] = field(default_factory=dict)  # test_name → detail
+    blocking_failures: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
