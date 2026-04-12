@@ -39,7 +39,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "router": "LLM routing with circuit breakers, cost tracking, and dead-letter queue",
     "perception": "Reflection engine — observation creation, pattern detection, signal processing",
     "cc_relay": "Claude Code invoker, session manager, checkpoints, and reflection bridge",
-    "memory": "Hybrid memory store — SQLite + Qdrant vector search for cross-session knowledge",
+    "memory": "Hybrid memory store — SQLite + Qdrant vector search, wing/room taxonomy, essential knowledge layer",
     "surplus": "Surplus compute scheduler — uses idle time for brainstorms and enrichment tasks",
     "learning": "Learning pipeline — triage, calibration, harvest, and procedural learning",
     "inbox": "Inbox monitor — watches ~/inbox/ for markdown files with URLs, evaluates them in background CC sessions",

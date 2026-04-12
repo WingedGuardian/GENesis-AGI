@@ -213,3 +213,63 @@ async def memory_stats() -> dict:
         "pending_deltas": len(pending_deltas),
         "total_links": total_links,
     }
+
+
+@mcp.tool()
+async def memory_synthesize(
+    content: str,
+    source_memory_ids: list[str] | None = None,
+    tags: list[str] | None = None,
+    wing: str | None = None,
+    room: str | None = None,
+) -> str:
+    """Store a synthesis — a conclusion derived from multiple recalled memories.
+
+    Use this when you've combined information from multiple memories into a new
+    insight worth preserving. The synthesis is stored with higher confidence
+    (validated by use) and linked back to source memories.
+
+    Args:
+        content: The synthesized knowledge.
+        source_memory_ids: IDs of memories that contributed to this synthesis.
+        tags: Additional tags for the synthesis.
+        wing: Structural domain (auto-classified if not provided).
+        room: Topic within the wing (auto-classified if not provided).
+
+    Returns:
+        The memory_id of the stored synthesis.
+    """
+    memory_mod = _memory_mod()
+    memory_mod._require_init()
+    assert memory_mod._store is not None
+
+    resolved_tags = list(tags or [])
+    if "synthesis" not in resolved_tags:
+        resolved_tags.append("synthesis")
+
+    memory_id = await memory_mod._store.store(
+        content,
+        source="synthesis",
+        memory_type="episodic",
+        tags=resolved_tags,
+        confidence=0.8,  # Higher confidence — validated by cross-memory derivation
+        source_pipeline="synthesis",
+        wing=wing,
+        room=room,
+    )
+
+    # Create links back to source memories
+    if source_memory_ids and memory_mod._store.linker:
+        for source_id in source_memory_ids:
+            try:
+                await memory_mod._store.linker.create_typed_links(
+                    memory_id,
+                    [{"target": source_id, "type": "extends"}],
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to link synthesis %s to source %s",
+                    memory_id, source_id, exc_info=True,
+                )
+
+    return memory_id

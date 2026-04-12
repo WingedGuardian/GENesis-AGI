@@ -160,8 +160,9 @@ def main() -> None:
     # Load last session data once — used for cognitive state tier + temporal awareness
     last_session_data = _load_last_session_data()
 
-    if not is_genesis_session:
-        # 2. Cognitive state from DB (graceful fallback)
+    if is_genesis_session:
+        # 2. Cognitive state from DB — for ego/background sessions only.
+        # Foreground sessions get essential knowledge instead (see below).
         try:
             cog = asyncio.run(_load_cognitive_state(last_session_data))
             if cog:
@@ -180,6 +181,40 @@ def main() -> None:
                 "`~/.genesis/status.json` for current resilience state."
             )
             first = False
+    else:
+        # 2. Essential knowledge for foreground sessions.
+        # Replaces cognitive state — shows what Genesis knows, not system health.
+        # Critical alerts only surface if genuinely user-blocking.
+        _ek_file = Path.home() / ".genesis" / "essential_knowledge.md"
+        if _ek_file.exists():
+            try:
+                ek_content = _ek_file.read_text(encoding="utf-8").strip()
+                if ek_content:
+                    if not first:
+                        _emit("\n\n---\n\n")
+                    _emit(ek_content)
+                    first = False
+            except OSError:
+                pass  # Essential knowledge is advisory — silent failure is correct
+
+        # Critical-only alert: surface genuinely user-blocking issues (DB down, etc.)
+        _status_file = Path.home() / ".genesis" / "status.json"
+        if _status_file.exists():
+            try:
+                import json as _json_status
+                status = _json_status.loads(_status_file.read_text())
+                resilience = status.get("resilience_state", "")
+                if resilience in ("critical", "degraded_critical"):
+                    if not first:
+                        _emit("\n\n---\n\n")
+                    _emit(
+                        "## GENESIS ALERT: System Issue\n\n"
+                        f"Resilience state: **{resilience}**. "
+                        "Use `health_status` MCP tool for details."
+                    )
+                    first = False
+            except (OSError, ValueError):
+                pass  # Never block session start
 
     # 2.5. Active procedures (advisory, silent failure is correct)
     try:
