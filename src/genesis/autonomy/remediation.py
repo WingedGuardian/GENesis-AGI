@@ -213,6 +213,7 @@ class RemediationRegistry:
                     )
                 except Exception:
                     logger.error("Failed to send alert outreach", exc_info=True)
+            self._last_run[action.name] = time.monotonic()
             return RemediationOutcome(
                 action=action,
                 triggered=True,
@@ -234,6 +235,7 @@ class RemediationRegistry:
                     )
                 except Exception:
                     logger.error("Failed to send proposal outreach", exc_info=True)
+            self._last_run[action.name] = time.monotonic()
             return RemediationOutcome(
                 action=action,
                 triggered=True,
@@ -383,7 +385,7 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         command=[],  # Alert-only, no command
         governance_level=4,
         reversible=True,
-        cooldown_s=600,
+        cooldown_s=86400,
         max_attempts=1,
     ),
     RemediationAction(
@@ -393,7 +395,7 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         command=["sudo", "journalctl", "--vacuum-size=100M"],
         governance_level=3,
         reversible=True,
-        cooldown_s=3600,
+        cooldown_s=86400,
         max_attempts=2,
     ),
 ]

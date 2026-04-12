@@ -62,6 +62,17 @@ set_secret() {
     echo "${key}=${value}" >> "$file"
 }
 
+# ── HOME guard ───────────────────────────────────────────────
+# Ensure HOME is set (may be empty in container sessions without login shell)
+# and persisted in /etc/environment so all future sessions inherit it.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    export HOME
+fi
+if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
+    echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+fi
+
 # ── TMPDIR guard ─────────────────────────────────────────────
 # pip downloads large wheels (e.g. torch ~2GB) to TMPDIR and will fail
 # with "No space left on device" if /tmp is a small tmpfs (512MB in
