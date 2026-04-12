@@ -117,7 +117,7 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
             "SELECT topic FROM cc_sessions "
             "WHERE source_tag = 'foreground' "
             "AND topic IS NOT NULL AND topic != '' "
-            "AND started_at > datetime('now', ?)"
+            "AND started_at > datetime('now', ?) "
             "ORDER BY started_at DESC LIMIT 10",
             (f"-{days} days",),
         )

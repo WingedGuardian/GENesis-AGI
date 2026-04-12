@@ -502,10 +502,14 @@ async def _run(prompt: str, session_id: str = "") -> None:
     vector = await _embed_text(prompt)
     embed_latency_ms = (time.monotonic() - embed_start) * 1000
     if vector:
-        vector_results = await _search_qdrant(vector)
-        # Wing-filtered search for domain-relevant boost
         if active_wing:
-            wing_results = await _search_qdrant(vector, wing_filter=active_wing)
+            # Run both searches in parallel to stay within budget
+            vector_results, wing_results = await asyncio.gather(
+                _search_qdrant(vector),
+                _search_qdrant(vector, wing_filter=active_wing),
+            )
+        else:
+            vector_results = await _search_qdrant(vector)
 
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
