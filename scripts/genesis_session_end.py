@@ -187,6 +187,7 @@ def _trigger_essential_knowledge_regen() -> None:
     import subprocess
 
     script = (
+        "import sys; sys.path.insert(0, '/home/ubuntu/genesis/src'); "
         "import asyncio; import aiosqlite; "
         "from genesis.memory.essential_knowledge import generate_and_write; "
         "async def _run(): "
@@ -195,12 +196,18 @@ def _trigger_essential_knowledge_regen() -> None:
         "  await db.close(); "
         "asyncio.run(_run())"
     )
+    # Log to file instead of DEVNULL so failures are diagnosable
+    _LOG_DIR = _GENESIS_DIR / "logs"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log_file = _LOG_DIR / "ek_regen.log"
     import contextlib
     with contextlib.suppress(OSError):
+        # trunk-ignore: stderr goes to log file for observability
+        log_fh = open(_log_file, "a")  # noqa: SIM115
         subprocess.Popen(
             [sys.executable, "-c", script],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=log_fh,
             start_new_session=True,  # Detach from hook process group
         )
 

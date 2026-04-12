@@ -69,6 +69,10 @@ class Classification:
 
 _PATH_PATTERNS: list[tuple[str, str, str]] = [
     # (regex pattern, wing, room)
+    # IMPORTANT: specific patterns MUST come before general catch-alls within
+    # each wing group. First match wins.
+
+    # memory wing — specific before catch-all
     (r"src/genesis/memory/retrieval", "memory", "retrieval"),
     (r"src/genesis/memory/extract", "memory", "extraction"),
     (r"src/genesis/memory/store", "memory", "store"),
@@ -77,28 +81,38 @@ _PATH_PATTERNS: list[tuple[str, str, str]] = [
     (r"src/genesis/memory/graph", "memory", "graph"),
     (r"src/genesis/memory/linker", "memory", "graph"),
     (r"src/genesis/memory/essential", "memory", "essential_knowledge"),
-    (r"src/genesis/memory/", "memory", "store"),
     (r"proactive_memory_hook", "memory", "proactive_hook"),
+    (r"src/genesis/memory/", "memory", "store"),  # catch-all LAST
+
+    # learning wing — specific before catch-all
     (r"src/genesis/learning/skill", "learning", "skills"),
     (r"src/genesis/learning/evolution", "learning", "evolution"),
     (r"src/genesis/learning/calibrat", "learning", "calibration"),
     (r"src/genesis/learning/procedur", "learning", "procedures"),
-    (r"src/genesis/learning/", "learning", "observations"),
     (r"src/genesis/perception/", "learning", "observations"),
-    (r"src/genesis/routing/", "routing", "model_selection"),
+    (r"src/genesis/learning/", "learning", "observations"),  # catch-all LAST
+
+    # routing wing — specific before catch-all
     (r"src/genesis/routing/circuit", "routing", "circuit_breakers"),
     (r"call.?site", "routing", "call_sites"),
+    (r"src/genesis/routing/", "routing", "model_selection"),  # catch-all LAST
+
+    # infrastructure wing
     (r"src/genesis/runtime/", "infrastructure", "runtime"),
     (r"src/genesis/surplus/", "infrastructure", "scheduler"),
     (r"src/genesis/db/", "infrastructure", "database"),
     (r"guardian", "infrastructure", "guardian"),
     (r"sentinel", "infrastructure", "sentinel"),
     (r"health", "infrastructure", "health"),
+
+    # channels wing — specific before catch-all
     (r"src/genesis/channels/telegram", "channels", "telegram"),
-    (r"src/genesis/channels/", "channels", "openclaw"),
     (r"dashboard", "channels", "dashboard"),
     (r"inbox", "channels", "inbox"),
     (r"mail", "channels", "mail"),
+    (r"src/genesis/channels/", "channels", "openclaw"),  # catch-all LAST
+
+    # autonomy wing
     (r"src/genesis/autonomy/", "autonomy", "tasks"),
     (r"protected_path", "autonomy", "protected_paths"),
     (r"adversarial", "autonomy", "adversarial_review"),
