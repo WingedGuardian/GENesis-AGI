@@ -28,6 +28,7 @@ from genesis.dashboard.routes import (
     tasks,
     terminal,
     ui_data,
+    updates,
     vitals,
 )
 
@@ -57,5 +58,6 @@ __all__ = [
     "tasks",
     "terminal",
     "ui_data",
+    "updates",
     "vitals",
 ]
