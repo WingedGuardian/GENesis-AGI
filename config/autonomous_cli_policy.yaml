@@ -1,5 +1,5 @@
 autonomous_cli_fallback_enabled: true
-manual_approval_required: true
+manual_approval_required: false
 reask_interval_hours: 24
 approval_channel: telegram
 shared_export_enabled: true
