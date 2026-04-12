@@ -11,6 +11,7 @@
 
 set -u  # catch unset vars; deliberately NOT -e so errors don't block commits
 
+HOME="${HOME:-$(eval echo ~)}"
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 LOG_FILE="$GENESIS_HOME/contribution-hook.log"
 PENDING_DIR="$GENESIS_HOME/pending-offers"
