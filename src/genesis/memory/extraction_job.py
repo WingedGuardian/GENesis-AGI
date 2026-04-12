@@ -69,8 +69,8 @@ async def run_extraction_cycle(
         "errors": 0,
     }
 
-    # Find sessions with unextracted content
-    sessions = await _find_extractable_sessions(db)
+    # Find sessions with unextracted content (includes filesystem discovery)
+    sessions = await _find_extractable_sessions(db, transcript_dir=transcript_dir)
 
     for session in sessions:
         session_id = session["id"]
@@ -173,8 +173,56 @@ async def run_extraction_cycle(
 
 async def _find_extractable_sessions(
     db: aiosqlite.Connection,
+    transcript_dir: Path = _TRANSCRIPT_DIR,
 ) -> list[dict]:
-    """Find sessions eligible for extraction with unprocessed content."""
+    """Find sessions eligible for extraction with unprocessed content.
+
+    Uses a hybrid approach:
+    1. DB-registered sessions (from bridge/channel pathway)
+    2. Filesystem discovery — scan transcript dir for .jsonl files not yet
+       registered, and auto-register them as foreground sessions.
+
+    This ensures interactive CLI sessions (which bypass cc_sessions registration)
+    are still discoverable for extraction.
+    """
+    # Phase 1: Auto-register untracked transcripts from filesystem
+    if transcript_dir.is_dir():
+        try:
+            known_cursor = await db.execute(
+                "SELECT cc_session_id FROM cc_sessions WHERE cc_session_id IS NOT NULL"
+            )
+            known_ids = {row[0] for row in await known_cursor.fetchall()}
+
+            for jsonl_file in transcript_dir.glob("*.jsonl"):
+                session_id = jsonl_file.stem
+                # Skip non-UUID filenames and already-registered sessions
+                if len(session_id) < 32 or session_id in known_ids:
+                    continue
+                # Auto-register as foreground session
+                import uuid as _uuid
+                try:
+                    _uuid.UUID(session_id)  # validate UUID format
+                except ValueError:
+                    continue
+
+                # Get file mtime as approximate start time
+                mtime = datetime.fromtimestamp(
+                    jsonl_file.stat().st_mtime, tz=UTC,
+                )
+                await db.execute(
+                    "INSERT OR IGNORE INTO cc_sessions "
+                    "(id, cc_session_id, source_tag, status, started_at) "
+                    "VALUES (?, ?, 'foreground', 'completed', ?)",
+                    (session_id, session_id, mtime.isoformat()),
+                )
+            await db.commit()
+        except Exception:
+            logger.warning(
+                "Filesystem transcript discovery failed — falling back to DB-only",
+                exc_info=True,
+            )
+
+    # Phase 2: Query all extractable sessions (including newly registered ones)
     cursor = await db.execute(
         """
         SELECT id, cc_session_id, source_tag, last_extracted_at,

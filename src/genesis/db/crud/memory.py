@@ -174,13 +174,15 @@ async def create_metadata(
     confidence: float | None = None,
     embedding_status: str = "embedded",
     memory_class: str = "fact",
+    wing: str | None = None,
+    room: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id."""
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
-        "(memory_id, created_at, collection, confidence, embedding_status, memory_class) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (memory_id, created_at, collection, confidence, embedding_status, memory_class),
+        "(memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room),
     )
     await db.commit()
     return memory_id

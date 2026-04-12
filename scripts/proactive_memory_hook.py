@@ -246,18 +246,29 @@ async def _embed_text(text: str) -> list[float] | None:
     return None
 
 
-async def _search_qdrant(vector: list[float]) -> list[dict]:
-    """Search episodic_memory for similar memories."""
+async def _search_qdrant(vector: list[float], wing_filter: str | None = None) -> list[dict]:
+    """Search episodic_memory for similar memories.
+
+    Args:
+        vector: Embedding vector to search with.
+        wing_filter: Optional wing to filter results (e.g., "memory", "routing").
+    """
     try:
         import httpx
+        body: dict = {
+            "vector": vector,
+            "limit": _MAX_RESULTS * 2,
+            "with_payload": True,
+        }
+        if wing_filter:
+            body["filter"] = {
+                "must": [{"key": "wing", "match": {"value": wing_filter}}]
+            }
+
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.post(
                 f"{_QDRANT_URL}/collections/{_QDRANT_COLLECTION}/points/search",
-                json={
-                    "vector": vector,
-                    "limit": _MAX_RESULTS * 2,
-                    "with_payload": True,
-                },
+                json=body,
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -271,6 +282,7 @@ async def _search_qdrant(vector: list[float]) -> list[dict]:
                         "source_session_id": payload.get("source_session_id"),
                         "memory_class": payload.get("memory_class", "fact"),
                         "_retrieved_count": payload.get("retrieved_count", 0),
+                        "_wing": payload.get("wing"),
                     })
                 return results
     except Exception as exc:
@@ -281,9 +293,14 @@ async def _search_qdrant(vector: list[float]) -> list[dict]:
 def _rrf_fusion(
     fts_results: list[dict],
     vector_results: list[dict],
+    wing_results: list[dict] | None = None,
     k: int = 60,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion of FTS5 and vector results."""
+    """Reciprocal Rank Fusion of FTS5, vector, and wing-filtered results.
+
+    Wing-filtered results get a 1.5x bonus to prioritize domain-relevant
+    content without exclusively filtering (cross-domain results still surface).
+    """
     scores: dict[str, float] = {}
     content_map: dict[str, dict] = {}
 
@@ -301,6 +318,17 @@ def _rrf_fusion(
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
         if mid not in content_map:
             content_map[mid] = r
+
+    # Wing-filtered results get 1.5x RRF bonus (domain-relevant boost)
+    if wing_results:
+        _WING_BOOST = 1.5
+        for rank, r in enumerate(wing_results):
+            mid = r.get("memory_id", "")
+            if not mid:
+                continue
+            scores[mid] = scores.get(mid, 0.0) + _WING_BOOST / (k + rank + 1)
+            if mid not in content_map:
+                content_map[mid] = r
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
@@ -455,25 +483,37 @@ async def _run(prompt: str, session_id: str = "") -> None:
         _SENTINEL.parent.mkdir(parents=True, exist_ok=True)
         _SENTINEL.touch(exist_ok=True)
 
+    # Detect active wing from prompt and recent files
+    active_wing: str | None = None
+    try:
+        from genesis.memory.taxonomy import detect_wing_from_prompt
+        active_wing = detect_wing_from_prompt(prompt, file_paths=recent_files)
+    except Exception:
+        pass  # Taxonomy module failure must not block hook
+
     # FTS5 search (synchronous, fast) — covers both episodic and knowledge
     fts_results = _search_fts5(_DB_PATH, keywords)
 
     # Vector search (async, may timeout)
     vector_results: list[dict] = []
+    wing_results: list[dict] = []
     embed_latency_ms: float | None = None
     embed_start = time.monotonic()
     vector = await _embed_text(prompt)
     embed_latency_ms = (time.monotonic() - embed_start) * 1000
     if vector:
         vector_results = await _search_qdrant(vector)
+        # Wing-filtered search for domain-relevant boost
+        if active_wing:
+            wing_results = await _search_qdrant(vector, wing_filter=active_wing)
 
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
-    # Fuse results
+    # Fuse results (with wing boost if available)
     fused: list[dict] = []
     fused_count = 0
-    if fts_results or vector_results:
-        fused = _rrf_fusion(fts_results, vector_results)
+    if fts_results or vector_results or wing_results:
+        fused = _rrf_fusion(fts_results, vector_results, wing_results=wing_results)
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
         fused_count = len(fused)
         output = _format_results(fused)
