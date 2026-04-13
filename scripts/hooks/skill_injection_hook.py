@@ -19,11 +19,31 @@ if os.environ.get("GENESIS_CC_SESSION") == "1":
     sys.exit(0)
 
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
+_CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h
 
 # Minimum confidence threshold — keyword overlap score must exceed this
 _MIN_CONFIDENCE = 0.3
 # Max nudges per prompt
 _MAX_NUDGES = 1
+
+
+def _ensure_catalog_fresh() -> None:
+    """Regenerate the skill catalog if it's missing or stale (>1h old)."""
+    try:
+        if CATALOG_PATH.exists():
+            age = __import__("time").time() - CATALOG_PATH.stat().st_mtime
+            if age < _CATALOG_MAX_AGE_S:
+                return
+        # Locate and run the generator
+        gen_script = Path(__file__).resolve().parents[1] / "generate_skill_catalog.py"
+        if gen_script.exists():
+            import subprocess
+            subprocess.run(
+                [sys.executable, str(gen_script)],
+                capture_output=True, timeout=5,
+            )
+    except Exception:
+        pass  # Never block prompt
 
 
 def _load_catalog() -> dict:
@@ -100,6 +120,8 @@ def _extract_keywords(prompt: str) -> list[str]:
 def main() -> None:
     """Hook entry point."""
     try:
+        _ensure_catalog_fresh()
+
         raw = sys.stdin.read()
         if not raw.strip():
             return
