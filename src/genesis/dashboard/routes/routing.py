@@ -114,7 +114,8 @@ async def routing_config_update(call_site_id: str):
             cc_model=cc_model, cc_position=cc_position, dispatch=dispatch,
         )
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+        logger.warning("Routing config validation error for %s: %s", call_site_id, e)
+        return jsonify({"error": f"Invalid config: {type(e).__name__}"}), 400
     except Exception as e:
         logger.error(
             "Routing config save failed for %s: %s", call_site_id, e, exc_info=True,
@@ -164,7 +165,8 @@ async def routing_config_reload():
     try:
         new_config = load_config(config_path)
     except Exception as e:
-        return jsonify({"error": f"Config parse failed: {e}"}), 400
+        logger.error("Config parse failed: %s", e, exc_info=True)
+        return jsonify({"error": "Config parse failed"}), 400
 
     rt.router.reload_config(new_config)
     orphans_expired = await rt.router.scan_dlq_orphans_after_reload()

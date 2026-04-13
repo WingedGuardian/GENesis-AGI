@@ -203,7 +203,7 @@ def _apply_direct(pid_file: Path) -> tuple:
         return jsonify({"status": "triggered", "pid": proc.pid, "supervised": False})
     except Exception as exc:
         logger.error("Failed to trigger update: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": "Failed to trigger update"}), 500
 
 
 # ── Three-tier CC update prompts ─────────────────────────────────────
