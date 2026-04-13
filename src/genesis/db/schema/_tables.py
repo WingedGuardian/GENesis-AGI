@@ -771,6 +771,42 @@ TABLES = {
             memory_class     TEXT DEFAULT 'fact'
         )
     """,
+    "code_modules": """
+        CREATE TABLE IF NOT EXISTS code_modules (
+            path             TEXT PRIMARY KEY,
+            package          TEXT NOT NULL,
+            module_name      TEXT NOT NULL,
+            docstring        TEXT,
+            loc              INTEGER NOT NULL,
+            num_functions    INTEGER NOT NULL DEFAULT 0,
+            num_classes      INTEGER NOT NULL DEFAULT 0,
+            file_mtime       REAL NOT NULL,
+            last_indexed_at  TEXT NOT NULL
+        )
+    """,
+    "code_symbols": """
+        CREATE TABLE IF NOT EXISTS code_symbols (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            module_path      TEXT NOT NULL REFERENCES code_modules(path) ON DELETE CASCADE,
+            name             TEXT NOT NULL,
+            symbol_type      TEXT NOT NULL,
+            line_start       INTEGER NOT NULL,
+            line_end         INTEGER,
+            signature        TEXT,
+            docstring        TEXT,
+            is_public        INTEGER NOT NULL DEFAULT 1,
+            parent_class     TEXT
+        )
+    """,
+    "code_imports": """
+        CREATE TABLE IF NOT EXISTS code_imports (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path      TEXT NOT NULL REFERENCES code_modules(path) ON DELETE CASCADE,
+            target_module    TEXT NOT NULL,
+            imported_names   TEXT,
+            is_relative      INTEGER NOT NULL DEFAULT 0
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -931,6 +967,12 @@ INDEXES = [
     # memory metadata (companion to FTS5)
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_created ON memory_metadata(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_collection ON memory_metadata(collection)",
+    # codebase index
+    "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
+    "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",
+    "CREATE INDEX IF NOT EXISTS idx_code_symbols_type ON code_symbols(symbol_type)",
+    "CREATE INDEX IF NOT EXISTS idx_code_imports_source ON code_imports(source_path)",
+    "CREATE INDEX IF NOT EXISTS idx_code_imports_target ON code_imports(target_module)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

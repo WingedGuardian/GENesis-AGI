@@ -16,6 +16,7 @@ from genesis.observability.snapshots.infrastructure import (
     infrastructure,
     resilience_state,
 )
+from genesis.observability.snapshots.memory_health import memory_health
 from genesis.observability.snapshots.outreach import outreach_stats
 from genesis.observability.snapshots.proactive_memory import proactive_memory_metrics
 from genesis.observability.snapshots.provider_activity import provider_activity
@@ -32,6 +33,7 @@ __all__ = [
     "cost",
     "infrastructure",
     "mcp_status",
+    "memory_health",
     "outreach_stats",
     "proactive_memory_metrics",
     "provider_activity",

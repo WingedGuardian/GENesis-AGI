@@ -67,6 +67,7 @@ class SurplusScheduler:
         self._task_expiry_hours = task_expiry_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
+        self._code_index_executor: SurplusExecutor | None = None
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._extraction_store: MemoryStore | None = None
@@ -81,6 +82,10 @@ class SurplusScheduler:
     def set_code_audit_executor(self, executor) -> None:
         """Set a dedicated executor for CODE_AUDIT tasks."""
         self._code_audit_executor = executor
+
+    def set_code_index_executor(self, executor: SurplusExecutor) -> None:
+        """Set a dedicated executor for CODE_INDEX tasks (no LLM, pure AST)."""
+        self._code_index_executor = executor
 
     def set_bookmark_enrichment_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for BOOKMARK_ENRICHMENT tasks."""
@@ -128,6 +133,13 @@ class SurplusScheduler:
         else:
             logger.info("Code audits disabled — skipping job registration")
         self._scheduler.add_job(
+            self.schedule_code_index,
+            IntervalTrigger(hours=4),
+            id="schedule_code_index",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        self._scheduler.add_job(
             self.schedule_infra_monitor,
             IntervalTrigger(hours=2),
             id="schedule_infra_monitor",
@@ -148,6 +160,7 @@ class SurplusScheduler:
         # otherwise they only fire after their IntervalTrigger elapses.
         if self._enable_code_audits:
             await self.schedule_code_audit()
+        await self.schedule_code_index()
         await self.schedule_infra_monitor()
         await self.run_recon_gather()
         logger.info(
@@ -213,6 +226,29 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_code_audit", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_code_index(self) -> None:
+        """Enqueue a code index task if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            pending = await self._queue.pending_by_type(TaskType.CODE_INDEX)
+            if pending == 0:
+                await self._queue.enqueue(
+                    TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.3, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_code_index")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Code index scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_code_index", str(exc))
             except Exception:
                 pass
 
@@ -368,6 +404,8 @@ class SurplusScheduler:
         executor = self._executor
         if task.task_type == _TT.CODE_AUDIT and self._code_audit_executor is not None:
             executor = self._code_audit_executor
+        elif task.task_type == _TT.CODE_INDEX and self._code_index_executor is not None:
+            executor = self._code_index_executor
         elif task.task_type == _TT.BOOKMARK_ENRICHMENT and self._bookmark_enrichment_executor is not None:
             executor = self._bookmark_enrichment_executor
 

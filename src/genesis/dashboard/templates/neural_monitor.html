@@ -1938,6 +1938,17 @@ function updateSubsystemGrid(data) {
             if (q.pending_embeddings !== undefined) box.appendChild(sectionRow('Pending', String(q.pending_embeddings)));
             if (q.failed_embeddings) box.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444'));
             if (q.embedded_total !== undefined) box.appendChild(sectionRow('Total Stored', String(q.embedded_total)));
+            const mh = data.memory_health || {};
+            if (mh.growth) {
+                const g = mh.growth;
+                if (g.last_7d !== undefined) box.appendChild(sectionRow('+7d', String(g.last_7d)));
+                if (g.avg_per_day_7d !== undefined) box.appendChild(sectionRow('Avg/day', String(g.avg_per_day_7d)));
+            }
+            if (mh.orphans && mh.orphans.orphan_pct !== undefined) {
+                const pct = mh.orphans.orphan_pct;
+                const c = pct > 50 ? 'color:#ef4444' : pct > 30 ? 'color:#ffe600' : 'color:#4ade80';
+                box.appendChild(sectionRow('Orphans', pct.toFixed(1) + '%', c));
+            }
         }
         if (key === 'surplus') {
             const s = data.surplus || {};
