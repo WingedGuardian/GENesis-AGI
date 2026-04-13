@@ -94,6 +94,7 @@
         outreachModal: {
           open: false,
           messages: [],
+          pendingApprovals: [],
           categoryFilter: null,
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
@@ -2314,9 +2315,13 @@
         async fetchOutreachMessages() {
           this.startModalFetch("outreachModal");
           try {
-            const resp = await fetchApi("/api/genesis/outreach/messages?limit=20");
-            if (resp?.ok) {
-              this.outreachModal.messages = await resp.json();
+            const [msgResp, approvalResp] = await Promise.all([
+              fetchApi("/api/genesis/outreach/messages?limit=20"),
+              fetchApi("/api/genesis/approvals").catch(() => null),
+            ]);
+            if (msgResp?.ok) {
+              this.outreachModal.messages = await msgResp.json();
+              this.outreachModal.pendingApprovals = approvalResp?.ok ? await approvalResp.json() : [];
               this.finishModalFetch("outreachModal");
             } else {
               this.failModalFetch("outreachModal", "Outreach history unavailable");
@@ -2324,6 +2329,47 @@
           } catch {
             this.failModalFetch("outreachModal", "Outreach history unavailable");
           }
+        },
+
+        // Find a pending approval that matches a blocker outreach message
+        findMatchingApproval(msg) {
+          if (msg.category !== 'blocker') return null;
+          const approvals = this.outreachModal.pendingApprovals || [];
+          // Match by signal_type → action_type mapping
+          for (const a of approvals) {
+            // CLI fallback approvals: signal_type contains 'cli_approval' or 'approval'
+            if (msg.signal_type === 'cli_approval' && a.action_type === 'autonomous_cli_fallback') return a;
+            // Generic: match topic substring
+            if (a.description && msg.topic && a.description.includes(msg.topic.slice(0, 30))) return a;
+          }
+          return null;
+        },
+
+        async resolveApproval(approvalId, decision, outreachMsgId) {
+          try {
+            await fetchApi("/api/genesis/approvals/" + approvalId + "/resolve", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({decision})
+            });
+            // Also record engagement on the outreach message
+            if (outreachMsgId) {
+              const outcome = decision === 'approved' ? 'useful' : 'not_useful';
+              await fetchApi("/api/genesis/outreach/" + outreachMsgId + "/engage", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({outcome, response: decision === 'approved' ? 'approve' : 'deny'})
+              });
+            }
+            await this.fetchOutreachMessages();
+          } catch (e) { console.error("resolve failed", e); }
+        },
+
+        async approveAllPending() {
+          try {
+            await fetchApi("/api/genesis/approvals/approve-all", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+            });
+            await this.fetchOutreachMessages();
+          } catch (e) { console.error("approve-all failed", e); }
         },
 
         async engageOutreach(id, outcome, response) {
@@ -5536,6 +5582,34 @@
              class="empty-state">Outreach history unavailable.</div>
         <template x-if="$store.genesisDashboard.outreachModal.messages.length > 0 || $store.genesisDashboard.outreachModal.fetch.state !== 'loading'">
           <div>
+            <!-- Pending approvals banner -->
+            <template x-if="$store.genesisDashboard.outreachModal.pendingApprovals.length > 0">
+              <div style="background: #d9534f1a; border: 1px solid #d9534f44; border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <span style="font-weight: 600; font-size: 0.82rem; color: #d9534f;">
+                    Action Required
+                    <span style="background: #d9534f; color: white; font-size: 0.65rem; padding: 0.1rem 0.35rem; border-radius: 10px; margin-left: 0.3rem;"
+                          x-text="$store.genesisDashboard.outreachModal.pendingApprovals.length"></span>
+                  </span>
+                  <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border: 1px solid #4caf50; color: #4caf50; border-radius: 3px; cursor: pointer; background: transparent;"
+                          @click="$store.genesisDashboard.approveAllPending()">Approve All</button>
+                </div>
+                <template x-for="a in $store.genesisDashboard.outreachModal.pendingApprovals" :key="a.id">
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.25rem 0; border-top: 1px solid #d9534f22;">
+                    <div>
+                      <span style="font-size: 0.75rem;" x-text="a.description || a.action_type"></span>
+                      <span style="font-size: 0.62rem; color: #888; margin-left: 0.3rem;" x-text="$store.genesisDashboard.formatDateTime(a.created_at)"></span>
+                    </div>
+                    <div style="display: flex; gap: 0.25rem;">
+                      <button style="font-size: 0.65rem; padding: 0.15rem 0.4rem; border: 1px solid #4caf50; color: #4caf50; border-radius: 3px; cursor: pointer; background: transparent;"
+                              @click="$store.genesisDashboard.resolveApproval(a.id, 'approved')">Approve</button>
+                      <button style="font-size: 0.65rem; padding: 0.15rem 0.4rem; border: 1px solid #d9534f; color: #d9534f; border-radius: 3px; cursor: pointer; background: transparent;"
+                              @click="$store.genesisDashboard.resolveApproval(a.id, 'rejected')">Deny</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
             <!-- Category filters -->
             <div style="display: flex; gap: 0.4rem; margin-bottom: 0.75rem; flex-wrap: wrap;">
               <template x-for="cat in [null, 'alert', 'digest', 'surplus', 'blocker']" :key="cat || 'all'">
@@ -5568,14 +5642,17 @@
                     <span style="font-size: 0.68rem; color: #888; margin-right: 0.3rem;"
                           x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.user_response || msg.engagement_outcome)"></span>
                   </template>
-                  <!-- Blocker: Approve/Deny -->
+                  <!-- Blocker: Approve/Deny — wire to approval API when matching -->
                   <template x-if="msg.category === 'blocker'">
-                    <div style="display: flex; gap: 0.3rem;">
-                      <template x-for="btn in [{value: 'approve', label: 'Approve', color: '#4caf50', outcome: 'useful'}, {value: 'deny', label: 'Deny', color: '#d9534f', outcome: 'not_useful'}]" :key="btn.value">
+                    <div style="display: flex; gap: 0.3rem; align-items: center;">
+                      <template x-for="btn in [{value: 'approved', label: 'Approve', color: '#4caf50'}, {value: 'rejected', label: 'Deny', color: '#d9534f'}]" :key="btn.value">
                         <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
-                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.user_response === btn.value ? btn.color + '33' : 'transparent'}; font-weight: ${msg.user_response === btn.value ? '700' : '400'}; opacity: ${!msg.user_response || msg.user_response === btn.value ? '1' : '0.4'}`"
-                                @click="$store.genesisDashboard.engageOutreach(msg.id, btn.outcome, btn.value)"
+                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? btn.color + '33' : 'transparent'}; font-weight: ${msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? '700' : '400'}; opacity: ${!msg.user_response || msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? '1' : '0.4'}`"
+                                @click="(() => { const a = $store.genesisDashboard.findMatchingApproval(msg); if (a) { $store.genesisDashboard.resolveApproval(a.id, btn.value, msg.id); } else { $store.genesisDashboard.engageOutreach(msg.id, btn.value === 'approved' ? 'useful' : 'not_useful', btn.value === 'approved' ? 'approve' : 'deny'); } })()"
                                 x-text="btn.label"></button>
+                      </template>
+                      <template x-if="$store.genesisDashboard.findMatchingApproval(msg)">
+                        <span style="font-size: 0.6rem; color: #4caf50; margin-left: 0.3rem;">linked</span>
                       </template>
                     </div>
                   </template>

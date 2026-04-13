@@ -18,7 +18,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from genesis.sentinel.classifier import FireAlarm, classify_alerts, worst_tier
@@ -233,6 +233,9 @@ class SentinelDispatcher:
             try:
                 approved = await self._request_dispatch_approval(request)
                 if not approved:
+                    # Record rejection with 24h suppression window
+                    expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+                    self._state.rejected_patterns[pattern] = expiry
                     self._state.transition(SentinelState.HEALTHY, reason="dispatch rejected by user")
                     save_state(self._state)
                     return SentinelResult(
@@ -310,6 +313,8 @@ class SentinelDispatcher:
                 del self._pattern_attempts[pattern]
             if pattern and pattern in self._escalated_patterns:
                 del self._escalated_patterns[pattern]
+            if pattern and pattern in self._state.rejected_patterns:
+                del self._state.rejected_patterns[pattern]
         elif result.dispatched:
             self._state.transition(SentinelState.ESCALATED, reason=result.reason or "CC could not resolve")
         else:
@@ -719,7 +724,21 @@ class SentinelDispatcher:
 
         Returns (ready, reason_if_not_ready). Escalated patterns are never
         ready until cleared by a resolved dispatch or process restart.
+        Rejected patterns are suppressed until their rejection window expires.
         """
+        # Check persistent rejection window (survives restarts)
+        rejected_until = self._state.rejected_patterns.get(pattern)
+        if rejected_until:
+            now_iso = datetime.now(UTC).isoformat()
+            if now_iso < rejected_until:
+                return (
+                    False,
+                    f"Pattern {pattern!r} rejected until {rejected_until}",
+                )
+            # Window expired — clear the rejection
+            del self._state.rejected_patterns[pattern]
+            save_state(self._state)
+
         if pattern in self._escalated_patterns:
             since = self._escalated_patterns[pattern]
             return (
