@@ -2326,11 +2326,13 @@
           }
         },
 
-        async engageOutreach(id, outcome) {
+        async engageOutreach(id, outcome, response) {
           try {
+            const body = {outcome};
+            if (response) body.response = response;
             await fetchApi("/api/genesis/outreach/" + id + "/engage", {
               method: "POST", headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({outcome})
+              body: JSON.stringify(body)
             });
             await this.fetchOutreachMessages();
           } catch (e) { console.error("engage failed", e); }
@@ -5560,21 +5562,44 @@
                 </div>
                 <div style="font-size: 0.8rem; white-space: pre-wrap; max-height: 150px; overflow-y: auto; padding: 0.4rem; background: var(--color-background); border-radius: 4px; margin-bottom: 0.3rem;"
                      x-text="msg.message_content || '(no content)'"></div>
-                <!-- Engagement buttons — always visible, smart state -->
+                <!-- Engagement buttons — category-aware -->
                 <div style="display: flex; gap: 0.3rem; align-items: center;">
                   <template x-if="msg.engagement_outcome && !['useful','not_useful','ambivalent'].includes(msg.engagement_outcome)">
                     <span style="font-size: 0.68rem; color: #888; margin-right: 0.3rem;"
-                          x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.engagement_outcome)"></span>
+                          x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.user_response || msg.engagement_outcome)"></span>
                   </template>
-                  <template x-for="btn in [{value: 'useful', label: 'Useful', color: '#4caf50'}, {value: 'not_useful', label: 'Not Useful', color: '#d9534f'}, {value: 'ambivalent', label: 'Ambivalent', color: '#888'}]" :key="btn.value">
+                  <!-- Blocker: Approve/Deny -->
+                  <template x-if="msg.category === 'blocker'">
+                    <div style="display: flex; gap: 0.3rem;">
+                      <template x-for="btn in [{value: 'approve', label: 'Approve', color: '#4caf50', outcome: 'useful'}, {value: 'deny', label: 'Deny', color: '#d9534f', outcome: 'not_useful'}]" :key="btn.value">
+                        <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
+                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.user_response === btn.value ? btn.color + '33' : 'transparent'}; font-weight: ${msg.user_response === btn.value ? '700' : '400'}; opacity: ${!msg.user_response || msg.user_response === btn.value ? '1' : '0.4'}`"
+                                @click="$store.genesisDashboard.engageOutreach(msg.id, btn.outcome, btn.value)"
+                                x-text="btn.label"></button>
+                      </template>
+                    </div>
+                  </template>
+                  <!-- Alert: Acknowledge -->
+                  <template x-if="msg.category === 'alert'">
                     <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
-                            :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? btn.color + '33' : 'transparent'}; font-weight: ${msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? '700' : '400'}; opacity: ${!msg.engagement_outcome || msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? '1' : '0.4'}`"
-                            @click="$store.genesisDashboard.engageOutreach(msg.id, btn.value)"
-                            x-text="btn.label"></button>
+                            :style="`border: 1px solid #f0ad4e; color: #f0ad4e; background: ${msg.engagement_outcome === 'useful' ? '#f0ad4e33' : 'transparent'}; font-weight: ${msg.engagement_outcome === 'useful' ? '700' : '400'}`"
+                            @click="$store.genesisDashboard.engageOutreach(msg.id, 'useful')"
+                            x-text="msg.engagement_outcome === 'useful' ? 'Acknowledged' : 'Acknowledge'"></button>
+                  </template>
+                  <!-- Digest/Surplus: Useful/Not Useful/Ambivalent -->
+                  <template x-if="msg.category !== 'blocker' && msg.category !== 'alert'">
+                    <div style="display: flex; gap: 0.3rem;">
+                      <template x-for="btn in [{value: 'useful', label: 'Useful', color: '#4caf50'}, {value: 'not_useful', label: 'Not Useful', color: '#d9534f'}, {value: 'ambivalent', label: 'Ambivalent', color: '#888'}]" :key="btn.value">
+                        <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
+                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.engagement_outcome === btn.value ? btn.color + '33' : 'transparent'}; font-weight: ${msg.engagement_outcome === btn.value ? '700' : '400'}; opacity: ${!msg.engagement_outcome || msg.engagement_outcome === btn.value ? '1' : '0.4'}`"
+                                @click="$store.genesisDashboard.engageOutreach(msg.id, btn.value)"
+                                x-text="btn.label"></button>
+                      </template>
+                    </div>
                   </template>
                 </div>
                 <div style="font-size: 0.62rem; color: var(--color-text-secondary); margin-top: 0.15rem; opacity: 0.7;"
-                     x-text="msg.category === 'digest' ? 'Feedback shapes report content over time' : msg.category === 'alert' || msg.category === 'blocker' ? 'Feedback calibrates future alert sensitivity' : 'Feedback guides task prioritization'"></div>
+                     x-text="msg.category === 'blocker' ? 'Approve or deny this request' : msg.category === 'alert' ? 'Acknowledge to dismiss' : msg.category === 'digest' ? 'Feedback shapes report content over time' : 'Feedback guides task prioritization'"></div>
               </div>
             </template>
           </div>
