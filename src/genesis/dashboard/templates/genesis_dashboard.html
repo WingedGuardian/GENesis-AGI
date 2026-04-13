@@ -688,7 +688,19 @@
           try {
             const resp = await fetchApi("/api/genesis/updates/check", { method: "POST" });
             if (resp && resp.ok) {
-              await this.fetchUpdateStatus();
+              const check = await resp.json();
+              // Merge check result into updateStatus directly
+              if (!this.updateStatus) await this.fetchUpdateStatus();
+              if (check.commits_behind > 0) {
+                this.updateStatus.update_available = {
+                  commits_behind: check.commits_behind,
+                  target_tag: check.target_tag,
+                  summary: check.summary,
+                  detected_at: new Date().toISOString(),
+                };
+              } else {
+                this.updateStatus.update_available = null;
+              }
             } else {
               alert("Check failed — could not reach upstream");
             }
