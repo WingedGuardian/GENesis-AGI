@@ -440,6 +440,19 @@ def _notify_tier3_needed() -> None:
 @blueprint.route("/api/genesis/updates/dismiss", methods=["POST"])
 def update_dismiss():
     """Clear stale update state files so the dashboard returns to normal."""
+    # Don't delete PID file if a process is still alive — prevents
+    # removing the concurrency guard during a slow-but-active update.
+    pid_alive = False
+    if _PID_FILE.is_file():
+        with contextlib.suppress(ValueError, subprocess.TimeoutExpired, OSError):
+            pid = int(_PID_FILE.read_text().strip())
+            result = subprocess.run(["kill", "-0", str(pid)],
+                                    capture_output=True, timeout=2)
+            pid_alive = result.returncode == 0
+
+    if pid_alive:
+        return jsonify({"error": "Update still in progress"}), 409
+
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE, _PID_FILE):
         f.unlink(missing_ok=True)
     logger.info("Update state files dismissed by user")
@@ -533,17 +546,25 @@ def update_progress():
         except (ValueError, subprocess.TimeoutExpired, OSError):
             pass
 
-    # Detect failed/stale states
+    # Detect failed/stale states.
+    # Guard against false positives during the brief window at update end:
+    # PID may die moments before the state file is updated to "done".
+    # Use a 60s grace period on the state file timestamp.
     failed = (
         not in_progress
         and summary is not None
         and not summary.startswith("success")
     )
-    stale = (
-        not in_progress
-        and state_data is not None
-        and phase not in (None, "done")
-    )
+
+    stale = False
+    if not in_progress and state_data is not None and phase not in (None, "done"):
+        # Only declare stale if state file is older than 60s
+        import time
+        try:
+            age = time.time() - _STATE_FILE.stat().st_mtime
+            stale = age > 60
+        except OSError:
+            stale = True
 
     return jsonify({
         "in_progress": in_progress,
