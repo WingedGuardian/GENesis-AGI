@@ -209,11 +209,14 @@ async def _find_extractable_sessions(
                 mtime = datetime.fromtimestamp(
                     jsonl_file.stat().st_mtime, tz=UTC,
                 )
+                mtime_iso = mtime.isoformat()
                 await db.execute(
                     "INSERT OR IGNORE INTO cc_sessions "
-                    "(id, cc_session_id, source_tag, status, started_at) "
-                    "VALUES (?, ?, 'foreground', 'completed', ?)",
-                    (session_id, session_id, mtime.isoformat()),
+                    "(id, cc_session_id, session_type, model, source_tag, "
+                    " status, started_at, last_activity_at) "
+                    "VALUES (?, ?, 'foreground', 'unknown', 'foreground', "
+                    " 'completed', ?, ?)",
+                    (session_id, session_id, mtime_iso, mtime_iso),
                 )
             await db.commit()
         except Exception:
