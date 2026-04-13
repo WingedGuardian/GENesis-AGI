@@ -21,6 +21,7 @@ class TaskType(StrEnum):
     CODE_AUDIT = "code_audit"
     INFRASTRUCTURE_MONITOR = "infrastructure_monitor"
     BOOKMARK_ENRICHMENT = "bookmark_enrichment"
+    CODE_INDEX = "code_index"
 
 
 class ComputeTier(StrEnum):

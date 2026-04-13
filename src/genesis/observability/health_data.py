@@ -79,6 +79,7 @@ class HealthDataService:
             cost,
             infrastructure,
             mcp_status,
+            memory_health,
             outreach_stats,
             proactive_memory_metrics,
             provider_activity,
@@ -122,6 +123,7 @@ class HealthDataService:
             "conversation": conversation_activity(),
             "provider_activity": await provider_activity(self._activity_tracker),
             "proactive_memory": proactive_memory_metrics(),
+            "memory_health": await memory_health(self._db),
             "provider_health": self._serialize_provider_health(),
         }
 

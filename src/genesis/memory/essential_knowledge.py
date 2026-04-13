@@ -18,8 +18,6 @@ from pathlib import Path
 
 import aiosqlite
 
-from genesis.memory.taxonomy import ROOMS
-
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
@@ -57,15 +55,16 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         for decision in decisions[:5]:
             parts.append(f"- {decision}")
 
-    # Wing index: which wings have content
+    # Wing index: which wings have content + top topics from actual data
     wing_stats = await _wing_stats(db)
     if wing_stats:
+        wing_rooms = await _wing_top_rooms(db, top_n=4)
         parts.append("\n### Wings")
         for wing, count in sorted(wing_stats.items(), key=lambda x: -x[1]):
             if wing == "general":
                 continue
-            rooms = ROOMS.get(wing, [])
-            room_str = ", ".join(rooms[:4])
+            rooms = wing_rooms.get(wing, [])
+            room_str = ", ".join(rooms) if rooms else "uncategorized"
             parts.append(f"- {wing} ({count}): {room_str}")
 
     return "\n".join(parts)
@@ -155,4 +154,35 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
         rows = await cursor.fetchall()
         return {row[0]: row[1] for row in rows}
     except Exception:
+        return {}
+
+
+async def _wing_top_rooms(
+    db: aiosqlite.Connection, top_n: int = 4,
+) -> dict[str, list[str]]:
+    """Return top rooms per wing by memory count (data-driven).
+
+    Uses a single query with window functions to get the top N rooms for
+    each wing, ordered by frequency. Only includes rooms with >1 memory
+    to filter noise.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT wing, room, cnt FROM ("
+            "  SELECT wing, room, COUNT(*) AS cnt,"
+            "    ROW_NUMBER() OVER (PARTITION BY wing ORDER BY COUNT(*) DESC) AS rn"
+            "  FROM memory_metadata"
+            "  WHERE wing IS NOT NULL AND room IS NOT NULL AND room != ''"
+            "  GROUP BY wing, room"
+            "  HAVING COUNT(*) > 1"
+            ") WHERE rn <= ?",
+            (top_n,),
+        )
+        rows = await cursor.fetchall()
+        result: dict[str, list[str]] = {}
+        for wing, room, _cnt in rows:
+            result.setdefault(wing, []).append(room)
+        return result
+    except Exception:
+        logger.debug("Failed to query wing top rooms", exc_info=True)
         return {}
