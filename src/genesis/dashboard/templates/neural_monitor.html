@@ -2003,7 +2003,7 @@ function updateSubsystemGrid(data) {
             if (ci.modules) {
                 const age = ci.age_hours;
                 const c = age > 24 ? 'color:#ffe600' : 'color:#4ade80';
-                box.appendChild(sectionRow('Code Index', ci.modules + ' mod · ' + ci.symbols.toLocaleString() + ' sym · ' + (age ? age + 'h' : '?'), c));
+                box.appendChild(sectionRow('Code Index', ci.modules + ' mod · ' + (ci.symbols || 0).toLocaleString() + ' sym · ' + (age ? age + 'h' : '?'), c));
             }
 
             // Embedding queue

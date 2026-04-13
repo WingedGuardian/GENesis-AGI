@@ -155,19 +155,23 @@ class OutreachPipeline:
         """
         outreach_id = str(uuid.uuid4())
 
-        # Lightweight dedup — only check, skip other governance
-        if await self._governance._is_duplicate(request):
-            logger.info(
-                "submit_raw dedup suppressed: signal=%s topic=%r",
-                request.signal_type, request.topic,
-            )
-            return OutreachResult(
-                outreach_id=outreach_id,
-                status=OutreachStatus.REJECTED,
-                channel="",
-                message_content="",
-                governance_result=None,
-            )
+        # Lightweight dedup — only check, skip other governance.
+        # Wrapped in try/except: submit_raw must stay reliable even if DB is down.
+        try:
+            if await self._governance.is_duplicate(request):
+                logger.info(
+                    "submit_raw dedup suppressed: signal=%s topic=%r",
+                    request.signal_type, request.topic,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id,
+                    status=OutreachStatus.REJECTED,
+                    channel="",
+                    message_content="",
+                    governance_result=None,
+                )
+        except Exception:
+            logger.debug("submit_raw dedup check failed, proceeding", exc_info=True)
 
         channel = request.channel or self._select_channel(request.category)
         format_target = _CHANNEL_FORMAT.get(channel, FormatTarget.GENERIC)
