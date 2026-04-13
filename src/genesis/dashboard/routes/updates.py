@@ -5,8 +5,10 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import sqlite3
 import subprocess
+import tempfile
 from pathlib import Path
 
 from flask import jsonify, request
@@ -351,15 +353,55 @@ def _apply_supervised(pid_file: Path) -> tuple:
         tier2_prompt=tier2_prompt,
     )
 
+    # Write orchestrator to a temp file (avoids arg-length limits with -c).
+    script_fd, script_path = tempfile.mkstemp(
+        suffix=".py", prefix="genesis-update-orch-", dir="/tmp",
+    )
+    with os.fdopen(script_fd, "w") as f:
+        f.write(orchestrator_code)
+
     log_file = _GENESIS_DIR / "update_orchestrator.log"
     log_fh = open(log_file, "w")  # noqa: SIM115
-    proc = subprocess.Popen(
-        [str(_GENESIS_ROOT / ".venv" / "bin" / "python"), "-c", orchestrator_code],
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        cwd=str(_GENESIS_ROOT),
-    )
+    python = str(_GENESIS_ROOT / ".venv" / "bin" / "python")
+
+    # The orchestrator MUST run outside genesis-server.service's cgroup.
+    # start_new_session=True only changes the session, not the cgroup —
+    # systemd's KillMode=control-group (the default) sends SIGTERM to every
+    # process in the service's cgroup when the service is stopped. This kills
+    # the orchestrator even though it has its own session.
+    #
+    # systemd-run --user --scope creates a transient scope unit with its own
+    # cgroup. When genesis-server is stopped, only its cgroup is killed;
+    # the orchestrator's scope is untouched.
+    try:
+        # Build env with D-Bus vars so systemd-run can talk to user session
+        env = os.environ.copy()
+        uid = os.getuid()
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        env.setdefault(
+            "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"
+        )
+        proc = subprocess.Popen(
+            ["systemd-run", "--user", "--scope", "--", python, script_path],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            env=env,
+            cwd=str(_GENESIS_ROOT),
+        )
+        logger.info("Orchestrator spawned via systemd-run --scope (pid %d)", proc.pid)
+    except (FileNotFoundError, OSError) as exc:
+        # Fallback: systemd-run not available (e.g., container restrictions).
+        # Use start_new_session=True — orchestrator may not survive server stop.
+        logger.warning(
+            "systemd-run failed (%s), falling back to start_new_session", exc,
+        )
+        proc = subprocess.Popen(
+            [python, script_path],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=str(_GENESIS_ROOT),
+        )
     log_fh.close()  # Child inherited the fd; parent can close its copy
     # Write orchestrator PID so dismiss/concurrency checks see a live process
     # even between tiers. The orchestrator overwrites with CC PIDs while they run.
@@ -388,7 +430,7 @@ def _spawn_detached_cc(prompt: str, model: str) -> subprocess.Popen:
 # Template for the orchestrator subprocess. Baked-in paths avoid genesis imports.
 # Uses {}-style placeholders filled by _apply_supervised().
 _ORCHESTRATOR_TEMPLATE = """\
-import os, subprocess, logging
+import os, sys, subprocess, logging
 from pathlib import Path
 
 logging.basicConfig(
@@ -402,6 +444,15 @@ ESCALATION = Path({escalation_file!r})
 PID_FILE = Path({pid_file!r})
 GENESIS_ROOT = Path({genesis_root!r})
 MY_PID = os.getpid()
+SCRIPT_FILE = Path(sys.argv[0]) if len(sys.argv) > 0 else None
+
+def cleanup():
+    PID_FILE.unlink(missing_ok=True)
+    if SCRIPT_FILE and SCRIPT_FILE.name.startswith("genesis-update-orch-"):
+        try:
+            SCRIPT_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 def spawn_cc(prompt, model):
     try:
@@ -427,11 +478,33 @@ def spawn_cc(prompt, model):
 log.info("Starting Tier 1 (Haiku)")
 rc1 = spawn_cc({tier1_prompt!r}, "haiku")
 
+# ── CC failure detection ──
+# If CC exited non-zero but wrote no escalation file, the CC session itself
+# failed (rate limit, API outage, crash) — not the update logic.
+if rc1 != 0 and not ESCALATION.is_file():
+    log.error("Tier 1 CC failed (rc=%d) with no escalation — CC infrastructure issue", rc1)
+    SUMMARY.write_text(
+        f"tier1_cc_error: CC session exited with code {{rc1}} before completing. "
+        "Possible causes: rate limit, API outage, or session crash. "
+        "Dismiss and retry when the issue clears."
+    )
+    cleanup()
+    sys.exit(1)
+
 # ── Check escalation ──
 if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
     log.info("Tier 1 escalated -> Tier 2 (Sonnet)")
     ESCALATION.unlink(missing_ok=True)
     rc2 = spawn_cc({tier2_prompt!r}, "sonnet")
+
+    if rc2 != 0 and not ESCALATION.is_file():
+        log.error("Tier 2 CC failed (rc=%d) with no escalation", rc2)
+        SUMMARY.write_text(
+            f"tier2_cc_error: Sonnet CC exited with code {{rc2}}. "
+            "Conflicts may still need resolution. Dismiss and retry."
+        )
+        cleanup()
+        sys.exit(1)
 
     # Check if Tier 3 needed
     if ESCALATION.is_file() and "tier3_needed" in ESCALATION.read_text():
@@ -441,8 +514,7 @@ if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
             "Use 'Resolve with Opus' from the dashboard."
         )
 
-# Clean up PID file — orchestrator is done
-PID_FILE.unlink(missing_ok=True)
+cleanup()
 log.info("Orchestrator finished")
 """
 
