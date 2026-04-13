@@ -154,11 +154,9 @@ def update_apply():
         return jsonify({"error": "Update script not found"}), 404
 
     # Check if an update is already in progress (simple PID file guard)
-    pid_file = _HOME / ".genesis" / "update_in_progress.pid"
-    if pid_file.is_file():
+    if _PID_FILE.is_file():
         try:
-            old_pid = int(pid_file.read_text().strip())
-            # Check if process is still running (kill -0 returns 0 if alive)
+            old_pid = int(_PID_FILE.read_text().strip())
             result = subprocess.run(["kill", "-0", str(old_pid)],
                                     capture_output=True, timeout=2)
             if result.returncode == 0:
@@ -166,17 +164,16 @@ def update_apply():
                     "error": "Update already in progress",
                     "pid": old_pid,
                 }), 409
-            # Process is gone — stale PID file
-            pid_file.unlink(missing_ok=True)
+            _PID_FILE.unlink(missing_ok=True)
         except (ValueError, subprocess.TimeoutExpired, OSError):
-            pid_file.unlink(missing_ok=True)
+            _PID_FILE.unlink(missing_ok=True)
 
     use_cc = request.get_json(silent=True) or {}
     supervised = use_cc.get("supervised", True)
 
     if supervised:
-        return _apply_supervised(pid_file)
-    return _apply_direct(pid_file)
+        return _apply_supervised(_PID_FILE)
+    return _apply_direct(_PID_FILE)
 
 
 def _apply_direct(pid_file: Path) -> tuple:
@@ -307,6 +304,8 @@ _GENESIS_DIR = _HOME / ".genesis"
 _SUMMARY_FILE = _GENESIS_DIR / "last_update_summary.txt"
 _ESCALATION_FILE = _GENESIS_DIR / "update_escalation.txt"
 _CONFLICT_FILE = _GENESIS_DIR / "update_conflicts.json"
+_STATE_FILE = _GENESIS_DIR / "update_state.json"
+_PID_FILE = _GENESIS_DIR / "update_in_progress.pid"
 
 
 def _apply_supervised(pid_file: Path) -> tuple:
@@ -323,8 +322,8 @@ def _apply_supervised(pid_file: Path) -> tuple:
 
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Clean up stale escalation/summary files from prior runs
-    for f in (_SUMMARY_FILE, _ESCALATION_FILE):
+    # Clean up ALL state files from prior runs
+    for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
         f.unlink(missing_ok=True)
 
     def _run_tiers():
@@ -438,22 +437,29 @@ def _notify_tier3_needed() -> None:
         logger.error("Failed to send tier3 notification", exc_info=True)
 
 
+@blueprint.route("/api/genesis/updates/dismiss", methods=["POST"])
+def update_dismiss():
+    """Clear stale update state files so the dashboard returns to normal."""
+    for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE, _PID_FILE):
+        f.unlink(missing_ok=True)
+    logger.info("Update state files dismissed by user")
+    return jsonify({"status": "dismissed"})
+
+
 @blueprint.route("/api/genesis/updates/resolve", methods=["POST"])
 def update_resolve():
     """User-initiated Tier 3 (Opus) conflict resolution."""
-    if not _ESCALATION_FILE.is_file():
-        return jsonify({"error": "No escalation pending"}), 404
-
-    escalation = _ESCALATION_FILE.read_text().strip()
-    if "tier3_needed" not in escalation:
-        return jsonify({"error": "No Tier 3 escalation pending"}), 404
-
-    pid_file = _HOME / ".genesis" / "update_in_progress.pid"
+    # Accept resolve when tier3 was explicitly requested OR when tier2 died
+    # leaving conflicts behind (failed state with conflict files present)
+    has_escalation = _ESCALATION_FILE.is_file()
+    has_conflicts = _CONFLICT_FILE.is_file()
+    if not has_escalation and not has_conflicts:
+        return jsonify({"error": "No conflicts pending"}), 404
 
     # Check if something is already running
-    if pid_file.is_file():
+    if _PID_FILE.is_file():
         try:
-            old_pid = int(pid_file.read_text().strip())
+            old_pid = int(_PID_FILE.read_text().strip())
             result = subprocess.run(["kill", "-0", str(old_pid)],
                                     capture_output=True, timeout=2)
             if result.returncode == 0:
@@ -461,15 +467,15 @@ def update_resolve():
                     "error": "Update session already in progress",
                     "pid": old_pid,
                 }), 409
-            pid_file.unlink(missing_ok=True)
+            _PID_FILE.unlink(missing_ok=True)
         except (ValueError, subprocess.TimeoutExpired, OSError):
-            pid_file.unlink(missing_ok=True)
+            _PID_FILE.unlink(missing_ok=True)
 
     import threading
 
     def _run():
         try:
-            _run_tier3(pid_file)
+            _run_tier3(_PID_FILE)
         except Exception:
             logger.error("Tier 3 (Opus) failed", exc_info=True)
 
@@ -485,37 +491,66 @@ def update_resolve():
 
 @blueprint.route("/api/genesis/updates/progress")
 def update_progress():
-    """Poll update progress — reads summary and escalation files."""
+    """Poll update progress — reads summary, escalation, and state files.
+
+    Returns phase-aware status so the frontend can show appropriate UX:
+    - in_progress: update process is alive
+    - failed: update finished but with errors/conflicts (not success)
+    - stale: state file exists but process is dead and phase != done
+    - phase: current update phase from update_state.json
+    """
     summary = None
     if _SUMMARY_FILE.is_file():
-        summary = _SUMMARY_FILE.read_text().strip()
+        with contextlib.suppress(OSError):
+            summary = _SUMMARY_FILE.read_text().strip()
 
     escalation = None
     if _ESCALATION_FILE.is_file():
-        escalation = _ESCALATION_FILE.read_text().strip()
+        with contextlib.suppress(OSError):
+            escalation = _ESCALATION_FILE.read_text().strip()
 
     conflicts = None
     if _CONFLICT_FILE.is_file():
-        import contextlib as _ctxlib
-
-        with _ctxlib.suppress(json.JSONDecodeError, OSError):
+        with contextlib.suppress(json.JSONDecodeError, OSError):
             conflicts = json.loads(_CONFLICT_FILE.read_text())
 
+    # Read update phase from state file
+    phase = None
+    state_data = None
+    if _STATE_FILE.is_file():
+        with contextlib.suppress(json.JSONDecodeError, OSError):
+            state_data = json.loads(_STATE_FILE.read_text())
+            phase = state_data.get("phase")
+
     # Check if an update process is still running
-    pid_file = _HOME / ".genesis" / "update_in_progress.pid"
     in_progress = False
-    if pid_file.is_file():
+    if _PID_FILE.is_file():
         try:
-            pid = int(pid_file.read_text().strip())
+            pid = int(_PID_FILE.read_text().strip())
             result = subprocess.run(["kill", "-0", str(pid)],
                                     capture_output=True, timeout=2)
             in_progress = result.returncode == 0
         except (ValueError, subprocess.TimeoutExpired, OSError):
             pass
 
+    # Detect failed/stale states
+    failed = (
+        not in_progress
+        and summary is not None
+        and not summary.startswith("success")
+    )
+    stale = (
+        not in_progress
+        and state_data is not None
+        and phase not in (None, "done")
+    )
+
     return jsonify({
         "in_progress": in_progress,
         "summary": summary,
         "escalation": escalation,
         "conflicts": conflicts,
+        "phase": phase,
+        "failed": failed,
+        "stale": stale,
     })
