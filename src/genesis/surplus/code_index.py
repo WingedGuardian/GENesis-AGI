@@ -20,7 +20,14 @@ class CodeIndexExecutor:
 
     def __init__(self, *, db: aiosqlite.Connection, repo_root: Path | None = None):
         self._db = db
-        self._repo_root = repo_root or Path(__file__).resolve().parents[3]  # -> genesis/
+        default_root = Path(__file__).resolve().parents[3]
+        # Validate default: must contain pyproject.toml (repo root marker)
+        if repo_root is None and not (default_root / "pyproject.toml").exists():
+            logger.warning(
+                "Inferred repo root %s lacks pyproject.toml — indexing may fail",
+                default_root,
+            )
+        self._repo_root = repo_root or default_root
 
     async def execute(self, task: SurplusTask) -> ExecutorResult:
         from genesis.codebase.indexer import index_codebase

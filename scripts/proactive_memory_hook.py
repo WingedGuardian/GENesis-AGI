@@ -173,8 +173,9 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
         try:
             conn.row_factory = sqlite3.Row
             # Search symbols by name match (exact prefix or contains)
-            placeholders = " OR ".join(["name LIKE ?"] * len(keywords))
-            params = [f"%{k}%" for k in keywords]
+            # Escape SQL LIKE special chars in user-derived keywords
+            placeholders = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(keywords))
+            params = [f"%{k.replace('%', '\\%').replace('_', '\\_')}%" for k in keywords]
             cursor = conn.execute(
                 f"""
                 SELECT cs.name, cs.symbol_type, cs.signature, cs.module_path,

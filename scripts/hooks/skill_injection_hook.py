@@ -31,7 +31,8 @@ def _ensure_catalog_fresh() -> None:
     """Regenerate the skill catalog if it's missing or stale (>1h old)."""
     try:
         if CATALOG_PATH.exists():
-            age = __import__("time").time() - CATALOG_PATH.stat().st_mtime
+            import time
+            age = time.time() - CATALOG_PATH.stat().st_mtime
             if age < _CATALOG_MAX_AGE_S:
                 return
         # Locate and run the generator
@@ -42,8 +43,9 @@ def _ensure_catalog_fresh() -> None:
                 [sys.executable, str(gen_script)],
                 capture_output=True, timeout=5,
             )
-    except Exception:
-        pass  # Never block prompt
+    except Exception as exc:
+        # Never block prompt, but emit diagnostics
+        print(f"Catalog refresh failed: {exc}", file=sys.stderr)
 
 
 def _load_catalog() -> dict:

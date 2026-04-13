@@ -36,10 +36,17 @@ async def near_duplicate_stats(
     qdrant_client,
     *,
     collection: str = "episodic_memory",
-    sample_size: int = 100,
+    sample_size: int = 20,
     threshold: float = 0.95,
 ) -> dict:
-    """Sample memories and check Qdrant for near-duplicates above *threshold*."""
+    """Sample memories and check Qdrant for near-duplicates above *threshold*.
+
+    Uses sync Qdrant client calls wrapped in asyncio.to_thread to avoid
+    blocking the event loop. Default sample_size is 20 to keep cost bounded
+    (~40 Qdrant calls: scroll + search per sample).
+    """
+    import asyncio
+
     try:
         cursor = await db.execute("SELECT memory_id FROM memory_metadata")
         all_ids = [row[0] for row in await cursor.fetchall()]
@@ -51,9 +58,10 @@ async def near_duplicate_stats(
         return {"total_sampled": 0, "near_duplicates_found": 0, "pairs": []}
 
     sampled = random.sample(all_ids, min(sample_size, len(all_ids)))
-    pairs: list[tuple[str, str, float]] = []
 
-    try:
+    def _scan_duplicates() -> list[tuple[str, str, float]]:
+        """Sync Qdrant work — runs in thread pool."""
+        found: list[tuple[str, str, float]] = []
         for mem_id in sampled:
             results = qdrant_client.scroll(
                 collection_name=collection,
@@ -74,7 +82,11 @@ async def near_duplicate_stats(
             for hit in hits:
                 hit_id = hit.payload.get("memory_id", str(hit.id))
                 if hit_id != mem_id and hit.score >= threshold:
-                    pairs.append((mem_id, hit_id, round(hit.score, 4)))
+                    found.append((mem_id, hit_id, round(hit.score, 4)))
+        return found
+
+    try:
+        pairs = await asyncio.to_thread(_scan_duplicates)
     except _QDRANT_ERRORS as exc:
         logger.error("Qdrant unavailable during duplicate check: %s", exc, exc_info=True)
         return {"error": f"Qdrant unavailable: {exc}"}
