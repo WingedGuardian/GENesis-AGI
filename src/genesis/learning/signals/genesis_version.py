@@ -348,7 +348,7 @@ class GenesisVersionCollector:
 
         # Get target tag if available
         proc = await asyncio.create_subprocess_exec(
-            "git", "describe", "--tags", "--abbrev=0", "origin/main",
+            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
