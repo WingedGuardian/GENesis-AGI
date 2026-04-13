@@ -273,11 +273,11 @@ async def test_expired_window_allows_resend(db):
 
 
 @pytest.mark.asyncio
-async def test_blocker_bypasses_even_when_duplicate(db):
-    """Blocker should ALWAYS bypass — dedup does not apply to blockers.
+async def test_blocker_deduped_when_duplicate(db):
+    """Blocker should be deduped when a recent identical message exists.
 
-    If something is blocking, it's blocking. Suppressing it silently is worse
-    than sending it twice. Fix the firing frequency, not the gate.
+    BLOCKER/ALERT bypass salience, quiet hours, and engagement throttle,
+    but NOT dedup — repeated identical alerts add noise, not information.
     """
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
@@ -304,8 +304,8 @@ async def test_blocker_bypasses_even_when_duplicate(db):
         signal_type="critical_failure",
     )
     result = await gate.check(req)
-    assert result.verdict == GovernanceVerdict.BYPASS
-    assert "category_bypass" in result.checks_passed
+    assert result.verdict == GovernanceVerdict.DENY
+    assert "dedup" in result.checks_failed
 
 
 @pytest.mark.asyncio
@@ -325,11 +325,11 @@ async def test_blocker_bypasses_when_not_duplicate(db):
 
 
 @pytest.mark.asyncio
-async def test_alert_bypasses_even_when_duplicate(db):
-    """Alert should ALWAYS bypass — dedup does not apply to alerts.
+async def test_alert_deduped_when_duplicate(db):
+    """Alert should be deduped when a recent identical message exists.
 
-    Same reasoning as blockers: if a condition is being reported, it exists
-    right now. Suppressing it hides persistence from the user.
+    BLOCKER/ALERT bypass salience, quiet hours, and engagement throttle,
+    but NOT dedup — repeated identical alerts add noise, not information.
     """
     cfg = _cfg_no_quiet()
     gate = GovernanceGate(cfg, db)
@@ -356,8 +356,8 @@ async def test_alert_bypasses_even_when_duplicate(db):
         signal_type="circuit_breaker",
     )
     result = await gate.check(req)
-    assert result.verdict == GovernanceVerdict.BYPASS
-    assert "category_bypass" in result.checks_passed
+    assert result.verdict == GovernanceVerdict.DENY
+    assert "dedup" in result.checks_failed
 
 
 @pytest.mark.asyncio
@@ -445,17 +445,17 @@ async def test_content_hash_different_content_allowed(db):
 
 
 @pytest.mark.asyncio
-async def test_health_alert_uses_6h_window(db):
-    """health_alert signal_type should use 6h dedup window, not 24h."""
+async def test_health_alert_uses_12h_window(db):
+    """health_alert signal_type should use 12h dedup window."""
     cfg = _cfg_no_quiet(surplus_daily=10)
     gate = GovernanceGate(cfg, db)
 
-    # Insert record 7 hours ago — outside 6h window but inside 24h
+    # Insert record 13 hours ago — outside 12h window but inside 24h
     await db.execute(
         """INSERT INTO outreach_history
            (id, signal_type, topic, category, salience_score, channel,
             message_content, delivered_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '-7 hours'), datetime('now', '-7 hours'))""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '-13 hours'), datetime('now', '-13 hours'))""",
         ("ha-old", "health_alert", "Disk full", "surplus", 0.9, "telegram", "Disk usage critical"),
     )
     await db.commit()
@@ -468,7 +468,7 @@ async def test_health_alert_uses_6h_window(db):
         signal_type="health_alert",
     )
     result = await gate.check(req)
-    # Should ALLOW because 7h > 6h window for health_alert
+    # Should ALLOW because 13h > 12h window for health_alert
     assert result.verdict == GovernanceVerdict.ALLOW
 
 

@@ -152,6 +152,13 @@ class GovernanceGate:
             return start <= now <= end
         return now >= start or now <= end
 
+    async def is_duplicate(self, request: OutreachRequest) -> bool:
+        """Check if a similar outreach was sent within the dedup window.
+
+        Public API — used by submit_raw() for lightweight dedup on urgent paths.
+        """
+        return await self._is_duplicate(request)
+
     async def _is_duplicate(self, request: OutreachRequest) -> bool:
         window_hours = _DEDUP_WINDOWS.get(
             request.signal_type, _DEFAULT_DEDUP_HOURS
