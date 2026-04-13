@@ -444,7 +444,12 @@ ESCALATION = Path({escalation_file!r})
 PID_FILE = Path({pid_file!r})
 GENESIS_ROOT = Path({genesis_root!r})
 MY_PID = os.getpid()
-SCRIPT_FILE = Path(sys.argv[0]) if len(sys.argv) > 0 else None
+SCRIPT_FILE = Path(sys.argv[0])
+
+# Write our PID immediately so concurrency guards see a live process.
+# systemd-run's PID (written by Flask) exits quickly after scope setup,
+# leaving a stale PID in the file until we overwrite it here.
+PID_FILE.write_text(str(MY_PID))
 
 def cleanup():
     PID_FILE.unlink(missing_ok=True)
