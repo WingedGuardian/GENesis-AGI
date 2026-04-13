@@ -16,8 +16,30 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# ── Copy-to-temp guard ──────────────────────────────────
+# The update script may update itself during git merge, which would corrupt
+# the running process. Industry standard (Chrome, Homebrew, Windows Update):
+# copy to temp, exec from there, so the original can be safely overwritten.
+if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ]; then
+    TEMP_COPY=$(mktemp /tmp/genesis-update-XXXXXX.sh)
+    cp "$0" "$TEMP_COPY"
+    chmod +x "$TEMP_COPY"
+    export GENESIS_UPDATE_FROM_TEMP=1
+    # Pass original script dir so GENESIS_ROOT resolves correctly
+    export GENESIS_UPDATE_ORIG_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    exec "$TEMP_COPY" "$@"
+fi
+# Running from temp copy — clean up on exit
+trap 'rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
+
+# ── Ensure systemctl --user works ───────────────────────
+# CC sessions lack D-Bus env vars, causing systemctl --user to fail silently
+# and triggering nohup fallback. Same fix as genesis.util.systemd.systemctl_env().
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
+SCRIPT_DIR="$GENESIS_ROOT/scripts"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
 STATE_FILE="$HOME/.genesis/update_state.json"
@@ -131,14 +153,20 @@ _stop_genesis_server() {
 }
 
 _start_genesis_server() {
-    # Try systemctl first
-    if systemctl --user start genesis-server.service 2>/dev/null; then
+    # Try systemctl first (preferred — enables health monitoring + auto-restart)
+    if systemctl --user start genesis-server.service 2>&1; then
+        echo "  Started genesis-server via systemd"
         return 0
     fi
-    # Fallback: start directly
+    # Fallback: start directly — DEGRADED MODE
+    # This bypasses systemd monitoring, so health dashboard will show red.
+    echo "  WARNING: systemctl --user start failed — falling back to direct start (degraded)"
+    echo "  Health monitoring will not work correctly. Run: systemctl --user start genesis-server.service"
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
         >> /tmp/genesis-server.log 2>&1 &
-    echo "  Started genesis-server (pid $!)"
+    echo "  Started genesis-server in degraded mode (pid $!)"
+    # Write marker so dashboard can detect degraded mode
+    echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
 
 # ── Stop services for update ──────────────────────────────

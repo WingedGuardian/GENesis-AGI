@@ -713,8 +713,19 @@
             if (resp && resp.ok) { this.updateProgress = await resp.json(); }
           } catch (e) { /* server may be down during update */ }
         },
+        _updatePhaseLabel(phase) {
+          const labels = {
+            fetching: "Fetching latest code...",
+            merging: "Merging updates...",
+            bootstrap: "Running bootstrap...",
+            migrations: "Running migrations...",
+            health_check: "Verifying system health...",
+            done: "Update complete",
+          };
+          return labels[phase] || "Starting update...";
+        },
         async applyUpdate() {
-          const msg = "Apply Genesis update?\n\nA background session will:\n• Back up data\n• Merge latest code\n• Resolve trivial conflicts automatically\n• Run migrations & restart services\n• Verify health\n\nThe dashboard will be briefly unavailable (~30-60s).\nContinue?";
+          const msg = "Apply Genesis update?\n\nA background session will:\n\u2022 Back up data\n\u2022 Merge latest code\n\u2022 Resolve trivial conflicts automatically\n\u2022 Run migrations & restart services\n\u2022 Verify health\n\nContinue?";
           if (!confirm(msg)) return;
           this._updating = true;
           try {
@@ -723,45 +734,50 @@
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ supervised: true }),
             });
-          } catch (e) { /* expected — server may die before response */ }
-          // Poll progress + health
-          this._updateReconnecting = true;
+          } catch (e) { /* expected — server may restart */ }
           const start = Date.now();
           const poll = setInterval(async () => {
             try {
               await this.fetchUpdateProgress();
               const prog = this.updateProgress;
-              // If progress shows conflicts needing Opus, stop polling and show resolve UI
-              if (prog && prog.escalation && prog.escalation.includes("tier3_needed")) {
+              if (!prog) return;
+              // Conflicts detected — stop polling, show resolve UI
+              if (prog.escalation && (prog.escalation.includes("tier3_needed") || prog.escalation.includes("tier2_needed"))
+                  && !prog.in_progress) {
                 clearInterval(poll);
                 this._updating = false;
-                this._updateReconnecting = false;
                 await this.fetchUpdateStatus();
                 return;
               }
-              // If progress shows completion (not in progress, has summary)
-              if (prog && !prog.in_progress && prog.summary && prog.summary.startsWith("success")) {
+              // Failed state (not success, not in progress)
+              if (prog.failed && !prog.in_progress) {
                 clearInterval(poll);
                 this._updating = false;
-                this._updateReconnecting = false;
+                await this.fetchUpdateStatus();
+                return;
+              }
+              // Success
+              if (!prog.in_progress && prog.summary && prog.summary.startsWith("success")) {
+                clearInterval(poll);
+                this._updating = false;
                 await this.fetchUpdateStatus();
                 await this.fetchHealth();
                 return;
               }
-              // Fallback: check health endpoint
-              const resp = await fetchApi("/api/genesis/health");
-              if (resp && resp.ok && prog && !prog.in_progress) {
-                clearInterval(poll);
-                this._updating = false;
-                this._updateReconnecting = false;
-                await this.fetchUpdateStatus();
-                await this.fetchHealth();
+              // Fallback: health ok + not in progress
+              if (!prog.in_progress) {
+                const resp = await fetchApi("/api/genesis/health");
+                if (resp && resp.ok) {
+                  clearInterval(poll);
+                  this._updating = false;
+                  await this.fetchUpdateStatus();
+                  await this.fetchHealth();
+                }
               }
-            } catch (e) { /* still down, keep polling */ }
+            } catch (e) { /* server may be restarting, keep polling */ }
             if (Date.now() - start > 300000) {
               clearInterval(poll);
               this._updating = false;
-              this._updateReconnecting = false;
               alert("Update did not complete after 5 minutes.\nCheck server logs for status.");
               await this.fetchUpdateStatus();
             }
@@ -793,6 +809,14 @@
           }, 5000);
           // Safety timeout
           setTimeout(() => { clearInterval(poll); this._resolvingConflicts = false; }, 600000);
+        },
+
+        async dismissUpdate() {
+          try {
+            await fetchApi("/api/genesis/updates/dismiss", { method: "POST" });
+            this.updateProgress = {};
+            await this.fetchUpdateStatus();
+          } catch (e) { console.warn("Dismiss failed:", e); }
         },
 
         // ── Settings hub fetches ─────────────────────────────────
@@ -6268,7 +6292,8 @@
           <template x-if="$store.genesisDashboard._updating">
             <div class="card" style="padding:1.5rem; text-align:center;">
               <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
-              <div style="font-size:1rem; font-weight:500;" x-text="$store.genesisDashboard._updateReconnecting ? 'Reconnecting to dashboard...' : 'Update in progress...'"></div>
+              <div style="font-size:1rem; font-weight:500;"
+                   x-text="$store.genesisDashboard._updatePhaseLabel($store.genesisDashboard.updateProgress?.phase)"></div>
               <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take a few minutes.</div>
               <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.25rem;">Do not close this tab. You may safely refresh &mdash; progress is saved.</div>
               <template x-if="$store.genesisDashboard.updateProgress?.summary">
@@ -6338,19 +6363,34 @@
                 </template>
               </div>
 
-              <!-- Conflicts needing resolution -->
-              <template x-if="$store.genesisDashboard.updateProgress?.escalation?.includes('tier3_needed')">
+              <!-- Conflicts / failed update needing resolution -->
+              <template x-if="$store.genesisDashboard.updateProgress?.conflicts || $store.genesisDashboard.updateProgress?.failed || $store.genesisDashboard.updateProgress?.stale">
                 <div class="card" style="padding:1rem; margin-bottom:1rem; border:1px solid rgba(255,152,0,0.4);">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;">Merge Conflicts</h3>
-                    <button @click="$store.genesisDashboard.resolveConflicts()"
-                            style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                      Resolve with Opus</button>
+                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;"
+                        x-text="$store.genesisDashboard.updateProgress?.conflicts ? 'Merge Conflicts' : 'Update Failed'"></h3>
+                    <div style="display:flex; gap:0.5rem;">
+                      <template x-if="$store.genesisDashboard.updateProgress?.conflicts">
+                        <button @click="$store.genesisDashboard.resolveConflicts()"
+                                style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                          Resolve with Opus</button>
+                      </template>
+                      <button @click="$store.genesisDashboard.applyUpdate()"
+                              style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Retry</button>
+                      <button @click="$store.genesisDashboard.dismissUpdate()"
+                              style="background:transparent; color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Dismiss</button>
+                    </div>
                   </div>
-                  <div style="font-size:0.8rem; color:var(--color-text-secondary);">
-                    The update has merge conflicts that couldn't be resolved automatically.
-                    Opus can analyze both sides and find the best resolution.
-                  </div>
+                  <div style="font-size:0.8rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.updateProgress?.conflicts
+                         ? 'The update has merge conflicts that could not be resolved automatically. Opus can analyze both sides and find the best resolution.'
+                         : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
+                  <template x-if="$store.genesisDashboard.updateProgress?.summary">
+                    <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(255,152,0,0.05); font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary);"
+                         x-text="$store.genesisDashboard.updateProgress.summary"></div>
+                  </template>
                   <template x-if="$store.genesisDashboard.updateProgress?.conflicts?.conflicted_files">
                     <div style="margin-top:0.5rem;">
                       <span style="font-size:0.7rem; color:var(--color-text-secondary);">Conflicted files:</span>
