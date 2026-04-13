@@ -309,132 +309,130 @@ _PID_FILE = _GENESIS_DIR / "update_in_progress.pid"
 
 
 def _apply_supervised(pid_file: Path) -> tuple:
-    """Spawn a three-tier CC update pipeline.
+    """Spawn a three-tier CC update pipeline as a detached subprocess.
 
-    Tier 1 (Haiku): runs update.sh, watches exit code, escalates if needed.
-    Tier 2 (Sonnet): resolves trivial conflicts or script errors.
-    Tier 3 (Opus): resolves deep merge conflicts requiring judgment.
+    The orchestrator MUST be a separate process, not a thread. update.sh
+    stops the genesis-server during updates — a daemon thread inside Flask
+    would die with it, orphaning the CC session with no one to check
+    escalation files or spawn the next tier.
 
-    Orchestration runs in a background thread so the API returns immediately.
-    Each tier checks for escalation files left by the previous tier.
+    The subprocess uses start_new_session=True so it survives the server
+    shutdown. It runs self-contained Python (no genesis imports) because
+    the genesis package may be mid-update.
     """
-    import threading
-
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Clean up ALL state files from prior runs
     for f in (_SUMMARY_FILE, _ESCALATION_FILE, _CONFLICT_FILE, _STATE_FILE):
         f.unlink(missing_ok=True)
 
-    def _run_tiers():
-        try:
-            _run_tier1(pid_file)
-        except Exception:
-            logger.error("Update orchestrator failed", exc_info=True)
-
-    thread = threading.Thread(target=_run_tiers, daemon=True, name="update-orchestrator")
-    thread.start()
-
-    return jsonify({
-        "status": "triggered",
-        "supervised": True,
-        "tier": 1,
-    })
-
-
-def _spawn_cc(prompt: str, model: str, pid_file: Path) -> int:
-    """Spawn a CC session and wait for it to complete. Returns exit code."""
-    try:
-        proc = subprocess.Popen(
-            [
-                "claude", "-p", prompt,
-                "--model", model,
-                "--dangerously-skip-permissions",
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-            cwd=str(_GENESIS_ROOT),
-        )
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(proc.pid))
-        logger.info("CC %s session started (pid %d)", model, proc.pid)
-        proc.wait()  # Block until CC finishes
-        return proc.returncode
-    except Exception as exc:
-        logger.error("Failed to spawn CC session: %s", exc, exc_info=True)
-        return 1
-
-
-def _run_tier1(pid_file: Path) -> None:
-    """Tier 1: Haiku watches update.sh and escalates if needed."""
-    prompt = _TIER1_PROMPT.format(
+    # Build the orchestrator as inline Python — no genesis imports needed.
+    # The prompts and paths are baked in as string literals.
+    tier1_prompt = _TIER1_PROMPT.format(
         update_script=_UPDATE_SCRIPT,
         genesis_root=_GENESIS_ROOT,
         summary_file=_SUMMARY_FILE,
         escalation_file=_ESCALATION_FILE,
         conflict_file=_CONFLICT_FILE,
     )
-
-    rc = _spawn_cc(prompt, "haiku", pid_file)
-    logger.info("Tier 1 (Haiku) completed with rc=%d", rc)
-
-    # Check if escalation is needed
-    if _ESCALATION_FILE.is_file():
-        escalation = _ESCALATION_FILE.read_text().strip()
-        if "tier2_needed" in escalation:
-            logger.info("Tier 1 escalated to Tier 2 (Sonnet)")
-            _ESCALATION_FILE.unlink(missing_ok=True)
-            _run_tier2(pid_file)
-
-
-def _run_tier2(pid_file: Path) -> None:
-    """Tier 2: Sonnet resolves trivial conflicts or script errors."""
-    prompt = _TIER2_PROMPT.format(
+    tier2_prompt = _TIER2_PROMPT.format(
         summary_file=_SUMMARY_FILE,
         conflict_file=_CONFLICT_FILE,
         escalation_file=_ESCALATION_FILE,
         update_script=_UPDATE_SCRIPT,
     )
 
-    rc = _spawn_cc(prompt, "sonnet", pid_file)
-    logger.info("Tier 2 (Sonnet) completed with rc=%d", rc)
-
-    # Check if further escalation is needed
-    if _ESCALATION_FILE.is_file():
-        escalation = _ESCALATION_FILE.read_text().strip()
-        if "tier3_needed" in escalation:
-            logger.info("Tier 2 escalated to Tier 3 (Opus) — notifying user")
-            _notify_tier3_needed()
-
-
-def _run_tier3(pid_file: Path) -> None:
-    """Tier 3: Opus resolves deep merge conflicts. User-initiated only."""
-    prompt = _TIER3_PROMPT.format(
-        escalation_file=_ESCALATION_FILE,
+    orchestrator_code = _ORCHESTRATOR_TEMPLATE.format(
         summary_file=_SUMMARY_FILE,
-        update_script=_UPDATE_SCRIPT,
+        escalation_file=_ESCALATION_FILE,
+        pid_file=pid_file,
+        genesis_root=_GENESIS_ROOT,
+        tier1_prompt=tier1_prompt,
+        tier2_prompt=tier2_prompt,
     )
 
-    rc = _spawn_cc(prompt, "opus", pid_file)
-    logger.info("Tier 3 (Opus) completed with rc=%d", rc)
+    log_file = _GENESIS_DIR / "update_orchestrator.log"
+    proc = subprocess.Popen(
+        [str(_GENESIS_ROOT / ".venv" / "bin" / "python"), "-c", orchestrator_code],
+        stdout=open(log_file, "w"),  # noqa: SIM115
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        cwd=str(_GENESIS_ROOT),
+    )
+    logger.info("Update orchestrator started (pid %d), log: %s", proc.pid, log_file)
+
+    return jsonify({
+        "status": "triggered",
+        "supervised": True,
+        "tier": 1,
+        "orchestrator_pid": proc.pid,
+    })
 
 
-def _notify_tier3_needed() -> None:
-    """Notify user that deep conflicts need Opus-level resolution."""
+def _spawn_detached_cc(prompt: str, model: str) -> subprocess.Popen:
+    """Spawn a detached CC session. Returns the Popen object (caller waits)."""
+    return subprocess.Popen(
+        ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        cwd=str(_GENESIS_ROOT),
+    )
+
+
+# Template for the orchestrator subprocess. Baked-in paths avoid genesis imports.
+# Uses {}-style placeholders filled by _apply_supervised().
+_ORCHESTRATOR_TEMPLATE = """\
+import subprocess, sys, logging
+from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [update-orchestrator] %(levelname)s %(message)s",
+)
+log = logging.getLogger("update-orchestrator")
+
+SUMMARY = Path({summary_file!r})
+ESCALATION = Path({escalation_file!r})
+PID_FILE = Path({pid_file!r})
+GENESIS_ROOT = Path({genesis_root!r})
+
+def spawn_cc(prompt, model):
     try:
-        # Write a summary for the dashboard to pick up
-        _SUMMARY_FILE.write_text(
+        proc = subprocess.Popen(
+            ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True, cwd=str(GENESIS_ROOT),
+        )
+        PID_FILE.write_text(str(proc.pid))
+        log.info("CC %s started (pid %d)", model, proc.pid)
+        proc.wait()
+        log.info("CC %s finished (rc=%d)", model, proc.returncode)
+        return proc.returncode
+    except Exception as e:
+        log.error("Failed to spawn CC %s: %s", model, e)
+        return 1
+
+# ── Tier 1: Haiku ──
+log.info("Starting Tier 1 (Haiku)")
+rc1 = spawn_cc({tier1_prompt!r}, "haiku")
+
+# ── Check escalation ──
+if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
+    log.info("Tier 1 escalated → Tier 2 (Sonnet)")
+    ESCALATION.unlink(missing_ok=True)
+    rc2 = spawn_cc({tier2_prompt!r}, "sonnet")
+
+    # Check if Tier 3 needed
+    if ESCALATION.is_file() and "tier3_needed" in ESCALATION.read_text():
+        log.info("Tier 2 escalated → Tier 3 (user-initiated Opus)")
+        SUMMARY.write_text(
             "conflicts_unresolved: Deep merge conflicts require Opus resolution. "
             "Use 'Resolve with Opus' from the dashboard."
         )
 
-        logger.info(
-            "Update has deep conflicts needing Opus resolution. "
-            "User should use dashboard 'Resolve with Opus' button."
-        )
-    except Exception:
-        logger.error("Failed to send tier3 notification", exc_info=True)
+log.info("Orchestrator finished")
+"""
 
 
 @blueprint.route("/api/genesis/updates/dismiss", methods=["POST"])
@@ -484,21 +482,21 @@ def update_resolve():
         except (ValueError, subprocess.TimeoutExpired, OSError):
             _PID_FILE.unlink(missing_ok=True)
 
-    import threading
+    tier3_prompt = _TIER3_PROMPT.format(
+        escalation_file=_ESCALATION_FILE,
+        summary_file=_SUMMARY_FILE,
+        update_script=_UPDATE_SCRIPT,
+    )
 
-    def _run():
-        try:
-            _run_tier3(_PID_FILE)
-        except Exception:
-            logger.error("Tier 3 (Opus) failed", exc_info=True)
-
-    thread = threading.Thread(target=_run, daemon=True, name="update-tier3")
-    thread.start()
+    proc = _spawn_detached_cc(tier3_prompt, "opus")
+    _PID_FILE.write_text(str(proc.pid))
+    logger.info("Tier 3 (Opus) started (pid %d)", proc.pid)
 
     return jsonify({
         "status": "triggered",
         "supervised": True,
         "tier": 3,
+        "pid": proc.pid,
     })
 
 
