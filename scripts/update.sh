@@ -20,6 +20,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
+STATE_FILE="$HOME/.genesis/update_state.json"
+
+# ── Update state file helper ────────────────────────────
+# Written at each phase boundary so crash recovery knows where we stopped.
+_write_state() {
+    local phase="$1"
+    mkdir -p "$HOME/.genesis"
+    cat > "$STATE_FILE" << SEOF
+{
+    "phase": "$phase",
+    "rollback_tag": "${ROLLBACK_TAG:-}",
+    "old_tag": "${OLD_TAG:-}",
+    "old_commit": "${OLD_COMMIT:-}",
+    "started_at": "$STARTED_AT",
+    "pid": $$,
+    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
+    "timestamp": "$(date -Iseconds)"
+}
+SEOF
+}
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
@@ -37,7 +57,7 @@ echo "  ────────────────────────
 
 # ── Current state ─────────────────────────────────────────
 ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")
-OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "untagged")
+OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 OLD_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 NEW_TAG="$OLD_TAG"
 NEW_COMMIT="$OLD_COMMIT"
@@ -61,6 +81,8 @@ ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
 git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
 echo "  Rollback tag: $ROLLBACK_TAG"
 echo ""
+
+_write_state "fetching"
 
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
@@ -252,10 +274,54 @@ _on_err() {
 }
 trap _on_err ERR
 
-# ── Pull ──────────────────────────────────────────────────
-echo "--- Pulling latest ---"
-git -C "$GENESIS_ROOT" pull --rebase origin main
-NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "untagged")
+_write_state "merging"
+
+# ── Fetch + Merge ────────────────────────────────────────
+echo "--- Fetching latest ---"
+git -C "$GENESIS_ROOT" fetch origin main
+
+echo "--- Merging origin/main ---"
+MERGE_OUTPUT=""
+MERGE_RC=0
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge origin/main --no-edit 2>&1) || MERGE_RC=$?
+
+if [[ $MERGE_RC -ne 0 ]]; then
+    # Check if this is a merge conflict (unmerged paths) vs other error
+    if git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then
+        CONFLICTED_FILES=$(git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U)
+        echo "  Merge conflicts detected in:"
+        echo "$CONFLICTED_FILES" | sed 's/^/    /'
+
+        # Write conflict context for supervising CC session
+        mkdir -p "$HOME/.genesis"
+        # Build JSON array of conflicted files
+        CONFLICT_JSON=$(echo "$CONFLICTED_FILES" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+        cat > "$HOME/.genesis/update_conflicts.json" << CEOF
+{
+    "old_tag": "$OLD_TAG",
+    "old_commit": "$OLD_COMMIT",
+    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 origin/main 2>/dev/null || echo 'untagged')",
+    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short origin/main 2>/dev/null || echo 'unknown')",
+    "conflicted_files": [$CONFLICT_JSON],
+    "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
+    "timestamp": "$(date -Iseconds)"
+}
+CEOF
+        echo ""
+        echo "  Conflict context written to ~/.genesis/update_conflicts.json"
+        echo "  A CC session can resolve these — exiting with code 2."
+
+        # Don't rollback — leave conflicts in place for CC to resolve
+        trap - ERR
+        exit 2
+    else
+        # Not a conflict — some other merge error. Let ERR trap handle rollback.
+        echo "  Merge failed: $MERGE_OUTPUT"
+        false  # triggers ERR trap → rollback
+    fi
+fi
+
+NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
 if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
@@ -278,6 +344,8 @@ echo "--- Changes ---"
 git -C "$GENESIS_ROOT" log "${OLD_COMMIT}..HEAD" --oneline --no-merges | head -20 || true
 echo ""
 
+_write_state "bootstrap"
+
 # ── Run bootstrap (idempotent — handles deps, configs, hooks, systemd) ─
 echo "--- Running bootstrap ---"
 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10
@@ -291,6 +359,8 @@ if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/d
 fi
 echo "  Genesis importable: OK"
 echo ""
+
+_write_state "migrations"
 
 # ── Run migrations (fatal on failure) ─────────────────────
 if "$VENV_DIR/bin/python" -c "import genesis.db.migrations" 2>/dev/null; then
@@ -332,6 +402,8 @@ if p.exists():
     echo "  Network identity updated in CLAUDE.md"
     echo ""
 fi
+
+_write_state "health_check"
 
 # ── Restart services ──────────────────────────────────────
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
@@ -442,6 +514,13 @@ fi
 
 # ── Record success in update_history ─────────────────────
 _record_update_history "success" "" ""
+
+_write_state "done"
+
+# Clean up state file — successful update, nothing to recover
+rm -f "$STATE_FILE"
+# Clean up PID file
+rm -f "$HOME/.genesis/update_in_progress.pid"
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"
