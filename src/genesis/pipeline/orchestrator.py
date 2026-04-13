@@ -106,7 +106,7 @@ class PipelineOrchestrator:
                         memory_type="knowledge",
                         collection="knowledge_base",  # Explicit — module signal data
                         tags=signal.tags + [f"tier:{signal.tier.name}", f"profile:{profile.name}"],
-                        confidence=signal.relevance_score * 0.5,
+                        confidence=signal.relevance_score * 0.7,
                         source_pipeline="recon",
                     )
                 except Exception:

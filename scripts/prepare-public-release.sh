@@ -201,20 +201,6 @@ with open(path) as f:
 
 warnings = []
 
-def checked_sub(pattern, repl, text, label, **kwargs):
-    result, count = re.subn(pattern, repl, text, **kwargs)
-    if count == 0:
-        warnings.append(label)
-    return result
-
-# Remove Build Order section — stops at next ## heading or end of file.
-content = checked_sub(r'\n## Build Order\n[\s\S]*?(?=\n## |\Z)', '\n', content, "Build Order removal")
-
-if warnings:
-    print(f"WARNING: {len(warnings)} regex(es) matched 0 times — CLAUDE.md structure may have changed:", file=sys.stderr)
-    for w in warnings:
-        print(f"  - {w}", file=sys.stderr)
-
 with open(path, 'w') as f:
     f.write(content)
 PYEOF
@@ -541,12 +527,13 @@ SCAN_EXCLUDES=(
     --glob '!**/push-public-release.sh'
     --glob '!**/public-release.yaml'
     --glob '!**/release-script-guarantees.md'
-    # Contribution-pipeline sanitizer: its source defines the regex
-    # patterns used to detect machine-specific content in contributor
-    # diffs. The literals appearing here are scanner definitions, not
-    # leaks. Its tests mirror the same literals as fixtures.
+    # Contribution-pipeline sanitizer and CI leak-detector: their source
+    # defines the regex patterns used to detect machine-specific content.
+    # The literals appearing here are scanner definitions, not leaks.
+    # sanitize.py tests mirror the same literals as fixtures.
     --glob '!**/src/genesis/contribution/sanitize.py'
     --glob '!**/tests/test_contribution/test_sanitize.py'
+    --glob '!**/.github/workflows/ci.yml'
     # (b) container install scripts — container-internal /home/ubuntu refs
     --glob '!**/host-setup.sh'
     --glob '!**/install.sh'
