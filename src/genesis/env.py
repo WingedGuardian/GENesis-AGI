@@ -2,6 +2,11 @@
 
 Centralizes machine-specific defaults so runtime code does not hardcode one
 developer's home directory, LAN topology, or venv layout.
+
+Configuration precedence (highest to lowest):
+  1. Environment variable (e.g. OLLAMA_URL)
+  2. ~/.genesis/config/genesis.yaml  (local install config)
+  3. Hardcoded default (safe for a fresh clone)
 """
 
 from __future__ import annotations
@@ -17,6 +22,37 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_QDRANT_URL = "http://localhost:6333"
 _DEFAULT_OLLAMA_URL = "http://localhost:11434"
 _DEFAULT_LM_STUDIO_URL = "http://localhost:1234/v1"
+
+# ---------------------------------------------------------------------------
+# Local config overlay — ~/.genesis/config/genesis.yaml
+# ---------------------------------------------------------------------------
+
+_LOCAL_CONFIG: dict | None = None
+_LOCAL_CONFIG_LOADED: bool = False
+
+
+def _local_config() -> dict:
+    """Load ~/.genesis/config/genesis.yaml (cached after first call).
+
+    Returns an empty dict if the file is absent or unreadable — all callers
+    must fall through to their hardcoded defaults gracefully.
+    """
+    global _LOCAL_CONFIG, _LOCAL_CONFIG_LOADED
+    if _LOCAL_CONFIG_LOADED:
+        return _LOCAL_CONFIG or {}
+    _LOCAL_CONFIG_LOADED = True
+    cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    if not cfg_path.is_file():
+        _LOCAL_CONFIG = {}
+        return {}
+    try:
+        import yaml  # noqa: PLC0415 — lazy import, yaml is always available
+        with cfg_path.open() as fh:
+            _LOCAL_CONFIG = yaml.safe_load(fh) or {}
+    except Exception:
+        logger.warning("Failed to load local config from %s", cfg_path, exc_info=True)
+        _LOCAL_CONFIG = {}
+    return _LOCAL_CONFIG
 
 
 def repo_root() -> Path:
@@ -75,7 +111,13 @@ def qdrant_collections_url() -> str:
 
 
 def ollama_url() -> str:
-    return os.environ.get("OLLAMA_URL", _DEFAULT_OLLAMA_URL).strip()
+    env_val = os.environ.get("OLLAMA_URL")
+    if env_val:
+        return env_val.strip()
+    local_val = _local_config().get("network", {}).get("ollama_url")
+    if local_val:
+        return str(local_val).strip()
+    return _DEFAULT_OLLAMA_URL
 
 
 def ollama_tags_url() -> str:
@@ -87,7 +129,13 @@ def ollama_embed_url() -> str:
 
 
 def lm_studio_url() -> str:
-    return os.environ.get("LM_STUDIO_URL", _DEFAULT_LM_STUDIO_URL).strip()
+    env_val = os.environ.get("LM_STUDIO_URL")
+    if env_val:
+        return env_val.strip()
+    local_val = _local_config().get("network", {}).get("lm_studio_url")
+    if local_val:
+        return str(local_val).strip()
+    return _DEFAULT_LM_STUDIO_URL
 
 
 def lm_studio_health_url() -> str:
@@ -98,12 +146,58 @@ def ollama_enabled() -> bool:
     """Check if Ollama local inference is enabled.
 
     Defaults to False (cloud-primary architecture). Set GENESIS_ENABLE_OLLAMA=true
-    in secrets.env for environments with a local Ollama instance.
+    in secrets.env or network.ollama_enabled in ~/.genesis/config/genesis.yaml.
     """
-    value = os.environ.get("GENESIS_ENABLE_OLLAMA")
-    if value is None:
-        return False
-    return value.strip().lower() not in {"0", "false", "no", "off"}
+    env_val = os.environ.get("GENESIS_ENABLE_OLLAMA")
+    if env_val is not None:
+        return env_val.strip().lower() not in {"0", "false", "no", "off"}
+    local_val = _local_config().get("network", {}).get("ollama_enabled")
+    if local_val is not None:
+        return bool(local_val)
+    return False
+
+
+def user_timezone() -> str:
+    """User's local timezone (IANA format).
+
+    Precedence: USER_TIMEZONE env var → local config timezone → UTC.
+    Used by tz.py and any subsystem that formats timestamps for display.
+    """
+    env_val = os.environ.get("USER_TIMEZONE")
+    if env_val:
+        return env_val.strip()
+    local_val = _local_config().get("timezone")
+    if local_val:
+        return str(local_val).strip()
+    return "UTC"
+
+
+def github_user() -> str:
+    """GitHub username for this Genesis install.
+
+    Precedence: GENESIS_GITHUB_USER env var → local config → empty string.
+    """
+    env_val = os.environ.get("GENESIS_GITHUB_USER")
+    if env_val:
+        return env_val.strip()
+    local_val = _local_config().get("github", {}).get("user")
+    if local_val:
+        return str(local_val).strip()
+    return ""
+
+
+def github_public_repo() -> str:
+    """Public GitHub repo name (without owner prefix).
+
+    Precedence: GENESIS_GITHUB_PUBLIC_REPO env var → local config → "GENesis-AGI".
+    """
+    env_val = os.environ.get("GENESIS_GITHUB_PUBLIC_REPO")
+    if env_val:
+        return env_val.strip()
+    local_val = _local_config().get("github", {}).get("public_repo")
+    if local_val:
+        return str(local_val).strip()
+    return "GENesis-AGI"
 
 
 def deepinfra_api_key() -> str | None:
