@@ -19,6 +19,73 @@ echo "=== Genesis Bootstrap ==="
 echo "Genesis root: $GENESIS_ROOT"
 echo
 
+# ── Crash recovery: check for interrupted update ─────────
+UPDATE_STATE="$HOME/.genesis/update_state.json"
+if [ -f "$UPDATE_STATE" ]; then
+    echo "--- Detected interrupted update state file ---"
+    # Read phase and PID from state file
+    STATE_PHASE=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('phase','unknown'))" 2>/dev/null || echo "unknown")
+    STATE_PID=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('pid',0))" 2>/dev/null || echo "0")
+
+    # Check if the update process is still alive
+    if [ "$STATE_PID" -gt 1 ] 2>/dev/null && kill -0 "$STATE_PID" 2>/dev/null; then
+        echo "  Update process (pid $STATE_PID) still running in phase '$STATE_PHASE' — not interfering."
+    elif [ "$STATE_PHASE" = "done" ]; then
+        echo "  Update completed successfully — cleaning up state file."
+        rm -f "$UPDATE_STATE"
+    else
+        echo "  Update CRASHED in phase '$STATE_PHASE' (pid $STATE_PID is dead)."
+
+        # Abort any in-progress merge
+        if [ -f "$GENESIS_ROOT/.git/MERGE_HEAD" ]; then
+            echo "  Aborting in-progress merge..."
+            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+        fi
+
+        # Read rollback tag from state file
+        ROLLBACK_TAG=$(python3 -c "import json,sys; print(json.load(open('$UPDATE_STATE')).get('rollback_tag',''))" 2>/dev/null || echo "")
+
+        if [ -n "$ROLLBACK_TAG" ] && git -C "$GENESIS_ROOT" rev-parse "$ROLLBACK_TAG" >/dev/null 2>&1; then
+            echo "  Rolling back to $ROLLBACK_TAG..."
+            git -C "$GENESIS_ROOT" reset --hard "$ROLLBACK_TAG" 2>&1 || true
+            echo "  Rollback complete."
+        else
+            echo "  No rollback tag found — resetting to HEAD."
+            git -C "$GENESIS_ROOT" reset --hard HEAD 2>&1 || true
+        fi
+
+        # Record crash recovery
+        echo "  Recording crash recovery in update_history..."
+        DB_PATH="$GENESIS_ROOT/data/genesis.db"
+        if [ -f "$DB_PATH" ]; then
+            python3 -c "
+import sqlite3, uuid, json
+from datetime import datetime, timezone
+state = json.load(open('$UPDATE_STATE'))
+try:
+    con = sqlite3.connect('$DB_PATH', timeout=5)
+    con.execute(
+        'INSERT INTO update_history (id, old_tag, new_tag, old_commit, new_commit, status, '
+        'rollback_tag, failure_reason, started_at, completed_at) '
+        'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        (str(uuid.uuid4()), state.get('old_tag',''), '', state.get('old_commit',''), '',
+         'crashed_recovered', state.get('rollback_tag',''),
+         f\"Crashed in phase: {state.get('phase','unknown')}\",
+         state.get('started_at',''), datetime.now(timezone.utc).isoformat()))
+    con.commit()
+    con.close()
+except Exception as e:
+    print(f'  WARNING: failed to record crash recovery: {e}')
+" 2>/dev/null || echo "  WARNING: could not record crash in update_history"
+        fi
+
+        rm -f "$UPDATE_STATE"
+        rm -f "$HOME/.genesis/update_in_progress.pid"
+        echo "  Crash recovery complete. Continuing bootstrap with rolled-back code."
+        echo ""
+    fi
+fi
+
 # --- Prerequisites ---
 echo "--- Checking and installing prerequisites ---"
 

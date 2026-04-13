@@ -20,6 +20,26 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENV_DIR="$GENESIS_ROOT/.venv"
 STARTED_AT="$(date -Iseconds)"
+STATE_FILE="$HOME/.genesis/update_state.json"
+
+# ── Update state file helper ────────────────────────────
+# Written at each phase boundary so crash recovery knows where we stopped.
+_write_state() {
+    local phase="$1"
+    mkdir -p "$HOME/.genesis"
+    cat > "$STATE_FILE" << SEOF
+{
+    "phase": "$phase",
+    "rollback_tag": "${ROLLBACK_TAG:-}",
+    "old_tag": "${OLD_TAG:-}",
+    "old_commit": "${OLD_COMMIT:-}",
+    "started_at": "$STARTED_AT",
+    "pid": $$,
+    "services_stopped": [$(printf '"%s",' "${WERE_RUNNING[@]:-}" | sed 's/,$//')],
+    "timestamp": "$(date -Iseconds)"
+}
+SEOF
+}
 
 # Refuse to run from a worktree — pip install -e in bootstrap.sh would
 # redirect system-wide imports and cause I/O death spiral.
@@ -55,7 +75,7 @@ echo "  Update remote: $UPDATE_REMOTE"
 
 # ── Current state ─────────────────────────────────────────
 ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")
-OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "untagged")
+OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 OLD_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 NEW_TAG="$OLD_TAG"
 NEW_COMMIT="$OLD_COMMIT"
@@ -80,15 +100,66 @@ git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
 echo "  Rollback tag: $ROLLBACK_TAG"
 echo ""
 
+_write_state "fetching"
+
+# ── Service stop/start helpers ───────────────────────────
+# Works with both systemd and bare-process environments.
+_stop_genesis_server() {
+    # Try systemctl first (works when D-Bus session bus is available)
+    if systemctl --user is-active --quiet genesis-server.service 2>/dev/null; then
+        systemctl --user stop genesis-server.service 2>/dev/null && return 0
+    fi
+    # Fallback: read PID from fcntl lock file
+    local lock_file="$HOME/.genesis/genesis-server.lock"
+    if [ -f "$lock_file" ]; then
+        local pid
+        pid=$(tr -d '\0' < "$lock_file" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            # Wait up to 10s for graceful shutdown
+            for i in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || return 0
+                sleep 0.5
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    # Last resort: pkill by command pattern
+    pkill -TERM -f "python -m genesis serve" 2>/dev/null || true
+    sleep 1
+}
+
+_start_genesis_server() {
+    # Try systemctl first
+    if systemctl --user start genesis-server.service 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: start directly
+    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
+        >> /tmp/genesis-server.log 2>&1 &
+    echo "  Started genesis-server (pid $!)"
+}
+
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 WERE_RUNNING=()
-for svc in genesis-server genesis-bridge; do
+
+# Check genesis-server
+if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
+   pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+    _stop_genesis_server
+    WERE_RUNNING+=("genesis-server")
+fi
+
+# Check genesis-bridge
+for svc in genesis-bridge; do
     if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
-        systemctl --user stop "$svc.service" || true  # stop failure shouldn't block rollback setup
+        systemctl --user stop "$svc.service" || true
         WERE_RUNNING+=("$svc")
     fi
 done
+
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
 
@@ -194,7 +265,8 @@ _do_rollback() {
     echo "  Rolling back to $ROLLBACK_TAG..."
 
     # Stop any running services first
-    systemctl --user stop genesis-server genesis-bridge 2>/dev/null || true
+    _stop_genesis_server
+    systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
     # This keeps us on a named branch (not detached HEAD) at the pre-update state.
@@ -219,8 +291,12 @@ _do_rollback() {
 
     # Restart services with old code
     for svc in "${WERE_RUNNING[@]}"; do
-        systemctl --user start "$svc.service" 2>/dev/null || \
-            echo "  CRITICAL: failed to restart $svc"
+        if [ "$svc" = "genesis-server" ]; then
+            _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
+        else
+            systemctl --user start "$svc.service" 2>/dev/null || \
+                echo "  CRITICAL: failed to restart $svc"
+        fi
     done
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ]; then
@@ -270,10 +346,70 @@ _on_err() {
 }
 trap _on_err ERR
 
-# ── Pull ──────────────────────────────────────────────────
-echo "--- Pulling latest ---"
-git -C "$GENESIS_ROOT" pull --rebase "$UPDATE_REMOTE" main
-NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --abbrev=0 2>/dev/null || echo "untagged")
+_write_state "merging"
+
+# ── Fetch + Merge ────────────────────────────────────────
+echo "--- Fetching latest ---"
+git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
+
+echo "--- Merging $UPDATE_REMOTE/main ---"
+MERGE_OUTPUT=""
+MERGE_RC=0
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit 2>&1) || MERGE_RC=$?
+
+if [[ $MERGE_RC -ne 0 ]]; then
+    # Check if this is a merge conflict (unmerged paths) vs other error
+    if git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then
+        CONFLICTED_FILES=$(git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U)
+        echo "  Merge conflicts detected in:"
+        echo "$CONFLICTED_FILES" | sed 's/^/    /'
+
+        # Write conflict context for supervising CC session
+        mkdir -p "$HOME/.genesis"
+        # Build JSON array of conflicted files
+        CONFLICT_JSON=$(echo "$CONFLICTED_FILES" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
+        cat > "$HOME/.genesis/update_conflicts.json" << CEOF
+{
+    "old_tag": "$OLD_TAG",
+    "old_commit": "$OLD_COMMIT",
+    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')",
+    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')",
+    "conflicted_files": [$CONFLICT_JSON],
+    "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
+    "timestamp": "$(date -Iseconds)"
+}
+CEOF
+        echo ""
+        echo "  Conflict context written to ~/.genesis/update_conflicts.json"
+
+        # Abort the merge — don't leave the working tree in a broken state.
+        # CC will resolve conflicts in a worktree, not in the main checkout.
+        echo "  Aborting merge to keep working tree clean..."
+        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+
+        # Restart services with original code so the system stays operational
+        echo "  Restarting services with pre-update code..."
+        for svc in "${WERE_RUNNING[@]}"; do
+            if [ "$svc" = "genesis-server" ]; then
+                _start_genesis_server || echo "  WARNING: failed to restart genesis-server"
+            else
+                systemctl --user start "$svc.service" 2>/dev/null || \
+                    echo "  WARNING: failed to restart $svc"
+            fi
+        done
+
+        echo "  System is running on pre-update code."
+        echo "  A CC session will resolve conflicts in a worktree."
+        trap - ERR
+        exit 2
+    else
+        # Not a conflict — some other merge error. Let ERR trap handle rollback.
+        echo "  Merge failed: $MERGE_OUTPUT"
+        false  # triggers ERR trap → rollback
+    fi
+fi
+
+NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
 if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
@@ -283,7 +419,11 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
     # Restart services that we stopped (if any)
     for svc in "${WERE_RUNNING[@]}"; do
-        systemctl --user start "$svc.service" 2>/dev/null || true
+        if [ "$svc" = "genesis-server" ]; then
+            _start_genesis_server || true
+        else
+            systemctl --user start "$svc.service" 2>/dev/null || true
+        fi
     done
     echo ""
     echo "  Nothing to do."
@@ -295,6 +435,8 @@ echo ""
 echo "--- Changes ---"
 git -C "$GENESIS_ROOT" log "${OLD_COMMIT}..HEAD" --oneline --no-merges | head -20 || true
 echo ""
+
+_write_state "bootstrap"
 
 # ── Run bootstrap (idempotent — handles deps, configs, hooks, systemd) ─
 echo "--- Running bootstrap ---"
@@ -309,6 +451,8 @@ if ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/d
 fi
 echo "  Genesis importable: OK"
 echo ""
+
+_write_state "migrations"
 
 # ── Run migrations (fatal on failure) ─────────────────────
 if "$VENV_DIR/bin/python" -c "import genesis.db.migrations" 2>/dev/null; then
@@ -351,6 +495,8 @@ if p.exists():
     echo ""
 fi
 
+_write_state "health_check"
+
 # ── Restart services ──────────────────────────────────────
 if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     echo "--- Restarting services ---"
@@ -359,7 +505,12 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
 
     for svc in "${WERE_RUNNING[@]}"; do
-        if ! systemctl --user start "$svc.service"; then
+        if [ "$svc" = "genesis-server" ]; then
+            if ! _start_genesis_server; then
+                _do_rollback "failed to start genesis-server after update"
+                exit 1
+            fi
+        elif ! systemctl --user start "$svc.service"; then
             _do_rollback "failed to start $svc after update"
             exit 1
         fi
@@ -460,6 +611,13 @@ fi
 
 # ── Record success in update_history ─────────────────────
 _record_update_history "success" "" ""
+
+_write_state "done"
+
+# Clean up state file — successful update, nothing to recover
+rm -f "$STATE_FILE"
+# Clean up PID file
+rm -f "$HOME/.genesis/update_in_progress.pid"
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"
