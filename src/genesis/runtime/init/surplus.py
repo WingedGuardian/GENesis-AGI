@@ -67,6 +67,18 @@ async def init(rt: GenesisRuntime) -> None:
             logger.info("Surplus executor upgraded: ReflectionBasedSurplusExecutor")
 
         try:
+            from genesis.surplus.code_index import CodeIndexExecutor
+            code_index_executor = CodeIndexExecutor(db=rt._db)
+            rt._surplus_scheduler.set_code_index_executor(code_index_executor)
+            logger.info("CodeIndexExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire CodeIndexExecutor", exc_info=True)
+            await _degraded(rt, "CodeIndexExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring CodeIndexExecutor", exc_info=True)
+            await _degraded(rt, "CodeIndexExecutor")
+
+        try:
             from genesis.surplus.code_audit import CodeAuditExecutor
             if rt._router is not None:
                 code_audit_executor = CodeAuditExecutor(
