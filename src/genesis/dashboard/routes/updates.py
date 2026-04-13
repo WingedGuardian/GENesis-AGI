@@ -352,13 +352,18 @@ def _apply_supervised(pid_file: Path) -> tuple:
     )
 
     log_file = _GENESIS_DIR / "update_orchestrator.log"
+    log_fh = open(log_file, "w")  # noqa: SIM115
     proc = subprocess.Popen(
         [str(_GENESIS_ROOT / ".venv" / "bin" / "python"), "-c", orchestrator_code],
-        stdout=open(log_file, "w"),  # noqa: SIM115
+        stdout=log_fh,
         stderr=subprocess.STDOUT,
         start_new_session=True,
         cwd=str(_GENESIS_ROOT),
     )
+    log_fh.close()  # Child inherited the fd; parent can close its copy
+    # Write orchestrator PID so dismiss/concurrency checks see a live process
+    # even between tiers. The orchestrator overwrites with CC PIDs while they run.
+    pid_file.write_text(str(proc.pid))
     logger.info("Update orchestrator started (pid %d), log: %s", proc.pid, log_file)
 
     return jsonify({
@@ -383,7 +388,7 @@ def _spawn_detached_cc(prompt: str, model: str) -> subprocess.Popen:
 # Template for the orchestrator subprocess. Baked-in paths avoid genesis imports.
 # Uses {}-style placeholders filled by _apply_supervised().
 _ORCHESTRATOR_TEMPLATE = """\
-import subprocess, sys, logging
+import os, subprocess, logging
 from pathlib import Path
 
 logging.basicConfig(
@@ -396,6 +401,7 @@ SUMMARY = Path({summary_file!r})
 ESCALATION = Path({escalation_file!r})
 PID_FILE = Path({pid_file!r})
 GENESIS_ROOT = Path({genesis_root!r})
+MY_PID = os.getpid()
 
 def spawn_cc(prompt, model):
     try:
@@ -408,9 +414,13 @@ def spawn_cc(prompt, model):
         log.info("CC %s started (pid %d)", model, proc.pid)
         proc.wait()
         log.info("CC %s finished (rc=%d)", model, proc.returncode)
+        # Restore orchestrator PID so dismiss/concurrency checks see us
+        # alive between tiers (prevents race where stale CC PID allows dismiss)
+        PID_FILE.write_text(str(MY_PID))
         return proc.returncode
     except Exception as e:
         log.error("Failed to spawn CC %s: %s", model, e)
+        PID_FILE.write_text(str(MY_PID))
         return 1
 
 # ── Tier 1: Haiku ──
@@ -419,18 +429,20 @@ rc1 = spawn_cc({tier1_prompt!r}, "haiku")
 
 # ── Check escalation ──
 if ESCALATION.is_file() and "tier2_needed" in ESCALATION.read_text():
-    log.info("Tier 1 escalated → Tier 2 (Sonnet)")
+    log.info("Tier 1 escalated -> Tier 2 (Sonnet)")
     ESCALATION.unlink(missing_ok=True)
     rc2 = spawn_cc({tier2_prompt!r}, "sonnet")
 
     # Check if Tier 3 needed
     if ESCALATION.is_file() and "tier3_needed" in ESCALATION.read_text():
-        log.info("Tier 2 escalated → Tier 3 (user-initiated Opus)")
+        log.info("Tier 2 escalated -> Tier 3 (user-initiated Opus)")
         SUMMARY.write_text(
             "conflicts_unresolved: Deep merge conflicts require Opus resolution. "
             "Use 'Resolve with Opus' from the dashboard."
         )
 
+# Clean up PID file — orchestrator is done
+PID_FILE.unlink(missing_ok=True)
 log.info("Orchestrator finished")
 """
 
@@ -491,6 +503,18 @@ def update_resolve():
     proc = _spawn_detached_cc(tier3_prompt, "opus")
     _PID_FILE.write_text(str(proc.pid))
     logger.info("Tier 3 (Opus) started (pid %d)", proc.pid)
+
+    # Reaper thread prevents zombie — waits for Opus to finish, cleans up PID file.
+    # Server stays up during Tier 3 (merge-abort keeps it running), so a daemon
+    # thread is safe here (unlike the Tier 1/2 orchestrator).
+    import threading
+
+    def _reap():
+        proc.wait()
+        _PID_FILE.unlink(missing_ok=True)
+        logger.info("Tier 3 (Opus) finished (rc=%d)", proc.returncode)
+
+    threading.Thread(target=_reap, daemon=True, name="tier3-reaper").start()
 
     return jsonify({
         "status": "triggered",
