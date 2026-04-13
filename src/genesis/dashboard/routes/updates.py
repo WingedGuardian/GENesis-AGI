@@ -232,25 +232,38 @@ call for backup when needed.\
 """
 
 _TIER2_PROMPT = """\
-You are resolving issues from a Genesis update that Tier 1 couldn't handle.
+You are resolving merge conflicts from a Genesis update.
 
 Read {summary_file} and {conflict_file} for context.
 
+IMPORTANT: The main working tree is CLEAN — the merge was aborted so the
+system stays operational. You must resolve conflicts in a temporary branch.
+
 If MERGE CONFLICTS:
-1. For each conflicted file, read BOTH sides of every conflict marker
-2. Evaluate: are the changes compatible? (same intent, just different history)
-3. If ALL conflicts in a file are trivially compatible — resolve them:
+1. Create a temporary branch: git checkout -b update-merge-resolution
+2. Redo the merge: git merge origin/main --no-edit
+   (This will reproduce the same conflicts)
+3. For each conflicted file, read BOTH sides of every conflict marker
+4. Evaluate: are the changes compatible? (same intent, just different history)
+5. If ALL conflicts in a file are trivially compatible — resolve them:
    - git checkout --theirs for upstream-only changes
    - git checkout --ours for user-only changes
    - Manual merge where both sides add different things
-4. After resolving: git add <file>
-5. If ANY conflict is ambiguous or involves genuinely different intents:
-   - Do NOT resolve it. Write to {escalation_file}: "tier3_needed"
+6. After resolving each file: git add <file>
+7. If ANY conflict is ambiguous or involves genuinely different intents:
+   - git merge --abort to clean up
+   - git checkout main
+   - git branch -D update-merge-resolution
+   - Write to {escalation_file}: "tier3_needed"
    - Include: which files, what the incompatibility is, your assessment
    - Done.
-6. If all conflicts resolved: git commit --no-edit, then run:
-   bash {update_script_post_merge} 2>&1
-   (This re-runs bootstrap, health checks, etc. from the merge point.)
+8. If all conflicts resolved:
+   - git commit --no-edit
+   - git checkout main
+   - git merge update-merge-resolution --ff-only
+   - git branch -d update-merge-resolution
+   - Run: bash {update_script} 2>&1
+     (update.sh will see the code is merged and run bootstrap + health)
 
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
@@ -267,21 +280,25 @@ _TIER3_PROMPT = """\
 You are resolving deep merge conflicts from a Genesis update.
 
 Read {escalation_file} for Sonnet's analysis of what couldn't be resolved.
-Read the conflicted files directly.
 
-For each conflict:
-1. Understand the intent of BOTH sides:
+IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
+
+1. git checkout -b update-merge-resolution-opus
+2. git merge origin/main --no-edit (reproduces conflicts)
+3. For each conflict, understand the intent of BOTH sides:
    - LOCAL (ours): user customizations, additions, local config
    - REMOTE (theirs): upstream bug fixes, features, improvements
-2. Find the resolution that preserves both intents
-3. Where intents genuinely conflict:
+4. Find the resolution that preserves both intents
+5. Where intents genuinely conflict:
    - Bug fixes and security patches: upstream wins
    - User identity, config, customizations: user wins
    - Feature additions: merge both, adapting as needed
-4. After resolving all conflicts: git add, git commit --no-edit
-5. Run: bash {update_script_post_merge} 2>&1
-6. Write a resolution report to {summary_file} explaining each decision
+6. After resolving: git add, git commit --no-edit
+7. git checkout main && git merge update-merge-resolution-opus --ff-only
+8. git branch -d update-merge-resolution-opus
+9. Run: bash {update_script} 2>&1
 
+Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\
 """
 
@@ -378,7 +395,7 @@ def _run_tier2(pid_file: Path) -> None:
         summary_file=_SUMMARY_FILE,
         conflict_file=_CONFLICT_FILE,
         escalation_file=_ESCALATION_FILE,
-        update_script_post_merge=_UPDATE_SCRIPT,
+        update_script=_UPDATE_SCRIPT,
     )
 
     rc = _spawn_cc(prompt, "sonnet", pid_file)
@@ -397,7 +414,7 @@ def _run_tier3(pid_file: Path) -> None:
     prompt = _TIER3_PROMPT.format(
         escalation_file=_ESCALATION_FILE,
         summary_file=_SUMMARY_FILE,
-        update_script_post_merge=_UPDATE_SCRIPT,
+        update_script=_UPDATE_SCRIPT,
     )
 
     rc = _spawn_cc(prompt, "opus", pid_file)
