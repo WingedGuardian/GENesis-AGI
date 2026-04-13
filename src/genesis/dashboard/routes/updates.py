@@ -261,8 +261,8 @@ If MERGE CONFLICTS:
    - git checkout main
    - git merge update-merge-resolution --ff-only
    - git branch -d update-merge-resolution
-   - Run: bash {update_script} 2>&1
-     (update.sh will see the code is merged and run bootstrap + health)
+   - Run: bash {update_script} --post-merge 2>&1
+     (--post-merge skips fetch/merge, runs only bootstrap + health)
 
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
@@ -295,7 +295,7 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 6. After resolving: git add, git commit --no-edit
 7. git checkout main && git merge update-merge-resolution-opus --ff-only
 8. git branch -d update-merge-resolution-opus
-9. Run: bash {update_script} 2>&1
+9. Run: bash {update_script} --post-merge 2>&1
 
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\

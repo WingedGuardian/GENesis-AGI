@@ -12,7 +12,9 @@
 #   - update_history table written on success + failure
 #   - Writes failure context for CC-assisted recovery
 #
-# Usage: ./scripts/update.sh
+# Usage: ./scripts/update.sh [--post-merge]
+#   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
+#                 run only bootstrap, migrations, health check, and service restart.
 
 set -euo pipefail
 
@@ -37,6 +39,12 @@ trap 'rm -f "${BASH_SOURCE[0]}" 2>/dev/null' EXIT
 # and triggering nohup fallback. Same fix as genesis.util.systemd.systemctl_env().
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
+# ── Flag parsing ─────────────────────────────────────────
+POST_MERGE=false
+for _arg in "$@"; do
+    [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
+done
 
 GENESIS_ROOT="${GENESIS_UPDATE_ORIG_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 SCRIPT_DIR="$GENESIS_ROOT/scripts"
@@ -118,8 +126,41 @@ fi
 
 # ── Rollback tag ─────────────────────────────────────────
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
-git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
-echo "  Rollback tag: $ROLLBACK_TAG"
+if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
+    # In post-merge mode, reuse the rollback tag from the initial update.sh run
+    # so rollback goes to pre-merge code, not the merged code.
+    _saved_rt=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('rollback_tag',''))" \
+        2>/dev/null
+    ) || _saved_rt=""
+    if [ -n "$_saved_rt" ] && git -C "$GENESIS_ROOT" rev-parse "$_saved_rt" >/dev/null 2>&1; then
+        ROLLBACK_TAG="$_saved_rt"
+        echo "  Post-merge mode: reusing rollback tag $ROLLBACK_TAG"
+    else
+        git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
+        echo "  Post-merge mode: created fallback rollback tag $ROLLBACK_TAG"
+    fi
+    # Recover OLD_TAG/OLD_COMMIT from state file for correct update_history.
+    _saved_old_tag=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_tag',''))" \
+        2>/dev/null
+    ) || true
+    [ -n "${_saved_old_tag:-}" ] && OLD_TAG="$_saved_old_tag"
+    _saved_old_commit=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_commit',''))" \
+        2>/dev/null
+    ) || true
+    [ -n "${_saved_old_commit:-}" ] && OLD_COMMIT="$_saved_old_commit"
+else
+    git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
+    echo "  Rollback tag: $ROLLBACK_TAG"
+fi
 echo ""
 
 _write_state "fetching"
@@ -374,6 +415,7 @@ _on_err() {
 }
 trap _on_err ERR
 
+if [[ "$POST_MERGE" == "false" ]]; then
 _write_state "merging"
 
 # ── Fetch + Merge ────────────────────────────────────────
@@ -456,6 +498,15 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     echo ""
     echo "  Nothing to do."
     exit 0
+fi
+fi  # end: [[ "$POST_MERGE" == "false" ]]
+
+NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
+NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
+
+if [[ "$POST_MERGE" == "true" ]]; then
+    echo "--- Post-merge mode: running bootstrap on conflict-resolved code ---"
+    echo "  Merged: $OLD_TAG ($OLD_COMMIT) → $NEW_TAG ($NEW_COMMIT)"
 fi
 echo ""
 
