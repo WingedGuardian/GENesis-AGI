@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 
+from genesis.env import user_timezone
 from genesis.mail.types import MailConfig
 
 logger = logging.getLogger(__name__)
@@ -29,6 +29,6 @@ def load_mail_config(path: Path) -> MailConfig:
         max_retries=section.get("max_retries", 3),
         imap_timeout_s=section.get("imap_timeout_s", 30),
         max_emails_per_run=section.get("max_emails_per_run", 50),
-        timezone=section.get("timezone", os.environ.get("USER_TIMEZONE", "UTC")),
+        timezone=section.get("timezone", user_timezone()),
         min_relevance=section.get("min_relevance", 3),
     )

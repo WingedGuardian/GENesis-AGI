@@ -21,6 +21,14 @@ providers:
     model: mistral-large-latest
     profile: mistral-large-3
     free: true
+    # Raised 2→4 on 2026-04-11 after a data-grounded review of observed
+    # usage (memory/project_mistral_large_review.md). Actual call sizes
+    # average ~3k tokens (not the 13k/call figure the earlier 2-rpm cap
+    # was based on), so 4 rpm × ~5k worst-case ≈ 20k tokens/min leaves
+    # ~60% headroom under the stated 50k tokens/min ceiling. The live
+    # TPM header has NOT been reprobed in this pass — if observed usage
+    # grows or call patterns shift above ~6k/call sustained, revisit
+    # before going higher.
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:
@@ -28,6 +36,9 @@ providers:
     model: mistral-small-latest
     profile: mistral-small
     free: true
+    # Mistral free tier publishes 60 req/min + 375k tokens/min for
+    # mistral-small-latest (verified 2026-04-11 via x-ratelimit-limit-req-minute
+    # header on a live probe). Setting to 30 leaves 50% headroom.
     rpm_limit: 30
     open_duration_s: 120
   groq-free:
@@ -174,8 +185,8 @@ call_sites:
     retry_profile: background
     never_pays: false
     cc_model: Sonnet
-    dispatch: cli
-    cc_position: 4
+    dispatch: dual
+    cc_position: 2
   6_strategic_reflection:
     chain:
     - claude-opus
@@ -210,6 +221,13 @@ call_sites:
     - claude-sonnet
     default_paid: true
   11_user_model_synthesis:
+    # LLM-narrative synthesis of the user model. Wired in
+    # runtime/init/learning.py — every 48h the user_model_evolver job calls
+    # router.call("11_user_model_synthesis", ...) with the current model dict
+    # plus recent delta evidence, and writes the result to USER_KNOWLEDGE.md.
+    # Free-first chain — synthesis is summary-quality work that does not
+    # require frontier models. On all-free-exhausted, learning.py falls back
+    # to Python dict rendering as graceful degradation.
     chain:
     - mistral-small-free
     - groq-free
@@ -270,7 +288,7 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
-    - openrouter-nemo
+    - openrouter-nemo  # cheap paid tail — prevents DLQ storm when both free providers trip (mirrors 37_infrastructure_monitor)
   30_triage_calibration:
     chain:
     - lmstudio-30b
@@ -311,7 +329,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
-    - openrouter-free
+    - openrouter-free  # 4th free provider for resilience (same failure shape as site 29)
     description: Draft content for various platforms
   23_fresh_eyes_review:
     chain:
@@ -347,8 +365,7 @@ call_sites:
     - groq-free
     never_pays: true
     retry_profile: background
-    description: "CC contingency \u2014 Micro reflection via free API when CC unavailable\
-      \ (cheap periodic ticks, quality not critical)"
+    description: "CC contingency \u2014 Micro reflection via free API when CC unavailable (cheap periodic ticks, quality not critical)"
   autonomous_executor_reasoning:
     chain:
     - claude-sonnet

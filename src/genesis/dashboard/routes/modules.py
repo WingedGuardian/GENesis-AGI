@@ -185,7 +185,12 @@ async def _build_module_health(rt, mod) -> dict:
 @blueprint.route("/api/genesis/modules/<name>/toggle", methods=["POST"])
 @_async_route
 async def module_toggle(name: str):
-    """Toggle a capability module on or off."""
+    """Toggle a capability module on or off.
+
+    Side effect: when a module owns a research profile (via
+    ``get_research_profile_name()``), toggling the module also
+    adds/removes the profile's pipeline scheduler job.
+    """
     from genesis.modules.persistence import save_module_state
     from genesis.runtime import GenesisRuntime
 
@@ -204,7 +209,61 @@ async def module_toggle(name: str):
     if rt.db is not None:
         await save_module_state(rt.db, name, enabled=new_state)
 
-    return jsonify({"status": "ok", "name": name, "enabled": new_state})
+    # Manage the associated research profile's scheduler job
+    profile_name = mod.get_research_profile_name()
+    profile_managed = False
+    if profile_name and rt.surplus_scheduler is not None:
+        scheduler = rt.surplus_scheduler._scheduler
+        job_id = f"pipeline_{profile_name}"
+        if new_state:
+            # Module enabled → add profile job if profile YAML is also enabled
+            try:
+                from apscheduler.triggers.interval import IntervalTrigger
+
+                from genesis.pipeline.profiles import ProfileLoader
+
+                loader = ProfileLoader()
+                loader.load_all()
+                loader.merge_overlay()
+                profile = loader.get(profile_name)
+                if profile and profile.enabled:
+                    async def _cycle(pname: str = profile_name) -> None:
+                        from genesis.runtime.init.pipeline import run_pipeline_cycle
+                        await run_pipeline_cycle(rt, pname)
+
+                    scheduler.add_job(
+                        _cycle,
+                        IntervalTrigger(minutes=profile.tier0_interval_minutes),
+                        id=job_id,
+                        max_instances=1,
+                        misfire_grace_time=300,
+                        replace_existing=True,
+                    )
+                    logger.info("Added pipeline job %s (module %s enabled)", job_id, name)
+                    profile_managed = True
+                elif profile and not profile.enabled:
+                    logger.info(
+                        "Module %s enabled but profile %s is disabled in YAML — no job added",
+                        name, profile_name,
+                    )
+            except Exception:
+                logger.warning("Failed to add pipeline job for %s", profile_name, exc_info=True)
+        else:
+            # Module disabled → remove profile job
+            try:
+                scheduler.remove_job(job_id)
+                logger.info("Removed pipeline job %s (module %s disabled)", job_id, name)
+                profile_managed = True
+            except Exception:
+                # Job may not exist (e.g., profile was disabled in YAML)
+                logger.debug("No pipeline job %s to remove", job_id)
+
+    return jsonify({
+        "status": "ok",
+        "name": name,
+        "enabled": new_state,
+        "profile_managed": profile_managed,
+    })
 
 
 @blueprint.route("/api/genesis/modules/<name>/config", methods=["PATCH"])

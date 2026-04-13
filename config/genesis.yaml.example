@@ -1,0 +1,30 @@
+# Genesis local configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy to ~/.genesis/config/genesis.yaml and edit for your environment.
+# Run scripts/setup-local-config.sh to generate this interactively.
+#
+# This file is machine-specific — NEVER commit it to git.
+# All values here can also be set via environment variables (env var wins).
+# ─────────────────────────────────────────────────────────────────────────────
+
+network:
+  # Ollama API endpoint. Set ollama_enabled: true if you have a local Ollama.
+  # Env var override: OLLAMA_URL
+  ollama_url: "http://localhost:11434"
+  ollama_enabled: false
+
+  # LM Studio endpoint (optional; leave as default if not using LM Studio).
+  # Env var override: LM_STUDIO_URL
+  lm_studio_url: "http://localhost:1234/v1"
+
+# Your local timezone in IANA format.
+# Find yours at https://en.wikipedia.org/wiki/List_of_tz_database_time_zones
+# Env var override: USER_TIMEZONE
+timezone: "UTC"
+
+# GitHub configuration — used by the contribution pipeline and docs.
+# Env var overrides: GENESIS_GITHUB_USER, GENESIS_GITHUB_PUBLIC_REPO
+github:
+  user: "YOUR_GITHUB_USER"
+  public_repo: "GENesis-AGI"
+  private_repo: ""   # Optional: your private fork name

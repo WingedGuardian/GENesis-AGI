@@ -507,12 +507,6 @@ echo "  Setting up user inside container..."
 # Create ubuntu user if it doesn't exist
 incus exec "$CONTAINER_NAME" -- bash -c 'id ubuntu &>/dev/null || useradd -m -s /bin/bash ubuntu' 2>/dev/null
 
-# Persist HOME in /etc/environment so all sessions (including Claude Code)
-# have it set without requiring a login shell.
-incus exec "$CONTAINER_NAME" -- bash -c '
-    grep -q "^HOME=" /etc/environment 2>/dev/null || echo "HOME=/home/ubuntu" >> /etc/environment
-' 2>/dev/null
-
 # Enable linger for systemd user services
 incus exec "$CONTAINER_NAME" -- loginctl enable-linger ubuntu 2>/dev/null || true
 

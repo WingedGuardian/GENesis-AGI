@@ -145,6 +145,7 @@
         // ── Memory tab state ──────────────────────────────────────
         memorySearch: { query: "", results: [], loading: false },
         memoryRecent: { items: [], total: 0, loading: false },
+        memoryCollectionFilter: "",  // "" = all, "episodic_memory", "knowledge_base"
         memoryStats: {},
         memoryDetail: null,
 
@@ -310,7 +311,7 @@
           // Check auth status (non-blocking, best-effort)
           this.checkAuth();
 
-          // Always fetch: health, errors, pause, update status (needed on all tabs)
+          // Always fetch: health, errors, pause (needed on all tabs)
           await Promise.all([
             this.fetchHealth(),
             this.fetchErrorSummary(),
@@ -613,7 +614,11 @@
         async fetchMemoryRecent() {
           this.memoryRecent.loading = true;
           try {
-            const resp = await fetchApi("/api/genesis/memory/recent?limit=50");
+            let url = "/api/genesis/memory/recent?limit=50";
+            if (this.memoryCollectionFilter) {
+              url += "&collection=" + encodeURIComponent(this.memoryCollectionFilter);
+            }
+            const resp = await fetchApi(url);
             if (resp && resp.ok) {
               const data = await resp.json();
               this.memoryRecent.items = data.memories || [];
@@ -703,8 +708,7 @@
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ supervised: true }),
             });
-          } catch (e) { /* expected — server may die before response */ }
-          // Enter reconnect loop
+          } catch (e) { alert("Apply failed: " + e.message); }
           this._updateReconnecting = true;
           const start = Date.now();
           const poll = setInterval(async () => {
@@ -2178,7 +2182,6 @@
           if (this.costSemantic().state === "degraded") {
             items.push({ level: "warning", title: "Budget pressure rising", detail: this.costSemantic().reason, href: "#budget-controls", tab: "config", anchor: "budget-controls" });
           }
-          // Update availability
           if (this.updateStatus?.update_available) {
             const u = this.updateStatus.update_available;
             const label = u.target_tag || (u.commits_behind + " commit" + (u.commits_behind === 1 ? "" : "s") + " behind");
@@ -6110,6 +6113,12 @@
               <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.qdrant_episodic_memory"></div>
             </div>
           </template>
+          <template x-if="$store.genesisDashboard.memoryStats.qdrant_knowledge_base != null">
+            <div class="card" style="flex:1; min-width:120px; padding:0.75rem;">
+              <div style="font-size:0.7rem; color:var(--color-text-secondary);">Qdrant Knowledge</div>
+              <div style="font-size:1.5rem; font-weight:600;" x-text="$store.genesisDashboard.memoryStats.qdrant_knowledge_base"></div>
+            </div>
+          </template>
         </div>
 
         <!-- Search -->
@@ -6164,8 +6173,15 @@
 
         <!-- Recent memories -->
         <div class="card">
-          <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary);">
-            Recent Memories (<span x-text="$store.genesisDashboard.memoryRecent.total"></span> total)
+          <div style="padding:0.5rem; font-size:0.8rem; color:var(--color-text-secondary); display:flex; justify-content:space-between; align-items:center;">
+            <span>Recent Memories (<span x-text="$store.genesisDashboard.memoryRecent.total"></span> total)</span>
+            <select x-model="$store.genesisDashboard.memoryCollectionFilter"
+                    @change="$store.genesisDashboard.fetchMemoryRecent()"
+                    style="background:var(--color-bg-primary); border:1px solid var(--color-border); color:var(--color-text-secondary); padding:0.2rem 0.4rem; border-radius:4px; font-size:0.7rem; font-family:inherit;">
+              <option value="">All Collections</option>
+              <option value="episodic_memory">Episodic Memory</option>
+              <option value="knowledge_base">Knowledge Base</option>
+            </select>
           </div>
           <template x-if="$store.genesisDashboard.memoryRecent.loading">
             <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
@@ -6185,111 +6201,14 @@
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════
-         Panel: Backup & Updates [Tab: backup]
+         Panel: Backup Monitoring [Tab: backup]
          ═══════════════════════════════════════════════════════════ -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'backup'">
       <div class="panel-header">
-        <span class="material-symbols-outlined">system_update</span>
-        Backup & Updates
+        <span class="material-symbols-outlined">backup</span>
+        Backup Monitoring
       </div>
       <div class="panel-body">
-
-        <!-- ── Update Section ─────────────────────────────────── -->
-        <div id="update-section" style="margin-bottom:1.5rem;">
-
-          <!-- Updating overlay -->
-          <template x-if="$store.genesisDashboard._updating">
-            <div class="card" style="padding:1.5rem; text-align:center;">
-              <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
-              <div style="font-size:1rem; font-weight:500;" x-text="$store.genesisDashboard._updateReconnecting ? 'Reconnecting to dashboard...' : 'Update in progress...'"></div>
-              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take 1-2 minutes.</div>
-            </div>
-          </template>
-
-          <!-- Normal update UI -->
-          <template x-if="!$store.genesisDashboard._updating">
-            <div>
-              <!-- Version + check/apply -->
-              <div class="card" style="padding:1rem; margin-bottom:1rem;">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                  <h3 style="margin:0; font-size:1rem;">Genesis Version</h3>
-                  <div style="display:flex; gap:0.5rem;">
-                    <template x-if="$store.genesisDashboard.updateStatus?.update_available">
-                      <button @click="$store.genesisDashboard.applyUpdate()"
-                              style="background:#2196F3; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                        Install Update</button>
-                    </template>
-                    <button @click="$store.genesisDashboard.checkForUpdates()"
-                            :disabled="$store.genesisDashboard._checkingForUpdates"
-                            style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                      <span x-text="$store.genesisDashboard._checkingForUpdates ? 'Checking...' : 'Check for Updates'"></span>
-                    </button>
-                  </div>
-                </div>
-
-                <!-- Current version -->
-                <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
-                  <div>
-                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">Current</span><br>
-                    <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus?.current_version || '...') + ' (' + ($store.genesisDashboard.updateStatus?.current_commit || '...') + ')'"></span>
-                  </div>
-                </div>
-
-                <!-- Update available banner -->
-                <template x-if="$store.genesisDashboard.updateStatus?.update_available">
-                  <div style="margin-top:0.75rem; padding:0.75rem; border-radius:4px; background:rgba(33,150,243,0.1); border:1px solid rgba(33,150,243,0.3);">
-                    <div style="font-size:0.85rem; font-weight:500; color:#2196F3;">
-                      Update available
-                      <span x-text="$store.genesisDashboard.updateStatus.update_available.target_tag ? '  ' + $store.genesisDashboard.updateStatus.update_available.target_tag : ''"></span>
-                    </div>
-                    <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.25rem;"
-                         x-text="($store.genesisDashboard.updateStatus.update_available.commits_behind || '?') + ' commit(s) behind'"></div>
-                    <template x-if="$store.genesisDashboard.updateStatus.update_available.summary">
-                      <pre style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.5rem; max-height:6rem; overflow-y:auto; white-space:pre-wrap; background:transparent; border:none; padding:0;"
-                           x-text="$store.genesisDashboard.updateStatus.update_available.summary"></pre>
-                    </template>
-                  </div>
-                </template>
-
-                <!-- Up to date -->
-                <template x-if="$store.genesisDashboard.updateStatus && !$store.genesisDashboard.updateStatus.update_available">
-                  <div style="margin-top:0.5rem; font-size:0.8rem; color:#81c784;">Up to date</div>
-                </template>
-              </div>
-
-              <!-- Last update result -->
-              <template x-if="$store.genesisDashboard.updateStatus?.last_update">
-                <div class="card" style="padding:1rem; margin-bottom:1rem;">
-                  <h3 style="margin:0 0 0.75rem 0; font-size:1rem;">Last Update</h3>
-                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
-                    <div>
-                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
-                      <span style="font-size:0.9rem;"
-                            :style="$store.genesisDashboard.updateStatus.last_update.status === 'success' ? 'color:#81c784' : 'color:#ef9a9a'"
-                            x-text="$store.genesisDashboard.updateStatus.last_update.status"></span>
-                    </div>
-                    <div>
-                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Version</span><br>
-                      <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus.last_update.old_tag || '?') + ' → ' + ($store.genesisDashboard.updateStatus.last_update.new_tag || '?')"></span>
-                    </div>
-                    <div>
-                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">When</span><br>
-                      <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.updateStatus.last_update.completed_at ? new Date($store.genesisDashboard.updateStatus.last_update.completed_at).toLocaleString() : 'in progress'"></span>
-                    </div>
-                  </div>
-                  <template x-if="$store.genesisDashboard.updateStatus.last_update.failure_reason">
-                    <div style="margin-top:0.75rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
-                         x-text="$store.genesisDashboard.updateStatus.last_update.failure_reason"></div>
-                  </template>
-                </div>
-              </template>
-            </div>
-          </template>
-        </div>
-
-        <hr style="border:none; border-top:1px solid var(--color-border); margin-bottom:1.5rem;">
-
-        <!-- ── Backup Section (original) ──────────────────────── -->
         <template x-if="!$store.genesisDashboard.backupStatus">
           <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
         </template>
@@ -6356,6 +6275,84 @@
             </div>
           </div>
         </template>
+
+        <!-- ── Update Section ─────────────────────────────────── -->
+        <div id="update-section" style="margin-bottom:1.5rem;">
+          <template x-if="$store.genesisDashboard._updating">
+            <div class="card" style="padding:1.5rem; text-align:center;">
+              <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
+              <div style="font-size:1rem; font-weight:500;" x-text="$store.genesisDashboard._updateReconnecting ? 'Reconnecting to dashboard...' : 'Update in progress...'"></div>
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take 1-2 minutes.</div>
+            </div>
+          </template>
+          <template x-if="!$store.genesisDashboard._updating">
+            <div>
+              <div class="card" style="padding:1rem; margin-bottom:1rem;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                  <h3 style="margin:0; font-size:1rem;">Genesis Version</h3>
+                  <div style="display:flex; gap:0.5rem;">
+                    <template x-if="$store.genesisDashboard.updateStatus?.update_available">
+                      <button @click="$store.genesisDashboard.applyUpdate()"
+                              style="background:#2196F3; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Install Update</button>
+                    </template>
+                    <button @click="$store.genesisDashboard.checkForUpdates()"
+                            style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                      Check for Updates</button>
+                  </div>
+                </div>
+                <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
+                  <div>
+                    <span style="font-size:0.7rem; color:var(--color-text-secondary);">Current</span><br>
+                    <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus?.current_version || '...') + ' (' + ($store.genesisDashboard.updateStatus?.current_commit || '...') + ')'"></span>
+                  </div>
+                </div>
+                <template x-if="$store.genesisDashboard.updateStatus?.update_available">
+                  <div style="margin-top:0.75rem; padding:0.75rem; border-radius:4px; background:rgba(33,150,243,0.1); border:1px solid rgba(33,150,243,0.3);">
+                    <div style="font-size:0.85rem; font-weight:500; color:#2196F3;">
+                      Update available
+                      <span x-text="$store.genesisDashboard.updateStatus.update_available.target_tag ? '  ' + $store.genesisDashboard.updateStatus.update_available.target_tag : ''"></span>
+                    </div>
+                    <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.25rem;"
+                         x-text="($store.genesisDashboard.updateStatus.update_available.commits_behind || '?') + ' commit(s) behind'"></div>
+                    <template x-if="$store.genesisDashboard.updateStatus.update_available.summary">
+                      <pre style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.5rem; max-height:6rem; overflow-y:auto; white-space:pre-wrap; background:transparent; border:none; padding:0;"
+                           x-text="$store.genesisDashboard.updateStatus.update_available.summary"></pre>
+                    </template>
+                  </div>
+                </template>
+                <template x-if="$store.genesisDashboard.updateStatus && !$store.genesisDashboard.updateStatus.update_available">
+                  <div style="margin-top:0.5rem; font-size:0.8rem; color:#81c784;">Up to date</div>
+                </template>
+              </div>
+              <template x-if="$store.genesisDashboard.updateStatus?.last_update">
+                <div class="card" style="padding:1rem; margin-bottom:1rem;">
+                  <h3 style="margin:0 0 0.75rem 0; font-size:1rem;">Last Update</h3>
+                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap;">
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Status</span><br>
+                      <span style="font-size:0.9rem;"
+                            :style="$store.genesisDashboard.updateStatus.last_update.status === 'success' ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.updateStatus.last_update.status"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Version</span><br>
+                      <span style="font-size:0.9rem;" x-text="($store.genesisDashboard.updateStatus.last_update.old_tag || '?') + ' → ' + ($store.genesisDashboard.updateStatus.last_update.new_tag || '?')"></span>
+                    </div>
+                    <div>
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">When</span><br>
+                      <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.updateStatus.last_update.completed_at ? new Date($store.genesisDashboard.updateStatus.last_update.completed_at).toLocaleString() : 'in progress'"></span>
+                    </div>
+                  </div>
+                  <template x-if="$store.genesisDashboard.updateStatus.last_update.failure_reason">
+                    <div style="margin-top:0.75rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
+                         x-text="$store.genesisDashboard.updateStatus.last_update.failure_reason"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
 

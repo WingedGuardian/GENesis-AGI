@@ -49,6 +49,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         profile_loader = ProfileLoader()
         profile_loader.load_all()
+        profile_loader.merge_overlay()
 
         module_dispatcher = None
         if rt._module_registry is not None:
