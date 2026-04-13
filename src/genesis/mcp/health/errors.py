@@ -441,8 +441,8 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                 alert_id = "genesis:update_available"
                 alerts.append({
                     "id": alert_id,
-                    "severity": "WARNING",
-                    "message": f"Genesis update available: {tag} ({behind} commits behind)",
+                    "severity": "INFO",
+                    "message": f"New Genesis version available: {tag} ({behind} commits behind) — update from dashboard",
                 })
                 current_ids.add(alert_id)
 
