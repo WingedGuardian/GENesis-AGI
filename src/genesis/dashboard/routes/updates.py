@@ -34,6 +34,24 @@ def _git(*args: str, timeout: int = 10) -> str | None:
         return None
 
 
+def _update_remote() -> str:
+    """Return the git remote that points to the public/primary repo.
+
+    Reads github.public_repo from genesis.env (e.g. 'GENesis-AGI') and finds
+    the matching remote. Falls back to 'origin' if detection fails.
+    """
+    try:
+        from genesis.env import github_public_repo
+        public_repo = github_public_repo()
+        output = _git("remote", "-v") or ""
+        for line in output.splitlines():
+            if public_repo in line and "(fetch)" in line:
+                return line.split()[0]
+    except Exception:
+        pass
+    return "origin"
+
+
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query against genesis.db. Returns list of row dicts."""
     if not _DB_PATH.is_file():
@@ -104,26 +122,24 @@ def update_status():
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
     """Force an upstream check (git fetch + compare)."""
+    remote = _update_remote()
     # git fetch produces no stdout on success; None means the command failed
-    if _git("fetch", "origin", "main", timeout=30) is None:
+    if _git("fetch", remote, "main", timeout=30) is None:
         return jsonify({"error": "git fetch failed"}), 502
 
+    ref = f"{remote}/main"
     # Count commits behind
-    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+    behind_str = _git("rev-list", "--count", f"HEAD..{ref}")
     commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
 
     target_tag = None
     if commits_behind > 0:
-        target_tag = _git(
-            "describe", "--tags", "--abbrev=0", "origin/main"
-        )
+        target_tag = _git("describe", "--tags", "--abbrev=0", ref)
 
     # Summary of what changed
     summary = None
     if commits_behind > 0:
-        summary = _git(
-            "log", "--oneline", "--no-merges", "HEAD..origin/main",
-        )
+        summary = _git("log", "--oneline", "--no-merges", f"HEAD..{ref}")
 
     return jsonify({
         "commits_behind": commits_behind,

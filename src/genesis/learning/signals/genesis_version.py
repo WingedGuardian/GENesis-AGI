@@ -47,6 +47,29 @@ def _load_updates_config() -> dict:
     return {"check": {"enabled": True, "interval_hours": 6}}
 
 
+def _update_remote() -> str:
+    """Return the git remote that points to the public/primary repo.
+
+    Reads github.public_repo from genesis.env and matches it against
+    'git remote -v'. Falls back to 'origin' if detection fails.
+    """
+    import subprocess
+    try:
+        from genesis.env import github_public_repo
+        public_repo = github_public_repo()
+        result = subprocess.run(
+            ["git", "-C", str(_GENESIS_ROOT), "remote", "-v"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if public_repo in line and "(fetch)" in line:
+                    return line.split()[0]
+    except Exception:
+        pass
+    return "origin"
+
+
 class GenesisVersionCollector:
     """Detects Genesis version changes and available upstream updates.
 
@@ -186,16 +209,17 @@ class GenesisVersionCollector:
         return stdout.decode().strip()
 
     async def _check_upstream(self) -> tuple[int, str]:
-        """Fetch origin/main and return (commits_behind, summary).
+        """Fetch the upstream primary remote and return (commits_behind, summary).
 
-        Returns (0, "") only when origin/main is reachable AND we are
-        up to date. Raises RuntimeError on git failure (network down,
-        auth failure, missing remote) so the caller can log the error
-        properly — silent failures hide broken state.
+        Uses the remote pointing to github_public_repo() (e.g. 'public'),
+        falling back to 'origin'. Raises RuntimeError on git failure.
         """
+        remote = _update_remote()
+        ref = f"{remote}/main"
+
         # Fetch (updates remote refs, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", "origin", "main",
+            "git", "fetch", remote, "main",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -204,12 +228,12 @@ class GenesisVersionCollector:
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
             raise RuntimeError(
-                f"git fetch origin main failed (exit {proc.returncode}): {stderr_text}"
+                f"git fetch {remote} main failed (exit {proc.returncode}): {stderr_text}"
             )
 
         # Count commits behind
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-list", "--count", "HEAD..origin/main",
+            "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -227,7 +251,7 @@ class GenesisVersionCollector:
 
         # Get summary of what's new
         proc = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", "HEAD..origin/main",
+            "git", "log", "--oneline", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
