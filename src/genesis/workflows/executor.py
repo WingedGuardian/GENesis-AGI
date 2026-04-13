@@ -156,17 +156,23 @@ def execute_deterministic_step(
     *,
     cwd: str | None = None,
 ) -> tuple[bool, str]:
-    """Execute a deterministic (bash) step. Returns (success, output)."""
+    """Execute a deterministic (bash) step. Returns (success, output).
+
+    SECURITY: Commands come from trusted YAML files in ~/.genesis/workflows/.
+    Only the user or Genesis (with user-granted autonomy) can place files there.
+    shell=True is intentional — workflow commands use shell features (&&, |, ~).
+    """
+    # GROUNDWORK(workflow-sandboxing): Future: validate commands against allowlist
     if not step.command:
         return False, "No command specified"
     try:
         result = subprocess.run(
             step.command,
-            shell=True,  # noqa: S602
+            shell=True,  # noqa: S602 — trusted YAML source, see docstring
             capture_output=True,
             text=True,
             cwd=cwd,
-            timeout=300,
+            timeout=300,  # user-acknowledged: workflow steps need bounded execution
         )
         output = result.stdout
         if result.returncode != 0:
