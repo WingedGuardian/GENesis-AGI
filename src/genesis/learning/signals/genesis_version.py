@@ -399,16 +399,16 @@ class GenesisVersionCollector:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
             message = (
-                f"Genesis update available — {behind} commit(s) behind origin/main.\n\n"
-                f"Recent changes:\n{summary}\n\n"
-                f"Run ./scripts/update.sh to update."
+                f"New Genesis version available ({behind} commit(s) behind).\n\n"
+                f"Highlights:\n{summary}\n\n"
+                f"Update from the dashboard when convenient."
             )
 
             await pipeline.submit(OutreachRequest(
-                category=OutreachCategory.ALERT,
+                category=OutreachCategory.DIGEST,
                 topic="Genesis update available",
                 context=message,
-                salience_score=0.6,
+                salience_score=0.4,
                 signal_type="genesis_update",
             ))
         except Exception:
