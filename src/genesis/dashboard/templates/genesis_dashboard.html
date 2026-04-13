@@ -691,7 +691,20 @@
           try {
             const resp = await fetchApi("/api/genesis/updates/check", { method: "POST" });
             if (resp && resp.ok) {
+              const data = await resp.json();
+              // Refresh current_version / last_update fields from DB
               await this.fetchUpdateStatus();
+              // Overlay the fresh check result — DB observation may be stale
+              if (this.updateStatus) {
+                this.updateStatus = {
+                  ...this.updateStatus,
+                  update_available: data.commits_behind > 0 ? {
+                    commits_behind: data.commits_behind,
+                    target_tag: data.target_tag,
+                    summary: data.summary,
+                  } : null,
+                };
+              }
             } else {
               alert("Check failed — could not reach upstream");
             }
@@ -6297,8 +6310,10 @@
                         Install Update</button>
                     </template>
                     <button @click="$store.genesisDashboard.checkForUpdates()"
-                            style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                      Check for Updates</button>
+                            :disabled="$store.genesisDashboard._checkingForUpdates"
+                            style="background:var(--color-accent); color:#000; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;"
+                            :style="$store.genesisDashboard._checkingForUpdates ? 'opacity:0.6;cursor:not-allowed' : ''">
+                      <span x-text="$store.genesisDashboard._checkingForUpdates ? 'Checking...' : 'Check for Updates'"></span></button>
                   </div>
                 </div>
                 <div style="display:flex; gap:1.5rem; flex-wrap:wrap; margin-bottom:0.5rem;">
