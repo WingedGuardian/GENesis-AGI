@@ -1935,15 +1935,89 @@ function updateSubsystemGrid(data) {
         }
         if (key === 'memory') {
             const q = data.queues || {};
-            if (q.pending_embeddings !== undefined) box.appendChild(sectionRow('Pending', String(q.pending_embeddings)));
-            if (q.failed_embeddings) box.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444'));
-            if (q.embedded_total !== undefined) box.appendChild(sectionRow('Total Stored', String(q.embedded_total)));
             const mh = data.memory_health || {};
+            const pm = data.proactive_memory || {};
+
+            // Header line: total vectors + links
+            const links = mh.links || {};
+            if (q.embedded_total || links.total) {
+                const parts = [];
+                if (q.embedded_total) parts.push(q.embedded_total + ' vectors');
+                if (links.total) parts.push(links.total.toLocaleString() + ' links');
+                box.appendChild(sectionRow('Store', parts.join(' · ')));
+            }
+
+            // L1 Essential Knowledge
+            const ek = mh.essential_knowledge || {};
+            if (ek.age_hours !== null && ek.age_hours !== undefined) {
+                const age = ek.age_hours;
+                const c = age > 24 ? 'color:#ef4444' : age > 6 ? 'color:#ffe600' : 'color:#4ade80';
+                const size = ek.size_bytes ? ' · ' + (ek.size_bytes / 1024).toFixed(1) + 'KB' : '';
+                box.appendChild(sectionRow('L1 EK', age.toFixed(1) + 'h ago' + size, c));
+            }
+
+            // L2 Proactive Hook
+            if (pm.latency_ms !== undefined) {
+                const lat = pm.latency_ms;
+                const fts = pm.fts5_results || 0;
+                const vec = pm.vector_results || 0;
+                const fused = pm.fused_results || 0;
+                box.appendChild(sectionRow('L2 Hook', lat + 'ms · FTS:' + fts + ' Vec:' + vec + ' → ' + fused));
+            }
+
+            // Wing distribution
+            const wings = mh.wings || [];
+            if (wings.length > 0) {
+                const wStr = wings.slice(0, 5).map(w => w[0] + ':' + w[1]).join(' ');
+                box.appendChild(sectionRow('Wings', wStr));
+            }
+
+            // Class distribution
+            const classes = mh.classes || [];
+            if (classes.length > 0) {
+                const cStr = classes.map(c => c[0] + ':' + c[1]).join(' ');
+                box.appendChild(sectionRow('Classes', cStr));
+            }
+
+            // Confidence distribution
+            const conf = mh.confidence || {};
+            if (conf.high !== undefined) {
+                box.appendChild(sectionRow('Confidence', 'hi:' + conf.high + ' med:' + conf.medium + ' lo:' + conf.low));
+            }
+
+            // Link types (top)
+            if (links.by_type && links.by_type.length > 0) {
+                const lStr = links.by_type.slice(0, 4).map(l => l[0] + ':' + l[1]).join(' ');
+                box.appendChild(sectionRow('Link Types', lStr));
+            }
+
+            // Extraction pipeline
+            const ext = mh.extraction || {};
+            if (ext.total_sessions !== undefined) {
+                const c = ext.coverage_pct >= 90 ? 'color:#4ade80' : ext.coverage_pct >= 50 ? 'color:#ffe600' : 'color:#ef4444';
+                box.appendChild(sectionRow('Extraction', ext.extracted + '/' + ext.total_sessions + ' · ' + ext.coverage_pct + '%', c));
+            }
+
+            // Code index
+            const ci = mh.code_index || {};
+            if (ci.modules) {
+                const age = ci.age_hours;
+                const c = age > 24 ? 'color:#ffe600' : 'color:#4ade80';
+                box.appendChild(sectionRow('Code Index', ci.modules + ' mod · ' + ci.symbols.toLocaleString() + ' sym · ' + (age ? age + 'h' : '?'), c));
+            }
+
+            // Embedding queue
+            if (q.pending_embeddings) box.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600'));
+            if (q.failed_embeddings) box.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444'));
+
+            // Growth
             if (mh.growth) {
                 const g = mh.growth;
                 if (g.last_7d !== undefined) box.appendChild(sectionRow('+7d', String(g.last_7d)));
                 if (g.avg_per_day_7d !== undefined) box.appendChild(sectionRow('Avg/day', String(g.avg_per_day_7d)));
             }
+
+            // Orphans
             if (mh.orphans && mh.orphans.orphan_pct !== undefined) {
                 const pct = mh.orphans.orphan_pct;
                 const c = pct > 50 ? 'color:#ef4444' : pct > 30 ? 'color:#ffe600' : 'color:#4ade80';
