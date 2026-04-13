@@ -2,62 +2,15 @@
 
 from __future__ import annotations
 
-import contextlib
-import json
 import logging
-from pathlib import Path
 
+from genesis.cc.session_cache import persist_session_config as _persist_session_config
 from genesis.mcp.health import mcp  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 _VALID_MODELS = {"sonnet", "opus", "haiku"}
 _VALID_EFFORTS = {"low", "medium", "high", "max"}
-_SESSION_CONFIG = Path.home() / ".genesis" / "session_config.json"
-
-
-def _persist_session_config(*, model: str | None = None, effort: str | None = None) -> None:
-    """Write current model/effort to disk for the SessionStart hook to read.
-
-    This is a best-effort cache write called AFTER the operational DB write
-    has already committed. Its only job is to keep the on-disk JSON in sync
-    so the SessionStart hook sees the new value on the next session. A
-    failure here is "recoverable degradation" (WARNING per observability
-    rules), not an operational write failure — the DB is already correct.
-    Swallowing the error keeps the caller's success path intact.
-    """
-    import os
-    import tempfile
-
-    try:
-        data: dict = {}
-        if _SESSION_CONFIG.exists():
-            data = json.loads(_SESSION_CONFIG.read_text())
-        if model is not None:
-            data["model"] = model
-        if effort is not None:
-            data["effort"] = effort
-        _SESSION_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=_SESSION_CONFIG.parent, suffix=".tmp")
-        try:
-            os.write(fd, json.dumps(data).encode())
-            os.close(fd)
-            os.replace(tmp, _SESSION_CONFIG)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-                os.unlink(tmp)
-            raise
-    except (OSError, json.JSONDecodeError, ValueError):
-        # OSError: filesystem issues (mkdir, mkstemp, write, replace).
-        # json.JSONDecodeError / ValueError: existing config file is
-        # corrupt — we'd rather log and move on than crash the caller.
-        # WARNING (not ERROR): the authoritative write (DB) already
-        # succeeded; this cache write is best-effort.
-        logger.warning(
-            "Failed to persist session config cache at %s",
-            _SESSION_CONFIG, exc_info=True,
-        )
 
 
 async def _impl_session_set_model(session_id: str, model: str) -> dict:
