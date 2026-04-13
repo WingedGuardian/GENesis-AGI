@@ -208,18 +208,38 @@ class GenesisVersionCollector:
             raise RuntimeError(f"git rev-parse failed: {stderr.decode(errors='replace')}")
         return stdout.decode().strip()
 
+    async def _git_output(self, *args: str, timeout: int = 10) -> str | None:
+        """Run a git command and return stdout, or None on failure."""
+        proc = await asyncio.create_subprocess_exec(
+            "git", *args,
+            cwd=str(_GENESIS_ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        if proc.returncode != 0:
+            return None
+        return stdout.decode().strip()
+
     async def _check_upstream(self) -> tuple[int, str]:
-        """Fetch the upstream primary remote and return (commits_behind, summary).
+        """Fetch upstream and compare release tags.
 
         Uses the remote pointing to github_public_repo() (e.g. 'public'),
-        falling back to 'origin'. Raises RuntimeError on git failure.
+        falling back to 'origin'. Tag-based comparison is robust against
+        squash-merge divergence — same release tag means same content even
+        if commit SHAs differ.
+
+        Returns (0, "") when tags match (up to date).
+        Returns (N, summary) where N is commits between tags and summary
+        shows what changed in the tag range.
+        Raises RuntimeError on git failure.
         """
         remote = _update_remote()
         ref = f"{remote}/main"
 
-        # Fetch (updates remote refs, doesn't change working tree)
+        # Fetch (updates remote refs + tags, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", remote, "main",
+            "git", "fetch", remote, "main", "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -231,7 +251,61 @@ class GenesisVersionCollector:
                 f"git fetch {remote} main failed (exit {proc.returncode}): {stderr_text}"
             )
 
-        # Count commits behind
+        # Get local and remote release tags
+        local_tag = await self._git_output(
+            "describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD",
+        )
+        origin_tag = await self._git_output(
+            "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
+        )
+
+        # If neither side has tags, fall back to commit-based comparison
+        if not local_tag and not origin_tag:
+            return await self._check_upstream_by_commits()
+
+        # If only one side has tags, there's definitely an update
+        if local_tag != origin_tag:
+            # Count commits in the tag range for a meaningful number
+            behind = 0
+            if local_tag and origin_tag:
+                count_str = await self._git_output(
+                    "rev-list", "--count", f"{local_tag}..{origin_tag}",
+                )
+                behind = int(count_str) if count_str and count_str.isdigit() else 1
+            else:
+                # One side untagged — use commit count as fallback
+                count_str = await self._git_output(
+                    "rev-list", "--count", f"HEAD..{ref}",
+                )
+                behind = int(count_str) if count_str and count_str.isdigit() else 1
+
+            # Summary of what changed between tags
+            summary = ""
+            if local_tag and origin_tag:
+                raw = await self._git_output(
+                    "log", "--oneline", "--no-merges",
+                    f"{local_tag}..{origin_tag}",
+                )
+                summary = raw or ""
+            else:
+                raw = await self._git_output(
+                    "log", "--oneline", "--no-merges", f"HEAD..{ref}",
+                )
+                summary = raw or ""
+
+            # Truncate to first 10 lines
+            lines = summary.split("\n")
+            if len(lines) > 10:
+                summary = "\n".join(lines[:10]) + f"\n... and {len(lines) - 10} more"
+
+            return max(behind, 1), summary
+
+        # Same tag — up to date
+        return 0, ""
+
+    async def _check_upstream_by_commits(self) -> tuple[int, str]:
+        """Fallback: count commits when no release tags exist."""
+        ref = f"{_update_remote()}/main"
         proc = await asyncio.create_subprocess_exec(
             "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
@@ -249,16 +323,10 @@ class GenesisVersionCollector:
         if behind == 0:
             return 0, ""
 
-        # Get summary of what's new
-        proc = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", f"HEAD..{ref}",
-            cwd=str(_GENESIS_ROOT),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        raw = await self._git_output(
+            "log", "--oneline", "--no-merges", f"HEAD..{ref}",
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-        summary = stdout.decode().strip() if proc.returncode == 0 else ""
-        # Truncate to first 10 lines
+        summary = raw or ""
         lines = summary.split("\n")
         if len(lines) > 10:
             summary = "\n".join(lines[:10]) + f"\n... and {len(lines) - 10} more"
@@ -347,9 +415,10 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
+        ref = f"{_update_remote()}/main"
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--short", "origin/main",
+            "git", "rev-parse", "--short", ref,
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -372,7 +441,7 @@ class GenesisVersionCollector:
 
         # Get target tag if available
         proc = await asyncio.create_subprocess_exec(
-            "git", "describe", "--tags", "--abbrev=0", "origin/main",
+            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -423,16 +492,16 @@ class GenesisVersionCollector:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
             message = (
-                f"Genesis update available — {behind} commit(s) behind origin/main.\n\n"
-                f"Recent changes:\n{summary}\n\n"
-                f"Run ./scripts/update.sh to update."
+                f"New Genesis version available ({behind} commit(s) behind).\n\n"
+                f"Highlights:\n{summary}\n\n"
+                f"Update from the dashboard when convenient."
             )
 
             await pipeline.submit(OutreachRequest(
-                category=OutreachCategory.ALERT,
+                category=OutreachCategory.DIGEST,
                 topic="Genesis update available",
                 context=message,
-                salience_score=0.6,
+                salience_score=0.4,
                 signal_type="genesis_update",
             ))
         except Exception:
