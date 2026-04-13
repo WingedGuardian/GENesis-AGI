@@ -343,10 +343,10 @@ def _apply_supervised(pid_file: Path) -> tuple:
     )
 
     orchestrator_code = _ORCHESTRATOR_TEMPLATE.format(
-        summary_file=_SUMMARY_FILE,
-        escalation_file=_ESCALATION_FILE,
-        pid_file=pid_file,
-        genesis_root=_GENESIS_ROOT,
+        summary_file=str(_SUMMARY_FILE),
+        escalation_file=str(_ESCALATION_FILE),
+        pid_file=str(pid_file),
+        genesis_root=str(_GENESIS_ROOT),
         tier1_prompt=tier1_prompt,
         tier2_prompt=tier2_prompt,
     )
