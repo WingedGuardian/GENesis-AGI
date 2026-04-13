@@ -55,6 +55,24 @@ echo ""
 echo "  Genesis Update"
 echo "  ──────────────────────────────────────"
 
+# ── Resolve upstream remote ────────────────────────────────
+# Use the remote pointing to github_public_repo (e.g. 'public' for GENesis-AGI).
+# Falls back to 'origin' if detection fails or genesis.env is unavailable.
+_detect_update_remote() {
+    local public_repo
+    public_repo=$(
+        "$VENV_DIR/bin/python" -c \
+        "from genesis.env import github_public_repo; print(github_public_repo())" \
+        2>/dev/null
+    ) || public_repo="GENesis-AGI"
+    local remote
+    remote=$(git -C "$GENESIS_ROOT" remote -v 2>/dev/null \
+        | awk "/$public_repo.*fetch/{print \$1; exit}")
+    echo "${remote:-origin}"
+}
+UPDATE_REMOTE="$(_detect_update_remote)"
+echo "  Update remote: $UPDATE_REMOTE"
+
 # ── Current state ─────────────────────────────────────────
 ORIGINAL_BRANCH=$(git -C "$GENESIS_ROOT" symbolic-ref --short HEAD 2>/dev/null || echo "main")
 OLD_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
