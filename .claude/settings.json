@@ -55,6 +55,15 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/skill_injection_hook.py",
+            "timeout": 500
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook contribution_offer_hook.py",
             "timeout": 500
           }
