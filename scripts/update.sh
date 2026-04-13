@@ -278,12 +278,12 @@ _write_state "merging"
 
 # ── Fetch + Merge ────────────────────────────────────────
 echo "--- Fetching latest ---"
-git -C "$GENESIS_ROOT" fetch origin main
+git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
 
-echo "--- Merging origin/main ---"
+echo "--- Merging $UPDATE_REMOTE/main ---"
 MERGE_OUTPUT=""
 MERGE_RC=0
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge origin/main --no-edit 2>&1) || MERGE_RC=$?
+MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit 2>&1) || MERGE_RC=$?
 
 if [[ $MERGE_RC -ne 0 ]]; then
     # Check if this is a merge conflict (unmerged paths) vs other error
@@ -300,8 +300,8 @@ if [[ $MERGE_RC -ne 0 ]]; then
 {
     "old_tag": "$OLD_TAG",
     "old_commit": "$OLD_COMMIT",
-    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 origin/main 2>/dev/null || echo 'untagged')",
-    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short origin/main 2>/dev/null || echo 'unknown')",
+    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')",
+    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')",
     "conflicted_files": [$CONFLICT_JSON],
     "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
     "timestamp": "$(date -Iseconds)"

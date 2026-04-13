@@ -47,6 +47,29 @@ def _load_updates_config() -> dict:
     return {"check": {"enabled": True, "interval_hours": 6}}
 
 
+def _update_remote() -> str:
+    """Return the git remote that points to the public/primary repo.
+
+    Reads github.public_repo from genesis.env and matches it against
+    'git remote -v'. Falls back to 'origin' if detection fails.
+    """
+    import subprocess
+    try:
+        from genesis.env import github_public_repo
+        public_repo = github_public_repo()
+        result = subprocess.run(
+            ["git", "-C", str(_GENESIS_ROOT), "remote", "-v"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if public_repo in line and "(fetch)" in line:
+                    return line.split()[0]
+    except Exception:
+        pass
+    return "origin"
+
+
 class GenesisVersionCollector:
     """Detects Genesis version changes and available upstream updates.
 
@@ -199,21 +222,24 @@ class GenesisVersionCollector:
         return stdout.decode().strip()
 
     async def _check_upstream(self) -> tuple[int, str]:
-        """Fetch origin/main and compare release tags.
+        """Fetch upstream and compare release tags.
 
-        Uses tag-based comparison instead of commit counting. This is
-        robust against squash-merge divergence between local main and
-        the public repo — same release tag means same content even if
-        commit SHAs differ.
+        Uses the remote pointing to github_public_repo() (e.g. 'public'),
+        falling back to 'origin'. Tag-based comparison is robust against
+        squash-merge divergence — same release tag means same content even
+        if commit SHAs differ.
 
         Returns (0, "") when tags match (up to date).
         Returns (N, summary) where N is commits between tags and summary
         shows what changed in the tag range.
         Raises RuntimeError on git failure.
         """
+        remote = _update_remote()
+        ref = f"{remote}/main"
+
         # Fetch (updates remote refs + tags, doesn't change working tree)
         proc = await asyncio.create_subprocess_exec(
-            "git", "fetch", "origin", "main", "--tags",
+            "git", "fetch", remote, "main", "--tags",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -222,7 +248,7 @@ class GenesisVersionCollector:
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
             raise RuntimeError(
-                f"git fetch origin main failed (exit {proc.returncode}): {stderr_text}"
+                f"git fetch {remote} main failed (exit {proc.returncode}): {stderr_text}"
             )
 
         # Get local and remote release tags
@@ -230,7 +256,7 @@ class GenesisVersionCollector:
             "describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD",
         )
         origin_tag = await self._git_output(
-            "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main",
+            "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
         )
 
         # If neither side has tags, fall back to commit-based comparison
@@ -249,7 +275,7 @@ class GenesisVersionCollector:
             else:
                 # One side untagged — use commit count as fallback
                 count_str = await self._git_output(
-                    "rev-list", "--count", "HEAD..origin/main",
+                    "rev-list", "--count", f"HEAD..{ref}",
                 )
                 behind = int(count_str) if count_str and count_str.isdigit() else 1
 
@@ -263,7 +289,7 @@ class GenesisVersionCollector:
                 summary = raw or ""
             else:
                 raw = await self._git_output(
-                    "log", "--oneline", "--no-merges", "HEAD..origin/main",
+                    "log", "--oneline", "--no-merges", f"HEAD..{ref}",
                 )
                 summary = raw or ""
 
@@ -279,8 +305,9 @@ class GenesisVersionCollector:
 
     async def _check_upstream_by_commits(self) -> tuple[int, str]:
         """Fallback: count commits when no release tags exist."""
+        ref = f"{_update_remote()}/main"
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-list", "--count", "HEAD..origin/main",
+            "git", "rev-list", "--count", f"HEAD..{ref}",
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -297,7 +324,7 @@ class GenesisVersionCollector:
             return 0, ""
 
         raw = await self._git_output(
-            "log", "--oneline", "--no-merges", "HEAD..origin/main",
+            "log", "--oneline", "--no-merges", f"HEAD..{ref}",
         )
         summary = raw or ""
         lines = summary.split("\n")
@@ -388,9 +415,10 @@ class GenesisVersionCollector:
         self, current: str, behind: int, summary: str,
     ) -> bool:
         """Store update-available observation. Returns True if new (not deduped)."""
+        ref = f"{_update_remote()}/main"
         # Get target commit for dedup
         proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--short", "origin/main",
+            "git", "rev-parse", "--short", ref,
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -413,7 +441,7 @@ class GenesisVersionCollector:
 
         # Get target tag if available
         proc = await asyncio.create_subprocess_exec(
-            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main",
+            "git", "describe", "--tags", "--match", "v*", "--abbrev=0", ref,
             cwd=str(_GENESIS_ROOT),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

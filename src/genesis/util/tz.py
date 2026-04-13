@@ -7,14 +7,15 @@ use these functions for storage — only for rendering to the user.
 
 from __future__ import annotations
 
-import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-_DEFAULT_TZ = "America/New_York"
+from genesis.env import user_timezone as _get_user_timezone
+
+_DEFAULT_TZ = "UTC"
 
 try:
-    _USER_TZ = ZoneInfo(os.environ.get("USER_TIMEZONE", _DEFAULT_TZ))
+    _USER_TZ = ZoneInfo(_get_user_timezone())
 except (ZoneInfoNotFoundError, KeyError):
     _USER_TZ = ZoneInfo(_DEFAULT_TZ)
 
