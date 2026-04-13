@@ -102,15 +102,64 @@ echo ""
 
 _write_state "fetching"
 
+# ── Service stop/start helpers ───────────────────────────
+# Works with both systemd and bare-process environments.
+_stop_genesis_server() {
+    # Try systemctl first (works when D-Bus session bus is available)
+    if systemctl --user is-active --quiet genesis-server.service 2>/dev/null; then
+        systemctl --user stop genesis-server.service 2>/dev/null && return 0
+    fi
+    # Fallback: read PID from fcntl lock file
+    local lock_file="$HOME/.genesis/genesis-server.lock"
+    if [ -f "$lock_file" ]; then
+        local pid
+        pid=$(tr -d '\0' < "$lock_file" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill -TERM "$pid" 2>/dev/null
+            # Wait up to 10s for graceful shutdown
+            for i in $(seq 1 20); do
+                kill -0 "$pid" 2>/dev/null || return 0
+                sleep 0.5
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+            return 0
+        fi
+    fi
+    # Last resort: pkill by command pattern
+    pkill -TERM -f "python -m genesis serve" 2>/dev/null || true
+    sleep 1
+}
+
+_start_genesis_server() {
+    # Try systemctl first
+    if systemctl --user start genesis-server.service 2>/dev/null; then
+        return 0
+    fi
+    # Fallback: start directly
+    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
+        >> /tmp/genesis-server.log 2>&1 &
+    echo "  Started genesis-server (pid $!)"
+}
+
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 WERE_RUNNING=()
-for svc in genesis-server genesis-bridge; do
+
+# Check genesis-server
+if systemctl --user is-active --quiet genesis-server.service 2>/dev/null || \
+   pgrep -f "python -m genesis serve" >/dev/null 2>&1; then
+    _stop_genesis_server
+    WERE_RUNNING+=("genesis-server")
+fi
+
+# Check genesis-bridge
+for svc in genesis-bridge; do
     if systemctl --user is-active --quiet "$svc.service" 2>/dev/null; then
-        systemctl --user stop "$svc.service" || true  # stop failure shouldn't block rollback setup
+        systemctl --user stop "$svc.service" || true
         WERE_RUNNING+=("$svc")
     fi
 done
+
 [[ ${#WERE_RUNNING[@]} -gt 0 ]] && echo "  Stopped: ${WERE_RUNNING[*]}" || echo "  No services were running"
 echo ""
 
@@ -216,7 +265,8 @@ _do_rollback() {
     echo "  Rolling back to $ROLLBACK_TAG..."
 
     # Stop any running services first
-    systemctl --user stop genesis-server genesis-bridge 2>/dev/null || true
+    _stop_genesis_server
+    systemctl --user stop genesis-bridge 2>/dev/null || true
 
     # Restore the original branch, then reset it to the rollback tag.
     # This keeps us on a named branch (not detached HEAD) at the pre-update state.
@@ -241,8 +291,12 @@ _do_rollback() {
 
     # Restart services with old code
     for svc in "${WERE_RUNNING[@]}"; do
-        systemctl --user start "$svc.service" 2>/dev/null || \
-            echo "  CRITICAL: failed to restart $svc"
+        if [ "$svc" = "genesis-server" ]; then
+            _start_genesis_server || echo "  CRITICAL: failed to restart genesis-server"
+        else
+            systemctl --user start "$svc.service" 2>/dev/null || \
+                echo "  CRITICAL: failed to restart $svc"
+        fi
     done
 
     if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ]; then
@@ -327,9 +381,25 @@ if [[ $MERGE_RC -ne 0 ]]; then
 CEOF
         echo ""
         echo "  Conflict context written to ~/.genesis/update_conflicts.json"
-        echo "  A CC session can resolve these — exiting with code 2."
 
-        # Don't rollback — leave conflicts in place for CC to resolve
+        # Abort the merge — don't leave the working tree in a broken state.
+        # CC will resolve conflicts in a worktree, not in the main checkout.
+        echo "  Aborting merge to keep working tree clean..."
+        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+
+        # Restart services with original code so the system stays operational
+        echo "  Restarting services with pre-update code..."
+        for svc in "${WERE_RUNNING[@]}"; do
+            if [ "$svc" = "genesis-server" ]; then
+                _start_genesis_server || echo "  WARNING: failed to restart genesis-server"
+            else
+                systemctl --user start "$svc.service" 2>/dev/null || \
+                    echo "  WARNING: failed to restart $svc"
+            fi
+        done
+
+        echo "  System is running on pre-update code."
+        echo "  A CC session will resolve conflicts in a worktree."
         trap - ERR
         exit 2
     else
@@ -349,7 +419,11 @@ if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
     git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
     # Restart services that we stopped (if any)
     for svc in "${WERE_RUNNING[@]}"; do
-        systemctl --user start "$svc.service" 2>/dev/null || true
+        if [ "$svc" = "genesis-server" ]; then
+            _start_genesis_server || true
+        else
+            systemctl --user start "$svc.service" 2>/dev/null || true
+        fi
     done
     echo ""
     echo "  Nothing to do."
@@ -431,7 +505,12 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
 
     for svc in "${WERE_RUNNING[@]}"; do
-        if ! systemctl --user start "$svc.service"; then
+        if [ "$svc" = "genesis-server" ]; then
+            if ! _start_genesis_server; then
+                _do_rollback "failed to start genesis-server after update"
+                exit 1
+            fi
+        elif ! systemctl --user start "$svc.service"; then
             _do_rollback "failed to start $svc after update"
             exit 1
         fi
