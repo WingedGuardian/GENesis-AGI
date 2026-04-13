@@ -51,8 +51,8 @@ def _query_db(sql: str, params: tuple = ()) -> list[dict]:
 @blueprint.route("/api/genesis/updates/status")
 def update_status():
     """Current version, update availability, and last update result."""
-    # Current version
-    tag = _git("describe", "--tags", "--always") or "unknown"
+    # Current version — only match release tags (v*), not backup/pre-update tags
+    tag = _git("describe", "--tags", "--match", "v*", "--always") or "unknown"
     commit = _git("rev-parse", "--short", "HEAD") or "unknown"
 
     # Check for unresolved update_available observations
@@ -115,7 +115,7 @@ def update_check():
     target_tag = None
     if commits_behind > 0:
         target_tag = _git(
-            "describe", "--tags", "--abbrev=0", "origin/main"
+            "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main"
         )
 
     # Summary of what changed
