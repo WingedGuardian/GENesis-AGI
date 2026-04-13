@@ -122,19 +122,24 @@ if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
         git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
         echo "  Post-merge mode: created fallback rollback tag $ROLLBACK_TAG"
     fi
-    # Also recover OLD_TAG / OLD_COMMIT for correct update_history recording
-    OLD_TAG=$(
+    # Also recover OLD_TAG / OLD_COMMIT for correct update_history recording.
+    # Capture to temp vars and only assign if non-empty so that a JSON parse
+    # failure (malformed state file) does not silently blank out the existing
+    # values and corrupt the update_history record.
+    _saved_old_tag=$(
         GH_STATE_FILE="$STATE_FILE" \
         "$VENV_DIR/bin/python" -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_tag','$OLD_TAG'))" \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_tag',''))" \
         2>/dev/null
     ) || true
-    OLD_COMMIT=$(
+    [ -n "$_saved_old_tag" ] && OLD_TAG="$_saved_old_tag"
+    _saved_old_commit=$(
         GH_STATE_FILE="$STATE_FILE" \
         "$VENV_DIR/bin/python" -c \
-        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_commit','$OLD_COMMIT'))" \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_commit',''))" \
         2>/dev/null
     ) || true
+    [ -n "$_saved_old_commit" ] && OLD_COMMIT="$_saved_old_commit"
 else
     git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
     echo "  Rollback tag: $ROLLBACK_TAG"

@@ -517,6 +517,7 @@ def update_resolve():
 @blueprint.route("/api/genesis/updates/progress")
 def update_progress():
     """Poll update progress — reads summary and escalation files."""
+    global _orchestrator_alive
     summary = None
     if _SUMMARY_FILE.is_file():
         summary = _SUMMARY_FILE.read_text().strip()
@@ -558,8 +559,12 @@ def update_progress():
         and not _orchestrator_alive
     ):
         with _orchestrator_lock:
-            # Double-check inside lock to prevent concurrent double-spawn
+            # Double-check inside lock to prevent concurrent double-spawn.
+            # Set _orchestrator_alive=True here (while lock is held) so that
+            # a second concurrent poll that acquires the lock next sees the
+            # flag already True before the thread has had a chance to run.
             if not _orchestrator_alive:
+                _orchestrator_alive = True
                 logger.info(
                     "Escalation recovery: spawning Tier 2 (orchestrator died, "
                     "tier2_needed in escalation file)"
@@ -569,7 +574,6 @@ def update_progress():
 
                 def _recover_tier2() -> None:
                     global _orchestrator_alive
-                    _orchestrator_alive = True
                     try:
                         _run_tier2(_recovery_pid)
                     except Exception:
