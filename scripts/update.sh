@@ -12,9 +12,17 @@
 #   - update_history table written on success + failure
 #   - Writes failure context for CC-assisted recovery
 #
-# Usage: ./scripts/update.sh
+# Usage: ./scripts/update.sh [--post-merge]
+#   --post-merge  Skip fetch/merge (code already merged by CC conflict resolution);
+#                 run only bootstrap, migrations, health check, and service restart.
 
 set -euo pipefail
+
+# ── Flag parsing ─────────────────────────────────────────
+POST_MERGE=false
+for _arg in "$@"; do
+    [[ "$_arg" == "--post-merge" ]] && POST_MERGE=true
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GENESIS_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -96,8 +104,41 @@ fi
 
 # ── Rollback tag ─────────────────────────────────────────
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
-git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
-echo "  Rollback tag: $ROLLBACK_TAG"
+if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
+    # In post-merge mode, the original pre-update rollback tag is in the state
+    # file (written by the initial update.sh run before the merge attempt).
+    # Reusing it ensures rollback still lands on pre-merge code, not merged code.
+    _saved_rt=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('rollback_tag',''))" \
+        2>/dev/null
+    ) || _saved_rt=""
+    if [ -n "$_saved_rt" ] && git -C "$GENESIS_ROOT" rev-parse "$_saved_rt" >/dev/null 2>&1; then
+        ROLLBACK_TAG="$_saved_rt"
+        echo "  Post-merge mode: reusing rollback tag $ROLLBACK_TAG"
+    else
+        # Original tag missing — tag current (merged) HEAD as fallback
+        git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
+        echo "  Post-merge mode: created fallback rollback tag $ROLLBACK_TAG"
+    fi
+    # Also recover OLD_TAG / OLD_COMMIT for correct update_history recording
+    OLD_TAG=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_tag','$OLD_TAG'))" \
+        2>/dev/null
+    ) || true
+    OLD_COMMIT=$(
+        GH_STATE_FILE="$STATE_FILE" \
+        "$VENV_DIR/bin/python" -c \
+        "import json, os; print(json.load(open(os.environ['GH_STATE_FILE'])).get('old_commit','$OLD_COMMIT'))" \
+        2>/dev/null
+    ) || true
+else
+    git -C "$GENESIS_ROOT" tag "$ROLLBACK_TAG"
+    echo "  Rollback tag: $ROLLBACK_TAG"
+fi
 echo ""
 
 _write_state "fetching"
@@ -131,14 +172,13 @@ _stop_genesis_server() {
 }
 
 _start_genesis_server() {
-    # Try systemctl first
     if systemctl --user start genesis-server.service 2>/dev/null; then
         return 0
     fi
-    # Fallback: start directly
-    nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        >> /tmp/genesis-server.log 2>&1 &
-    echo "  Started genesis-server (pid $!)"
+    # Genesis is always deployed with systemd — no nohup fallback.
+    echo "  ERROR: systemctl --user start genesis-server.service failed."
+    echo "         Check: systemctl --user status genesis-server.service"
+    return 1
 }
 
 # ── Stop services for update ──────────────────────────────
@@ -314,22 +354,36 @@ _do_rollback() {
     echo "  Reason: $reason"
     [ -n "$degraded" ] && echo "  Degraded subsystems: $degraded"
 
-    # Write failure context for CC to pick up
+    # Write failure context for CC to pick up.
+    # Use Python json.dumps to safely handle special chars in $reason / $BASH_COMMAND.
     mkdir -p "$HOME/.genesis"
-    cat > "$HOME/.genesis/last_update_failure.json" << FAILEOF
-{
-    "old_tag": "$OLD_TAG",
-    "new_tag": "$NEW_TAG",
-    "old_commit": "$OLD_COMMIT",
-    "new_commit": "$NEW_COMMIT",
-    "rollback_tag": "$ROLLBACK_TAG",
-    "reason": "$reason",
-    "degraded_subsystems": "$degraded",
-    "original_branch": "$ORIGINAL_BRANCH",
-    "rollback_complete": $([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false),
-    "timestamp": "$(date -Iseconds)"
+    GH_OLD_TAG="$OLD_TAG" \
+    GH_NEW_TAG="$NEW_TAG" \
+    GH_OLD_COMMIT="$OLD_COMMIT" \
+    GH_NEW_COMMIT="$NEW_COMMIT" \
+    GH_ROLLBACK_TAG="$ROLLBACK_TAG" \
+    GH_REASON="$reason" \
+    GH_DEGRADED="$degraded" \
+    GH_ORIGINAL_BRANCH="$ORIGINAL_BRANCH" \
+    GH_ROLLBACK_COMPLETE="$([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false)" \
+    "$VENV_DIR/bin/python" -c "
+import json, os
+from datetime import datetime, timezone
+data = {
+    'old_tag': os.environ['GH_OLD_TAG'],
+    'new_tag': os.environ['GH_NEW_TAG'],
+    'old_commit': os.environ['GH_OLD_COMMIT'],
+    'new_commit': os.environ['GH_NEW_COMMIT'],
+    'rollback_tag': os.environ['GH_ROLLBACK_TAG'],
+    'reason': os.environ['GH_REASON'],
+    'degraded_subsystems': os.environ['GH_DEGRADED'],
+    'original_branch': os.environ['GH_ORIGINAL_BRANCH'],
+    'rollback_complete': os.environ['GH_ROLLBACK_COMPLETE'] == 'true',
+    'timestamp': datetime.now(timezone.utc).isoformat(),
 }
-FAILEOF
+with open(os.path.expanduser('~/.genesis/last_update_failure.json'), 'w') as _f:
+    json.dump(data, _f, indent=4)
+" 2>/dev/null || echo "  WARNING: failed to write failure context"
 
     echo ""
     echo "  ──────────────────────────────────────"
@@ -346,88 +400,109 @@ _on_err() {
 }
 trap _on_err ERR
 
-_write_state "merging"
+if [[ "$POST_MERGE" == "false" ]]; then
+    _write_state "merging"
 
-# ── Fetch + Merge ────────────────────────────────────────
-echo "--- Fetching latest ---"
-git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
+    # ── Fetch + Merge ────────────────────────────────────────
+    echo "--- Fetching latest ---"
+    git -C "$GENESIS_ROOT" fetch "$UPDATE_REMOTE" main
 
-echo "--- Merging $UPDATE_REMOTE/main ---"
-MERGE_OUTPUT=""
-MERGE_RC=0
-MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit 2>&1) || MERGE_RC=$?
+    echo "--- Merging $UPDATE_REMOTE/main ---"
+    MERGE_OUTPUT=""
+    MERGE_RC=0
+    MERGE_OUTPUT=$(git -C "$GENESIS_ROOT" merge "$UPDATE_REMOTE/main" --no-edit 2>&1) || MERGE_RC=$?
 
-if [[ $MERGE_RC -ne 0 ]]; then
-    # Check if this is a merge conflict (unmerged paths) vs other error
-    if git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then
-        CONFLICTED_FILES=$(git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U)
-        echo "  Merge conflicts detected in:"
-        echo "$CONFLICTED_FILES" | sed 's/^/    /'
+    if [[ $MERGE_RC -ne 0 ]]; then
+        # Check if this is a merge conflict (unmerged paths) vs other error
+        if git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U 2>/dev/null | grep -q .; then
+            CONFLICTED_FILES=$(git -C "$GENESIS_ROOT" diff --name-only --diff-filter=U)
+            echo "  Merge conflicts detected in:"
+            echo "$CONFLICTED_FILES" | sed 's/^/    /'
 
-        # Write conflict context for supervising CC session
-        mkdir -p "$HOME/.genesis"
-        # Build JSON array of conflicted files
-        CONFLICT_JSON=$(echo "$CONFLICTED_FILES" | awk '{printf "\"%s\",", $0}' | sed 's/,$//')
-        cat > "$HOME/.genesis/update_conflicts.json" << CEOF
-{
-    "old_tag": "$OLD_TAG",
-    "old_commit": "$OLD_COMMIT",
-    "target_tag": "$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')",
-    "target_commit": "$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')",
-    "conflicted_files": [$CONFLICT_JSON],
-    "merge_output": "$(echo "$MERGE_OUTPUT" | head -20 | sed 's/"/\\"/g')",
-    "timestamp": "$(date -Iseconds)"
+            # Write conflict context for supervising CC session.
+            # Use Python json.dumps to safely handle special chars in filenames
+            # and git output without JSON injection.
+            mkdir -p "$HOME/.genesis"
+            GH_OLD_TAG="$OLD_TAG" \
+            GH_OLD_COMMIT="$OLD_COMMIT" \
+            GH_TARGET_TAG="$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 "$UPDATE_REMOTE/main" 2>/dev/null || echo 'untagged')" \
+            GH_TARGET_COMMIT="$(git -C "$GENESIS_ROOT" rev-parse --short "$UPDATE_REMOTE/main" 2>/dev/null || echo 'unknown')" \
+            GH_CONFLICTED_FILES="$CONFLICTED_FILES" \
+            GH_MERGE_OUTPUT="$(echo "$MERGE_OUTPUT" | head -20)" \
+            "$VENV_DIR/bin/python" -c "
+import json, os
+from datetime import datetime, timezone
+data = {
+    'old_tag': os.environ['GH_OLD_TAG'],
+    'old_commit': os.environ['GH_OLD_COMMIT'],
+    'target_tag': os.environ['GH_TARGET_TAG'],
+    'target_commit': os.environ['GH_TARGET_COMMIT'],
+    'conflicted_files': [f for f in os.environ['GH_CONFLICTED_FILES'].split('\n') if f],
+    'merge_output': os.environ['GH_MERGE_OUTPUT'],
+    'timestamp': datetime.now(timezone.utc).isoformat(),
 }
-CEOF
-        echo ""
-        echo "  Conflict context written to ~/.genesis/update_conflicts.json"
+with open(os.path.expanduser('~/.genesis/update_conflicts.json'), 'w') as _f:
+    json.dump(data, _f, indent=4)
+" 2>/dev/null || echo "  WARNING: failed to write conflict context"
 
-        # Abort the merge — don't leave the working tree in a broken state.
-        # CC will resolve conflicts in a worktree, not in the main checkout.
-        echo "  Aborting merge to keep working tree clean..."
-        git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+            echo ""
+            echo "  Conflict context written to ~/.genesis/update_conflicts.json"
 
-        # Restart services with original code so the system stays operational
-        echo "  Restarting services with pre-update code..."
+            # Abort the merge — don't leave the working tree in a broken state.
+            # CC will resolve conflicts in a worktree, not in the main checkout.
+            echo "  Aborting merge to keep working tree clean..."
+            git -C "$GENESIS_ROOT" merge --abort 2>/dev/null || true
+
+            # Restart services with original code so the system stays operational
+            echo "  Restarting services with pre-update code..."
+            for svc in "${WERE_RUNNING[@]}"; do
+                if [ "$svc" = "genesis-server" ]; then
+                    _start_genesis_server || echo "  WARNING: failed to restart genesis-server"
+                else
+                    systemctl --user start "$svc.service" 2>/dev/null || \
+                        echo "  WARNING: failed to restart $svc"
+                fi
+            done
+
+            echo "  System is running on pre-update code."
+            echo "  A CC session will resolve conflicts in a worktree."
+            trap - ERR
+            exit 2
+        else
+            # Not a conflict — some other merge error. Let ERR trap handle rollback.
+            echo "  Merge failed: $MERGE_OUTPUT"
+            false  # triggers ERR trap → rollback
+        fi
+    fi
+
+    NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
+    NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
+
+    if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
+        echo "  Already up to date ($NEW_COMMIT)."
+        # Clean up unnecessary rollback tag and disarm trap
+        trap - ERR
+        git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
+        # Restart services that we stopped (if any)
         for svc in "${WERE_RUNNING[@]}"; do
             if [ "$svc" = "genesis-server" ]; then
-                _start_genesis_server || echo "  WARNING: failed to restart genesis-server"
+                _start_genesis_server || true
             else
-                systemctl --user start "$svc.service" 2>/dev/null || \
-                    echo "  WARNING: failed to restart $svc"
+                systemctl --user start "$svc.service" 2>/dev/null || true
             fi
         done
-
-        echo "  System is running on pre-update code."
-        echo "  A CC session will resolve conflicts in a worktree."
-        trap - ERR
-        exit 2
-    else
-        # Not a conflict — some other merge error. Let ERR trap handle rollback.
-        echo "  Merge failed: $MERGE_OUTPUT"
-        false  # triggers ERR trap → rollback
+        echo ""
+        echo "  Nothing to do."
+        exit 0
     fi
-fi
+fi  # end: [[ "$POST_MERGE" == "false" ]]
 
 NEW_TAG=$(git -C "$GENESIS_ROOT" describe --tags --match 'v*' --abbrev=0 2>/dev/null || echo "untagged")
 NEW_COMMIT=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
 
-if [[ "$OLD_COMMIT" == "$NEW_COMMIT" ]]; then
-    echo "  Already up to date ($NEW_COMMIT)."
-    # Clean up unnecessary rollback tag and disarm trap
-    trap - ERR
-    git -C "$GENESIS_ROOT" tag -d "$ROLLBACK_TAG" 2>/dev/null || true
-    # Restart services that we stopped (if any)
-    for svc in "${WERE_RUNNING[@]}"; do
-        if [ "$svc" = "genesis-server" ]; then
-            _start_genesis_server || true
-        else
-            systemctl --user start "$svc.service" 2>/dev/null || true
-        fi
-    done
-    echo ""
-    echo "  Nothing to do."
-    exit 0
+if [[ "$POST_MERGE" == "true" ]]; then
+    echo "--- Post-merge mode: running bootstrap on conflict-resolved code ---"
+    echo "  Merged: $OLD_TAG ($OLD_COMMIT) → $NEW_TAG ($NEW_COMMIT)"
 fi
 echo ""
 
@@ -616,8 +691,9 @@ _write_state "done"
 
 # Clean up state file — successful update, nothing to recover
 rm -f "$STATE_FILE"
-# Clean up PID file
-rm -f "$HOME/.genesis/update_in_progress.pid"
+# Note: update_in_progress.pid is owned by the Python orchestration layer
+# (_spawn_cc in updates.py) and is cleaned up in its finally block.
+# update.sh must not remove it — the CC session that's running us is still live.
 
 # ── Done ──────────────────────────────────────────────────
 echo "  ──────────────────────────────────────"

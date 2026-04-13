@@ -758,11 +758,11 @@
                 await this.fetchHealth();
               }
             } catch (e) { /* still down, keep polling */ }
-            if (Date.now() - start > 300000) {
+            if (Date.now() - start > 600000) {
               clearInterval(poll);
               this._updating = false;
               this._updateReconnecting = false;
-              alert("Update did not complete after 5 minutes.\nCheck server logs for status.");
+              alert("Update is taking longer than expected.\nIt may still be running — check server logs for status.");
               await this.fetchUpdateStatus();
             }
           }, 5000);

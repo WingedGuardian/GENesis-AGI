@@ -7,6 +7,7 @@ import json
 import logging
 import sqlite3
 import subprocess
+import threading
 from pathlib import Path
 
 from flask import jsonify, request
@@ -14,6 +15,14 @@ from flask import jsonify, request
 from genesis.dashboard._blueprint import blueprint
 
 logger = logging.getLogger(__name__)
+
+# ── Orchestrator state ────────────────────────────────────────────────────────
+# Tracks whether a supervised CC update pipeline is currently running in this
+# process. Used by update_progress() to auto-recover Tier 2 escalation after
+# a Flask restart (daemon thread dies but CC subprocess survives; on the next
+# poll, progress endpoint detects tier2_needed + no live orchestrator → spawns).
+_orchestrator_lock = threading.Lock()
+_orchestrator_alive = False
 
 _HOME = Path.home()
 _GENESIS_ROOT = _HOME / "genesis"
@@ -262,8 +271,8 @@ If MERGE CONFLICTS:
    - git checkout main
    - git merge update-merge-resolution --ff-only
    - git branch -d update-merge-resolution
-   - Run: bash {update_script} 2>&1
-     (update.sh will see the code is merged and run bootstrap + health)
+   - Run: bash {update_script} --post-merge 2>&1
+     (skips re-merge, runs bootstrap + migrations + health on resolved code)
 
 If SCRIPT ERROR:
 1. Diagnose the root cause from the error output
@@ -296,7 +305,8 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 6. After resolving: git add, git commit --no-edit
 7. git checkout main && git merge update-merge-resolution-opus --ff-only
 8. git branch -d update-merge-resolution-opus
-9. Run: bash {update_script} 2>&1
+9. Run: bash {update_script} --post-merge 2>&1
+   (skips re-merge, runs bootstrap + migrations + health on resolved code)
 
 Write a resolution report to {summary_file} explaining each decision.
 Use conventional commit format for any fixes (fix: ...).\
@@ -319,7 +329,7 @@ def _apply_supervised(pid_file: Path) -> tuple:
     Orchestration runs in a background thread so the API returns immediately.
     Each tier checks for escalation files left by the previous tier.
     """
-    import threading
+    global _orchestrator_alive
 
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -328,10 +338,16 @@ def _apply_supervised(pid_file: Path) -> tuple:
         f.unlink(missing_ok=True)
 
     def _run_tiers():
+        global _orchestrator_alive
+        _orchestrator_alive = True
         try:
             _run_tier1(pid_file)
         except Exception:
             logger.error("Update orchestrator failed", exc_info=True)
+        finally:
+            _orchestrator_alive = False
+            pid_file.unlink(missing_ok=True)
+            logger.info("Update orchestrator finished, PID file cleaned up")
 
     thread = threading.Thread(target=_run_tiers, daemon=True, name="update-orchestrator")
     thread.start()
@@ -360,7 +376,16 @@ def _spawn_cc(prompt: str, model: str, pid_file: Path) -> int:
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(proc.pid))
         logger.info("CC %s session started (pid %d)", model, proc.pid)
-        proc.wait()  # Block until CC finishes
+        try:
+            proc.wait(timeout=3600)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "CC %s session (pid %d) timed out after 3600s — killing",
+                model, proc.pid,
+            )
+            proc.kill()
+            proc.wait(timeout=30)
+            return 1
         return proc.returncode
     except Exception as exc:
         logger.error("Failed to spawn CC session: %s", exc, exc_info=True)
@@ -465,13 +490,19 @@ def update_resolve():
         except (ValueError, subprocess.TimeoutExpired, OSError):
             pid_file.unlink(missing_ok=True)
 
-    import threading
+    global _orchestrator_alive
 
     def _run():
+        global _orchestrator_alive
+        _orchestrator_alive = True
         try:
             _run_tier3(pid_file)
         except Exception:
             logger.error("Tier 3 (Opus) failed", exc_info=True)
+        finally:
+            _orchestrator_alive = False
+            pid_file.unlink(missing_ok=True)
+            logger.info("Tier 3 (Opus) finished, PID file cleaned up")
 
     thread = threading.Thread(target=_run, daemon=True, name="update-tier3")
     thread.start()
@@ -512,6 +543,48 @@ def update_progress():
             in_progress = result.returncode == 0
         except (ValueError, subprocess.TimeoutExpired, OSError):
             pass
+
+    # ── Escalation recovery after Flask restart ───────────────────────────────
+    # If Flask restarted mid-update (genesis-server was stopped/started by
+    # update.sh), the daemon orchestrator thread died. The CC subprocess
+    # survived (start_new_session=True) and may have written tier2_needed.
+    # When Tier 1 CC exits, the PID goes dead → in_progress=False. On the
+    # next poll we detect tier2_needed + no live orchestrator → auto-spawn.
+    # Tier 3 is intentionally NOT auto-spawned (user must confirm via dashboard).
+    if (
+        escalation
+        and "tier2_needed" in escalation
+        and not in_progress
+        and not _orchestrator_alive
+    ):
+        with _orchestrator_lock:
+            # Double-check inside lock to prevent concurrent double-spawn
+            if not _orchestrator_alive:
+                logger.info(
+                    "Escalation recovery: spawning Tier 2 (orchestrator died, "
+                    "tier2_needed in escalation file)"
+                )
+                _ESCALATION_FILE.unlink(missing_ok=True)
+                _recovery_pid = _HOME / ".genesis" / "update_in_progress.pid"
+
+                def _recover_tier2() -> None:
+                    global _orchestrator_alive
+                    _orchestrator_alive = True
+                    try:
+                        _run_tier2(_recovery_pid)
+                    except Exception:
+                        logger.error("Tier 2 escalation recovery failed", exc_info=True)
+                    finally:
+                        _orchestrator_alive = False
+                        _recovery_pid.unlink(missing_ok=True)
+                        logger.info("Tier 2 recovery finished, PID file cleaned up")
+
+                threading.Thread(
+                    target=_recover_tier2,
+                    daemon=True,
+                    name="update-tier2-recovery",
+                ).start()
+                in_progress = True  # reflect spawned state in this response
 
     return jsonify({
         "in_progress": in_progress,
