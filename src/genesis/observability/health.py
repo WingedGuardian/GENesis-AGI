@@ -482,9 +482,11 @@ async def collect_probe_results(
                 checked_at=datetime.now(UTC).isoformat(),
             )
 
+    from genesis.env import ollama_enabled
+
     tasks = [
         _safe("qdrant", probe_qdrant()),
-        _safe("ollama", probe_ollama()),
+        *([] if not ollama_enabled() else [_safe("ollama", probe_ollama())]),
         _safe("tmp_usage", probe_tmp()),
         _safe("disk", probe_disk()),
         _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
