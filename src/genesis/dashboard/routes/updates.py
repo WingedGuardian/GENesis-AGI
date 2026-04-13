@@ -103,31 +103,46 @@ def update_status():
 
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
-    """Force an upstream check (git fetch + compare)."""
-    # git fetch produces no stdout on success; None means the command failed
-    if _git("fetch", "origin", "main", timeout=30) is None:
+    """Force an upstream check (git fetch + tag comparison)."""
+    # Fetch with tags so we can compare release versions
+    if _git("fetch", "origin", "main", "--tags", timeout=30) is None:
         return jsonify({"error": "git fetch failed"}), 502
 
-    # Count commits behind
-    behind_str = _git("rev-list", "--count", "HEAD..origin/main")
-    commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
+    # Compare release tags (robust against squash-merge divergence)
+    local_tag = _git("describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD")
+    origin_tag = _git(
+        "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main"
+    )
 
-    target_tag = None
-    if commits_behind > 0:
-        target_tag = _git(
-            "describe", "--tags", "--match", "v*", "--abbrev=0", "origin/main"
-        )
+    if local_tag and origin_tag and local_tag == origin_tag:
+        # Same release tag — up to date
+        return jsonify({
+            "commits_behind": 0,
+            "local_tag": local_tag,
+            "target_tag": None,
+            "summary": None,
+        })
 
-    # Summary of what changed
+    # Different tags or no tags — count commits and build summary
+    commits_behind = 0
     summary = None
-    if commits_behind > 0:
-        summary = _git(
-            "log", "--oneline", "--no-merges", "HEAD..origin/main",
-        )
+
+    if local_tag and origin_tag:
+        # Count between tags (meaningful range, ignores squash noise)
+        behind_str = _git("rev-list", "--count", f"{local_tag}..{origin_tag}")
+        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 1
+        summary = _git("log", "--oneline", "--no-merges", f"{local_tag}..{origin_tag}")
+    else:
+        # Fallback to commit-based when tags are missing
+        behind_str = _git("rev-list", "--count", "HEAD..origin/main")
+        commits_behind = int(behind_str) if behind_str and behind_str.isdigit() else 0
+        if commits_behind > 0:
+            summary = _git("log", "--oneline", "--no-merges", "HEAD..origin/main")
 
     return jsonify({
         "commits_behind": commits_behind,
-        "target_tag": target_tag,
+        "local_tag": local_tag or "untagged",
+        "target_tag": origin_tag if local_tag != origin_tag else None,
         "summary": summary,
     })
 
@@ -182,50 +197,142 @@ def _apply_direct(pid_file: Path) -> tuple:
         return jsonify({"error": str(exc)}), 500
 
 
-_UPDATE_PROMPT = """\
-You are managing a Genesis self-update. Run the update script and supervise the outcome.
+# ── Three-tier CC update prompts ─────────────────────────────────────
+
+_TIER1_PROMPT = """\
+You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
 
 1. Run: bash {update_script} 2>&1
-   Capture and review the full output.
+   Capture the FULL output and the exit code.
 
 2. If exit 0 (success):
-   - Verify health endpoint responds: curl -sf http://localhost:5000/api/genesis/health
-   - Verify Genesis is importable: python -c "from genesis.runtime import GenesisRuntime"
-   - Check version changed: git describe --tags --always
-   - If verification passes, report success.
-   - If anything is off, diagnose and fix.
+   - Verify: curl -sf http://localhost:5000/api/genesis/health
+   - Verify: python -c "from genesis.runtime import GenesisRuntime"
+   - Check version: git -C {genesis_root} describe --tags --match 'v*' --always
+   - Write result to {summary_file} (e.g., "success: v3.0a3 -> v3.0a4")
+   - Done.
 
-3. If exit non-zero (failure/rollback):
-   - Read {failure_file} for structured failure context.
-   - Diagnose the root cause.
-   - If it's a targeted fix (missing column, import error, config mismatch),
-     apply the fix and retry the update.
-   - If you can't resolve it confidently, write a clear diagnostic report and stop.
+3. If exit 2 (merge conflicts):
+   - Read {conflict_file} for the list of conflicted files
+   - Write to {summary_file}: "conflicts: <file list>"
+   - Write to {escalation_file}: "tier2_needed"
+   - Done. Do NOT attempt to resolve conflicts yourself.
 
-4. Any fixes you commit should use conventional commit format (fix: ...).
+4. If exit 1 (script error):
+   - Read the error output. If it's a simple retry (network timeout,
+     temp file issue, pip cache), retry ONCE.
+   - If retry succeeds, continue from step 2.
+   - If retry fails or the error is not trivially retryable:
+     Write to {escalation_file}: "tier2_needed"
+     Write error context to {summary_file}
+   - Done. Do NOT attempt code changes.
 
-5. When done, write a one-line summary to {summary_file} with the outcome
-   (e.g., "success: updated v3.0a3 -> v3.0a4" or "failed: <reason>").
-
-Use mechanical judgment: targeted fixes yes, architectural decisions no.
-If in doubt, stop and report rather than guessing.\
+You are a security guard, not an engineer. Press buttons, report status,
+call for backup when needed.\
 """
+
+_TIER2_PROMPT = """\
+You are resolving issues from a Genesis update that Tier 1 couldn't handle.
+
+Read {summary_file} and {conflict_file} for context.
+
+If MERGE CONFLICTS:
+1. For each conflicted file, read BOTH sides of every conflict marker
+2. Evaluate: are the changes compatible? (same intent, just different history)
+3. If ALL conflicts in a file are trivially compatible — resolve them:
+   - git checkout --theirs for upstream-only changes
+   - git checkout --ours for user-only changes
+   - Manual merge where both sides add different things
+4. After resolving: git add <file>
+5. If ANY conflict is ambiguous or involves genuinely different intents:
+   - Do NOT resolve it. Write to {escalation_file}: "tier3_needed"
+   - Include: which files, what the incompatibility is, your assessment
+   - Done.
+6. If all conflicts resolved: git commit --no-edit, then run:
+   bash {update_script_post_merge} 2>&1
+   (This re-runs bootstrap, health checks, etc. from the merge point.)
+
+If SCRIPT ERROR:
+1. Diagnose the root cause from the error output
+2. If fixable (missing dep, config mismatch, import error): fix and retry
+3. If not fixable: write report to {summary_file}, write "tier3_needed"
+   to {escalation_file}, done
+
+Commit any fixes with conventional format (fix: ...).
+Write final outcome to {summary_file}.
+Log every action taken for user review.\
+"""
+
+_TIER3_PROMPT = """\
+You are resolving deep merge conflicts from a Genesis update.
+
+Read {escalation_file} for Sonnet's analysis of what couldn't be resolved.
+Read the conflicted files directly.
+
+For each conflict:
+1. Understand the intent of BOTH sides:
+   - LOCAL (ours): user customizations, additions, local config
+   - REMOTE (theirs): upstream bug fixes, features, improvements
+2. Find the resolution that preserves both intents
+3. Where intents genuinely conflict:
+   - Bug fixes and security patches: upstream wins
+   - User identity, config, customizations: user wins
+   - Feature additions: merge both, adapting as needed
+4. After resolving all conflicts: git add, git commit --no-edit
+5. Run: bash {update_script_post_merge} 2>&1
+6. Write a resolution report to {summary_file} explaining each decision
+
+Use conventional commit format for any fixes (fix: ...).\
+"""
+
+# Files used for inter-tier communication
+_GENESIS_DIR = _HOME / ".genesis"
+_SUMMARY_FILE = _GENESIS_DIR / "last_update_summary.txt"
+_ESCALATION_FILE = _GENESIS_DIR / "update_escalation.txt"
+_CONFLICT_FILE = _GENESIS_DIR / "update_conflicts.json"
 
 
 def _apply_supervised(pid_file: Path) -> tuple:
-    """Spawn a background CC session to run and supervise the update."""
-    summary_file = _HOME / ".genesis" / "last_update_summary.txt"
-    prompt = _UPDATE_PROMPT.format(
-        update_script=_UPDATE_SCRIPT,
-        failure_file=_FAILURE_FILE,
-        summary_file=summary_file,
-    )
+    """Spawn a three-tier CC update pipeline.
 
+    Tier 1 (Haiku): runs update.sh, watches exit code, escalates if needed.
+    Tier 2 (Sonnet): resolves trivial conflicts or script errors.
+    Tier 3 (Opus): resolves deep merge conflicts requiring judgment.
+
+    Orchestration runs in a background thread so the API returns immediately.
+    Each tier checks for escalation files left by the previous tier.
+    """
+    import threading
+
+    _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Clean up stale escalation/summary files from prior runs
+    for f in (_SUMMARY_FILE, _ESCALATION_FILE):
+        f.unlink(missing_ok=True)
+
+    def _run_tiers():
+        try:
+            _run_tier1(pid_file)
+        except Exception:
+            logger.error("Update orchestrator failed", exc_info=True)
+
+    thread = threading.Thread(target=_run_tiers, daemon=True, name="update-orchestrator")
+    thread.start()
+
+    return jsonify({
+        "status": "triggered",
+        "supervised": True,
+        "tier": 1,
+    })
+
+
+def _spawn_cc(prompt: str, model: str, pid_file: Path) -> int:
+    """Spawn a CC session and wait for it to complete. Returns exit code."""
     try:
         proc = subprocess.Popen(
             [
                 "claude", "-p", prompt,
-                "--model", "sonnet",
+                "--model", model,
                 "--dangerously-skip-permissions",
             ],
             stdout=subprocess.DEVNULL,
@@ -235,14 +342,163 @@ def _apply_supervised(pid_file: Path) -> tuple:
         )
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(proc.pid))
-        logger.info("CC-supervised update triggered (pid %d)", proc.pid)
-        return jsonify({
-            "status": "triggered",
-            "pid": proc.pid,
-            "supervised": True,
-        })
+        logger.info("CC %s session started (pid %d)", model, proc.pid)
+        proc.wait()  # Block until CC finishes
+        return proc.returncode
     except Exception as exc:
-        logger.error("Failed to spawn CC update session: %s", exc, exc_info=True)
-        # Fall back to direct update
-        logger.info("Falling back to direct update")
-        return _apply_direct(pid_file)
+        logger.error("Failed to spawn CC session: %s", exc, exc_info=True)
+        return 1
+
+
+def _run_tier1(pid_file: Path) -> None:
+    """Tier 1: Haiku watches update.sh and escalates if needed."""
+    prompt = _TIER1_PROMPT.format(
+        update_script=_UPDATE_SCRIPT,
+        genesis_root=_GENESIS_ROOT,
+        summary_file=_SUMMARY_FILE,
+        escalation_file=_ESCALATION_FILE,
+        conflict_file=_CONFLICT_FILE,
+    )
+
+    rc = _spawn_cc(prompt, "haiku", pid_file)
+    logger.info("Tier 1 (Haiku) completed with rc=%d", rc)
+
+    # Check if escalation is needed
+    if _ESCALATION_FILE.is_file():
+        escalation = _ESCALATION_FILE.read_text().strip()
+        if "tier2_needed" in escalation:
+            logger.info("Tier 1 escalated to Tier 2 (Sonnet)")
+            _ESCALATION_FILE.unlink(missing_ok=True)
+            _run_tier2(pid_file)
+
+
+def _run_tier2(pid_file: Path) -> None:
+    """Tier 2: Sonnet resolves trivial conflicts or script errors."""
+    prompt = _TIER2_PROMPT.format(
+        summary_file=_SUMMARY_FILE,
+        conflict_file=_CONFLICT_FILE,
+        escalation_file=_ESCALATION_FILE,
+        update_script_post_merge=_UPDATE_SCRIPT,
+    )
+
+    rc = _spawn_cc(prompt, "sonnet", pid_file)
+    logger.info("Tier 2 (Sonnet) completed with rc=%d", rc)
+
+    # Check if further escalation is needed
+    if _ESCALATION_FILE.is_file():
+        escalation = _ESCALATION_FILE.read_text().strip()
+        if "tier3_needed" in escalation:
+            logger.info("Tier 2 escalated to Tier 3 (Opus) — notifying user")
+            _notify_tier3_needed()
+
+
+def _run_tier3(pid_file: Path) -> None:
+    """Tier 3: Opus resolves deep merge conflicts. User-initiated only."""
+    prompt = _TIER3_PROMPT.format(
+        escalation_file=_ESCALATION_FILE,
+        summary_file=_SUMMARY_FILE,
+        update_script_post_merge=_UPDATE_SCRIPT,
+    )
+
+    rc = _spawn_cc(prompt, "opus", pid_file)
+    logger.info("Tier 3 (Opus) completed with rc=%d", rc)
+
+
+def _notify_tier3_needed() -> None:
+    """Notify user that deep conflicts need Opus-level resolution."""
+    try:
+        # Write a summary for the dashboard to pick up
+        _SUMMARY_FILE.write_text(
+            "conflicts_unresolved: Deep merge conflicts require Opus resolution. "
+            "Use 'Resolve with Opus' from the dashboard."
+        )
+
+        logger.info(
+            "Update has deep conflicts needing Opus resolution. "
+            "User should use dashboard 'Resolve with Opus' button."
+        )
+    except Exception:
+        logger.error("Failed to send tier3 notification", exc_info=True)
+
+
+@blueprint.route("/api/genesis/updates/resolve", methods=["POST"])
+def update_resolve():
+    """User-initiated Tier 3 (Opus) conflict resolution."""
+    if not _ESCALATION_FILE.is_file():
+        return jsonify({"error": "No escalation pending"}), 404
+
+    escalation = _ESCALATION_FILE.read_text().strip()
+    if "tier3_needed" not in escalation:
+        return jsonify({"error": "No Tier 3 escalation pending"}), 404
+
+    pid_file = _HOME / ".genesis" / "update_in_progress.pid"
+
+    # Check if something is already running
+    if pid_file.is_file():
+        try:
+            old_pid = int(pid_file.read_text().strip())
+            result = subprocess.run(["kill", "-0", str(old_pid)],
+                                    capture_output=True, timeout=2)
+            if result.returncode == 0:
+                return jsonify({
+                    "error": "Update session already in progress",
+                    "pid": old_pid,
+                }), 409
+            pid_file.unlink(missing_ok=True)
+        except (ValueError, subprocess.TimeoutExpired, OSError):
+            pid_file.unlink(missing_ok=True)
+
+    import threading
+
+    def _run():
+        try:
+            _run_tier3(pid_file)
+        except Exception:
+            logger.error("Tier 3 (Opus) failed", exc_info=True)
+
+    thread = threading.Thread(target=_run, daemon=True, name="update-tier3")
+    thread.start()
+
+    return jsonify({
+        "status": "triggered",
+        "supervised": True,
+        "tier": 3,
+    })
+
+
+@blueprint.route("/api/genesis/updates/progress")
+def update_progress():
+    """Poll update progress — reads summary and escalation files."""
+    summary = None
+    if _SUMMARY_FILE.is_file():
+        summary = _SUMMARY_FILE.read_text().strip()
+
+    escalation = None
+    if _ESCALATION_FILE.is_file():
+        escalation = _ESCALATION_FILE.read_text().strip()
+
+    conflicts = None
+    if _CONFLICT_FILE.is_file():
+        import contextlib as _ctxlib
+
+        with _ctxlib.suppress(json.JSONDecodeError, OSError):
+            conflicts = json.loads(_CONFLICT_FILE.read_text())
+
+    # Check if an update process is still running
+    pid_file = _HOME / ".genesis" / "update_in_progress.pid"
+    in_progress = False
+    if pid_file.is_file():
+        try:
+            pid = int(pid_file.read_text().strip())
+            result = subprocess.run(["kill", "-0", str(pid)],
+                                    capture_output=True, timeout=2)
+            in_progress = result.returncode == 0
+        except (ValueError, subprocess.TimeoutExpired, OSError):
+            pass
+
+    return jsonify({
+        "in_progress": in_progress,
+        "summary": summary,
+        "escalation": escalation,
+        "conflicts": conflicts,
+    })
