@@ -24,7 +24,7 @@ async def outreach_messages():
     limit = request.args.get("limit", 20, type=int)
     cursor = await rt.db.execute(
         """SELECT id, category, signal_type, topic, channel, message_content,
-                  delivered_at, engagement_outcome, created_at
+                  delivered_at, engagement_outcome, user_response, created_at
            FROM outreach_history
            ORDER BY created_at DESC LIMIT ?""",
         (limit,),
