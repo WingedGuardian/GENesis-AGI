@@ -25,7 +25,7 @@ connection between them.
 ## Input
 
 One of:
-- **Running service URL** (e.g., `http://${LOCAL_HOST:-localhost:8080}`)
+- **Running service URL** (e.g., `http://your-host:8080`)
 - **Repository URL** (e.g., `github.com/user/repo`)
 - **Local path** (e.g., `~/my-tool/`)
 - **Description** (e.g., "a job automation tool running on my server")

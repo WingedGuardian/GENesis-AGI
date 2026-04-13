@@ -7,6 +7,53 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a3-hf3] - 2026-04-12
+
+Public-primary repo overhaul — Genesis now defaults to install-agnostic
+configuration. Machine-specific values (IPs, timezone, GitHub identity)
+move to `~/.genesis/config/genesis.yaml` instead of being hardcoded in
+the repo. Sets up the public repo (`GENesis-AGI`) as the primary
+development target going forward.
+
+### Added
+
+- **Local config overlay** (`~/.genesis/config/genesis.yaml`). Three-tier
+  precedence: env var > local config > safe default. Covers Ollama/LM
+  Studio URLs, timezone, GitHub identity. Generate with
+  `./scripts/setup-local-config.sh`.
+- **`setup-local-config.sh`** — Interactive setup script for new installs.
+  Auto-detects system timezone, migrates `career-agent.yaml` to local
+  overlay on first run.
+- **Local module overlay** (`~/.genesis/config/modules/`). User-specific
+  module configs (e.g. career-agent) live outside the repo; local files
+  take precedence over repo files on same filename.
+- **Local research-profile overlay** (`~/.genesis/config/research-profiles/`).
+  `ProfileLoader.merge_overlay()` loads user-specific profiles not
+  committed to the repo.
+- **CI leak detector** — `leak-detector` job in `.github/workflows/ci.yml`
+  blocks PRs with hardcoded timezones, personal paths, private repo refs,
+  secrets (`detect-secrets`), and personal email addresses.
+- **`config/genesis.yaml.example`** — Template for local config.
+
+### Changed
+
+- Config YAMLs (`ego`, `outreach`, `inbox_monitor`, `mail_monitor`):
+  timezone defaults changed from `America/New_York` to `UTC`. Existing
+  installs set timezone in `~/.genesis/config/genesis.yaml`.
+- `tz.py`, dataclass defaults, and config loaders now resolve timezone
+  via `user_timezone()` from `env.py` instead of hardcoded string.
+- CLAUDE.md: hardcoded IPs and GitHub usernames removed; network config
+  points to local config file.
+- `.claude/docs/dual-repo.md` rewritten for three-repo model.
+
+### Fixed
+
+- `prepare-public-release.sh` portability scan now excludes `ci.yml`
+  (the leak-detector job contains timezone patterns as scanner definitions,
+  not config leaks). Removed stale `Build Order` CLAUDE.md regex.
+
+---
+
 ## [v3.0a3-hf1] - 2026-04-11
 
 Hotfix immediately after v3.0a3 to restore Phase 6 functionality in the
