@@ -347,6 +347,7 @@ class AwarenessLoop:
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
+        self._session_observer_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
@@ -602,6 +603,18 @@ class AwarenessLoop:
                     await self._sentinel.check_fire_alarms()
                 except Exception:
                     logger.warning("Sentinel fire alarm check failed", exc_info=True)
+
+            # Session observer — process pending tool observations into memories
+            if self._session_observer_fn:
+                try:
+                    obs_result = await self._session_observer_fn()
+                    if obs_result and obs_result.notes_stored > 0:
+                        logger.info(
+                            "Session observer: %d notes from %d observations",
+                            obs_result.notes_stored, obs_result.observations_read,
+                        )
+                except Exception:
+                    logger.warning("Session observer processing failed", exc_info=True)
 
         if result is None:
             return
@@ -895,6 +908,10 @@ class AwarenessLoop:
     def set_findings_ingest(self, fn) -> None:
         """Inject Guardian findings ingest for reading diagnosis results."""
         self._findings_ingest_fn = fn
+
+    def set_session_observer(self, fn) -> None:
+        """Inject session observer processor for tool activity notes."""
+        self._session_observer_fn = fn
 
     def replace_collectors(self, collectors: list) -> None:
         """Replace signal collectors (late-binding upgrade from stubs to real).
