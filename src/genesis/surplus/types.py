@@ -21,6 +21,12 @@ class TaskType(StrEnum):
     CODE_AUDIT = "code_audit"
     INFRASTRUCTURE_MONITOR = "infrastructure_monitor"
     BOOKMARK_ENRICHMENT = "bookmark_enrichment"
+    # Phase 1 surplus expansion: eval + infrastructure maintenance
+    MODEL_EVAL = "model_eval"
+    DISK_CLEANUP = "disk_cleanup"
+    DB_MAINTENANCE = "db_maintenance"
+    DEAD_LETTER_REPLAY = "dead_letter_replay"
+    BACKUP_VERIFICATION = "backup_verification"
 
 
 class ComputeTier(StrEnum):
