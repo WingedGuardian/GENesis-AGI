@@ -130,6 +130,12 @@ class TestInferWing:
     def test_learning_wing(self):
         assert _infer_wing_from_files(["src/genesis/learning/triage.py"]) == "learning"
 
+    def test_infrastructure_hooks(self):
+        assert _infer_wing_from_files(["scripts/hooks/session_observer_hook.py"]) == "infrastructure"
+
+    def test_infrastructure_config(self):
+        assert _infer_wing_from_files(["/home/ubuntu/genesis/config/model_routing.yaml"]) == "infrastructure"
+
     def test_no_match(self):
         assert _infer_wing_from_files(["README.md"]) is None
 
