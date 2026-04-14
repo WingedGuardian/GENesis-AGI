@@ -316,11 +316,16 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             # Each task: check pending, enqueue if zero
+            # Infrastructure maintenance (no LLM needed)
             maintenance_tasks = [
                 (TaskType.DISK_CLEANUP, 0.4, "preservation"),
                 (TaskType.BACKUP_VERIFICATION, 0.7, "preservation"),
                 (TaskType.DEAD_LETTER_REPLAY, 0.5, "cooperation"),
                 (TaskType.DB_MAINTENANCE, 0.3, "competence"),
+                # Tier 1 LLM tasks — observation-only analysis via ReflectionEngine
+                (TaskType.GAP_CLUSTERING, 0.4, "competence"),
+                (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
+                (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
             ]
             for task_type, priority, drive in maintenance_tasks:
                 pending = await self._queue.pending_by_type(task_type)
