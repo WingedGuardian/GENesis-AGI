@@ -69,6 +69,10 @@ class SurplusScheduler:
         self._code_audit_executor: SurplusExecutor | None = None
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
         self._model_eval_executor: SurplusExecutor | None = None
+        self._disk_cleanup_executor: SurplusExecutor | None = None
+        self._backup_verification_executor: SurplusExecutor | None = None
+        self._dead_letter_replay_executor: SurplusExecutor | None = None
+        self._db_maintenance_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
@@ -90,6 +94,24 @@ class SurplusScheduler:
     def set_model_eval_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for MODEL_EVAL tasks."""
         self._model_eval_executor = executor
+
+    def set_maintenance_executors(
+        self,
+        *,
+        disk_cleanup: SurplusExecutor | None = None,
+        backup_verification: SurplusExecutor | None = None,
+        dead_letter_replay: SurplusExecutor | None = None,
+        db_maintenance: SurplusExecutor | None = None,
+    ) -> None:
+        """Set dedicated executors for infrastructure maintenance tasks."""
+        if disk_cleanup:
+            self._disk_cleanup_executor = disk_cleanup
+        if backup_verification:
+            self._backup_verification_executor = backup_verification
+        if dead_letter_replay:
+            self._dead_letter_replay_executor = dead_letter_replay
+        if db_maintenance:
+            self._db_maintenance_executor = db_maintenance
 
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
@@ -146,6 +168,13 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        self._scheduler.add_job(
+            self.schedule_maintenance,
+            IntervalTrigger(hours=6),
+            id="schedule_maintenance",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
         self._scheduler.start()
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
@@ -155,6 +184,7 @@ class SurplusScheduler:
             await self.schedule_code_audit()
         await self.schedule_infra_monitor()
         await self.run_recon_gather()
+        await self.schedule_maintenance()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
             self._dispatch_interval, self._brainstorm_interval,
@@ -241,6 +271,37 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_infra_monitor", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_maintenance(self) -> None:
+        """Enqueue infrastructure maintenance tasks if none pending."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            # Each task: check pending, enqueue if zero
+            maintenance_tasks = [
+                (TaskType.DISK_CLEANUP, 0.4, "preservation"),
+                (TaskType.BACKUP_VERIFICATION, 0.7, "preservation"),
+                (TaskType.DEAD_LETTER_REPLAY, 0.5, "cooperation"),
+                (TaskType.DB_MAINTENANCE, 0.3, "competence"),
+            ]
+            for task_type, priority, drive in maintenance_tasks:
+                pending = await self._queue.pending_by_type(task_type)
+                if pending == 0:
+                    await self._queue.enqueue(
+                        task_type, ComputeTier.FREE_API, priority, drive,
+                    )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_maintenance")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Maintenance scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_maintenance", str(exc))
             except Exception:
                 pass
 
@@ -377,6 +438,14 @@ class SurplusScheduler:
             executor = self._bookmark_enrichment_executor
         elif task.task_type == _TT.MODEL_EVAL and self._model_eval_executor is not None:
             executor = self._model_eval_executor
+        elif task.task_type == _TT.DISK_CLEANUP and self._disk_cleanup_executor is not None:
+            executor = self._disk_cleanup_executor
+        elif task.task_type == _TT.BACKUP_VERIFICATION and self._backup_verification_executor is not None:
+            executor = self._backup_verification_executor
+        elif task.task_type == _TT.DEAD_LETTER_REPLAY and self._dead_letter_replay_executor is not None:
+            executor = self._dead_letter_replay_executor
+        elif task.task_type == _TT.DB_MAINTENANCE and self._db_maintenance_executor is not None:
+            executor = self._db_maintenance_executor
 
         try:
             result = await executor.execute(task)

@@ -120,6 +120,32 @@ async def init(rt: GenesisRuntime) -> None:
             await _degraded(rt, "ModelEvalExecutor")
 
         try:
+            from genesis.surplus.maintenance import (
+                BackupVerificationExecutor,
+                DbMaintenanceExecutor,
+                DeadLetterReplayExecutor,
+                DiskCleanupExecutor,
+            )
+            maint_kwargs: dict = {
+                "disk_cleanup": DiskCleanupExecutor(),
+                "backup_verification": BackupVerificationExecutor(),
+                "db_maintenance": DbMaintenanceExecutor(db=rt._db),
+            }
+            # DLQ replay needs both dead_letter_queue and router
+            if rt._dead_letter_queue is not None and rt._router is not None:
+                maint_kwargs["dead_letter_replay"] = DeadLetterReplayExecutor(
+                    dead_letter=rt._dead_letter_queue, router=rt._router,
+                )
+            rt._surplus_scheduler.set_maintenance_executors(**maint_kwargs)
+            logger.info("Maintenance executors wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire maintenance executors", exc_info=True)
+            await _degraded(rt, "MaintenanceExecutors")
+        except Exception:
+            logger.error("Unexpected error wiring maintenance executors", exc_info=True)
+            await _degraded(rt, "MaintenanceExecutors")
+
+        try:
             from genesis.surplus.findings_bridge import FindingsBridge
             rt._findings_bridge = FindingsBridge(db=rt._db)
             logger.info("FindingsBridge initialized")
