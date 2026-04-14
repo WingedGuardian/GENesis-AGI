@@ -100,6 +100,7 @@ async def init(rt: GenesisRuntime) -> None:
             activity_tracker=rt._activity_tracker,
             pipeline=rt._outreach_pipeline,
             memory_store=rt._memory_store,
+            surplus_queue=rt._surplus_queue,
         )
 
         logger.info("Step 13: Outreach pipeline + scheduler initialized")
