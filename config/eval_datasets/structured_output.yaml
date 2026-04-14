@@ -1,0 +1,138 @@
+# Golden dataset: structured output generation
+# Tests models on producing valid JSON with specific schemas.
+# Critical for Genesis — most call sites expect structured responses.
+
+metadata:
+  name: structured_output
+  description: Generate valid JSON output matching specific schemas
+  category: structured_output
+  default_scorer: json_validity
+  version: "1.0"
+
+cases:
+  - id: struct_01
+    description: "Generate observation JSON"
+    input: |
+      Generate a Genesis observation for the following event.
+      Reply with valid JSON matching this schema:
+      {"type": "string", "source": "string", "content": "string", "priority": "low|medium|high"}
+
+      Event: The Groq API returned 3 consecutive rate limit errors in
+      the last 5 minutes on the triage call site.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["type", "source", "content", "priority"]
+
+  - id: struct_02
+    description: "Generate task classification"
+    input: |
+      Classify this task. Reply with valid JSON:
+      {"category": "string", "complexity": "simple|moderate|complex", "estimated_steps": number}
+
+      Task: Add a new API endpoint that validates user input, stores it
+      in the database, and sends a confirmation email.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["category", "complexity", "estimated_steps"]
+
+  - id: struct_03
+    description: "Generate provider health report"
+    input: |
+      Summarize this provider status as JSON:
+      {"provider": "string", "status": "healthy|degraded|down", "issues": ["string"], "recommendation": "string"}
+
+      Status: Mistral API has been returning 503 errors for 15% of
+      requests over the last hour. Response times are 3x normal.
+      Other providers are unaffected.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["provider", "status", "issues", "recommendation"]
+
+  - id: struct_04
+    description: "Generate session summary"
+    input: |
+      Summarize this session as JSON:
+      {"topic": "string", "key_decisions": ["string"], "action_items": ["string"], "duration_minutes": number}
+
+      Session: 45-minute debugging session. Found that the memory
+      retrieval was failing because the Qdrant collection had been
+      recreated without the custom index. Decision: add a bootstrap
+      check that verifies collection schema on startup. Also decided
+      to add a health check endpoint for Qdrant status.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["topic", "key_decisions", "action_items", "duration_minutes"]
+
+  - id: struct_05
+    description: "Valid JSON array output"
+    input: |
+      List the top 3 risks of this approach as a JSON array of objects.
+      Each object must have: {"risk": "string", "severity": "low|medium|high", "mitigation": "string"}
+
+      Approach: We plan to replace the SQLite database with PostgreSQL
+      in production without a parallel-run period. The migration script
+      will run during a 2-hour maintenance window on Saturday night.
+    expected: ""
+    scorer: json_validity
+
+  - id: struct_06
+    description: "Nested JSON structure"
+    input: |
+      Generate a model evaluation summary as valid JSON:
+      {"model": "string", "scores": {"accuracy": number, "latency_ms": number}, "recommendation": "promote|hold|reject"}
+
+      Results: cerebras-qwen scored 73% on classification (target: 70%),
+      average latency 450ms. Struggled with complex multi-step reasoning
+      but handled simple extraction well.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["model", "scores", "recommendation"]
+
+  - id: struct_07
+    description: "Empty/null handling"
+    input: |
+      Parse this partial record into JSON. Use null for missing fields.
+      Schema: {"name": "string", "email": "string|null", "role": "string|null", "active": boolean}
+
+      Record: John Smith, no email on file, currently active user.
+    expected: ""
+    scorer: json_validity
+    scorer_config:
+      required_keys: ["name", "email", "role", "active"]
+
+  - id: struct_08
+    description: "No slop in structured output"
+    input: |
+      Reply with ONLY valid JSON, no explanation or markdown.
+      {"status": "ok", "message": "health check passed"}
+    expected: ""
+    scorer: slop_detection
+
+  - id: struct_09
+    description: "Numeric precision"
+    input: |
+      Calculate and return as JSON: {"total_cost": number, "average_cost": number}
+
+      Costs: 3 API calls at $0.002 each, 1 call at $0.015, 2 calls at $0.001 each.
+    expected: '{"total_cost": 0.023, "average_cost": 0.0038}'
+    scorer: json_field_match
+    scorer_config:
+      fields: ["total_cost"]
+      expected_values:
+        total_cost: 0.023
+
+  - id: struct_10
+    description: "Boolean field generation"
+    input: |
+      Evaluate these statements and return JSON with boolean values:
+      {"is_free": boolean, "has_rate_limit": boolean, "supports_streaming": boolean}
+
+      Provider info: Groq offers free API access with a 30 RPM rate limit.
+      The API supports streaming responses via SSE.
+    expected: '{"is_free": true, "has_rate_limit": true, "supports_streaming": true}'
+    scorer: json_field_match
