@@ -224,7 +224,7 @@ async def test_process_pending_observations_no_files(monkeypatch):
 @pytest.mark.asyncio
 async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     """Observations are read, LLM is called, notes are stored."""
-    # Setup observation file
+    # Setup observation file in a realistic directory structure
     session_dir = tmp_path / "test-session"
     session_dir.mkdir()
     obs_file = session_dir / "tool_observations.jsonl"
@@ -271,3 +271,8 @@ async def test_process_pending_observations_stores_notes(tmp_path, monkeypatch):
     assert "session_note" in call_kwargs.kwargs["tags"]
     assert call_kwargs.kwargs["source_pipeline"] == "session_observer"
     assert call_kwargs.kwargs["source"] == "session_observer"
+
+    # Verify atomic rename: original file should be gone (renamed to .processing
+    # then deleted after processing)
+    assert not obs_file.exists()
+    assert not obs_file.with_suffix(".jsonl.processing").exists()
