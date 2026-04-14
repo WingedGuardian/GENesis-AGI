@@ -50,8 +50,11 @@ def test_update_chain(config_file):
 
 
 def test_update_creates_backup(config_file):
+    # First update creates the local overlay; second update creates a backup of it
     update_call_site_in_yaml(config_file, "2_triage", chain=["groq_llama"])
-    bak = config_file.with_suffix(".yaml.bak.1")
+    update_call_site_in_yaml(config_file, "2_triage", chain=["openrouter_haiku"])
+    local_path = config_file.with_name("model_routing.local.yaml")
+    bak = local_path.with_suffix(".yaml.bak.1")
     assert bak.exists()
 
 
@@ -61,9 +64,10 @@ def test_rolling_backups(config_file):
             config_file, "2_triage",
             chain=["groq_llama", "openrouter_haiku"] if i % 2 == 0 else ["openrouter_haiku", "groq_llama"],
         )
-    assert config_file.with_suffix(".yaml.bak.1").exists()
-    assert config_file.with_suffix(".yaml.bak.2").exists()
-    assert config_file.with_suffix(".yaml.bak.3").exists()
+    local_path = config_file.with_name("model_routing.local.yaml")
+    assert local_path.with_suffix(".yaml.bak.1").exists()
+    assert local_path.with_suffix(".yaml.bak.2").exists()
+    assert local_path.with_suffix(".yaml.bak.3").exists()
 
 
 def test_reject_empty_chain(config_file):
@@ -117,12 +121,12 @@ def test_noop_update_no_backup(config_file):
 def test_dispatch_api_mode_clears_cc_fields(config_file):
     """dispatch='api' writes the mode and strips cc_model/cc_position.
 
-    cc_model / cc_position are stored in raw yaml (the dashboard route
-    reads them via ``yaml.safe_load``), NOT as typed fields on
-    ``CallSiteConfig``.  Assertions therefore round-trip through the
-    yaml file rather than the parsed dataclass.
+    cc_model / cc_position are stored in the local overlay yaml (the
+    dashboard route reads them via yaml.safe_load after merging).
+    Assertions round-trip through the local overlay file.
     """
     import yaml as _y
+    local_path = config_file.with_name("model_routing.local.yaml")
     # Seed with cc_model first
     update_call_site_in_yaml(
         config_file, "5_deep_reflection",
@@ -133,7 +137,7 @@ def test_dispatch_api_mode_clears_cc_fields(config_file):
         config_file, "5_deep_reflection", dispatch="api",
     )
     assert new_config.call_sites["5_deep_reflection"].dispatch == "api"
-    raw = _y.safe_load(config_file.read_text())
+    raw = _y.safe_load(local_path.read_text())
     site = raw["call_sites"]["5_deep_reflection"]
     assert site.get("dispatch") == "api"
     assert "cc_model" not in site
@@ -143,12 +147,13 @@ def test_dispatch_api_mode_clears_cc_fields(config_file):
 def test_dispatch_cli_mode_preserves_cc_model(config_file):
     """dispatch='cli' forces CLI execution while preserving cc_model."""
     import yaml as _y
+    local_path = config_file.with_name("model_routing.local.yaml")
     new_config = update_call_site_in_yaml(
         config_file, "5_deep_reflection",
         chain=["openrouter_sonnet"], cc_model="Opus", dispatch="cli",
     )
     assert new_config.call_sites["5_deep_reflection"].dispatch == "cli"
-    raw = _y.safe_load(config_file.read_text())
+    raw = _y.safe_load(local_path.read_text())
     site = raw["call_sites"]["5_deep_reflection"]
     assert site.get("dispatch") == "cli"
     assert site.get("cc_model") == "Opus"
@@ -157,12 +162,13 @@ def test_dispatch_cli_mode_preserves_cc_model(config_file):
 def test_dispatch_dual_mode_is_auto(config_file):
     """dispatch='dual' stores the explicit auto mode."""
     import yaml as _y
+    local_path = config_file.with_name("model_routing.local.yaml")
     new_config = update_call_site_in_yaml(
         config_file, "5_deep_reflection",
         chain=["openrouter_sonnet"], cc_model="Sonnet", dispatch="dual",
     )
     assert new_config.call_sites["5_deep_reflection"].dispatch == "dual"
-    raw = _y.safe_load(config_file.read_text())
+    raw = _y.safe_load(local_path.read_text())
     site = raw["call_sites"]["5_deep_reflection"]
     assert site.get("dispatch") == "dual"
     assert site.get("cc_model") == "Sonnet"
@@ -175,22 +181,25 @@ def test_dispatch_invalid_value_rejected(config_file):
 
 
 def test_atomic_write_cleans_up_on_failure(config_file, monkeypatch):
-    """If validation fails after writing .new, the .new file should be cleaned up."""
-    # Corrupt the validation by monkeypatching load_config to fail
-    original = load_config
+    """If validation fails, no overlay file is written and base is untouched."""
+    from genesis.routing import config as config_mod
 
-    def bad_load(path):
-        if str(path).endswith(".new"):
-            raise RuntimeError("simulated parse failure")
-        return original(path)
+    # Corrupt the validation by monkeypatching _parse to fail
+    original_parse = config_mod._parse
 
-    monkeypatch.setattr("genesis.routing.config.load_config", bad_load)
+    def bad_parse(raw):
+        raise RuntimeError("simulated parse failure")
+
+    monkeypatch.setattr(config_mod, "_parse", bad_parse)
 
     with pytest.raises(ValueError, match="validation"):
         update_call_site_in_yaml(config_file, "2_triage", chain=["groq_llama"])
 
-    # .new file should be cleaned up
-    assert not config_file.with_suffix(".yaml.new").exists()
-    # Original file should be untouched
-    reloaded = original(config_file)
+    # No overlay file should have been created (validation failed before write)
+    local_path = config_file.with_name("model_routing.local.yaml")
+    assert not local_path.exists()
+    assert not local_path.with_suffix(".yaml.new").exists()
+    # Original base file should be untouched — restore parse and reload
+    monkeypatch.setattr(config_mod, "_parse", original_parse)
+    reloaded = load_config(config_file)
     assert list(reloaded.call_sites["2_triage"].chain) == ["openrouter_haiku", "groq_llama"]

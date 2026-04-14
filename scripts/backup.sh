@@ -143,7 +143,19 @@ else
     log "WARNING: backup_cc_memory.sh not found"
 fi
 
-# --- 6. Secrets (encrypted with GPG symmetric) ---
+# --- 6. Local config overlays (user customizations, gitignored) ---
+log "Backing up local config overlays..."
+mkdir -p config_overrides
+_LOCAL_OVERLAY_COUNT=0
+if [ -d "$GENESIS_DIR/config" ]; then
+    find "$GENESIS_DIR/config" -maxdepth 1 -name "*.local.yaml" | while IFS= read -r f; do
+        cp "$f" config_overrides/ && _LOCAL_OVERLAY_COUNT=$(( _LOCAL_OVERLAY_COUNT + 1 ))
+    done
+    _LOCAL_OVERLAY_COUNT=$(find config_overrides -name "*.local.yaml" 2>/dev/null | wc -l)
+    log "Local overlays: $_LOCAL_OVERLAY_COUNT files"
+fi
+
+# --- 7. Secrets (encrypted with GPG symmetric) ---
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets
 if [ -f "$SECRETS_FILE" ]; then

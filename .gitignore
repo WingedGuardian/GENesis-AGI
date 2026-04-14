@@ -42,6 +42,7 @@ scripts/cc_cli_output/
 .firecrawl/
 .mcp.json
 config/.generated/
+config/*.local.yaml
 .gstack/
 .context/
 .playwright-mcp/
