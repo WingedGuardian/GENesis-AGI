@@ -20,10 +20,16 @@ from genesis.eval.types import (
     ScoredOutput,
     TaskCategory,
 )
+import litellm
+
 from genesis.routing.config import load_config
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.rate_gate import ProviderRateGate
 from genesis.routing.types import RoutingConfig
+
+# Suppress litellm's verbose cost-calculator noise in eval output
+litellm.suppress_debug_info = True
+litellm.set_verbose = False
 
 if TYPE_CHECKING:
     from pathlib import Path
