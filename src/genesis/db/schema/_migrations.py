@@ -591,6 +591,27 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE cost_events ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
         "cost_events.cost_known")
 
+    # 2026-04-14: Move critical_failure and software_error_spike to Micro only.
+    # These are delta signals — they matter when they flip state, not as
+    # persistent conditions driving hourly Light reflections.
+    await db.execute(
+        "UPDATE signal_weights SET feeds_depths = '[\"Micro\"]', "
+        "current_weight = 0.70, initial_weight = 0.70 "
+        "WHERE signal_name = 'critical_failure'"
+    )
+    await db.execute(
+        "UPDATE signal_weights SET feeds_depths = '[\"Micro\"]' "
+        "WHERE signal_name = 'software_error_spike'"
+    )
+
+    # 2026-04-14: Reduce Light floor from 6h to 3h.
+    # 6h was never enforced (floor_seconds was unused in classifier).
+    # Now that floor enforcement is active, 3h is appropriate for Light.
+    await db.execute(
+        "UPDATE depth_thresholds SET floor_seconds = 10800 "
+        "WHERE depth_name = 'Light' AND floor_seconds = 21600"
+    )
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

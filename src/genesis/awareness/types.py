@@ -55,3 +55,4 @@ class TickResult:
     trigger_reason: str | None
     escalation_source: str | None = None
     escalation_pending_id: str | None = None  # observation ID to resolve after dispatch
+    signal_staleness: dict[str, int] | None = None  # signal_name → consecutive unchanged ticks
