@@ -20,6 +20,11 @@ schedules:
     cron: "0 6 * * 0"
     enabled: true
 
+  free_model_inventory:
+    description: "Daily scan for new free models on OpenRouter — enqueues MODEL_EVAL surplus tasks"
+    cron: "0 7 * * *"
+    enabled: true
+
   source_discovery:
     description: "Discover new sources worth monitoring"
     cron: "0 6 1 * *"

@@ -452,10 +452,93 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - Best for burst scenarios or when Mistral's 2 RPM limit is too slow
 
 ### OpenRouter Free Tier
-- ~29 models available as free variants on OpenRouter
-- **Rate limits:** 20 RPM, 200 RPD (shared across all free models)
-- Includes Llama 4 Scout, various community models
-- Use as overflow when other free sources are exhausted
+- ~29 models available as free variants (`:free` suffix) on OpenRouter
+- **Base rate limits:** 20 RPM, 200 RPD (shared across all free models)
+- **With $10 balance:** 1,000 RPD (5x increase, balance is not consumed by free models)
+- Includes Llama 4 Scout, DeepSeek-R1, Gemma 4 31B, Qwen3-Coder 480B, various community models
+- Use as overflow when other free sources are exhausted, or as primary diversity source
+- Free models use `pricing.prompt == "0"` in API — detectable programmatically
+
+### Cerebras Free Tier
+- **Endpoint:** `api.cerebras.ai`
+- **Setup:** Create account at cloud.cerebras.ai — no payment required
+- **Best model:** Qwen3-235B-A22B (instruct only — thinking mode deprecated Nov 2025)
+- **Rate limits:** 10 RPM, 14,400 RPD, 1M tokens/min
+- Also available: Llama 3.3 70B, Llama 3.1 8B
+- **Key caveat:** Non-thinking instruct only. GPQA ~70, not 81.1 (thinking score).
+  Volume play (14,400 RPD), not quality play. Useful for classification, extraction,
+  and bulk tasks that don't require deep reasoning.
+- Data privacy: check current terms — policy may differ from API-first providers
+
+### GitHub Models Free Tier
+- **Endpoint:** `models.inference.ai.azure.com`
+- **Setup:** GitHub account required, access via github.com/marketplace/models
+- **Available models:** GPT-OSS-120B, o3-mini, Llama 4 Scout, Phi-4, others
+- **Rate limits:** Vary by model — o3-mini: 50 RPD; GPT-OSS-120B: check marketplace
+- Best for spot reasoning tasks (o3-mini at 50 RPD) or diversity overflow
+- Uses Azure-backed infrastructure — generally reliable
+
+### SambaNova Free Tier
+- **Endpoint:** `api.sambanova.ai`
+- **Setup:** Create account at cloud.sambanova.ai
+- **Available models:** DeepSeek-R1, Llama 3.3 70B, QwQ-32B
+- **Rate limits:** Verify current limits — historically generous for inference demos
+- SambaNova Cloud focuses on speed (custom hardware); worth benchmarking latency
+
+---
+
+## Free Tier Benchmark Comparison (April 2026)
+
+Verified scores from primary sources. Caveats noted inline. This table guides
+routing decisions — eval harness (Phase 3) provides Genesis-specific validation.
+
+| Model | Provider | MMLU-Pro | GPQA | LiveCodeBench | AIME | Free Limit |
+|---|---|---|---|---|---|---|
+| Qwen3.6+ Preview | OpenRouter | 88.5 | **90.4** | **87.1** | 95.3 | Verify — preview, may flip paid |
+| Kimi K2.5 | NVIDIA NIM | 87.1 | 87.6 | SWE 76.8% | 96.1 | ~5,000 credits (not unlimited) |
+| Gemma 4 27B Dense | OpenRouter | 85.2 | 84.3 | 80.0 | 89.2 | free `:free` |
+| Gemini 2.5 Flash | Google | — | 82.8 | 63.9 | 72.0 | 250 RPD |
+| o3-mini | GitHub Models | — | 74.9 | 96.3 (HE) | 97.3 | 50 RPD |
+| DeepSeek-R1 | OpenRouter | 84.0 | 71.5 | 65.9 | 87.5 | 1,000 RPD ($10 bal.) |
+| Qwen3-235B *(no thinking)* | Cerebras | ~75 | ~70 | ~62 | ~60 | 14,400 RPD |
+| Qwen3-Coder 480B | OpenRouter | — | — | SWE 69.6 | — | free `:free` |
+| Llama 3.3 70B | Groq | 68.9 | 50.5 | 88.4 (HE) | ~30 | 1,000 RPD |
+| Mistral Large 3 | Mistral | ~75† | 43.9 | 90.2 (HE) | — | ~1,440 RPD (2 RPM) |
+| Mistral Small 3.2 | Mistral | 69.1 | — | 92.9 (HE+) | — | ~43,200 RPD (30 RPM) |
+| Trinity Large | OpenRouter | 75.2 | 63.3 | — | 24.0 | free until Apr 22 |
+
+**Reading this table:**
+- **GPQA** = graduate-level reasoning (higher = better analytical tasks)
+- **LiveCodeBench** = code generation on novel problems (HE = HumanEval, not directly comparable)
+- **AIME** = competition math (proxy for multi-step reasoning)
+- **†** = estimated from related benchmarks, not official
+- **SWE** = SWE-bench Verified (end-to-end bug fixing, different scale)
+
+**Key takeaways for routing:**
+- Qwen3.6+ is the quality leader IF free tier holds (preview period, no end date published)
+- Cerebras qwen3-235b is the volume leader (14,400 RPD) for classification/extraction
+- o3-mini is the reasoning reserve (50 RPD) for hardest analytical tasks
+- Gemma 4 27B is the reliable middle ground (free, decent quality, no preview expiry)
+- Mistral Small 3.2 is the high-throughput option (30 RPM) for classification
+
+---
+
+## Pending Evaluation
+
+Models requiring benchmark or free-tier verification before routing decisions:
+
+- **Qwen3.6+ Preview** — Free during preview, but no published end date. May collect
+  prompt data. Verify free status weekly. Routing must have fallback path.
+- **Trinity Large (OpenRouter)** — Free until April 22, 2026. Benchmark before expiry
+  to evaluate paid tier viability.
+- **Kimi K2.5 on NIM** — Confirmed K2.5 (not K2), but ~5,000 credit cap means
+  limited total usage. Not a long-term free source.
+- **SambaNova models** — Rate limits and data terms unverified. Worth a latency
+  benchmark given custom hardware claims.
+- **Cohere rerank-3.5** — 10 RPM free. Not a generative model — for retrieval
+  reranking only. Evaluate for memory recall chain improvement.
+- **Voyage AI voyage-3** — 200M token one-time free embeddings. Evaluate for
+  Qdrant embedding quality vs. current embeddings.
 
 ---
 
@@ -508,6 +591,9 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
+2026-04-14 — added free tier benchmark comparison table; added Cerebras, GitHub
+Models, SambaNova free tier terms; updated OpenRouter with $10 balance info;
+added Pending Evaluation section; added Qwen3-Coder 480B, Gemma 4, Trinity Large.
 2026-04-12 — added effort level section with current assignments, research assessment, and V4 path.
 2026-03-14 — added GPT-5.4 (computer use, compaction training, agentic focus);
 noted co-orchestrator potential and disagreement gate use case for Genesis.
