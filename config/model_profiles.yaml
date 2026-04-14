@@ -807,3 +807,158 @@ profiles:
       limits: "unlimited (local inference)"
     last_reviewed: "2026-03-26"
     review_source: manual
+
+  # ── Phase 2 profiles (April 2026) ──────────────────────────────────────
+
+  cerebras-qwen3-235b:
+    display_name: "Qwen3-235B-A22B (Cerebras)"
+    provider: cerebras
+    api_id: "qwen-3-235b-a22b"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: fast
+    strengths:
+      - extremely high volume (14,400 RPD)
+      - fast inference (Cerebras hardware)
+      - reasonable classification and extraction
+      - large MoE model (235B params, 22B active)
+    weaknesses:
+      - NO thinking mode (deprecated Nov 2025 on Cerebras)
+      - GPQA ~70 (instruct only, not 81.1 thinking score)
+      - deep analytical reasoning
+      - creative or nuanced output
+    best_for: [triage, tagging, classification, extraction, surplus_brainstorm]
+    avoid_for: [deep_reflection, strategic_reflection, code_work, adversarial_counterargument]
+    free_tier:
+      available: true
+      provider: cerebras
+      limits: "10 RPM, 14,400 RPD, 1M tokens/min"
+    last_reviewed: "2026-04-14"
+    review_source: manual
+
+  github-o3-mini:
+    display_name: "o3-mini (GitHub Models)"
+    provider: github
+    api_id: "o3-mini"
+    intelligence_tier: A
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 200000
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - frontier reasoning (GPQA 74.9, AIME 97.3)
+      - competition-level math and logic
+      - strong code generation (HumanEval 96.3)
+    weaknesses:
+      - very limited quota (50 RPD)
+      - not suitable for bulk work
+      - Azure-backed latency can vary
+    best_for: [hard_reasoning, math_heavy, code_work]
+    avoid_for: [surplus_brainstorm, triage, tagging, bulk_classification]
+    free_tier:
+      available: true
+      provider: github
+      limits: "50 RPD (varies by model)"
+    last_reviewed: "2026-04-14"
+    review_source: manual
+
+  gemma-4-27b:
+    display_name: "Gemma 4 27B Dense"
+    provider: google
+    api_id: "google/gemma-4-27b-it:free"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - solid GPQA (84.3) for free model
+      - reliable middle ground quality
+      - no preview expiry (stable free tier)
+      - decent coding (LiveCodeBench 80.0)
+    weaknesses:
+      - smaller model, less nuance than 70B+
+      - creative writing
+      - very long context handling
+    best_for: [surplus_brainstorm, extraction, classification, code_work]
+    avoid_for: [deep_reflection, strategic_reflection]
+    free_tier:
+      available: true
+      provider: openrouter
+      limits: "OpenRouter free tier (20 RPM, 200-1000 RPD)"
+    last_reviewed: "2026-04-14"
+    review_source: manual
+
+  qwen3-coder-480b:
+    display_name: "Qwen3-Coder 480B"
+    provider: alibaba
+    api_id: "qwen/qwen3-coder-480b-a35b:free"
+    intelligence_tier: B
+    reasoning: B
+    instruction_following: B
+    anti_sycophancy: C
+    context_window: 262144
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - code-specialized (SWE-bench 69.6)
+      - large MoE architecture (480B params, 35B active)
+      - 256k context window
+    weaknesses:
+      - code-focused, weaker on general reasoning
+      - benchmark data sparse (no GPQA/MMLU-Pro scores)
+      - quality unverified for Genesis tasks
+    best_for: [code_work, code_audit]
+    avoid_for: [deep_reflection, strategic_reflection, triage]
+    free_tier:
+      available: true
+      provider: openrouter
+      limits: "OpenRouter free tier (20 RPM, 200-1000 RPD)"
+    last_reviewed: "2026-04-14"
+    review_source: manual
+
+  deepseek-r1:
+    display_name: "DeepSeek-R1"
+    provider: deepseek
+    api_id: "deepseek/deepseek-r1:free"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: B
+    anti_sycophancy: B
+    context_window: 163840
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: high
+    strengths:
+      - strong reasoning (GPQA 71.5, MMLU-Pro 84.0)
+      - chain-of-thought by default
+      - AIME 87.5
+    weaknesses:
+      - slow (thinking overhead)
+      - verbose chain-of-thought output
+      - requires OpenRouter $10 balance for 1,000 RPD
+    best_for: [hard_reasoning, math_heavy, research_synthesis]
+    avoid_for: [triage, tagging, micro_reflection, bulk_classification]
+    free_tier:
+      available: true
+      provider: openrouter
+      limits: "OpenRouter free tier (1,000 RPD with $10 balance)"
+    last_reviewed: "2026-04-14"
+    review_source: manual

@@ -41,6 +41,10 @@ def main() -> None:
     from genesis.contribution import cli as contrib_cli
     contrib_cli.add_parser(sub)
 
+    # Eval harness: genesis eval run/results/datasets
+    from genesis.eval import cli as eval_cli
+    eval_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -53,7 +57,7 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
-    elif args.command == "contribute":
+    elif args.command in ("contribute", "eval"):
         sys.exit(args.func(args))
     else:
         parser.print_help()
