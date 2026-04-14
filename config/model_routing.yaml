@@ -54,7 +54,7 @@ providers:
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   cerebras-qwen:
     type: cerebras
-    model: qwen-3-235b-a22b
+    model: qwen-3-235b-a22b-instruct-2507
     profile: cerebras-qwen3-235b
     free: true
     # 10 RPM, 14,400 RPD. Instruct only (no thinking). Volume play.
@@ -65,7 +65,9 @@ providers:
     model: o3-mini
     profile: github-o3-mini
     free: true
-    # 50 RPD — reserve for hardest reasoning tasks
+    # Disabled: GitHub Models API does not currently serve o3-mini
+    # (only gpt-4o, gpt-4o-mini, Llama 3.1 available as of 2026-04-14)
+    enabled: false
     rpm_limit: 10
     open_duration_s: 120
   openrouter-gemma4:
