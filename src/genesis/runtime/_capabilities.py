@@ -56,6 +56,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "guardian_monitoring": "Guardian bidirectional monitoring — detects stale Guardian heartbeat and auto-restarts via SSH",
     "sentinel": "Container-side guardian — autonomous CC call site for infrastructure diagnosis and remediation, counterpart to external Guardian",
     "codebase_index": "AST-based codebase structural index — modules, symbols, imports stored in SQLite for code-aware sessions",
+    "serena": "Serena MCP — LSP-powered semantic code intelligence (Pyright). Symbol lookup, call site analysis, type-aware refactoring. External tool, not Genesis-managed.",
 }
 
 
