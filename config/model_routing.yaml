@@ -173,6 +173,13 @@ providers:
     profile: kimi-k2.5
     free: false
     open_duration_s: 120
+  openrouter-qwen36plus:
+    type: openrouter
+    model: qwen/qwen3.6-plus
+    profile: qwen-3.6-plus
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
     model: mistral-small-3.2-24b-instruct-2506
@@ -383,6 +390,7 @@ call_sites:
   contingency_foreground:
     chain:
     - kimi-k2.5
+    - openrouter-qwen36plus
     - gpt-5.4
     default_paid: true
     retry_profile: user_facing
@@ -399,6 +407,7 @@ call_sites:
   autonomous_executor_reasoning:
     chain:
     - claude-sonnet
+    - openrouter-qwen36plus
     - gpt-5.4
     default_paid: true
     retry_profile: background
