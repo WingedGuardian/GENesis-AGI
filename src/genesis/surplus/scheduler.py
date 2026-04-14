@@ -68,6 +68,7 @@ class SurplusScheduler:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
+        self._model_eval_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
@@ -85,6 +86,10 @@ class SurplusScheduler:
     def set_bookmark_enrichment_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for BOOKMARK_ENRICHMENT tasks."""
         self._bookmark_enrichment_executor = executor
+
+    def set_model_eval_executor(self, executor: SurplusExecutor) -> None:
+        """Set a dedicated executor for MODEL_EVAL tasks."""
+        self._model_eval_executor = executor
 
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
@@ -370,6 +375,8 @@ class SurplusScheduler:
             executor = self._code_audit_executor
         elif task.task_type == _TT.BOOKMARK_ENRICHMENT and self._bookmark_enrichment_executor is not None:
             executor = self._bookmark_enrichment_executor
+        elif task.task_type == _TT.MODEL_EVAL and self._model_eval_executor is not None:
+            executor = self._model_eval_executor
 
         try:
             result = await executor.execute(task)
