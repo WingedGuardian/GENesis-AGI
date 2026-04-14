@@ -31,32 +31,12 @@ def _make_config(provider_name: str = "test-provider") -> RoutingConfig:
 
 
 @pytest.mark.asyncio
-async def test_run_eval_all_pass():
-    """Mock delegate returns correct answers for all classification cases."""
+async def test_run_eval_completes_and_scores():
+    """Mock delegate returns fixed answer; verify scoring works correctly."""
     config = _make_config()
 
-    # Map case IDs to expected outputs
-    expected_map = {
-        "cal_01": "0", "cal_02": "1", "cal_03": "2", "cal_04": "3",
-        "cal_05": "4", "cal_06": "4", "cal_07": "4", "cal_08": "0",
-        "sup_01": "1", "sup_02": "3", "sup_03": "0", "sup_04": "4",
-        "sup_05": "1", "sup_06": "2", "sup_07": "4",
-    }
-
-    call_count = 0
-
     async def mock_call(provider, model_id, messages, **kwargs):
-        nonlocal call_count
-        # Extract the expected answer from the prompt content
-        prompt = messages[-1]["content"]
-        # Find matching case by checking prompt content
-        for case_id, _answer in expected_map.items():
-            if case_id.startswith("cal_01") and "what time is it" in prompt:
-                return CallResult(success=True, content="0")
-            if "rename a variable" in prompt:
-                return CallResult(success=True, content="1")
-        # Default: return "0" — some will fail, that's OK for this test
-        call_count += 1
+        # Always return "0" — matches depth-0 cases, fails others
         return CallResult(success=True, content="0")
 
     with patch("genesis.eval.runner.LiteLLMDelegate") as MockDelegate:
@@ -69,8 +49,12 @@ async def test_run_eval_all_pass():
         )
 
     assert summary.total_cases == 15
-    assert summary.model_id == "test-model"
+    assert summary.model_id == "test-provider"
     assert summary.trigger == EvalTrigger.MANUAL
+    # "0" matches cal_01 (0), cal_08 (0), sup_03 (0) = 3 passes
+    assert summary.passed_cases == 3
+    assert summary.failed_cases == 12
+    assert summary.skipped_cases == 0
 
 
 @pytest.mark.asyncio

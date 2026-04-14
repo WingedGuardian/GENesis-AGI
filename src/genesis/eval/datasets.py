@@ -21,7 +21,9 @@ def load_dataset(name: str, *, datasets_dir: Path | None = None) -> list[EvalCas
     Raises ValueError on malformed entries.
     """
     base = datasets_dir or _DATASETS_DIR
-    path = base / f"{name}.yaml"
+    path = (base / f"{name}.yaml").resolve()
+    if not str(path).startswith(str(base.resolve())):
+        raise ValueError(f"dataset name contains path traversal: {name!r}")
     if not path.exists():
         raise FileNotFoundError(f"dataset not found: {path}")
     return _parse_dataset_file(path)

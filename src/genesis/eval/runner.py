@@ -168,7 +168,7 @@ async def run_eval(
 
     summary = EvalRunSummary(
         run_id=run_id,
-        model_id=provider_cfg.model_id,
+        model_id=provider_name,
         model_profile=provider_cfg.profile or provider_name,
         dataset=dataset_name,
         trigger=trigger,
