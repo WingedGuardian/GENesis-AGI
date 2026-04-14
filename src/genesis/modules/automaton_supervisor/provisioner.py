@@ -121,7 +121,7 @@ class AutomatonProvisioner:
         # 5. Initialize wallet
         result = await self._client.exec(
             sandbox_id,
-            "npx automaton --init",
+            "automaton --init",
             timeout=30,
         )
         wallet_address = ""
@@ -144,7 +144,7 @@ class AutomatonProvisioner:
         # 7. Start Automaton (backgrounded via nohup)
         await self._client.exec(
             sandbox_id,
-            "nohup npx automaton --run > ~/.automaton/automaton.log 2>&1 &",
+            "nohup automaton --run > ~/.automaton/automaton.log 2>&1 &",
             timeout=10,
         )
         logger.info("Automaton '%s' started on sandbox %s", name, sandbox_id)

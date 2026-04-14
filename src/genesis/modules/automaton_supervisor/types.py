@@ -93,19 +93,9 @@ class ProbeResult:
 
     probe_type: str
     success: bool
+    instance_id: str = ""
     value: float | None = None
     message: str = ""
     alerts: list[str] = field(default_factory=list)
 
 
-@dataclass
-class AutomatonTurn:
-    """A single reasoning turn from the Automaton."""
-
-    id: str
-    timestamp: str
-    state: str
-    thinking: str
-    tool_calls: list[dict] = field(default_factory=list)
-    token_usage: dict = field(default_factory=dict)
-    cost_cents: int = 0

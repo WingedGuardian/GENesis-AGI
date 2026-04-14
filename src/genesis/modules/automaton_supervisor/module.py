@@ -58,7 +58,13 @@ class AutomatonSupervisorModule:
     def enabled(self, value: bool) -> None:
         was_enabled = self._enabled
         self._enabled = value
-        # Start/stop probe loop on state change
+        # Start/stop probe loop on state change — but only if an event loop
+        # is running (during sync restore at boot, there may not be one yet;
+        # register() handles the initial start in that case).
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # No event loop — register() will handle it
         if value and not was_enabled:
             self._start_probe_loop()
         elif not value and was_enabled:
@@ -272,6 +278,7 @@ class AutomatonSupervisorModule:
                     ProbeResult(
                         probe_type="alive",
                         success=False,
+                        instance_id=instance.id,
                         message=f"Probe failed for {instance.name}",
                         alerts=[f"Automaton '{instance.name}' unreachable"],
                     )
@@ -285,11 +292,13 @@ class AutomatonSupervisorModule:
         db = self._runtime._db
         now = datetime.now(UTC).isoformat()
         for r in results:
+            if not r.instance_id:
+                continue  # Skip probes without an instance association
             await db.execute(
                 "INSERT INTO automaton_probes "
                 "(instance_id, probe_type, result, value_numeric, timestamp) "
                 "VALUES (?, ?, ?, ?, ?)",
-                ("_all", r.probe_type, r.message, r.value, now),
+                (r.instance_id, r.probe_type, r.message, r.value, now),
             )
         await db.commit()
 
@@ -321,6 +330,7 @@ class AutomatonSupervisorModule:
             ProbeResult(
                 probe_type="alive",
                 success=alive,
+                instance_id=instance.id,
                 message=f"state={state}",
                 alerts=[] if alive else [f"Automaton '{instance.name}' is {state}"],
             )
@@ -339,6 +349,7 @@ class AutomatonSupervisorModule:
             ProbeResult(
                 probe_type="turns",
                 success=True,
+                instance_id=instance.id,
                 value=float(turns_delta),
                 message=f"total={turn_count}, delta={turns_delta}",
                 alerts=(
@@ -369,6 +380,7 @@ class AutomatonSupervisorModule:
                 ProbeResult(
                     probe_type="wallet",
                     success=True,
+                    instance_id=instance.id,
                     value=float(balance),
                     message=f"balance=${balance / 100:.2f}, tier={tier.value}",
                     alerts=alerts,
@@ -379,6 +391,7 @@ class AutomatonSupervisorModule:
                 ProbeResult(
                     probe_type="wallet",
                     success=False,
+                    instance_id=instance.id,
                     message=str(exc),
                     alerts=[f"Cannot read wallet for '{instance.name}'"],
                 )

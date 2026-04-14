@@ -7,6 +7,7 @@ Automaton state interaction. Mapped from the Automaton TypeScript source
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -92,7 +93,6 @@ class ConwayCloudClient:
                     resp = await client.request(method, path, json=body)
 
                 if resp.status_code == 404 and attempt < max_retries:
-                    import asyncio
                     await asyncio.sleep(1.0 * (attempt + 1))
                     continue
 
@@ -112,7 +112,6 @@ class ConwayCloudClient:
 
             except httpx.TimeoutException as exc:
                 if attempt < max_retries:
-                    import asyncio
                     await asyncio.sleep(1.0 * (attempt + 1))
                     continue
                 raise ConwayCloudError(
@@ -350,18 +349,30 @@ class ConwayCloudClient:
 
         The Automaton claims up to 10 inbox messages per wake cycle and
         processes them as high-priority input.
+
+        Uses base64 encoding to safely transport arbitrary message content
+        through the shell without injection risk.
         """
-        # Use exec + sqlite3 to INSERT directly — avoids needing a custom API
-        escaped_msg = message.replace("'", "''")
-        escaped_from = from_addr.replace("'", "''")
-        await self.exec(
-            sandbox_id,
-            f"sqlite3 ~/.automaton/state.db \"INSERT INTO inbox_messages "
-            f"(id, from_address, content, received_at, status) VALUES "
-            f"(lower(hex(randomblob(16))), '{escaped_from}', '{escaped_msg}', "
-            f"datetime('now'), 'received')\"",
-            timeout=10,
+        import base64
+
+        msg_b64 = base64.b64encode(message.encode()).decode()
+        from_b64 = base64.b64encode(from_addr.encode()).decode()
+
+        # Decode in the sandbox and pipe into sqlite3 via a parameterized script
+        # This avoids any shell quoting / SQL injection issues
+        script = (
+            f"python3 -c \""
+            f"import base64,sqlite3,uuid;"
+            f"db=sqlite3.connect('/root/.automaton/state.db');"
+            f"db.execute("
+            f"'INSERT INTO inbox_messages (id,from_address,content,received_at,status) "
+            f"VALUES (?,?,?,datetime(\\'now\\'),\\'received\\')',"
+            f"(uuid.uuid4().hex,"
+            f"base64.b64decode('{from_b64}').decode(),"
+            f"base64.b64decode('{msg_b64}').decode()));"
+            f"db.commit();db.close()\""
         )
+        await self.exec(sandbox_id, script, timeout=10)
 
     async def inject_skill(
         self,
