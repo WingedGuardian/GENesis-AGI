@@ -29,7 +29,10 @@ _EXPECTED_QDRANT_COLLECTIONS = {"episodic_memory", "knowledge_base"}
 
 _SYSTEMD_UNITS = {
     "watchdog_timer": "genesis-watchdog.timer",
+    "tmp_watchgod": "genesis-tmp-watchgod.service",
 }
+
+_TMP_WATCHGOD_STATE = Path.home() / ".genesis" / "watchgod_state.json"
 
 
 def _detect_genesis_service() -> tuple[str, str]:
@@ -272,7 +275,35 @@ def collect_service_status() -> dict:
         "last_check_at": wd_state.get("last_check_at"),
     }
 
+    # Tmp watchgod service
+    watchgod_props = query_systemd_unit(_SYSTEMD_UNITS["tmp_watchgod"])
+    result["tmp_watchgod"] = {
+        "active_state": watchgod_props.get("ActiveState", "unknown"),
+        "sub_state": watchgod_props.get("SubState", "unknown"),
+    }
+
     return result
+
+
+def collect_cc_tmp_usage() -> dict:
+    """Read watchgod state file for CC temp usage. Returns dict with tier, usage, budget."""
+    try:
+        if not _TMP_WATCHGOD_STATE.exists():
+            return {"status": "unavailable", "error": "watchgod not running"}
+        data = json.loads(_TMP_WATCHGOD_STATE.read_text())
+        cc = data.get("cc_tmp", {})
+        sys = data.get("system_tmp", {})
+        return {
+            "cc_tier": cc.get("tier", "unknown"),
+            "cc_used_mb": cc.get("used_mb", 0),
+            "cc_budget_mb": cc.get("budget_mb", 500),
+            "cc_sacred_mb": cc.get("sacred_mb", 150),
+            "sys_tier": sys.get("tier", "unknown"),
+            "sys_used_pct": sys.get("used_pct", 0),
+            "poll_at": data.get("poll_at", ""),
+        }
+    except (json.JSONDecodeError, OSError):
+        return {"status": "error", "error": "cannot read watchgod state"}
 
 
 def collect_tmpfs_usage() -> dict:

@@ -21,7 +21,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 USER_DATA_DIR = Path.home() / ".genesis" / "browser-profile"
-DEFAULT_SCREENSHOT = "/tmp/browser_screenshot.png"
+DEFAULT_SCREENSHOT = str(Path.home() / "tmp" / "browser_screenshot.png")
 
 
 def _launch(pw):

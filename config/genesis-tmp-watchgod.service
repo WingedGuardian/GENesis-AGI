@@ -1,0 +1,12 @@
+[Unit]
+Description=Genesis /tmp watchgod — dual-zone temp protection
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/genesis/scripts/tmp_watchgod.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

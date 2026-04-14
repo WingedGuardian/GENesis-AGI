@@ -85,7 +85,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'URL=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read /tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
+            "command": "bash -c 'URL=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"$HOME/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read /tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
           }
         ]
       },
