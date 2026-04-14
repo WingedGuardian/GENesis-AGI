@@ -121,11 +121,13 @@ def test_load_full_yaml(monkeypatch):
 
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
-    # lmstudio-30b disabled by default → 25 enabled providers
-    # (26 total - 1 disabled lmstudio-30b; Phase 2 added cerebras-qwen,
-    # github-o3mini, openrouter-gemma4, openrouter-qwen3coder, openrouter-deepseek-r1)
+    # lmstudio-30b and github-o3mini disabled → 25 enabled providers
+    # (27 total - 2 disabled; added cerebras-qwen, github-o3mini (disabled),
+    # openrouter-gemma4, openrouter-qwen3coder, openrouter-deepseek-r1,
+    # openrouter-qwen36plus)
     assert len(cfg.providers) == 25
     assert "lmstudio-30b" not in cfg.providers
+    assert "github-o3mini" not in cfg.providers
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
     assert len(cfg.call_sites) == 37

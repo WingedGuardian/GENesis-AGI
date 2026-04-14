@@ -39,6 +39,24 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Skip storing results in the database",
     )
 
+    # -- eval benchmark --
+    bench_cmd = eval_sub.add_parser(
+        "benchmark",
+        help="Run all enabled providers across all datasets (comparison table)",
+    )
+    bench_cmd.add_argument(
+        "--include-paid", action="store_true",
+        help="Include paid (non-free) providers",
+    )
+    bench_cmd.add_argument(
+        "--model", "-m",
+        help="Run only this provider (single-provider mode)",
+    )
+    bench_cmd.add_argument(
+        "--no-db", action="store_true",
+        help="Skip storing results in the database",
+    )
+
     # -- eval results --
     results_cmd = eval_sub.add_parser("results", help="Show recent eval results")
     results_cmd.add_argument(
@@ -52,6 +70,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     results_cmd.add_argument(
         "--last", "-n", type=int, default=5,
         help="Number of recent runs to show (default: 5)",
+    )
+
+    # -- eval compare --
+    compare_cmd = eval_sub.add_parser(
+        "compare",
+        help="Show comparison table from stored results (no re-running)",
+    )
+    compare_cmd.add_argument(
+        "--last", "-n", type=int, default=1,
+        help="Most recent N runs per provider/dataset (default: 1)",
     )
 
     # -- eval datasets --
@@ -68,12 +96,16 @@ def _run_eval_cli(args: argparse.Namespace) -> int:
 
     if args.eval_command == "run":
         return asyncio.run(_cmd_run(args))
+    elif args.eval_command == "benchmark":
+        return asyncio.run(_cmd_benchmark(args))
     elif args.eval_command == "results":
         return asyncio.run(_cmd_results(args))
+    elif args.eval_command == "compare":
+        return asyncio.run(_cmd_compare(args))
     elif args.eval_command == "datasets":
         return _cmd_datasets()
     else:
-        print("usage: genesis eval {run|results|datasets}", file=sys.stderr)
+        print("usage: genesis eval {run|benchmark|results|compare|datasets}", file=sys.stderr)
         return 1
 
 
@@ -117,6 +149,93 @@ async def _cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+async def _cmd_benchmark(args: argparse.Namespace) -> int:
+    """Run all enabled providers across all datasets and print a comparison table."""
+    from pathlib import Path
+
+    from genesis.eval.runner import run_eval
+    from genesis.routing.config import load_config
+
+    config_path = Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+    config = load_config(config_path)
+    datasets = list_datasets()
+
+    if not datasets:
+        print("no eval datasets found in config/eval_datasets/")
+        return 1
+
+    # Determine which providers to benchmark
+    if args.model:
+        if args.model not in config.providers:
+            print(f"error: unknown provider '{args.model}'", file=sys.stderr)
+            return 1
+        providers = [args.model]
+    else:
+        providers = [
+            name for name, cfg in sorted(config.providers.items())
+            if getattr(cfg, "enabled", True)  # skip explicitly disabled
+            and (args.include_paid or cfg.is_free)
+        ]
+
+    if not providers:
+        print("no matching providers found (use --include-paid to include paid providers)")
+        return 1
+
+    db = None
+    if not args.no_db:
+        try:
+            import aiosqlite  # noqa: I001
+            from genesis.env import genesis_db_path
+            db = await aiosqlite.connect(str(genesis_db_path()))
+        except Exception as e:
+            print(f"warning: could not open DB ({e}), results won't be stored")
+
+    # results[provider][dataset] = (passed, attempted, skipped)
+    results: dict[str, dict[str, tuple[int, int, int]]] = {}
+
+    total_providers = len(providers)
+    total_datasets = len(datasets)
+    print(f"\nBenchmarking {total_providers} provider(s) × {total_datasets} dataset(s)")
+    print(f"Providers: {', '.join(providers)}")
+    print(f"Datasets:  {', '.join(datasets)}")
+    print()
+
+    try:
+        for p_idx, provider_name in enumerate(providers, 1):
+            results[provider_name] = {}
+            print(f"[{p_idx}/{total_providers}] {provider_name}")
+
+            for ds_idx, ds_name in enumerate(datasets, 1):
+                print(f"  [{ds_idx}/{total_datasets}] {ds_name} ...", end="", flush=True)
+                try:
+                    summary = await run_eval(
+                        provider_name=provider_name,
+                        dataset_name=ds_name,
+                        trigger=EvalTrigger.MANUAL,
+                        config=config,
+                        db=db,
+                    )
+                    attempted = summary.passed_cases + summary.failed_cases
+                    results[provider_name][ds_name] = (
+                        summary.passed_cases, attempted, summary.skipped_cases,
+                    )
+                    pct = (summary.passed_cases / attempted * 100) if attempted > 0 else 0
+                    print(f" {summary.passed_cases}/{attempted} ({pct:.0f}%) "
+                          f"[{summary.skipped_cases} skipped]  {summary.duration_s:.0f}s")
+                except Exception as exc:
+                    print(f" ERROR: {exc}")
+                    results[provider_name][ds_name] = (0, 0, 0)
+
+            print()
+
+    finally:
+        if db is not None:
+            await db.close()
+
+    _print_benchmark_table(providers, datasets, results)
+    return 0
+
+
 async def _cmd_results(args: argparse.Namespace) -> int:
     try:
         import aiosqlite  # noqa: I001
@@ -137,16 +256,61 @@ async def _cmd_results(args: argparse.Namespace) -> int:
         return 0
 
     for run in runs:
-        total = run.get("total_cases", 0)
         passed = run.get("passed_cases", 0)
-        pct = (passed / total * 100) if total > 0 else 0
+        failed = run.get("failed_cases", 0)
+        attempted = passed + failed
+        pct = (passed / attempted * 100) if attempted > 0 else 0
+        skipped = run.get("skipped_cases", 0)
+        skipped_str = f" ({skipped} skipped)" if skipped else ""
         print(
             f"  {run.get('created_at', '?')[:19]}  "
             f"{run.get('model_id', '?'):30s}  "
             f"{run.get('dataset', '?'):20s}  "
-            f"{passed}/{total} ({pct:.0f}%)  "
+            f"{passed}/{attempted} ({pct:.0f}%){skipped_str}  "
             f"{run.get('duration_s', 0):.1f}s"
         )
+    return 0
+
+
+async def _cmd_compare(args: argparse.Namespace) -> int:
+    """Read latest results from DB and print comparison table."""
+    try:
+        import aiosqlite  # noqa: I001
+        from genesis.env import genesis_db_path
+        from genesis.eval.db import get_runs
+
+        datasets = list_datasets()
+        providers_seen: set[str] = set()
+        results: dict[str, dict[str, tuple[int, int, int]]] = {}
+
+        async with aiosqlite.connect(str(genesis_db_path())) as db:
+            for ds_name in datasets:
+                runs = await get_runs(db, dataset=ds_name, limit=args.last * 50)
+                # Group by model_id, take most recent per provider
+                seen_for_ds: set[str] = set()
+                for run in runs:
+                    model_id = run.get("model_id", "")
+                    if model_id in seen_for_ds:
+                        continue
+                    seen_for_ds.add(model_id)
+                    providers_seen.add(model_id)
+                    if model_id not in results:
+                        results[model_id] = {}
+                    passed = run.get("passed_cases", 0)
+                    failed = run.get("failed_cases", 0)
+                    skipped = run.get("skipped_cases", 0)
+                    results[model_id][ds_name] = (passed, passed + failed, skipped)
+
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    if not results:
+        print("no eval runs found in DB. Run `genesis eval benchmark` first.")
+        return 0
+
+    providers = sorted(providers_seen)
+    _print_benchmark_table(providers, datasets, results)
     return 0
 
 
@@ -163,22 +327,84 @@ def _cmd_datasets() -> int:
 
 def _print_summary(summary) -> None:
     """Pretty-print an EvalRunSummary."""
-    pct = summary.aggregate_score * 100
+    attempted = summary.passed_cases + summary.failed_cases
+    pct = (summary.passed_cases / attempted * 100) if attempted > 0 else 0
     print(f"  Run ID:   {summary.run_id[:12]}")
     print(f"  Model:    {summary.model_id} ({summary.model_profile})")
     print(f"  Dataset:  {summary.dataset}")
-    print(f"  Results:  {summary.passed_cases}/{summary.total_cases} passed ({pct:.0f}%)")
+    print(f"  Results:  {summary.passed_cases}/{attempted} passed ({pct:.0f}%)", end="")
     if summary.skipped_cases:
-        print(f"  Skipped:  {summary.skipped_cases}")
+        print(f"  [{summary.skipped_cases} skipped — excluded from score]", end="")
+    print()
     print(f"  Duration: {summary.duration_s:.1f}s")
     print()
 
     # Per-case breakdown
     for r in summary.results:
-        status = "PASS" if r.passed else "FAIL"
+        if r.skipped:
+            status = "SKIP"
+        elif r.passed:
+            status = "PASS"
+        else:
+            status = "FAIL"
         print(f"    [{status}] {r.case_id}", end="")
         if r.scorer_detail:
             print(f"  -- {r.scorer_detail}", end="")
         if r.latency_ms > 0:
             print(f"  ({r.latency_ms:.0f}ms)", end="")
         print()
+
+
+def _print_benchmark_table(
+    providers: list[str],
+    datasets: list[str],
+    results: dict[str, dict[str, tuple[int, int, int]]],
+) -> None:
+    """Print a formatted comparison table of benchmark results.
+
+    results[provider][dataset] = (passed, attempted, skipped)
+    """
+    if not providers or not datasets:
+        return
+
+    # Column widths
+    name_w = max(len(p) for p in providers) + 2
+    name_w = max(name_w, 28)
+    ds_w = max(max(len(d) for d in datasets), 14)
+    col_w = ds_w + 2
+
+    print("\n" + "=" * (name_w + col_w * len(datasets) + 10))
+    print("  BENCHMARK RESULTS  (score = passed/attempted, skipped excluded)")
+    print("=" * (name_w + col_w * len(datasets) + 10))
+
+    # Header row
+    header = f"  {'Provider':<{name_w}}"
+    for ds in datasets:
+        header += f"  {ds:^{col_w}}"
+    header += f"  {'AVG':^8}"
+    print(header)
+    print("  " + "-" * (name_w + col_w * len(datasets) + 8))
+
+    # Data rows
+    for provider in providers:
+        row = f"  {provider:<{name_w}}"
+        ds_pcts: list[float] = []
+        for ds in datasets:
+            passed, attempted, skipped = results.get(provider, {}).get(ds, (0, 0, 0))
+            if attempted == 0 and skipped == 0:
+                cell = "  n/a"
+            elif attempted == 0:
+                cell = f"  -/{skipped}sk"
+            else:
+                pct = passed / attempted * 100
+                ds_pcts.append(pct)
+                cell = f"{passed}/{attempted} ({pct:.0f}%)"
+                if skipped:
+                    cell += f"+{skipped}sk"
+            row += f"  {cell:^{col_w}}"
+        avg = sum(ds_pcts) / len(ds_pcts) if ds_pcts else 0.0
+        row += f"  {avg:>6.0f}%"
+        print(row)
+
+    print("=" * (name_w + col_w * len(datasets) + 10))
+    print()

@@ -55,6 +55,7 @@ class ScoredOutput:
     input_tokens: int = 0
     output_tokens: int = 0
     cost_usd: float = 0.0
+    skipped: bool = False  # True = API call failed (rate limit/error), not a scoring result
 
 
 @dataclass(frozen=True)

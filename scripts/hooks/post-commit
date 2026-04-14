@@ -43,6 +43,28 @@ if [[ "$COMMIT_SUBJECT" =~ ^fix\(local\): ]]; then
     exit 0
 fi
 
+# Auto-filter: skip if ALL changed files are local-only (don't exist upstream).
+# Uses git object store — no network, <10ms for typical diffs.
+# If at least one file exists in origin/main, the hook fires normally and the
+# sanitizer filters non-upstreamable paths. If every file is local-only, there
+# is nothing to contribute upstream.
+if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
+    changed_files=$(git diff-tree --no-commit-id --name-only -r "$COMMIT_SHA" 2>/dev/null || true)
+    if [[ -n "$changed_files" ]]; then
+        has_upstream_file=false
+        while IFS= read -r f; do
+            if [[ -n "$f" ]] && git show "origin/main:$f" >/dev/null 2>&1; then
+                has_upstream_file=true
+                break
+            fi
+        done <<< "$changed_files"
+        if [[ "$has_upstream_file" = false ]]; then
+            _log "skip local-only: sha=$COMMIT_SHA (no changed files exist in origin/main)"
+            exit 0
+        fi
+    fi
+fi
+
 # Write the marker file for the hot path.
 mkdir -p "$PENDING_DIR" 2>/dev/null || { _log "err: cannot mkdir $PENDING_DIR"; exit 0; }
 
