@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.awareness.classifier import classify_depth
-from genesis.awareness.scorer import compute_scores
+from genesis.awareness.scorer import compute_scores, get_staleness_context
 from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.contingency import RATE_LIMIT_DEFERRAL_TTL_S
@@ -174,6 +174,7 @@ async def perform_tick(
         trigger_reason=trigger_reason,
         escalation_source=escalation_source,
         escalation_pending_id=escalation_pending_id,
+        signal_staleness=get_staleness_context(),
     )
 
     # 4. Store tick result
