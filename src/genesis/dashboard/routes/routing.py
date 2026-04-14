@@ -47,11 +47,15 @@ def routing_config_read():
     if config_path.exists():
         try:
             raw = yaml.safe_load(config_path.read_text()) or {}
-            # Merge local overlay if present
-            local_path = config_path.with_name("model_routing.local.yaml")
-            if local_path.exists():
-                local_raw = yaml.safe_load(local_path.read_text()) or {}
-                from genesis.routing.config import _deep_merge
+            # Merge local overlay if present (with stale-provider sanitization)
+            from genesis.routing.config import (
+                _deep_merge,
+                _load_local_overlay,
+                _sanitize_local_overlay,
+            )
+            local_raw = _load_local_overlay(config_path)
+            if local_raw:
+                local_raw = _sanitize_local_overlay(raw, local_raw)
                 raw = _deep_merge(raw, local_raw)
             for cs_name, cs_raw in (raw.get("call_sites") or {}).items():
                 if isinstance(cs_raw, dict) and (cs_raw.get("dispatch") or cs_raw.get("cc_model")):

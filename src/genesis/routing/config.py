@@ -94,9 +94,12 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     exist in the base config's providers section. This prevents a stale
     .local.yaml from breaking startup after an upstream update removes
     a provider.
+
+    Returns a sanitized copy — does NOT mutate the input.
     """
+    result = copy.deepcopy(local_raw)
     base_providers = set((base_raw.get("providers") or {}).keys())
-    local_call_sites = (local_raw.get("call_sites") or {})
+    local_call_sites = (result.get("call_sites") or {})
 
     for cs_name, cs in list(local_call_sites.items()):
         if not isinstance(cs, dict) or "chain" not in cs:
@@ -122,7 +125,7 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
         else:
             cs["chain"] = filtered
 
-    return local_raw
+    return result
 
 
 def load_config(path: str | Path) -> RoutingConfig:

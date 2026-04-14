@@ -193,8 +193,12 @@ def _load_yaml_local(filename: str) -> dict:
     path = _CONFIG_DIR / _local_filename(filename)
     if not path.is_file():
         return {}
-    with open(path) as f:
-        return yaml.safe_load(f) or {}
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
+        logger.warning("Failed to read local overlay %s", path, exc_info=True)
+        return {}
 
 
 def _load_yaml_merged(filename: str) -> dict:
