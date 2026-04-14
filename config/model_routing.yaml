@@ -72,7 +72,7 @@ providers:
     open_duration_s: 120
   openrouter-gemma4:
     type: openrouter
-    model: google/gemma-4-27b-it:free
+    model: google/gemma-4-31b-it:free
     profile: gemma-4-27b
     free: true
     rpm_limit: 20
