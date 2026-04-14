@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shlex
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -66,13 +67,15 @@ async def compare_models(
         output_path = Path(tmpdir) / "output.json"
         config_path.write_text(yaml.dump(config, default_flow_style=False))
 
-        cmd = f"{promptfoo_bin} eval -c {config_path} -o {output_path} --no-cache"
-        logger.info("Running promptfoo: %s", cmd)
+        cmd_parts = [
+            *shlex.split(promptfoo_bin),
+            "eval", "-c", str(config_path), "-o", str(output_path), "--no-cache",
+        ]
+        logger.info("Running promptfoo: %s", cmd_parts)
 
         try:
             proc = subprocess.run(
-                cmd,
-                shell=True,
+                cmd_parts,
                 capture_output=True,
                 text=True,
                 timeout=timeout_s,

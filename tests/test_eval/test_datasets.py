@@ -37,6 +37,12 @@ def test_load_empty_dataset(tmp_path):
     assert cases == []
 
 
+def test_path_traversal_blocked(tmp_path):
+    """Path traversal in dataset name is rejected."""
+    with pytest.raises(ValueError, match="path traversal"):
+        load_dataset("../../../etc/passwd", datasets_dir=tmp_path)
+
+
 def test_load_malformed_case(tmp_path):
     """Missing required fields raises ValueError."""
     f = tmp_path / "bad.yaml"
