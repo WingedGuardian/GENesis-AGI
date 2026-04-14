@@ -1,0 +1,153 @@
+# Golden dataset: fact/entity extraction
+# Tests models on extracting structured information from unstructured text.
+# Mirrors real Genesis tasks: observation extraction, session summarization,
+# fact extraction for memory system.
+
+metadata:
+  name: fact_extraction
+  description: Extract specific facts or entities from text passages
+  category: extraction
+  default_scorer: json_field_match
+  version: "1.0"
+
+cases:
+  - id: ext_01
+    description: "Extract key decision from meeting notes"
+    input: |
+      Extract the key decision from this text. Reply with JSON: {"decision": "..."}
+
+      Text: After extensive discussion about the migration timeline, the team
+      agreed to postpone the database upgrade from April to June. Sarah will
+      lead the migration planning. Budget was approved at $15,000.
+    expected: '{"decision": "postpone the database upgrade from April to June"}'
+    scorer: json_field_match
+
+  - id: ext_02
+    description: "Extract person and role"
+    input: |
+      Extract the person and their role from this text.
+      Reply with JSON: {"person": "...", "role": "..."}
+
+      Text: Marcus Chen was promoted to Senior Infrastructure Engineer last
+      week after successfully leading the Kubernetes migration project.
+    expected: '{"person": "Marcus Chen", "role": "Senior Infrastructure Engineer"}'
+    scorer: json_field_match
+
+  - id: ext_03
+    description: "Extract error type from log"
+    input: |
+      What type of error is described? Reply with exactly one of:
+      timeout, auth_failure, rate_limit, connection_error, unknown
+
+      Log: 2026-04-10T03:22:15Z [ERROR] Provider groq returned HTTP 429:
+      "Rate limit exceeded. Please retry after 30 seconds."
+      Retry attempt 3/5 scheduled.
+    expected: "rate_limit"
+    scorer: exact_match
+
+  - id: ext_04
+    description: "Extract numeric metrics"
+    input: |
+      Extract the metrics from this report.
+      Reply with JSON: {"latency_ms": <number>, "success_rate": <number>, "total_requests": <number>}
+
+      Performance Report: The API endpoint processed 12,450 requests today
+      with an average latency of 142ms. Success rate was 99.2%, with 100
+      failures due to upstream timeouts.
+    expected: '{"latency_ms": 142, "success_rate": 99.2, "total_requests": 12450}'
+    scorer: json_field_match
+
+  - id: ext_05
+    description: "Extract action items"
+    input: |
+      List the action items from this text as a JSON array of strings.
+      Reply with JSON: {"actions": ["...", "..."]}
+
+      Standup notes: Jake needs to fix the flaky CI test by Thursday.
+      Maria will review the PR for the new auth module. The deployment
+      to staging is blocked until the config change is merged.
+    expected: '["fix the flaky CI test", "review the PR for the new auth module", "merge the config change"]'
+    scorer: set_overlap
+
+  - id: ext_06
+    description: "Extract priority level"
+    input: |
+      What priority level is this issue? Reply with exactly one of:
+      critical, high, medium, low
+
+      Issue: Users in the EU region are experiencing intermittent 500 errors
+      on the login endpoint. Approximately 5% of login attempts fail.
+      Workaround: users can retry and succeed on second attempt.
+    expected: "high"
+    scorer: exact_match
+
+  - id: ext_07
+    description: "Extract technology stack"
+    input: |
+      Extract the technologies mentioned. Reply as a comma-separated list, lowercase.
+
+      Stack: Our backend runs on Python 3.12 with FastAPI, using PostgreSQL
+      for persistence and Redis for caching. The frontend is React with
+      TypeScript, deployed via Docker on AWS ECS.
+    expected: "python, fastapi, postgresql, redis, react, typescript, docker, aws ecs"
+    scorer: set_overlap
+
+  - id: ext_08
+    description: "Extract date and event"
+    input: |
+      Extract the date and event from this text.
+      Reply with JSON: {"date": "YYYY-MM-DD", "event": "..."}
+
+      Reminder: The quarterly security audit is scheduled for March 15, 2026.
+      All teams must have their compliance reports submitted by then.
+    expected: '{"date": "2026-03-15", "event": "quarterly security audit"}'
+    scorer: json_field_match
+
+  - id: ext_09
+    description: "Extract sentiment"
+    input: |
+      What is the sentiment of this user feedback? Reply with exactly one of:
+      positive, negative, neutral, mixed
+
+      Feedback: "The new dashboard is way faster than before and I love the
+      dark mode. But the search is broken — I can't find anything anymore.
+      Please fix search, everything else is great."
+    expected: "mixed"
+    scorer: exact_match
+
+  - id: ext_10
+    description: "Extract configuration values"
+    input: |
+      Extract the configuration values from this text.
+      Reply with JSON: {"timeout_s": <number>, "max_retries": <number>, "port": <number>}
+
+      Config update: Set the request timeout to 30 seconds with a maximum
+      of 5 retry attempts. The service should listen on port 8080.
+    expected: '{"timeout_s": 30, "max_retries": 5, "port": 8080}'
+    scorer: json_field_match
+
+  - id: ext_11
+    description: "Extract cause from incident report"
+    input: |
+      What was the root cause? Reply in one sentence, no more than 20 words.
+
+      Incident Report: At 02:15 UTC, the payment service began returning
+      503 errors. Investigation revealed that a misconfigured connection
+      pool limit of 5 (instead of 50) caused all database connections to
+      be exhausted under normal load. Fixed by correcting the pool size
+      in the environment config.
+    expected: "misconfigured connection pool limit"
+    scorer: exact_match
+    scorer_config:
+      normalize: true
+
+  - id: ext_12
+    description: "Extract version numbers"
+    input: |
+      Extract all version numbers mentioned. Reply as a JSON array of strings.
+
+      Changelog: Upgraded Python from 3.11.4 to 3.12.3. Updated litellm
+      to version 1.55.2. Node.js remains at 20.11.0. Docker base image
+      updated to alpine:3.19.
+    expected: '["3.11.4", "3.12.3", "1.55.2", "20.11.0", "3.19"]'
+    scorer: set_overlap
