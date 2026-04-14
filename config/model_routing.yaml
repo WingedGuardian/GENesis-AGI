@@ -251,6 +251,13 @@ call_sites:
     - openrouter-free
     - claude-sonnet
     default_paid: true
+  21_session_observer:
+    chain:
+    - mistral-large-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+    retry_profile: background
   22_tagging:
     chain:
     - ollama-3b
