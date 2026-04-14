@@ -3,11 +3,15 @@
 Cognitive oversight of Conway Research Automaton instances running on Conway
 Cloud. Genesis provides strategic direction, monitors health, enforces
 treasury policy, and closes the learning loop.
+
+Probes run on an internal schedule — no awareness loop coupling.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from .client import ConwayCloudClient
@@ -21,9 +25,16 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+# Default probe interval (configurable via update_config)
+_DEFAULT_PROBE_INTERVAL_S = 300  # 5 minutes
+
 
 class AutomatonSupervisorModule:
-    """CapabilityModule for supervising Automatons on Conway Cloud."""
+    """CapabilityModule for supervising Automatons on Conway Cloud.
+
+    Manages its own probe schedule internally — does not wire into the
+    awareness loop. Alerts fire through the event bus.
+    """
 
     def __init__(self) -> None:
         self._enabled: bool = False
@@ -31,6 +42,8 @@ class AutomatonSupervisorModule:
         self._client: ConwayCloudClient | None = None
         self._instances: dict[str, AutomatonInstance] = {}
         self._treasury: TreasuryPolicy = TreasuryPolicy()
+        self._probe_interval_s: int = _DEFAULT_PROBE_INTERVAL_S
+        self._probe_task: asyncio.Task | None = None
         self._description: str = ""
 
     @property
@@ -43,7 +56,13 @@ class AutomatonSupervisorModule:
 
     @enabled.setter
     def enabled(self, value: bool) -> None:
+        was_enabled = self._enabled
         self._enabled = value
+        # Start/stop probe loop on state change
+        if value and not was_enabled:
+            self._start_probe_loop()
+        elif not value and was_enabled:
+            self._stop_probe_loop()
 
     async def register(self, runtime: Any) -> None:
         """Wire into Genesis runtime.
@@ -51,6 +70,7 @@ class AutomatonSupervisorModule:
         - Load Conway Cloud API key from secrets
         - Initialize the client
         - Load managed instances from DB
+        - Start probe loop if enabled
         """
         self._runtime = runtime
 
@@ -70,6 +90,11 @@ class AutomatonSupervisorModule:
 
         # Load managed instances from DB
         await self._load_instances()
+
+        # Start probe loop if already enabled (restored from DB state)
+        if self._enabled and self._instances:
+            self._start_probe_loop()
+
         logger.info(
             "Automaton supervisor registered (%d managed instances)",
             len(self._instances),
@@ -77,26 +102,22 @@ class AutomatonSupervisorModule:
 
     async def deregister(self) -> None:
         """Clean shutdown."""
+        self._stop_probe_loop()
         if self._client:
             await self._client.close()
             self._client = None
         self._instances.clear()
 
     def get_research_profile_name(self) -> str | None:
-        """No research pipeline subscription for now.
+        """No research pipeline subscription.
 
-        Automaton supervision is poll-based via the awareness loop,
+        Automaton supervision is poll-based via internal probe loop,
         not signal-driven via the research pipeline.
         """
         return None
 
     async def handle_opportunity(self, opportunity: dict) -> dict | None:
         """Evaluate whether to take action on an Automaton-related signal.
-
-        This could be triggered by:
-        - Research pipeline finding a revenue opportunity
-        - Awareness loop detecting an Automaton needs intervention
-        - User requesting a new Automaton deployment
 
         Returns an action proposal for user approval, or None.
         """
@@ -107,7 +128,7 @@ class AutomatonSupervisorModule:
                 "action": "provision_automaton",
                 "name": opportunity.get("name", "genesis-worker"),
                 "genesis_prompt": opportunity.get("genesis_prompt", ""),
-                "estimated_cost_usd": 5.0,  # Minimum viable funding
+                "estimated_cost_usd": 5.0,
                 "requires_approval": True,
             }
 
@@ -134,10 +155,7 @@ class AutomatonSupervisorModule:
         return None
 
     async def record_outcome(self, outcome: dict) -> None:
-        """Record an Automaton-related outcome.
-
-        Pulls recent state from the Automaton and stores locally.
-        """
+        """Record an Automaton-related outcome."""
         instance_id = outcome.get("instance_id", "")
         event_type = outcome.get("event_type", "unknown")
         details = outcome.get("details", "")
@@ -156,14 +174,19 @@ class AutomatonSupervisorModule:
     async def extract_generalizable(self, outcome: dict) -> list[dict] | None:
         """Extract lessons from Automaton outcomes for Genesis core memory.
 
-        Uses an LLM pass to analyze what worked, what failed, and why.
-        Returns observations suitable for the learning pipeline.
+        Phase 3 — not yet implemented.
         """
-        # Phase 3 implementation — for now, return None
         return None
 
     def configurable_fields(self) -> list[dict[str, Any]]:
         return [
+            {
+                "name": "probe_interval_s",
+                "label": "Probe Interval (seconds)",
+                "type": "int",
+                "value": self._probe_interval_s,
+                "description": "How often to check Automaton health",
+            },
             {
                 "name": "auto_topup_amount_cents",
                 "label": "Auto-topup Amount (cents)",
@@ -188,25 +211,55 @@ class AutomatonSupervisorModule:
         ]
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
-        for key, value in updates.items():
-            if hasattr(self._treasury, key):
-                setattr(self._treasury, key, int(value))
+        if "probe_interval_s" in updates:
+            self._probe_interval_s = max(60, int(updates["probe_interval_s"]))
+        for key in ("auto_topup_amount_cents", "min_reserve_cents", "daily_cap_cents"):
+            if key in updates:
+                setattr(self._treasury, key, int(updates[key]))
         return {
+            "probe_interval_s": self._probe_interval_s,
             "auto_topup_amount_cents": self._treasury.auto_topup_amount_cents,
             "min_reserve_cents": self._treasury.min_reserve_cents,
             "daily_cap_cents": self._treasury.daily_cap_cents,
         }
 
-    # ── Probe Methods (called by awareness loop) ───────────────────
+    # ── Internal Probe Loop ────────────────────────────────────────
 
-    async def probe_all(self) -> list[ProbeResult]:
-        """Run all probes across all managed instances.
+    def _start_probe_loop(self) -> None:
+        """Start the background probe task."""
+        if self._probe_task and not self._probe_task.done():
+            return  # Already running
+        self._probe_task = asyncio.create_task(
+            self._probe_loop(), name="automaton-supervisor-probes"
+        )
+        logger.info(
+            "Automaton probe loop started (interval=%ds)", self._probe_interval_s
+        )
 
-        Called by the awareness loop on each tick when the module is enabled.
-        """
-        if not self._client or not self._enabled:
-            return []
+    def _stop_probe_loop(self) -> None:
+        """Stop the background probe task."""
+        if self._probe_task and not self._probe_task.done():
+            self._probe_task.cancel()
+            self._probe_task = None
+            logger.info("Automaton probe loop stopped")
 
+    async def _probe_loop(self) -> None:
+        """Background loop that probes all managed instances on a schedule."""
+        try:
+            while self._enabled:
+                if self._instances and self._client:
+                    try:
+                        results = await self._run_probes()
+                        await self._persist_probes(results)
+                        await self._handle_alerts(results)
+                    except Exception:
+                        logger.exception("Probe cycle failed")
+                await asyncio.sleep(self._probe_interval_s)
+        except asyncio.CancelledError:
+            pass
+
+    async def _run_probes(self) -> list[ProbeResult]:
+        """Run all probes across all managed instances."""
         results: list[ProbeResult] = []
         for instance in self._instances.values():
             if instance.status == InstanceStatus.DEAD:
@@ -225,6 +278,37 @@ class AutomatonSupervisorModule:
                 )
         return results
 
+    async def _persist_probes(self, results: list[ProbeResult]) -> None:
+        """Write probe results to the database."""
+        if not self._runtime or not hasattr(self._runtime, "_db"):
+            return
+        db = self._runtime._db
+        now = datetime.now(UTC).isoformat()
+        for r in results:
+            await db.execute(
+                "INSERT INTO automaton_probes "
+                "(instance_id, probe_type, result, value_numeric, timestamp) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("_all", r.probe_type, r.message, r.value, now),
+            )
+        await db.commit()
+
+    async def _handle_alerts(self, results: list[ProbeResult]) -> None:
+        """Fire alerts for any probe results that need attention."""
+        alerts = [a for r in results for a in r.alerts]
+        if not alerts:
+            return
+
+        # Fire via event bus if available
+        if self._runtime and hasattr(self._runtime, "_event_bus"):
+            bus = self._runtime._event_bus
+            for alert in alerts:
+                bus.emit(
+                    "automaton.alert",
+                    {"message": alert, "module": self.name},
+                )
+                logger.warning("Automaton alert: %s", alert)
+
     async def _probe_instance(self, instance: AutomatonInstance) -> list[ProbeResult]:
         """Probe a single Automaton instance."""
         assert self._client is not None
@@ -242,7 +326,6 @@ class AutomatonSupervisorModule:
             )
         )
 
-        # Update status
         if state == "dead":
             instance.status = InstanceStatus.DEAD
         elif state in ("running", "waking", "sleeping", "low_compute", "critical"):
@@ -348,5 +431,4 @@ class AutomatonSupervisorModule:
                     )
                     self._instances[inst.id] = inst
         except Exception:
-            # Table might not exist yet
             logger.debug("automaton_instances table not found — will be created on first use")
