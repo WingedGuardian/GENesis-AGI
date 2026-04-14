@@ -25,8 +25,11 @@ logger = logging.getLogger(__name__)
 # ── Signal formatting ────────────────────────────────────────────────
 
 
-def _format_signal(s: SignalReading) -> str:
-    """Format a signal with threshold annotation when available."""
+_TICK_INTERVAL_MINUTES = 5  # awareness loop tick interval
+
+
+def _format_signal(s: SignalReading, *, unchanged_ticks: int = 0) -> str:
+    """Format a signal with threshold and staleness annotations."""
     base = f"{s.name}={s.value}"
     if s.normal_max is not None:
         status = (
@@ -35,7 +38,20 @@ def _format_signal(s: SignalReading) -> str:
             else "normal"
         )
         base += f" [{status}]"
+    if unchanged_ticks >= 2:
+        hours = unchanged_ticks * _TICK_INTERVAL_MINUTES / 60
+        base += f" (persistent ~{hours:.1f}h)"
     return base
+
+
+def _format_signals_from_tick(tick: TickResult, *, limit: int = 10) -> str:
+    """Format signals with staleness annotations from a TickResult."""
+    staleness = tick.signal_staleness or {}
+    parts = [
+        _format_signal(s, unchanged_ticks=staleness.get(s.name, 0))
+        for s in tick.signals[:limit]
+    ]
+    return ", ".join(parts) if parts else "none"
 
 
 # ── Light reflection focus rotation ──────────────────────────────────
@@ -150,9 +166,7 @@ async def build_reflection_prompt(
     # Legacy simple path
     from genesis.db.crud import cognitive_state
 
-    signals_summary = ", ".join(
-        _format_signal(s) for s in tick.signals[:10]
-    ) if tick.signals else "none"
+    signals_summary = _format_signals_from_tick(tick)
 
     scores_summary = ", ".join(
         f"{s.depth.value}={s.final_score:.2f}" for s in tick.scores
@@ -208,9 +222,7 @@ async def build_strategic_prompt_enriched(
     from genesis.db.crud import cognitive_state
     cog_state = await cognitive_state.render(db)
 
-    signals_summary = ", ".join(
-        _format_signal(s) for s in tick.signals[:10]
-    ) if tick.signals else "none"
+    signals_summary = _format_signals_from_tick(tick)
 
     parts = [
         "Perform a Strategic reflection.\n",
@@ -262,7 +274,7 @@ async def build_enriched_prompt(
     ]
 
     if tick.signals:
-        signals = ", ".join(_format_signal(s) for s in tick.signals[:10])
+        signals = _format_signals_from_tick(tick)
         parts.append(f"\n## Signals\n{signals}")
 
     parts.append(f"\n## Current Cognitive State\n{bundle.cognitive_state}")

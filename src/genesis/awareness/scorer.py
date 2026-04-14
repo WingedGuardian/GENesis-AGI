@@ -1,16 +1,58 @@
 """Urgency scoring for the Awareness Loop.
 
-Implements: urgency_score(depth) = Σ(signal_value × weight) × time_multiplier(depth)
+Implements: urgency_score(depth) = Σ(signal_value × weight × staleness_factor) × time_multiplier(depth)
+
+Staleness decay: signals whose value hasn't changed since the previous tick
+get exponentially reduced weight contribution. This prevents permanently-stuck
+signals (e.g. critical_failure=1.0 for hours) from triggering reflections
+every tick. First occurrence = full weight; each consecutive unchanged tick
+halves the contribution, flooring at 5%.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from datetime import UTC, datetime
 
 import aiosqlite
 
 from genesis.awareness.types import Depth, DepthScore, SignalReading
 from genesis.db.crud import awareness_ticks, depth_thresholds, signal_weights
+
+logger = logging.getLogger(__name__)
+
+# ─── Staleness decay ────────────────────────────────────────────────────────
+_DECAY_BASE = 0.5   # halve contribution each unchanged tick
+_DECAY_FLOOR = 0.05  # never decay below 5%
+_EPSILON = 0.001     # float comparison tolerance for 0-1 normalized signals
+
+# Module-level state: consecutive-unchanged count per signal.
+# Resets on process restart (acceptable — one free full-weight tick).
+_signal_unchanged_counts: dict[str, int] = {}
+
+
+def get_staleness_context() -> dict[str, int]:
+    """Return a snapshot of consecutive-unchanged counts per signal.
+
+    Used by prompt builders to annotate persistent signals.
+    """
+    return dict(_signal_unchanged_counts)
+
+
+def _update_staleness(current_signals: dict[str, float], prev_signals: dict[str, float]) -> dict[str, float]:
+    """Update unchanged counts and return decay factors per signal."""
+    factors: dict[str, float] = {}
+    for name, value in current_signals.items():
+        prev_value = prev_signals.get(name)
+        if prev_value is not None and abs(value - prev_value) < _EPSILON:
+            _signal_unchanged_counts[name] = _signal_unchanged_counts.get(name, 0) + 1
+        else:
+            _signal_unchanged_counts[name] = 0
+        count = _signal_unchanged_counts[name]
+        factors[name] = max(_DECAY_FLOOR, _DECAY_BASE ** count) if count > 0 else 1.0
+    return factors
+
 
 # ─── Time multiplier curves ──────────────────────────────────────────────────
 # Each curve is a list of (elapsed_seconds, multiplier) breakpoints.
@@ -70,6 +112,19 @@ async def compute_scores(
         now = datetime.now(UTC).isoformat()
 
     signal_map = {s.name: s.value for s in signals}
+
+    # Fetch previous tick's signals for staleness comparison
+    prev_tick = await awareness_ticks.last_tick(db)
+    prev_signals: dict[str, float] = {}
+    if prev_tick and prev_tick.get("signals_json"):
+        try:
+            for entry in json.loads(prev_tick["signals_json"]):
+                prev_signals[entry["name"]] = entry["value"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            logger.debug("Could not parse previous tick signals for staleness")
+
+    decay_factors = _update_staleness(signal_map, prev_signals)
+
     thresholds = {r["depth_name"]: r for r in await depth_thresholds.list_all(db)}
     results = []
 
@@ -79,7 +134,8 @@ async def compute_scores(
         raw_score = 0.0
         for w in weights_rows:
             val = signal_map.get(w["signal_name"], 0.0)
-            raw_score += val * w["current_weight"]
+            factor = decay_factors.get(w["signal_name"], 1.0)
+            raw_score += val * w["current_weight"] * factor
 
         # Elapsed time since last tick at this depth
         last_tick = await awareness_ticks.last_at_depth(db, depth.value)
