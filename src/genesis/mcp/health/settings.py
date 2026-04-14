@@ -170,12 +170,44 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
 
 
 def _load_yaml(filename: str) -> dict:
-    """Read a YAML file from the config dir. Returns empty dict if missing."""
+    """Read a base YAML file from the config dir. Returns empty dict if missing.
+
+    This reads ONLY the base (git-tracked) config file. For the merged
+    view (base + local overrides), use ``_load_yaml_merged()``.
+    """
     path = _CONFIG_DIR / filename
     if not path.is_file():
         return {}
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def _local_filename(filename: str) -> str:
+    """Derive the .local.yaml filename from a base config filename."""
+    stem = Path(filename).stem
+    return f"{stem}.local.yaml"
+
+
+def _load_yaml_local(filename: str) -> dict:
+    """Read the .local.yaml overlay for a config file. Returns {} if none."""
+    path = _CONFIG_DIR / _local_filename(filename)
+    if not path.is_file():
+        return {}
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def _load_yaml_merged(filename: str) -> dict:
+    """Read base config + local overlay, deep-merged.
+
+    The local overlay (``{stem}.local.yaml``) contains user customizations
+    that survive git updates. The base file is upstream-tracked defaults.
+    """
+    base = _load_yaml(filename)
+    local = _load_yaml_local(filename)
+    if not local:
+        return base
+    return _deep_merge(base, local)
 
 
 def _atomic_yaml_write(filename: str, data: dict) -> Path:
@@ -498,14 +530,19 @@ async def _impl_settings_get(domain: str) -> dict:
             "dedicated_tool": entry.dedicated_tool,
         }
 
-    config = _load_yaml(entry.config_filename)
-    return {
+    config = _load_yaml_merged(entry.config_filename)
+    local_file = _local_filename(entry.config_filename)
+    has_local = (_CONFIG_DIR / local_file).is_file()
+    result = {
         "domain": domain,
         "config": config,
         "readonly": entry.readonly,
         "needs_restart": entry.needs_restart,
         "source_file": f"config/{entry.config_filename}",
     }
+    if has_local:
+        result["local_override_file"] = f"config/{local_file}"
+    return result
 
 
 async def _impl_settings_update(
@@ -543,31 +580,37 @@ async def _impl_settings_update(
                 "validation_errors": errors,
             }
 
-    # Merge with current config
-    current = _load_yaml(entry.config_filename)
-    merged = _deep_merge(current, changes)
+    # Merge changes into the local overlay (NOT the base file).
+    # The base file stays git-tracked and clean for upstream updates.
+    local = _load_yaml_local(entry.config_filename)
+    new_local = _deep_merge(local, changes)
 
     if dry_run:
+        # Show what the full merged config would look like
+        base = _load_yaml(entry.config_filename)
         return {
             "domain": domain,
             "status": "dry_run_ok",
             "changes_applied": changes,
+            "merged_preview": _deep_merge(base, new_local),
             "needs_restart": entry.needs_restart,
         }
 
-    # Atomic write
+    # Atomic write to .local.yaml
+    local_file = _local_filename(entry.config_filename)
     try:
-        _atomic_yaml_write(entry.config_filename, merged)
+        _atomic_yaml_write(local_file, new_local)
     except Exception:
         logger.error(
-            "Failed to write settings for %s", domain, exc_info=True,
+            "Failed to write local settings for %s", domain, exc_info=True,
         )
-        return {"domain": domain, "error": "Failed to write config file"}
+        return {"domain": domain, "error": "Failed to write local config file"}
 
     result: dict = {
         "domain": domain,
         "status": "applied",
         "changes_applied": changes,
+        "local_override_file": f"config/{local_file}",
         "needs_restart": entry.needs_restart,
     }
     if entry.needs_restart:

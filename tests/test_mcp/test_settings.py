@@ -126,12 +126,21 @@ async def test_settings_update_tts(config_dir: Path):
     })
     assert result["status"] == "applied"
     assert result["needs_restart"] is False
+    assert "local_override_file" in result
 
-    # Verify file was actually written
-    written = yaml.safe_load((config_dir / "tts.yaml").read_text())
-    assert written["elevenlabs"]["stability"] == 0.9
-    assert written["elevenlabs"]["speed"] == 1.1  # Preserved
-    assert written["provider"] == "elevenlabs"  # Preserved
+    # Changes go to .local.yaml; base file is unchanged
+    local = yaml.safe_load((config_dir / "tts.local.yaml").read_text())
+    assert local["elevenlabs"]["stability"] == 0.9
+    # Base file should be unchanged
+    base = yaml.safe_load((config_dir / "tts.yaml").read_text())
+    assert base["elevenlabs"]["stability"] == 0.85  # Unchanged in base
+
+    # Merged view (via settings_get) should show updated value
+    from genesis.mcp.health.settings import _load_yaml_merged
+    merged = _load_yaml_merged("tts.yaml")
+    assert merged["elevenlabs"]["stability"] == 0.9
+    assert merged["elevenlabs"]["speed"] == 1.1  # Preserved from base
+    assert merged["provider"] == "elevenlabs"  # Preserved from base
 
 
 async def test_settings_update_tts_validation_error(config_dir: Path):
@@ -155,9 +164,11 @@ async def test_settings_update_resilience(config_dir: Path):
     assert result["needs_restart"] is True
     assert "note" in result  # Restart note
 
-    written = yaml.safe_load((config_dir / "resilience.yaml").read_text())
-    assert written["cc"]["max_sessions_per_hour"] == 30
-    assert written["flapping"]["transition_count"] == 3  # Preserved
+    # Changes in .local.yaml; merged view has both
+    from genesis.mcp.health.settings import _load_yaml_merged
+    merged = _load_yaml_merged("resilience.yaml")
+    assert merged["cc"]["max_sessions_per_hour"] == 30
+    assert merged["flapping"]["transition_count"] == 3  # Preserved from base
 
 
 async def test_settings_update_inbox_monitor(config_dir: Path):
@@ -175,10 +186,11 @@ async def test_settings_update_inbox_monitor(config_dir: Path):
     assert result["status"] == "applied"
     assert result["needs_restart"] is True
 
-    written = yaml.safe_load((config_dir / "inbox_monitor.yaml").read_text())
-    assert written["inbox_monitor"]["batch_size"] == 3
-    assert written["inbox_monitor"]["model"] == "opus"
-    assert written["inbox_monitor"]["timezone"] == "America/New_York"  # Preserved
+    from genesis.mcp.health.settings import _load_yaml_merged
+    merged = _load_yaml_merged("inbox_monitor.yaml")
+    assert merged["inbox_monitor"]["batch_size"] == 3
+    assert merged["inbox_monitor"]["model"] == "opus"
+    assert merged["inbox_monitor"]["timezone"] == "America/New_York"  # Preserved from base
 
 
 async def test_settings_update_inbox_bad_timezone(config_dir: Path):
@@ -224,12 +236,13 @@ async def test_settings_update_dry_run(config_dir: Path):
 
 
 async def test_settings_update_creates_file(config_dir: Path):
-    """Update should create the file if it doesn't exist."""
+    """Update should create the local overlay file (base may not exist)."""
     assert not (config_dir / "tts.yaml").exists()
     result = await _impl_settings_update("tts", {"provider": "fish_audio"})
     assert result["status"] == "applied"
-    assert (config_dir / "tts.yaml").exists()
-    written = yaml.safe_load((config_dir / "tts.yaml").read_text())
+    # Changes go to .local.yaml
+    assert (config_dir / "tts.local.yaml").exists()
+    written = yaml.safe_load((config_dir / "tts.local.yaml").read_text())
     assert written["provider"] == "fish_audio"
 
 
@@ -253,9 +266,10 @@ async def test_settings_update_inbox_flat_changes_auto_wrapped(config_dir: Path)
     result = await _impl_settings_update("inbox_monitor", {"batch_size": 5})
     assert result["status"] == "applied"
 
-    written = yaml.safe_load((config_dir / "inbox_monitor.yaml").read_text())
-    assert written["inbox_monitor"]["batch_size"] == 5
-    assert written["inbox_monitor"]["enabled"] is True  # Preserved
+    from genesis.mcp.health.settings import _load_yaml_merged
+    merged = _load_yaml_merged("inbox_monitor.yaml")
+    assert merged["inbox_monitor"]["batch_size"] == 5
+    assert merged["inbox_monitor"]["enabled"] is True  # Preserved from base
 
 
 # ── deep_merge ─────────────────────────────────────────────────────────
