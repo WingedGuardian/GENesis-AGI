@@ -93,8 +93,9 @@ class JsonFieldMatch(Scorer):
         self, actual: str, expected: str, config: dict | None = None,
     ) -> tuple[bool, float, str]:
         cfg = config or {}
+        extracted = _extract_json(actual)
         try:
-            actual_obj = json.loads(actual.strip())
+            actual_obj = json.loads(extracted)
         except (json.JSONDecodeError, ValueError) as e:
             return False, 0.0, f"actual is not valid JSON: {e}"
 
@@ -160,8 +161,9 @@ class JsonValidity(Scorer):
         self, actual: str, expected: str, config: dict | None = None,
     ) -> tuple[bool, float, str]:
         cfg = config or {}
+        extracted = _extract_json(actual)
         try:
-            obj = json.loads(actual.strip())
+            obj = json.loads(extracted)
         except (json.JSONDecodeError, ValueError) as e:
             return False, 0.0, f"invalid JSON: {e}"
 
@@ -206,6 +208,38 @@ def get_scorer(scorer_type: ScorerType) -> Scorer:
 
 
 # -- Helpers --
+
+def _extract_json(text: str) -> str:
+    """Extract JSON from text that may contain markdown fences or prose.
+
+    LLMs often wrap JSON in ```json ... ``` blocks or add explanatory text.
+    This extracts the JSON content for scoring.
+    """
+    import re
+    text = text.strip()
+    # Try direct parse first
+    try:
+        json.loads(text)
+        return text
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Strip markdown code fences
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Find first { or [ and match to last } or ]
+    for start_char, end_char in [('{', '}'), ('[', ']')]:
+        start = text.find(start_char)
+        end = text.rfind(end_char)
+        if start != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return text
+
 
 def _get_nested(obj: Any, path: str) -> Any:
     """Get nested value by dot-notation path."""
