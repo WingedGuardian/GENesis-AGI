@@ -244,23 +244,43 @@ async def process_pending_observations(
     if not obs_files:
         return result
 
-    # Collect observations across all files, respecting budget
+    # Atomic rename: move each JSONL to .processing so the hook creates
+    # a fresh file for new writes.  This prevents race conditions where
+    # the hook appends between our read and truncate.
+    processing_files: list[tuple[Path, Path]] = []  # (original, processing)
+    for obs_file in obs_files:
+        processing_path = obs_file.with_suffix(".jsonl.processing")
+        try:
+            os.rename(obs_file, processing_path)
+            processing_files.append((obs_file, processing_path))
+        except OSError:
+            # File may have been removed or renamed by another process
+            continue
+
+    if not processing_files:
+        _cleanup_stale_files(obs_files)
+        return result
+
+    # Read observations from renamed files, respecting budget
     all_observations: list[tuple[Path, list[dict]]] = []
     total_obs = 0
 
-    for obs_file in obs_files:
+    for _original, processing_path in processing_files:
         remaining = MAX_OBS_PER_TICK - total_obs
         if remaining <= 0:
             break
-        observations = _read_observations(obs_file, limit=remaining)
+        observations = _read_observations(processing_path, limit=remaining)
         if observations:
-            all_observations.append((obs_file, observations))
+            all_observations.append((processing_path, observations))
             total_obs += len(observations)
             result.observations_read += len(observations)
 
     if not all_observations:
-        # Clean up empty or stale files
-        _cleanup_stale_files(obs_files)
+        # Clean up processing files (they were empty or unreadable)
+        import contextlib
+        for _original, processing_path in processing_files:
+            with contextlib.suppress(OSError):
+                processing_path.unlink(missing_ok=True)
         return result
 
     # Process in batches via LLM
@@ -320,17 +340,30 @@ async def process_pending_observations(
             logger.warning("Session observer batch processing failed", exc_info=True)
             result.errors += 1
 
-    # Mark processed files as done
-    for obs_file, _observations in all_observations:
+    # Clean up processing files — already fully read, safe to remove
+    for processing_path, _observations in all_observations:
         try:
-            done_file = obs_file.with_suffix(".jsonl.done")
-            # Append to done file (preserve history), then truncate source
-            with open(done_file, "a") as dst, open(obs_file) as src:
-                dst.write(src.read())
-            # Truncate the source file (atomic: write empty)
-            obs_file.write_text("")
+            processing_path.unlink(missing_ok=True)
         except OSError:
-            logger.warning("Failed to mark %s as processed", obs_file, exc_info=True)
+            logger.warning("Failed to remove %s", processing_path, exc_info=True)
+
+    # Also clean up any processing files we didn't read (budget exceeded)
+    for _original, processing_path in processing_files:
+        if processing_path.exists():
+            try:
+                # These had observations we didn't process — rename back
+                # so they're picked up next tick
+                original = processing_path.with_suffix(".jsonl")
+                if original.exists():
+                    # Original was recreated by hook — append our unprocessed
+                    # data to the new file
+                    with open(original, "a") as dst, open(processing_path) as src:
+                        dst.write(src.read())
+                    processing_path.unlink(missing_ok=True)
+                else:
+                    os.rename(processing_path, original)
+            except OSError:
+                logger.warning("Failed to restore %s", processing_path, exc_info=True)
 
     result.files_processed = len(all_observations)
     result.elapsed_s = time.monotonic() - start
