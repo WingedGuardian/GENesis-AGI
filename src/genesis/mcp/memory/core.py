@@ -44,15 +44,19 @@ async def memory_recall(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
+    # Over-fetch when filtering to compensate for post-retrieval filtering
+    fetch_limit = limit * 3 if (wing or room) else limit
     results = await memory_mod._retriever.recall(
-        query, source=source, limit=limit, min_activation=min_activation
+        query, source=source, limit=fetch_limit, min_activation=min_activation
     )
 
-    # Apply wing/room filters
+    # Apply wing/room filters (post-retrieval — Qdrant doesn't support combined
+    # vector search + payload filter in a single recall path)
     if wing:
         results = [r for r in results if (r.payload.get("wing") or "") == wing]
     if room:
         results = [r for r in results if (r.payload.get("room") or "") == room]
+    results = results[:limit]
 
     if compact:
         return [
@@ -112,55 +116,62 @@ async def memory_expand(
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
 
+    # Batch retrieve all IDs in a single Qdrant call
+    try:
+        points = memory_mod._qdrant.retrieve(
+            collection_name="episodic_memory",
+            ids=memory_ids,
+            with_payload=True,
+        )
+    except Exception:
+        logger.warning("Qdrant batch retrieve failed", exc_info=True)
+        return []
+
+    found_ids = {str(p.id) for p in points}
+    not_found = [mid for mid in memory_ids if mid not in found_ids]
+
     results = []
-    for mid in memory_ids:
+    for point in points:
+        mid = str(point.id)
+        payload = point.payload or {}
+
+        d = {
+            "memory_id": mid,
+            "content": payload.get("content", ""),
+            "source": payload.get("source", ""),
+            "memory_type": payload.get("memory_type", "episodic"),
+            "memory_class": payload.get("memory_class", "fact"),
+            "wing": payload.get("wing", ""),
+            "room": payload.get("room", ""),
+            "confidence": payload.get("confidence"),
+            "tags": payload.get("tags", []),
+            "source_pipeline": payload.get("source_pipeline", ""),
+            "source_session_id": payload.get("source_session_id"),
+            "created_at": payload.get("created_at"),
+        }
+
+        # Graph enrichment
         try:
-            points = memory_mod._qdrant.retrieve(
-                collection_name="episodic_memory",
-                ids=[mid],
-                with_payload=True,
+            traversal = await graph_traverse(
+                memory_mod._db, mid, max_depth=2, min_strength=0.3,
             )
-            if not points:
-                continue
-            point = points[0]
-            payload = point.payload or {}
-
-            d = {
-                "memory_id": mid,
-                "content": payload.get("content", ""),
-                "source": payload.get("source", ""),
-                "memory_type": payload.get("memory_type", "episodic"),
-                "memory_class": payload.get("memory_class", "fact"),
-                "wing": payload.get("wing", ""),
-                "room": payload.get("room", ""),
-                "confidence": payload.get("confidence"),
-                "tags": payload.get("tags", []),
-                "source_pipeline": payload.get("source_pipeline", ""),
-                "source_session_id": payload.get("source_session_id"),
-                "created_at": payload.get("created_at"),
-            }
-
-            # Graph enrichment
-            try:
-                traversal = await graph_traverse(
-                    memory_mod._db, mid, max_depth=2, min_strength=0.3,
-                )
-                if traversal.nodes:
-                    d["graph_neighbors"] = [
-                        {
-                            "memory_id": n.memory_id,
-                            "link_type": n.link_type,
-                            "depth": n.depth,
-                            "strength": n.strength,
-                        }
-                        for n in traversal.nodes[:5]
-                    ]
-            except Exception:
-                logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
-
-            results.append(d)
+            if traversal.nodes:
+                d["graph_neighbors"] = [
+                    {
+                        "memory_id": n.memory_id,
+                        "link_type": n.link_type,
+                        "depth": n.depth,
+                        "strength": n.strength,
+                    }
+                    for n in traversal.nodes[:5]
+                ]
         except Exception:
-            logger.warning("Failed to expand memory %s", mid, exc_info=True)
+            logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
+
+        results.append(d)
+
+    if not_found:
+        results.append({"not_found": not_found})
 
     return results
 
@@ -247,7 +258,7 @@ async def memory_core_facts(
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
-    assert memory_mod._retriever is not None and memory_mod._db is not None
+    assert memory_mod._qdrant is not None and memory_mod._db is not None
 
     # Query high-confidence memories across all wings
     # Use a broad query to get candidates, then re-rank by activation
@@ -295,7 +306,27 @@ async def memory_core_facts(
         ))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    return [item for item, _ in scored[:limit]]
+    top = scored[:limit]
+
+    # Track retrieval so activation scores reflect actual usage
+    if top:
+        try:
+            for item, _ in top:
+                mid = item["memory_id"]
+                pts = memory_mod._qdrant.retrieve(
+                    collection_name="episodic_memory", ids=[mid], with_payload=True,
+                )
+                if pts:
+                    old_count = (pts[0].payload or {}).get("retrieved_count", 0)
+                    memory_mod._qdrant.set_payload(
+                        collection_name="episodic_memory",
+                        payload={"retrieved_count": old_count + 1},
+                        points=[mid],
+                    )
+        except Exception:
+            logger.debug("Failed to update retrieved_count for core_facts", exc_info=True)
+
+    return [item for item, _ in top]
 
 
 @mcp.tool()
