@@ -214,7 +214,8 @@ def _infer_wing_from_files(files: list[str]) -> str | None:
     for f in files:
         if "/memory/" in f or "/retrieval" in f:
             return "memory"
-        if "/awareness/" in f or "/runtime/" in f or "/guardian/" in f or "/sentinel/" in f:
+        if any(p in f for p in ("/awareness/", "/runtime/", "/guardian/", "/sentinel/",
+                                "/hooks/", "/config/", "/.claude/", "/scripts/")):
             return "infrastructure"
         if "/learning/" in f or "/perception/" in f or "/reflection/" in f:
             return "learning"

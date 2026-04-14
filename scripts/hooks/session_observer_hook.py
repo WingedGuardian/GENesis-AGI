@@ -11,6 +11,7 @@ Budget: <50ms (JSON parse + file append).  No LLM, no network, no SQLite.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
@@ -46,13 +47,24 @@ _SKIP_TOOLS = frozenset({
 _OUTPUT_CAP = 2000
 # Max chars to capture from tool input
 _INPUT_CAP = 1500
+# Max JSONL file size before dropping observations (prevents unbounded growth)
+_MAX_FILE_BYTES = 500_000  # ~500KB, roughly 200-300 observations
 
 
 def _extract_key_info(tool_name: str, tool_input: dict) -> dict:
     """Extract the most useful information from tool input by tool type."""
     info: dict = {}
-    if tool_name in ("Read", "Edit", "Write"):
+    if tool_name in ("Read", "Write"):
         info["file_path"] = tool_input.get("file_path", "")
+    elif tool_name == "Edit":
+        info["file_path"] = tool_input.get("file_path", "")
+        # Capture what changed for richer LLM context
+        old = tool_input.get("old_string", "")
+        new = tool_input.get("new_string", "")
+        if old:
+            info["old_string"] = old[:150]
+        if new:
+            info["new_string"] = new[:150]
     elif tool_name == "Bash":
         cmd = tool_input.get("command", "")
         info["command"] = cmd[:500] if cmd else ""
@@ -131,9 +143,20 @@ def _process(data: dict) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     obs_file = session_dir / "tool_observations.jsonl"
 
-    # Atomic-ish append: open in append mode, write one line
+    # Size gate: drop observations if file is too large (processor may be down)
+    try:
+        if obs_file.exists() and obs_file.stat().st_size > _MAX_FILE_BYTES:
+            return
+    except OSError:
+        pass
+
+    # Locked append: flock prevents interleaved writes when CC fires
+    # parallel tool calls (JSONL lines can exceed PIPE_BUF of 4096 bytes)
+    line = json.dumps(observation, separators=(",", ":")) + "\n"
     with open(obs_file, "a") as f:
-        f.write(json.dumps(observation, separators=(",", ":")) + "\n")
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(line)
+        fcntl.flock(f, fcntl.LOCK_UN)
 
 
 if __name__ == "__main__":
