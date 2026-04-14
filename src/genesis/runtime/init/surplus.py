@@ -108,6 +108,18 @@ async def init(rt: GenesisRuntime) -> None:
             await _degraded(rt, "BookmarkEnrichmentExecutor")
 
         try:
+            from genesis.eval.surplus_executor import ModelEvalExecutor
+            model_eval_executor = ModelEvalExecutor(db=rt._db)
+            rt._surplus_scheduler.set_model_eval_executor(model_eval_executor)
+            logger.info("ModelEvalExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire ModelEvalExecutor", exc_info=True)
+            await _degraded(rt, "ModelEvalExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring ModelEvalExecutor", exc_info=True)
+            await _degraded(rt, "ModelEvalExecutor")
+
+        try:
             from genesis.surplus.findings_bridge import FindingsBridge
             rt._findings_bridge = FindingsBridge(db=rt._db)
             logger.info("FindingsBridge initialized")
