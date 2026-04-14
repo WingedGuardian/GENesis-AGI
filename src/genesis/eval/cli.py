@@ -88,11 +88,25 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     eval_cmd.set_defaults(func=_run_eval_cli)
 
 
+def _load_secrets() -> None:
+    """Load secrets.env so API keys are available for standalone CLI use."""
+    try:
+        from dotenv import load_dotenv
+
+        from genesis.env import secrets_path
+        path = secrets_path()
+        if path.is_file():
+            load_dotenv(str(path), override=True)
+    except Exception:
+        pass  # Fail silently — server may have already loaded them
+
+
 def _run_eval_cli(args: argparse.Namespace) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    _load_secrets()
 
     if args.eval_command == "run":
         return asyncio.run(_cmd_run(args))
