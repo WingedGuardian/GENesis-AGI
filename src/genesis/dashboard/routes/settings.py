@@ -13,6 +13,9 @@ from genesis.mcp.health.settings import (
     _atomic_yaml_write,
     _deep_merge,
     _load_yaml,
+    _load_yaml_local,
+    _load_yaml_merged,
+    _local_filename,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +45,7 @@ async def settings_get(domain_name: str):
     domain = _DOMAIN_REGISTRY.get(domain_name)
     if not domain:
         return jsonify({"error": f"Unknown domain: {domain_name}"}), 404
-    data = _load_yaml(domain.config_filename)
+    data = _load_yaml_merged(domain.config_filename)
     return jsonify({"domain": domain_name, "config": data, "readonly": domain.readonly})
 
 
@@ -67,12 +70,16 @@ async def settings_update(domain_name: str):
         if errors:
             return jsonify({"error": "Validation failed", "details": errors}), 422
 
-    # Merge and write atomically
+    # Write changes to the local overlay (not the base file)
     try:
-        current = _load_yaml(domain.config_filename)
-        merged = _deep_merge(current, changes)
-        _atomic_yaml_write(domain.config_filename, merged)
-        logger.info("Settings domain '%s' updated via dashboard", domain_name)
+        local = _load_yaml_local(domain.config_filename)
+        new_local = _deep_merge(local, changes)
+        local_file = _local_filename(domain.config_filename)
+        _atomic_yaml_write(local_file, new_local)
+        logger.info("Settings domain '%s' updated via dashboard (local overlay)", domain_name)
+        # Return the full merged view
+        base = _load_yaml(domain.config_filename)
+        merged = _deep_merge(base, new_local)
         return jsonify({
             "domain": domain_name,
             "config": merged,
