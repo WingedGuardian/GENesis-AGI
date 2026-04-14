@@ -23,7 +23,8 @@ set -euo pipefail
 # the running process. Industry standard (Chrome, Homebrew, Windows Update):
 # copy to temp, exec from there, so the original can be safely overwritten.
 if [ "${GENESIS_UPDATE_FROM_TEMP:-}" != "1" ]; then
-    TEMP_COPY=$(mktemp /tmp/genesis-update-XXXXXX.sh)
+    mkdir -p "$HOME/tmp"
+    TEMP_COPY=$(mktemp "$HOME/tmp/genesis-update-XXXXXX.sh")
     cp "$0" "$TEMP_COPY"
     chmod +x "$TEMP_COPY"
     export GENESIS_UPDATE_FROM_TEMP=1
@@ -204,7 +205,7 @@ _start_genesis_server() {
     echo "  WARNING: systemctl --user start failed — falling back to direct start (degraded)"
     echo "  Health monitoring will not work correctly. Run: systemctl --user start genesis-server.service"
     nohup "$VENV_DIR/bin/python" -m genesis serve --host 0.0.0.0 --port 5000 \
-        >> /tmp/genesis-server.log 2>&1 &
+        >> "$HOME/.genesis/logs/genesis-server.log" 2>&1 &
     echo "  Started genesis-server in degraded mode (pid $!)"
     # Write marker so dashboard can detect degraded mode
     echo "nohup" > "$HOME/.genesis/server-start-mode"

@@ -397,6 +397,21 @@ echo
 echo "--- Initializing runtime state ---"
 mkdir -p "$HOME/.genesis"
 touch "$HOME/.genesis/setup-complete"
+
+# CC temp directory (keeps /tmp clean — CC uses TMPDIR)
+CC_TMP_DIR="$HOME/.genesis/cc-tmp"
+mkdir -p "$CC_TMP_DIR"
+chmod 700 "$CC_TMP_DIR"
+
+# Watchgod config — 500MB budget, 150MB sacred ground
+mkdir -p "$HOME/.genesis/config"
+cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
+CC_TMP_DIR=$CC_TMP_DIR
+CC_TMP_BUDGET_MB=500
+SACRED_GROUND_MB=150
+WEOF
+echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+
 echo "  ~/.genesis/ initialized"
 echo
 
@@ -438,6 +453,15 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     fi
 else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
+fi
+
+# Install tmp watchgod service (OS-level temp protection)
+WATCHGOD_SRC="$GENESIS_ROOT/config/genesis-tmp-watchgod.service"
+if [[ -f "$WATCHGOD_SRC" ]]; then
+    cp "$WATCHGOD_SRC" "$SYSTEMD_USER_DIR/"
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
+        echo "  genesis-tmp-watchgod.service enabled + started" || true
 fi
 echo
 

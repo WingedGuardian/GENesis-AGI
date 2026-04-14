@@ -478,6 +478,41 @@ async def check_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
         )
 
 
+async def check_cc_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
+    """Check CC temp directory usage via watchgod state file."""
+    name = "cc_tmp_usage"
+    t0 = datetime.now(UTC)
+    try:
+        rc, stdout, stderr = await _run_subprocess(
+            "incus", "exec", config.container_name, "--",
+            "su", "-", "ubuntu", "-c",
+            "cat ~/.genesis/watchgod_state.json 2>/dev/null || echo '{}'",
+            timeout=config.probes.probe_timeout_s,
+        )
+        if rc != 0:
+            return SuspiciousResult(
+                name=name, ok=True, detail=f"read failed: {stderr[:200]}",
+                collected_at=t0.isoformat(),
+            )
+        import json
+
+        data = json.loads(stdout.strip() or "{}")
+        cc_tier = data.get("cc_tmp", {}).get("tier", "unknown")
+        sys_tier = data.get("system_tmp", {}).get("tier", "unknown")
+        used_mb = data.get("cc_tmp", {}).get("used_mb", 0)
+
+        ok = cc_tier in ("green", "yellow") and sys_tier in ("green", "yellow")
+        detail = f"cc_tmp: {cc_tier} ({used_mb}MB), /tmp: {sys_tier}"
+        return SuspiciousResult(
+            name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
+        )
+    except Exception as exc:
+        return SuspiciousResult(
+            name=name, ok=True, detail=f"exception: {exc}",
+            collected_at=t0.isoformat(),
+        )
+
+
 async def check_restart_count(config: GuardianConfig) -> SuspiciousResult:
     """Check genesis-bridge systemd restart count (crash loop detection)."""
     name = "restart_count"
@@ -610,6 +645,7 @@ async def collect_all_signals(config: GuardianConfig) -> HealthSnapshot:
             check_tick_regularity(config),
             check_memory_pressure(config),
             check_tmp_usage(config),
+            check_cc_tmp_usage(config),
             check_restart_count(config),
             check_error_spike(config),
             return_exceptions=True,
