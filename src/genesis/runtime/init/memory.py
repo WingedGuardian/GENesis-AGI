@@ -167,6 +167,26 @@ async def init(rt: GenesisRuntime) -> None:
                 rt._recovery_orchestrator.set_dispatch_fn(rt._router.route_call)
             logger.info("RecoveryOrchestrator created")
 
+        # Wire session observer into awareness loop (needs both store + router)
+        if (
+            rt._awareness_loop is not None
+            and rt._memory_store is not None
+            and rt._router is not None
+        ):
+            try:
+                from genesis.memory.session_observer import process_pending_observations
+
+                async def _observer_fn():
+                    return await process_pending_observations(
+                        store=rt._memory_store,
+                        router=rt._router,
+                    )
+
+                rt._awareness_loop.set_session_observer(_observer_fn)
+                logger.info("Session observer wired to awareness loop")
+            except Exception:
+                logger.warning("Failed to wire session observer", exc_info=True)
+
     except (ConnectionError, TimeoutError) as exc:
         logger.error(
             "MemoryStore creation failed (Qdrant down?) — "
