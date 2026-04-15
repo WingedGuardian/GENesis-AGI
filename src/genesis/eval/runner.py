@@ -189,11 +189,14 @@ async def run_eval(
         latency_ms = (time.monotonic() - case_start) * 1000
 
         if not call_result.success:
-            # Transient errors (rate limit, service unavailable) → skip.
-            # Genuine provider errors (auth failure, bad request) → fail.
+            # Transient / infrastructure errors → skip (excluded from score).
+            # Genuine model errors (wrong answer) → fail (counted in score).
+            # 429/503: rate limit / service unavailable (retried above, now exhausted)
+            # 404: endpoint not found — model ID wrong or provider dropped it
+            # 400: bad request — usually wrong model ID from our side, not model quality
             is_transient = (
                 call_result.retry_after_s is not None
-                or call_result.status_code in (429, 503)
+                or call_result.status_code in (400, 404, 429, 503)
             )
             if is_transient:
                 logger.warning(
