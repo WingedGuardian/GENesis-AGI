@@ -194,6 +194,14 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  openrouter-trinity-free:
+    type: openrouter
+    model: arcee-ai/trinity-large-preview:free
+    profile: trinity-large-preview
+    free: true
+    # 400B MoE (13B active). Free until 2026-04-22. Benchmark before expiry.
+    rpm_limit: 20
+    open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
     model: mistral-small-3.2-24b-instruct-2506
