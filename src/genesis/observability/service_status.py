@@ -292,14 +292,14 @@ def collect_cc_tmp_usage() -> dict:
             return {"status": "unavailable", "error": "watchgod not running"}
         data = json.loads(_TMP_WATCHGOD_STATE.read_text())
         cc = data.get("cc_tmp", {})
-        sys = data.get("system_tmp", {})
+        sys_tmp = data.get("system_tmp", {})
         return {
             "cc_tier": cc.get("tier", "unknown"),
             "cc_used_mb": cc.get("used_mb", 0),
             "cc_budget_mb": cc.get("budget_mb", 500),
             "cc_sacred_mb": cc.get("sacred_mb", 150),
-            "sys_tier": sys.get("tier", "unknown"),
-            "sys_used_pct": sys.get("used_pct", 0),
+            "sys_tier": sys_tmp.get("tier", "unknown"),
+            "sys_used_pct": sys_tmp.get("used_pct", 0),
             "poll_at": data.get("poll_at", ""),
         }
     except (json.JSONDecodeError, OSError):
