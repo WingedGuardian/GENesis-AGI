@@ -1873,7 +1873,7 @@ async function loadSurplusDetail(container) {
                 const weight = d.current_weight != null ? d.current_weight : d[1];
                 const min = d.min_weight != null ? d.min_weight : 0.1;
                 const max = d.max_weight != null ? d.max_weight : 0.5;
-                const pct = Math.round(((weight - min) / (max - min)) * 100);
+                const pct = max > min ? Math.round(((weight - min) / (max - min)) * 100) : 50;
                 const row = el('div', 'section-row');
                 row.appendChild(el('span', 'label', name));
                 const bar = el('span', 'value');
