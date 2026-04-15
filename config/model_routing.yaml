@@ -73,14 +73,14 @@ providers:
   openrouter-gemma4:
     type: openrouter
     model: google/gemma-4-31b-it:free
-    profile: gemma-4-27b
+    profile: gemma-4-31b
     free: true
     rpm_limit: 20
     open_duration_s: 120
   openrouter-qwen3coder:
     type: openrouter
-    model: qwen/qwen3-coder-480b-a35b:free
-    profile: qwen3-coder-480b
+    model: qwen/qwen3-coder:free
+    profile: qwen3-coder
     free: true
     rpm_limit: 20
     open_duration_s: 120
@@ -89,6 +89,8 @@ providers:
     model: deepseek/deepseek-r1:free
     profile: deepseek-r1
     free: true
+    # Free endpoint removed from OpenRouter as of 2026-04-15; disable until restored
+    enabled: false
     rpm_limit: 20
     open_duration_s: 120
   openrouter-mimo:
