@@ -193,7 +193,12 @@ Also report in your output:
 ## Output Format
 
 Respond with valid JSON. Only include non-empty fields. Every field is optional
-except `observations` and `confidence`.
+except `observations`, `confidence`, and `cognitive_state_update`.
+
+**`cognitive_state_update` is REQUIRED.** Always regenerate the cognitive state
+summary — this is the primary output of deep reflection that every future CC
+session will read. Omitting it means no CC session gets updated context until
+the next deep reflection fires.
 
 ```json
 {
