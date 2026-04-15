@@ -28,6 +28,7 @@ class SurplusQueue:
         priority: float,
         drive_alignment: str,
         payload: str | None = None,
+        not_before: str | None = None,
     ) -> str:
         """Add a task to the queue. Rejects NEVER tier."""
         tier = ComputeTier(compute_tier) if isinstance(compute_tier, str) else compute_tier
@@ -46,6 +47,7 @@ class SurplusQueue:
             drive_alignment=drive_alignment,
             payload=payload,
             created_at=self._clock().isoformat(),
+            not_before=not_before,
         )
         return task_id
 
