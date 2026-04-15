@@ -16,14 +16,15 @@ async def create(
     created_at: str,
     payload: str | None = None,
     status: str = "pending",
+    not_before: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO surplus_tasks
            (id, task_type, compute_tier, priority, drive_alignment,
-            status, payload, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            status, payload, created_at, not_before)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, task_type, compute_tier, priority, drive_alignment,
-         status, payload, created_at),
+         status, payload, created_at, not_before),
     )
     await db.commit()
     return id
@@ -44,6 +45,7 @@ async def next_task(
     cursor = await db.execute(
         f"SELECT * FROM surplus_tasks WHERE status = 'pending' "
         f"AND compute_tier IN ({placeholders}) "
+        f"AND (not_before IS NULL OR not_before <= datetime('now')) "
         f"ORDER BY priority DESC, created_at ASC LIMIT 1",
         available_tiers,
     )

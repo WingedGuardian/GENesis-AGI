@@ -146,6 +146,18 @@ async def init(rt: GenesisRuntime) -> None:
             await _degraded(rt, "MaintenanceExecutors")
 
         try:
+            from genesis.follow_ups.dispatcher import FollowUpDispatcher
+            follow_up_dispatcher = FollowUpDispatcher(db=rt._db, queue=queue)
+            rt._surplus_scheduler.set_follow_up_dispatcher(follow_up_dispatcher)
+            logger.info("FollowUpDispatcher wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire FollowUpDispatcher", exc_info=True)
+            await _degraded(rt, "FollowUpDispatcher")
+        except Exception:
+            logger.error("Unexpected error wiring FollowUpDispatcher", exc_info=True)
+            await _degraded(rt, "FollowUpDispatcher")
+
+        try:
             from genesis.surplus.findings_bridge import FindingsBridge
             rt._findings_bridge = FindingsBridge(db=rt._db)
             logger.info("FindingsBridge initialized")
