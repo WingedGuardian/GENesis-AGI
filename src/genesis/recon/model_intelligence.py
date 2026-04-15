@@ -6,8 +6,9 @@ free models, enriches profiles from ArtificialAnalysis.ai, flags stale
 profiles, and stores findings for strategic reflection review.
 
 Free model inventory runs daily (free_model_inventory schedule) via
-_check_free_models(). New free models are enqueued as MODEL_EVAL surplus
-tasks when a SurplusQueue is provided.
+_check_free_models(). New free models create follow-up records with
+strategy='surplus_task' — the follow-up dispatcher handles actual
+MODEL_EVAL enqueueing and tracks benchmark lifecycle to completion.
 """
 
 from __future__ import annotations
@@ -229,29 +230,8 @@ class ModelIntelligenceJob:
                 "context_length": info["context_length"],
                 "created": info.get("created"),
             })
-            # Enqueue MODEL_EVAL surplus task if queue available
-            if self._surplus_queue is not None:
-                try:
-                    from genesis.surplus.types import ComputeTier, TaskType
-                    # Cap: max 10 pending MODEL_EVAL tasks to avoid queue flooding
-                    pending = await self._surplus_queue.pending_by_type(TaskType.MODEL_EVAL)
-                    if pending < 10:
-                        await self._surplus_queue.enqueue(
-                            task_type=TaskType.MODEL_EVAL,
-                            compute_tier=ComputeTier.FREE_API,
-                            priority=0.6,
-                            drive_alignment="competence",
-                            payload=json.dumps({
-                                "model_id": model_id,
-                                "name": info["name"],
-                                "source": "openrouter_free_scan",
-                            }),
-                        )
-                        logger.info("Enqueued MODEL_EVAL for %s", model_id)
-                    else:
-                        logger.info("MODEL_EVAL queue already has %d pending, skipping %s", pending, model_id)
-                except Exception:
-                    logger.warning("Failed to enqueue MODEL_EVAL for %s", model_id, exc_info=True)
+            # Create follow-up to track benchmark lifecycle
+            await self._create_benchmark_follow_up(model_id, info)
 
         # Report removed free models (went paid or deprecated)
         for model_id in sorted(removed_ids):
@@ -427,3 +407,53 @@ class ModelIntelligenceJob:
         )
         await self._db.commit()
         return finding_id
+
+    async def _create_benchmark_follow_up(
+        self, model_id: str, info: dict,
+    ) -> str | None:
+        """Create a follow-up to benchmark a newly detected free model.
+
+        The follow-up dispatcher will enqueue the MODEL_EVAL surplus task
+        and track it through to completion. This replaces direct surplus
+        enqueueing so the benchmark lifecycle is visible and accountable.
+        """
+        from genesis.db.crud import follow_ups as follow_up_crud
+
+        # Respect the same cap as before: max 10 pending MODEL_EVAL tasks
+        if self._surplus_queue is not None:
+            try:
+                from genesis.surplus.types import TaskType
+
+                pending = await self._surplus_queue.pending_by_type(TaskType.MODEL_EVAL)
+                if pending >= 10:
+                    logger.info(
+                        "MODEL_EVAL queue already has %d pending, skipping follow-up for %s",
+                        pending, model_id,
+                    )
+                    return None
+            except Exception:
+                logger.warning("Failed to check MODEL_EVAL pending count", exc_info=True)
+
+        try:
+            payload = {
+                "task_type": "model_eval",
+                "compute_tier": "free_api",
+                "payload": {
+                    "model_id": model_id,
+                    "name": info["name"],
+                    "source": "openrouter_free_scan",
+                },
+            }
+            fid = await follow_up_crud.create(
+                self._db,
+                content=f"Benchmark new free model: {model_id} ({info['name']})",
+                source="recon_pipeline",
+                strategy="surplus_task",
+                reason=json.dumps(payload),
+                priority="medium",
+            )
+            logger.info("Created benchmark follow-up %s for %s", fid[:8], model_id)
+            return fid
+        except Exception:
+            logger.warning("Failed to create benchmark follow-up for %s", model_id, exc_info=True)
+            return None

@@ -14,8 +14,9 @@ from genesis.routing.model_profiles import ModelProfileRegistry
 
 @pytest.fixture()
 async def db():
-    """In-memory SQLite with observations table."""
+    """In-memory SQLite with observations and follow_ups tables."""
     async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
         await conn.execute(
             "CREATE TABLE observations ("
             "  id TEXT PRIMARY KEY,"
@@ -24,6 +25,8 @@ async def db():
             "  resolved_at TEXT, resolution_notes TEXT"
             ")"
         )
+        from genesis.db.schema import TABLES
+        await conn.execute(TABLES["follow_ups"])
         await conn.commit()
         yield conn
 
@@ -191,6 +194,88 @@ class TestStalenessCheck:
             result = await job.run()
 
         assert result["stale_findings"] == 0
+
+
+class TestReconFollowUpPipeline:
+    """Recon creates follow-ups for new free models."""
+
+    @pytest.mark.asyncio
+    async def test_new_free_model_creates_follow_up(self, db, registry, tmp_path) -> None:
+        """New free model creates a follow-up with structured payload."""
+        import json
+
+        models = [
+            {
+                "id": "new-provider/free-model",
+                "name": "Free Model",
+                "context_length": 100_000,
+                "pricing": {"prompt": "0", "completion": "0"},
+            },
+        ]
+
+        # Use tmp_path for cache to avoid polluting real cache
+        cache_path = tmp_path / "free_model_cache.json"
+
+        job = ModelIntelligenceJob(db=db, profile_registry=registry)
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+        mock_client.get = AsyncMock(return_value=_mock_openrouter_response(models))
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("genesis.recon.model_intelligence._FREE_MODEL_CACHE_PATH", cache_path),
+        ):
+            await job.run()
+
+        # Check follow-up was created
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups WHERE source = 'recon_pipeline'"
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1
+
+        fu = dict(rows[0])
+        assert fu["strategy"] == "surplus_task"
+        assert "new-provider/free-model" in fu["content"]
+        assert fu["status"] == "pending"
+
+        # Verify structured payload in reason
+        payload = json.loads(fu["reason"])
+        assert payload["task_type"] == "model_eval"
+        assert payload["payload"]["model_id"] == "new-provider/free-model"
+
+    @pytest.mark.asyncio
+    async def test_no_follow_up_without_surplus_queue(self, db, registry, tmp_path) -> None:
+        """Without surplus queue, follow-up is still created (no cap check)."""
+        models = [
+            {
+                "id": "another/free-model",
+                "name": "Another Free",
+                "context_length": 50_000,
+                "pricing": {"prompt": "0", "completion": "0"},
+            },
+        ]
+
+        cache_path = tmp_path / "free_model_cache.json"
+        job = ModelIntelligenceJob(db=db, profile_registry=registry)
+
+        mock_client = AsyncMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+        mock_client.get = AsyncMock(return_value=_mock_openrouter_response(models))
+
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("genesis.recon.model_intelligence._FREE_MODEL_CACHE_PATH", cache_path),
+        ):
+            await job.run()
+
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM follow_ups WHERE source = 'recon_pipeline'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 1  # follow-up created even without queue
 
 
 class TestFindingStorage:
