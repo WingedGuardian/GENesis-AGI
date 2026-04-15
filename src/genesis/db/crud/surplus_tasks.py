@@ -45,7 +45,7 @@ async def next_task(
     cursor = await db.execute(
         f"SELECT * FROM surplus_tasks WHERE status = 'pending' "
         f"AND compute_tier IN ({placeholders}) "
-        f"AND (not_before IS NULL OR not_before <= datetime('now')) "
+        f"AND (not_before IS NULL OR not_before <= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')) "
         f"ORDER BY priority DESC, created_at ASC LIMIT 1",
         available_tiers,
     )
