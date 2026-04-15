@@ -66,6 +66,11 @@ fi
 
 echo "→ Slot ${SLOT} (session: ${SESSION_NAME}, cap: ${existing}/${max_sessions})" >&2
 
+# Redirect CC temp to dedicated directory (keeps /tmp clean)
+export TMPDIR="$HOME/.genesis/cc-tmp"
+mkdir -p "$TMPDIR"
+chmod 700 "$TMPDIR"
+
 exec tmux new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     "cd ${GENESIS_ROOT} && claude --dangerously-skip-permissions; exit"

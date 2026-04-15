@@ -20,12 +20,12 @@ targets=(
 
 status=0
 for pattern in "${patterns[@]}"; do
-    if rg -n --hidden --glob '!**/.git/**' --glob '!**/.claude/**' --glob '!**/logs/**' --glob '!**/docs/**' --glob '!**/CLAUDE.md' --glob '!**/genesis-container-setup.md' --glob '!**/scripts/check_portability.sh' --glob '!**/scripts/prepare-public-release.sh' --glob '!**/scripts/cc_cli_output/**' --glob '!**/scripts/spike_*' "$pattern" "${targets[@]}" >/tmp/genesis-portability-scan.txt; then
+    if rg -n --hidden --glob '!**/.git/**' --glob '!**/.claude/**' --glob '!**/logs/**' --glob '!**/docs/**' --glob '!**/CLAUDE.md' --glob '!**/genesis-container-setup.md' --glob '!**/scripts/check_portability.sh' --glob '!**/scripts/prepare-public-release.sh' --glob '!**/scripts/cc_cli_output/**' --glob '!**/scripts/spike_*' "$pattern" "${targets[@]}" >"$HOME/tmp/genesis-portability-scan.txt"; then
         echo "Portability check failed for pattern: $pattern"
-        cat /tmp/genesis-portability-scan.txt
+        cat "$HOME/tmp/genesis-portability-scan.txt"
         status=1
     fi
 done
 
-rm -f /tmp/genesis-portability-scan.txt
+rm -f "$HOME/tmp/genesis-portability-scan.txt"
 exit "$status"

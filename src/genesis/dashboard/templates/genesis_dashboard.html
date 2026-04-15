@@ -1765,6 +1765,12 @@
           if ((infra.ollama?.missing_models?.length || 0) > 0) {
             return { state: "degraded", reason: "configured Ollama models are missing" };
           }
+          if (infra.cc_tmp?.cc_tier === "red" || infra.cc_tmp?.sys_tier === "red") {
+            return { state: "error", reason: "temp directory critically full" };
+          }
+          if (infra.cc_tmp?.cc_tier === "orange" || infra.cc_tmp?.sys_tier === "orange") {
+            return { state: "degraded", reason: "temp directory pressure detected" };
+          }
           if (probes.some(probe => ["degraded", "fallback", "overdue"].includes(probe?.status))) {
             return { state: "degraded", reason: "one or more infrastructure probes are degraded" };
           }
