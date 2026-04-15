@@ -254,6 +254,12 @@ Full pipeline details are in the `genesis-development` skill's
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending, what
   was learned. If it's not committed, it doesn't exist.
+- **Follow-up ownership**: For each follow-up item identified during a session:
+  1. State what it is and why
+  2. State what Genesis will do: schedule it, flag for ego, or surface to user
+  3. Create the follow-up via the `follow_up_create` MCP tool before session ends
+  4. Never leave a follow-up as just text — every deferred item needs a backing
+     record. Genesis owns follow-through, not the user.
 - **No laziness.** Find root causes. No temporary fixes. No "good enough"
   shortcuts. No skipping steps because the answer seems obvious. Hold yourself
   to senior developer standards — if you wouldn't approve it in a code review,

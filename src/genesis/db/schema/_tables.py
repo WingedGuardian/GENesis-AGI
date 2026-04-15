@@ -332,7 +332,8 @@ TABLES = {
             completed_at      TEXT,
             result_staging_id TEXT,
             failure_reason    TEXT,
-            attempt_count     INTEGER NOT NULL DEFAULT 0
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            not_before        TEXT
         )
     """,
     "drive_weights": """
@@ -807,6 +808,31 @@ TABLES = {
             is_relative      INTEGER NOT NULL DEFAULT 0
         )
     """,
+    "follow_ups": """
+        CREATE TABLE IF NOT EXISTS follow_ups (
+            id               TEXT PRIMARY KEY,
+            source           TEXT NOT NULL,
+            source_session   TEXT,
+            content          TEXT NOT NULL,
+            reason           TEXT,
+            strategy         TEXT NOT NULL CHECK (
+                strategy IN ('scheduled_task', 'surplus_task', 'ego_judgment', 'user_input_needed')
+            ),
+            scheduled_at     TEXT,
+            status           TEXT NOT NULL DEFAULT 'pending' CHECK (
+                status IN ('pending', 'scheduled', 'in_progress', 'completed', 'failed', 'blocked')
+            ),
+            linked_task_id   TEXT,
+            priority         TEXT NOT NULL DEFAULT 'medium' CHECK (
+                priority IN ('low', 'medium', 'high', 'critical')
+            ),
+            created_at       TEXT NOT NULL,
+            completed_at     TEXT,
+            resolution_notes TEXT,
+            blocked_reason   TEXT,
+            escalated_to     TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -973,6 +999,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_type ON code_symbols(symbol_type)",
     "CREATE INDEX IF NOT EXISTS idx_code_imports_source ON code_imports(source_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_imports_target ON code_imports(target_module)",
+    # follow-ups (accountability ledger)
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_status ON follow_ups(status)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_scheduled ON follow_ups(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_source ON follow_ups(source)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_linked_task ON follow_ups(linked_task_id)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
@@ -987,8 +1018,8 @@ SIGNAL_WEIGHTS_SEED = [
     # Signal collectors and cognitive-state flag removed in the same sweep.
     # Existing rows cleaned up by _migrate_add_columns() on next boot.
     ("budget_pct_consumed", "health_mcp", 0.40, 0.40, 0.0, 1.0, '["Light","Deep"]'),
-    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
-    ("critical_failure", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
+    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro","Light"]'),
+    ("critical_failure", "health_mcp", 0.90, 0.90, 0.0, 1.0, '["Light"]'),
     ("time_since_last_strategic", "clock", 0.50, 0.50, 0.0, 1.0, '["Strategic"]'),
     ("micro_count_since_light", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Light"]'),
     ("cc_version_changed", "awareness_loop", 0.60, 0.60, 0.0, 1.0, '["Light"]'),
@@ -1000,7 +1031,7 @@ DEPTH_THRESHOLDS_SEED = [
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
     ("Micro", 0.30, 1800, 2, 3600),         # floor 30min, max 2/hr
-    ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
+    ("Light", 0.60, 21600, 1, 3600),         # floor 6h, max 1/hr
     ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]
