@@ -651,6 +651,12 @@ class AwarenessLoop:
 
         tick_id = result.tick_id
         db = self._db
+        logger.info(
+            "Dispatch reflection: depth=%s, tick=%s, bridge=%s, engine=%s",
+            depth.value, tick_id[:8],
+            self._cc_reflection_bridge is not None,
+            self._reflection_engine is not None,
+        )
 
         if self._reflection_engine is not None and depth == Depth.MICRO:
             ref_result = None

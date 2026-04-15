@@ -57,6 +57,7 @@ def init_health_mcp(
 
 
 from genesis.mcp.health import browser as _browser  # noqa: E402
+from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
@@ -68,6 +69,7 @@ from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
 
+codebase = _codebase
 db_schema = _db_schema
 errors = _errors
 manifest = _manifest
@@ -78,6 +80,7 @@ status = _status
 task_tools = _task_tools
 update_history = _update_history
 
+_impl_codebase_navigate = _codebase._impl_codebase_navigate
 _impl_db_schema = _db_schema._impl_db_schema
 _impl_health_errors = _errors._impl_health_errors
 _impl_health_alerts = _errors._impl_health_alerts
