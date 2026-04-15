@@ -248,14 +248,21 @@ class CCReflectionBridge:
         escalation_source: str | None = None,
     ) -> ReflectionResult:
         """Run Deep or Strategic reflection via CC background session."""
+        logger.info(
+            "Reflection dispatch starting: depth=%s, tick=%s, escalation=%s",
+            depth.value, tick.tick_id[:8], escalation_source,
+        )
+
         # Check CC budget before proceeding
         throttle_result = await self._check_throttle(priority=2, work_type="reflection")
         if throttle_result is not None:
+            logger.info("Reflection %s THROTTLED: %s", depth.value, throttle_result.reason)
             return throttle_result
 
         # Pre-dispatch autonomy gate
         gate_result = self._check_dispatch_gate(depth)
         if gate_result is not None:
+            logger.info("Reflection %s GATE-BLOCKED: %s", depth.value, gate_result.reason)
             return gate_result
 
         model = self._model_for_depth(depth)
@@ -264,6 +271,16 @@ class CCReflectionBridge:
         # Check if there's pending work (Phase 7 enriched path)
         if self._context_gatherer and depth == Depth.DEEP:
             pending = await self._context_gatherer.detect_pending_work(db)
+            logger.info(
+                "Deep reflection pending work: has_any=%s, jobs=%s "
+                "(obs=%d, surplus=%d, skills=%d, cog_stale=%s)",
+                pending.has_any_work,
+                [j.value for j in pending.active_jobs],
+                pending.observation_backlog,
+                pending.surplus_pending,
+                pending.skills_needing_review,
+                pending.cognitive_regeneration,
+            )
             if not pending.has_any_work:
                 logger.info("Deep reflection skipped — no pending work")
                 return ReflectionResult(
