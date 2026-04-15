@@ -1,4 +1,4 @@
-"""Health signal collection — HOST-SIDE. 5 probes + 6 suspicious checks.
+"""Health signal collection — HOST-SIDE. 5 probes + 7 suspicious checks.
 
 Each probe runs independently with its own timeout. A probe failure returns
 alive=False but never crashes the check. All probes run in parallel via
@@ -15,9 +15,10 @@ Suspicious checks (run when all 5 probes pass):
   1. Tick regularity      — sqlite3 query for interval gaps
   2. Memory pressure      — cgroup memory.current vs max
   3. /tmp usage           — df /tmp
-  4. Restart count        — systemctl NRestarts
-  5. Error spike          — journalctl error count in window
-  6. Pause state          — /api/genesis/pause or paused.json
+  4. CC tmp usage         — watchgod_state.json tier check
+  5. Restart count        — systemctl NRestarts
+  6. Error spike          — journalctl error count in window
+  7. Pause state          — /api/genesis/pause or paused.json
 """
 
 from __future__ import annotations

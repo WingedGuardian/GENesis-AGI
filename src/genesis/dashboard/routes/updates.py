@@ -355,7 +355,8 @@ def _apply_supervised(pid_file: Path) -> tuple:
 
     # Write orchestrator to a temp file (avoids arg-length limits with -c).
     script_fd, script_path = tempfile.mkstemp(
-        suffix=".py", prefix="genesis-update-orch-", dir="/tmp",
+        suffix=".py", prefix="genesis-update-orch-",
+        dir=str(Path.home() / "tmp"),
     )
     with os.fdopen(script_fd, "w") as f:
         f.write(orchestrator_code)

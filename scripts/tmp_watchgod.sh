@@ -59,19 +59,21 @@ write_state() {
     if df -T /tmp 2>/dev/null | grep -q tmpfs; then
         is_tmpfs="true"
     fi
-    cat > "$STATE_FILE" <<EOF
+    local tmp="${STATE_FILE}.tmp"
+    cat > "$tmp" <<EOF
 {
   "cc_tmp": {"tier": "$cc_tier", "used_mb": $cc_used, "budget_mb": $CC_TMP_BUDGET_MB, "sacred_mb": $SACRED_GROUND_MB},
   "system_tmp": {"tier": "$sys_tier", "used_pct": $sys_pct, "is_tmpfs": $is_tmpfs},
   "poll_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
+    mv "$tmp" "$STATE_FILE"
 }
 
 # ── Zone A: CC Temp ──────────────────────────────────────────
 #
 # Tiers (% of budget):
-#   Green  : < 25%  — no action
+#   Green  : < 50%  — no action
 #   Yellow : > 50%  — clean stale session dirs + old temp files
 #   Orange : > 75%  — yellow + delete caches + kill idle sessions + alert
 #   Red    : > 90% OR fs free < sacred — nuclear cleanup + emergency alert
@@ -132,7 +134,7 @@ clean_cc_red() {
     # Delete ALL session dirs EXCEPT the newest one and files modified in last 60s
     find "$CC_TMP_DIR" -mindepth 1 -maxdepth 1 -type d | while IFS= read -r dir; do
         # Skip if this contains the active session
-        if [[ -n "$newest_session" && "$newest_session" == "$dir"* ]]; then
+        if [[ -n "$newest_session" && "$newest_session" == "$dir/"* ]]; then
             continue
         fi
         rm -rf "$dir" 2>/dev/null || true
@@ -271,6 +273,13 @@ main() {
         # Clear stale alerts when back to green
         if [[ "$cc_tier" == "green" && "$sys_tier" == "green" ]]; then
             rm -f "$ALERT_DIR/tmp_warning" "$ALERT_DIR/tmp_emergency" 2>/dev/null || true
+        fi
+
+        # Log rotation — truncate when > 1MB
+        local log_size
+        log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if (( log_size > 1048576 )); then
+            tail -100 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
         fi
 
         sleep "$POLL_INTERVAL"
