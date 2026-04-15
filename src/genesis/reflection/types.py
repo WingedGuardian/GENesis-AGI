@@ -48,14 +48,16 @@ class PendingWorkSummary:
     def has_any_work(self) -> bool:
         """True if there's substantive work justifying a deep reflection.
 
-        Cost reconciliation and cognitive regeneration are always-included
-        jobs but don't justify triggering a reflection on their own.
+        Cost reconciliation is always-included but doesn't justify triggering
+        a reflection on its own.  Cognitive regeneration DOES justify a
+        reflection — stale or missing cognitive state is self-healing work.
         """
         return any([
             self.memory_consolidation,
             self.surplus_review,
             self.skill_review,
             self.lessons_extraction,
+            self.cognitive_regeneration,
         ])
 
     @property
