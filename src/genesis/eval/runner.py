@@ -12,6 +12,8 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
+import litellm
+
 from genesis.eval.datasets import load_dataset
 from genesis.eval.scorers import get_scorer
 from genesis.eval.types import (
@@ -20,8 +22,6 @@ from genesis.eval.types import (
     ScoredOutput,
     TaskCategory,
 )
-import litellm
-
 from genesis.routing.config import load_config
 from genesis.routing.litellm_delegate import LiteLLMDelegate
 from genesis.routing.rate_gate import ProviderRateGate
@@ -170,8 +170,8 @@ async def run_eval(
 
         if last_exc is not None:
             logger.warning(
-                "Eval case %s skipped for %s after %d attempts: %s",
-                case.id, provider_name, _MAX_RETRIES + 1, last_exc,
+                "Eval case %s skipped for %s: %s",
+                case.id, provider_name, last_exc,
             )
             skipped_count += 1
             results.append(ScoredOutput(

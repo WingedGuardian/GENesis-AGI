@@ -50,9 +50,9 @@ async def insert_run(
         await db.execute(
             """INSERT INTO eval_results
                (id, run_id, case_id, input_text, expected_output, actual_output,
-                score, passed, scorer_type, scorer_detail, latency_ms,
+                score, passed, skipped, scorer_type, scorer_detail, latency_ms,
                 input_tokens, output_tokens, cost_usd, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 uuid.uuid4().hex,
                 run_id,
@@ -62,6 +62,7 @@ async def insert_run(
                 result.actual_output,
                 result.score,
                 1 if result.passed else 0,
+                1 if result.skipped else 0,
                 result.scorer_type,
                 result.scorer_detail,
                 result.latency_ms,
