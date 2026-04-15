@@ -119,11 +119,15 @@ class JsonFieldMatch(Scorer):
             return passed, 1.0 if passed else 0.0, detail
 
         # Check specified fields against expected_values
+        # Every field listed in `fields` must appear in expected_values — a missing
+        # entry is a dataset config bug that would silently produce false passes.
         mismatches = []
         for field_name in fields:
+            if field_name not in expected_values:
+                return False, 0.0, f"config error: field '{field_name}' in fields list but not in expected_values"
             actual_val = _get_nested(actual_obj, field_name)
-            expected_val = expected_values.get(field_name)
-            if expected_val is not None and not _values_match(actual_val, expected_val):
+            expected_val = expected_values[field_name]
+            if not _values_match(actual_val, expected_val):
                 mismatches.append(
                     f"{field_name}: expected={expected_val!r}, got={actual_val!r}"
                 )

@@ -299,21 +299,26 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
 
         async with aiosqlite.connect(str(genesis_db_path())) as db:
             for ds_name in datasets:
-                runs = await get_runs(db, dataset=ds_name, limit=args.last * 50)
-                # Group by model_id, take most recent per provider
-                seen_for_ds: set[str] = set()
+                # Fetch enough rows so each provider can contribute up to args.last runs.
+                # We don't know the provider count upfront, so over-fetch generously.
+                runs = await get_runs(db, dataset=ds_name, limit=500)
+                # Count runs per model_id, take the most recent args.last per provider
+                run_counts: dict[str, int] = {}
                 for run in runs:
                     model_id = run.get("model_id", "")
-                    if model_id in seen_for_ds:
+                    count = run_counts.get(model_id, 0)
+                    if count >= args.last:
                         continue
-                    seen_for_ds.add(model_id)
+                    run_counts[model_id] = count + 1
                     providers_seen.add(model_id)
                     if model_id not in results:
                         results[model_id] = {}
-                    passed = run.get("passed_cases", 0)
-                    failed = run.get("failed_cases", 0)
-                    skipped = run.get("skipped_cases", 0)
-                    results[model_id][ds_name] = (passed, passed + failed, skipped)
+                    # Use the most recent run (first one seen for this provider)
+                    if ds_name not in results[model_id]:
+                        passed = run.get("passed_cases", 0)
+                        failed = run.get("failed_cases", 0)
+                        skipped = run.get("skipped_cases", 0)
+                        results[model_id][ds_name] = (passed, passed + failed, skipped)
 
     except Exception as e:
         print(f"error: {e}", file=sys.stderr)
