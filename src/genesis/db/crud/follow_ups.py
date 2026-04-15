@@ -79,13 +79,18 @@ async def get_by_status(
     return [dict(row) for row in await cursor.fetchall()]
 
 
-async def get_actionable(db: aiosqlite.Connection) -> list[dict]:
-    """Get follow-ups needing attention: pending, failed, blocked."""
+async def get_actionable(db: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
+    """Get follow-ups needing attention: pending, failed, blocked.
+
+    Capped at `limit` to prevent unbounded growth from flooding contexts.
+    """
     cursor = await db.execute(
         "SELECT * FROM follow_ups WHERE status IN ('pending', 'failed', 'blocked') "
         "ORDER BY CASE priority "
         "  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
-        "  WHEN 'medium' THEN 2 ELSE 3 END, created_at ASC",
+        "  WHEN 'medium' THEN 2 ELSE 3 END, created_at ASC "
+        "LIMIT ?",
+        (limit,),
     )
     return [dict(row) for row in await cursor.fetchall()]
 
@@ -95,7 +100,8 @@ async def get_scheduled_due(db: aiosqlite.Connection) -> list[dict]:
     cursor = await db.execute(
         "SELECT * FROM follow_ups "
         "WHERE strategy = 'scheduled_task' AND status = 'pending' "
-        "AND scheduled_at IS NOT NULL AND scheduled_at <= datetime('now') "
+        "AND scheduled_at IS NOT NULL "
+        "AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') "
         "ORDER BY scheduled_at ASC",
     )
     return [dict(row) for row in await cursor.fetchall()]
