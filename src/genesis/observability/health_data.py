@@ -77,6 +77,7 @@ class HealthDataService:
             cc_sessions,
             conversation_activity,
             cost,
+            eval_staleness,
             infrastructure,
             mcp_status,
             outreach_stats,
@@ -123,6 +124,7 @@ class HealthDataService:
             "provider_activity": await provider_activity(self._activity_tracker),
             "proactive_memory": proactive_memory_metrics(),
             "provider_health": self._serialize_provider_health(),
+            "eval_staleness": await eval_staleness(self._db),
         }
 
     def _serialize_provider_health(self) -> dict:

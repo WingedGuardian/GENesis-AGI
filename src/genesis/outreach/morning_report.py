@@ -107,7 +107,15 @@ class MorningReportGenerator:
             logger.warning("Morning report: pending items unavailable", exc_info=True)
             await self._emit_warning("pending_items", "Pending items section unavailable")
 
-        # 5. Outreach summary (just total count, no self-analysis)
+        # 5. Follow-ups (user-actionable + blocked + recently completed)
+        try:
+            followups = await self._get_follow_ups_summary()
+            if followups:
+                sections.append(f"## Follow-ups\n{followups}")
+        except Exception:
+            logger.warning("Morning report: follow-ups unavailable", exc_info=True)
+
+        # 6. Outreach summary (just total count, no self-analysis)
         try:
             engagement = await self._get_engagement_summary()
             sections.append(f"## Outreach (7 days)\n{engagement}")
@@ -266,6 +274,45 @@ class MorningReportGenerator:
             f"- [{r[0]}] priority={r[2]}, from={r[1] or '?'}, created={r[4]}: {r[3][:200]}"
             for r in rows
         )
+
+    async def _get_follow_ups_summary(self) -> str | None:
+        """Return follow-ups needing user attention + recently completed."""
+        from genesis.db.crud import follow_ups
+
+        lines = []
+
+        # User-input-needed items
+        user_items = await follow_ups.get_pending(
+            self._db, strategy="user_input_needed",
+        )
+        if user_items:
+            lines.append("**Needs your input:**")
+            for fu in user_items[:5]:
+                lines.append(f"- {fu['content'][:200]}")
+
+        # Blocked/failed items
+        blocked = await follow_ups.get_by_status(self._db, "failed")
+        blocked += await follow_ups.get_by_status(self._db, "blocked")
+        if blocked:
+            lines.append("**Blocked/failed:**")
+            for fu in blocked[:5]:
+                reason = fu.get("blocked_reason", "") or "no reason recorded"
+                lines.append(f"- {fu['content'][:150]} — {reason[:100]}")
+
+        # Recently completed (last 24h)
+        cursor = await self._db.execute(
+            "SELECT content, resolution_notes FROM follow_ups "
+            "WHERE status = 'completed' "
+            "AND completed_at >= datetime('now', '-24 hours') "
+            "ORDER BY completed_at DESC LIMIT 5"
+        )
+        completed = await cursor.fetchall()
+        if completed:
+            lines.append("**Completed (24h):**")
+            for row in completed:
+                lines.append(f"- ✓ {row[0][:200]}")
+
+        return "\n".join(lines) if lines else None
 
     async def _get_critical_issues(self) -> str | None:
         """Return critical issues text ONLY if WARNING+ alerts are active.
