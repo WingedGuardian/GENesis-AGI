@@ -111,6 +111,7 @@
         operationalVitals: null,
         autonomousCliPolicy: null,
         cognitiveState: null,
+        essentialKnowledge: null,
         awarenessSignals: null,
         jobHealth: null,
         autonomyConfig: null,
@@ -207,13 +208,14 @@
         _routingInterval: null,
         _approvalsInterval: null,
         _cognitiveInterval: null,
+        _ekInterval: null,
         _awarenessInterval: null,
         _jobHealthInterval: null,
         _tasksInterval: null,
 
         // Tab management
         _TAB_INTERVALS: {
-          overview:  ["_cognitiveInterval", "_modulesInterval"],
+          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
           chat:      [],
           internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
@@ -253,8 +255,9 @@
           this._tabInitialized[tab] = true;
           switch (tab) {
             case "overview":
-              if (first) { this.fetchCognitive(); this.fetchModules(); this.fetchProvidersDetail(); }
+              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); }
               this._cognitiveInterval = setInterval(() => this.fetchCognitive(), 60000);
+              this._ekInterval = setInterval(() => this.fetchEssentialKnowledge(), 120000);
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
@@ -1133,6 +1136,17 @@
           } catch (e) {
             console.warn("Cognitive fetch failed:", e);
             this.failFetch("cognitive", "Cognitive state unavailable");
+          }
+        },
+
+        async fetchEssentialKnowledge() {
+          try {
+            const resp = await fetchApi("/api/genesis/essential-knowledge");
+            if (resp && resp.ok) {
+              this.essentialKnowledge = await resp.json();
+            }
+          } catch (e) {
+            console.warn("Essential knowledge fetch failed:", e);
           }
         },
 
@@ -3769,6 +3783,35 @@
               </div>
             </template>
           </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Essential Knowledge (Collapsible) [Tab: overview] -->
+    <div class="panel" x-data="{ ekOpen: false }" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor: pointer;" @click="ekOpen = !ekOpen">
+        <span class="material-symbols-outlined" :style="ekOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">auto_stories</span>
+        Essential Knowledge
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.essentialKnowledge?.updated_at">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => {
+                    const s = Math.round((Date.now() - new Date($store.genesisDashboard.essentialKnowledge.updated_at).getTime()) / 60000);
+                    if (s < 60) return s + 'm ago';
+                    if (s < 1440) return Math.round(s/60) + 'h ago';
+                    return Math.round(s/1440) + 'd ago';
+                  })()"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="ekOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.essentialKnowledge?.content">
+          <div class="empty-state" x-text="$store.genesisDashboard.essentialKnowledge?.error || 'Essential knowledge not loaded yet.'"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.essentialKnowledge?.content">
+          <div style="font-size: 0.76rem; white-space: pre-wrap; color: var(--color-text-secondary); max-height: 400px; overflow-y: auto;"
+               x-text="$store.genesisDashboard.essentialKnowledge.content"></div>
         </template>
       </div>
     </div>
