@@ -93,6 +93,20 @@ class FollowUpDispatcher:
         # Parse task type and tier from follow-up content/payload
         task_type, tier, payload = self._parse_follow_up_task(fu)
 
+        # Enforce per-type cap to prevent queue flooding (e.g. MODEL_EVAL max 10)
+        from genesis.surplus.types import TaskType
+
+        _TYPE_CAPS = {TaskType.MODEL_EVAL: 10}
+        cap = _TYPE_CAPS.get(task_type)
+        if cap is not None:
+            pending = await self._queue.pending_by_type(task_type)
+            if pending >= cap:
+                logger.info(
+                    "Skipping follow-up %s: %s queue already has %d pending (cap %d)",
+                    fu["id"][:8], task_type, pending, cap,
+                )
+                return None
+
         task_id = await self._queue.enqueue(
             task_type,
             tier,
@@ -111,12 +125,41 @@ class FollowUpDispatcher:
         """Determine surplus task type and tier from follow-up content.
 
         Returns (task_type, compute_tier, payload_dict).
+
+        First tries structured routing: if the follow-up's reason field contains
+        JSON with a ``task_type`` key, uses that directly (e.g. recon-originated
+        follow-ups). Falls back to keyword matching on content.
         """
         from genesis.surplus.types import ComputeTier, TaskType
 
+        _TIER_MAP = {
+            "free_api": ComputeTier.FREE_API,
+            "cheap_paid": ComputeTier.CHEAP_PAID,
+            "local_30b": ComputeTier.LOCAL_30B,
+        }
+        _TYPE_MAP = {t.value: t for t in TaskType}
+
+        # 1. Try structured payload in reason field
+        reason = fu.get("reason") or ""
+        if reason.startswith("{"):
+            try:
+                parsed = json.loads(reason)
+                if isinstance(parsed, dict) and "task_type" in parsed:
+                    task_type = _TYPE_MAP.get(parsed["task_type"])
+                    tier = _TIER_MAP.get(parsed.get("compute_tier", ""), ComputeTier.FREE_API)
+                    if task_type is not None:
+                        payload = parsed.get("payload", {})
+                        if "source" in payload:
+                            payload["original_source"] = payload["source"]
+                        payload["source"] = "follow_up"
+                        payload["follow_up_id"] = fu["id"]
+                        return task_type, tier, payload
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # 2. Fall back to keyword matching on content
         content = fu.get("content", "").lower()
 
-        # Try to detect task type from content keywords
         if "benchmark" in content or "eval" in content:
             return TaskType.MODEL_EVAL, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
         if "research" in content:
