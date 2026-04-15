@@ -46,6 +46,3 @@ async def recon_findings():
         results.append(finding)
 
     return jsonify(results)
-
-
-    # surplus_activity() moved to routes/surplus.py

@@ -56,6 +56,3 @@ async def outreach_engage(msg_id: str):
     )
     await rt.db.commit()
     return jsonify({"ok": True})
-
-
-    # surplus_detail() moved to routes/surplus.py

@@ -132,6 +132,8 @@ async def surplus_config():
 
     rt = GenesisRuntime.instance()
     db = rt.db if rt.is_bootstrapped else None
+    if db is not None:
+        db.row_factory = aiosqlite.Row
 
     # Config
     config = _load_yaml_merged("surplus.yaml")
@@ -150,7 +152,7 @@ async def surplus_config():
                 )
                 row = await cursor.fetchone()
                 if row:
-                    r = dict(row) if hasattr(row, "keys") else {"status": row[0], "created_at": row[1], "completed_at": row[2]}
+                    r = dict(row)
                     item["last_status"] = r.get("status")
                     item["last_run"] = r.get("completed_at") or r.get("created_at")
     except Exception:
@@ -175,7 +177,7 @@ async def surplus_config():
                 "SELECT status, COUNT(*) as cnt FROM surplus_tasks GROUP BY status"
             )
             for row in await cursor.fetchall():
-                r = dict(row) if hasattr(row, "keys") else {"status": row[0], "cnt": row[1]}
+                r = dict(row)
                 stats[r["status"]] = r["cnt"]
         except Exception:
             logger.warning("Failed to read surplus stats", exc_info=True)
@@ -197,6 +199,7 @@ async def update_surplus_config():
         _atomic_yaml_write,
         _load_yaml_local,
         _load_yaml_merged,
+        _local_filename,
         _validate_surplus,
     )
 
@@ -208,10 +211,10 @@ async def update_surplus_config():
     if errors:
         return jsonify({"error": "Validation failed", "details": errors}), 422
 
-    # Merge into local overlay
+    # Merge into local overlay — NEVER write to the base config
     local = _load_yaml_local("surplus.yaml")
     _deep_merge(local, data)
-    _atomic_yaml_write("surplus.yaml", local)
+    _atomic_yaml_write(_local_filename("surplus.yaml"), local)
 
     merged = _load_yaml_merged("surplus.yaml")
     return jsonify({"ok": True, "config": merged})
@@ -233,8 +236,12 @@ async def update_surplus_drives():
     if not updates:
         return jsonify({"error": "No drives provided"}), 400
 
+    valid_drives = {"competence", "cooperation", "curiosity", "preservation"}
     results = {}
     for drive_name, weight in updates.items():
+        if drive_name not in valid_drives:
+            results[drive_name] = {"ok": False, "error": f"Unknown drive: {drive_name}"}
+            continue
         try:
             weight = float(weight)
             await dw_crud.update_weight(rt.db, drive_name, weight)
@@ -246,10 +253,7 @@ async def update_surplus_drives():
 
 
 def _deep_merge(base: dict, overlay: dict) -> dict:
-    """Recursive merge — overlay wins for scalars, recurses for dicts."""
-    for k, v in overlay.items():
-        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
-            _deep_merge(base[k], v)
-        else:
-            base[k] = v
-    return base
+    """Recursive merge — delegates to settings module implementation."""
+    from genesis.mcp.health.settings import _deep_merge as _dm
+
+    return _dm(base, overlay)
