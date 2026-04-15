@@ -8,11 +8,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/LOC-72%2C000%2B-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/LOC-100%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/status-v3%20alpha-orange" alt="Status">
-  <a href="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml"><img src="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
+<a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
 
 ---
