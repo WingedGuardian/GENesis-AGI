@@ -8,11 +8,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/LOC-72%2C000%2B-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/LOC-100%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/status-v3%20alpha-orange" alt="Status">
-  <a href="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml"><img src="https://github.com/WingedGuardian/GENesis-AGI/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
+<a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
 
 ---
@@ -48,6 +47,17 @@ V3 is the foundation that makes this possible. What's already here is a full cog
 
 ---
 
+## Genesis in 30 seconds
+
+- **It remembers.** 4-layer memory (vector + keyword search + knowledge graph + relational) that compounds with every interaction. Day 180 is architecturally different from day 1.
+- **It learns.** A six-stage pipeline classifies outcomes, attributes causes, and extracts reusable procedures after every session — Laplace-smoothed confidence, not vibes.
+- **It runs on its own.** Background cognition, surplus compute research, email triage, proactive Telegram messages — keeps working when you're not there.
+- **It earns its autonomy.** Trust is granted per action category through demonstrated competence. Mess up twice, drop a level. Earn it back through performance.
+
+[**Get started →**](#getting-started)
+
+---
+
 ## What this is
 
 Genesis is a cognitive architecture that aspires to *earn* the title of "AGI." Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
@@ -63,6 +73,89 @@ Genesis serves as a layer that sits between Claude Code (as well as other AI mod
 </p>
 
 72,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Built to production by one person — which is exactly the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+
+---
+
+<a id="getting-started"></a>
+
+## Getting started
+
+**Alpha release — you're joining the build.** Genesis v3-alpha is architecturally complete but actively stabilizing. You will encounter experimental features, edge cases that need hardening, and subsystems that are 95% wired but need that last touch. This is by design — Genesis is being built in the open, and every person who installs it, hits a rough edge, and fixes it (or reports it) is making the system better. The good news: you can tell Genesis to diagnose and fix its own issues via Claude Code. If you're the kind of engineer who finds that exciting rather than frustrating, you're exactly who this project is for. If you want a polished turnkey experience, check back when we hit beta.
+
+### System requirements
+
+Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine.
+
+| Resource | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
+| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. |
+| **Disk** | 10 GB | 40 GB+ | Fresh install is ~400 MB. Qdrant data, logs, memory, and model caches grow steadily. Production uses 2-5 GB within weeks, more with active memory. |
+| **CPU** | 2 cores | 4-8 cores | Concurrent background tasks (awareness loop, reflection, outreach, triage) benefit from parallelism. |
+| **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
+
+These are the requirements for the **host VM** — the machine you run the installer on. Genesis itself runs inside a container that the installer creates with its own resource limits and security boundaries.
+
+### Before you start
+
+Two accounts to create before running the installer:
+
+| What you need | Why | Where |
+|---|---|---|
+| **Claude account** | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
+| **Tailscale** (free) | Remote dashboard access from any device — no port-forwarding | [tailscale.com](https://tailscale.com) |
+
+Create both accounts before running the installer. The installer walks you through connecting them.
+
+### Prerequisites
+
+The host VM needs `git` and `sudo`. That's it — the installer handles everything else, including Incus, the container, and all software inside it.
+
+```bash
+# Ubuntu/Debian
+sudo apt install git sudo
+```
+
+### Install
+
+One script sets up the entire infrastructure: creates an Incus container with resource limits (RAM, CPU, disk I/O), installs Genesis and all dependencies inside it, deploys the Guardian health monitor on the host, and configures bidirectional SSH between host and container.
+
+```bash
+git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis-setup
+cd ~/genesis-setup
+./scripts/host-setup.sh
+```
+
+The installer is interactive by default — it will prompt for API keys, timezone, and preferences. Use `--non-interactive` for scripted/CI deployments.
+
+**What you get after install:**
+
+| Component | Where | What it does |
+|---|---|---|
+| **Genesis container** | Incus container on host | Runs all Genesis services with resource limits and isolation |
+| **Genesis server** | Inside container, port 5000 | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
+| **Qdrant** | Inside container, port 6333 | Vector database for semantic memory |
+| **Guardian** | Host VM | Monitors container health every 30s, auto-recovers, alerts via Telegram |
+| **Claude Code** | Host VM + container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
+
+**After install, access the container:**
+
+```bash
+genesis   # shortcut alias the installer adds (runs incus exec with the right env)
+cd ~/genesis
+claude    # start your first session
+```
+
+### Optional components
+
+These add local embedding support (privacy, speed). Without them, Genesis uses cloud embedding APIs.
+
+| Component | What it does | Install |
+|---|---|---|
+| **[Ollama](https://ollama.com)** | Local embedding models on Windows/Linux/Mac. Can run on same machine or seperatly. | `curl -fsSL https://ollama.com/install.sh \| sh` |
+| **[LM Studio](https://lmstudio.ai)** | Local embedding models with a GUI (Windows/Mac/Linux). Can run on same machine or seperatly. | Download from [lmstudio.ai](https://lmstudio.ai) |
+
+The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
 ---
 
@@ -465,87 +558,6 @@ V5 requires months of V4 operational data. Every V5 feature is gated behind meas
   <br>
   <i>Data, probably, after hearing about Genesis.</i>
 </p>
-
----
-
-## Getting started
-
-**Alpha release — you're joining the build.** Genesis v3-alpha is architecturally complete but actively stabilizing. You will encounter experimental features, edge cases that need hardening, and subsystems that are 95% wired but need that last touch. This is by design — Genesis is being built in the open, and every person who installs it, hits a rough edge, and fixes it (or reports it) is making the system better. The good news: you can tell Genesis to diagnose and fix its own issues via Claude Code. If you're the kind of engineer who finds that exciting rather than frustrating, you're exactly who this project is for. If you want a polished turnkey experience, check back when we hit beta.
-
-### System requirements
-
-Genesis is a full system, not a pip package. It runs best on a dedicated Linux machine.
-
-| Resource | Minimum | Recommended | Notes |
-|---|---|---|---|
-| **OS** | Ubuntu 22.04+ | Ubuntu 24.04 LTS | Debian-based required for auto-install. Other Linux works with manual setup. |
-| **RAM** | 8 GB | 16 GB+ | Genesis + Qdrant + Claude Code + background tasks. 8 GB is tight under load. |
-| **Disk** | 10 GB | 40 GB+ | Fresh install is ~400 MB. Qdrant data, logs, memory, and model caches grow steadily. Production uses 2-5 GB within weeks, more with active memory. |
-| **CPU** | 2 cores | 4-8 cores | Concurrent background tasks (awareness loop, reflection, outreach, triage) benefit from parallelism. |
-| **Network** | Internet access | Always-on | Genesis calls cloud LLM APIs (Anthropic, etc). Offline operation is not supported. |
-
-These are the requirements for the **host VM** — the machine you run the installer on. Genesis itself runs inside a container that the installer creates with its own resource limits and security boundaries.
-
-### Before you start
-
-Two accounts to create before running the installer:
-
-| What you need | Why | Where |
-|---|---|---|
-| **Claude account** | Claude Code powers all reasoning and agentic sessions | [claude.ai](https://claude.ai) |
-| **Tailscale** (free) | Remote dashboard access from any device — no port-forwarding | [tailscale.com](https://tailscale.com) |
-
-Create both accounts before running the installer. The installer walks you through connecting them.
-
-### Prerequisites
-
-The host VM needs `git` and `sudo`. That's it — the installer handles everything else, including Incus, the container, and all software inside it.
-
-```bash
-# Ubuntu/Debian
-sudo apt install git sudo
-```
-
-### Install
-
-One script sets up the entire infrastructure: creates an Incus container with resource limits (RAM, CPU, disk I/O), installs Genesis and all dependencies inside it, deploys the Guardian health monitor on the host, and configures bidirectional SSH between host and container.
-
-```bash
-git clone https://github.com/WingedGuardian/GENesis-AGI.git ~/genesis-setup
-cd ~/genesis-setup
-./scripts/host-setup.sh
-```
-
-The installer is interactive by default — it will prompt for API keys, timezone, and preferences. Use `--non-interactive` for scripted/CI deployments.
-
-**What you get after install:**
-
-| Component | Where | What it does |
-|---|---|---|
-| **Genesis container** | Incus container on host | Runs all Genesis services with resource limits and isolation |
-| **Genesis server** | Inside container, port 5000 | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
-| **Qdrant** | Inside container, port 6333 | Vector database for semantic memory |
-| **Guardian** | Host VM | Monitors container health every 30s, auto-recovers, alerts via Telegram |
-| **Claude Code** | Host VM + container | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
-
-**After install, access the container:**
-
-```bash
-genesis   # shortcut alias the installer adds (runs incus exec with the right env)
-cd ~/genesis
-claude    # start your first session
-```
-
-### Optional components
-
-These add local embedding support (privacy, speed). Without them, Genesis uses cloud embedding APIs.
-
-| Component | What it does | Install |
-|---|---|---|
-| **[Ollama](https://ollama.com)** | Local embedding models on Windows/Linux/Mac. Can run on same machine or seperatly. | `curl -fsSL https://ollama.com/install.sh \| sh` |
-| **[LM Studio](https://lmstudio.ai)** | Local embedding models with a GUI (Windows/Mac/Linux). Can run on same machine or seperatly. | Download from [lmstudio.ai](https://lmstudio.ai) |
-
-The architecture docs in [`docs/architecture/`](docs/architecture/) cover the full design.
 
 ---
 
