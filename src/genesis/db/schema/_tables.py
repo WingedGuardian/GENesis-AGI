@@ -332,7 +332,8 @@ TABLES = {
             completed_at      TEXT,
             result_staging_id TEXT,
             failure_reason    TEXT,
-            attempt_count     INTEGER NOT NULL DEFAULT 0
+            attempt_count     INTEGER NOT NULL DEFAULT 0,
+            not_before        TEXT
         )
     """,
     "drive_weights": """
@@ -771,6 +772,31 @@ TABLES = {
             memory_class     TEXT DEFAULT 'fact'
         )
     """,
+    "follow_ups": """
+        CREATE TABLE IF NOT EXISTS follow_ups (
+            id               TEXT PRIMARY KEY,
+            source           TEXT NOT NULL,
+            source_session   TEXT,
+            content          TEXT NOT NULL,
+            reason           TEXT,
+            strategy         TEXT NOT NULL CHECK (
+                strategy IN ('scheduled_task', 'surplus_task', 'ego_judgment', 'user_input_needed')
+            ),
+            scheduled_at     TEXT,
+            status           TEXT NOT NULL DEFAULT 'pending' CHECK (
+                status IN ('pending', 'scheduled', 'in_progress', 'completed', 'failed', 'blocked')
+            ),
+            linked_task_id   TEXT,
+            priority         TEXT NOT NULL DEFAULT 'medium' CHECK (
+                priority IN ('low', 'medium', 'high', 'critical')
+            ),
+            created_at       TEXT NOT NULL,
+            completed_at     TEXT,
+            resolution_notes TEXT,
+            blocked_reason   TEXT,
+            escalated_to     TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -931,6 +957,11 @@ INDEXES = [
     # memory metadata (companion to FTS5)
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_created ON memory_metadata(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_collection ON memory_metadata(collection)",
+    # follow-ups (accountability ledger)
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_status ON follow_ups(status)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_scheduled ON follow_ups(scheduled_at)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_source ON follow_ups(source)",
+    "CREATE INDEX IF NOT EXISTS idx_follow_ups_linked_task ON follow_ups(linked_task_id)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

@@ -76,6 +76,7 @@ class SurplusScheduler:
         self._recon_gatherer: ReconGatherer | None = None
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
+        self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
         self._scheduler = AsyncIOScheduler()
 
     def set_executor(self, executor) -> None:
@@ -127,6 +128,22 @@ class SurplusScheduler:
         self._extraction_store = store
         self._extraction_router = router
 
+    def set_follow_up_dispatcher(self, dispatcher) -> None:
+        """Set the follow-up dispatcher for accountability tracking.
+
+        Registers the dispatch job if the scheduler is already running.
+        """
+        self._follow_up_dispatcher = dispatcher
+        # Register the job if the scheduler is already running (late wiring)
+        if self._scheduler.running and not self._scheduler.get_job("follow_up_dispatch"):
+            self._scheduler.add_job(
+                self.dispatch_follow_ups,
+                IntervalTrigger(minutes=self._dispatch_interval),
+                id="follow_up_dispatch",
+                max_instances=1,
+                misfire_grace_time=60,
+            )
+
     async def start(self) -> None:
         """Start the surplus scheduler with brainstorm check and dispatch jobs."""
         self._scheduler.add_job(
@@ -175,6 +192,14 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        if self._follow_up_dispatcher is not None:
+            self._scheduler.add_job(
+                self.dispatch_follow_ups,
+                IntervalTrigger(minutes=self._dispatch_interval),
+                id="follow_up_dispatch",
+                max_instances=1,
+                misfire_grace_time=60,
+            )
         self._scheduler.start()
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
@@ -302,6 +327,37 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_maintenance", str(exc))
+            except Exception:
+                pass
+
+    async def dispatch_follow_ups(self) -> None:
+        """Run the follow-up dispatcher cycle (always-on, not idle-gated)."""
+        if self._follow_up_dispatcher is None:
+            return
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Follow-up dispatch skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
+        try:
+            summary = await self._follow_up_dispatcher.run_cycle()
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("follow_up_dispatch")
+            except Exception:
+                pass
+            if summary.get("failures_detected", 0) > 0:
+                logger.warning(
+                    "Follow-up dispatch detected %d failure(s)",
+                    summary["failures_detected"],
+                )
+        except Exception as exc:
+            logger.exception("Follow-up dispatch failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("follow_up_dispatch", str(exc))
             except Exception:
                 pass
 

@@ -82,6 +82,16 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Most recent N runs per provider/dataset (default: 1)",
     )
 
+    # -- eval export --
+    export_cmd = eval_sub.add_parser(
+        "export",
+        help="Export benchmark results as markdown",
+    )
+    export_cmd.add_argument(
+        "-o", "--output",
+        help="Write to file instead of stdout",
+    )
+
     # -- eval datasets --
     eval_sub.add_parser("datasets", help="List available eval datasets")
 
@@ -116,10 +126,12 @@ def _run_eval_cli(args: argparse.Namespace) -> int:
         return asyncio.run(_cmd_results(args))
     elif args.eval_command == "compare":
         return asyncio.run(_cmd_compare(args))
+    elif args.eval_command == "export":
+        return asyncio.run(_cmd_export(args))
     elif args.eval_command == "datasets":
         return _cmd_datasets()
     else:
-        print("usage: genesis eval {run|benchmark|results|compare|datasets}", file=sys.stderr)
+        print("usage: genesis eval {run|benchmark|results|compare|export|datasets}", file=sys.stderr)
         return 1
 
 
@@ -331,6 +343,143 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
     providers = sorted(providers_seen)
     _print_benchmark_table(providers, datasets, results)
     return 0
+
+
+async def _cmd_export(args: argparse.Namespace) -> int:
+    """Export benchmark results as a markdown document."""
+    try:
+        import aiosqlite  # noqa: I001
+
+        from genesis.env import genesis_db_path
+        from genesis.eval.db import get_runs
+        from genesis.routing.config import load_config
+
+        config_path = __import__("pathlib").Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+        config = load_config(config_path)
+
+        datasets = list_datasets()
+        results: dict[str, dict[str, tuple[int, int, int]]] = {}
+        provider_notes: dict[str, str] = {}
+
+        async with aiosqlite.connect(str(genesis_db_path())) as db:
+            for ds_name in datasets:
+                runs = await get_runs(db, dataset=ds_name, limit=500)
+                seen: set[str] = set()
+                for run in runs:
+                    model_id = run.get("model_id", "")
+                    if model_id in seen:
+                        continue
+                    seen.add(model_id)
+                    if model_id not in results:
+                        results[model_id] = {}
+                    passed = run.get("passed_cases", 0)
+                    failed = run.get("failed_cases", 0)
+                    skipped = run.get("skipped_cases", 0)
+                    results[model_id][ds_name] = (passed, passed + failed, skipped)
+
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+
+    if not results:
+        print("no eval runs found in DB. Run `genesis eval benchmark` first.", file=sys.stderr)
+        return 1
+
+    # Determine free/paid status from config
+    for provider_name in results:
+        cfg = config.providers.get(provider_name)
+        if cfg:
+            provider_notes[provider_name] = "free" if cfg.is_free else "paid"
+
+    md = _generate_export_markdown(datasets, results, provider_notes)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(md)
+        print(f"exported to {args.output}")
+    else:
+        print(md)
+
+    return 0
+
+
+def _generate_export_markdown(
+    datasets: list[str],
+    results: dict[str, dict[str, tuple[int, int, int]]],
+    provider_notes: dict[str, str],
+) -> str:
+    """Generate benchmark results markdown from DB data."""
+    from datetime import UTC, datetime
+
+    lines = []
+    lines.append("# Model Benchmark Results\n")
+    lines.append(f"Last updated: {datetime.now(UTC).strftime('%Y-%m-%d')}\n")
+    lines.append(
+        "Benchmark methodology: 3 datasets (classification, extraction, structured_output)"
+    )
+    lines.append(
+        "with 37 total cases. Scores are `passed/attempted` — skipped cases (rate limits,"
+    )
+    lines.append(
+        "API errors) excluded from the denominator. All runs use the eval harness in"
+    )
+    lines.append("`src/genesis/eval/` with binary pass/fail scorers (no LLM-as-judge).\n")
+    lines.append("## Current Results\n")
+    lines.append("Best run per provider. Providers marked (free) cost $0; others are paid.\n")
+
+    # Build table header
+    header = "| Provider |"
+    sep = "|---|"
+    for ds in datasets:
+        header += f" {ds.replace('_', ' ').title()} |"
+        sep += "---|"
+    header += " AVG | Notes |"
+    sep += "---|---|"
+    lines.append(header)
+    lines.append(sep)
+
+    # Compute averages and sort
+    provider_avgs: list[tuple[str, float]] = []
+    for provider in results:
+        pcts = []
+        for ds in datasets:
+            passed, attempted, _sk = results[provider].get(ds, (0, 0, 0))
+            if attempted > 0:
+                pcts.append(passed / attempted * 100)
+        avg = sum(pcts) / len(pcts) if pcts else 0
+        provider_avgs.append((provider, avg))
+
+    provider_avgs.sort(key=lambda x: -x[1])
+
+    for provider, avg in provider_avgs:
+        row = f"| {provider} |"
+        for ds in datasets:
+            passed, attempted, skipped = results[provider].get(ds, (0, 0, 0))
+            if attempted == 0 and skipped == 0:
+                row += " n/a |"
+            elif attempted == 0:
+                row += f" -/{skipped}sk |"
+            else:
+                pct = passed / attempted * 100
+                cell = f"{passed}/{attempted} ({pct:.0f}%)"
+                if skipped:
+                    cell += f" +{skipped}sk"
+                row += f" {cell} |"
+        note = provider_notes.get(provider, "")
+        row += f" **{avg:.0f}%** | {note.title()} |"
+        lines.append(row)
+
+    lines.append("")
+    lines.append("## Scoring Methodology\n")
+    lines.append("- **Fair denominator**: `passed / (passed + failed)`. Skipped cases excluded.")
+    lines.append("- **Binary scoring**: Pass or fail, no partial credit.")
+    lines.append("- **Rate-aware**: Each provider throttled to its `rpm_limit`.")
+    lines.append("- **Retry**: 2 retries with exponential backoff on transient errors.\n")
+    lines.append("## Run History\n")
+    lines.append("Stored in `eval_runs` and `eval_results` tables in `genesis.db`.")
+    lines.append("Query with `genesis eval results` or `genesis eval compare`.\n")
+
+    return "\n".join(lines)
 
 
 def _cmd_datasets() -> int:
