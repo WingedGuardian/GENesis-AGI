@@ -82,7 +82,7 @@ providers:
     model: qwen/qwen3-coder:free
     profile: qwen3-coder
     free: true
-    rpm_limit: 20
+    rpm_limit: 8  # Actual OpenRouter limit (high-demand Venice backend)
     open_duration_s: 120
   openrouter-deepseek-r1:
     type: openrouter
