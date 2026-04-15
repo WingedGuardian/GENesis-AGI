@@ -169,6 +169,32 @@ class StandaloneHealthDataService:
         except Exception:
             logger.warning("Infrastructure snapshot failed in standalone mode", exc_info=True)
 
+        # Awareness — tick counts, depth distribution, scoring
+        try:
+            from genesis.observability.snapshots.awareness import (
+                awareness as awareness_snap,
+            )
+
+            result["awareness"] = await awareness_snap(self._db)
+        except Exception:
+            logger.warning("Awareness snapshot failed in standalone mode", exc_info=True)
+
+        # Surplus — queue depth, recent tasks, executor status
+        try:
+            from genesis.observability.snapshots.surplus import surplus_status
+
+            result["surplus"] = await surplus_status(self._db, None)
+        except Exception:
+            logger.warning("Surplus snapshot failed in standalone mode", exc_info=True)
+
+        # Outreach — message counts, delivery stats
+        try:
+            from genesis.observability.snapshots.outreach import outreach_stats
+
+            result["outreach_stats"] = await outreach_stats(self._db)
+        except Exception:
+            logger.warning("Outreach snapshot failed in standalone mode", exc_info=True)
+
 
 _MCP_CRASH_DIR = Path.home() / ".genesis" / "mcp_crashes"
 _EXPECTED_SERVERS = ("health", "memory", "outreach", "recon")

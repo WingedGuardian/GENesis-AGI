@@ -66,7 +66,7 @@ Known failure mode inventory (from real incidents):
 | Mode | Signals | Root cause | Recovery |
 |------|---------|------------|----------|
 | OOM kill | Container running, services dead, journal "Killed process" | Memory exhaustion | RESTART_SERVICES or RESTART_CONTAINER |
-| /tmp full | Services degraded, /tmp >95% | tmpfs overflow (512MB limit) | RESOURCE_CLEAR |
+| /tmp full | Services degraded, /tmp >95% | Temp dir overflow (CC uses ~/.genesis/cc-tmp via TMPDIR, watchgod protects both zones) | RESOURCE_CLEAR |
 | Bridge crash loop | Health API down, NRestarts high | Code bug or dependency | RESTART_SERVICES, then REVERT_CODE |
 | Bad deploy | Failure correlates with recent git commit | Code regression | REVERT_CODE |
 | Container freeze | Ping OK, all APIs timeout, D-state processes | I/O deadlock | RESTART_CONTAINER |
