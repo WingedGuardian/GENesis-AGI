@@ -602,7 +602,7 @@ if [ -z "$_detected_tz" ]; then
     _detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
 fi
 
-if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ] && [ -e /dev/tty ]; then
+if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ] && (exec </dev/tty) 2>/dev/null; then
     echo ""
     echo "  Detected timezone: $_detected_tz"
     read -r -p "  Is this correct? [Y/n] " _tz_confirm </dev/tty
