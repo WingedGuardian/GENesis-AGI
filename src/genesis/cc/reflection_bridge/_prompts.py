@@ -218,10 +218,14 @@ async def build_strategic_prompt_enriched(
         _format_signal(s) for s in tick.signals[:10]
     ) if tick.signals else "none"
 
+    from genesis.env import user_timezone
+    tz_name = user_timezone()
+
     parts = [
         "Perform a Strategic reflection.\n",
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
+        f"User timezone: {tz_name}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}",
         f"Signals: {signals_summary}\n",
         f"## Current Cognitive State\n\n{cog_state}\n",
@@ -263,10 +267,14 @@ async def build_enriched_prompt(
     """
     bundle = await context_gatherer.gather(db)
 
+    from genesis.env import user_timezone
+    tz_name = user_timezone()
+
     parts = [
         "Perform a Deep reflection.\n",
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
+        f"User timezone: {tz_name}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}",
     ]
 
