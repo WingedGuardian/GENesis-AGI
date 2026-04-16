@@ -194,9 +194,11 @@ async def run_eval(
             # 429/503: rate limit / service unavailable (retried above, now exhausted)
             # 404: endpoint not found — model ID wrong or provider dropped it
             # 400: bad request — usually wrong model ID from our side, not model quality
+            # 401/403: auth failure — credentials missing/invalid/revoked, not quality
+            # 402: payment required — quota/billing, not quality
             is_transient = (
                 call_result.retry_after_s is not None
-                or call_result.status_code in (400, 404, 429, 503)
+                or call_result.status_code in (400, 401, 402, 403, 404, 429, 503)
             )
             if is_transient:
                 logger.warning(
