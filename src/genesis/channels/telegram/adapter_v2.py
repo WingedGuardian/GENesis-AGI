@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from typing import TYPE_CHECKING
 
 from telegram import Update
@@ -76,7 +77,13 @@ class TelegramAdapterV2(ChannelAdapter):
         self._typing_breaker = TypingCircuitBreaker()
         self._watchdog: PollingWatchdog | None = None
         self._chat_locks: dict[str, asyncio.Lock] = {}
-        self._last_offset_write: float = 0.0
+        # None = never persisted; first call must persist regardless of uptime.
+        # Using 0.0 here would silently suppress the first persist on fresh
+        # processes because time.monotonic() is system-wide: if system uptime
+        # is under _OFFSET_PERSIST_INTERVAL_S, (now - 0.0) < interval holds and
+        # the debounce check would block the first write. Same bug class as
+        # the litellm_delegate._should_log_failure fix (commit cf71db2).
+        self._last_offset_write: float | None = None
 
         if tts_provider:
             from genesis.channels.voice import VoiceDeliveryHelper
@@ -100,12 +107,14 @@ class TelegramAdapterV2(ChannelAdapter):
         Debounced to avoid blocking I/O on every update. Called with
         force=True on stop() to ensure the final offset is persisted.
         """
-        import time
-
         if not self._app or not self._app.updater:
             return
         now = time.monotonic()
-        if not force and (now - self._last_offset_write) < self._OFFSET_PERSIST_INTERVAL_S:
+        if (
+            not force
+            and self._last_offset_write is not None
+            and (now - self._last_offset_write) < self._OFFSET_PERSIST_INTERVAL_S
+        ):
             return
         offset = getattr(self._app.updater, "_last_update_id", 0)
         if offset > 0:
