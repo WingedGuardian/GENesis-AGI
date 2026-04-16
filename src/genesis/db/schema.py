@@ -767,41 +767,6 @@ TABLES = {
             embedding_status TEXT NOT NULL DEFAULT 'embedded'
         )
     """,
-    "automaton_instances": """
-        CREATE TABLE IF NOT EXISTS automaton_instances (
-            id                   TEXT PRIMARY KEY,
-            sandbox_id           TEXT NOT NULL,
-            name                 TEXT NOT NULL,
-            wallet_address       TEXT,
-            genesis_prompt       TEXT,
-            status               TEXT NOT NULL DEFAULT 'provisioning',
-            survival_tier        TEXT NOT NULL DEFAULT 'normal',
-            created_at           TEXT NOT NULL DEFAULT (datetime('now')),
-            last_probe           TEXT,
-            total_earnings_cents INTEGER NOT NULL DEFAULT 0,
-            total_spent_cents    INTEGER NOT NULL DEFAULT 0,
-            total_turns          INTEGER NOT NULL DEFAULT 0
-        )
-    """,
-    "automaton_probes": """
-        CREATE TABLE IF NOT EXISTS automaton_probes (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            instance_id   TEXT NOT NULL REFERENCES automaton_instances(id),
-            probe_type    TEXT NOT NULL,
-            result        TEXT NOT NULL,
-            value_numeric REAL,
-            timestamp     TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
-    "automaton_events": """
-        CREATE TABLE IF NOT EXISTS automaton_events (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            instance_id   TEXT NOT NULL REFERENCES automaton_instances(id),
-            event_type    TEXT NOT NULL,
-            details       TEXT,
-            timestamp     TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
