@@ -187,11 +187,13 @@ def _trigger_essential_knowledge_regen() -> None:
     import subprocess
 
     script = (
-        "import sys; sys.path.insert(0, '/home/ubuntu/genesis/src'); "
+        "import sys; "
+        "from pathlib import Path; "
+        "sys.path.insert(0, str(Path.home() / 'genesis' / 'src')); "
         "import asyncio; import aiosqlite; "
         "from genesis.memory.essential_knowledge import generate_and_write; "
         "async def _run(): "
-        "  db = await aiosqlite.connect(str(__import__('pathlib').Path.home() / 'genesis/data/genesis.db')); "
+        "  db = await aiosqlite.connect(str(Path.home() / 'genesis/data/genesis.db')); "
         "  await generate_and_write(db); "
         "  await db.close(); "
         "asyncio.run(_run())"
