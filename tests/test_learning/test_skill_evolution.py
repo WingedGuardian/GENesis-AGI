@@ -418,6 +418,12 @@ class TestApplicator:
 
         applicator = SkillApplicator(autonomy_level=2)
 
+        # Mock validator to pass (this test is about applicator logic, not validation)
+        from genesis.learning.skills.types import ValidationResult
+        applicator._validator.validate = lambda *a, **kw: ValidationResult(
+            passed=True, test_results={}, blocking_failures=[], warnings=[],
+        )
+
         # Patch get_skill_path to use tmp_path
         import genesis.learning.skills.wiring as wiring_mod
         original = wiring_mod.get_skill_path
@@ -446,6 +452,12 @@ class TestApplicator:
 
         applicator = SkillApplicator(autonomy_level=2)
 
+        # Mock validator to pass so we test the path-not-found logic
+        from genesis.learning.skills.types import ValidationResult
+        applicator._validator.validate = lambda *a, **kw: ValidationResult(
+            passed=True, test_results={}, blocking_failures=[], warnings=[],
+        )
+
         import genesis.learning.skills.wiring as wiring_mod
         original = wiring_mod.get_skill_path
         wiring_mod.get_skill_path = lambda _: None
@@ -469,7 +481,7 @@ class TestApplicator:
         result = await applicator.apply(proposal, db)
 
         assert result["action"] == "staged"
-        assert result["validated"] is True  # no router, so validated defaults True
+        assert result["validated"] is False  # no router means unvalidated
 
     @pytest.mark.asyncio
     async def test_apply_moderate_with_router_validation(self, db):
@@ -538,7 +550,7 @@ class TestApplicator:
             skill_name="x", proposed_content="c",
             rationale="r", change_size=ChangeSize.MODERATE,
         )
-        assert await applicator.validate(proposal, router=router) is True
+        assert await applicator._llm_validate(proposal, router=router) is True
 
     @pytest.mark.asyncio
     async def test_validate_rejected(self):
@@ -552,7 +564,7 @@ class TestApplicator:
             skill_name="x", proposed_content="c",
             rationale="r", change_size=ChangeSize.MODERATE,
         )
-        assert await applicator.validate(proposal, router=router) is False
+        assert await applicator._llm_validate(proposal, router=router) is False
 
     @pytest.mark.asyncio
     async def test_validate_error_returns_false(self):
@@ -564,7 +576,7 @@ class TestApplicator:
             skill_name="x", proposed_content="c",
             rationale="r", change_size=ChangeSize.MODERATE,
         )
-        assert await applicator.validate(proposal, router=router) is False
+        assert await applicator._llm_validate(proposal, router=router) is False
 
 
 # ---------------------------------------------------------------------------
