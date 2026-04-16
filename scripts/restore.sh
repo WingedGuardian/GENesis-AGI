@@ -144,7 +144,7 @@ _has_encrypted=false
 for candidate in "$BACKUP_DIR"/data/genesis.sql.gpg "$BACKUP_DIR"/secrets/secrets.env.gpg; do
     [ -f "$candidate" ] && _has_encrypted=true
 done
-if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
+if find "$BACKUP_DIR"/transcripts "$BACKUP_DIR"/memory "$BACKUP_DIR"/data/qdrant -name '*.gpg' -print -quit 2>/dev/null | grep -q .; then
     _has_encrypted=true
 fi
 if $_has_encrypted && [ -z "$_BACKUP_PASSPHRASE" ]; then
@@ -207,8 +207,26 @@ if [ -d "$BACKUP_DIR/data/qdrant" ]; then
     if ! curl -sf "$QDRANT_URL/" >/dev/null; then
         warn "Qdrant at $QDRANT_URL not reachable — skipping collection restore"
     else
+        # Build a dedup'd collection → source map. When both .snapshot and
+        # .snapshot.gpg exist for the same collection, prefer the encrypted
+        # form (the plaintext is stale from a pre-encryption backup).
+        declare -A _SNAPSHOTS
         while IFS= read -r -d '' snap; do
-            coll=$(basename "$snap" .snapshot)
+            name=$(basename "$snap")
+            case "$name" in
+                *.snapshot.gpg) coll="${name%.snapshot.gpg}" ;;
+                *.snapshot)     coll="${name%.snapshot}" ;;
+                *) continue ;;
+            esac
+            existing="${_SNAPSHOTS[$coll]:-}"
+            if [ -z "$existing" ] || [[ "$snap" == *.gpg ]]; then
+                _SNAPSHOTS[$coll]="$snap"
+            fi
+        done < <(find "$BACKUP_DIR/data/qdrant" -maxdepth 1 \
+            \( -name '*.snapshot' -o -name '*.snapshot.gpg' \) -print0 2>/dev/null)
+
+        for coll in "${!_SNAPSHOTS[@]}"; do
+            snap="${_SNAPSHOTS[$coll]}"
             # If the collection already exists with points, don't clobber.
             existing_count=$(curl -sf "$QDRANT_URL/collections/$coll" 2>/dev/null \
                 | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('result',{}).get('points_count',0))" 2>/dev/null \
@@ -226,12 +244,33 @@ if [ -d "$BACKUP_DIR/data/qdrant" ]; then
                 log "Qdrant: '$coll' skipped (user declined)"
                 continue
             fi
+
+            # Decrypt to tempfile if encrypted — curl -F needs a real fs path.
+            upload_src="$snap"
+            _QDRANT_TMP=""
+            if [[ "$snap" == *.gpg ]]; then
+                if [ -z "$_BACKUP_PASSPHRASE" ]; then
+                    warn "Qdrant: '$coll' is encrypted but GENESIS_BACKUP_PASSPHRASE unset — skipping"
+                    continue
+                fi
+                _QDRANT_TMP=$(mktemp --suffix=.snapshot)
+                if ! decrypt_file "$snap" "$_QDRANT_TMP"; then
+                    warn "Qdrant: decrypt failed for '$coll'"
+                    rm -f "$_QDRANT_TMP"
+                    continue
+                fi
+                upload_src="$_QDRANT_TMP"
+            fi
+
             log "Qdrant: uploading '$coll' snapshot..."
             resp=$(curl -sf -X POST "$QDRANT_URL/collections/$coll/snapshots/upload?priority=snapshot" \
-                -F "snapshot=@$snap" 2>/dev/null) || {
+                -F "snapshot=@$upload_src" 2>/dev/null) || {
                 warn "Qdrant: upload failed for '$coll'"
+                [ -n "$_QDRANT_TMP" ] && rm -f "$_QDRANT_TMP"
                 continue
             }
+            [ -n "$_QDRANT_TMP" ] && rm -f "$_QDRANT_TMP"
+
             ok=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('result',False))" 2>/dev/null || echo false)
             if [ "$ok" = "True" ]; then
                 _QDRANT_RESTORED=$(( _QDRANT_RESTORED + 1 ))
@@ -241,7 +280,7 @@ if [ -d "$BACKUP_DIR/data/qdrant" ]; then
             else
                 warn "Qdrant: upload returned non-ok for '$coll': $resp"
             fi
-        done < <(find "$BACKUP_DIR/data/qdrant" -maxdepth 1 -name '*.snapshot' -print0 2>/dev/null)
+        done
     fi
 else
     log "Qdrant: no snapshots in backup"

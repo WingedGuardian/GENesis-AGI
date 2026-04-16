@@ -8,6 +8,9 @@
 #
 # Restore via scripts/restore.sh or `python -m genesis restore`.
 #
+# To scrub pre-encryption plaintext payloads from the backup repo's git
+# history, run scripts/migrate-backup-history.sh (one-shot, user-invoked).
+#
 # Environment variables (all optional unless noted):
 #   GENESIS_BACKUP_REPO        — Git URL for backup repo (auto-detected from existing clone)
 #   GENESIS_BACKUP_PASSPHRASE  — GPG passphrase (REQUIRED for secrets + encrypted payloads)
@@ -129,9 +132,13 @@ else
     log "WARNING: genesis.db not found at $DB_FILE"
 fi
 
-# --- 2. Qdrant snapshots ---
+# --- 2. Qdrant snapshots (encrypted — snapshots contain embedding vectors
+#       and payloads derived from memory/DB content) ---
 log "Backing up Qdrant collections..."
 mkdir -p data/qdrant
+# Purge any pre-encryption plaintext snapshots so they don't persist
+# alongside the new encrypted form.
+find data/qdrant -maxdepth 1 -name '*.snapshot' -type f -delete 2>/dev/null || true
 for collection in episodic_memory knowledge_base; do
     # Create snapshot via Qdrant API
     snapshot_resp=$(curl -sf -X POST "$QDRANT_URL/collections/$collection/snapshots" 2>/dev/null) || {
@@ -148,8 +155,20 @@ for collection in episodic_memory knowledge_base; do
         log "WARNING: Could not download snapshot for $collection"
         continue
     }
-    _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
-    log "Qdrant: $collection snapshot saved ($(du -sh "data/qdrant/${collection}.snapshot" | cut -f1))"
+
+    # Encrypt. Refuse plaintext if no passphrase — Qdrant snapshots are
+    # not opaque enough to ship plaintext to the backup repo.
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping Qdrant snapshot for $collection (refusing plaintext)"
+        rm -f "data/qdrant/${collection}.snapshot"
+    elif encrypt_file "data/qdrant/${collection}.snapshot" "data/qdrant/${collection}.snapshot.gpg"; then
+        rm -f "data/qdrant/${collection}.snapshot"
+        _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
+        log "Qdrant: $collection ($(du -sh "data/qdrant/${collection}.snapshot.gpg" | cut -f1), encrypted)"
+    else
+        log "WARNING: Qdrant encryption failed for $collection"
+        rm -f "data/qdrant/${collection}.snapshot"
+    fi
 
     # Clean up snapshot from Qdrant server
     curl -sf -X DELETE "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" >/dev/null 2>&1 || true
