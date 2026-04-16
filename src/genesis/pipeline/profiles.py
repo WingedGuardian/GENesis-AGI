@@ -13,6 +13,9 @@ from genesis.pipeline.types import Tier
 
 logger = logging.getLogger(__name__)
 
+# Local overlay: user-specific profiles live here, not in the repo.
+_LOCAL_PROFILES_DIR = Path.home() / ".genesis" / "config" / "research-profiles"
+
 
 @dataclass
 class SourceConfig:
@@ -106,6 +109,40 @@ class ProfileLoader:
             notify_on_tier=notify_tier,
             store_config=data.get("store_config", {}),
         )
+
+    def merge_overlay(
+        self,
+        overlay_dir: Path | str | None = None,
+    ) -> dict[str, ResearchProfile]:
+        """Merge profiles from an overlay directory into the loaded set.
+
+        Local profiles take precedence over repo profiles on name collision.
+        overlay_dir defaults to ~/.genesis/config/research-profiles/.
+        Call after load_all() to include user-specific profiles not in the repo.
+        """
+        path = Path(overlay_dir) if overlay_dir is not None else _LOCAL_PROFILES_DIR
+        if not path.is_dir():
+            return self._profiles
+        for yaml_path in sorted(path.glob("*.yaml")):
+            try:
+                profile = self.load_profile(yaml_path)
+                if profile.name in self._profiles:
+                    logger.debug("Local profile overrides repo: %s", profile.name)
+                self._profiles[profile.name] = profile
+            except Exception:
+                logger.warning("Failed to load overlay profile from %s", yaml_path, exc_info=True)
+        for yml_path in sorted(path.glob("*.yml")):
+            if yml_path.with_suffix(".yaml").exists():
+                continue  # skip if .yaml variant already loaded
+            try:
+                profile = self.load_profile(yml_path)
+                if profile.name in self._profiles:
+                    logger.debug("Local profile overrides repo: %s", profile.name)
+                self._profiles[profile.name] = profile
+            except Exception:
+                logger.warning("Failed to load overlay profile from %s", yml_path, exc_info=True)
+        logger.debug("After overlay: %d profiles total", len(self._profiles))
+        return self._profiles
 
     def get(self, name: str) -> ResearchProfile | None:
         return self._profiles.get(name)

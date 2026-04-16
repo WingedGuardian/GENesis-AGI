@@ -11,8 +11,8 @@ observation_write:
   shadow_mode: true
 
 memory_upsertion:
-  min_confidence: 0.2
-  shadow_mode: true
+  min_confidence: 0.4
+  shadow_mode: false
 
 deep_reflection:
   min_confidence: 0.3

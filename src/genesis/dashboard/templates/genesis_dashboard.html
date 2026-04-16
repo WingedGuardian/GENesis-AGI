@@ -153,9 +153,11 @@
 
         // ── Update state ─────────────────────────────────────────
         updateStatus: null,
+        updateProgress: null,
         _updating: false,
         _updateReconnecting: false,
         _checkingForUpdates: false,
+        _resolvingConflicts: false,
 
         // ── Settings hub state ────────────────────────────────────
         settingsDomains: null,
@@ -285,7 +287,7 @@
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
               break;
             case "backup":
-              if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); }
+              if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
               break;
           }
         },
@@ -686,15 +688,33 @@
           try {
             const resp = await fetchApi("/api/genesis/updates/check", { method: "POST" });
             if (resp && resp.ok) {
-              await this.fetchUpdateStatus();
+              const check = await resp.json();
+              // Merge check result into updateStatus directly
+              if (!this.updateStatus) await this.fetchUpdateStatus();
+              if (check.commits_behind > 0) {
+                this.updateStatus.update_available = {
+                  commits_behind: check.commits_behind,
+                  target_tag: check.target_tag,
+                  summary: check.summary,
+                  detected_at: new Date().toISOString(),
+                };
+              } else {
+                this.updateStatus.update_available = null;
+              }
             } else {
               alert("Check failed — could not reach upstream");
             }
           } catch (e) { alert("Check failed: " + e.message); }
           this._checkingForUpdates = false;
         },
+        async fetchUpdateProgress() {
+          try {
+            const resp = await fetchApi("/api/genesis/updates/progress");
+            if (resp && resp.ok) { this.updateProgress = await resp.json(); }
+          } catch (e) { /* server may be down during update */ }
+        },
         async applyUpdate() {
-          const msg = "Apply Genesis update?\n\nA background session will:\n• Back up data\n• Pull latest code\n• Run migrations\n• Restart services\n• Verify health\n\nThe dashboard will be briefly unavailable (~30-60s).\nContinue?";
+          const msg = "Apply Genesis update?\n\nA background session will:\n• Back up data\n• Merge latest code\n• Resolve trivial conflicts automatically\n• Run migrations & restart services\n• Verify health\n\nThe dashboard will be briefly unavailable (~30-60s).\nContinue?";
           if (!confirm(msg)) return;
           this._updating = true;
           try {
@@ -704,13 +724,33 @@
               body: JSON.stringify({ supervised: true }),
             });
           } catch (e) { /* expected — server may die before response */ }
-          // Enter reconnect loop
+          // Poll progress + health
           this._updateReconnecting = true;
           const start = Date.now();
           const poll = setInterval(async () => {
             try {
+              await this.fetchUpdateProgress();
+              const prog = this.updateProgress;
+              // If progress shows conflicts needing Opus, stop polling and show resolve UI
+              if (prog && prog.escalation && prog.escalation.includes("tier3_needed")) {
+                clearInterval(poll);
+                this._updating = false;
+                this._updateReconnecting = false;
+                await this.fetchUpdateStatus();
+                return;
+              }
+              // If progress shows completion (not in progress, has summary)
+              if (prog && !prog.in_progress && prog.summary && prog.summary.startsWith("success")) {
+                clearInterval(poll);
+                this._updating = false;
+                this._updateReconnecting = false;
+                await this.fetchUpdateStatus();
+                await this.fetchHealth();
+                return;
+              }
+              // Fallback: check health endpoint
               const resp = await fetchApi("/api/genesis/health");
-              if (resp && resp.ok) {
+              if (resp && resp.ok && prog && !prog.in_progress) {
                 clearInterval(poll);
                 this._updating = false;
                 this._updateReconnecting = false;
@@ -718,14 +758,41 @@
                 await this.fetchHealth();
               }
             } catch (e) { /* still down, keep polling */ }
-            if (Date.now() - start > 120000) {
+            if (Date.now() - start > 600000) {
               clearInterval(poll);
               this._updating = false;
               this._updateReconnecting = false;
-              alert("Dashboard did not reconnect after 2 minutes.\nCheck server logs for update status.");
+              alert("Update is taking longer than expected.\nIt may still be running — check server logs for status.");
               await this.fetchUpdateStatus();
             }
           }, 5000);
+        },
+        async resolveConflicts() {
+          if (!confirm("Spawn an Opus session to resolve deep merge conflicts?\n\nThis may take a few minutes.")) return;
+          this._resolvingConflicts = true;
+          try {
+            const resp = await fetchApi("/api/genesis/updates/resolve", { method: "POST" });
+            if (resp && !resp.ok) {
+              const data = await resp.json();
+              alert("Failed: " + (data.error || "unknown error"));
+              this._resolvingConflicts = false;
+              return;
+            }
+          } catch (e) { /* server may restart */ }
+          // Poll for completion
+          const poll = setInterval(async () => {
+            try {
+              await this.fetchUpdateProgress();
+              if (this.updateProgress && !this.updateProgress.in_progress) {
+                clearInterval(poll);
+                this._resolvingConflicts = false;
+                await this.fetchUpdateStatus();
+                await this.fetchHealth();
+              }
+            } catch (e) { /* keep polling */ }
+          }, 5000);
+          // Safety timeout
+          setTimeout(() => { clearInterval(poll); this._resolvingConflicts = false; }, 600000);
         },
 
         // ── Settings hub fetches ─────────────────────────────────
@@ -6202,12 +6269,26 @@
             <div class="card" style="padding:1.5rem; text-align:center;">
               <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
               <div style="font-size:1rem; font-weight:500;" x-text="$store.genesisDashboard._updateReconnecting ? 'Reconnecting to dashboard...' : 'Update in progress...'"></div>
-              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take 1-2 minutes.</div>
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take a few minutes.</div>
+              <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.25rem;">Do not close this tab. You may safely refresh &mdash; progress is saved.</div>
+              <template x-if="$store.genesisDashboard.updateProgress?.summary">
+                <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem; font-family:monospace;"
+                     x-text="$store.genesisDashboard.updateProgress.summary"></div>
+              </template>
+            </div>
+          </template>
+
+          <!-- Resolving conflicts overlay -->
+          <template x-if="$store.genesisDashboard._resolvingConflicts">
+            <div class="card" style="padding:1.5rem; text-align:center;">
+              <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#128295;</div>
+              <div style="font-size:1rem; font-weight:500;">Opus is resolving merge conflicts...</div>
+              <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">This may take several minutes. The page will update when complete.</div>
             </div>
           </template>
 
           <!-- Normal update UI -->
-          <template x-if="!$store.genesisDashboard._updating">
+          <template x-if="!$store.genesisDashboard._updating && !$store.genesisDashboard._resolvingConflicts">
             <div>
               <!-- Version + check/apply -->
               <div class="card" style="padding:1rem; margin-bottom:1rem;">
@@ -6256,6 +6337,29 @@
                   <div style="margin-top:0.5rem; font-size:0.8rem; color:#81c784;">Up to date</div>
                 </template>
               </div>
+
+              <!-- Conflicts needing resolution -->
+              <template x-if="$store.genesisDashboard.updateProgress?.escalation?.includes('tier3_needed')">
+                <div class="card" style="padding:1rem; margin-bottom:1rem; border:1px solid rgba(255,152,0,0.4);">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
+                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;">Merge Conflicts</h3>
+                    <button @click="$store.genesisDashboard.resolveConflicts()"
+                            style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                      Resolve with Opus</button>
+                  </div>
+                  <div style="font-size:0.8rem; color:var(--color-text-secondary);">
+                    The update has merge conflicts that couldn't be resolved automatically.
+                    Opus can analyze both sides and find the best resolution.
+                  </div>
+                  <template x-if="$store.genesisDashboard.updateProgress?.conflicts?.conflicted_files">
+                    <div style="margin-top:0.5rem;">
+                      <span style="font-size:0.7rem; color:var(--color-text-secondary);">Conflicted files:</span>
+                      <pre style="font-size:0.75rem; color:#ffb74d; margin-top:0.25rem; white-space:pre-wrap; background:transparent; border:none; padding:0;"
+                           x-text="$store.genesisDashboard.updateProgress.conflicts.conflicted_files.join('\n')"></pre>
+                    </div>
+                  </template>
+                </div>
+              </template>
 
               <!-- Last update result -->
               <template x-if="$store.genesisDashboard.updateStatus?.last_update">

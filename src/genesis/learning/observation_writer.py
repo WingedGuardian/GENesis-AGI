@@ -84,6 +84,7 @@ class ObservationWriter:
                     source,
                     memory_type="episodic",
                     tags=[type, f"obs:{obs_id}"],
+                    confidence=0.6,
                     source_pipeline=source,
                 )
             except Exception:

@@ -3,7 +3,11 @@
 **Date:** 2026-03-11
 **Status:** Active — applies to all skill creation and modification
 **Source:** Anthropic's official skill-building guide + Genesis-specific requirements
-**Location:** All skills live in `src/genesis/skills/<skill-name>/`
+**Location:** Genesis internal skills live in `src/genesis/skills/<skill-name>/`.
+Claude Code native skills live in `.claude/skills/<skill-name>/` (project-scoped)
+or `~/.claude/skills/<skill-name>/` (user-scoped). Both follow the same
+conventions; CC-native skills omit the `consumer`, `phase`, `skill_type`
+Genesis-specific frontmatter fields
 
 ---
 
@@ -535,3 +539,92 @@ Before finalizing any skill:
 | Duplicated resources | Update drift, wasted tokens | Shared resources live in one skill, others reference it |
 | No output format | Downstream consumers can't parse results | Define explicit output template |
 | Missing Genesis fields | Skill evolution system can't track it | Add `consumer`, `phase`, `skill_type` |
+| No in-skill examples | Abstract instructions get misinterpreted | Add 1-2 input→output demos in SKILL.md body |
+| No negative boundaries | Skill hijacks unrelated requests | Add "Do NOT use for [list]" to description |
+
+---
+
+## Failure Mode Taxonomy
+
+When a skill misbehaves, diagnose which failure mode it exhibits. Each
+mode has a specific root cause and fix — don't guess, match the symptom.
+
+| Mode | Symptom | Diagnosis | Fix |
+|------|---------|-----------|-----|
+| **Silent** | Never fires on matching requests | Description too weak, missing trigger phrases | Add 5-7+ explicit trigger phrases. Be embarrassingly explicit. |
+| **Hijacker** | Fires on unrelated requests | Description too broad, no negative boundaries | Add "Do NOT use for [X, Y, Z]" to description. |
+| **Drifter** | Fires correctly but output varies | Instructions are ambiguous, multiple interpretations | Replace vague rules with testable ones. "Handle appropriately" → "If X, then Y." |
+| **Fragile** | Works on clean input, breaks on edge cases | Missing edge-case handling | Add "If [condition], then [specific action]" for each failure. |
+| **Overachiever** | Adds unsolicited content, extra sections | Instructions say what to do but not what NOT to do | Add explicit scope constraints: "Output ONLY [format]. Do NOT add [list]." |
+
+Use this taxonomy both when authoring new skills (prevent each mode by
+design) and when the skill evolution pipeline flags a declining skill
+(diagnose which mode is causing the decline, then apply the matching fix).
+
+---
+
+## Testing Protocol
+
+Before marking any skill as finalized, run all five tests. This is a
+required gate alongside the Validation Checklist above.
+
+### Test 1: Happy Path
+
+Run the skill with clean, complete, ideal input. Does it produce the
+expected output in the expected format? If not, refine the workflow
+instructions.
+
+### Test 2: Minimal Input
+
+Run the skill with the absolute minimum information a user might provide.
+Does it ask for what it needs? Does it handle missing information
+gracefully without inventing data?
+
+### Test 3: Edge Case
+
+Run the skill with unusual inputs — contradictory requirements, extremely
+short or long inputs, unexpected formats. Does it handle them with
+specific instructions, or fall back to generic behavior?
+
+### Test 4: Negative Test
+
+Try to trigger the skill with a request that SHOULD NOT activate it. Does
+it correctly stay silent? If it fires, the description needs tighter
+negative boundaries (Silent/Hijacker fix).
+
+### Test 5: Repeat Test
+
+Run the same input through the skill three times. Is the output
+consistent in structure and quality? If it varies significantly, the
+instructions are ambiguous somewhere (Drifter fix).
+
+Fix every failure. Update the SKILL.md. Test again. All five tests must
+pass before the skill is considered production-ready.
+
+---
+
+## In-Skill Examples
+
+Include at least one happy-path example and one edge-case example directly
+in SKILL.md body, not only in `examples/`. A concrete input→output demo
+is worth fifty lines of abstract instruction and is cheap at Level 2
+(loaded on every trigger).
+
+Use `examples/` directory for longer, rarer scenarios that don't need to
+load on every invocation.
+
+Examples count toward the SKILL.md word budget (1,500-2,000 target) but
+are high-ROI tokens — prioritize them over additional abstract rules when
+approaching the budget limit.
+
+**Format:**
+
+```markdown
+### Fire Example
+**Input:** "specific user request"
+**Action:** What the skill does, which references it reads
+
+### Don't-Fire Example
+**Input:** "request that looks similar but shouldn't trigger"
+**Reason:** Why this doesn't match, what should happen instead
+```

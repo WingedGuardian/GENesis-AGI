@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.runtime")
 
 _MODULES_DIR = Path(__file__).resolve().parents[4] / "config" / "modules"
+_LOCAL_MODULES_DIR = Path.home() / ".genesis" / "config" / "modules"
 
 
 def _import_class(class_path: str):
@@ -47,14 +48,31 @@ async def init(rt: GenesisRuntime) -> None:
 
 
 async def _load_modules_from_yaml(rt: GenesisRuntime) -> None:
-    """Scan config/modules/*.yaml and load each as a module."""
+    """Scan config/modules/*.yaml and ~/.genesis/config/modules/*.yaml for module configs.
+
+    Local overlay (~/.genesis/config/modules/) takes precedence over repo configs
+    when the same filename exists in both directories.
+    """
     import yaml
 
-    if not _MODULES_DIR.is_dir():
-        logger.warning("Module config directory not found: %s", _MODULES_DIR)
+    # Collect configs: repo defaults first, then local overlay (local wins on same filename)
+    config_files: dict[str, Path] = {}
+
+    if _MODULES_DIR.is_dir():
+        for p in sorted(_MODULES_DIR.glob("*.yaml")):
+            config_files[p.name] = p
+    elif not _LOCAL_MODULES_DIR.is_dir():
+        logger.warning("No module config directories found (checked %s and %s)",
+                       _MODULES_DIR, _LOCAL_MODULES_DIR)
         return
 
-    for yaml_path in sorted(_MODULES_DIR.glob("*.yaml")):
+    if _LOCAL_MODULES_DIR.is_dir():
+        for p in sorted(_LOCAL_MODULES_DIR.glob("*.yaml")):
+            if p.name in config_files:
+                logger.debug("Local module config overrides repo: %s", p.name)
+            config_files[p.name] = p
+
+    for yaml_path in sorted(config_files.values(), key=lambda p: p.name):
         try:
             data = yaml.safe_load(yaml_path.read_text())
             if not data or not isinstance(data, dict) or "name" not in data:

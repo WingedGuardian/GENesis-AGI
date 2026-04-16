@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -18,6 +21,111 @@ jobs:
         run: pip install ruff
       - name: Lint
         run: ruff check src/ tests/ scripts/
+
+  leak-detector:
+    # Verify no user-specific content (IPs, timezones, personal paths, secrets)
+    # leaked into the codebase. Blocking — PRs must pass this.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          pip install detect-secrets
+          sudo apt-get install -y ripgrep
+
+      - name: Secret scan (detect-secrets)
+        run: |
+          set -euo pipefail
+          detect-secrets scan --all-files \
+              --exclude-files '\.git/' \
+              --exclude-files '__pycache__/' \
+              --exclude-files '\.pyc$' \
+              --exclude-files 'vendor/' \
+              src/ config/ scripts/ .github/ > /tmp/ds-results.json
+          count=$(python3 -c "
+          import json, sys
+          data = json.load(open('/tmp/ds-results.json'))
+          results = data.get('results', {})
+          real = sum(len([f for f in v if 'CACHEDIR' not in fp])
+                     for fp, v in results.items())
+          print(real)
+          ")
+          if [[ "$count" != "0" ]]; then
+            echo "::error::detect-secrets found $count potential secrets"
+            cat /tmp/ds-results.json
+            exit 1
+          fi
+          echo "Secret scan: CLEAN (0 findings)"
+
+      - name: Portability scan (user-specific content)
+        run: |
+          set -euo pipefail
+          # Exclusions mirror prepare-public-release.sh SCAN_EXCLUDES.
+          SCAN_EXCLUDES=(
+            --glob '!**/.git/**'
+            --glob '!**/prepare-public-release.sh'
+            --glob '!**/push-public-release.sh'
+            --glob '!**/public-release.yaml'
+            --glob '!**/release-script-guarantees.md'
+            --glob '!**/src/genesis/contribution/sanitize.py'
+            --glob '!**/tests/test_contribution/test_sanitize.py'
+            --glob '!**/host-setup.sh'
+            --glob '!**/install.sh'
+            --glob '!**/install_guardian.sh'
+            --glob '!**/uninstall.sh'
+            --glob '!**/src/genesis/util/tz.py'
+            --glob '!**/src/genesis/dashboard/templates/genesis_dashboard.html'
+            --glob '!**/config/modules/career-agent.yaml'
+            --glob '!**/config/external-modules/**'
+            --glob '!**/tests/**'
+          )
+          hits=$(
+            rg -n --hidden "${SCAN_EXCLUDES[@]}" \
+              -e 'America/New_York' \
+              -e '/home/[a-z][a-z0-9_-]*/genesis' \
+              -e '\bWingedGuardian/(Genesis|genesis-backups)\b' \
+              src/ config/ scripts/ .github/ \
+              2>/dev/null || true
+          )
+          if [[ -n "$hits" ]]; then
+            echo "::error::Portability scan found user-specific content:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "Portability scan: CLEAN"
+
+      - name: Email scan
+        run: |
+          set -euo pipefail
+          hits=$(
+            rg -n --hidden \
+              --glob '!**/.git/**' \
+              --glob '!**/tests/**' \
+              --glob '!**/prepare-public-release.sh' \
+              --glob '!**/readme-legacy.md' \
+              --glob '!**/vendor/**' \
+              -e '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' \
+              src/ config/ scripts/ .github/ 2>/dev/null | \
+            grep -vE '(^|[^a-zA-Z0-9._+-])(noreply|no-reply)@' | \
+            grep -vE 'backup@genesis\.local\b' | \
+            grep -vE 'feedback@anthropic\.com\b' | \
+            grep -vE 'support@anthropic\.com\b' | \
+            grep -vE '@(example|example\.com|example\.org|localhost|test|invalid)\b' | \
+            grep -vE '@(claude|github|gitlab|sentry|grafana|slack|discord)\.com\b' | \
+            grep -vE 'user@[0-9]+\.service' \
+              || true
+          )
+          if [[ -n "$hits" ]]; then
+            echo "::error::Email scan found personal email addresses:"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "Email scan: CLEAN"
 
   test:
     runs-on: ubuntu-latest

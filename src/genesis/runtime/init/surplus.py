@@ -182,10 +182,26 @@ async def init(rt: GenesisRuntime) -> None:
                 from genesis.pipeline.profiles import ProfileLoader
 
                 loader = ProfileLoader()
-                profiles = loader.load_all()
+                loader.load_all()
+                profiles = loader.merge_overlay()
                 for name, profile in profiles.items():
                     if not profile.enabled:
                         continue
+
+                    # Skip if owning module is disabled
+                    if rt._module_registry is not None:
+                        skip_profile = False
+                        for mod_name in rt._module_registry.list_modules():
+                            mod = rt._module_registry.get(mod_name)
+                            if mod and mod.get_research_profile_name() == name and not mod.enabled:
+                                logger.info(
+                                    "Skipping profile %s — owning module %s is disabled",
+                                    name, mod_name,
+                                )
+                                skip_profile = True
+                                break
+                        if skip_profile:
+                            continue
 
                     async def _cycle(pname: str = name) -> None:
                         from genesis.runtime.init.pipeline import run_pipeline_cycle
