@@ -265,8 +265,9 @@ async def autonomy_config():
 async def settings_timezone():
     """Get or set the user's display timezone.
 
-    GET: returns {"timezone": "America/New_York"}
-    POST: {"timezone": "US/Eastern"} → validates, writes to genesis.yaml,
+    GET: returns {"timezone": <IANA tz name>} — whatever the user configured
+         (defaults to "UTC" if unset).
+    POST: {"timezone": <IANA tz name>} → validates, writes to genesis.yaml,
           invalidates caches. Takes effect immediately for display;
           scheduler CronTrigger timezone updates on next restart.
     """
