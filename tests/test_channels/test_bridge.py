@@ -18,6 +18,7 @@ class TestLoadBridgeConfig:
     def test_forum_chat_id_parsed(self, monkeypatch):
         path = _write_secrets(
             'TELEGRAM_BOT_TOKEN=testtoken\n'
+            'TELEGRAM_ALLOWED_USERS=12345\n'
             'TELEGRAM_FORUM_CHAT_ID=-100123456\n'
         )
         monkeypatch.setattr(
@@ -28,7 +29,10 @@ class TestLoadBridgeConfig:
         os.unlink(path)
 
     def test_forum_chat_id_absent(self, monkeypatch):
-        path = _write_secrets('TELEGRAM_BOT_TOKEN=testtoken\n')
+        path = _write_secrets(
+            'TELEGRAM_BOT_TOKEN=testtoken\n'
+            'TELEGRAM_ALLOWED_USERS=12345\n'
+        )
         monkeypatch.setattr(
             "genesis.channels.bridge.secrets_path", lambda: path,
         )
@@ -39,6 +43,7 @@ class TestLoadBridgeConfig:
     def test_forum_chat_id_empty_string(self, monkeypatch):
         path = _write_secrets(
             'TELEGRAM_BOT_TOKEN=testtoken\n'
+            'TELEGRAM_ALLOWED_USERS=12345\n'
             'TELEGRAM_FORUM_CHAT_ID=\n'
         )
         monkeypatch.setattr(
@@ -51,6 +56,7 @@ class TestLoadBridgeConfig:
     def test_forum_chat_id_positive(self, monkeypatch):
         path = _write_secrets(
             'TELEGRAM_BOT_TOKEN=testtoken\n'
+            'TELEGRAM_ALLOWED_USERS=12345\n'
             'TELEGRAM_FORUM_CHAT_ID=999\n'
         )
         monkeypatch.setattr(
