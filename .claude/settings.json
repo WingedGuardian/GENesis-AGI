@@ -174,10 +174,6 @@
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook plan_bookmark_hook.py",
             "timeout": 2000
-          },
-          {
-            "type": "command",
-            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"RECOMMENDED: You have exited plan mode. Before implementation, run an architecture review proportional to the plan scope. For small plans (1-2 files, wiring changes): dispatch a single code-architect agent to check dependencies, edge cases, and DRY violations. For medium plans (3-10 files, new components): run a focused CEO premise challenge + eng architecture review. For large plans (10+ files, new systems): run the full /autoplan pipeline (CEO \\u2192 design \\u2192 eng review). Always surface findings and update the plan before starting implementation. The goal is catching real issues, not ceremony.\"}}'"
           }
         ]
       }

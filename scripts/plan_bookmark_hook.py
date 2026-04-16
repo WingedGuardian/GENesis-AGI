@@ -42,8 +42,58 @@ _ARCH_REVIEW = (
     "catching real issues, not ceremony."
 )
 
+_WORKTREE_REMINDER = (
+    "MANDATORY: Before writing any code, create a git worktree for isolation. "
+    "Run: git worktree add .claude/worktrees/<scope>-<desc> -b <scope>/<desc> "
+    "then work inside the worktree directory. Commit on the branch, merge to "
+    "main when done. NEVER commit directly to main. This is enforced by "
+    "project convention — skipping it risks cross-session contamination."
+)
+
+_CONFIDENCE_REMINDER = (
+    "MANDATORY: Before starting implementation, state explicit confidence "
+    "percentages for each part of the plan with rationale. Anything below 90% "
+    "needs investigation to raise it first. Separate root-cause confidence from "
+    "fix confidence when they differ. State what information would move each "
+    "item to 100%."
+)
+
+_DUE_DILIGENCE_REMINDER = (
+    "MANDATORY: Before starting implementation, verify your plan against actual "
+    "code. For each file you plan to modify: READ IT FIRST. Confirm the "
+    "functions/classes you plan to change actually exist and work the way you "
+    "think. Check for recent changes (git log) that might conflict. If your "
+    "plan references a table, query its schema. If it references a config, "
+    "read the file. 'I assume' is not due diligence — 'I verified' is."
+)
+
 _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
+
+
+def _is_in_worktree() -> bool:
+    """Check if the current working directory is inside a git worktree."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode != 0:
+            return False
+        # Check if it's a worktree (not the main working tree)
+        result2 = subprocess.run(
+            ["git", "rev-parse", "--git-common-dir"],
+            capture_output=True, text=True, timeout=2,
+        )
+        result3 = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            capture_output=True, text=True, timeout=2,
+        )
+        # In a worktree, --git-dir != --git-common-dir
+        return result2.stdout.strip() != result3.stdout.strip()
+    except Exception:
+        return False
 
 
 def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
@@ -148,11 +198,16 @@ def main() -> int:
     except OSError as exc:
         print(f"plan_bookmark_hook: failed to write pending file: {exc}", file=sys.stderr)
 
-    # Output only the architecture review recommendation
+    # Build implementation checklist
+    reminders = [_ARCH_REVIEW, _CONFIDENCE_REMINDER, _DUE_DILIGENCE_REMINDER]
+    if not _is_in_worktree():
+        reminders.append(_WORKTREE_REMINDER)
+
+    # Output all reminders
     output = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": _ARCH_REVIEW,
+            "additionalContext": "\n\n".join(reminders),
         }
     }
 

@@ -591,6 +591,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE cost_events ADD COLUMN cost_known INTEGER NOT NULL DEFAULT 1",
         "cost_events.cost_known")
 
+    # Memory taxonomy: add wing/room columns to memory_metadata for
+    # structural domain classification (MemPalace-inspired navigational retrieval).
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN wing TEXT",
+        "memory_metadata.wing")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN room TEXT",
+        "memory_metadata.room")
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

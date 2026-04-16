@@ -1,0 +1,59 @@
+#!/bin/bash
+# Genesis pre-merge-commit hook — block merging PR branches into local main.
+#
+# PR branches are cherry-picked onto origin/main for the public repo. Because
+# origin/main diverges from local main (squash merges), merging a PR branch
+# back into local main creates spurious conflicts. The PR branch's job is done
+# once pushed — never merge it back.
+#
+# Portable copy: scripts/hooks/pre-merge-commit (symlinked by install scripts)
+
+current_branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+
+# Only care about merges INTO main
+if [ "$current_branch" != "main" ] && [ "$current_branch" != "master" ]; then
+    exit 0
+fi
+
+# Allow explicit override
+if [ "${GENESIS_ALLOW_PR_MERGE:-}" = "1" ]; then
+    echo "OVERRIDE: PR branch merge into main allowed (GENESIS_ALLOW_PR_MERGE=1)."
+    exit 0
+fi
+
+# What branch is being merged?
+merge_head=$(git rev-parse MERGE_HEAD 2>/dev/null)
+if [ -z "$merge_head" ]; then
+    exit 0
+fi
+
+# Check if the merge source is an ancestor of origin/main (i.e., based on it)
+# If the branch was created from origin/main, it shares ancestry that local
+# main may not (due to squash merges). Detect this by checking if origin/main
+# is an ancestor of the merge head.
+if git merge-base --is-ancestor origin/main "$merge_head" 2>/dev/null; then
+    # Now check: is this branch ALSO an ancestor of local main?
+    # If yes, it's a normal local branch — allow it.
+    # If no, it was forked from origin/main and diverges from local main.
+    if ! git merge-base --is-ancestor "$merge_head" main 2>/dev/null; then
+        # Get the branch name for the error message
+        merge_branch=$(git name-rev --name-only "$merge_head" 2>/dev/null | sed 's|remotes/origin/||')
+
+        echo ""
+        echo "BLOCKED: Merging a PR branch into local main."
+        echo ""
+        echo "Branch '$merge_branch' is based on origin/main, which has diverged"
+        echo "from local main (due to squash merges on GitHub). Merging it back"
+        echo "will create spurious conflicts."
+        echo ""
+        echo "The PR branch's job is done once pushed. For any new files created"
+        echo "on the PR branch, commit them directly to local main instead."
+        echo ""
+        echo "If you're sure this merge is correct:"
+        echo "  GENESIS_ALLOW_PR_MERGE=1 git merge <branch>"
+        echo ""
+        exit 1
+    fi
+fi
+
+exit 0

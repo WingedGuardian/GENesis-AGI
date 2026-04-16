@@ -156,8 +156,15 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Failed to parse extraction JSON: {exc}") from exc
+    except json.JSONDecodeError:
+        # LLMs often produce invalid \escapes in JSON (e.g., file paths).
+        # Attempt to fix by escaping lone backslashes before re-parsing.
+        try:
+            import re as _re
+            sanitized = _re.sub(r'\\(?!["\\/bfnrtu])', r'\\\\', raw)
+            data = json.loads(sanitized)
+        except json.JSONDecodeError as exc2:
+            raise ValueError(f"Failed to parse extraction JSON: {exc2}") from exc2
 
     # Handle new object format with extractions + metadata
     session_keywords: list[str] = []

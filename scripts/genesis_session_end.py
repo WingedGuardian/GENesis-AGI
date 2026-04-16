@@ -172,6 +172,47 @@ def main() -> None:
         ended_at=now,
     )
 
+    # 4. Trigger async essential knowledge regeneration (fire-and-forget).
+    # Spawns a background subprocess since LLM/DB work exceeds 1500ms budget.
+    _trigger_essential_knowledge_regen()
+
+
+def _trigger_essential_knowledge_regen() -> None:
+    """Spawn background subprocess to regenerate essential knowledge.
+
+    Fire-and-forget — must not block the 1500ms hook budget.
+    Uses subprocess.Popen (non-blocking) to run an inline Python script
+    that imports and calls the generator.
+    """
+    import subprocess
+
+    script = (
+        "import sys; "
+        "from pathlib import Path; "
+        "sys.path.insert(0, str(Path.home() / 'genesis' / 'src')); "
+        "import asyncio; import aiosqlite; "
+        "from genesis.memory.essential_knowledge import generate_and_write; "
+        "async def _run(): "
+        "  db = await aiosqlite.connect(str(Path.home() / 'genesis/data/genesis.db')); "
+        "  await generate_and_write(db); "
+        "  await db.close(); "
+        "asyncio.run(_run())"
+    )
+    # Log to file instead of DEVNULL so failures are diagnosable
+    _LOG_DIR = _GENESIS_DIR / "logs"
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log_file = _LOG_DIR / "ek_regen.log"
+    import contextlib
+    with contextlib.suppress(OSError):
+        # trunk-ignore: stderr goes to log file for observability
+        log_fh = open(_log_file, "a")  # noqa: SIM115
+        subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdout=subprocess.DEVNULL,
+            stderr=log_fh,
+            start_new_session=True,  # Detach from hook process group
+        )
+
 
 if __name__ == "__main__":
     main()
