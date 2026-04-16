@@ -72,6 +72,7 @@ async def test_memory_store_delegates(mock_deps, tools):
     memory_mcp._store.store.assert_awaited_once_with(
         "hello", "test", memory_type="episodic", tags=None, confidence=0.5,
         memory_class=None, source_pipeline="conversation",
+        wing=None, room=None,
     )
 
 
