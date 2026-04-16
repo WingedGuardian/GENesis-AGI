@@ -135,3 +135,61 @@ class TestFollowUpDispatcher:
     async def test_empty_cycle(self, dispatcher):
         summary = await dispatcher.run_cycle()
         assert all(v == 0 for v in summary.values())
+
+    async def test_structured_reason_routes_model_eval(self, dispatcher, db):
+        """Follow-up with structured reason routes to correct task type."""
+        import json
+
+        from genesis.surplus.types import TaskType
+
+        payload = {
+            "task_type": "model_eval",
+            "compute_tier": "free_api",
+            "payload": {
+                "model_id": "test/new-model",
+                "name": "Test Model",
+                "source": "openrouter_free_scan",
+            },
+        }
+        fid = await follow_ups.create(
+            db,
+            content="Benchmark new free model: test/new-model (Test Model)",
+            source="recon_pipeline",
+            strategy="surplus_task",
+            reason=json.dumps(payload),
+        )
+
+        summary = await dispatcher.run_cycle()
+        assert summary["surplus_dispatched"] == 1
+
+        fu = await follow_ups.get_by_id(db, fid)
+        assert fu["linked_task_id"] is not None
+
+        # Verify the surplus task has the right type
+        task = await surplus_tasks.get_by_id(db, fu["linked_task_id"])
+        assert task["task_type"] == str(TaskType.MODEL_EVAL)
+
+        # Verify payload includes model info with source provenance
+        task_payload = json.loads(task["payload"])
+        assert task_payload["model_id"] == "test/new-model"
+        assert task_payload["source"] == "follow_up"
+        assert task_payload["original_source"] == "openrouter_free_scan"
+
+    async def test_structured_reason_invalid_json_falls_back(self, dispatcher, db):
+        """Malformed reason JSON falls back to keyword matching."""
+        fid = await follow_ups.create(
+            db,
+            content="benchmark something",
+            source="test",
+            strategy="surplus_task",
+            reason="{invalid json",
+        )
+
+        summary = await dispatcher.run_cycle()
+        assert summary["surplus_dispatched"] == 1
+
+        fu = await follow_ups.get_by_id(db, fid)
+        task = await surplus_tasks.get_by_id(db, fu["linked_task_id"])
+        # Falls back to keyword "benchmark" → MODEL_EVAL
+        from genesis.surplus.types import TaskType
+        assert task["task_type"] == str(TaskType.MODEL_EVAL)

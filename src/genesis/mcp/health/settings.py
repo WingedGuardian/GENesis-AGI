@@ -163,6 +163,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=False,
     ),
+    "surplus": SettingsDomain(
+        name="surplus",
+        description="Surplus compute scheduler (dispatch intervals, job frequencies, task defaults)",
+        config_filename="surplus.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
 }
 
 
@@ -467,6 +474,37 @@ def _validate_updates(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_surplus(changes: dict) -> list[str]:
+    errors: list[str] = []
+    if "dispatch" in changes:
+        d = changes["dispatch"]
+        if isinstance(d, dict):
+            _validate_positive_int(d, "interval_minutes", errors)
+            _validate_positive_int(d, "task_expiry_hours", errors)
+            _validate_positive_int(d, "max_iterations_per_cycle", errors)
+    if "jobs" in changes:
+        j = changes["jobs"]
+        if isinstance(j, dict):
+            for key in j:
+                _validate_positive_int(j, key, errors)
+    if "task_defaults" in changes:
+        td = changes["task_defaults"]
+        if isinstance(td, dict):
+            valid_tiers = {"free_api", "cheap_paid", "local_30b", "never"}
+            valid_drives = {"competence", "cooperation", "curiosity", "preservation"}
+            for task_name, cfg in td.items():
+                if not isinstance(cfg, dict):
+                    errors.append(f"task_defaults.{task_name} must be a dict")
+                    continue
+                if "priority" in cfg:
+                    _validate_float_range(cfg, "priority", 0.0, 1.0, errors)
+                if "tier" in cfg and cfg["tier"] not in valid_tiers:
+                    errors.append(f"task_defaults.{task_name}.tier must be one of {valid_tiers}")
+                if "drive" in cfg and cfg["drive"] not in valid_drives:
+                    errors.append(f"task_defaults.{task_name}.drive must be one of {valid_drives}")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
@@ -474,6 +512,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "ego": _validate_ego,
     "autonomous_cli_policy": _validate_autonomous_cli_policy,
     "updates": _validate_updates,
+    "surplus": _validate_surplus,
 }
 
 
