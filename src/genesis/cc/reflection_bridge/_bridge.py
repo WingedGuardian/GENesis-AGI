@@ -424,6 +424,14 @@ class CCReflectionBridge:
                 await store_reflection_output(depth, tick, output, db=db)
         else:
             await store_reflection_output(depth, tick, output, db=db)
+            # Mark influenced for non-deep paths (strategic, light) that
+            # go through store_reflection_output instead of OutputRouter
+            if gathered_obs_ids and output.text and output.text.strip():
+                try:
+                    from genesis.db.crud import observations
+                    await observations.mark_influenced_batch(db, list(gathered_obs_ids))
+                except Exception:
+                    logger.warning("Failed to mark influenced observations", exc_info=True)
 
         # 6. Send to topic
         await send_to_topic(session_id, depth, output, topic_manager=self._topic_manager)
