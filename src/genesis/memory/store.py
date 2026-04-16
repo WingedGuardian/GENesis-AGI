@@ -13,6 +13,7 @@ from genesis.db.crud import pending_embeddings
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.linker import MemoryLinker
+from genesis.memory.taxonomy import classify as classify_taxonomy
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import track_operation
@@ -83,6 +84,8 @@ class MemoryStore:
         source_line_range: tuple[int, int] | None = None,
         extraction_timestamp: str | None = None,
         source_pipeline: str | None = None,
+        wing: str | None = None,
+        room: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -129,6 +132,19 @@ class MemoryStore:
         if class_tag not in resolved_tags:
             resolved_tags = [*resolved_tags, class_tag]
 
+        # Taxonomy classification — auto-classify if not explicitly provided
+        if not wing or not room:
+            taxo = classify_taxonomy(
+                content, tags=resolved_tags,
+                source=source, source_pipeline=source_pipeline or "",
+            )
+            wing = wing or taxo.wing
+            room = room or taxo.room
+        # Append wing tag for FTS5 keyword searchability
+        wing_tag = f"wing:{wing}"
+        if wing_tag not in resolved_tags:
+            resolved_tags = [*resolved_tags, wing_tag]
+
         embedding_ok = not force_fts5_only
         if embedding_ok:
             try:
@@ -153,6 +169,8 @@ class MemoryStore:
                         "source_type": "memory",
                         "scope": "external" if resolved_collection == "knowledge_base" else "user",
                         "memory_class": resolved_class,
+                        "wing": wing,
+                        "room": room,
                     }
                     # Provenance fields — trace memory back to source conversation
                     if source_session_id:
@@ -213,6 +231,8 @@ class MemoryStore:
             confidence=confidence,
             embedding_status="embedded" if embedding_ok else "pending",
             memory_class=resolved_class,
+            wing=wing,
+            room=room,
         )
 
         if not embedding_ok:

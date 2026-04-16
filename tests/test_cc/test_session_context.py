@@ -79,8 +79,17 @@ class TestSessionContextHook:
         assert len(content) > 10
 
     def test_cognitive_state_failure_is_loud(self, flag_dir: Path) -> None:
-        """When cognitive state fails, output should contain a visible alert."""
-        env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
+        """When cognitive state fails in a genesis session, output a visible alert.
+
+        The loud-alert path only runs for background/ego sessions
+        (GENESIS_CC_SESSION=1); foreground sessions use the essential_knowledge
+        path instead and degrade silently by design.
+        """
+        env = {
+            "HOME": str(flag_dir.parent),
+            "PATH": "/usr/bin",
+            "GENESIS_CC_SESSION": "1",
+        }
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
             capture_output=True, text=True, env=env, timeout=10,
