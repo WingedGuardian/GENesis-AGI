@@ -29,7 +29,7 @@ Best run per provider. Providers marked (free) cost $0; others are paid.
 | Provider | Reason | Status |
 |---|---|---|
 | openrouter-deepseek-r1 | Free endpoint removed from OpenRouter | Disabled |
-| openrouter-qwen3coder | Venice backend congestion, all requests timeout | Retry off-peak |
+| openrouter-qwen3coder | Returns HTTP 401 "No cookie auth credentials found" on all requests — the Qwen3-Coder free endpoint appears to require browser/cookie auth, not API key (retested 2026-04-16 off-peak) | Disable or investigate |
 
 ## Key Findings
 
