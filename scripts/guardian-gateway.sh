@@ -149,6 +149,9 @@ PYEOF
             exit 1
         fi
         ;;
+    ping)
+        echo '{"ok": true, "action": "ping"}'
+        ;;
     *)
         echo '{"ok": false, "error": "denied"}' >&2
         exit 1
