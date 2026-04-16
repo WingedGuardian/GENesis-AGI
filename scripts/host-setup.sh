@@ -602,7 +602,7 @@ if [ -z "$_detected_tz" ]; then
     _detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
 fi
 
-if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ]; then
+if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ] && [ -e /dev/tty ]; then
     echo ""
     echo "  Detected timezone: $_detected_tz"
     read -r -p "  Is this correct? [Y/n] " _tz_confirm </dev/tty
@@ -619,8 +619,12 @@ if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ]; then
         _final_tz="$_detected_tz"
     fi
 else
-    # Non-interactive or detection failed — keep detected value or UTC default
+    # Non-interactive, no TTY, or detection failed — keep detected value or UTC default
     _final_tz="${_detected_tz:-UTC}"
+    if [ -n "$_detected_tz" ] && [ "$_detected_tz" != "UTC" ]; then
+        echo ""
+        echo "  Detected timezone: $_detected_tz (auto-accepted, no TTY)"
+    fi
 fi
 
 # Set on host VM
