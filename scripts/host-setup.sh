@@ -634,6 +634,14 @@ incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/nul
 
 echo "  + Timezone: $_final_tz (host + container)"
 
+# Pre-seed timezone in container's secrets.env so install.sh doesn't re-detect.
+# install.sh checks USER_TIMEZONE in secrets.env first (lines 1206-1208) and
+# skips its own timezone prompt if present.
+incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- \
+    bash -c "mkdir -p /home/ubuntu/genesis && f=/home/ubuntu/genesis/secrets.env && \
+    grep -q '^USER_TIMEZONE=' \"\$f\" 2>/dev/null || \
+    { echo 'USER_TIMEZONE=$_final_tz' >> \"\$f\" && chmod 600 \"\$f\"; }" 2>/dev/null || true
+
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
 
@@ -857,52 +865,42 @@ echo "  Running container smoke test..."
 _smoke_ok=0
 _smoke_fail=""
 
-# 1. /tmp exists and is writable
-if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n"
-fi
+# Run all checks in a single incus exec to avoid websocket handshake issues
+# that occur with multiple separate incus exec calls (especially in nested
+# pty environments like script, screen, or tmux wrappers).
+_smoke_output=$(timeout -k 10 45 incus exec -T "$CONTAINER_NAME" \
+    --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- bash -c '
+    test -w /tmp && echo "PASS_TMP" || echo "FAIL_TMP"
+    python3 -c "print(42)" &>/dev/null && echo "PASS_PYTHON" || echo "FAIL_PYTHON"
+    /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null && echo "PASS_VENV" || echo "FAIL_VENV"
+    curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null && echo "PASS_QDRANT" || echo "FAIL_QDRANT"
+    # Retry loop: genesis-server may still be starting on slow machines
+    _code="000"
+    for _try in 1 2 3 4 5; do
+        _code=$(curl -so /dev/null -w "%{http_code}" --max-time 5 http://localhost:5000/api/genesis/health 2>/dev/null || echo "000")
+        [ "$_code" = "200" ] || [ "$_code" = "503" ] && break
+        sleep 2
+    done
+    if [ "$_code" = "200" ] || [ "$_code" = "503" ]; then echo "PASS_SERVER"; else echo "FAIL_SERVER"; fi
+' 2>/dev/null || echo "FAIL_EXEC")
 
-# 2. Python works
-if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
+# Parse results — distinguish total exec failure from individual check failures
+if echo "$_smoke_output" | grep -q "FAIL_EXEC"; then
+    _smoke_fail="    FAIL  Could not execute smoke test in container (incus exec failed/timed out)\n"
 else
-    _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n"
-fi
-
-# 3. Genesis venv is intact
-if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n"
-fi
-
-# 4. Qdrant is reachable
-if timeout -k 5 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n"
-fi
-
-# 5. genesis-server responds
-_server_tries=0
-_server_ok=0
-while [ "$_server_tries" -lt 5 ]; do
-    # Accept 200 (healthy) or 503 (running but not bootstrapped — expected on fresh install)
-    _http_code=$(timeout -k 5 15 incus exec "$CONTAINER_NAME" -- \
-        curl -so /dev/null -w '%{http_code}' --max-time 5 http://localhost:5000/api/genesis/health 2>/dev/null || echo "000")
-    if [ "$_http_code" = "200" ] || [ "$_http_code" = "503" ]; then
-        _server_ok=1
-        break
-    fi
-    sleep 2
-    _server_tries=$((_server_tries + 1))
-done
-if [ "$_server_ok" = "1" ]; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  genesis-server not responding on port 5000\n"
+    for _check in TMP PYTHON VENV QDRANT SERVER; do
+        if echo "$_smoke_output" | grep -q "PASS_$_check"; then
+            _smoke_ok=$((_smoke_ok + 1))
+        else
+            case "$_check" in
+                TMP)     _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n" ;;
+                PYTHON)  _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n" ;;
+                VENV)    _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n" ;;
+                QDRANT)  _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n" ;;
+                SERVER)  _smoke_fail="${_smoke_fail}    FAIL  genesis-server not responding on port 5000\n" ;;
+            esac
+        fi
+    done
 fi
 
 if [ -z "$_smoke_fail" ]; then
