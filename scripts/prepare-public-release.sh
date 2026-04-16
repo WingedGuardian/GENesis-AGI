@@ -210,43 +210,8 @@ PYEOF
     echo "    + CLAUDE.md templated"
 fi
 
-# .claude/docs/ — strip user-specific content from extracted CC docs
-if [ -f "$OUTPUT_DIR/.claude/docs/dual-repo.md" ]; then
-    python3 - "$OUTPUT_DIR/.claude/docs/dual-repo.md" << 'PYEOF'
-import re, sys
-
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-
-# "(private, will go public)" → "(public)"
-content = content.replace('(private, will go public)', '(public)')
-
-# Strip "Generated from..." clause from the repo bullet
-content = re.sub(
-    r' Generated from\s+the working repo via `scripts/prepare-public-release\.sh`\.',
-    '',
-    content
-)
-
-# Remove "Update Workflow" section (heading through code block and trailing text)
-content = re.sub(r'\n## Update Workflow\n[\s\S]*?(?=\n## |\Z)', '\n', content)
-
-# Remove "What the Release Script Strips" section
-content = re.sub(r'\n## What the Release Script Strips\n[\s\S]*?(?=\n## |\Z)', '\n', content)
-
-# Shorten Secret Scanning to first sentence
-content = re.sub(
-    r'(`detect-secrets` \(Yelp\) is installed in the venv\.) Used[\s\S]*?the public repo\.',
-    r'\1',
-    content
-)
-
-with open(path, 'w') as f:
-    f.write(content)
-PYEOF
-    echo "    + .claude/docs/dual-repo.md templated"
-fi
+# .claude/docs/dual-repo.md was removed in favor of .claude/docs/your-genesis.md
+# (install-agnostic, no templating needed).
 
 # USER.md — replace with onboarding template for public release
 cat > "$OUTPUT_DIR/src/genesis/identity/USER.md" << 'USERMD'
