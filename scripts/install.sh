@@ -1202,8 +1202,8 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  Configuring timezone..."
 
-GENESIS_TIMEZONE=""
-if [ -f "$SECRETS_FILE" ]; then
+GENESIS_TIMEZONE="${GENESIS_TIMEZONE:-}"
+if [ -z "$GENESIS_TIMEZONE" ] && [ -f "$SECRETS_FILE" ]; then
     GENESIS_TIMEZONE=$(grep -oP '^USER_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
     [ -z "$GENESIS_TIMEZONE" ] && GENESIS_TIMEZONE=$(grep -oP '^GENESIS_TIMEZONE=\K.*' "$SECRETS_FILE" 2>/dev/null || true)
 fi
