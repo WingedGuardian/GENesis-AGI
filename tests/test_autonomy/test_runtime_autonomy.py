@@ -33,10 +33,11 @@ class TestAutonomyProperties:
 
 
 class TestAutonomyInit:
-    def test_init_autonomy_creates_components(self):
+    @pytest.mark.asyncio
+    async def test_init_autonomy_creates_components(self):
         """_init_autonomy loads protection, classifier, verifier even without DB."""
         rt = GenesisRuntime.instance()
-        rt._init_autonomy()
+        await rt._init_autonomy()
         # Protected paths, classifier, verifier should be set
         assert rt.protected_paths is not None
         assert rt.action_classifier is not None
@@ -58,12 +59,17 @@ class TestAutonomyInit:
 
         rt = GenesisRuntime.instance()
         rt._db = conn
-        rt._init_autonomy()
+        await rt._init_autonomy()
 
         assert rt.autonomy_manager is not None
         assert rt.protected_paths is not None
         assert rt.action_classifier is not None
         assert rt.task_verifier is not None
+
+        # Verify state was seeded (load_or_create_defaults called)
+        cursor = await conn.execute("SELECT COUNT(*) FROM autonomy_state")
+        row = await cursor.fetchone()
+        assert row[0] > 0, "autonomy_state should be seeded after init"
 
         await conn.close()
 
