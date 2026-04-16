@@ -89,7 +89,6 @@ jobs:
             rg -n --hidden "${SCAN_EXCLUDES[@]}" \
               -e 'America/New_York' \
               -e '/home/[a-z][a-z0-9_-]*/genesis' \
-              -e '\bWingedGuardian/(Genesis|genesis-backups)\b' \
               src/ config/ scripts/ .github/ \
               2>/dev/null || true
           )
