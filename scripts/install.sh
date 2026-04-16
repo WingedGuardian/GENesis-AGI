@@ -1223,7 +1223,8 @@ if command -v timedatectl &>/dev/null; then
         echo "    + System timezone set to $GENESIS_TIMEZONE" || \
         echo "    WARNING: Could not set timezone. Set manually: sudo timedatectl set-timezone $GENESIS_TIMEZONE"
 fi
-if [ -f "$SECRETS_FILE" ] && ! grep -q "^USER_TIMEZONE=" "$SECRETS_FILE" 2>/dev/null; then
+if [ -f "$SECRETS_FILE" ]; then
+    # Always update — template ships with USER_TIMEZONE=UTC
     set_secret "USER_TIMEZONE" "$GENESIS_TIMEZONE" "$SECRETS_FILE"
     echo "    + Saved to secrets.env"
 fi
