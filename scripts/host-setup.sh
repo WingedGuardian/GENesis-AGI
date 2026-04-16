@@ -111,12 +111,22 @@ echo ""
 echo "  Pre-flight checks..."
 PREFLIGHT_OK=1
 
-# Root or sudo
-if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
-    echo "    FAIL  Need root or passwordless sudo"
-    PREFLIGHT_OK=0
+# Root or sudo — prompt for password once if needed (caches for script duration)
+if [ "$(id -u)" = "0" ]; then
+    echo "    OK    Root access"
+elif sudo -n true 2>/dev/null; then
+    echo "    OK    Passwordless sudo"
+elif [ "$NON_INTERACTIVE" = "0" ]; then
+    echo "    Sudo requires a password. Enter it once — the script handles the rest."
+    if sudo -v 2>/dev/null; then
+        echo "    OK    Sudo authenticated"
+    else
+        echo "    FAIL  Sudo authentication failed"
+        PREFLIGHT_OK=0
+    fi
 else
-    echo "    OK    Root/sudo access"
+    echo "    FAIL  Need root or passwordless sudo (non-interactive mode)"
+    PREFLIGHT_OK=0
 fi
 
 # OS check
@@ -577,6 +587,52 @@ if ! incus exec "$CONTAINER_NAME" -- bash -c 'getent hosts github.com' &>/dev/nu
 fi
 echo "  + DNS resolution OK"
 
+# ── Timezone detection ────────────────────────────────────────
+# Detect timezone via IP geolocation, confirm with user, set on host + container.
+# This is the one moment we have interactive access + sudo on both machines.
+_detected_tz=""
+_final_tz="UTC"
+
+# Try IP geolocation (the install requires internet, so this should work)
+_detected_tz=$(curl -sf --max-time 5 "http://ip-api.com/json?fields=timezone" 2>/dev/null | \
+    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
+
+# Fallback: host system timezone (may be UTC on fresh cloud VMs)
+if [ -z "$_detected_tz" ]; then
+    _detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
+fi
+
+if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ]; then
+    echo ""
+    echo "  Detected timezone: $_detected_tz"
+    read -r -p "  Is this correct? [Y/n] " _tz_confirm </dev/tty
+    if [ "$_tz_confirm" = "n" ] || [ "$_tz_confirm" = "N" ]; then
+        read -r -p "  Enter timezone (e.g., America/New_York, Europe/London): " _manual_tz </dev/tty
+        # Validate against system timezone list
+        if timedatectl list-timezones 2>/dev/null | grep -qx "$_manual_tz"; then
+            _final_tz="$_manual_tz"
+        else
+            echo "  WARN: '$_manual_tz' not recognized. Using $_detected_tz."
+            _final_tz="$_detected_tz"
+        fi
+    else
+        _final_tz="$_detected_tz"
+    fi
+else
+    _final_tz="$_detected_tz"
+fi
+
+# Set on host VM
+if [ "$_final_tz" != "UTC" ] && [ "$_final_tz" != "Etc/UTC" ]; then
+    sudo timedatectl set-timezone "$_final_tz" 2>/dev/null || true
+fi
+
+# Set inside container
+incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null || \
+    incus exec "$CONTAINER_NAME" -- ln -sf "/usr/share/zoneinfo/$_final_tz" /etc/localtime 2>/dev/null || true
+
+echo "  + Timezone: $_final_tz (host + container)"
+
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
 
@@ -700,6 +756,8 @@ if command -v tailscale &>/dev/null && ! tailscale ip -4 &>/dev/null; then
             _ts_i=$((_ts_i + 1))
             tailscale ip -4 &>/dev/null && break
         done
+        # Kill the blocking tailscale up — it never exits without auth
+        sudo kill "$_ts_pid" 2>/dev/null
         wait "$_ts_pid" 2>/dev/null || true
         if tailscale ip -4 &>/dev/null; then
             echo "  + Tailscale authenticated: $(tailscale ip -4)"
@@ -799,28 +857,28 @@ _smoke_ok=0
 _smoke_fail=""
 
 # 1. /tmp exists and is writable
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
+if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n"
 fi
 
 # 2. Python works
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
+if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n"
 fi
 
 # 3. Genesis venv is intact
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
+if timeout -k 5 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n"
 fi
 
 # 4. Qdrant is reachable
-if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null; then
+if timeout -k 5 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null; then
     _smoke_ok=$((_smoke_ok + 1))
 else
     _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n"
@@ -830,7 +888,10 @@ fi
 _server_tries=0
 _server_ok=0
 while [ "$_server_tries" -lt 5 ]; do
-    if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:5000/api/genesis/health &>/dev/null; then
+    # Accept 200 (healthy) or 503 (running but not bootstrapped — expected on fresh install)
+    _http_code=$(timeout -k 5 15 incus exec "$CONTAINER_NAME" -- \
+        curl -so /dev/null -w '%{http_code}' --max-time 5 http://localhost:5000/api/genesis/health 2>/dev/null || echo "000")
+    if [ "$_http_code" = "200" ] || [ "$_http_code" = "503" ]; then
         _server_ok=1
         break
     fi
