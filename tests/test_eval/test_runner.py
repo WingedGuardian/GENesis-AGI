@@ -80,6 +80,36 @@ async def test_run_eval_provider_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 401, 402, 403, 404, 429, 503])
+async def test_run_eval_provider_refusal_skipped(status_code):
+    """Provider-refusal status codes (auth/billing/not-found/rate-limit) are
+    treated as transient and excluded from the score denominator."""
+    config = _make_config()
+
+    async def mock_call(provider, model_id, messages, **kwargs):
+        return CallResult(
+            success=False,
+            error=f"provider error HTTP {status_code}",
+            status_code=status_code,
+        )
+
+    with patch("genesis.eval.runner.LiteLLMDelegate") as MockDelegate:
+        instance = MockDelegate.return_value
+        instance.call = mock_call
+        summary = await run_eval(
+            provider_name="test-provider",
+            dataset_name="classification",
+            config=config,
+        )
+
+    assert summary.total_cases == 15
+    assert summary.skipped_cases == 15, (
+        f"status {status_code} should be skipped, not counted as failure"
+    )
+    assert summary.failed_cases == 0
+
+
+@pytest.mark.asyncio
 async def test_run_eval_unknown_provider():
     config = _make_config("other")
     with pytest.raises(ValueError, match="unknown provider"):
