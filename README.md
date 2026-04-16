@@ -159,6 +159,16 @@ The architecture docs in [`docs/architecture/`](docs/architecture/) cover the fu
 
 ---
 
+## Your Genesis
+
+Your Genesis install is one operational system: the public `GENesis-AGI` codebase you clone, your private fork for customizations and contributions, and your private `genesis-backups` repo holding your encrypted data. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md) for the full model.
+
+- **Back up** — `scripts/backup.sh` runs every 6h via cron after setup. SQLite, Qdrant snapshots, memory, transcripts, and secrets are GPG-encrypted with your `GENESIS_BACKUP_PASSPHRASE` before push.
+- **Restore after disk failure** — `git clone <your-fork>` → `scripts/bootstrap.sh` → `scripts/restore.sh` (or `python -m genesis restore`). You'll be prompted for the passphrase.
+- **Contribute a bug fix** — Genesis offers to contribute upstream automatically when you commit a `fix:` commit. Say yes; the pipeline auto-creates your fork, sanitizes the diff, and opens the PR.
+
+---
+
 ## How it thinks 🧠
 
 Genesis has three cognitive layers that work in a continuous loop:
