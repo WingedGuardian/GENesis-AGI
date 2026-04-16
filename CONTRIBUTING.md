@@ -36,8 +36,16 @@ ruff check . && pytest -v
 
 ## Making changes
 
+### Two contribution paths
+
+**For bug fixes while running Genesis** — use the pipeline. Genesis detects `fix:` commits and offers to contribute them upstream. Just accept. The pipeline auto-creates your fork, sanitizes the diff (stripping personal paths, secrets, PII), and opens the PR against `main`. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md).
+
+**For features or larger changes** — use the standard open-source flow below.
+
+### Standard flow (features, larger changes)
+
 1. **Fork the repo** and clone your fork
-2. **Create a branch**: `git checkout -b <scope>/<description>` (e.g., `fix/memory-recall-timeout`)
+2. **Create a branch**: `git checkout -b <scope>/<description>` (e.g., `feat/memory-recall-timeout`)
 3. **Make your changes** — target ~600 LOC per file, hard cap 1000
 4. **Run lint + tests**: `ruff check . && pytest -v`
 5. **Commit** with a conventional prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`

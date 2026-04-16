@@ -26,7 +26,9 @@ what they miss — that's part of your job.
 - **Qdrant**: `localhost:6333` (systemd service)
 - **GitHub**: configured in `~/.genesis/config/genesis.yaml` (`github.user` / `github.public_repo`)
 - **Database**: `~/genesis/data/genesis.db` (NOT `~/genesis/genesis.db`)
-- **Backups**: private repo, cron every 6h (`scripts/backup.sh`). Repo name in local config.
+- **Backups**: encrypted 6h cron via `scripts/backup.sh` → your private
+  `genesis-backups` repo (SQLite, Qdrant, memory, transcripts, config,
+  secrets). Restore via `scripts/restore.sh` or `python -m genesis restore`.
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 
@@ -75,10 +77,12 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
   patterns, `$CLAUDE_PROJECT_DIR` usage) are in the `genesis-development`
   skill's `references/architecture.md`.
 
-## Dual-Repo Distribution
+## Your Genesis
 
-Two repos: private `GENesis` (working) and `GENesis-AGI` (public distribution).
-Sync via `scripts/prepare-public-release.sh`. Full details: `.claude/docs/dual-repo.md`.
+Your Genesis install is one operational system: the public `GENesis-AGI`
+codebase, your private fork for customizations, and your private
+`genesis-backups` repo for encrypted data. Full model:
+`.claude/docs/your-genesis.md`.
 
 ## Documentation
 
