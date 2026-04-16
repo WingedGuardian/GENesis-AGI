@@ -619,7 +619,8 @@ if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ]; then
         _final_tz="$_detected_tz"
     fi
 else
-    _final_tz="$_detected_tz"
+    # Non-interactive or detection failed — keep detected value or UTC default
+    _final_tz="${_detected_tz:-UTC}"
 fi
 
 # Set on host VM
@@ -757,7 +758,7 @@ if command -v tailscale &>/dev/null && ! tailscale ip -4 &>/dev/null; then
             tailscale ip -4 &>/dev/null && break
         done
         # Kill the blocking tailscale up — it never exits without auth
-        sudo kill "$_ts_pid" 2>/dev/null
+        kill -0 "$_ts_pid" 2>/dev/null && sudo kill "$_ts_pid" 2>/dev/null
         wait "$_ts_pid" 2>/dev/null || true
         if tailscale ip -4 &>/dev/null; then
             echo "  + Tailscale authenticated: $(tailscale ip -4)"
