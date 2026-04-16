@@ -11,6 +11,7 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 
 def _parse_approval_rows(rows: list[dict]) -> list[dict]:
+    now = datetime.now(UTC)
     parsed: list[dict] = []
     for row in rows:
         entry = dict(row)
@@ -21,6 +22,27 @@ def _parse_approval_rows(rows: list[dict]) -> list[dict]:
         if not isinstance(context, dict):
             context = {}
         entry["context_data"] = context
+
+        # Staleness indicator for pending approvals
+        created = entry.get("created_at")
+        if created and entry.get("status") == "pending":
+            try:
+                created_dt = datetime.fromisoformat(created)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=UTC)
+                age = now - created_dt
+                age_hours = age.total_seconds() / 3600
+                entry["age_hours"] = round(age_hours, 1)
+                if age_hours < 4:
+                    entry["freshness"] = "fresh"
+                elif age_hours < 24:
+                    entry["freshness"] = "aging"
+                else:
+                    entry["freshness"] = "stale"
+            except (ValueError, TypeError):
+                entry["age_hours"] = None
+                entry["freshness"] = "unknown"
+
         parsed.append(entry)
     return parsed
 

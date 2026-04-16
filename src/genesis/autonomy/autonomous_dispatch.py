@@ -122,6 +122,32 @@ class AutonomousCliApprovalGate:
         self._policy_loader = policy_loader
         self._delivery_to_request: dict[str, str] = {}
 
+    async def hydrate_delivery_map(self, db) -> int:
+        """Rebuild _delivery_to_request from pending approvals in DB.
+
+        Call at startup to restore quote-reply resolution after restart.
+        Returns number of mappings restored.
+        """
+        from genesis.db.crud import approval_requests
+
+        pending = await approval_requests.list_pending(db)
+        count = 0
+        for row in pending:
+            request_id = row.get("id")
+            context_raw = row.get("context")
+            if not request_id or not context_raw:
+                continue
+            context = _json_loads(context_raw)
+            delivery_id = context.get("delivery_id")
+            if delivery_id:
+                self._delivery_to_request[str(delivery_id)] = request_id
+                count += 1
+        if count:
+            logger.info(
+                "Hydrated delivery-to-request map: %d pending approvals", count,
+            )
+        return count
+
     def _policy(self):
         return self._policy_loader()
 
