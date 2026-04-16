@@ -828,16 +828,20 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     if [ "$NON_INTERACTIVE" = "1" ]; then
         _install_flags="--non-interactive"
     fi
-    # Note: we do NOT pass --force-interactive here. incus exec -t allocates a
-    # pseudo-TTY, so install.sh's should_prompt ([ -t 0 ]) should work. If it
-    # doesn't on a specific platform, the user can re-run install.sh inside the
-    # container directly where TTY detection is reliable.
+    # Use -t (PTY) when we have a real terminal, -T (no PTY) otherwise.
+    # install.sh uses `[ -t 0 ]` (should_prompt) to decide interactive mode.
+    # If we pass -t without a real terminal, incus allocates a zombie PTY and
+    # install.sh's reads block forever waiting for input that can't arrive.
+    _incus_tty="-T"
+    if (exec </dev/tty) 2>/dev/null; then
+        _incus_tty="-t"
+    fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         --env "HOME=/home/ubuntu" \
         --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
-        -t --cwd /home/ubuntu/genesis -- \
+        $_incus_tty --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
         _install_ok=0
