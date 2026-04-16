@@ -405,7 +405,7 @@ class OutreachPipeline:
                 }),
                 reason=reason,
                 staleness_policy="drain",
-                staleness_ttl_s=3600,
+                staleness_ttl_s=14400,  # 4h — accommodates 5 retries with backoff
             )
         except Exception:
             logger.exception("Failed to defer outreach %s", outreach_id)
