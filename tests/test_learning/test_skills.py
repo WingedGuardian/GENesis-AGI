@@ -61,6 +61,12 @@ class TestWiring:
         monkeypatch.setattr(
             "genesis.learning.skills.wiring._GENESIS_SKILLS_DIR", tmp_path
         )
+        # wiring.py now scans two tiers (core + .claude/); patch both so the
+        # real .claude/skills/ dir doesn't leak into the test result.
+        monkeypatch.setattr(
+            "genesis.learning.skills.wiring._CLAUDE_SKILLS_DIR",
+            tmp_path / "nonexistent",
+        )
         assert list_available_skills() == ["alpha", "gamma"]
 
     def test_get_skill_path(self, tmp_path: Path, monkeypatch):
@@ -68,6 +74,10 @@ class TestWiring:
         (tmp_path / "foo" / "SKILL.md").write_text("content")
         monkeypatch.setattr(
             "genesis.learning.skills.wiring._GENESIS_SKILLS_DIR", tmp_path
+        )
+        monkeypatch.setattr(
+            "genesis.learning.skills.wiring._CLAUDE_SKILLS_DIR",
+            tmp_path / "nonexistent",
         )
         assert get_skill_path("foo") == tmp_path / "foo" / "SKILL.md"
         assert get_skill_path("missing") is None
@@ -78,6 +88,10 @@ class TestWiring:
         monkeypatch.setattr(
             "genesis.learning.skills.wiring._GENESIS_SKILLS_DIR", tmp_path
         )
+        monkeypatch.setattr(
+            "genesis.learning.skills.wiring._CLAUDE_SKILLS_DIR",
+            tmp_path / "nonexistent",
+        )
         assert load_skill("bar") == "bar content"
         assert load_skill("nope") is None
 
@@ -85,6 +99,10 @@ class TestWiring:
         monkeypatch.setattr(
             "genesis.learning.skills.wiring._GENESIS_SKILLS_DIR",
             tmp_path / "nonexistent",
+        )
+        monkeypatch.setattr(
+            "genesis.learning.skills.wiring._CLAUDE_SKILLS_DIR",
+            tmp_path / "also-nonexistent",
         )
         assert list_available_skills() == []
 

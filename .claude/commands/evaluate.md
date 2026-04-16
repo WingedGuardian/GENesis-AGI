@@ -101,9 +101,9 @@ Every actionable item gets a version tag:
 - **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
 
 ### Phase Mapping
-Map actionable items to specific Genesis build phases. If a finding is
-"Phase 6 work," say so. If it requires a new phase or cross-cutting work,
-flag it.
+V3 build phases (0-9) are all complete. Map actionable items to version
+scope only (V3 improvement, V4, V5, Future, Never). Do not reference
+build phase numbers — they are historical.
 
 ## Phase 4: Discussion & Refinement
 
@@ -120,32 +120,25 @@ When evaluating autonomously (strategic reflection, surplus research):
 
 ## Phase 5: Documentation
 
-### Living Design Document
-Update `docs/plans/2026-03-08-research-insights-and-followups.md` (or create
-a new dated document for major research sessions) with:
+### Action Item Filing
 
-- Source and summary for each finding
-- Four-lens evaluation results
-- Architecture comparison tables
-- Categorized follow-up items:
-  - **Infrastructure** (near-term setup/integration)
-  - **Architecture** (design changes, phase inputs)
-  - **Research** (further investigation needed)
-  - **UX** (dashboard, interface, user experience)
+Evaluations produce action items. File them by scope:
+
+- **V3 improvements** (actionable now) → `docs/actions/genesis/active.md`
+- **V4/V5/deferred** (future scope) → `docs/actions/genesis/deferred.md`
+
+Follow the format in `docs/actions/README.md`. Each item needs:
+- Source (this evaluation)
+- Date
+- Description of what to do
+- Scope tag (V3 / V4 / V5 / Future / Never)
+- For deferred items: reason for deferral
 
 ### Cross-Reference Updates
 When findings affect existing design documents, update them:
-- Build phases doc — new items for specific phases
-- Agentic runtime doc — open questions, session config
+- Architecture docs — design changes, open questions
 - Gap assessment — newly identified gaps
 - Memory files — key learnings for session persistence
-
-### Action Items
-Every follow-up item must have:
-- Clear description of what to do
-- Phase/version scope tag
-- Dependency on other items (if any)
-- Priority indicator (blocking vs nice-to-have)
 
 ## Anti-Patterns
 

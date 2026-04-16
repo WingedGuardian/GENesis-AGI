@@ -53,12 +53,25 @@ class SkillRefiner:
 
     def _build_prompt(self, report: SkillReport, current_content: str) -> str:
         lines = len(current_content.splitlines())
-        progressive_note = ""
+        notes: list[str] = []
+
         if lines > 500:  # noqa: PLR2004
-            progressive_note = (
-                "\n\nIMPORTANT: This skill is over 500 lines. Consider restructuring "
+            notes.append(
+                "IMPORTANT: This skill is over 500 lines. Consider restructuring "
                 "into a shorter SKILL.md with references/ for detailed content."
             )
+
+        # Encourage examples if missing
+        if "## Example" not in current_content and "## Examples: Not Required" not in current_content:
+            notes.append(
+                "NOTE: This skill lacks an Examples section. Include at least one "
+                "realistic input→output example in your proposed content to anchor "
+                "expected behavior and prevent output drift."
+            )
+
+        notes_block = "\n\n".join(notes)
+        if notes_block:
+            notes_block = f"\n\n{notes_block}"
 
         baseline_str = (
             f"\n- Baseline: {report.baseline_success_rate:.1%}"
@@ -77,7 +90,7 @@ class SkillRefiner:
             f"- Failure patterns: {', '.join(report.failure_patterns) or 'none'}\n"
             f"- Tools used: {', '.join(report.tools_used) or 'none'}\n"
             f"- Tools declared: {', '.join(report.tools_declared) or 'none'}\n"
-            f"{progressive_note}\n\n"
+            f"{notes_block}\n\n"
             f"## Current Content ({lines} lines)\n```\n{current_content[:3000]}\n```\n\n"
             f"Respond with JSON:\n"
             f'{{"proposed_content": "...", "rationale": "...", '
