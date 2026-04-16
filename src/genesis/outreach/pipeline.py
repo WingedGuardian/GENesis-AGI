@@ -288,29 +288,6 @@ class OutreachPipeline:
                 error=f"No adapter or recipient for {channel}",
             )
 
-        # Delivery-layer dedup: reject duplicate content within 60s window
-        if self._db:
-            try:
-                from genesis.outreach.governance import content_hash as _chash
-                _hash = _chash(formatted.text)
-                cursor = await self._db.execute(
-                    "SELECT 1 FROM outreach_log WHERE content_hash = ? "
-                    "AND channel = ? AND delivered_at >= datetime('now', '-60 seconds')",
-                    (_hash, channel),
-                )
-                if await cursor.fetchone():
-                    logger.warning("Delivery dedup: identical message within 60s, skipping")
-                    return OutreachResult(
-                        outreach_id=outreach_id,
-                        status=OutreachStatus.DELIVERED,
-                        channel=channel,
-                        message_content=formatted.text,
-                    )
-            except aiosqlite.OperationalError:
-                pass  # outreach_log table may not exist yet
-            except Exception:
-                logger.warning("Delivery dedup check failed", exc_info=True)
-
         # Determine delivery routing: supergroup, dm, or both
         routing = "supergroup"  # default
         if self._config:

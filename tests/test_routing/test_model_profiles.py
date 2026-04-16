@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import textwrap
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -13,6 +14,13 @@ from genesis.routing.model_profiles import (
     TIER_SCORES,
     ModelProfileRegistry,
 )
+
+# Reference date used by staleness fixtures below.
+# model-a and model-c set last_reviewed = REFERENCE_DATE (fresh);
+# model-b sets last_reviewed = "2026-01-01" (stale).
+# TestStaleness tests patch datetime.now() to return this date so the
+# asserts don't break as real time passes.
+REFERENCE_DATE = datetime(2026, 3, 14, tzinfo=UTC)
 
 
 @pytest.fixture()
@@ -230,9 +238,9 @@ class TestMatcher:
     ) -> None:
         mock_cb_registry = MagicMock()
         unhealthy_cb = MagicMock()
-        unhealthy_cb.is_healthy = False
+        unhealthy_cb.is_available.return_value = False
         healthy_cb = MagicMock()
-        healthy_cb.is_healthy = True
+        healthy_cb.is_available.return_value = True
 
         def get_cb(provider: str):
             if provider == "alpha":
@@ -261,16 +269,42 @@ class TestMatcher:
         assert len(results) >= 1
 
 
+class _FrozenDatetime(datetime):
+    """datetime subclass whose now() returns REFERENCE_DATE, for deterministic
+    staleness tests. Subclass rather than monkeypatching a specific method so
+    ``isinstance(x, datetime)`` still holds everywhere."""
+
+    @classmethod
+    def now(cls, tz=None):  # type: ignore[override]
+        if tz is None:
+            return REFERENCE_DATE.replace(tzinfo=None)
+        return REFERENCE_DATE.astimezone(tz)
+
+
+@pytest.fixture()
+def _freeze_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freeze datetime.now() in the model_profiles module to REFERENCE_DATE
+    so that fixture dates (which assume 'today' is 2026-03-14) stay valid
+    regardless of when the tests run."""
+    monkeypatch.setattr(
+        "genesis.routing.model_profiles.datetime", _FrozenDatetime,
+    )
+
+
 class TestStaleness:
     """Stale profile detection."""
 
-    def test_stale_detected(self, registry: ModelProfileRegistry) -> None:
+    def test_stale_detected(
+        self, registry: ModelProfileRegistry, _freeze_now: None,
+    ) -> None:
         # model-b last reviewed 2026-01-01 — over 30 days ago from 2026-03-14
         stale = registry.stale_profiles(days=30)
         names = [p.name for p in stale]
         assert "model-b" in names
 
-    def test_fresh_not_stale(self, registry: ModelProfileRegistry) -> None:
+    def test_fresh_not_stale(
+        self, registry: ModelProfileRegistry, _freeze_now: None,
+    ) -> None:
         # model-a and model-c reviewed 2026-03-14 — fresh
         stale = registry.stale_profiles(days=30)
         names = [p.name for p in stale]

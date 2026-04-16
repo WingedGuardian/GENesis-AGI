@@ -110,6 +110,9 @@ class ContextBundle:
     cost_summary: CostSummary = field(default_factory=CostSummary)
     pending_work: PendingWorkSummary = field(default_factory=PendingWorkSummary)
     recent_conversations: list[dict] = field(default_factory=list)
+    # IDs of observations retrieved for deep reflection context — used to
+    # mark influenced AFTER reflection produces output, not before.
+    gathered_observation_ids: tuple[str, ...] = ()
 
 
 # ── Deep reflection output types ──────────────────────────────────────
@@ -172,6 +175,7 @@ class DeepReflectionOutput:
     confidence: float = 0.7
     separability: float | None = None
     alternative_assessment: str | None = None
+    parse_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,7 @@ class WeeklyAssessmentOutput:
     overall_score: float = 0.0
     observations: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
+    parse_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,3 +219,4 @@ class QualityCalibrationOutput:
     per_procedure_trends: list[ProcedureTrend] = field(default_factory=list)
     quarantine_candidates: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
+    parse_failed: bool = False
