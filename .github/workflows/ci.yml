@@ -83,6 +83,7 @@ jobs:
             --glob '!**/config/modules/career-agent.yaml'
             --glob '!**/config/external-modules/**'
             --glob '!**/tests/**'
+            --glob '!**/.github/workflows/ci.yml'
           )
           hits=$(
             rg -n --hidden "${SCAN_EXCLUDES[@]}" \
