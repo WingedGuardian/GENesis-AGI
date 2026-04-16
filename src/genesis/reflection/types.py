@@ -110,6 +110,9 @@ class ContextBundle:
     cost_summary: CostSummary = field(default_factory=CostSummary)
     pending_work: PendingWorkSummary = field(default_factory=PendingWorkSummary)
     recent_conversations: list[dict] = field(default_factory=list)
+    # IDs of observations retrieved for deep reflection context — used to
+    # mark influenced AFTER reflection produces output, not before.
+    gathered_observation_ids: tuple[str, ...] = ()
 
 
 # ── Deep reflection output types ──────────────────────────────────────

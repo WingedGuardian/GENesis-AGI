@@ -213,10 +213,14 @@ class OutputRouter:
 
     async def route(
         self, output: DeepReflectionOutput, db: aiosqlite.Connection,
+        *, gathered_obs_ids: tuple[str, ...] = (),
     ) -> dict:
         """Route all components of a deep reflection output to their stores.
 
         Returns a summary dict of what was routed.
+
+        ``gathered_obs_ids``: observation IDs fed into the reflection context.
+        Marked as "influenced" only when output is substantive.
         """
         summary: dict = {
             "observations_written": 0,
@@ -493,7 +497,18 @@ class OutputRouter:
             )
             summary["reflection_summary_stored"] = True
 
-        # 9. Emit events
+        # 9. Mark gathered observations as influenced (deferred from context
+        #    gathering — only mark after reflection produced real output)
+        if gathered_obs_ids:
+            try:
+                await observations.mark_influenced_batch(db, list(gathered_obs_ids))
+            except Exception:
+                logger.warning(
+                    "Failed to mark influenced observations after successful routing",
+                    exc_info=True,
+                )
+
+        # 10. Emit events
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
             await self._event_bus.emit(
