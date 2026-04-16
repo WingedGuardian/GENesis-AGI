@@ -20,6 +20,22 @@ except (ZoneInfoNotFoundError, KeyError):
     _USER_TZ = ZoneInfo(_DEFAULT_TZ)
 
 
+def reload() -> str:
+    """Re-read user timezone and update the module-level cache.
+
+    Call after changing the timezone in genesis.yaml. Returns the new
+    timezone name.
+    """
+    global _USER_TZ
+    tz_name = _get_user_timezone()
+    try:
+        _USER_TZ = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, KeyError):
+        _USER_TZ = ZoneInfo(_DEFAULT_TZ)
+        tz_name = _DEFAULT_TZ
+    return tz_name
+
+
 def fmt(iso_str: str, fmt_str: str = "%a %Y-%m-%d %H:%M %Z") -> str:
     """Convert a UTC ISO string to user-local formatted string.
 
