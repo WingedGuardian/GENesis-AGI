@@ -8,9 +8,9 @@
 #
 # Options:
 #   --container-name NAME  Container name (default: genesis)
-#   --ram SIZE             Memory limit (default: 24GiB)
-#   --disk SIZE            Disk size (default: 30GB)
-#   --cpus N               CPU limit (default: 8)
+#   --ram SIZE             Memory limit (default: auto-scaled to host, max 24GiB)
+#   --disk SIZE            Disk size (default: auto-scaled to host, max 30GB)
+#   --cpus N               CPU limit (default: all host CPUs)
 #   --repo URL             Genesis git repo URL (default: current remote)
 #   --branch NAME          Branch to clone (default: main)
 #   --non-interactive      Skip all prompts
@@ -59,14 +59,17 @@ INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
 _ORIG_ARGS="$*"
 _install_ok=1      # tracks install.sh success
 _guardian_ok=1     # tracks Guardian install success
+_RAM_EXPLICIT=0    # set to 1 if user passed --ram
+_DISK_EXPLICIT=0   # set to 1 if user passed --disk
+_CPUS_EXPLICIT=0   # set to 1 if user passed --cpus
 
 # ── Parse args ───────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
         --container-name) [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CONTAINER_NAME="$2"; shift ;;
-        --ram)            [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; RAM="$2"; shift ;;
-        --disk)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; DISK="$2"; shift ;;
-        --cpus)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CPUS="$2"; shift ;;
+        --ram)            [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; RAM="$2"; _RAM_EXPLICIT=1; shift ;;
+        --disk)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; DISK="$2"; _DISK_EXPLICIT=1; shift ;;
+        --cpus)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CPUS="$2"; _CPUS_EXPLICIT=1; shift ;;
         --repo)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; REPO_URL="$2"; shift ;;
         --branch)         [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; BRANCH="$2"; shift ;;
         --non-interactive) NON_INTERACTIVE=1 ;;
@@ -93,7 +96,10 @@ echo ""
 echo "  Genesis — Host VM Setup"
 echo "  ─────────────────────────────────────────"
 echo "  Container: $CONTAINER_NAME"
-echo "  RAM: $RAM | Disk: $DISK | CPUs: $CPUS"
+_banner_ram="$RAM"; [ "$_RAM_EXPLICIT" = "0" ] && _banner_ram="auto (max 24GiB)"
+_banner_disk="$DISK"; [ "$_DISK_EXPLICIT" = "0" ] && _banner_disk="auto (max 30GB)"
+_banner_cpus="$CPUS"; [ "$_CPUS_EXPLICIT" = "0" ] && _banner_cpus="auto"
+echo "  RAM: $_banner_ram | Disk: $_banner_disk | CPUs: $_banner_cpus"
 echo "  Repo: $REPO_URL ($BRANCH)"
 echo ""
 echo "  TIP: This script is safe to re-run. If anything fails or you get"
@@ -169,6 +175,76 @@ if [ "$PREFLIGHT_OK" = "0" ]; then
     echo ""
     echo "  Pre-flight FAILED — fix the errors above."
     exit 1
+fi
+
+# ── Auto-scale container resources to host capacity ──────────
+# Only adjusts defaults — explicit --ram/--disk/--cpus are never overridden.
+# Reserve 3GB RAM and 5GB disk for host OS, Guardian, and headroom.
+_HOST_RESERVE_RAM_GB=3
+_HOST_RESERVE_DISK_GB=5
+_autoscale_changed=0
+_check_avail_gb=$((check_avail_kb / 1048576))
+
+if [ "$_RAM_EXPLICIT" = "0" ]; then
+    _auto_ram=$((host_mem_gb - _HOST_RESERVE_RAM_GB))
+    # Cap at the default (no overallocation on large hosts)
+    if [ "$_auto_ram" -gt 24 ]; then
+        _auto_ram=24
+    fi
+    # Floor: 4GB minimum for Genesis + Qdrant + CC
+    if [ "$_auto_ram" -lt 4 ]; then
+        echo ""
+        echo "  FATAL: Host has ${host_mem_gb}GB RAM. After reserving ${_HOST_RESERVE_RAM_GB}GB"
+        echo "  for the host, only ${_auto_ram}GB remains — Genesis needs at least 4GB."
+        echo "  Minimum host RAM: $((4 + _HOST_RESERVE_RAM_GB))GB."
+        exit 1
+    fi
+    RAM="${_auto_ram}GiB"
+    _autoscale_changed=1
+fi
+
+if [ "$_DISK_EXPLICIT" = "0" ]; then
+    _auto_disk=$((_check_avail_gb - _HOST_RESERVE_DISK_GB))
+    # Cap at the default
+    if [ "$_auto_disk" -gt 30 ]; then
+        _auto_disk=30
+    fi
+    # Floor: 10GB minimum
+    if [ "$_auto_disk" -lt 10 ]; then
+        echo ""
+        echo "  FATAL: Only ${_check_avail_gb}GB disk available. After reserving"
+        echo "  ${_HOST_RESERVE_DISK_GB}GB for the host, only ${_auto_disk}GB remains"
+        echo "  — Genesis needs at least 10GB."
+        exit 1
+    fi
+    DISK="${_auto_disk}GB"
+    _autoscale_changed=1
+fi
+
+if [ "$_CPUS_EXPLICIT" = "0" ]; then
+    _auto_cpus=$(nproc 2>/dev/null || echo 4)
+    # No upper cap: unlike RAM/disk, CPU limits are soft cgroup caps — the
+    # container can use all cores but won't starve the host. Background tasks
+    # (awareness loop, reflection, triage) benefit from parallelism.
+    # Floor at 2
+    if [ "$_auto_cpus" -lt 2 ]; then
+        _auto_cpus=2
+    fi
+    CPUS="$_auto_cpus"
+    _autoscale_changed=1
+fi
+
+if [ "$_autoscale_changed" = "1" ]; then
+    echo ""
+    echo "  Auto-sized container resources to host capacity:"
+    echo "    RAM:  $RAM  (${host_mem_gb}GB host - ${_HOST_RESERVE_RAM_GB}GB reserved)"
+    echo "    Disk: $DISK  (${_check_avail_gb}GB available - ${_HOST_RESERVE_DISK_GB}GB reserved)"
+    echo "    CPUs: $CPUS  ($(nproc 2>/dev/null || echo '?') available)"
+    if [ "${_auto_ram:-99}" -lt 8 ]; then
+        echo ""
+        echo "    NOTE: Container RAM is ${RAM} — Genesis will work but may be"
+        echo "    slow under concurrent load. 8GB+ recommended for production use."
+    fi
 fi
 echo ""
 
