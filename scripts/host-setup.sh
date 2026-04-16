@@ -459,7 +459,7 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
         fi
     else
         if [ "$_container_healthy" = "0" ]; then
-            read -rp "  Delete and recreate? [Y/n] " _recreate
+            read -rp "  Delete and recreate? [Y/n] " _recreate || true
             if [ "${_recreate:-Y}" != "n" ] && [ "${_recreate:-Y}" != "N" ]; then
                 incus delete "$CONTAINER_NAME" --force
                 echo "  + Old container deleted"
@@ -467,7 +467,7 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
                 echo "  Continuing with existing container (repair attempt)."
             fi
         else
-            read -rp "  Delete and recreate? [y/N] " _recreate
+            read -rp "  Delete and recreate? [y/N] " _recreate || true
             if [ "${_recreate:-N}" = "y" ] || [ "${_recreate:-N}" = "Y" ]; then
                 incus delete "$CONTAINER_NAME" --force
                 echo "  + Old container deleted"
