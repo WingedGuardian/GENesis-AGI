@@ -221,7 +221,7 @@ class CCReflectionBridge:
                 )
 
         # 1. Build prompt
-        prompt = await build_reflection_prompt(
+        prompt, gathered_obs_ids = await build_reflection_prompt(
             depth, tick, db=db,
             context_gatherer=self._context_gatherer,
             context_assembler=self._context_assembler,
@@ -355,12 +355,32 @@ class CCReflectionBridge:
                     retry_output.model_used,
                 )
                 output = retry_output
+                if self._event_bus:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.REFLECTION, Severity.WARNING,
+                        "reflection.model_degraded",
+                        f"Strategic reflection fell back from {model} to "
+                        f"{retry_output.model_used} after retry",
+                        requested_model=str(model),
+                        actual_model=retry_output.model_used or "unknown",
+                        depth=depth.value,
+                    )
         elif used_cli and output.downgraded and depth == Depth.DEEP:
-            logger.info(
-                "Deep reflection model downgraded (%s -> %s), "
-                "proceeding (Sonnet adequate)",
+            logger.warning(
+                "Deep reflection model downgraded (%s -> %s), proceeding with weaker model",
                 model, output.model_used,
             )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.WARNING,
+                    "reflection.model_degraded",
+                    f"Deep reflection fell back from {model} to {output.model_used}",
+                    requested_model=str(model),
+                    actual_model=output.model_used or "unknown",
+                    depth=depth.value,
+                )
 
         if output.is_error:
             logger.error(
@@ -387,9 +407,15 @@ class CCReflectionBridge:
             )
 
         # 5. Route output
+        routing_failed = False
         if self._output_router and depth == Depth.DEEP:
             try:
-                await route_deep_output(output.text, db=db, output_router=self._output_router)
+                routing_summary = await route_deep_output(
+                    output.text, db=db, output_router=self._output_router,
+                    gathered_obs_ids=gathered_obs_ids,
+                )
+                if routing_summary.get("parse_failed") or routing_summary.get("empty_output"):
+                    routing_failed = True
             except Exception:
                 logger.error(
                     "Deep output routing failed — falling back to legacy store",
@@ -398,6 +424,14 @@ class CCReflectionBridge:
                 await store_reflection_output(depth, tick, output, db=db)
         else:
             await store_reflection_output(depth, tick, output, db=db)
+            # Mark influenced for non-deep paths (strategic, light) that
+            # go through store_reflection_output instead of OutputRouter
+            if gathered_obs_ids and output.text and output.text.strip():
+                try:
+                    from genesis.db.crud import observations
+                    await observations.mark_influenced_batch(db, list(gathered_obs_ids))
+                except Exception:
+                    logger.warning("Failed to mark influenced observations", exc_info=True)
 
         # 6. Send to topic
         await send_to_topic(session_id, depth, output, topic_manager=self._topic_manager)
@@ -408,6 +442,13 @@ class CCReflectionBridge:
             depth.value,
             output.cost_usd, output.input_tokens, output.output_tokens,
         )
+
+        if routing_failed:
+            return ReflectionResult(
+                success=False,
+                reason=f"{depth.value} reflection output was unparseable or empty — recorded as failure",
+            )
+
         return ReflectionResult(
             success=True,
             reason=f"{'CLI' if used_cli else 'API'} {depth.value} reflection completed",
@@ -480,6 +521,11 @@ class CCReflectionBridge:
         if self._output_router:
             from genesis.reflection.output_router import parse_weekly_assessment_output
             parsed = parse_weekly_assessment_output(output.text)
+            if parsed.parse_failed:
+                logger.error("Weekly assessment output could not be parsed")
+                return ReflectionResult(
+                    success=False, reason="Weekly assessment output unparseable",
+                )
             await self._output_router.route_assessment(parsed, db)
 
         logger.info("Weekly self-assessment completed")
@@ -550,6 +596,11 @@ class CCReflectionBridge:
         if self._output_router:
             from genesis.reflection.output_router import parse_quality_calibration_output
             parsed = parse_quality_calibration_output(output.text)
+            if parsed.parse_failed:
+                logger.error("Quality calibration output could not be parsed")
+                return ReflectionResult(
+                    success=False, reason="Quality calibration output unparseable",
+                )
             await self._output_router.route_calibration(parsed, db)
 
         logger.info("Quality calibration completed")

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -13,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("genesis.runtime")
 
 
-def init(rt: GenesisRuntime) -> None:
+async def init(rt: GenesisRuntime) -> None:
     """Initialize autonomy: protection, state machine, classification, verification."""
     try:
         from genesis.autonomy.classification import ActionClassifier
@@ -40,7 +39,8 @@ def init(rt: GenesisRuntime) -> None:
                 db=rt._db,
                 event_bus=rt._event_bus,
             )
-            logger.info("Autonomy manager created (state loading deferred to first use)")
+            await rt._autonomy_manager.load_or_create_defaults()
+            logger.info("Autonomy manager created and state seeded")
         else:
             logger.warning("DB not available — autonomy state machine disabled")
 
@@ -68,25 +68,45 @@ def init(rt: GenesisRuntime) -> None:
                     approval_gate=rt._autonomous_cli_approval_gate,
                 )
                 if rt._cc_reflection_bridge is not None:
-                    with contextlib.suppress(Exception):
+                    try:
                         rt._cc_reflection_bridge.set_autonomous_dispatcher(
                             rt._autonomous_dispatcher,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to wire autonomous dispatcher into reflection bridge",
+                            exc_info=True,
                         )
                 if rt._inbox_monitor is not None and hasattr(
                     rt._inbox_monitor, "set_autonomous_dispatcher",
                 ):
-                    with contextlib.suppress(Exception):
+                    try:
                         rt._inbox_monitor.set_autonomous_dispatcher(
                             rt._autonomous_dispatcher,
                         )
+                    except Exception:
+                        logger.warning(
+                            "Failed to wire autonomous dispatcher into inbox monitor",
+                            exc_info=True,
+                        )
                 logger.info("Autonomous dispatch router initialized")
             if rt._awareness_loop is not None:
-                with contextlib.suppress(Exception):
+                try:
                     rt._awareness_loop.set_autonomous_cli_policy_exporter(
                         rt._autonomous_cli_policy_exporter.export,
                     )
-            with contextlib.suppress(Exception):
+                except Exception:
+                    logger.warning(
+                        "Failed to wire CLI policy exporter into awareness loop",
+                        exc_info=True,
+                    )
+            try:
                 rt._autonomous_cli_policy_exporter.export()
+            except Exception:
+                logger.warning(
+                    "Failed initial CLI policy export",
+                    exc_info=True,
+                )
 
             from genesis.util.tasks import tracked_task
 

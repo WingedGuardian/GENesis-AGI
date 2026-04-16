@@ -271,11 +271,18 @@ class TestRouteDeepReflection:
         assert summary["contradictions"] == 1
 
     @pytest.mark.asyncio
-    async def test_empty_output_no_crash(self, db, router):
+    async def test_empty_output_detected_as_failure(self, db, router):
         output = DeepReflectionOutput()
         summary = await router.route(output, db)
+        assert summary.get("empty_output") is True
         assert summary["observations_written"] == 0
-        assert not summary["cognitive_state_updated"]
+
+    @pytest.mark.asyncio
+    async def test_parse_failed_detected(self, db, router):
+        output = DeepReflectionOutput(parse_failed=True)
+        summary = await router.route(output, db)
+        assert summary.get("parse_failed") is True
+        assert summary["observations_written"] == 0
 
 
 class TestRouteAssessment:

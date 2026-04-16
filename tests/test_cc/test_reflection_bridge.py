@@ -177,7 +177,7 @@ async def test_reflection_prompt_includes_cognitive_state(db, bridge, tick):
         section="active_context", generated_by="test", created_at=now,
     )
     from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
-    prompt = await build_reflection_prompt(
+    prompt, _obs_ids = await build_reflection_prompt(
         depth=Depth.DEEP, tick=tick, db=db,
         context_gatherer=None, context_assembler=None,
         prompt_dir=Path("/nonexistent"),
@@ -227,7 +227,7 @@ async def test_route_deep_output_success_skips_legacy(db, bridge, tick):
     from unittest.mock import patch
     bridge._output_router = AsyncMock()  # enable deep routing path
 
-    mock_route = AsyncMock()
+    mock_route = AsyncMock(return_value={"observations_written": 1})
     mock_store = AsyncMock()
 
     with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route), \
@@ -305,6 +305,7 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
         cost_summary=CostSummary(daily_usd=0.0, weekly_usd=0.0, monthly_usd=0.0,
                                  daily_budget_pct=0.0, weekly_budget_pct=0.0, monthly_budget_pct=0.0),
         recent_conversations=[],
+        gathered_observation_ids=("obs-1",),
     ))
 
     bridge = CCReflectionBridge(
@@ -319,7 +320,7 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
     )
 
     from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
-    prompt = await build_reflection_prompt(
+    prompt, obs_ids = await build_reflection_prompt(
         depth=Depth.STRATEGIC, tick=tick, db=db,
         context_gatherer=mock_gatherer, context_assembler=None,
         prompt_dir=Path("/nonexistent"),
@@ -328,6 +329,7 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
     assert "Observation content here" in prompt
     assert "Available Data Sources" in prompt
     assert "Strategic" in prompt
+    assert "obs-1" in obs_ids
 
 
 # ── Model downgrade response (Layer 2) ────────────────────────────

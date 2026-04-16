@@ -55,3 +55,7 @@ health_alerts:
     - "infra:tmpfs_low"
     - "infra:disk_low"
     - "infra:container_memory_high"
+    - "cc:quota_exhausted"
+    - "provider:embedding_failing"
+    - "provider:qdrant_unreachable"
+    - "awareness:tick_overdue"
