@@ -258,3 +258,67 @@ async def autonomy_config():
     drives = [dict(r) for r in await cursor.fetchall()]
 
     return jsonify({"drives": drives, "thresholds": thresholds})
+
+
+@blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
+@_async_route
+async def settings_timezone():
+    """Get or set the user's display timezone.
+
+    GET: returns {"timezone": "America/New_York"}
+    POST: {"timezone": "US/Eastern"} → validates, writes to genesis.yaml,
+          invalidates caches. Takes effect immediately for display;
+          scheduler CronTrigger timezone updates on next restart.
+    """
+    from genesis.env import user_timezone
+
+    if request.method == "GET":
+        return jsonify({"timezone": user_timezone()})
+
+    payload = request.get_json(silent=True) or {}
+    new_tz = payload.get("timezone", "").strip()
+    if not new_tz:
+        return jsonify({"error": "timezone is required"}), 400
+
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(new_tz)
+    except (ZoneInfoNotFoundError, KeyError):
+        return jsonify({"error": f"Invalid timezone: {new_tz}"}), 400
+
+    # Write to genesis.yaml
+    import tempfile
+    from pathlib import Path
+    cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    try:
+        import yaml
+        existing = {}
+        if cfg_path.is_file():
+            with cfg_path.open() as fh:
+                existing = yaml.safe_load(fh) or {}
+        existing["timezone"] = new_tz
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(cfg_path.parent), suffix=".yaml.tmp",
+        )
+        try:
+            import os
+            with os.fdopen(tmp_fd, "w") as f:
+                yaml.dump(existing, f, default_flow_style=False)
+            os.replace(tmp_path, str(cfg_path))
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+    except Exception as exc:
+        return jsonify({"error": f"Failed to write config: {exc}"}), 500
+
+    # Invalidate caches
+    from genesis.env import _invalidate_local_config
+    _invalidate_local_config()
+
+    from genesis.util.tz import reload as tz_reload
+    effective = tz_reload()
+
+    return jsonify({
+        "timezone": effective,
+        "note": "Scheduler timezone updates on next restart",
+    })
