@@ -172,6 +172,7 @@ class DeepReflectionOutput:
     confidence: float = 0.7
     separability: float | None = None
     alternative_assessment: str | None = None
+    parse_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ class WeeklyAssessmentOutput:
     overall_score: float = 0.0
     observations: list[str] = field(default_factory=list)
     recommendations: list[str] = field(default_factory=list)
+    parse_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -214,3 +216,4 @@ class QualityCalibrationOutput:
     per_procedure_trends: list[ProcedureTrend] = field(default_factory=list)
     quarantine_candidates: list[str] = field(default_factory=list)
     observations: list[str] = field(default_factory=list)
+    parse_failed: bool = False

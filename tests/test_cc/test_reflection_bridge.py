@@ -227,7 +227,7 @@ async def test_route_deep_output_success_skips_legacy(db, bridge, tick):
     from unittest.mock import patch
     bridge._output_router = AsyncMock()  # enable deep routing path
 
-    mock_route = AsyncMock()
+    mock_route = AsyncMock(return_value={"observations_written": 1})
     mock_store = AsyncMock()
 
     with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route), \

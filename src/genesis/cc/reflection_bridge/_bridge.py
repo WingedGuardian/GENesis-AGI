@@ -355,12 +355,32 @@ class CCReflectionBridge:
                     retry_output.model_used,
                 )
                 output = retry_output
+                if self._event_bus:
+                    from genesis.observability.types import Severity, Subsystem
+                    await self._event_bus.emit(
+                        Subsystem.REFLECTION, Severity.WARNING,
+                        "reflection.model_degraded",
+                        f"Strategic reflection fell back from {model} to "
+                        f"{retry_output.model_used} after retry",
+                        requested_model=str(model),
+                        actual_model=retry_output.model_used or "unknown",
+                        depth=depth.value,
+                    )
         elif used_cli and output.downgraded and depth == Depth.DEEP:
-            logger.info(
-                "Deep reflection model downgraded (%s -> %s), "
-                "proceeding (Sonnet adequate)",
+            logger.warning(
+                "Deep reflection model downgraded (%s -> %s), proceeding with weaker model",
                 model, output.model_used,
             )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.WARNING,
+                    "reflection.model_degraded",
+                    f"Deep reflection fell back from {model} to {output.model_used}",
+                    requested_model=str(model),
+                    actual_model=output.model_used or "unknown",
+                    depth=depth.value,
+                )
 
         if output.is_error:
             logger.error(
@@ -387,9 +407,14 @@ class CCReflectionBridge:
             )
 
         # 5. Route output
+        routing_failed = False
         if self._output_router and depth == Depth.DEEP:
             try:
-                await route_deep_output(output.text, db=db, output_router=self._output_router)
+                routing_summary = await route_deep_output(
+                    output.text, db=db, output_router=self._output_router,
+                )
+                if routing_summary.get("parse_failed") or routing_summary.get("empty_output"):
+                    routing_failed = True
             except Exception:
                 logger.error(
                     "Deep output routing failed — falling back to legacy store",
@@ -408,6 +433,13 @@ class CCReflectionBridge:
             depth.value,
             output.cost_usd, output.input_tokens, output.output_tokens,
         )
+
+        if routing_failed:
+            return ReflectionResult(
+                success=False,
+                reason=f"{depth.value} reflection output was unparseable or empty — recorded as failure",
+            )
+
         return ReflectionResult(
             success=True,
             reason=f"{'CLI' if used_cli else 'API'} {depth.value} reflection completed",
