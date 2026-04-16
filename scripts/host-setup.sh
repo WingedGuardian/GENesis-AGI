@@ -634,15 +634,6 @@ incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/nul
 
 echo "  + Timezone: $_final_tz (host + container)"
 
-# Pre-seed timezone in container's secrets.env so install.sh doesn't re-detect.
-# install.sh checks USER_TIMEZONE in secrets.env first (lines 1206-1208) and
-# skips its own timezone prompt if present.
-# Run as root (UBUNTU_UID not yet resolved), then chown so install.sh (as ubuntu) can write
-incus exec "$CONTAINER_NAME" -- \
-    bash -c "mkdir -p /home/ubuntu/genesis && f=/home/ubuntu/genesis/secrets.env && \
-    grep -q '^USER_TIMEZONE=' \"\$f\" 2>/dev/null || \
-    { echo 'USER_TIMEZONE=$_final_tz' >> \"\$f\" && chmod 600 \"\$f\"; }; \
-    chown -R ubuntu:ubuntu /home/ubuntu/genesis 2>/dev/null" 2>/dev/null || true
 
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
