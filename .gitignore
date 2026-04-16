@@ -55,3 +55,4 @@ docs/actions/user/*.md
 !docs/actions/README.md
 data/genesis.db
 *.jsonl
+.config/
