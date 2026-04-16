@@ -489,8 +489,8 @@ REMOTECONF
     echo "  Testing SSH connectivity (container → host)..."
     CONTAINER_IP=$(incus list "$CONTAINER_NAME" -f csv -c 4 2>/dev/null | grep -oP '[\d.]+' | head -1)
     SSH_TEST=$(incus exec "$CONTAINER_NAME" -- su - "$CONTAINER_USER" -c \
-        "ssh -i ${GUARDIAN_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${HOST_USER}@${HOST_IP} 'echo ok' 2>&1" || echo "FAILED")
-    if echo "$SSH_TEST" | grep -q "^ok"; then
+        "ssh -i ${GUARDIAN_KEY} -o StrictHostKeyChecking=no -o ConnectTimeout=5 ${HOST_USER}@${HOST_IP} ping 2>&1" || echo "FAILED")
+    if echo "$SSH_TEST" | grep -q '"ok": true'; then
         echo "  SSH bidirectional link verified"
     else
         echo ""
