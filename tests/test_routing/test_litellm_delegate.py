@@ -366,6 +366,35 @@ async def test_rate_limit_logs_warning():
     assert "rate-limited" in args[0]
 
 
+def test_should_log_failure_first_call_regardless_of_monotonic_value():
+    """Regression: first _should_log_failure call must log even when
+    time.monotonic() returns a small value (e.g., fresh CI runner with
+    system uptime < _FAILURE_LOG_INTERVAL_S).
+
+    Previously `_last_failure_log.get(provider, 0.0)` meant the check
+    `now - 0.0 >= 300` was False on fresh systems, silently suppressing
+    the first failure log. Fixed by using None as the "never seen" sentinel
+    (commit cf71db2). This test proves the invariant independently of host
+    uptime.
+    """
+    import genesis.routing.litellm_delegate as mod
+
+    mod._last_failure_log.clear()
+
+    with patch("genesis.routing.litellm_delegate.time.monotonic", return_value=10.0):
+        # now=10.0, no entry for "fresh-provider" → last is None → must log
+        assert mod._should_log_failure("fresh-provider") is True
+        # Second call at same "time" — now entry exists, interval not elapsed → suppress
+        assert mod._should_log_failure("fresh-provider") is False
+
+    # After the interval elapses, should log again
+    with patch(
+        "genesis.routing.litellm_delegate.time.monotonic",
+        return_value=10.0 + mod._FAILURE_LOG_INTERVAL_S + 1.0,
+    ):
+        assert mod._should_log_failure("fresh-provider") is True
+
+
 async def test_failure_logging_rate_limited():
     """Second failure within 5 minutes should NOT log."""
     import genesis.routing.litellm_delegate as mod
