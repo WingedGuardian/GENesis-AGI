@@ -8,9 +8,9 @@
 #
 # Options:
 #   --container-name NAME  Container name (default: genesis)
-#   --ram SIZE             Memory limit (default: 24GiB)
-#   --disk SIZE            Disk size (default: 30GB)
-#   --cpus N               CPU limit (default: 8)
+#   --ram SIZE             Memory limit (default: auto-scaled to host, max 24GiB)
+#   --disk SIZE            Disk size (default: auto-scaled to host, max 30GB)
+#   --cpus N               CPU limit (default: all host CPUs)
 #   --repo URL             Genesis git repo URL (default: current remote)
 #   --branch NAME          Branch to clone (default: main)
 #   --non-interactive      Skip all prompts
@@ -96,7 +96,10 @@ echo ""
 echo "  Genesis — Host VM Setup"
 echo "  ─────────────────────────────────────────"
 echo "  Container: $CONTAINER_NAME"
-echo "  RAM: $RAM | Disk: $DISK | CPUs: $CPUS"
+_banner_ram="$RAM"; [ "$_RAM_EXPLICIT" = "0" ] && _banner_ram="auto (max 24GiB)"
+_banner_disk="$DISK"; [ "$_DISK_EXPLICIT" = "0" ] && _banner_disk="auto (max 30GB)"
+_banner_cpus="$CPUS"; [ "$_CPUS_EXPLICIT" = "0" ] && _banner_cpus="auto"
+echo "  RAM: $_banner_ram | Disk: $_banner_disk | CPUs: $_banner_cpus"
 echo "  Repo: $REPO_URL ($BRANCH)"
 echo ""
 echo "  TIP: This script is safe to re-run. If anything fails or you get"
@@ -180,6 +183,7 @@ fi
 _HOST_RESERVE_RAM_GB=3
 _HOST_RESERVE_DISK_GB=5
 _autoscale_changed=0
+_check_avail_gb=$((check_avail_kb / 1048576))
 
 if [ "$_RAM_EXPLICIT" = "0" ]; then
     _auto_ram=$((host_mem_gb - _HOST_RESERVE_RAM_GB))
@@ -200,7 +204,6 @@ if [ "$_RAM_EXPLICIT" = "0" ]; then
 fi
 
 if [ "$_DISK_EXPLICIT" = "0" ]; then
-    _check_avail_gb=$((check_avail_kb / 1048576))
     _auto_disk=$((_check_avail_gb - _HOST_RESERVE_DISK_GB))
     # Cap at the default
     if [ "$_auto_disk" -gt 30 ]; then
@@ -220,6 +223,9 @@ fi
 
 if [ "$_CPUS_EXPLICIT" = "0" ]; then
     _auto_cpus=$(nproc 2>/dev/null || echo 4)
+    # No upper cap: unlike RAM/disk, CPU limits are soft cgroup caps — the
+    # container can use all cores but won't starve the host. Background tasks
+    # (awareness loop, reflection, triage) benefit from parallelism.
     # Floor at 2
     if [ "$_auto_cpus" -lt 2 ]; then
         _auto_cpus=2
@@ -232,10 +238,9 @@ if [ "$_autoscale_changed" = "1" ]; then
     echo ""
     echo "  Auto-sized container resources to host capacity:"
     echo "    RAM:  $RAM  (${host_mem_gb}GB host - ${_HOST_RESERVE_RAM_GB}GB reserved)"
-    _check_avail_gb=$((check_avail_kb / 1048576))
     echo "    Disk: $DISK  (${_check_avail_gb}GB available - ${_HOST_RESERVE_DISK_GB}GB reserved)"
     echo "    CPUs: $CPUS  ($(nproc 2>/dev/null || echo '?') available)"
-    if [ "${_auto_ram:-99}" -lt 8 ] 2>/dev/null; then
+    if [ "${_auto_ram:-99}" -lt 8 ]; then
         echo ""
         echo "    NOTE: Container RAM is ${RAM} — Genesis will work but may be"
         echo "    slow under concurrent load. 8GB+ recommended for production use."
