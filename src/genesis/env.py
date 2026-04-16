@@ -31,6 +31,13 @@ _LOCAL_CONFIG: dict | None = None
 _LOCAL_CONFIG_LOADED: bool = False
 
 
+def _invalidate_local_config() -> None:
+    """Clear the cached local config so next access re-reads from disk."""
+    global _LOCAL_CONFIG, _LOCAL_CONFIG_LOADED
+    _LOCAL_CONFIG = None
+    _LOCAL_CONFIG_LOADED = False
+
+
 def _local_config() -> dict:
     """Load ~/.genesis/config/genesis.yaml (cached after first call).
 
