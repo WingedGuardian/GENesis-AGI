@@ -512,6 +512,11 @@ class CCReflectionBridge:
         if self._output_router:
             from genesis.reflection.output_router import parse_weekly_assessment_output
             parsed = parse_weekly_assessment_output(output.text)
+            if parsed.parse_failed:
+                logger.error("Weekly assessment output could not be parsed")
+                return ReflectionResult(
+                    success=False, reason="Weekly assessment output unparseable",
+                )
             await self._output_router.route_assessment(parsed, db)
 
         logger.info("Weekly self-assessment completed")
@@ -582,6 +587,11 @@ class CCReflectionBridge:
         if self._output_router:
             from genesis.reflection.output_router import parse_quality_calibration_output
             parsed = parse_quality_calibration_output(output.text)
+            if parsed.parse_failed:
+                logger.error("Quality calibration output could not be parsed")
+                return ReflectionResult(
+                    success=False, reason="Quality calibration output unparseable",
+                )
             await self._output_router.route_calibration(parsed, db)
 
         logger.info("Quality calibration completed")
