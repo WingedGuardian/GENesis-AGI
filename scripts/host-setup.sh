@@ -632,11 +632,10 @@ if [ "$_final_tz" != "UTC" ] && [ "$_final_tz" != "Etc/UTC" ]; then
     sudo timedatectl set-timezone "$_final_tz" 2>/dev/null || true
 fi
 
-# Set inside container
-incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null || \
-    incus exec "$CONTAINER_NAME" -- ln -sf "/usr/share/zoneinfo/$_final_tz" /etc/localtime 2>/dev/null || true
+# Container timezone is set later (right before install.sh) because
+# apt-get with DEBIAN_FRONTEND=noninteractive reconfigures tzdata→UTC.
 
-echo "  + Timezone: $_final_tz (host + container)"
+echo "  + Timezone: $_final_tz (host)"
 
 
 # ── Set up user inside container ─────────────────────────────
@@ -835,6 +834,13 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     _incus_tty="-T"
     if (exec </dev/tty) 2>/dev/null; then
         _incus_tty="-t"
+    fi
+
+    # Set container timezone now (after apt-get which resets tzdata to UTC)
+    if [ -n "$_final_tz" ] && [ "$_final_tz" != "UTC" ]; then
+        incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null || \
+            incus exec "$CONTAINER_NAME" -- ln -sf "/usr/share/zoneinfo/$_final_tz" /etc/localtime 2>/dev/null || true
+        echo "  + Container timezone: $_final_tz"
     fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
