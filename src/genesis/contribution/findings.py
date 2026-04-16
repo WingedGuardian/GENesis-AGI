@@ -21,7 +21,7 @@ class Severity(StrEnum):
 class FindingKind(StrEnum):
     """Taxonomy of things the sanitizer can detect."""
 
-    SECRET = "secret"                  # detect-secrets / gitleaks hit
+    SECRET = "secret"                  # detect-secrets / gitleaks hit  # pragma: allowlist secret
     PORTABILITY = "portability"        # IPs, hostnames, absolute paths
     FINGERPRINT = "fingerprint"        # user-defined fingerprints
     EMAIL = "email"                    # personal email (outside allowlist)

@@ -20,8 +20,16 @@ _last_failure_log: dict[str, float] = {}
 
 def _should_log_failure(provider: str) -> bool:
     now = time.monotonic()
-    last = _last_failure_log.get(provider, 0.0)
-    if now - last >= _FAILURE_LOG_INTERVAL_S:
+    last = _last_failure_log.get(provider)
+    # Log the FIRST failure per provider unconditionally (last is None means
+    # we've never seen this provider). Previously used 0.0 as the "never
+    # seen" sentinel, which silently suppressed the first failure when
+    # process uptime was under _FAILURE_LOG_INTERVAL_S (e.g., fresh CI
+    # runners): time.monotonic() is system-wide, not process-relative, so
+    # the check `now - 0 >= 300` was False until 5 minutes of uptime had
+    # elapsed. That broke the intended "log first failure, suppress for
+    # 5 minutes" semantics on short-lived processes.
+    if last is None or now - last >= _FAILURE_LOG_INTERVAL_S:
         _last_failure_log[provider] = now
         return True
     return False

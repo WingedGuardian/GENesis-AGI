@@ -49,15 +49,15 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
                     data = json.loads(match.group(1))
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to parse extracted JSON from CC output")
-                    return DeepReflectionOutput()
+                    return DeepReflectionOutput(parse_failed=True)
             else:
-                return DeepReflectionOutput()
+                return DeepReflectionOutput(parse_failed=True)
         else:
             logger.warning("Failed to parse CC reflection output as JSON")
-            return DeepReflectionOutput()
+            return DeepReflectionOutput(parse_failed=True)
 
     if not isinstance(data, dict):
-        return DeepReflectionOutput()
+        return DeepReflectionOutput(parse_failed=True)
 
     # Parse memory operations
     mem_ops = []
@@ -131,12 +131,12 @@ def parse_weekly_assessment_output(raw_json: str) -> WeeklyAssessmentOutput:
             try:
                 data = json.loads(match.group(1))
             except (json.JSONDecodeError, TypeError):
-                return WeeklyAssessmentOutput()
+                return WeeklyAssessmentOutput(parse_failed=True)
         else:
-            return WeeklyAssessmentOutput()
+            return WeeklyAssessmentOutput(parse_failed=True)
 
     if not isinstance(data, dict):
-        return WeeklyAssessmentOutput()
+        return WeeklyAssessmentOutput(parse_failed=True)
 
     dims = []
     for d in data.get("dimensions", []):
@@ -171,12 +171,12 @@ def parse_quality_calibration_output(raw_json: str) -> QualityCalibrationOutput:
             try:
                 data = json.loads(match.group(1))
             except (json.JSONDecodeError, TypeError):
-                return QualityCalibrationOutput()
+                return QualityCalibrationOutput(parse_failed=True)
         else:
-            return QualityCalibrationOutput()
+            return QualityCalibrationOutput(parse_failed=True)
 
     if not isinstance(data, dict):
-        return QualityCalibrationOutput()
+        return QualityCalibrationOutput(parse_failed=True)
 
     return QualityCalibrationOutput(
         drift_detected=bool(data.get("drift_detected", False)),
@@ -213,10 +213,14 @@ class OutputRouter:
 
     async def route(
         self, output: DeepReflectionOutput, db: aiosqlite.Connection,
+        *, gathered_obs_ids: tuple[str, ...] = (),
     ) -> dict:
         """Route all components of a deep reflection output to their stores.
 
         Returns a summary dict of what was routed.
+
+        ``gathered_obs_ids``: observation IDs fed into the reflection context.
+        Marked as "influenced" only when output is substantive.
         """
         summary: dict = {
             "observations_written": 0,
@@ -228,6 +232,46 @@ class OutputRouter:
             "surplus_tasks_enqueued": 0,
             "question_surfaced": False,
         }
+
+        # Quality gate — reject parse failures and all-zero output
+        if output.parse_failed:
+            logger.error("Deep reflection parse failed — output is empty defaults, not real data")
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.ERROR,
+                    "deep_reflection.parse_failed",
+                    "Deep reflection output could not be parsed — recorded as failure",
+                )
+            summary["parse_failed"] = True
+            return summary
+
+        _has_substance = bool(
+            output.observations
+            or output.cognitive_state_update
+            or output.memory_operations
+            or output.surplus_decisions
+            or output.learnings
+            or output.focus_next
+            or output.skill_triggers
+            or output.contradictions
+            or output.surplus_task_requests
+            or output.user_question
+            or output.procedure_quarantines
+        )
+        if not _has_substance:
+            logger.error(
+                "Deep reflection produced zero output across all fields — treating as failure"
+            )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.ERROR,
+                    "deep_reflection.empty_output",
+                    "Deep reflection returned valid JSON but every field is empty — recorded as failure",
+                )
+            summary["empty_output"] = True
+            return summary
 
         # Confidence gate — quarantine entire output if below threshold
         cfg = load_confidence_config()
@@ -453,7 +497,18 @@ class OutputRouter:
             )
             summary["reflection_summary_stored"] = True
 
-        # 9. Emit events
+        # 9. Mark gathered observations as influenced (deferred from context
+        #    gathering — only mark after reflection produced real output)
+        if gathered_obs_ids:
+            try:
+                await observations.mark_influenced_batch(db, list(gathered_obs_ids))
+            except Exception:
+                logger.warning(
+                    "Failed to mark influenced observations after successful routing",
+                    exc_info=True,
+                )
+
+        # 10. Emit events
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
             await self._event_bus.emit(
@@ -468,7 +523,18 @@ class OutputRouter:
     async def route_assessment(
         self, output: WeeklyAssessmentOutput, db: aiosqlite.Connection,
     ) -> str:
-        """Route weekly self-assessment output. Returns observation ID."""
+        """Route weekly self-assessment output. Returns observation ID or empty string on failure."""
+        if output.parse_failed:
+            logger.error("Weekly assessment parse failed — skipping routing")
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.ERROR,
+                    "weekly_assessment.parse_failed",
+                    "Weekly assessment output could not be parsed",
+                )
+            return ""
+
         content = json.dumps({
             "dimensions": [
                 {
@@ -499,7 +565,18 @@ class OutputRouter:
     async def route_calibration(
         self, output: QualityCalibrationOutput, db: aiosqlite.Connection,
     ) -> str:
-        """Route quality calibration output. Returns observation ID."""
+        """Route quality calibration output. Returns observation ID or empty string on failure."""
+        if output.parse_failed:
+            logger.error("Quality calibration parse failed — skipping routing")
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.REFLECTION, Severity.ERROR,
+                    "quality_calibration.parse_failed",
+                    "Quality calibration output could not be parsed",
+                )
+            return ""
+
         obs_type = "quality_drift" if output.drift_detected else "quality_calibration"
 
         content = json.dumps({

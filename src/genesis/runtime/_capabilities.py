@@ -30,7 +30,7 @@ logger = logging.getLogger("genesis.runtime")
 
 
 _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
-    "secrets": "API key loader for external services (Gemini, Groq, Mistral, etc.)",
+    "secrets": "API key loader for external services (Gemini, Groq, Mistral, etc.)",  # pragma: allowlist secret
     "db": "SQLite database (60+ tables) — use db_schema MCP tool to discover tables and columns before querying",
     "tool_registry": "Registry of known tools available to CC sessions",
     "observability": "Event bus, structured logging, and provider activity tracking",

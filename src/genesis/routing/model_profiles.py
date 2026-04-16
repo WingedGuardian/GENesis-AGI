@@ -192,7 +192,7 @@ class ModelProfileRegistry:
             if circuit_breakers is not None:
                 try:
                     cb = circuit_breakers.get(profile.provider)
-                    if cb is not None and not cb.is_healthy:
+                    if cb is not None and not cb.is_available():
                         continue
                 except Exception:
                     pass  # If CB check fails, don't exclude
