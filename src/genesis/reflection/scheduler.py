@@ -18,9 +18,12 @@ logger = logging.getLogger(__name__)
 class ReflectionScheduler:
     """Owns APScheduler for weekly reflection jobs.
 
-    - Weekly self-assessment: Sunday 10:00 UTC
-    - Weekly quality calibration: Sunday 12:00 UTC (2h after assessment)
+    - Weekly self-assessment: Sunday 10:00 (user-configured timezone)
+    - Weekly quality calibration: Sunday 12:00 (user-configured timezone)
     - Learning regression check runs after quality calibration completes
+
+    Timezone is resolved via ``genesis.env.user_timezone()`` which checks
+    USER_TIMEZONE env → genesis.yaml timezone → UTC fallback.
     """
 
     def __init__(
@@ -49,8 +52,20 @@ class ReflectionScheduler:
 
     async def start(self) -> None:
         """Start the weekly reflection scheduler."""
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
+
+        from genesis.env import user_timezone
+
+        tz_name = user_timezone()
+        try:
+            tz = ZoneInfo(tz_name)
+        except (ZoneInfoNotFoundError, KeyError):
+            logger.warning("Invalid timezone %r, falling back to UTC", tz_name)
+            tz = ZoneInfo("UTC")
+            tz_name = "UTC"
 
         self._scheduler = AsyncIOScheduler()
 
@@ -59,6 +74,7 @@ class ReflectionScheduler:
             CronTrigger(
                 day_of_week=self._assessment_day,
                 hour=self._assessment_hour,
+                timezone=tz,
             ),
             id="weekly_self_assessment",
             max_instances=1,
@@ -70,6 +86,7 @@ class ReflectionScheduler:
             CronTrigger(
                 day_of_week=self._assessment_day,
                 hour=self._calibration_hour,
+                timezone=tz,
             ),
             id="weekly_quality_calibration",
             max_instances=1,
@@ -78,9 +95,9 @@ class ReflectionScheduler:
 
         self._scheduler.start()
         logger.info(
-            "Reflection scheduler started (assessment=%s@%02d, calibration=%s@%02d)",
+            "Reflection scheduler started (assessment=%s@%02d, calibration=%s@%02d, tz=%s)",
             self._assessment_day, self._assessment_hour,
-            self._assessment_day, self._calibration_hour,
+            self._assessment_day, self._calibration_hour, tz_name,
         )
 
     async def stop(self) -> None:

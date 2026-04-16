@@ -230,9 +230,9 @@ class TestMatcher:
     ) -> None:
         mock_cb_registry = MagicMock()
         unhealthy_cb = MagicMock()
-        unhealthy_cb.is_healthy = False
+        unhealthy_cb.is_available.return_value = False
         healthy_cb = MagicMock()
-        healthy_cb.is_healthy = True
+        healthy_cb.is_available.return_value = True
 
         def get_cb(provider: str):
             if provider == "alpha":
