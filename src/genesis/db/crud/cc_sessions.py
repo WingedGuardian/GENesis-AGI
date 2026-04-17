@@ -137,6 +137,15 @@ async def reap_stale(
     return cursor.rowcount
 
 
+async def set_pid(db: aiosqlite.Connection, id: str, pid: int) -> bool:
+    """Write the subprocess PID to an existing cc_sessions row."""
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET pid = ? WHERE id = ?", (pid, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def update_cc_session_id(
     db: aiosqlite.Connection,
     id: str,

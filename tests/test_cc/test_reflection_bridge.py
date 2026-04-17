@@ -1,5 +1,6 @@
 """Tests for CCReflectionBridge."""
 
+import json
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -450,3 +451,119 @@ async def test_strategic_retry_failure_uses_original_output(db, mock_session_mgr
         result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
     assert result.success  # original downgraded output still usable
     assert invoker.run.call_count == 2
+
+
+# ── F3+F4: pid, cc_session_id, and dispatch_mode backfill ─────────
+
+
+@pytest.mark.asyncio
+async def test_bridge_writes_pid_and_cc_session_id(db):
+    """Integration: bridge CLI path writes pid + cc_session_id + dispatch_mode."""
+    from genesis.cc.session_manager import SessionManager
+
+    FAKE_PID = 54321
+    CC_SESSION_UUID = "cc-uuid-from-cli"
+
+    async def mock_run(invocation):
+        # Fire on_spawn with fake PID (simulates what CCInvoker does)
+        if invocation.on_spawn is not None:
+            await invocation.on_spawn(FAKE_PID)
+        return CCOutput(
+            session_id=CC_SESSION_UUID,
+            text='{"observations":["test"],"patterns":[],"recommendations":[]}',
+            model_used="sonnet",
+            cost_usd=0.02, input_tokens=500, output_tokens=200,
+            duration_ms=5000, exit_code=0,
+        )
+
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(side_effect=mock_run)
+
+    mgr = SessionManager(db=db, invoker=invoker, day_boundary_hour=0)
+    bridge = CCReflectionBridge(
+        session_manager=mgr, invoker=invoker, db=db,
+    )
+
+    tick = TickResult(
+        tick_id="t-backfill", timestamp="2026-04-16T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.DEEP, trigger_reason="test",
+    )
+
+    result = await bridge.reflect(Depth.DEEP, tick, db=db)
+    assert result.success
+
+    # Find the session row created by the bridge
+    rows = await db.execute_fetchall(
+        "SELECT id, pid, cc_session_id, metadata FROM cc_sessions "
+        "WHERE session_type = 'background_reflection' ORDER BY started_at DESC LIMIT 1"
+    )
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["pid"] == FAKE_PID
+    assert row["cc_session_id"] == CC_SESSION_UUID
+    meta = json.loads(row["metadata"])
+    assert meta["dispatch_mode"] == "cli"
+
+
+@pytest.mark.asyncio
+async def test_bridge_cc_session_id_after_retry(db):
+    """After a strategic retry, cc_session_id reflects the RETRY output, not the first."""
+    from genesis.cc.session_manager import SessionManager
+
+    FIRST_CC_SID = "first-cc-session"
+    RETRY_CC_SID = "retry-cc-session"
+    call_count = 0
+
+    async def mock_run(invocation):
+        nonlocal call_count
+        call_count += 1
+        if invocation.on_spawn is not None:
+            await invocation.on_spawn(50000 + call_count)
+        if call_count == 1:
+            return CCOutput(
+                session_id=FIRST_CC_SID,
+                text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+                model_used="claude-sonnet-4-6",
+                cost_usd=0.02, input_tokens=500, output_tokens=200,
+                duration_ms=5000, exit_code=0,
+                model_requested="opus", downgraded=True,
+            )
+        return CCOutput(
+            session_id=RETRY_CC_SID,
+            text='{"observations":["obs"],"patterns":[],"recommendations":[]}',
+            model_used="claude-opus-4-6",
+            cost_usd=0.05, input_tokens=500, output_tokens=200,
+            duration_ms=8000, exit_code=0,
+            model_requested="opus", downgraded=False,
+        )
+
+    invoker = AsyncMock()
+    invoker.run = AsyncMock(side_effect=mock_run)
+
+    mgr = SessionManager(db=db, invoker=invoker, day_boundary_hour=0)
+    bridge = CCReflectionBridge(
+        session_manager=mgr, invoker=invoker, db=db,
+    )
+
+    tick = TickResult(
+        tick_id="t-retry", timestamp="2026-04-16T12:00:00",
+        source="scheduled", signals=[], scores=[],
+        classified_depth=Depth.STRATEGIC, trigger_reason="test",
+    )
+
+    with patch("genesis.cc.reflection_bridge._bridge.asyncio.sleep", new_callable=AsyncMock):
+        result = await bridge.reflect(Depth.STRATEGIC, tick, db=db)
+
+    assert result.success
+    assert call_count == 2
+
+    rows = await db.execute_fetchall(
+        "SELECT pid, cc_session_id FROM cc_sessions "
+        "WHERE session_type = 'background_reflection' ORDER BY started_at DESC LIMIT 1"
+    )
+    row = rows[0]
+    # PID should be from the retry (50002), not the first run (50001)
+    assert row["pid"] == 50002
+    # cc_session_id should be from the retry, not the first run
+    assert row["cc_session_id"] == RETRY_CC_SID

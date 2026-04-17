@@ -8,6 +8,7 @@ _output submodules.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 from pathlib import Path
@@ -29,6 +30,7 @@ from genesis.cc.reflection_bridge._prompts import (
     system_prompt_for_depth,
 )
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
+from genesis.db.crud import cc_sessions as cc_sessions_crud
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.perception.types import ReflectionResult
 
@@ -321,12 +323,20 @@ class CCReflectionBridge:
                     effort=effort,
                     source_tag=f"reflection_{depth.value.lower()}",
                     skill_tags=skill_tags,
+                    dispatch_mode="cli",
                 )
                 session_id = sess["id"]
             except Exception:
                 logger.exception("Failed to create background session for %s", depth.value)
                 return ReflectionResult(success=False, reason="Session creation failed")
 
+            async def _on_spawn(pid: int) -> None:
+                try:
+                    await cc_sessions_crud.set_pid(self._db, session_id, pid)
+                except Exception:
+                    logger.warning("set_pid failed for session %s", session_id[:8], exc_info=True)
+
+            invocation = dataclasses.replace(invocation, on_spawn=_on_spawn)
             output = await self._invoker.run(invocation)
 
         # Model downgrade response (Layer 2)
@@ -380,6 +390,19 @@ class CCReflectionBridge:
                     requested_model=str(model),
                     actual_model=output.model_used or "unknown",
                     depth=depth.value,
+                )
+
+        # Write cc_session_id after all retries resolve (Issue A: must be
+        # after the retry block because retries produce new CC sessions).
+        if used_cli and session_id and not session_id.startswith("api:") and output.session_id:
+            try:
+                await cc_sessions_crud.update_cc_session_id(
+                    self._db, session_id, cc_session_id=output.session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to write cc_session_id for %s",
+                    session_id[:8], exc_info=True,
                 )
 
         if output.is_error:
