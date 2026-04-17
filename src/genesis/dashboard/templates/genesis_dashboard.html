@@ -6619,14 +6619,26 @@
                       <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.backupStatus.last_backup.duration_s + 's'"></span>
                     </div>
                   </div>
-                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
-                    <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
-                    <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
-                    <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
-                    <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
-                    <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
-                          x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
-                  </div>
+                  <template x-if="$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
+                      <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
+                      <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
+                      <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
+                      <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
+                      <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
+                    </div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div>
+                      <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
+                           x-text="$store.genesisDashboard.backupStatus.last_backup.failure_reason || 'Backup failed — check logs'"></div>
+                      <template x-if="!$store.genesisDashboard.backupStatus?.repo_configured">
+                        <div style="margin-top:0.4rem; padding:0.5rem; border-radius:4px; background:rgba(255,183,77,0.1); border:1px solid rgba(255,183,77,0.3); font-size:0.8rem; color:#ffb74d;">
+                          Backup repo not configured. Set GENESIS_BACKUP_REPO in secrets.env and run a backup to clone it.</div>
+                      </template>
+                    </div>
+                  </template>
                 </div>
               </template>
               <template x-if="!$store.genesisDashboard.backupStatus.last_backup">

@@ -28,6 +28,7 @@ _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
 _SECRETS_OK=false
 _SUCCESS=false
+_FAILURE_REASON=""
 
 _write_status() {
     local _ended_at
@@ -35,7 +36,7 @@ _write_status() {
     local _duration=$(( _ended_at - _STARTED_AT ))
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_FAILURE_REASON"}
 STATUSEOF
 }
 trap '_write_status' EXIT
@@ -52,7 +53,7 @@ LOG_PREFIX="[genesis-backup]"
 
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
-die() { log "FATAL: $*"; exit 1; }
+die() { _FAILURE_REASON="$*"; log "FATAL: $*"; exit 1; }
 
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the

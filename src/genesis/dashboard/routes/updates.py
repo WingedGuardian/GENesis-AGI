@@ -87,6 +87,17 @@ def update_status():
     if hist_rows:
         last_update = hist_rows[0]
 
+    # Reconcile: if update_history says rolled_back/failed but the target
+    # commit actually landed in HEAD, the update succeeded despite the
+    # script's rollback (e.g. a CC tier completed it manually).
+    if last_update and last_update.get("status") in ("rolled_back", "failed"):
+        new_commit = last_update.get("new_commit")
+        if new_commit and _git("merge-base", "--is-ancestor", new_commit, "HEAD") is not None:
+            last_update = dict(last_update)
+            last_update["status"] = "success"
+            last_update["failure_reason"] = None
+            last_update["reconciled"] = True
+
     # Failure context file (persists until next successful update)
     last_failure = None
     if _FAILURE_FILE.is_file():
@@ -665,6 +676,12 @@ def update_progress():
             stale = age > 60
         except OSError:
             stale = True
+
+        # Clean up stale state file — no process is running and the file
+        # is just noise at this point (its purpose is crash recovery).
+        if stale:
+            with contextlib.suppress(OSError):
+                _STATE_FILE.unlink()
 
     return jsonify({
         "in_progress": in_progress,
