@@ -283,3 +283,60 @@ async def knowledge_ingest_batch(
             for r in results
         ],
     }
+
+
+@mcp.tool()
+async def resume_review(
+    resume_source: str,
+    job_description: str | None = None,
+    knowledge_domains: list[str] | None = None,
+) -> dict:
+    """Two-pass resume review: native LLM analysis + knowledge-augmented critique.
+
+    Pass 1 evaluates structure, clarity, impact, ATS compatibility.
+    Pass 2 queries the knowledge base for professional context and
+    domain knowledge to provide grounded, non-generic feedback.
+
+    Args:
+        resume_source: Path to resume file (PDF or text) or raw resume text.
+        job_description: Optional job description text or URL for alignment scoring.
+        knowledge_domains: Optional list of KB domains to query (default: all).
+    """
+    from pathlib import Path
+
+    from genesis.knowledge.applications.resume_review import ResumeReviewer
+    from genesis.runtime._core import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if rt._router is None:
+        return {"error": "Router not available"}
+
+    # Resolve resume text
+    resume_text = resume_source
+    source_path = Path(resume_source)
+    if source_path.exists():
+        if source_path.suffix.lower() == ".pdf":
+            import pymupdf
+
+            doc = pymupdf.open(str(source_path))
+            resume_text = "\n\n".join(
+                page.get_text().strip() for page in doc if page.get_text().strip()
+            )
+            doc.close()
+        else:
+            resume_text = source_path.read_text(encoding="utf-8", errors="replace")
+
+    reviewer = ResumeReviewer(router=rt._router)
+    result = await reviewer.review(
+        resume_text,
+        job_description=job_description,
+        knowledge_domains=knowledge_domains,
+    )
+
+    return {
+        "pass1_analysis": result.pass1_analysis,
+        "pass2_augmented": result.pass2_augmented,
+        "combined_output": result.combined_output,
+        "knowledge_citations": result.knowledge_citations,
+        "error": result.error,
+    }
