@@ -1,7 +1,7 @@
 # Post-v3: Knowledge Base & Ingestion Pipeline
 
 **Date:** 2026-02-27
-**Status:** Designed (post-v3 feature, v3 lays groundwork)
+**Status:** Implemented (v3.0a5+ — content processors, distillation, orchestrator, dashboard, resume review)
 **Decision source:** Conversation between user and Claude Code, 2026-02-27
 **Behavioral layer:** `genesis-knowledge-autonomy.md` — defines the user-facing
 principle (Genesis handles ingestion/organization/retrieval autonomously) that
