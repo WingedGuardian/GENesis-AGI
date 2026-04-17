@@ -624,6 +624,24 @@ TABLES = {
     # outlive the entries they describe — deleting a reference entry (e.g.
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
+    "knowledge_uploads": """
+        CREATE TABLE IF NOT EXISTS knowledge_uploads (
+            id            TEXT PRIMARY KEY,
+            filename      TEXT NOT NULL,
+            file_path     TEXT NOT NULL,
+            file_size     INTEGER NOT NULL,
+            mime_type     TEXT,
+            project_type  TEXT,
+            domain        TEXT,
+            purpose       TEXT,
+            status        TEXT NOT NULL DEFAULT 'uploaded'
+                          CHECK (status IN ('uploaded', 'processing', 'completed', 'failed')),
+            error_message TEXT,
+            unit_ids      TEXT,
+            created_at    TEXT NOT NULL,
+            completed_at  TEXT
+        )
+    """,
     "evolution_proposals": """
         CREATE TABLE IF NOT EXISTS evolution_proposals (
             id                    TEXT PRIMARY KEY,

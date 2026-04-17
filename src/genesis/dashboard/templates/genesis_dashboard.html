@@ -153,6 +153,21 @@
         knowledgeRecent: [],
         knowledgeStats: null,
         knowledgeDetail: null,
+        // Upload state
+        knowledgeUpload: {
+          dragging: false,
+          file: null,
+          uploading: false,
+          confirm: false,
+          uploadId: null,
+          projectType: "",
+          domain: "",
+          purpose: "",
+          error: null,
+        },
+        knowledgeUploads: [],
+        knowledgeTaxonomy: { project_types: [], domains: [] },
+        _uploadPollInterval: null,
 
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
@@ -294,7 +309,9 @@
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
               break;
             case "knowledge":
-              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); }
+              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); this.fetchKnowledgeUploads(); this.fetchKnowledgeTaxonomy(); }
+              // Resume polling if any uploads are processing
+              if (this.knowledgeUploads.some(u => u.status === "processing")) { this._startUploadPolling(); }
               break;
             case "backup":
               if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
@@ -694,6 +711,111 @@
             await this.fetchKnowledgeRecent();
             await this.fetchKnowledgeStats();
           } catch (e) { console.warn("Knowledge delete failed:", e); }
+        },
+
+        // ── Knowledge upload methods ────────────────────────────
+        async handleKnowledgeFileDrop(event) {
+          event.preventDefault();
+          this.knowledgeUpload.dragging = false;
+          const files = event.dataTransfer?.files || event.target?.files;
+          if (!files || files.length === 0) return;
+          await this._uploadKnowledgeFile(files[0]);
+        },
+        async _uploadKnowledgeFile(file) {
+          this.knowledgeUpload.error = null;
+          this.knowledgeUpload.uploading = true;
+          try {
+            const form = new FormData();
+            form.append("file", file);
+            const resp = await fetch("/api/genesis/knowledge/upload", { method: "POST", body: form });
+            if (!resp.ok) {
+              const err = await resp.json().catch(() => ({}));
+              throw new Error(err.error || `Upload failed (${resp.status})`);
+            }
+            const data = await resp.json();
+            this.knowledgeUpload.file = { name: data.filename, size: data.file_size, mime: data.mime_type };
+            this.knowledgeUpload.uploadId = data.upload_id;
+            this.knowledgeUpload.confirm = true;
+            this.knowledgeUpload.uploading = false;
+            // Fetch taxonomy for autocomplete
+            await this.fetchKnowledgeTaxonomy();
+          } catch (e) {
+            this.knowledgeUpload.uploading = false;
+            this.knowledgeUpload.error = e.message;
+          }
+        },
+        async fetchKnowledgeTaxonomy() {
+          try {
+            const resp = await fetchApi("/api/genesis/knowledge/taxonomy");
+            if (resp && resp.ok) { this.knowledgeTaxonomy = await resp.json(); }
+          } catch (e) { console.warn("Taxonomy fetch failed:", e); }
+        },
+        async confirmKnowledgeIngest() {
+          const u = this.knowledgeUpload;
+          if (!u.projectType.trim()) { u.error = "Project type is required"; return; }
+          u.error = null;
+          try {
+            const resp = await fetchApi("/api/genesis/knowledge/ingest", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                upload_id: u.uploadId,
+                project_type: u.projectType.trim(),
+                domain: u.domain.trim() || "auto",
+                purpose: u.purpose.trim() || null,
+              }),
+            });
+            if (!resp.ok) {
+              const err = await resp.json().catch(() => ({}));
+              throw new Error(err.error || "Ingest failed");
+            }
+            this.cancelKnowledgeUpload();
+            await this.fetchKnowledgeUploads();
+            this._startUploadPolling();
+          } catch (e) {
+            u.error = e.message;
+          }
+        },
+        async cancelKnowledgeUpload() {
+          const uploadId = this.knowledgeUpload.uploadId;
+          this.knowledgeUpload = {
+            dragging: false, file: null, uploading: false, confirm: false,
+            uploadId: null, projectType: "", domain: "", purpose: "", error: null,
+          };
+          // Clean up server-side file + DB record
+          if (uploadId) {
+            try { await fetchApi(`/api/genesis/knowledge/upload/${uploadId}`, { method: "DELETE" }); }
+            catch (e) { console.warn("Upload cleanup failed:", e); }
+          }
+        },
+        async fetchKnowledgeUploads() {
+          try {
+            const resp = await fetchApi("/api/genesis/knowledge/uploads");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.knowledgeUploads = data.uploads || [];
+            }
+          } catch (e) { console.warn("Uploads list failed:", e); }
+        },
+        _startUploadPolling() {
+          if (this._uploadPollInterval) return;
+          this._uploadPollInterval = setInterval(async () => {
+            await this.fetchKnowledgeUploads();
+            const hasActive = this.knowledgeUploads.some(u => u.status === "processing");
+            if (!hasActive) {
+              clearInterval(this._uploadPollInterval);
+              this._uploadPollInterval = null;
+              // Refresh knowledge data since new units may have been created
+              await this.fetchKnowledgeRecent();
+              await this.fetchKnowledgeStats();
+            }
+          }, 3000);
+        },
+        _formatFileSize(bytes) {
+          if (!bytes) return "—";
+          if (bytes < 1024) return bytes + " B";
+          if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+          return (bytes / (1024 * 1024)).toFixed(1) + " MB";
         },
 
         // ── Backup tab fetches ───────────────────────────────────
@@ -6415,6 +6537,106 @@
         <span class="material-symbols-outlined">school</span>
         Knowledge Base
       </div>
+
+      <!-- ── Upload Zone ─────────────────────────────────────── -->
+      <div style="margin-bottom: 1.5rem;">
+        <!-- Drop Zone -->
+        <div x-show="!$store.genesisDashboard.knowledgeUpload.confirm"
+             @dragover.prevent="$store.genesisDashboard.knowledgeUpload.dragging = true"
+             @dragleave.prevent="$store.genesisDashboard.knowledgeUpload.dragging = false"
+             @drop.prevent="$store.genesisDashboard.handleKnowledgeFileDrop($event)"
+             @click="$refs.knowledgeFileInput.click()"
+             :style="`border: 2px dashed ${$store.genesisDashboard.knowledgeUpload.dragging ? 'var(--accent)' : 'var(--border)'}; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: ${$store.genesisDashboard.knowledgeUpload.dragging ? 'rgba(99,102,241,.08)' : 'transparent'};`">
+          <span class="material-symbols-outlined" style="font-size: 2rem; color: var(--text-dim);">upload_file</span>
+          <div style="margin-top: .5rem; color: var(--text-dim);" x-text="$store.genesisDashboard.knowledgeUpload.uploading ? 'Uploading...' : 'Drop files here or click to browse'"></div>
+          <div style="font-size: .8em; color: var(--text-dim); margin-top: .25rem;">PDF, text, audio, video — up to 500 MB</div>
+          <input type="file" x-ref="knowledgeFileInput" style="display:none"
+                 @change="$store.genesisDashboard.handleKnowledgeFileDrop($event)">
+        </div>
+
+        <!-- Confirmation Card -->
+        <template x-if="$store.genesisDashboard.knowledgeUpload.confirm">
+          <div class="card" style="border: 1px solid var(--accent); padding: 1.25rem;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+              <strong>Store to Knowledge Base</strong>
+              <span class="badge" x-text="$store.genesisDashboard.knowledgeUpload.file?.mime || 'unknown'"></span>
+            </div>
+            <div style="margin-bottom: .75rem; color: var(--text-dim);">
+              <span x-text="$store.genesisDashboard.knowledgeUpload.file?.name"></span>
+              (<span x-text="$store.genesisDashboard._formatFileSize($store.genesisDashboard.knowledgeUpload.file?.size)"></span>)
+            </div>
+            <div style="display: flex; gap: .5rem; margin-bottom: .75rem;">
+              <div style="flex: 1;">
+                <label style="font-size: .8em; color: var(--text-dim);">Project Type *</label>
+                <input type="text" list="kb-project-types" x-model="$store.genesisDashboard.knowledgeUpload.projectType"
+                       placeholder="e.g. professional" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+                <datalist id="kb-project-types">
+                  <template x-for="pt in $store.genesisDashboard.knowledgeTaxonomy.project_types" :key="pt">
+                    <option :value="pt"></option>
+                  </template>
+                </datalist>
+              </div>
+              <div style="flex: 1;">
+                <label style="font-size: .8em; color: var(--text-dim);">Domain</label>
+                <input type="text" list="kb-domains" x-model="$store.genesisDashboard.knowledgeUpload.domain"
+                       placeholder="auto" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+                <datalist id="kb-domains">
+                  <template x-for="d in $store.genesisDashboard.knowledgeTaxonomy.domains" :key="d">
+                    <option :value="d"></option>
+                  </template>
+                </datalist>
+              </div>
+            </div>
+            <div style="margin-bottom: .75rem;">
+              <label style="font-size: .8em; color: var(--text-dim);">Purpose (optional, comma-separated)</label>
+              <input type="text" x-model="$store.genesisDashboard.knowledgeUpload.purpose"
+                     placeholder="e.g. resume-prep, cloud-eng" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+            </div>
+            <template x-if="$store.genesisDashboard.knowledgeUpload.error">
+              <div style="color: var(--error); margin-bottom: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+            </template>
+            <div style="display: flex; gap: .5rem; justify-content: flex-end;">
+              <button class="btn-sm" style="opacity: .7;" @click="$store.genesisDashboard.cancelKnowledgeUpload()">Cancel</button>
+              <button class="btn-sm" style="background: var(--accent); color: #fff;" @click="$store.genesisDashboard.confirmKnowledgeIngest()">Store</button>
+            </div>
+          </div>
+        </template>
+
+        <!-- Upload error outside confirmation -->
+        <template x-if="$store.genesisDashboard.knowledgeUpload.error && !$store.genesisDashboard.knowledgeUpload.confirm">
+          <div style="color: var(--error); margin-top: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+        </template>
+      </div>
+
+      <!-- ── Recent Uploads Status ────────────────────────────── -->
+      <template x-if="$store.genesisDashboard.knowledgeUploads.length > 0">
+        <div style="margin-bottom: 1.5rem;">
+          <h4 style="margin-bottom: .5rem;">Recent Uploads</h4>
+          <template x-for="upload in $store.genesisDashboard.knowledgeUploads.slice(0, 10)" :key="upload.id">
+            <div class="card" style="margin-bottom: .4rem; padding: .6rem .8rem; display: flex; justify-content: space-between; align-items: center;">
+              <div>
+                <span x-text="upload.filename" style="font-weight: 500;"></span>
+                <span style="font-size: .8em; color: var(--text-dim); margin-left: .5rem;"
+                      x-text="$store.genesisDashboard._formatFileSize(upload.file_size)"></span>
+              </div>
+              <div style="display: flex; align-items: center; gap: .5rem;">
+                <template x-if="upload.status === 'processing'">
+                  <span class="badge" style="background: var(--warning); color: #000;">processing</span>
+                </template>
+                <template x-if="upload.status === 'completed'">
+                  <span class="badge" style="background: var(--success); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
+                </template>
+                <template x-if="upload.status === 'failed'">
+                  <span class="badge" style="background: var(--error); color: #fff;" :title="upload.error_message">failed</span>
+                </template>
+                <template x-if="upload.status === 'uploaded'">
+                  <span class="badge">uploaded</span>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+      </template>
 
       <!-- Stats Cards -->
       <div class="stat-row" style="margin-bottom: 1.5rem;">

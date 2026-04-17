@@ -197,6 +197,7 @@ recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy. The proactive hook auto-detects your active wing from file paths
 and prompt keywords.
 
+<<<<<<< HEAD
 ## Reference Capture (silent, automatic)
 
 When user input contains credentials, URLs, IP addresses, account handles,
@@ -227,6 +228,16 @@ Genesis has learned.
 infrastructure credentials (API keys, backup passphrase). The reference
 store is for user-level credentials and reference data that Genesis learns
 across sessions.
+
+## Knowledge Ingestion (Conversational Path)
+
+When a user shares a file path or URL in conversation:
+- If they explicitly ask to ingest/store/learn it: confirm project_type
+  and domain, then call `knowledge_ingest_source` MCP tool.
+- If the context is ambiguous: ask "Would you like me to store this to
+  the knowledge base as an authoritative source?"
+- Never auto-ingest without explicit user confirmation.
+- The dashboard also supports drag-drop file upload on the Knowledge tab.
 
 ## Community Contributions
 
