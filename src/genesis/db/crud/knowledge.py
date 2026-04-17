@@ -40,8 +40,12 @@ async def insert(
     source_pipeline: str | None = None,
     purpose: str | None = None,
     ingestion_source: str | None = None,
+    _commit: bool = True,
 ) -> str:
-    """Insert a knowledge unit into both knowledge_units and knowledge_fts. Returns id."""
+    """Insert a knowledge unit into both knowledge_units and knowledge_fts. Returns id.
+
+    Pass _commit=False for batch operations where the caller manages the transaction.
+    """
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
 
@@ -65,7 +69,8 @@ async def insert(
         (unit_id, concept, body, tags or "", domain, project_type),
     )
 
-    await db.commit()
+    if _commit:
+        await db.commit()
     return unit_id
 
 

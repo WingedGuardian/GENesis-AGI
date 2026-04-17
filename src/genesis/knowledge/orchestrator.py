@@ -175,6 +175,9 @@ class KnowledgeOrchestrator:
         for file_path in sorted(dir_path.rglob("*")):
             if not file_path.is_file():
                 continue
+            # Skip symlinks to prevent traversal attacks and infinite recursion
+            if file_path.is_symlink():
+                continue
             if file_path.suffix.lower() not in supported:
                 continue
 
@@ -230,7 +233,7 @@ class KnowledgeOrchestrator:
                 source_pipeline="curated",
             )
 
-            # Store to SQLite via CRUD
+            # Store to SQLite via CRUD (_commit=False for batch transaction)
             await memory_mod.knowledge.insert(
                 memory_mod._db,
                 id=unit_id,
@@ -251,9 +254,12 @@ class KnowledgeOrchestrator:
                 source_pipeline="curated",
                 purpose=purpose_json,
                 ingestion_source=source,
+                _commit=False,
             )
 
             unit_ids.append(unit_id)
 
+        # Single commit for all units in the batch
+        await memory_mod._db.commit()
         logger.info("Stored %d knowledge units from %s", len(unit_ids), source)
         return unit_ids
