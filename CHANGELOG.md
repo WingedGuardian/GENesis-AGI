@@ -7,6 +7,144 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a6] - 2026-04-17
+
+137-commit release. Major themes: **knowledge ingestion pipeline**,
+**embedding storm fix** (Ollama CPU spikes eliminated), **awareness
+scoring overhaul**, and **persistent reference store**.
+
+### Added
+
+- **Knowledge ingestion pipeline** (#67, #68) — `knowledge_ingest` MCP
+  tool for ingesting files and URLs as authoritative knowledge units.
+  Dashboard file upload UX with drag-drop support and ingestion worker.
+- **Awareness scoring overhaul** (#65) — signal redistribution across
+  subsystems, subsystem-level signals, citation tracking for score
+  attribution.
+- **Persistent reference store** (#58) — unified store for credentials,
+  URLs, IPs, and account handles learned across sessions. Auto-capture
+  from conversations, `reference_lookup` retrieval, read-only mirror at
+  `~/.genesis/known-to-genesis.md`.
+- **Merge/push safety hooks** (#60) — PreToolUse hooks block `git merge`
+  on main and `git push origin main` to enforce PR workflow.
+- **Session observer** — real-time tool activity capture for foreground
+  CC sessions, feeding memory extraction.
+- **Codebase navigation MCP tool** — progressive drill-down code
+  exploration (`codebase_navigate`).
+
+### Changed
+
+- **Queue-first extraction** (#66) — memory extraction no longer
+  hammers the embedding backend with hundreds of sequential calls.
+  Stores FTS5-only, queues embeddings for the recovery worker's paced
+  drain (10/min). Reduces Ollama embed calls from ~562/hr to ~10/min.
+- **Ollama health cache** (#66) — `is_available()` results cached for
+  120s, eliminating ~818 uncached `/api/tags` polls per hour.
+- **Budget event emission** (#71) — `budget.exceeded` events fire once
+  per budget period (daily/weekly/monthly) instead of on every routing
+  call. Reduces log entries from ~2,857/7hr to 1 per period crossing.
+- **Embedding recovery drain limit** — increased 100 → 500 to handle
+  full extraction cycle output in a single recovery pass.
+- **CLAUDE.md scope split** — extracted Serena guide, moved dev rules
+  to genesis-development skill, compressed main CLAUDE.md.
+
+### Fixed
+
+- **Systemd PATH** (#66) — service templates now include Claude CLI bin
+  dir (`__CC_BIN_DIR__`), fixing "Claude CLI not found" errors in
+  Telegram bridge sessions. Detected at install time, falls back to
+  `~/.npm-global/bin`.
+- **Embedding recovery status** (#66) — recovery worker now updates
+  `memory_metadata.embedding_status` from "pending" to "embedded"
+  after successful recovery (was stale on the queue-first path).
+- **Security**: redact identifier in migration dry-run log (#70).
+- **Cognitive state catch-22** (#64) — dashboard quality issues and
+  circular dependency in state initialization.
+- **Backup passphrase, cost attribution, dashboard UX** (#63) — four
+  fixes from post-Codex audit.
+- **OpenCode wrapper** (#61) — silent exit when no stale sessions exist.
+- README portfolio polish — TOC, call-site count, fallback framing (#69).
+
+---
+
+## [v3.0a5] - 2026-04-17
+
+120-commit batch release — memory v4, surplus compute, eval framework,
+follow-ups, new providers, and update-system improvements.
+
+### Added
+
+- **4-layer memory redesign** (#37) — hybrid retrieval (vector + FTS5 +
+  RRF fusion), wing/room taxonomy, essential knowledge layer, activation
+  scoring, graph traversal.
+- **Skill validator + evolution pipeline** (#34) — validation framework
+  for skills with evolution tracking.
+- **Encrypted backups** (#53) — Qdrant snapshot encryption, backup
+  history migration script.
+- **"Your Genesis"** (#48) — encrypted backups, `restore.sh`, unified
+  docs for the dual-repo model.
+- **Outreach recovery worker** — retries failed deliveries with backoff.
+- **Approval staleness + session timezone** — stale approvals
+  auto-expire, timezone-aware session tracking.
+- **Dashboard timezone endpoint** — configurable timezone via settings.
+
+### Fixed (install hardening, PRs #46-52)
+
+13 install fixes from fresh-VM testing:
+- Auto-scale container resources to host capacity (#46).
+- Five bugs from fresh VM install test (#47).
+- Single incus exec smoke test + timezone seed (#50).
+- Unbound `UBUNTU_UID` in timezone seed (#51).
+- Remove `secrets.env` seed that broke `git clone` (#52).
+- TTY detection, timezone persistence across `apt-get`, `read` EOF.
+
+### Fixed (other)
+
+- **Security**: CodeQL findings — stack-trace exposure, workflow
+  permissions (#39).
+- **Reflection**: post-Codex audit Phase 1+2 — stop silent failures,
+  influence timing, surplus count, scheduler timezone, `parse_failed`.
+- **Routing/Sentinel**: `cb.is_available()` fix + `watchdog_failing`
+  Tier 2.
+- **Guardian**: SSH test uses gateway-compatible ping; `cp -rT` for
+  update path.
+- **Telegram**: offset persist suppressed on fresh processes (#43).
+- **Dashboard**: portability — genericize tz examples (#45).
+- **Outreach**: remove dead dedup code.
+- **CI**: detect-secrets false positive allowlist (#41).
+- README updated — Genesis in 30 seconds, quickstart first, 100k+ LOC.
+- Stale branch auto-cleanup after public releases (#44).
+
+---
+
+## [v3.0a4] - 2026-04-13
+
+### Changed
+
+- **Merge-based update system** — Genesis updates via `git merge` instead
+  of rebase, compatible with the dual-repo model. Three-tier CC
+  escalation for conflict resolution: Haiku (watch), Sonnet (resolve
+  trivial), Opus (deep incompatibilities). Crash recovery via
+  `update_state.json` phase tracking with automatic rollback.
+- Tag-based version comparison (robust against squash-merge divergence).
+- Dashboard poll timeout extended to 10 minutes.
+- Service management without systemd D-Bus session bus (reads PID from
+  lock file).
+
+### Fixed
+
+- PID file cleanup moved to Python `finally` blocks.
+- `proc.wait(timeout=3600)` prevents hung CC session wedging background
+  thread.
+- Escalation recovery in `update_progress()` auto-spawns Tier 2 after
+  Flask restart.
+- JSON heredoc injection fixed (`FAILEOF`/`CEOF` replaced with
+  `json.dumps` via env vars).
+- Removed nohup fallback from service management; systemd only.
+- `_orchestrator_alive` set inside lock before `thread.start()` (TOCTOU).
+
+---
+
 ## [v3.0a3-hf3] - 2026-04-12
 
 Public-primary repo overhaul — Genesis now defaults to install-agnostic
