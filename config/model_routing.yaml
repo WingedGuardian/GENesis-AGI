@@ -411,6 +411,7 @@ call_sites:
     - mistral-small-free
     - gemini-free
     - groq-free
+    - openrouter-free
     never_pays: true
     retry_profile: background
     description: "CC contingency \u2014 Micro reflection via free API when CC unavailable\

@@ -933,11 +933,11 @@ else
     echo "  Continuing anyway — Guardian and remaining steps may still work."
 fi
 
-# ── Persist network identity into container CLAUDE.md ─────────
-# Append detected IPs to the container's CLAUDE.md so CC sessions know the
-# network topology. Idempotent: removes prior block before appending.
+# ── Persist network identity into user-level CLAUDE.md ─────────
+# Write detected IPs into the container's ~/.claude/CLAUDE.md (user-level CC
+# instructions, not tracked in the repo). Idempotent via sentinel blocks.
 echo ""
-echo "  Writing network identity into container CLAUDE.md..."
+echo "  Writing network identity into ~/.claude/CLAUDE.md..."
 # Build the network block on the host side where all variables are available
 _NET_LINES="## Network Identity"
 _NET_LINES="${_NET_LINES}
@@ -953,19 +953,56 @@ _NET_LINES="${_NET_LINES}
 _NET_LINES="${_NET_LINES}
 - **Dashboard**: http://${HOST_IPV4:-localhost}:5000 (via proxy device)"
 
-# Write into container via incus exec, piping the block through stdin
+# Write into container via incus exec, piping the block through stdin.
+# Target: ~/.claude/CLAUDE.md (user-level, not tracked in repo).
+# Seed the file on first run; on subsequent runs only replace the
+# network-identity sentinel block. <<\SEED prevents expansion inside
+# the single-quoted bash -c.
 echo "$_NET_LINES" | incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
     --env "HOME=/home/ubuntu" -- bash -c '
-    _claude="/home/ubuntu/genesis/CLAUDE.md"
-    # Remove prior network identity block if present
-    if grep -q "^## Network Identity" "$_claude" 2>/dev/null; then
-        sed -i "/^## Network Identity/,\$d" "$_claude"
+    _claude="$HOME/.claude/CLAUDE.md"
+    mkdir -p "$HOME/.claude"
+    # Seed file on first run (placeholder sections filled by later scripts)
+    if [ ! -f "$_claude" ]; then
+        cat > "$_claude" <<\SEED
+# This Genesis Install — User-Level Configuration
+
+Install-specific overlay to the project CLAUDE.md. Populated by
+scripts/host-setup.sh and refreshed by scripts/update.sh. The
+<!-- begin:SECTION --> / <!-- end:SECTION --> blocks below are
+managed by install scripts — edit at your own risk. The "Personal Notes"
+section is safe to hand-edit; install scripts preserve it.
+
+<!-- begin:container-specs -->
+## Container
+- **Specs**: (run host-setup.sh to detect and populate)
+<!-- end:container-specs -->
+
+<!-- begin:network-identity -->
+<!-- end:network-identity -->
+
+<!-- begin:github-config -->
+## GitHub
+- **Working Repo**: (set by installer)
+- **Backups Repo**: (set by installer)
+- **Public Distribution**: (set by installer)
+<!-- end:github-config -->
+
+## Personal Notes
+
+(Install scripts preserve this section. Add any machine-specific
+reminders here.)
+SEED
     fi
-    # Append new block from stdin
-    echo "" >> "$_claude"
-    cat >> "$_claude"
-' 2>/dev/null && echo "  + Network identity written to container CLAUDE.md" || \
-    echo "  WARN: Could not write network identity to container CLAUDE.md"
+    # Replace network-identity sentinel block with fresh data from stdin
+    sed -i "/<!-- begin:network-identity -->/,/<!-- end:network-identity -->/d" "$_claude"
+    {
+        echo "<!-- begin:network-identity -->"
+        cat   # consume stdin — _NET_LINES includes heading + content
+        echo "<!-- end:network-identity -->"
+    } >> "$_claude"
+' 2>/dev/null && echo "  + Network identity written to ~/.claude/CLAUDE.md" || \
+    echo "  WARN: Could not write network identity to ~/.claude/CLAUDE.md"
 
 # ── Install Guardian on host ───────────────────────────────────
 # Reuse CONTAINER_IPV4 detected earlier; fall back to incus list if empty
