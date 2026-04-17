@@ -447,8 +447,8 @@ async def main(args: argparse.Namespace) -> None:
         for name, entries in sources:
             for e in entries:
                 logger.info(
-                    "  [%s] %-18s %s",
-                    name, e.kind, e.identifier[:30] + "..." if len(e.identifier) > 30 else e.identifier,
+                    "  [%s] %-18s (identifier redacted)",
+                    name, e.kind,
                 )
         logger.info("Dry run complete. Re-run without --dry-run to ingest.")
         return
