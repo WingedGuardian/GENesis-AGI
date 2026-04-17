@@ -19,7 +19,7 @@ RestartSec=10
 RestartPreventExitStatus=200 2
 
 Environment=TMPDIR=__HOME__/.genesis/cc-tmp
-Environment=PATH=__VENV__/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
 MemoryMax=80%
 LimitNOFILE=65536
 OOMScoreAdjust=-500

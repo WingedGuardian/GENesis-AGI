@@ -65,6 +65,8 @@ class OllamaBackend:
     loading) and retries once on ReadTimeout before propagating the failure.
     """
 
+    _AVAIL_TTL = 120.0  # seconds — cache is_available() result
+
     def __init__(
         self,
         url: str,
@@ -74,6 +76,8 @@ class OllamaBackend:
         self._url = url
         self._model = model
         self._client = client or httpx.AsyncClient(timeout=60.0)
+        self._avail_cache: bool | None = None
+        self._avail_cache_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -101,13 +105,22 @@ class OllamaBackend:
         raise last_exc  # type: ignore[misc]  # unreachable, but satisfies type checker
 
     async def is_available(self) -> bool:
+        now = time.monotonic()
+        if (
+            self._avail_cache is not None
+            and (now - self._avail_cache_at) < self._AVAIL_TTL
+        ):
+            return self._avail_cache
         try:
             resp = await self._client.get(
                 f"{self._url.rstrip('/')}/api/tags", timeout=5.0,
             )
-            return resp.status_code == 200
+            result = resp.status_code == 200
         except _HTTPX_ERRORS:
-            return False
+            result = False
+        self._avail_cache = result
+        self._avail_cache_at = now
+        return result
 
 
 class DeepInfraBackend:

@@ -270,6 +270,7 @@ async def ingest_reference_from_extraction(
     store: MemoryStore,
     db: aiosqlite.Connection,
     source_session_id: str | None = None,
+    force_fts5_only: bool = False,
 ) -> str | None:
     """Classify an Extraction and ingest it as a reference entry if matched.
 
@@ -326,6 +327,7 @@ async def ingest_reference_from_extraction(
             memory_class="fact",  # bypass 0.7x auto-reference penalty
             concept=identifier,
             tags_json=tags_json,
+            force_fts5_only=force_fts5_only,
         )
     except Exception:
         logger.warning(
@@ -347,6 +349,7 @@ async def extract_references_from_chunk(
     store: MemoryStore,
     db: aiosqlite.Connection,
     source_session_id: str | None = None,
+    force_fts5_only: bool = False,
 ) -> int:
     """Run the classifier over a chunk of extractions, ingesting references.
 
@@ -361,6 +364,7 @@ async def extract_references_from_chunk(
             store=store,
             db=db,
             source_session_id=source_session_id,
+            force_fts5_only=force_fts5_only,
         )
         if unit_id:
             count += 1
