@@ -1,5 +1,6 @@
 """Tests for SessionManager."""
 
+import json
 from unittest.mock import AsyncMock
 
 import pytest
@@ -46,6 +47,42 @@ async def test_create_background(db, manager):
     )
     assert sess["session_type"] == "background_reflection"
     assert sess["model"] == "sonnet"
+
+
+async def test_create_background_dispatch_mode(db, manager):
+    """dispatch_mode is stored in metadata JSON alongside skill_tags."""
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_REFLECTION,
+        model=CCModel.SONNET,
+        dispatch_mode="cli",
+    )
+    meta = json.loads(sess["metadata"])
+    assert meta["dispatch_mode"] == "cli"
+
+
+async def test_create_background_dispatch_mode_with_skill_tags(db, manager):
+    """Both dispatch_mode and skill_tags coexist in metadata."""
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_REFLECTION,
+        model=CCModel.SONNET,
+        skill_tags=["deep-reflection"],
+        dispatch_mode="cli",
+    )
+    meta = json.loads(sess["metadata"])
+    assert meta["dispatch_mode"] == "cli"
+    assert meta["skill_tags"] == ["deep-reflection"]
+
+
+async def test_create_background_no_dispatch_mode(db, manager):
+    """Without dispatch_mode, metadata only contains skill_tags (backward compat)."""
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_REFLECTION,
+        model=CCModel.SONNET,
+        skill_tags=["light-reflection"],
+    )
+    meta = json.loads(sess["metadata"])
+    assert "dispatch_mode" not in meta
+    assert meta["skill_tags"] == ["light-reflection"]
 
 
 async def test_checkpoint(db, manager):

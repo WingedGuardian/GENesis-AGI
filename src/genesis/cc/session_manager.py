@@ -90,10 +90,16 @@ class SessionManager:
         effort: EffortLevel = EffortLevel.MEDIUM,
         source_tag: str = "background",
         skill_tags: list[str] | None = None,
+        dispatch_mode: str | None = None,
     ) -> dict:
         now = datetime.now(UTC).isoformat()
         sess_id = str(uuid.uuid4())
-        metadata = json.dumps({"skill_tags": skill_tags}) if skill_tags else None
+        meta: dict = {}
+        if skill_tags:
+            meta["skill_tags"] = skill_tags
+        if dispatch_mode:
+            meta["dispatch_mode"] = dispatch_mode
+        metadata = json.dumps(meta) if meta else None
         await cc_sessions.create(
             self._db,
             id=sess_id,
