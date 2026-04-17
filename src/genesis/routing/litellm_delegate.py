@@ -92,17 +92,21 @@ class LiteLLMDelegate:
             )
             content = response.choices[0].message.content
             usage = getattr(response, "usage", None)
-            cost_known = True
-            try:
-                cost = litellm.completion_cost(completion_response=response)
-            except Exception:
+            if cfg.is_free:
                 cost = 0.0
-                cost_known = False
-                if _should_log_failure(provider):
-                    logger.warning(
-                        "Cost calculation failed for %s/%s — recording as $0.00",
-                        provider, model_string, exc_info=True,
-                    )
+                cost_known = True
+            else:
+                cost_known = True
+                try:
+                    cost = litellm.completion_cost(completion_response=response)
+                except Exception:
+                    cost = 0.0
+                    cost_known = False
+                    if _should_log_failure(provider):
+                        logger.warning(
+                            "Cost calculation failed for %s/%s — recording as $0.00",
+                            provider, model_string, exc_info=True,
+                        )
             return CallResult(
                 success=True,
                 content=content,

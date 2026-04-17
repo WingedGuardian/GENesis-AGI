@@ -20,6 +20,7 @@ def _config(
     provider_type="groq",
     model_id="llama-3.3-70b-versatile",
     base_url=None,
+    is_free=True,
 ) -> RoutingConfig:
     """Minimal config with one provider."""
     return RoutingConfig(
@@ -28,7 +29,7 @@ def _config(
                 name="test-provider",
                 provider_type=provider_type,
                 model_id=model_id,
-                is_free=True,
+                is_free=is_free,
                 rpm_limit=30,
                 open_duration_s=120,
                 base_url=base_url,
@@ -104,7 +105,7 @@ def test_resolve_api_key_not_found():
 
 
 async def test_call_success():
-    config = _config()
+    config = _config(is_free=False)
     delegate = LiteLLMDelegate(config)
     mock_resp = _mock_response(content="Test output", prompt_tokens=15, completion_tokens=8)
 
@@ -122,6 +123,27 @@ async def test_call_success():
     assert result.input_tokens == 15
     assert result.output_tokens == 8
     assert result.cost_usd == 0.0003
+
+
+async def test_free_provider_always_zero_cost():
+    """Free providers should always report cost=0.0 without calling litellm.completion_cost."""
+    config = _config(is_free=True)
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response(content="Free output", prompt_tokens=10, completion_tokens=5)
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+
+        result = await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hello"}],
+        )
+
+    assert result.success is True
+    assert result.cost_usd == 0.0
+    assert result.cost_known is True
+    # completion_cost should never be called for free providers
+    mock_litellm.completion_cost.assert_not_called()
 
 
 async def test_call_passes_model_string():
@@ -284,8 +306,8 @@ async def test_call_generic_error():
 
 
 async def test_call_cost_extraction_fallback():
-    """If completion_cost raises, cost_usd should be 0.0 not an exception."""
-    config = _config()
+    """If completion_cost raises on a paid provider, cost_usd should be 0.0 and cost_known False."""
+    config = _config(is_free=False)
     delegate = LiteLLMDelegate(config)
     mock_resp = _mock_response()
 
@@ -300,6 +322,7 @@ async def test_call_cost_extraction_fallback():
 
     assert result.success is True
     assert result.cost_usd == 0.0
+    assert result.cost_known is False
 
 
 # ── Provider failure logging ──────────────────────────────────────────────
