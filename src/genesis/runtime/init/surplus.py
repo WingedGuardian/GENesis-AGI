@@ -40,6 +40,7 @@ async def init(rt: GenesisRuntime) -> None:
             idle_detector=idle_detector,
             compute_availability=compute,
             event_bus=rt._event_bus,
+            enable_code_audits=False,
         )
 
         try:

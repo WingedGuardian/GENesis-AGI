@@ -1024,6 +1024,7 @@ SIGNAL_WEIGHTS_SEED = [
     ("time_since_last_strategic", "clock", 0.50, 0.50, 0.0, 1.0, '["Strategic"]'),
     ("micro_count_since_light", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Light"]'),
     ("cc_version_changed", "awareness_loop", 0.60, 0.60, 0.0, 1.0, '["Light"]'),
+    ("stale_pending_items", "genesis", 0.45, 0.45, 0.0, 1.0, '["Deep"]'),
 ]
 
 DEPTH_THRESHOLDS_SEED = [

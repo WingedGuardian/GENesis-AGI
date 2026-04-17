@@ -106,8 +106,6 @@
         apiKeysModal: { open: false },
         modules: [],
         providersDetail: [],
-        codeFindings: [],
-        codeAuditStats: null,
         operationalVitals: null,
         autonomousCliPolicy: null,
         cognitiveState: null,
@@ -185,7 +183,6 @@
           sessions: { state: "idle", lastSuccess: null, error: null },
 
           // providerActivity removed — data now in operationalVitals
-          codeQuality: { state: "idle", lastSuccess: null, error: null },
           attention: { state: "idle", lastSuccess: null, error: null },
           budgets: { state: "idle", lastSuccess: null, error: null },
           routing: { state: "idle", lastSuccess: null, error: null },
@@ -204,7 +201,6 @@
         _activityInterval: null,
 
         _sessionsInterval: null,
-        _codeFindingsInterval: null,
         _modulesInterval: null,
         _routingInterval: null,
         _approvalsInterval: null,
@@ -218,7 +214,7 @@
         _TAB_INTERVALS: {
           overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
           chat:      [],
-          internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
+          internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
@@ -262,8 +258,7 @@
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
-              if (first) { this.fetchCodeFindings(); this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); }
-              this._codeFindingsInterval = setInterval(() => this.fetchCodeFindings(), 60000);
+              if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); }
               this._awarenessInterval = setInterval(() => this.fetchAwarenessSignals(), 30000);
               this._routingInterval = setInterval(() => this.fetchRoutingConfig(), 15000);
               this._jobHealthInterval = setInterval(() => this.fetchJobHealth(), 60000);
@@ -466,26 +461,6 @@
           } catch (e) {
             console.error("Providers detail fetch failed:", e);
             this.failFetch("providersDetail", "Providers endpoint unavailable");
-          }
-        },
-
-        async fetchCodeFindings() {
-          this.startFetch("codeQuality");
-          try {
-            const [findingsResp, statsResp] = await Promise.all([
-              fetchApi("/api/genesis/recon/findings?limit=10"),
-              fetchApi("/api/genesis/surplus/activity"),
-            ]);
-            if (findingsResp?.ok) this.codeFindings = await findingsResp.json();
-            if (statsResp?.ok) this.codeAuditStats = await statsResp.json();
-            if (findingsResp?.ok || statsResp?.ok) {
-              this.finishFetch("codeQuality");
-            } else {
-              this.failFetch("codeQuality", "Code quality data unavailable");
-            }
-          } catch (e) {
-            console.error("Code findings fetch failed:", e);
-            this.failFetch("codeQuality", "Code quality data unavailable");
           }
         },
 
@@ -2058,6 +2033,14 @@
             if (probe.free_pct > 10) return "#f0ad4e";
             return "#d9534f";
           }
+          // CC tmp: derive from cc_tier/sys_tier
+          if (probe?.cc_tier != null || probe?.sys_tier != null) {
+            const worst = [probe.cc_tier, probe.sys_tier].includes("red") ? "red"
+              : [probe.cc_tier, probe.sys_tier].includes("orange") ? "orange" : "green";
+            if (worst === "red") return "#d9534f";
+            if (worst === "orange") return "#f0ad4e";
+            return "#4caf50";
+          }
           return "#666";
         },
 
@@ -3053,7 +3036,8 @@
             <div class="health-card-value">
               <template x-if="$store.genesisDashboard.health.infrastructure">
                 <template x-for="(probe, name) in $store.genesisDashboard.health.infrastructure" :key="name">
-                  <div style="margin-bottom: 0.2rem; cursor: default;"
+                  <div x-show="!['container_memory', 'disk', 'cpu'].includes(name)"
+                       style="margin-bottom: 0.2rem; cursor: default;"
                        :title="probe.error
                          ? name + ': ERROR — ' + probe.error
                          : probe.latency_ms != null
@@ -4800,79 +4784,6 @@
             </div>
           </template>
         </div>
-      </div>
-    </div>
-
-    <!-- Panel: Code Quality [Tab: internals] -->
-    <div class="panel" x-data="{ codeQualityOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
-      <div class="panel-header" style="cursor: pointer;" @click="codeQualityOpen = !codeQualityOpen">
-        <span class="material-symbols-outlined"
-              :style="codeQualityOpen ? 'transform: rotate(90deg)' : ''">
-          chevron_right
-        </span>
-        <span class="material-symbols-outlined">code</span>
-        Code Quality
-        <span class="panel-status">
-          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('codeQuality')}`"></span>
-          <span x-text="$store.genesisDashboard.panelStateLabel('codeQuality')"></span>
-        </span>
-        <template x-if="$store.genesisDashboard.codeAuditStats">
-          <span style="margin-left: auto; font-size: 0.75rem; opacity: 0.7;"
-                x-text="(() => {
-                  const s = $store.genesisDashboard.codeAuditStats;
-                  if (!s?.last_audit) return 'no audit data yet';
-                  const open = $store.genesisDashboard.codeFindings.filter(f => !f.resolved).length;
-                  const total = $store.genesisDashboard.codeFindings.length;
-                  return open + ' open / ' + total + ' total findings';
-                })()"></span>
-        </template>
-      </div>
-      <div class="panel-body" x-show="codeQualityOpen" x-transition>
-        <template x-if="$store.genesisDashboard.panelStatusDetail('codeQuality')">
-          <div class="inline-warning" x-text="$store.genesisDashboard.panelStatusDetail('codeQuality')"></div>
-        </template>
-        <!-- Audit stats summary -->
-        <template x-if="$store.genesisDashboard.codeAuditStats">
-          <div style="display: flex; gap: 1rem; margin-bottom: 0.75rem; flex-wrap: wrap;">
-            <div style="font-size: 0.78rem;">
-              <span style="font-weight: 600;">Last Audit:</span>
-              <span x-text="$store.genesisDashboard.codeAuditStats.last_audit ? new Date($store.genesisDashboard.codeAuditStats.last_audit.created_at).toLocaleString() : 'Never'"
-                    :style="$store.genesisDashboard.codeAuditStats.last_audit ? '' : 'color: var(--color-text-secondary)'"></span>
-              <template x-if="$store.genesisDashboard.codeAuditStats.last_audit">
-                <span style="opacity: 0.6; font-size: 0.7rem;"
-                      x-text="'(' + $store.genesisDashboard.codeAuditStats.last_audit.status + ')'"></span>
-              </template>
-            </div>
-            <template x-if="Object.keys($store.genesisDashboard.codeAuditStats.severity_counts || {}).length > 0">
-              <div style="font-size: 0.78rem;">
-                <span style="font-weight: 600;">Severity:</span>
-                <template x-for="(count, sev) in $store.genesisDashboard.codeAuditStats.severity_counts" :key="sev">
-                  <span style="margin-left: 0.4rem; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.72rem;"
-                        :style="sev === 'high' || sev === 'critical' ? 'background: #d9534f; color: white;' : sev === 'medium' ? 'background: #f0ad4e; color: #333;' : 'background: var(--color-border); color: var(--color-text);'"
-                        x-text="sev + ': ' + count"></span>
-                </template>
-              </div>
-            </template>
-          </div>
-        </template>
-        <!-- Findings list -->
-        <template x-if="$store.genesisDashboard.codeFindings.length === 0">
-          <div style="font-size: 0.78rem; color: var(--color-text-secondary); padding: 0.5rem 0;">No code audit findings.</div>
-        </template>
-        <template x-for="f in $store.genesisDashboard.codeFindings" :key="f.id">
-          <div style="font-size: 0.78rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border);"
-               :style="f.resolved ? 'opacity: 0.45; text-decoration: line-through;' : ''">
-            <span style="padding: 0.1rem 0.35rem; border-radius: 3px; font-size: 0.68rem; font-weight: 600; margin-right: 0.3rem;"
-                  :style="(f.parsed?.severity === 'high' || f.parsed?.severity === 'critical') ? 'background: #d9534f; color: white;' : f.parsed?.severity === 'medium' ? 'background: #f0ad4e; color: #333;' : 'background: var(--color-border); color: var(--color-text);'"
-                  x-text="(f.parsed?.severity || f.priority || 'info').toUpperCase()"></span>
-            <template x-if="f.resolved">
-              <span style="padding: 0.1rem 0.3rem; border-radius: 3px; font-size: 0.62rem; background: #4caf50; color: white; margin-right: 0.3rem;">RESOLVED</span>
-            </template>
-            <span x-text="f.parsed?.title || f.parsed?.message || f.content?.substring(0, 80) || '(no title)'"></span>
-            <span style="opacity: 0.5; font-size: 0.68rem; margin-left: 0.3rem;"
-                  x-text="f.created_at ? new Date(f.created_at).toLocaleDateString() : ''"></span>
-          </div>
-        </template>
       </div>
     </div>
 

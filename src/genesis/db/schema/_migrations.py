@@ -120,6 +120,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "DELETE FROM signal_weights WHERE signal_name = 'unprocessed_memory_backlog'"
     )
 
+    # Cognitive state catch-22: stale_pending_items signal was collected
+    # but had no weight row, contributing zero to Deep scorer.
+    await db.execute(
+        "INSERT OR IGNORE INTO signal_weights "
+        "(signal_name, source_mcp, current_weight, initial_weight, "
+        "min_weight, max_weight, feeds_depths) "
+        "VALUES ('stale_pending_items', 'genesis', 0.45, 0.45, 0.0, 1.0, "
+        "'[\"Deep\"]')"
+    )
+
     # Reflection starvation fix: tighten strategic ceiling from 7d to 3d
     # Only apply if still at default 604800 to avoid overwriting manual tuning
     await db.execute(
