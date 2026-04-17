@@ -55,28 +55,9 @@ python -m genesis serve --port 5001               # Custom port
 Serena is an MCP server providing LSP-powered code intelligence via Pyright.
 Available as `mcp__serena__*` tools. Complements Grep, does not replace it.
 
-**When to use Serena:**
-- "Where is this class/function wired in?" → `find_referencing_symbols`
-- "What's the definition and signature?" → `find_symbol` with `include_body`
-- "What methods does this class have?" → `find_symbol` with `depth=1`
-- Architectural traversal — dependency injection patterns, type hierarchies
-- Safe refactoring — `rename_symbol`, `replace_symbol_body`
-
-**When to use Grep instead:**
-- String patterns, comments, config files, migrations, YAML/JSON
-- Test files using mocks (Pyright doesn't follow mock patterns)
-- Anything outside Python semantics (shell scripts, HTML templates, SQL)
-
-**When to use the AST code index (`code_modules`/`code_symbols` tables):**
-- Lightweight structural queries (module counts, symbol stats)
-- Proactive hook enrichment (runs every prompt — must be fast)
-- Package-level summaries
-
-**Key behaviors:**
-- 1-2s one-time LSP init per session, then fast
-- Returns semantic context (symbol kind, type signatures, containing class)
-- Distinguishes `TYPE_CHECKING` imports from runtime imports
-- Config: `.serena/project.yml`
+Use for symbol references, definitions, type hierarchies, and safe refactoring.
+Use Grep instead for non-Python (config, YAML, shell, SQL, mocks).
+Full decision guide: `.claude/docs/serena-guide.md`
 
 ## Genesis Development Work
 
@@ -139,8 +120,7 @@ For plans, fixes, architecture decisions, or any non-trivial change:
 - **Call out what you don't know** — lead with unknowns, don't bury them.
   State what information would move confidence to 100%.
 - **No speculative changes** — if you can't confirm a diagnosis, don't touch
-  the code for it. Deploy diagnostics first, fix with certainty second.
-  "Fix what you know, instrument what you don't."
+  the code for it.
 - **Falsifiability criteria** — for every hypothesis at <100% confidence,
   state: "This would be DISPROVEN if [specific observation]." Turns vague
   uncertainty into testable predictions with contingency plans.
@@ -161,15 +141,9 @@ Applies to both CC sessions and Genesis autonomy decisions.
 Genesis memory operates in 4 layers. Each has a role — use the lightest layer
 that answers your question before escalating.
 
-**L0 — Identity (always present, ~200 tokens):**
-SOUL.md + USER.md injected at session start. Who Genesis is, who the user is.
-You don't need to do anything — this is automatic.
-
 **L1 — Essential Knowledge (always present, ~150-300 tokens):**
-`~/.genesis/essential_knowledge.md` injected at session start. Contains: active
-context, recent decisions, wing index. Regenerated after each foreground session.
-If this answers your question about "what are we working on" or "what was
-decided recently," you're done — don't burn a recall.
+`~/.genesis/essential_knowledge.md` — active context, recent decisions, wing
+index. If this answers "what are we working on," don't burn a recall.
 
 **L2 — Proactive Recall (automatic per prompt):**
 The UserPromptSubmit hook searches FTS5 + Qdrant based on your prompt keywords
@@ -177,9 +151,8 @@ and injects `[Memory]` tags. Check these first before doing explicit recall.
 Results are biased toward the active wing (domain) when detectable.
 
 **L3 — Deep Search (on demand):**
-Use `memory_recall` MCP for full hybrid retrieval (vector + FTS5 + RRF fusion
-+ activation scoring + graph traversal). Use when L1-L2 don't answer the
-question. Query SQLite `cc_sessions` for structured session data. Use
+Use `memory_recall` MCP for full hybrid retrieval. Use when L1-L2 don't answer
+the question. Query SQLite `cc_sessions` for structured session data. Use
 `db_schema` MCP to discover table schemas before any SQLite query (60+ tables).
 **Grep transcripts is LAST RESORT** — only after all above fail.
 
@@ -194,8 +167,7 @@ that would be expensive to re-derive.
 Memories are tagged with a `wing` (top-level domain) and optional `room`
 (specific topic). When searching, you can filter by wing for domain-specific
 recall. Current wings: memory, learning, routing, infrastructure, channels,
-autonomy. The proactive hook auto-detects your active wing from file paths
-and prompt keywords.
+autonomy.
 
 <<<<<<< HEAD
 ## Reference Capture (silent, automatic)
@@ -254,33 +226,17 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 
 ## Rules
 
-- **No silent timeouts.** Never add a new timeout (`asyncio.wait_for`,
+- **No silent timeouts.** Never add a timeout (`asyncio.wait_for`,
   `asyncio.timeout`, stream idle timeout, subprocess timeout, watchdog
-  threshold, etc.) to Genesis without explicit user approval. Timeouts
-  on reflections, CC calls, cognitive paths, and long-thinking work fight
-  Genesis instead of helping it — they cap legitimate long thinking and
-  add speculative defense against rare hangs. If a timeout is genuinely
-  needed, surface the request to the user first with the specific value,
-  the failure mode it addresses, and the evidence that the failure is
-  real. Never build one as a "small improvement" or "defense in depth."
-- **Verify the outcome, not just the tests.** `ruff check . && pytest -v` is
-  the minimum bar, not the finish line. After tests pass, verify the actual
-  end-to-end outcome the change delivers. Diff behavior between main and your
-  changes when relevant. For wiring changes: verify the init/bootstrap order
-  passes the right values at runtime, not just that parameters exist. For
-  notification changes: verify the notification actually arrives. Ask: "If the
-  system restarts right now, will this actually work?" If you can't answer yes
-  with evidence, you're not done. Learned the hard way on 2026-03-26: 34 tests
-  passed, live API test passed, but a code review caught an init ordering bug
-  that would have silently broken the primary runtime path.
-- **Built ≠ wired. Wired ≠ verified.** Every component you build MUST have at
-  least one call site in the actual runtime path — not just a unit test that
-  mocks its callers. "Later" is where code goes to die. The
-  `genesis-development` skill has the full 4-level verification taxonomy.
-- **Code review after code changes.** Dispatch the superpowers:code-reviewer
-  agent after writing or modifying code. Review enforcement hooks will remind
-  you of pending unreviewed changes. The `genesis-development` skill has the
-  full adaptive review protocol (what level of review for what size change).
+  threshold, etc.) to Genesis without explicit user approval.
+- **Verify the outcome, not just the tests.** End-to-end verification
+  required — "if the system restarts now, will this work?" Details in
+  genesis-development skill.
+- **Built ≠ wired. Wired ≠ verified.** Every component needs a live call
+  site in the actual runtime path, not just a unit test. Taxonomy in
+  genesis-development skill.
+- **Code review after code changes.** Dispatch superpowers:code-reviewer.
+  Protocol in genesis-development skill.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
   The user is the only human on this project — uncommitted work is invisible
   work, and invisible work is lost work.
@@ -324,9 +280,7 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   Ruthlessly iterate on these lessons until the mistake rate drops. Review
   relevant lessons at session start (the memory system surfaces these
   automatically — read them, don't skip them).
-- **Register new capabilities**: New subsystems must be registered in the
-  bootstrap manifest and capabilities file. See the `genesis-development`
-  skill for specifics.
+- **Register new capabilities** in bootstrap manifest + capabilities file.
 - **NEVER hide, suppress, or work around broken things — FIX THEM.** When
   you encounter something broken, your first instinct must be to fix the
   root cause. Not hide the element, not skip the section, not propose
