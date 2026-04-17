@@ -1,6 +1,7 @@
 """Tests for CostTracker."""
 
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -90,3 +91,71 @@ async def test_period_start_this_month(clock):
     tracker._clock = clock
     start = tracker._period_start("this_month")
     assert start == "2026-03-01T00:00:00+00:00"
+
+
+class TestBudgetEventThrottle:
+    """Verify budget events are throttled but status is always returned."""
+
+    @pytest.mark.asyncio
+    async def test_exceeded_event_emitted_once_on_rapid_calls(self, db, clock):
+        bus = AsyncMock()
+        tracker = CostTracker(db, clock=clock, event_bus=bus)
+
+        # Push past daily budget
+        await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=3.00))
+
+        # Call check_budget 10 times rapidly
+        for _ in range(10):
+            status = await tracker.check_budget()
+            assert status == BudgetStatus.EXCEEDED  # status always returned
+
+        # Event emitted exactly once (first call only)
+        exceeded_calls = [
+            c for c in bus.emit.call_args_list
+            if c.args[2] == "budget.exceeded"
+        ]
+        assert len(exceeded_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_warning_event_emitted_once_on_rapid_calls(self, db, clock):
+        bus = AsyncMock()
+        tracker = CostTracker(db, clock=clock, event_bus=bus)
+
+        # Push into warning zone (daily $2, 80% = $1.60)
+        await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=1.70))
+
+        for _ in range(10):
+            status = await tracker.check_budget()
+            assert status == BudgetStatus.WARNING
+
+        warning_calls = [
+            c for c in bus.emit.call_args_list
+            if c.args[2] == "budget.warning"
+        ]
+        assert len(warning_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_event_re_emits_after_throttle_expires(self, db, clock):
+        bus = AsyncMock()
+        tracker = CostTracker(db, clock=clock, event_bus=bus)
+        tracker._EVENT_THROTTLE_S = 0.0  # disable throttle → every call emits
+
+        await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=3.00))
+
+        await tracker.check_budget()
+        await tracker.check_budget()
+        await tracker.check_budget()
+
+        exceeded_calls = [
+            c for c in bus.emit.call_args_list
+            if c.args[2] == "budget.exceeded"
+        ]
+        assert len(exceeded_calls) == 3  # all emitted with throttle=0
+
+    @pytest.mark.asyncio
+    async def test_no_event_bus_still_returns_status(self, db, clock):
+        """Without event_bus, status still works (no emit, no error)."""
+        tracker = CostTracker(db, clock=clock, event_bus=None)
+        await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=3.00))
+        status = await tracker.check_budget()
+        assert status == BudgetStatus.EXCEEDED
