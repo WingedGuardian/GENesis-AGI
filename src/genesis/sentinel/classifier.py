@@ -33,6 +33,9 @@ _TIER1_PATTERNS = {
     # the container has lost its external eyes on itself. This must wake
     # the Sentinel immediately regardless of other conditions.
     "guardian:heartbeat_stale",
+    # Awareness IS the monitoring system. If it's down, Genesis is blind
+    # to all other failures — this is a defense mechanism failure.
+    "awareness:tick_overdue",
 }
 
 # Alert IDs for cascading/compounding failures (Tier 2)

@@ -211,6 +211,19 @@ _start_genesis_server() {
     echo "nohup" > "$HOME/.genesis/server-start-mode"
 }
 
+# ── Pre-update DB snapshot ────────────────────────────────
+# Flush the WAL and create a clean backup before stopping services.
+# If the server is killed mid-write during the update, this backup
+# enables recovery without data loss.
+DB_FILE="$GENESIS_ROOT/data/genesis.db"
+if [ -f "$DB_FILE" ]; then
+    echo "--- Snapshotting database ---"
+    sqlite3 "$DB_FILE" "PRAGMA wal_checkpoint(TRUNCATE);" 2>/dev/null || true
+    cp "$DB_FILE" "$DB_FILE.pre-update" 2>/dev/null && \
+        echo "  DB snapshot: $DB_FILE.pre-update" || \
+        echo "  WARNING: DB snapshot failed (continuing anyway)"
+fi
+
 # ── Stop services for update ──────────────────────────────
 echo "--- Stopping services for update ---"
 WERE_RUNNING=()
