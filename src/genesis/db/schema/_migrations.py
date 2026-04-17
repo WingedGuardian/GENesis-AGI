@@ -621,6 +621,7 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "WHERE depth_name = 'Light' AND floor_seconds = 21600"
     )
 
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

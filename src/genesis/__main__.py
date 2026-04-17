@@ -45,6 +45,10 @@ def main() -> None:
     from genesis.eval import cli as eval_cli
     eval_cli.add_parser(sub)
 
+    # Restore from your genesis-backups repo
+    from genesis.restore import cli as restore_cli
+    restore_cli.add_parser(sub)
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -57,7 +61,7 @@ def main() -> None:
 
         with ProcessLock("genesis-server"):
             asyncio.run(_serve(args))
-    elif args.command in ("contribute", "eval"):
+    elif args.command in ("contribute", "eval", "restore"):
         sys.exit(args.func(args))
     else:
         parser.print_help()

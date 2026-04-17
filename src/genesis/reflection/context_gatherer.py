@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 # Thresholds for "pending work" detection
 _MIN_OBSERVATIONS_FOR_CONSOLIDATION = 10
 _COGNITIVE_STATE_STALE_HOURS = 24
+_SURPLUS_BACKLOG_WARNING_THRESHOLD = 500
 
 
 class ContextGatherer:
@@ -46,6 +47,7 @@ class ContextGatherer:
         pending = await self.detect_pending_work(db)
         conversations = self._recent_conversation_turns()
 
+        obs_ids = tuple(o["id"] for o in recent_obs if o.get("id"))
         return ContextBundle(
             cognitive_state=cog_state,
             recent_observations=recent_obs,
@@ -54,6 +56,7 @@ class ContextGatherer:
             cost_summary=cost,
             pending_work=pending,
             recent_conversations=conversations,
+            gathered_observation_ids=obs_ids,
         )
 
     async def detect_pending_work(self, db: aiosqlite.Connection) -> PendingWorkSummary:
@@ -65,13 +68,14 @@ class ContextGatherer:
         obs_backlog = len(unresolved)
         has_memory_work = obs_backlog >= _MIN_OBSERVATIONS_FOR_CONSOLIDATION
 
-        # Surplus review: pending staging items
-        pending_surplus = await surplus.list_pending(db, limit=1)
-        surplus_count = len(pending_surplus)
-        # Get actual count if any exist
-        if surplus_count > 0:
-            all_pending = await surplus.list_pending(db, limit=100)
-            surplus_count = len(all_pending)
+        # Surplus review: pending staging items (real count, not capped)
+        surplus_count = await surplus.count_pending(db)
+        if surplus_count >= _SURPLUS_BACKLOG_WARNING_THRESHOLD:
+            logger.warning(
+                "Surplus backlog at %d items (threshold: %d) — "
+                "drain rate may be insufficient",
+                surplus_count, _SURPLUS_BACKLOG_WARNING_THRESHOLD,
+            )
 
         # Cognitive state staleness
         current_cog = await cognitive_state.get_current(db, "active_context")
@@ -232,12 +236,13 @@ class ContextGatherer:
         hard_cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
         result = [o for o in result if o.get("created_at", "") >= hard_cutoff]
 
-        # Track that these observations were retrieved for deep reflection context
+        # Track that these observations were retrieved for deep reflection context.
+        # NOTE: influence marking is deferred to AFTER reflection produces
+        # output — see OutputRouter.route(). Only retrieval is recorded here.
         obs_ids = [o["id"] for o in result if o.get("id")]
         if obs_ids:
             try:
                 await observations.increment_retrieved_batch(db, obs_ids)
-                await observations.mark_influenced_batch(db, obs_ids)
             except Exception:
                 logger.warning("Failed to track observation retrieval in deep reflection", exc_info=True)
 

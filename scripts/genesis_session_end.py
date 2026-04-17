@@ -189,6 +189,7 @@ def _trigger_essential_knowledge_regen() -> None:
     if not regen_script.exists():
         return
 
+
     _LOG_DIR = _GENESIS_DIR / "logs"
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _log_file = _LOG_DIR / "ek_regen.log"

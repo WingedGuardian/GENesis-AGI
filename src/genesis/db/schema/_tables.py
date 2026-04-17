@@ -892,6 +892,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(source, content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_outreach_person ON outreach_history(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_person ON autonomy_state(person_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_category ON autonomy_state(category)",
     "CREATE INDEX IF NOT EXISTS idx_traces_person ON execution_traces(person_id)",
     # cost tracking
     "CREATE INDEX IF NOT EXISTS idx_cost_events_task ON cost_events(task_id)",
@@ -1031,7 +1032,7 @@ DEPTH_THRESHOLDS_SEED = [
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
     ("Micro", 0.30, 1800, 2, 3600),         # floor 30min, max 2/hr
-    ("Light", 0.60, 21600, 1, 3600),         # floor 6h, max 1/hr
+    ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
     ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]

@@ -152,6 +152,33 @@ outcome -> rule extraction not yet flowing.
 `SurplusScheduler` fires on 12h cadence but `StubExecutor` does nothing.
 Queue fills up; tasks don't execute.
 
+### 13. `time.monotonic()` + `0.0` Sentinel Silently Breaks on Fresh Processes
+
+`time.monotonic()` is **system-wide** on Linux, not process-relative. Its
+epoch is effectively system boot. If you write a debounce/rate-limit like:
+
+```python
+_last_event: float = 0.0  # ← bug
+...
+if (time.monotonic() - _last_event) < INTERVAL_S:
+    return  # suppressed
+```
+
+…then on a fresh VM (CI runner, just-booted container) where system uptime
+< `INTERVAL_S`, `now - 0.0 < INTERVAL_S` holds and the **first event is
+silently suppressed**. Tests on developer machines pass because host uptime
+is huge. Bit twice: `litellm_delegate._should_log_failure` (fixed cf71db2)
+and `telegram/adapter_v2._last_offset_write` (fixed in follow-up).
+
+**Correct patterns:**
+- Use `None` as the "never seen" sentinel and check `last is None or ...`.
+- Or initialize at construction with `time.monotonic()` (only if "just
+  started" should count as "recent event" — opposite semantics, pick
+  carefully).
+
+`learning/failure_detector.py` already uses the None-sentinel pattern
+correctly. When writing a new debounce/throttle, copy that.
+
 ## Debugging Ladder
 
 When Genesis breaks, check in this order:

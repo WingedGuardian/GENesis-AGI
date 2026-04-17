@@ -43,6 +43,7 @@ _TIER2_PATTERNS = {
     "embedding:unreachable",
     "qdrant:unreachable",
     "qdrant:collections_missing",
+    "service:watchdog_failing",
 }
 
 

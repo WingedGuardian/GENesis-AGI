@@ -125,7 +125,7 @@ def test_load_full_yaml(monkeypatch):
     # (27 total - 3 disabled; added cerebras-qwen, github-o3mini (disabled),
     # openrouter-gemma4, openrouter-qwen3coder, openrouter-deepseek-r1 (disabled — free
     # endpoint removed from OpenRouter 2026-04-15), openrouter-qwen36plus)
-    assert len(cfg.providers) == 24
+    assert len(cfg.providers) == 25
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers

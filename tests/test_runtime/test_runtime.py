@@ -318,6 +318,9 @@ class TestProviderRegistryBootstrap:
     @pytest.mark.asyncio
     async def test_init_providers_no_ollama_by_default(self, monkeypatch):
         monkeypatch.delenv("GENESIS_ENABLE_OLLAMA", raising=False)
+        monkeypatch.setattr(
+            "genesis.env.ollama_enabled", lambda: False,
+        )
         rt = GenesisRuntime.instance()
         rt._db = None
         rt._event_bus = None

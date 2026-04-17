@@ -157,6 +157,7 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
         return {}
 
 
+
 async def _wing_top_rooms(
     db: aiosqlite.Connection, top_n: int = 4,
 ) -> dict[str, list[str]]:

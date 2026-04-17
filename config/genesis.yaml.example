@@ -27,4 +27,7 @@ timezone: "UTC"
 github:
   user: "YOUR_GITHUB_USER"
   public_repo: "GENesis-AGI"
-  private_repo: ""   # Optional: your private fork name
+  # Your fork of GENesis-AGI. The contribution pipeline auto-creates
+  # this on first use — you usually don't need to set it manually.
+  # Override here only if your fork has a non-default name.
+  private_repo: ""

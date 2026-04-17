@@ -103,6 +103,20 @@ async def init(rt: GenesisRuntime) -> None:
             surplus_queue=rt._surplus_queue,
         )
 
+        # Outreach recovery worker — retries failed Telegram deliveries
+        if rt._deferred_work_queue is not None:
+            try:
+                from genesis.resilience.outreach_recovery import OutreachRecoveryWorker
+
+                rt._outreach_recovery_worker = OutreachRecoveryWorker(
+                    queue=rt._deferred_work_queue,
+                    pipeline=rt._outreach_pipeline,
+                    db=rt._db,
+                )
+                rt._outreach_recovery_worker.start()
+            except Exception:
+                logger.warning("Failed to start outreach recovery worker", exc_info=True)
+
         logger.info("Step 13: Outreach pipeline + scheduler initialized")
 
     except ImportError:

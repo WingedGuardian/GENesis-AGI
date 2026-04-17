@@ -79,7 +79,11 @@ class TestSessionContextHook:
         assert len(content) > 10
 
     def test_missing_essential_knowledge_is_silent(self, flag_dir: Path) -> None:
-        """When essential knowledge file is missing, hook succeeds silently."""
+        """When essential knowledge file is missing, hook succeeds silently.
+
+        Foreground sessions use the essential_knowledge path and degrade
+        silently by design — missing EK is advisory, not an error.
+        """
         env = {"HOME": str(flag_dir.parent), "PATH": "/usr/bin"}
         result = subprocess.run(
             [_PYTHON, str(_CONTEXT_SCRIPT)],
@@ -87,6 +91,25 @@ class TestSessionContextHook:
         )
         # Essential knowledge is advisory — missing file is not an error.
         # The hook should still succeed and output capabilities.
+        assert result.returncode == 0
+
+    def test_cognitive_state_failure_is_loud(self, flag_dir: Path) -> None:
+        """When cognitive state fails in a genesis session, output a visible alert.
+
+        The loud-alert path only runs for background/ego sessions
+        (GENESIS_CC_SESSION=1); foreground sessions use the essential_knowledge
+        path instead and degrade silently by design.
+        """
+        env = {
+            "HOME": str(flag_dir.parent),
+            "PATH": "/usr/bin",
+            "GENESIS_CC_SESSION": "1",
+        }
+        result = subprocess.run(
+            [_PYTHON, str(_CONTEXT_SCRIPT)],
+            capture_output=True, text=True, env=env, timeout=10,
+        )
+        # Background sessions should still succeed but may emit alerts.
         assert result.returncode == 0
 
 

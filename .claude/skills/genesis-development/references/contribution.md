@@ -1,11 +1,17 @@
 # Community Contribution Pipeline (Phase 6)
 
-## Dual-Repo Distribution
+## Contribution Model
 
-Genesis uses a dual-repo model: a private working repo and a public
-distribution repo. Sync via `scripts/prepare-public-release.sh`. Full
-details: `.claude/docs/dual-repo.md`. Repo names are install-specific
-(configured in CLAUDE.md).
+Genesis development is public-primary: all contributors work on the
+public `GENesis-AGI` repo. The contribution pipeline
+(`genesis contribute <sha>`) auto-creates a private fork in the user's
+namespace on first use, sanitizes the diff, and opens a PR from the
+fork against the public repo.
+
+Repo identity is read from `~/.genesis/config/genesis.yaml`
+(`github.user` / `github.public_repo`). Fork resolution and
+sanitization live in `src/genesis/contribution/pr_opener.py` and
+`sanitize.py`. Full user-facing story: `.claude/docs/your-genesis.md`.
 
 ## Contribution Offers
 
