@@ -63,6 +63,29 @@ changes), dispatch a `genesis-architect` subagent before implementation
 to check dependencies, edge cases, and DRY violations. Small targeted
 changes skip this.
 
+### No Silent Timeouts
+
+Never add a timeout (`asyncio.wait_for`, `asyncio.timeout`, stream idle
+timeout, subprocess timeout, watchdog threshold, etc.) without explicit
+user approval. Timeouts on reflections, CC calls, cognitive paths, and
+long-thinking work fight Genesis instead of helping it — they cap
+legitimate long thinking and add speculative defense against rare hangs.
+If a timeout is genuinely needed, surface the request to the user first
+with the specific value, the failure mode it addresses, and the evidence
+that the failure is real. Never build one as a "small improvement" or
+"defense in depth."
+
+### Verify Outcomes, Not Just Tests
+
+`ruff check . && pytest -v` is the minimum bar, not the finish line.
+After tests pass, verify the actual end-to-end outcome the change
+delivers. Diff behavior between main and your changes when relevant.
+For wiring changes: verify the init/bootstrap order passes the right
+values at runtime, not just that parameters exist. For notification
+changes: verify the notification actually arrives. Ask: "If the system
+restarts right now, will this actually work?" If you can't answer yes
+with evidence, you're not done.
+
 ### Common Traps
 
 - **Ego sessions are inert.** `src/genesis/ego/` exists but has zero
