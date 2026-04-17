@@ -88,7 +88,7 @@ Genesis serves as a layer that sits between Claude Code (as well as other AI mod
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-100,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Built to production by one person — which is exactly the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+100,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Every design decision — routing topology, memory fusion, autonomy gating, resilience envelope, subsystem boundaries — made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 ---
 
