@@ -14,6 +14,22 @@
 <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
 
+## Contents
+
+- [Genesis in 30 seconds](#genesis-in-30-seconds)
+- [What this is](#what-this-is)
+- [Getting started](#getting-started)
+- [How it thinks](#how-it-thinks)
+- [Memory · Learning · Autonomy · Drives](#memory)
+- [Compute routing · Resilience · Guardian](#compute-routing)
+- [Real-world integration · Modules](#real-world-integration)
+- [What's inside](#whats-inside)
+- [Roadmap — V4 & V5](#where-its-headed)
+- [Primitives from the Genesis portfolio](#primitives-from-the-genesis-portfolio)
+- [Get involved](#get-involved)
+
+> Reading time: ~8 min full, ~90 sec for the architecture section alone.
+
 ---
 
 We have the most capable AI models ever created, and we're using them like search bars with better grammar.
@@ -43,7 +59,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 V3 is the foundation that makes this possible. What's already here is a full cognitive copilot. What's on the [roadmap](#where-its-headed) — a cognitive cycle grounded in Global Workspace Theory and the LIDA architecture from consciousness research, autonomous codebase evolution, and a system that runs experiments on its own cognition — is where it gets ambitious enough that we'll need help building it.
 
-**Where things stand today:** Genesis is architecturally complete — 100,000+ lines, 37 subsystems, all V3 phases built and tested. What it needs now is the last mile. Features that are 95% there but need edge-case hardening. Wiring that works in isolation but hasn't been stress-tested end-to-end. The kind of work that's genuinely interesting if you like digging into complex systems, and genuinely tedious to do alone. If you install Genesis today, you will hit rough edges. That's not a caveat — it's the opportunity. Every bug you find and fix makes the system better for everyone. This is an active build, and using it means participating in it. If that sounds like your kind of project, [come build with us](#get-involved).
+**Where things stand today:** Genesis is architecturally complete — 100,000+ lines, 37 subsystems, ~40 heterogeneous LLM call sites each with configurable fallback chains, all V3 phases built and tested. What it needs now is the last mile. Features that are 95% there but need edge-case hardening. Wiring that works in isolation but hasn't been stress-tested end-to-end. The kind of work that's genuinely interesting if you like digging into complex systems, and genuinely tedious to do alone. If you install Genesis today, you will hit rough edges. That's not a caveat — it's the opportunity. Every bug you find and fix makes the system better for everyone. This is an active build, and using it means participating in it. If that sounds like your kind of project, [come build with us](#get-involved).
 
 ---
 
@@ -332,7 +348,16 @@ Genesis prefers to route work to the most appropriate model, starting with the c
 | Sonnet-class | Deep reflection, judgment calls | $ |
 | Opus-class | Strategic reflection, self-evolution | $$ |
 
-Circuit breakers and fallback chains handle failures at every tier. If a provider goes down, work routes around it automatically. The resilience layer tracks four independent failure axes — cloud availability, memory status, embedding status, and CC availability — each with its own degradation levels and recovery paths. A composite state machine maps partial availability to contingency strategies, with deferred work queues that hold tasks during outages and replay them on recovery. Most systems have binary health: up or down. Genesis maps the entire space in-between.
+Circuit breakers and fallback chains handle failures at every tier. If a provider goes down, work routes around it automatically.
+
+> **The call site never fails — only individual providers do.**
+> Every routing decision carries a primary and a user-defined fallback chain
+> (local Ollama / LM Studio → free cloud Groq / Mistral → OpenRouter →
+> frontier). If the primary 429s or drops, the router walks the chain until
+> a capable model responds. Scoring, reasoning, writing, and adversarial-review
+> call sites all inherit this guarantee.
+
+The resilience layer tracks four independent failure axes — cloud availability, memory status, embedding status, and CC availability — each with its own degradation levels and recovery paths. A composite state machine maps partial availability to contingency strategies, with deferred work queues that hold tasks during outages and replay them on recovery. Most systems have binary health: up or down. Genesis maps the entire space in-between.
 
 ---
 
@@ -581,6 +606,18 @@ The complete design lives in [`docs/architecture/`](docs/architecture/):
 - [`genesis-v3-build-phases.md`](docs/architecture/genesis-v3-build-phases.md) — Safety-ordered build plan
 - [`genesis-v3-dual-engine-plan.md`](docs/architecture/genesis-v3-dual-engine-plan.md) — Multi-engine strategy
 - [`genesis-v3-resilience-architecture.md`](docs/architecture/genesis-v3-resilience-architecture.md) — Resilience layer design
+
+---
+
+<a id="primitives-from-the-genesis-portfolio"></a>
+
+## Primitives from the Genesis portfolio
+
+Standalone libraries from the same portfolio — reusable on their own, stabilized against Genesis's production use:
+
+- [**copilot-router**](https://github.com/WingedGuardian/copilot-router) — LLM routing primitive. Circuit breakers, fallback chains, per-call-site provider config. What runs the ~40 call sites.
+- [**copilot-memory**](https://github.com/WingedGuardian/copilot-memory) — Hybrid memory primitive. Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.
+- [**cognitive-dissonance-dspy**](https://github.com/WingedGuardian/cognitive-dissonance-dspy) — Multi-agent adversarial-review prototype using DSPy with NL→Coq formal verification. The belief-conflict mechanism here informed Genesis's subsystem-disagreement resolution.
 
 ---
 
