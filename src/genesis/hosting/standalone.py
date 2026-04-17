@@ -232,6 +232,7 @@ class StandaloneAdapter:
         app.config["SESSION_COOKIE_HTTPONLY"] = True
         app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
         app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=30)
+        app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500 MB (knowledge uploads)
 
         # Login page (on app, not blueprint — must be reachable before auth)
         @app.route("/genesis/login")
