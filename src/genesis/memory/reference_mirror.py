@@ -29,6 +29,25 @@ _DOMAIN_ORDER = [
     ("reference.fact", "Facts"),
 ]
 _DOMAIN_HEADING = dict(_DOMAIN_ORDER)
+_SENSITIVE_DOMAINS = {"reference.credentials"}
+
+
+def _render_entry(entry: dict, domain_key: str) -> list[str]:
+    """Render a single entry, redacting values for sensitive domains."""
+    lines: list[str] = [f"### {entry['concept']}"]
+    body = entry.get("body") or ""
+    for body_line in body.splitlines():
+        # Redact the Value line for credentials to avoid plaintext leakage.
+        if domain_key in _SENSITIVE_DOMAINS and body_line.strip().startswith("Value:"):
+            lines.append("- Value: [redacted -- use reference_lookup]")
+        elif body_line.strip():
+            lines.append(f"- {body_line}")
+        else:
+            lines.append("")
+    if entry.get("ingested_at"):
+        lines.append(f"- **Stored**: {entry['ingested_at'][:10]}")
+    lines.append("")
+    return lines
 
 
 async def regenerate_mirror(db: aiosqlite.Connection) -> Path:
@@ -59,13 +78,7 @@ async def regenerate_mirror(db: aiosqlite.Connection) -> Path:
         lines.append(f"## {heading}")
         lines.append("")
         for entry in entries:
-            lines.append(f"### {entry['concept']}")
-            # Body already contains the formatted value, description, tags.
-            for body_line in (entry.get("body") or "").splitlines():
-                lines.append(f"- {body_line}" if body_line.strip() else "")
-            if entry.get("ingested_at"):
-                lines.append(f"- **Stored**: {entry['ingested_at'][:10]}")
-            lines.append("")
+            lines.extend(_render_entry(entry, domain_key))
 
     # Any domains not in _DOMAIN_ORDER (future-proofing).
     for domain_key, entries in sorted(grouped.items()):
@@ -74,12 +87,7 @@ async def regenerate_mirror(db: aiosqlite.Connection) -> Path:
         lines.append(f"## {heading}")
         lines.append("")
         for entry in entries:
-            lines.append(f"### {entry['concept']}")
-            for body_line in (entry.get("body") or "").splitlines():
-                lines.append(f"- {body_line}" if body_line.strip() else "")
-            if entry.get("ingested_at"):
-                lines.append(f"- **Stored**: {entry['ingested_at'][:10]}")
-            lines.append("")
+            lines.extend(_render_entry(entry, domain_key))
 
     if total == 0:
         lines.append("_No reference entries stored yet._")

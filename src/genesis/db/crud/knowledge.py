@@ -139,6 +139,13 @@ async def upsert(
     execute inside the same implicit transaction and are committed atomically
     by the single ``db.commit()`` at the end. A crash mid-sequence rolls
     back every write — no partial state.
+
+    **Caller invariant**: on re-upsert, callers should pass the existing
+    row's ``id`` (via ``find_by_unique_key``) rather than a fresh UUID.
+    If a different ``id`` is passed for a conflicting key, the
+    ``inserted`` flag will incorrectly return True because the actual_id
+    (from the pre-existing row) won't match the caller-supplied id.
+    ``ingest_knowledge_unit`` enforces this correctly.
     """
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()

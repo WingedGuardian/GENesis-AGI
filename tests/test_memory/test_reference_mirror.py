@@ -64,7 +64,11 @@ class TestRegenerateMirror:
         content = path.read_text()
         assert "## Credentials" in content
         assert "### Test Login" in content
-        assert "hunter2" in content
+        # Credential values must be redacted in the mirror file (C1 security fix)
+        assert "hunter2" not in content
+        assert "[redacted -- use reference_lookup]" in content
+        # Description should still be visible
+        assert "A test credential" in content
 
     @pytest.mark.asyncio
     async def test_multiple_domains(self, db, tmp_path, monkeypatch):
@@ -98,6 +102,24 @@ class TestRegenerateMirror:
         content = mirror_path.read_text()
         assert "## Custom Thing" in content
         assert "### Custom" in content
+
+    @pytest.mark.asyncio
+    async def test_non_credential_value_not_redacted(self, db, tmp_path, monkeypatch):
+        mirror_path = tmp_path / "known-to-genesis.md"
+        monkeypatch.setattr(
+            "genesis.memory.reference_mirror._MIRROR_PATH", mirror_path,
+        )
+        await _insert_ref(
+            db,
+            domain="reference.url",
+            concept="My Dashboard",
+            body="[reference.url] My Dashboard\nValue: https://example.com\nDescription: test",
+        )
+        await regenerate_mirror(db)
+        content = mirror_path.read_text()
+        # Non-credential values should NOT be redacted
+        assert "https://example.com" in content
+        assert "[redacted" not in content
 
     @pytest.mark.asyncio
     async def test_idempotent(self, db, tmp_path, monkeypatch):
