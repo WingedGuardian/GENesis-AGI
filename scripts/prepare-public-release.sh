@@ -210,6 +210,15 @@ PYEOF
     echo "    + CLAUDE.md templated"
 fi
 
+# Fail-closed: install-specific content must never leak into the public release.
+# Matches private repo names but not the public GENesis-AGI (legitimate in docs).
+if [ -f "$OUTPUT_DIR/CLAUDE.md" ] && \
+   grep -qE 'WingedGuardian/(Genesis|genesis-backups)|10\.176\.34\.|192\.168\.50\.' "$OUTPUT_DIR/CLAUDE.md"; then
+    echo "    FATAL: install-specific content leaked into public CLAUDE.md" >&2
+    grep -nE 'WingedGuardian/(Genesis|genesis-backups)|10\.176\.34\.|192\.168\.50\.' "$OUTPUT_DIR/CLAUDE.md" >&2
+    exit 1
+fi
+
 # .claude/docs/dual-repo.md was removed in favor of .claude/docs/your-genesis.md
 # (install-agnostic, no templating needed).
 
