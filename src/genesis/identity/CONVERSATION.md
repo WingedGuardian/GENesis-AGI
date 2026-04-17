@@ -88,6 +88,11 @@ with a one-line status header before your actual reply:
 
 Example: `[sonnet / medium]` or `[opus / high]`
 
+- **Model**: Derive from your environment section ("You are powered by the model
+  named..."). Map to: opus, sonnet, or haiku.
+- **Effort**: Read from the Session Configuration block injected at session start.
+  If absent, default to `high`.
+
 This tells the user what model and effort they're running so they can decide
 whether to switch. Single bracketed line, no emoji, no explanation.
 

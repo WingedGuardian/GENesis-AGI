@@ -694,8 +694,10 @@ _record_update_history "success" "" ""
 
 _write_state "done"
 
-# Clean up state file — successful update, nothing to recover
+# Clean up state files — successful update, nothing to recover
 rm -f "$STATE_FILE"
+rm -f "$HOME/.genesis/update_conflicts.json"
+rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
 rm -f "$HOME/.genesis/update_in_progress.pid"
 

@@ -9,7 +9,6 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from genesis.cc.session_cache import persist_session_config
 from genesis.cc.types import CCModel, ChannelType, EffortLevel, SessionType
 from genesis.db.crud import cc_sessions
 
@@ -76,10 +75,6 @@ class SessionManager:
             source_tag="foreground",
             thread_id=thread_id,
         )
-        # Sync the on-disk cache so the SessionStart hook shows correct
-        # model/effort in the session header (fixes stale-cache bug where
-        # the previous session's explicitly-set values persisted).
-        persist_session_config(model=str(model), effort=str(effort))
         return await cc_sessions.get_by_id(self._db, sess_id)
 
     async def create_background(
