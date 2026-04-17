@@ -77,7 +77,7 @@ class TestClassifyAlerts:
             # and deliberately not in _TIER1_PATTERNS (see classifier.py
             # rationale). It routes to Tier 3 via the WARNING fall-through.
             "guardian:heartbeat_stale",             # Tier 1 (Part 8)
-            "awareness:tick_overdue",               # Tier 2 (via blanket)
+            "awareness:tick_overdue",               # Tier 1 (explicit — defense mechanism)
             "infra:disk_low",                       # Tier 2 (via blanket)
             "infra:tmpfs_low",                      # Tier 2 (via blanket)
             "infra:container_memory_high",          # Tier 2 (via blanket)
