@@ -1,0 +1,9 @@
+name: automaton_supervisor
+type: native
+class: genesis.modules.automaton_supervisor.module.AutomatonSupervisorModule
+description: >
+  Automaton Supervisor — cognitive oversight of Conway Research Automaton
+  instances on Conway Cloud. Monitors health, injects strategy via skills
+  and inbox messages, enforces treasury policy, and feeds outcomes into the
+  Genesis learning pipeline.
+enabled: false

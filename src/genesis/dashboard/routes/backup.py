@@ -23,7 +23,10 @@ _BACKUP_DIR = _HOME / "backups" / "genesis-backups"
 @blueprint.route("/api/genesis/backup/status")
 def backup_status():
     """Return last backup status from status file + cron info."""
-    result = {"configured": _BACKUP_SCRIPT.is_file()}
+    result = {
+        "configured": _BACKUP_SCRIPT.is_file(),
+        "repo_configured": _BACKUP_DIR.is_dir(),
+    }
 
     # Read structured status file
     if _STATUS_FILE.is_file():

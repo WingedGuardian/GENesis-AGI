@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m json.tool)",
+      "Bash(./scripts/bootstrap.sh 2>&1)",
+      "Bash(env -u HOME bash .git/hooks/post-commit)",
+      "Bash(echo \"exit: $?\")"
+    ]
+  },
+  "enabledMcpjsonServers": [
+    "genesis-health",
+    "genesis-memory",
+    "genesis-outreach",
+    "genesis-recon"
+  ],
+  "prefersReducedMotion": false
+}

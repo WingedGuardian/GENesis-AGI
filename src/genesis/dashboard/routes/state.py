@@ -275,6 +275,8 @@ def essential_knowledge_endpoint():
         return jsonify({"content": None, "error": str(e)})
 
 
+
+
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
 @_async_route
 async def settings_timezone():

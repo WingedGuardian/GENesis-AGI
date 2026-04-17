@@ -601,8 +601,8 @@ if [[ ${#WERE_RUNNING[@]} -gt 0 ]]; then
     HEALTH_OK=false
     DEGRADED=""
 
-    for attempt in 1 2 3; do
-        sleep 5
+    for attempt in $(seq 1 12); do
+        sleep 15
         if curl -sf http://localhost:5000/api/genesis/health > /dev/null 2>&1; then
             echo "  OK: Genesis health endpoint responding (attempt $attempt)"
             HEALTH_OK=true
@@ -647,7 +647,7 @@ except Exception:
     fi
 
     if [ "$HEALTH_OK" = "false" ]; then
-        _do_rollback "health endpoint did not respond after 3 attempts (15s)"
+        _do_rollback "health endpoint did not respond after 12 attempts (3 minutes)"
         exit 1
     fi
     echo ""

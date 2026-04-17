@@ -159,6 +159,7 @@
         _updating: false,
         _updateReconnecting: false,
         _checkingForUpdates: false,
+        _checkUpToDate: false,
         _resolvingConflicts: false,
 
         // ── Settings hub state ────────────────────────────────────
@@ -689,11 +690,11 @@
         },
         async checkForUpdates() {
           this._checkingForUpdates = true;
+          this._checkUpToDate = false;
           try {
             const resp = await fetchApi("/api/genesis/updates/check", { method: "POST" });
             if (resp && resp.ok) {
               const check = await resp.json();
-              // Merge check result into updateStatus directly
               if (!this.updateStatus) await this.fetchUpdateStatus();
               if (check.commits_behind > 0) {
                 this.updateStatus.update_available = {
@@ -704,11 +705,15 @@
                 };
               } else {
                 this.updateStatus.update_available = null;
+                this._checkUpToDate = true;
+                setTimeout(() => { this._checkUpToDate = false; }, 4000);
               }
             } else {
-              alert("Check failed — could not reach upstream");
+              let msg = "Could not reach upstream";
+              try { const body = await resp.json(); if (body.error) msg = body.error; } catch {}
+              alert("Check failed: " + msg);
             }
-          } catch (e) { alert("Check failed: " + e.message); }
+          } catch (e) { alert("Server unreachable — is Genesis running?"); }
           this._checkingForUpdates = false;
         },
         async fetchUpdateProgress() {
@@ -6482,7 +6487,7 @@
                     <button @click="$store.genesisDashboard.checkForUpdates()"
                             :disabled="$store.genesisDashboard._checkingForUpdates"
                             style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                      <span x-text="$store.genesisDashboard._checkingForUpdates ? 'Checking...' : 'Check for Updates'"></span>
+                      <span x-text="$store.genesisDashboard._checkingForUpdates ? 'Checking...' : $store.genesisDashboard._checkUpToDate ? 'Up to date \u2714' : 'Check for Updates'"></span>
                     </button>
                   </div>
                 </div>
@@ -6619,14 +6624,26 @@
                       <span style="font-size:0.9rem;" x-text="$store.genesisDashboard.backupStatus.last_backup.duration_s + 's'"></span>
                     </div>
                   </div>
-                  <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
-                    <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
-                    <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
-                    <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
-                    <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
-                    <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
-                          x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
-                  </div>
+                  <template x-if="$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div style="display:flex; gap:1.5rem; flex-wrap:wrap; font-size:0.8rem; color:var(--color-text-secondary);">
+                      <span x-text="'SQLite: ' + $store.genesisDashboard.backupStatus.last_backup.sqlite_lines + ' lines'"></span>
+                      <span x-text="'Qdrant: ' + $store.genesisDashboard.backupStatus.last_backup.qdrant_collections + ' collections'"></span>
+                      <span x-text="'Transcripts: ' + $store.genesisDashboard.backupStatus.last_backup.transcript_files + ' files'"></span>
+                      <span x-text="'Memory: ' + $store.genesisDashboard.backupStatus.last_backup.memory_files + ' files'"></span>
+                      <span :style="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'color:#81c784' : 'color:#ef9a9a'"
+                            x-text="$store.genesisDashboard.backupStatus.last_backup.secrets_encrypted ? 'Secrets: encrypted' : 'Secrets: NOT encrypted'"></span>
+                    </div>
+                  </template>
+                  <template x-if="!$store.genesisDashboard.backupStatus.last_backup.success">
+                    <div>
+                      <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(239,154,154,0.1); border:1px solid rgba(239,154,154,0.3); font-size:0.8rem; color:#ef9a9a;"
+                           x-text="$store.genesisDashboard.backupStatus.last_backup.failure_reason || 'Backup failed — check logs'"></div>
+                      <template x-if="!$store.genesisDashboard.backupStatus?.repo_configured">
+                        <div style="margin-top:0.4rem; padding:0.5rem; border-radius:4px; background:rgba(255,183,77,0.1); border:1px solid rgba(255,183,77,0.3); font-size:0.8rem; color:#ffb74d;">
+                          Backup repo not configured. Set GENESIS_BACKUP_REPO in secrets.env and run a backup to clone it.</div>
+                      </template>
+                    </div>
+                  </template>
                 </div>
               </template>
               <template x-if="!$store.genesisDashboard.backupStatus.last_backup">

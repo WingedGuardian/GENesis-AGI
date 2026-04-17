@@ -28,6 +28,7 @@ _TRANSCRIPT_COUNT=0
 _MEMORY_COUNT=0
 _SECRETS_OK=false
 _SUCCESS=false
+_FAILURE_REASON=""
 
 _write_status() {
     local _ended_at
@@ -35,7 +36,7 @@ _write_status() {
     local _duration=$(( _ended_at - _STARTED_AT ))
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_FAILURE_REASON"}
 STATUSEOF
 }
 trap '_write_status' EXIT
@@ -52,7 +53,34 @@ LOG_PREFIX="[genesis-backup]"
 
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
-die() { log "FATAL: $*"; exit 1; }
+die() { _FAILURE_REASON="$*"; log "FATAL: $*"; exit 1; }
+
+# ── Encryption helpers ───────────────────────────────────────────────
+# All PII-bearing payloads (SQLite dump, transcripts, memory) use the
+# same GPG symmetric passphrase as secrets. If the passphrase is unset,
+# encrypted sections are SKIPPED rather than falling back to plaintext
+# (the memory system is designed to hold credentials — plaintext leak
+# to a private repo is not acceptable).
+_BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
+_ENCRYPT_READY=false
+if [ -n "$_BACKUP_PASSPHRASE" ]; then
+    _ENCRYPT_READY=true
+fi
+
+# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
+encrypt_stdin() {
+    local out="$1"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
+}
+
+# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+encrypt_file() {
+    local src="$1"
+    local dst="$2"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+}
 
 # ── Encryption helpers ───────────────────────────────────────────────
 # All PII-bearing payloads (SQLite dump, transcripts, memory) use the

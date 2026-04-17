@@ -64,6 +64,7 @@ _MODULE_DESCRIPTIONS: dict[str, str] = {
     "prediction_markets": "Prediction market analysis — calibration-driven forecasting, market scanning, Kelly position sizing",
     "crypto_ops": "Crypto token operations — narrative detection, launch monitoring, position health tracking",
     "content_pipeline": "Content pipeline — idea capture, weekly planning, voice-calibrated script drafting, multi-platform publishing, analytics feedback loop",
+    "automaton_supervisor": "Automaton Supervisor — cognitive oversight of Conway Research Automaton instances on Conway Cloud, treasury policy, strategy injection, learning loop",
 }
 
 
