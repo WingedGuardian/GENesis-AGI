@@ -50,6 +50,34 @@ python -m genesis serve                           # Standalone server (port 5000
 python -m genesis serve --port 5001               # Custom port
 ```
 
+## Serena — Semantic Code Analysis
+
+Serena is an MCP server providing LSP-powered code intelligence via Pyright.
+Available as `mcp__serena__*` tools. Complements Grep, does not replace it.
+
+**When to use Serena:**
+- "Where is this class/function wired in?" → `find_referencing_symbols`
+- "What's the definition and signature?" → `find_symbol` with `include_body`
+- "What methods does this class have?" → `find_symbol` with `depth=1`
+- Architectural traversal — dependency injection patterns, type hierarchies
+- Safe refactoring — `rename_symbol`, `replace_symbol_body`
+
+**When to use Grep instead:**
+- String patterns, comments, config files, migrations, YAML/JSON
+- Test files using mocks (Pyright doesn't follow mock patterns)
+- Anything outside Python semantics (shell scripts, HTML templates, SQL)
+
+**When to use the AST code index (`code_modules`/`code_symbols` tables):**
+- Lightweight structural queries (module counts, symbol stats)
+- Proactive hook enrichment (runs every prompt — must be fast)
+- Package-level summaries
+
+**Key behaviors:**
+- 1-2s one-time LSP init per session, then fast
+- Returns semantic context (symbol kind, type signatures, containing class)
+- Distinguishes `TYPE_CHECKING` imports from runtime imports
+- Config: `.serena/project.yml`
+
 ## Genesis Development Work
 
 When the task involves modifying Genesis itself — fixing bugs, implementing
@@ -230,6 +258,12 @@ Full pipeline details are in the `genesis-development` skill's
   without explicit user confirmation.
 - **Session wrap-up**: structured handoff — what changed, what's pending, what
   was learned. If it's not committed, it doesn't exist.
+- **Follow-up ownership**: For each follow-up item identified during a session:
+  1. State what it is and why
+  2. State what Genesis will do: schedule it, flag for ego, or surface to user
+  3. Create the follow-up via the `follow_up_create` MCP tool before session ends
+  4. Never leave a follow-up as just text — every deferred item needs a backing
+     record. Genesis owns follow-through, not the user.
 - **No laziness.** Find root causes. No temporary fixes. No "good enough"
   shortcuts. No skipping steps because the answer seems obvious. Hold yourself
   to senior developer standards — if you wouldn't approve it in a code review,

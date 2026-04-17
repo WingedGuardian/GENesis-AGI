@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -58,14 +59,97 @@ def _normalize_dispatch(raw: object, *, call_site_name: str) -> str:
     return "dual"
 
 
+def _deep_merge(base: dict, overlay: dict) -> dict:
+    """Recursively merge overlay into base. Lists are replaced, not appended."""
+    merged = copy.deepcopy(base)
+    for key, val in overlay.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
+def _local_path_for(path: Path) -> Path:
+    """Derive the .local.yaml path for a base config file."""
+    return path.with_name(f"{path.stem}.local.yaml")
+
+
+def _load_local_overlay(path: Path) -> dict:
+    """Load the .local.yaml overlay for a config path. Returns {} if none."""
+    local = _local_path_for(path)
+    if not local.is_file():
+        return {}
+    try:
+        return yaml.safe_load(local.read_text()) or {}
+    except Exception:
+        logger.warning("Failed to read local overlay %s", local, exc_info=True)
+        return {}
+
+
+def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
+    """Filter stale references from a local overlay before merging.
+
+    Removes provider references from local call site chains that don't
+    exist in the base config's providers section. This prevents a stale
+    .local.yaml from breaking startup after an upstream update removes
+    a provider.
+
+    Returns a sanitized copy — does NOT mutate the input.
+    """
+    result = copy.deepcopy(local_raw)
+    base_providers = set((base_raw.get("providers") or {}).keys())
+    local_call_sites = (result.get("call_sites") or {})
+
+    for cs_name, cs in list(local_call_sites.items()):
+        if not isinstance(cs, dict) or "chain" not in cs:
+            continue
+        original_chain = cs["chain"]
+        filtered = [p for p in original_chain if p in base_providers]
+        stale = set(original_chain) - set(filtered)
+        if stale:
+            logger.warning(
+                "Local override for call site '%s' references unknown "
+                "provider(s) %s (removed upstream?) — skipping them",
+                cs_name, sorted(stale),
+            )
+        if not filtered:
+            logger.warning(
+                "Local override for call site '%s' has no valid providers "
+                "after filtering — dropping local chain override",
+                cs_name,
+            )
+            del cs["chain"]
+            if not cs:
+                del local_call_sites[cs_name]
+        else:
+            cs["chain"] = filtered
+
+    return result
+
+
 def load_config(path: str | Path) -> RoutingConfig:
-    """Load routing config from a YAML file path."""
-    text = Path(path).read_text()
-    return load_config_from_string(text)
+    """Load routing config from a YAML file path.
+
+    Checks for a ``{stem}.local.yaml`` overlay in the same directory and
+    deep-merges it on top of the base config before parsing. Local overlays
+    are gitignored and survive upstream updates.
+    """
+    path = Path(path)
+    text = path.read_text()
+    base_raw = yaml.safe_load(_expand_env_vars(text))
+
+    local_raw = _load_local_overlay(path)
+    if local_raw:
+        local_raw = _sanitize_local_overlay(base_raw, local_raw)
+        if local_raw:
+            base_raw = _deep_merge(base_raw, local_raw)
+
+    return _parse(base_raw)
 
 
 def load_config_from_string(text: str) -> RoutingConfig:
-    """Load routing config from a YAML string."""
+    """Load routing config from a YAML string (no overlay support)."""
     raw = yaml.safe_load(_expand_env_vars(text))
     return _parse(raw)
 
@@ -184,10 +268,14 @@ def update_call_site_in_yaml(
     cc_position: int | None = None,
     dispatch: str | None = None,
 ) -> RoutingConfig:
-    """Update a single call site in the YAML config file.
+    """Update a single call site, writing changes to the local overlay.
 
-    Uses atomic write (write .new, validate, rename) with rolling backups.
-    Returns the newly loaded config if successful.
+    Reads the base config for validation (provider existence, etc.) but
+    writes user changes to ``{stem}.local.yaml`` so the base file stays
+    clean for upstream git updates.
+
+    Uses atomic write with rolling backups on the local overlay file.
+    Returns the newly loaded (merged) config if successful.
     Raises ValueError on validation failure.
 
     ``dispatch`` is the user-controlled runtime mode:
@@ -197,14 +285,14 @@ def update_call_site_in_yaml(
       - None   → leave the existing yaml value unchanged
     """
     path = Path(path)
-    raw = yaml.safe_load(path.read_text())
+    base_raw = yaml.safe_load(path.read_text())
 
-    if call_site_id not in (raw.get("call_sites") or {}):
+    if call_site_id not in (base_raw.get("call_sites") or {}):
         msg = f"Unknown call site: {call_site_id}"
         raise ValueError(msg)
 
-    cs = raw["call_sites"][call_site_id]
-    providers = raw.get("providers") or {}
+    # Build the change dict for the local overlay
+    providers = base_raw.get("providers") or {}
 
     if dispatch is not None and dispatch not in _VALID_DISPATCH_MODES:
         msg = f"Invalid dispatch mode: {dispatch!r}. Must be one of {_VALID_DISPATCH_MODES}"
@@ -221,6 +309,15 @@ def update_call_site_in_yaml(
     ):
         return load_config(path)
 
+    # Start with existing local overlay for this call site
+    local_path = _local_path_for(path)
+    local_raw = _load_local_overlay(path)
+    local_cs = local_raw.setdefault("call_sites", {}).setdefault(call_site_id, {})
+
+    # Resolve effective call site (base + existing local) for validation
+    base_cs = base_raw["call_sites"][call_site_id]
+    effective_cs = _deep_merge(base_cs, local_cs)
+
     if chain is not None:
         if not chain:
             msg = "Chain must have at least one provider"
@@ -232,13 +329,16 @@ def update_call_site_in_yaml(
             if p not in providers:
                 msg = f"Unknown provider in chain: {p}"
                 raise ValueError(msg)
-        cs["chain"] = chain
+        local_cs["chain"] = chain
+        effective_cs["chain"] = chain
 
     if default_paid is not None:
-        cs["default_paid"] = default_paid
+        local_cs["default_paid"] = default_paid
+        effective_cs["default_paid"] = default_paid
 
     if never_pays is not None:
-        cs["never_pays"] = never_pays
+        local_cs["never_pays"] = never_pays
+        effective_cs["never_pays"] = never_pays
 
     # CC dispatch metadata (stored in YAML, read by dashboard)
     _VALID_CC_MODELS = {"Haiku", "Sonnet", "Opus"}
@@ -250,63 +350,61 @@ def update_call_site_in_yaml(
         if cc_position < 0:
             cc_position = None
     if cc_model is not None:
-        cs["cc_model"] = cc_model
-        # Default to 'dual' when cc_model present with a chain, but defer to
-        # the explicit dispatch parameter (applied below) if the caller sent one.
+        local_cs["cc_model"] = cc_model
         if dispatch is None:
-            cs["dispatch"] = "dual" if chain else cs.get("dispatch", "cc")
+            local_cs["dispatch"] = "dual" if chain else effective_cs.get("dispatch", "cc")
         if cc_position is not None:
-            cs["cc_position"] = cc_position
+            local_cs["cc_position"] = cc_position
         else:
-            cs.pop("cc_position", None)
+            local_cs.pop("cc_position", None)
     elif chain is not None and cc_model is None and dispatch is None:
-        # Explicit removal: cc_model sent as None with a chain update and no
-        # explicit dispatch = API-only (legacy behavior).
-        cs.pop("cc_model", None)
-        cs.pop("dispatch", None)
-        cs.pop("cc_position", None)
+        local_cs.pop("cc_model", None)
+        local_cs.pop("dispatch", None)
+        local_cs.pop("cc_position", None)
 
-    # Explicit dispatch mode wins over implicit logic above. When the caller
-    # sends dispatch='api', we remove CC-only fields; dispatch='cli' or 'dual'
-    # preserves cc_model but stores the new dispatch value.
     if dispatch is not None:
-        cs["dispatch"] = dispatch
+        local_cs["dispatch"] = dispatch
         if dispatch == "api":
-            cs.pop("cc_model", None)
-            cs.pop("cc_position", None)
+            local_cs.pop("cc_model", None)
+            local_cs.pop("cc_position", None)
 
     # Validate: never_pays sites must have at least one free provider
-    if cs.get("never_pays"):
-        free_in_chain = [p for p in cs["chain"] if providers.get(p, {}).get("free")]
+    effective_chain = effective_cs.get("chain", base_cs.get("chain", []))
+    if effective_cs.get("never_pays"):
+        free_in_chain = [p for p in effective_chain if providers.get(p, {}).get("free")]
         if not free_in_chain:
             msg = f"never_pays site '{call_site_id}' must have at least one free provider"
             raise ValueError(msg)
 
-    # Atomic write: .new → validate parse → rotate backups → rename
-    new_text = yaml.dump(raw, default_flow_style=False, sort_keys=False)
-    new_path = path.with_suffix(".yaml.new")
-    new_path.write_text(new_text)
-
-    # Validate the new config parses correctly
+    # Validate the merged config in-memory before touching disk.
+    # Merges local_raw (with new changes) onto base_raw and parses it.
     try:
-        new_config = load_config(new_path)
+        merged_raw = _deep_merge(base_raw, local_raw)
+        new_config = _parse(merged_raw)
     except Exception as e:
-        new_path.unlink(missing_ok=True)
         msg = f"Generated config failed validation: {e}"
         raise ValueError(msg) from e
 
-    # Rolling backups (.bak.3 → .bak.2 → .bak.1 → current)
+    # Atomic write to local overlay: .new → rotate backups → rename
+    new_text = yaml.dump(local_raw, default_flow_style=False, sort_keys=False)
+    new_local_path = local_path.with_suffix(".yaml.new")
+    new_local_path.write_text(new_text)
+
+    # Rolling backups on the local overlay (.bak.3 → .bak.2 → .bak.1)
     for i in range(3, 1, -1):
-        older = path.with_suffix(f".yaml.bak.{i}")
-        newer = path.with_suffix(f".yaml.bak.{i - 1}")
+        older = local_path.with_suffix(f".yaml.bak.{i}")
+        newer = local_path.with_suffix(f".yaml.bak.{i - 1}")
         if newer.exists():
             shutil.copy2(newer, older)
-    bak1 = path.with_suffix(".yaml.bak.1")
-    if path.exists():
-        shutil.copy2(path, bak1)
+    bak1 = local_path.with_suffix(".yaml.bak.1")
+    if local_path.exists():
+        shutil.copy2(local_path, bak1)
 
     # Atomic rename
-    new_path.rename(path)
-    logger.info("Routing config updated: call site '%s' modified", call_site_id)
+    new_local_path.rename(local_path)
+    logger.info(
+        "Routing config updated: call site '%s' modified in local overlay",
+        call_site_id,
+    )
 
     return new_config

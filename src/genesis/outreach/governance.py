@@ -24,10 +24,19 @@ _MORNING_REPORT_SIGNAL = "morning_report"
 
 # Per-signal_type dedup windows (hours).  Prevents awareness-loop retries from
 # double-sending.  Keys not listed here fall through to _DEFAULT_DEDUP_HOURS.
+# Three-tier policy:
+#   - Informational alerts (12-24h): suppress duplicates entirely
+#   - Approval requests (4h): re-send as reminder after window
+#   - Escalations (8h): re-send as reminder, less often
 _DEDUP_WINDOWS: dict[str, int] = {
-    "health_alert": 6,
+    "health_alert": 12,
+    "sentinel_approval": 4,
+    "sentinel_escalation": 8,
+    "sentinel_action_approval": 4,
+    "autonomous_cli_fallback": 4,
+    "genesis_update": 24,
     "code_audit": 6,
-    "cc_version_update": 1,
+    "cc_version_update": 24,
     "morning_report": 24,
     "surplus_insight": 24,
     "surplus_opportunity": 24,
@@ -49,16 +58,21 @@ class GovernanceGate:
 
     async def check(self, request: OutreachRequest) -> GovernanceResult:
         if request.category in _BYPASS_CATEGORIES:
-            # BLOCKER and ALERT: fully bypass all governance including dedup.
-            # If a condition is being reported, it exists right now. If it's
-            # the same as 6 hours ago, that's information — the problem
-            # persists. Suppressing it hides persistence from the user.
-            # Dedup is for proactive outreach (morning reports, surplus
-            # insights). Reactive alerts should never be suppressed.
+            # BLOCKER/ALERT bypass salience, quiet hours, engagement throttle
+            # but NOT dedup — repeated identical alerts add noise, not
+            # information.  The user who got "Ollama down" 2h ago knows it's
+            # still down; re-sending doesn't help.  Approval requests get
+            # shorter dedup windows (4h) so they act as reminders.
+            if await self._is_duplicate(request):
+                return GovernanceResult(
+                    verdict=GovernanceVerdict.DENY,
+                    reason=f"{request.category.value} suppressed (duplicate within window)",
+                    checks_failed=["dedup"],
+                )
             return GovernanceResult(
                 verdict=GovernanceVerdict.BYPASS,
-                reason=f"{request.category.value} bypasses all governance",
-                checks_passed=["category_bypass"],
+                reason=f"{request.category.value} bypasses governance (dedup passed)",
+                checks_passed=["category_bypass", "dedup"],
             )
 
         if request.signal_type == _MORNING_REPORT_SIGNAL:
@@ -137,6 +151,13 @@ class GovernanceGate:
         if start <= end:
             return start <= now <= end
         return now >= start or now <= end
+
+    async def is_duplicate(self, request: OutreachRequest) -> bool:
+        """Check if a similar outreach was sent within the dedup window.
+
+        Public API — used by submit_raw() for lightweight dedup on urgent paths.
+        """
+        return await self._is_duplicate(request)
 
     async def _is_duplicate(self, request: OutreachRequest) -> bool:
         window_hours = _DEDUP_WINDOWS.get(

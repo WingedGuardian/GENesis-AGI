@@ -1,7 +1,16 @@
 """Tests for urgency scorer."""
 
-from genesis.awareness.scorer import compute_scores, compute_time_multiplier
+import json
+
+from genesis.awareness.scorer import (
+    _signal_unchanged_counts,
+    _update_staleness,
+    compute_scores,
+    compute_time_multiplier,
+    get_staleness_context,
+)
 from genesis.awareness.types import Depth, SignalReading
+from genesis.db.crud import awareness_ticks
 
 # ─── Time multiplier curve tests ─────────────────────────────────────────────
 
@@ -121,3 +130,96 @@ async def test_compute_scores_zero_signals(db):
     scores = await compute_scores(db, [], now="2026-03-03T12:00:00+00:00")
     for s in scores:
         assert s.raw_score == 0.0
+
+
+# ─── Staleness decay tests ──────────────────────────────────────────────────
+
+
+def test_update_staleness_unchanged_signal():
+    """Unchanged signal gets decaying factor."""
+    _signal_unchanged_counts.clear()
+    current = {"sig_a": 1.0}
+    prev = {"sig_a": 1.0}
+    factors = _update_staleness(current, prev)
+    assert factors["sig_a"] == 0.5  # first unchanged tick: 0.5
+    assert _signal_unchanged_counts["sig_a"] == 1
+
+    # Second unchanged tick
+    factors = _update_staleness(current, prev)
+    assert factors["sig_a"] == 0.25  # 0.5^2
+    assert _signal_unchanged_counts["sig_a"] == 2
+
+
+def test_update_staleness_changed_signal():
+    """Changed signal resets to full weight."""
+    _signal_unchanged_counts.clear()
+    _signal_unchanged_counts["sig_a"] = 5  # previously stale
+
+    current = {"sig_a": 0.8}
+    prev = {"sig_a": 0.3}  # different value
+    factors = _update_staleness(current, prev)
+    assert factors["sig_a"] == 1.0  # reset to full weight
+    assert _signal_unchanged_counts["sig_a"] == 0
+
+
+def test_update_staleness_new_signal():
+    """Signal not in previous tick gets full weight."""
+    _signal_unchanged_counts.clear()
+    current = {"sig_a": 1.0}
+    prev = {}  # signal didn't exist before
+    factors = _update_staleness(current, prev)
+    assert factors["sig_a"] == 1.0
+    assert _signal_unchanged_counts["sig_a"] == 0
+
+
+def test_update_staleness_decay_floor():
+    """Decay should not go below the floor (0.05)."""
+    _signal_unchanged_counts.clear()
+    _signal_unchanged_counts["sig_a"] = 10  # very stale
+    current = {"sig_a": 1.0}
+    prev = {"sig_a": 1.0}
+    factors = _update_staleness(current, prev)
+    assert factors["sig_a"] == 0.05  # floored at 5%
+
+
+def test_get_staleness_context_returns_copy():
+    """get_staleness_context should return a copy, not the mutable dict."""
+    _signal_unchanged_counts.clear()
+    _signal_unchanged_counts["test"] = 3
+    ctx = get_staleness_context()
+    assert ctx == {"test": 3}
+    ctx["test"] = 99
+    assert _signal_unchanged_counts["test"] == 3  # original unchanged
+
+
+async def test_compute_scores_staleness_decay(db):
+    """Identical signals across consecutive ticks produce decayed raw scores."""
+    _signal_unchanged_counts.clear()
+    signals = [
+        SignalReading(
+            name="software_error_spike", value=1.0,
+            source="health_mcp", collected_at="2026-03-03T12:00:00+00:00",
+        ),
+    ]
+
+    # First call — no prior tick in DB, signal treated as fresh
+    scores1 = await compute_scores(db, signals, now="2026-03-03T12:00:00+00:00")
+    micro1 = next(s for s in scores1 if s.depth == Depth.MICRO)
+
+    # Store a tick so the next call has a prior to compare against
+    await awareness_ticks.create(
+        db,
+        id="tick-1",
+        source="scheduled",
+        signals_json=json.dumps([{"name": "software_error_spike", "value": 1.0}]),
+        scores_json="[]",
+        created_at="2026-03-03T12:00:00+00:00",
+    )
+
+    # Second call — same signal value, should see decay
+    scores2 = await compute_scores(db, signals, now="2026-03-03T12:05:00+00:00")
+    micro2 = next(s for s in scores2 if s.depth == Depth.MICRO)
+
+    assert micro2.raw_score < micro1.raw_score, (
+        f"Stale signal should produce lower raw score: {micro2.raw_score} >= {micro1.raw_score}"
+    )

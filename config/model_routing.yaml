@@ -21,14 +21,6 @@ providers:
     model: mistral-large-latest
     profile: mistral-large-3
     free: true
-    # Raised 2→4 on 2026-04-11 after a data-grounded review of observed
-    # usage (memory/project_mistral_large_review.md). Actual call sizes
-    # average ~3k tokens (not the 13k/call figure the earlier 2-rpm cap
-    # was based on), so 4 rpm × ~5k worst-case ≈ 20k tokens/min leaves
-    # ~60% headroom under the stated 50k tokens/min ceiling. The live
-    # TPM header has NOT been reprobed in this pass — if observed usage
-    # grows or call patterns shift above ~6k/call sustained, revisit
-    # before going higher.
     rpm_limit: 4
     open_duration_s: 120
   mistral-small-free:
@@ -36,9 +28,6 @@ providers:
     model: mistral-small-latest
     profile: mistral-small
     free: true
-    # Mistral free tier publishes 60 req/min + 375k tokens/min for
-    # mistral-small-latest (verified 2026-04-11 via x-ratelimit-limit-req-minute
-    # header on a live probe). Setting to 30 leaves 50% headroom.
     rpm_limit: 30
     open_duration_s: 120
   groq-free:
@@ -60,6 +49,48 @@ providers:
     model: qwen/qwen-2.5-72b-instruct
     profile: qwen-2.5-72b
     free: true
+    rpm_limit: 20
+    open_duration_s: 120
+  # ── Phase 2 providers (gated on eval before chain promotion) ──
+  cerebras-qwen:
+    type: cerebras
+    model: qwen-3-235b-a22b-instruct-2507
+    profile: cerebras-qwen3-235b
+    free: true
+    # 10 RPM, 14,400 RPD. Instruct only (no thinking). Volume play.
+    rpm_limit: 10
+    open_duration_s: 120
+  github-o3mini:
+    type: github
+    model: o3-mini
+    profile: github-o3-mini
+    free: true
+    # Disabled: GitHub Models API does not currently serve o3-mini
+    # (only gpt-4o, gpt-4o-mini, Llama 3.1 available as of 2026-04-14)
+    enabled: false
+    rpm_limit: 10
+    open_duration_s: 120
+  openrouter-gemma4:
+    type: openrouter
+    model: google/gemma-4-31b-it:free
+    profile: gemma-4-31b
+    free: true
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-qwen3coder:
+    type: openrouter
+    model: qwen/qwen3-coder:free
+    profile: qwen3-coder
+    free: true
+    rpm_limit: 8  # Actual OpenRouter limit (high-demand Venice backend)
+    open_duration_s: 120
+  openrouter-deepseek-r1:
+    type: openrouter
+    model: deepseek/deepseek-r1:free
+    profile: deepseek-r1
+    free: true
+    # Free endpoint removed from OpenRouter as of 2026-04-15; disable until restored
+    enabled: false
     rpm_limit: 20
     open_duration_s: 120
   openrouter-mimo:
@@ -143,6 +174,22 @@ providers:
     model: moonshotai/kimi-k2.5
     profile: kimi-k2.5
     free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-qwen36plus:
+    type: openrouter
+    model: qwen/qwen3.6-plus
+    profile: qwen-3.6-plus
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-trinity-free:
+    type: openrouter
+    model: arcee-ai/trinity-large-preview:free
+    profile: trinity-large-preview
+    free: true
+    # 400B MoE (13B active). Free until 2026-04-22. Benchmark before expiry.
+    rpm_limit: 20
     open_duration_s: 120
   lmstudio-30b:
     type: lmstudio
@@ -185,8 +232,8 @@ call_sites:
     retry_profile: background
     never_pays: false
     cc_model: Sonnet
-    dispatch: dual
-    cc_position: 2
+    dispatch: cli
+    cc_position: 4
   6_strategic_reflection:
     chain:
     - claude-opus
@@ -221,13 +268,6 @@ call_sites:
     - claude-sonnet
     default_paid: true
   11_user_model_synthesis:
-    # LLM-narrative synthesis of the user model. Wired in
-    # runtime/init/learning.py — every 48h the user_model_evolver job calls
-    # router.call("11_user_model_synthesis", ...) with the current model dict
-    # plus recent delta evidence, and writes the result to USER_KNOWLEDGE.md.
-    # Free-first chain — synthesis is summary-quality work that does not
-    # require frontier models. On all-free-exhausted, learning.py falls back
-    # to Python dict rendering as graceful degradation.
     chain:
     - mistral-small-free
     - groq-free
@@ -269,6 +309,13 @@ call_sites:
     - openrouter-free
     - claude-sonnet
     default_paid: true
+  21_session_observer:
+    chain:
+    - mistral-large-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+    retry_profile: background
   22_tagging:
     chain:
     - ollama-3b
@@ -288,7 +335,7 @@ call_sites:
     chain:
     - groq-free
     - mistral-large-free
-    - openrouter-nemo  # cheap paid tail — prevents DLQ storm when both free providers trip (mirrors 37_infrastructure_monitor)
+    - openrouter-nemo
   30_triage_calibration:
     chain:
     - lmstudio-30b
@@ -329,7 +376,7 @@ call_sites:
     - gemini-free
     - groq-free
     - mistral-large-free
-    - openrouter-free  # 4th free provider for resilience (same failure shape as site 29)
+    - openrouter-free
     description: Draft content for various platforms
   23_fresh_eyes_review:
     chain:
@@ -354,6 +401,7 @@ call_sites:
   contingency_foreground:
     chain:
     - kimi-k2.5
+    - openrouter-qwen36plus
     - gpt-5.4
     default_paid: true
     retry_profile: user_facing
@@ -365,10 +413,12 @@ call_sites:
     - groq-free
     never_pays: true
     retry_profile: background
-    description: "CC contingency \u2014 Micro reflection via free API when CC unavailable (cheap periodic ticks, quality not critical)"
+    description: "CC contingency \u2014 Micro reflection via free API when CC unavailable\
+      \ (cheap periodic ticks, quality not critical)"
   autonomous_executor_reasoning:
     chain:
     - claude-sonnet
+    - openrouter-qwen36plus
     - gpt-5.4
     default_paid: true
     retry_profile: background
@@ -417,6 +467,24 @@ surplus:
     meta_brainstorm:
     - free_api
     - local_30b
+    # Phase 2: new surplus task types (Tier 1 — observation only)
+    model_eval:
+    - free_api
+    gap_clustering:
+    - free_api
+    anticipatory_research:
+    - free_api
+    prompt_effectiveness_review:
+    - free_api
+    # Infrastructure maintenance (no LLM needed — scripts only)
+    disk_cleanup:
+    - free_api
+    db_maintenance:
+    - free_api
+    dead_letter_replay:
+    - free_api
+    backup_verification:
+    - free_api
   health_checks:
     lmstudio:
       url: ${LM_STUDIO_HEALTH_URL:-http://localhost:1234/v1/models}

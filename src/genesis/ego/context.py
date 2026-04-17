@@ -53,6 +53,7 @@ class EgoContextBuilder:
         sections.append(await self._system_health_section())
         sections.append(await self._signals_section())
         sections.append(await self._observations_section())
+        sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
         sections.append(await self._proposal_history_section())
         sections.append(await self._output_contract_section())
@@ -245,6 +246,45 @@ class EgoContextBuilder:
             )
 
         lines.append("")
+        return "\n".join(lines)
+
+    async def _follow_ups_section(self) -> str:
+        """Pending and failed follow-ups that need ego attention."""
+        lines = ["## Follow-ups Requiring Attention\n"]
+
+        try:
+            from genesis.db.crud import follow_ups as follow_up_crud
+
+            actionable = await follow_up_crud.get_actionable(self._db)
+        except Exception:
+            logger.error("Failed to query follow-ups", exc_info=True)
+            lines.append("*Could not query follow-ups.*\n")
+            return "\n".join(lines)
+
+        if not actionable:
+            lines.append("*No follow-ups requiring attention.*\n")
+            return "\n".join(lines)
+
+        lines.append(f"**{len(actionable)} items** needing action:\n")
+        for fu in actionable[:15]:  # Cap to avoid flooding context
+            status = fu.get("status", "?")
+            priority = fu.get("priority", "medium")
+            content = fu.get("content", "")[:200]
+            content = content.replace("\n", " ")
+            source = fu.get("source", "?")
+            strategy = fu.get("strategy", "?")
+            blocked = fu.get("blocked_reason", "")
+
+            line = f"- [{priority}/{status}] ({source}) **{strategy}**: {content}"
+            if blocked:
+                line += f" — BLOCKED: {blocked[:100]}"
+            lines.append(line)
+
+        lines.append(
+            "\nYou can: create new follow-ups (they persist until resolved), "
+            "mark items completed, or change strategy. Failed items need "
+            "your judgment — retry, promote to task, escalate to user, or dismiss.\n"
+        )
         return "\n".join(lines)
 
     async def _cost_section(self) -> str:

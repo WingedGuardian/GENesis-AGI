@@ -94,6 +94,7 @@
         outreachModal: {
           open: false,
           messages: [],
+          pendingApprovals: [],
           categoryFilter: null,
           fetch: { state: "idle", lastSuccess: null, error: null },
         },
@@ -110,6 +111,7 @@
         operationalVitals: null,
         autonomousCliPolicy: null,
         cognitiveState: null,
+        essentialKnowledge: null,
         awarenessSignals: null,
         jobHealth: null,
         autonomyConfig: null,
@@ -206,13 +208,14 @@
         _routingInterval: null,
         _approvalsInterval: null,
         _cognitiveInterval: null,
+        _ekInterval: null,
         _awarenessInterval: null,
         _jobHealthInterval: null,
         _tasksInterval: null,
 
         // Tab management
         _TAB_INTERVALS: {
-          overview:  ["_cognitiveInterval", "_modulesInterval"],
+          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
           chat:      [],
           internals: ["_codeFindingsInterval", "_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
@@ -252,8 +255,9 @@
           this._tabInitialized[tab] = true;
           switch (tab) {
             case "overview":
-              if (first) { this.fetchCognitive(); this.fetchModules(); this.fetchProvidersDetail(); }
+              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); }
               this._cognitiveInterval = setInterval(() => this.fetchCognitive(), 60000);
+              this._ekInterval = setInterval(() => this.fetchEssentialKnowledge(), 120000);
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
@@ -713,8 +717,19 @@
             if (resp && resp.ok) { this.updateProgress = await resp.json(); }
           } catch (e) { /* server may be down during update */ }
         },
+        _updatePhaseLabel(phase) {
+          const labels = {
+            fetching: "Fetching latest code...",
+            merging: "Merging updates...",
+            bootstrap: "Running bootstrap...",
+            migrations: "Running migrations...",
+            health_check: "Verifying system health...",
+            done: "Update complete",
+          };
+          return labels[phase] || "Starting update...";
+        },
         async applyUpdate() {
-          const msg = "Apply Genesis update?\n\nA background session will:\n• Back up data\n• Merge latest code\n• Resolve trivial conflicts automatically\n• Run migrations & restart services\n• Verify health\n\nThe dashboard will be briefly unavailable (~30-60s).\nContinue?";
+          const msg = "Apply Genesis update?\n\nA background session will:\n\u2022 Back up data\n\u2022 Merge latest code\n\u2022 Resolve trivial conflicts automatically\n\u2022 Run migrations & restart services\n\u2022 Verify health\n\nContinue?";
           if (!confirm(msg)) return;
           this._updating = true;
           try {
@@ -723,46 +738,51 @@
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ supervised: true }),
             });
-          } catch (e) { /* expected — server may die before response */ }
-          // Poll progress + health
-          this._updateReconnecting = true;
+          } catch (e) { /* expected — server may restart */ }
           const start = Date.now();
           const poll = setInterval(async () => {
             try {
               await this.fetchUpdateProgress();
               const prog = this.updateProgress;
-              // If progress shows conflicts needing Opus, stop polling and show resolve UI
-              if (prog && prog.escalation && prog.escalation.includes("tier3_needed")) {
+              if (!prog) return;
+              // Conflicts detected — stop polling, show resolve UI
+              if (prog.escalation && (prog.escalation.includes("tier3_needed") || prog.escalation.includes("tier2_needed"))
+                  && !prog.in_progress) {
                 clearInterval(poll);
                 this._updating = false;
-                this._updateReconnecting = false;
                 await this.fetchUpdateStatus();
                 return;
               }
-              // If progress shows completion (not in progress, has summary)
-              if (prog && !prog.in_progress && prog.summary && prog.summary.startsWith("success")) {
+              // Failed state (not success, not in progress)
+              if (prog.failed && !prog.in_progress) {
                 clearInterval(poll);
                 this._updating = false;
-                this._updateReconnecting = false;
+                await this.fetchUpdateStatus();
+                return;
+              }
+              // Success
+              if (!prog.in_progress && prog.summary && prog.summary.startsWith("success")) {
+                clearInterval(poll);
+                this._updating = false;
                 await this.fetchUpdateStatus();
                 await this.fetchHealth();
                 return;
               }
-              // Fallback: check health endpoint
-              const resp = await fetchApi("/api/genesis/health");
-              if (resp && resp.ok && prog && !prog.in_progress) {
-                clearInterval(poll);
-                this._updating = false;
-                this._updateReconnecting = false;
-                await this.fetchUpdateStatus();
-                await this.fetchHealth();
+              // Fallback: health ok + not in progress
+              if (!prog.in_progress) {
+                const resp = await fetchApi("/api/genesis/health");
+                if (resp && resp.ok) {
+                  clearInterval(poll);
+                  this._updating = false;
+                  await this.fetchUpdateStatus();
+                  await this.fetchHealth();
+                }
               }
-            } catch (e) { /* still down, keep polling */ }
-            if (Date.now() - start > 600000) {
+            } catch (e) { /* server may be restarting, keep polling */ }
+            if (Date.now() - start > 300000) {
               clearInterval(poll);
               this._updating = false;
-              this._updateReconnecting = false;
-              alert("Update is taking longer than expected.\nIt may still be running — check server logs for status.");
+              alert("Update did not complete after 5 minutes.\nCheck server logs for status.");
               await this.fetchUpdateStatus();
             }
           }, 5000);
@@ -793,6 +813,14 @@
           }, 5000);
           // Safety timeout
           setTimeout(() => { clearInterval(poll); this._resolvingConflicts = false; }, 600000);
+        },
+
+        async dismissUpdate() {
+          try {
+            await fetchApi("/api/genesis/updates/dismiss", { method: "POST" });
+            this.updateProgress = {};
+            await this.fetchUpdateStatus();
+          } catch (e) { console.warn("Dismiss failed:", e); }
         },
 
         // ── Settings hub fetches ─────────────────────────────────
@@ -886,6 +914,9 @@
           OPENAI_API_KEY: ['openai'],
           API_KEY_XAI: ['xai'],
           API_KEY_DEEPINFRA: ['deepinfra'],
+          API_KEY_CEREBRAS: ['cerebras'],
+          API_KEY_GITHUB: ['github'],
+          API_KEY_SAMBANOVA: ['sambanova'],
         },
         secretHealthStatus(keyEntry) {
           if (keyEntry.status === 'not_set') return 'not_set';
@@ -1105,6 +1136,17 @@
           } catch (e) {
             console.warn("Cognitive fetch failed:", e);
             this.failFetch("cognitive", "Cognitive state unavailable");
+          }
+        },
+
+        async fetchEssentialKnowledge() {
+          try {
+            const resp = await fetchApi("/api/genesis/essential-knowledge");
+            if (resp && resp.ok) {
+              this.essentialKnowledge = await resp.json();
+            }
+          } catch (e) {
+            console.warn("Essential knowledge fetch failed:", e);
           }
         },
 
@@ -1723,6 +1765,12 @@
           if ((infra.ollama?.missing_models?.length || 0) > 0) {
             return { state: "degraded", reason: "configured Ollama models are missing" };
           }
+          if (infra.cc_tmp?.cc_tier === "red" || infra.cc_tmp?.sys_tier === "red") {
+            return { state: "error", reason: "temp directory critically full" };
+          }
+          if (infra.cc_tmp?.cc_tier === "orange" || infra.cc_tmp?.sys_tier === "orange") {
+            return { state: "degraded", reason: "temp directory pressure detected" };
+          }
           if (probes.some(probe => ["degraded", "fallback", "overdue"].includes(probe?.status))) {
             return { state: "degraded", reason: "one or more infrastructure probes are degraded" };
           }
@@ -2290,9 +2338,13 @@
         async fetchOutreachMessages() {
           this.startModalFetch("outreachModal");
           try {
-            const resp = await fetchApi("/api/genesis/outreach/messages?limit=20");
-            if (resp?.ok) {
-              this.outreachModal.messages = await resp.json();
+            const [msgResp, approvalResp] = await Promise.all([
+              fetchApi("/api/genesis/outreach/messages?limit=20"),
+              fetchApi("/api/genesis/approvals").catch(() => null),
+            ]);
+            if (msgResp?.ok) {
+              this.outreachModal.messages = await msgResp.json();
+              this.outreachModal.pendingApprovals = approvalResp?.ok ? await approvalResp.json() : [];
               this.finishModalFetch("outreachModal");
             } else {
               this.failModalFetch("outreachModal", "Outreach history unavailable");
@@ -2302,11 +2354,54 @@
           }
         },
 
-        async engageOutreach(id, outcome) {
+        // Find a pending approval that matches a blocker outreach message
+        findMatchingApproval(msg) {
+          if (msg.category !== 'blocker') return null;
+          const approvals = this.outreachModal.pendingApprovals || [];
+          // Match by signal_type → action_type mapping
+          for (const a of approvals) {
+            // CLI fallback approvals: signal_type contains 'cli_approval' or 'approval'
+            if (msg.signal_type === 'cli_approval' && a.action_type === 'autonomous_cli_fallback') return a;
+            // Generic: match topic substring
+            if (a.description && msg.topic && a.description.includes(msg.topic.slice(0, 30))) return a;
+          }
+          return null;
+        },
+
+        async resolveApproval(approvalId, decision, outreachMsgId) {
           try {
+            await fetchApi("/api/genesis/approvals/" + approvalId + "/resolve", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({decision})
+            });
+            // Also record engagement on the outreach message
+            if (outreachMsgId) {
+              const outcome = decision === 'approved' ? 'useful' : 'not_useful';
+              await fetchApi("/api/genesis/outreach/" + outreachMsgId + "/engage", {
+                method: "POST", headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({outcome, response: decision === 'approved' ? 'approve' : 'deny'})
+              });
+            }
+            await this.fetchOutreachMessages();
+          } catch (e) { console.error("resolve failed", e); }
+        },
+
+        async approveAllPending() {
+          try {
+            await fetchApi("/api/genesis/approvals/approve-all", {
+              method: "POST", headers: {"Content-Type": "application/json"},
+            });
+            await this.fetchOutreachMessages();
+          } catch (e) { console.error("approve-all failed", e); }
+        },
+
+        async engageOutreach(id, outcome, response) {
+          try {
+            const body = {outcome};
+            if (response) body.response = response;
             await fetchApi("/api/genesis/outreach/" + id + "/engage", {
               method: "POST", headers: {"Content-Type": "application/json"},
-              body: JSON.stringify({outcome})
+              body: JSON.stringify(body)
             });
             await this.fetchOutreachMessages();
           } catch (e) { console.error("engage failed", e); }
@@ -3694,6 +3789,35 @@
               </div>
             </template>
           </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Essential Knowledge (Collapsible) [Tab: overview] -->
+    <div class="panel" x-data="{ ekOpen: false }" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor: pointer;" @click="ekOpen = !ekOpen">
+        <span class="material-symbols-outlined" :style="ekOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">auto_stories</span>
+        Essential Knowledge
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.essentialKnowledge?.updated_at">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => {
+                    const s = Math.round((Date.now() - new Date($store.genesisDashboard.essentialKnowledge.updated_at).getTime()) / 60000);
+                    if (s < 60) return s + 'm ago';
+                    if (s < 1440) return Math.round(s/60) + 'h ago';
+                    return Math.round(s/1440) + 'd ago';
+                  })()"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="ekOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.essentialKnowledge?.content">
+          <div class="empty-state" x-text="$store.genesisDashboard.essentialKnowledge?.error || 'Essential knowledge not loaded yet.'"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.essentialKnowledge?.content">
+          <div style="font-size: 0.76rem; white-space: pre-wrap; color: var(--color-text-secondary); max-height: 400px; overflow-y: auto;"
+               x-text="$store.genesisDashboard.essentialKnowledge.content"></div>
         </template>
       </div>
     </div>
@@ -5510,6 +5634,34 @@
              class="empty-state">Outreach history unavailable.</div>
         <template x-if="$store.genesisDashboard.outreachModal.messages.length > 0 || $store.genesisDashboard.outreachModal.fetch.state !== 'loading'">
           <div>
+            <!-- Pending approvals banner -->
+            <template x-if="$store.genesisDashboard.outreachModal.pendingApprovals.length > 0">
+              <div style="background: #d9534f1a; border: 1px solid #d9534f44; border-radius: 6px; padding: 0.6rem 0.75rem; margin-bottom: 0.75rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <span style="font-weight: 600; font-size: 0.82rem; color: #d9534f;">
+                    Action Required
+                    <span style="background: #d9534f; color: white; font-size: 0.65rem; padding: 0.1rem 0.35rem; border-radius: 10px; margin-left: 0.3rem;"
+                          x-text="$store.genesisDashboard.outreachModal.pendingApprovals.length"></span>
+                  </span>
+                  <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border: 1px solid #4caf50; color: #4caf50; border-radius: 3px; cursor: pointer; background: transparent;"
+                          @click="$store.genesisDashboard.approveAllPending()">Approve All</button>
+                </div>
+                <template x-for="a in $store.genesisDashboard.outreachModal.pendingApprovals" :key="a.id">
+                  <div style="display: flex; justify-content: space-between; align-items: center; padding: 0.25rem 0; border-top: 1px solid #d9534f22;">
+                    <div>
+                      <span style="font-size: 0.75rem;" x-text="a.description || a.action_type"></span>
+                      <span style="font-size: 0.62rem; color: #888; margin-left: 0.3rem;" x-text="$store.genesisDashboard.formatDateTime(a.created_at)"></span>
+                    </div>
+                    <div style="display: flex; gap: 0.25rem;">
+                      <button style="font-size: 0.65rem; padding: 0.15rem 0.4rem; border: 1px solid #4caf50; color: #4caf50; border-radius: 3px; cursor: pointer; background: transparent;"
+                              @click="$store.genesisDashboard.resolveApproval(a.id, 'approved')">Approve</button>
+                      <button style="font-size: 0.65rem; padding: 0.15rem 0.4rem; border: 1px solid #d9534f; color: #d9534f; border-radius: 3px; cursor: pointer; background: transparent;"
+                              @click="$store.genesisDashboard.resolveApproval(a.id, 'rejected')">Deny</button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
             <!-- Category filters -->
             <div style="display: flex; gap: 0.4rem; margin-bottom: 0.75rem; flex-wrap: wrap;">
               <template x-for="cat in [null, 'alert', 'digest', 'surplus', 'blocker']" :key="cat || 'all'">
@@ -5536,21 +5688,47 @@
                 </div>
                 <div style="font-size: 0.8rem; white-space: pre-wrap; max-height: 150px; overflow-y: auto; padding: 0.4rem; background: var(--color-background); border-radius: 4px; margin-bottom: 0.3rem;"
                      x-text="msg.message_content || '(no content)'"></div>
-                <!-- Engagement buttons — always visible, smart state -->
+                <!-- Engagement buttons — category-aware -->
                 <div style="display: flex; gap: 0.3rem; align-items: center;">
                   <template x-if="msg.engagement_outcome && !['useful','not_useful','ambivalent'].includes(msg.engagement_outcome)">
                     <span style="font-size: 0.68rem; color: #888; margin-right: 0.3rem;"
-                          x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.engagement_outcome)"></span>
+                          x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.user_response || msg.engagement_outcome)"></span>
                   </template>
-                  <template x-for="btn in [{value: 'useful', label: 'Useful', color: '#4caf50'}, {value: 'not_useful', label: 'Not Useful', color: '#d9534f'}, {value: 'ambivalent', label: 'Ambivalent', color: '#888'}]" :key="btn.value">
+                  <!-- Blocker: Approve/Deny — wire to approval API when matching -->
+                  <template x-if="msg.category === 'blocker'">
+                    <div style="display: flex; gap: 0.3rem; align-items: center;">
+                      <template x-for="btn in [{value: 'approved', label: 'Approve', color: '#4caf50'}, {value: 'rejected', label: 'Deny', color: '#d9534f'}]" :key="btn.value">
+                        <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
+                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? btn.color + '33' : 'transparent'}; font-weight: ${msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? '700' : '400'}; opacity: ${!msg.user_response || msg.user_response === (btn.value === 'approved' ? 'approve' : 'deny') ? '1' : '0.4'}`"
+                                @click="(() => { const a = $store.genesisDashboard.findMatchingApproval(msg); if (a) { $store.genesisDashboard.resolveApproval(a.id, btn.value, msg.id); } else { $store.genesisDashboard.engageOutreach(msg.id, btn.value === 'approved' ? 'useful' : 'not_useful', btn.value === 'approved' ? 'approve' : 'deny'); } })()"
+                                x-text="btn.label"></button>
+                      </template>
+                      <template x-if="$store.genesisDashboard.findMatchingApproval(msg)">
+                        <span style="font-size: 0.6rem; color: #4caf50; margin-left: 0.3rem;">linked</span>
+                      </template>
+                    </div>
+                  </template>
+                  <!-- Alert: Acknowledge -->
+                  <template x-if="msg.category === 'alert'">
                     <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
-                            :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? btn.color + '33' : 'transparent'}; font-weight: ${msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? '700' : '400'}; opacity: ${!msg.engagement_outcome || msg.engagement_outcome === btn.value || (msg.engagement_outcome === 'engaged' && btn.value === 'useful') || (msg.engagement_outcome === 'neutral' && btn.value === 'ambivalent') ? '1' : '0.4'}`"
-                            @click="$store.genesisDashboard.engageOutreach(msg.id, btn.value)"
-                            x-text="btn.label"></button>
+                            :style="`border: 1px solid #f0ad4e; color: #f0ad4e; background: ${msg.engagement_outcome === 'useful' ? '#f0ad4e33' : 'transparent'}; font-weight: ${msg.engagement_outcome === 'useful' ? '700' : '400'}`"
+                            @click="$store.genesisDashboard.engageOutreach(msg.id, 'useful')"
+                            x-text="msg.engagement_outcome === 'useful' ? 'Acknowledged' : 'Acknowledge'"></button>
+                  </template>
+                  <!-- Digest/Surplus: Useful/Not Useful/Ambivalent -->
+                  <template x-if="msg.category !== 'blocker' && msg.category !== 'alert'">
+                    <div style="display: flex; gap: 0.3rem;">
+                      <template x-for="btn in [{value: 'useful', label: 'Useful', color: '#4caf50'}, {value: 'not_useful', label: 'Not Useful', color: '#d9534f'}, {value: 'ambivalent', label: 'Ambivalent', color: '#888'}]" :key="btn.value">
+                        <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
+                                :style="`border: 1px solid ${btn.color}; color: ${btn.color}; background: ${msg.engagement_outcome === btn.value ? btn.color + '33' : 'transparent'}; font-weight: ${msg.engagement_outcome === btn.value ? '700' : '400'}; opacity: ${!msg.engagement_outcome || msg.engagement_outcome === btn.value ? '1' : '0.4'}`"
+                                @click="$store.genesisDashboard.engageOutreach(msg.id, btn.value)"
+                                x-text="btn.label"></button>
+                      </template>
+                    </div>
                   </template>
                 </div>
                 <div style="font-size: 0.62rem; color: var(--color-text-secondary); margin-top: 0.15rem; opacity: 0.7;"
-                     x-text="msg.category === 'digest' ? 'Feedback shapes report content over time' : msg.category === 'alert' || msg.category === 'blocker' ? 'Feedback calibrates future alert sensitivity' : 'Feedback guides task prioritization'"></div>
+                     x-text="msg.category === 'blocker' ? 'Approve or deny this request' : msg.category === 'alert' ? 'Acknowledge to dismiss' : msg.category === 'digest' ? 'Feedback shapes report content over time' : 'Feedback guides task prioritization'"></div>
               </div>
             </template>
           </div>
@@ -6268,9 +6446,10 @@
           <template x-if="$store.genesisDashboard._updating">
             <div class="card" style="padding:1.5rem; text-align:center;">
               <div style="font-size:1.5rem; margin-bottom:0.5rem;">&#8987;</div>
-              <div style="font-size:1rem; font-weight:500;" x-text="$store.genesisDashboard._updateReconnecting ? 'Reconnecting to dashboard...' : 'Update in progress...'"></div>
+              <div style="font-size:1rem; font-weight:500;"
+                   x-text="$store.genesisDashboard._updatePhaseLabel($store.genesisDashboard.updateProgress?.phase)"></div>
               <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem;">A background session is managing the update. This may take a few minutes.</div>
-              <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.25rem;">Do not close this tab. You may safely refresh &mdash; progress is saved.</div>
+              <div style="font-size:0.75rem; color:var(--color-text-secondary); margin-top:0.25rem;">Progress continues in the background. You can safely close or refresh this page.</div>
               <template x-if="$store.genesisDashboard.updateProgress?.summary">
                 <div style="font-size:0.8rem; color:var(--color-text-secondary); margin-top:0.5rem; font-family:monospace;"
                      x-text="$store.genesisDashboard.updateProgress.summary"></div>
@@ -6338,19 +6517,34 @@
                 </template>
               </div>
 
-              <!-- Conflicts needing resolution -->
-              <template x-if="$store.genesisDashboard.updateProgress?.escalation?.includes('tier3_needed')">
+              <!-- Conflicts / failed update needing resolution -->
+              <template x-if="$store.genesisDashboard.updateProgress?.conflicts || $store.genesisDashboard.updateProgress?.failed || $store.genesisDashboard.updateProgress?.stale">
                 <div class="card" style="padding:1rem; margin-bottom:1rem; border:1px solid rgba(255,152,0,0.4);">
                   <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem;">
-                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;">Merge Conflicts</h3>
-                    <button @click="$store.genesisDashboard.resolveConflicts()"
-                            style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
-                      Resolve with Opus</button>
+                    <h3 style="margin:0; font-size:1rem; color:#ffb74d;"
+                        x-text="$store.genesisDashboard.updateProgress?.conflicts ? 'Merge Conflicts' : 'Update Failed'"></h3>
+                    <div style="display:flex; gap:0.5rem;">
+                      <template x-if="$store.genesisDashboard.updateProgress?.conflicts">
+                        <button @click="$store.genesisDashboard.resolveConflicts()"
+                                style="background:#ff9800; color:#fff; border:none; padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                          Resolve with Opus</button>
+                      </template>
+                      <button @click="$store.genesisDashboard.applyUpdate()"
+                              style="background:var(--color-surface-elevated); color:var(--color-text); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Retry</button>
+                      <button @click="$store.genesisDashboard.dismissUpdate()"
+                              style="background:transparent; color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.4rem 0.8rem; border-radius:4px; cursor:pointer; font-size:0.8rem;">
+                        Dismiss</button>
+                    </div>
                   </div>
-                  <div style="font-size:0.8rem; color:var(--color-text-secondary);">
-                    The update has merge conflicts that couldn't be resolved automatically.
-                    Opus can analyze both sides and find the best resolution.
-                  </div>
+                  <div style="font-size:0.8rem; color:var(--color-text-secondary);"
+                       x-text="$store.genesisDashboard.updateProgress?.conflicts
+                         ? 'The update has merge conflicts that could not be resolved automatically. Opus can analyze both sides and find the best resolution.'
+                         : 'The last update attempt did not complete successfully. You can retry or dismiss this notice.'"></div>
+                  <template x-if="$store.genesisDashboard.updateProgress?.summary">
+                    <div style="margin-top:0.5rem; padding:0.5rem; border-radius:4px; background:rgba(255,152,0,0.05); font-size:0.8rem; font-family:monospace; color:var(--color-text-secondary);"
+                         x-text="$store.genesisDashboard.updateProgress.summary"></div>
+                  </template>
                   <template x-if="$store.genesisDashboard.updateProgress?.conflicts?.conflicted_files">
                     <div style="margin-top:0.5rem;">
                       <span style="font-size:0.7rem; color:var(--color-text-secondary);">Conflicted files:</span>

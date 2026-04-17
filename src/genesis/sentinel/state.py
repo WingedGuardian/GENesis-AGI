@@ -56,6 +56,10 @@ class SentinelStateData:
     # Last dispatch timestamp (observability only — not a gate)
     last_cc_dispatch_at: str = ""
 
+    # Rejection tracking — pattern → ISO timestamp when suppression expires.
+    # Prevents rejected dispatch patterns from re-triggering within the window.
+    rejected_patterns: dict[str, str] = field(default_factory=dict)
+
     # Bootstrap grace
     bootstrap_grace_s: int = 240
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())

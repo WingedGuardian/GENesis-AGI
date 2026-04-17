@@ -57,8 +57,10 @@ def init_health_mcp(
 
 
 from genesis.mcp.health import browser as _browser  # noqa: E402
+from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
+from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402
@@ -68,6 +70,7 @@ from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
 
+codebase = _codebase
 db_schema = _db_schema
 errors = _errors
 manifest = _manifest
@@ -78,6 +81,7 @@ status = _status
 task_tools = _task_tools
 update_history = _update_history
 
+_impl_codebase_navigate = _codebase._impl_codebase_navigate
 _impl_db_schema = _db_schema._impl_db_schema
 _impl_health_errors = _errors._impl_health_errors
 _impl_health_alerts = _errors._impl_health_alerts
@@ -107,6 +111,8 @@ _impl_browser_run_js = _browser._impl_browser_run_js
 _impl_browser_sessions = _browser._impl_browser_sessions
 _impl_browser_clear_domain = _browser._impl_browser_clear_domain
 _impl_update_history_recent = _update_history._impl_update_history_recent
+_impl_follow_up_create = _follow_up_tools._impl_follow_up_create
+_impl_follow_up_list = _follow_up_tools._impl_follow_up_list
 
 # Re-export init function for runtime wiring
 init_task_tools = _task_tools.init_task_tools
@@ -157,4 +163,7 @@ __all__ = [
     "_impl_browser_run_js",
     "_impl_browser_sessions",
     "_impl_browser_clear_domain",
+    "_follow_up_tools",
+    "_impl_follow_up_create",
+    "_impl_follow_up_list",
 ]

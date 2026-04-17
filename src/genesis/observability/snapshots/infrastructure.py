@@ -171,6 +171,13 @@ async def infrastructure(
         infra["tmpfs"] = {"status": "error", "error": str(exc)}
 
     try:
+        from genesis.observability.service_status import collect_cc_tmp_usage
+
+        infra["cc_tmp"] = collect_cc_tmp_usage()
+    except (ImportError, OSError) as exc:
+        infra["cc_tmp"] = {"status": "error", "error": str(exc)}
+
+    try:
         from genesis.observability.service_status import probe_qdrant_collections
 
         infra["qdrant_collections"] = await probe_qdrant_collections()

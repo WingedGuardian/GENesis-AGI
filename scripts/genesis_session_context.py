@@ -231,6 +231,43 @@ def main() -> None:
     except Exception:
         pass  # Procedures are advisory; silent failure is correct
 
+    # 2.6. Codebase L0 — package index from AST code index (advisory)
+    if not is_genesis_session:
+        try:
+            import aiosqlite
+            _db_path_l0 = Path.home() / "genesis" / "data" / "genesis.db"
+            if _db_path_l0.exists():
+                async def _load_l0():
+                    async with aiosqlite.connect(str(_db_path_l0)) as db:
+                        db.row_factory = aiosqlite.Row
+                        cursor = await db.execute(
+                            "SELECT package, COUNT(*) as modules, SUM(loc) as loc "
+                            "FROM code_modules GROUP BY package ORDER BY loc DESC"
+                        )
+                        return await cursor.fetchall()
+                rows = asyncio.run(_load_l0())
+                if rows:
+                    lines = ["## Codebase\n"]
+                    # Show top 15 packages, summarize the rest
+                    top = rows[:15]
+                    rest = rows[15:]
+                    for r in top:
+                        lines.append(f"- **{r['package']}**: {r['modules']} modules, {r['loc']} LOC")
+                    if rest:
+                        rest_mods = sum(r['modules'] for r in rest)
+                        rest_loc = sum(r['loc'] for r in rest)
+                        lines.append(f"- *{len(rest)} more packages*: {rest_mods} modules, {rest_loc} LOC")
+                    lines.append(
+                        "\nUse `codebase_navigate` MCP tool for drill-down "
+                        "(L1: modules in a package, L2: symbols in a module)."
+                    )
+                    if not first:
+                        _emit("\n\n---\n\n")
+                    _emit("\n".join(lines))
+                    first = False
+        except Exception:
+            pass  # Codebase index is advisory — silent failure is correct
+
     # 3. Previous session context (temporal awareness — uses pre-loaded data)
     try:
         prev_session = _format_previous_session(last_session_data)

@@ -62,6 +62,17 @@ set_secret() {
     echo "${key}=${value}" >> "$file"
 }
 
+# ── HOME guard ───────────────────────────────────────────────
+# Ensure HOME is set (may be empty in container sessions without login shell)
+# and persisted in /etc/environment so all future sessions inherit it.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(whoami)" | cut -d: -f6)"
+    export HOME
+fi
+if ! grep -q "^HOME=" /etc/environment 2>/dev/null; then
+    echo "HOME=$HOME" >> /etc/environment 2>/dev/null || true
+fi
+
 # ── TMPDIR guard ─────────────────────────────────────────────
 # pip downloads large wheels (e.g. torch ~2GB) to TMPDIR and will fail
 # with "No space left on device" if /tmp is a small tmpfs (512MB in
@@ -662,6 +673,20 @@ done
 
 mkdir -p ~/.genesis 2>/dev/null || true
 
+# ── CC temp directory ────────────────────────────────────────
+CC_TMP_DIR="$HOME/.genesis/cc-tmp"
+mkdir -p "$CC_TMP_DIR"
+chmod 700 "$CC_TMP_DIR"
+
+# Watchgod config — 500MB budget, 150MB sacred ground
+mkdir -p "$HOME/.genesis/config"
+cat > "$HOME/.genesis/config/watchgod.conf" <<WEOF
+CC_TMP_DIR=$CC_TMP_DIR
+CC_TMP_BUDGET_MB=500
+SACRED_GROUND_MB=150
+WEOF
+echo "    + CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
+
 # Auto-cd to genesis on login so Claude Code finds the project (slash
 # commands, hooks, .claude/settings.json all depend on cwd = project root)
 if ! grep -q 'cd ~/genesis' "$HOME/.bashrc" 2>/dev/null; then
@@ -988,6 +1013,15 @@ fi
 if [ -f "$SYSTEMD_USER_DIR/genesis-watchdog.timer" ]; then
     systemctl --user enable --now genesis-watchdog.timer 2>/dev/null && \
         echo "    + genesis-watchdog.timer enabled + started" || true
+fi
+
+# Enable AND start tmp watchgod (OS-level temp protection)
+WATCHGOD_SRC="$REPO_DIR/config/genesis-tmp-watchgod.service"
+if [ -f "$WATCHGOD_SRC" ]; then
+    cp "$WATCHGOD_SRC" "$SYSTEMD_USER_DIR/"
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
+        echo "    + genesis-tmp-watchgod.service enabled + started" || true
 fi
 
 # Enable AND start genesis-server (standalone)

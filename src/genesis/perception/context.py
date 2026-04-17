@@ -261,6 +261,8 @@ class ContextAssembler:
         return header + "\n" + "\n".join(lines)
 
     def _format_signals(self, tick: TickResult) -> str:
+        staleness = tick.signal_staleness or {}
+        tick_interval_min = 5  # awareness loop tick interval
         lines = []
         for s in tick.signals:
             line = f"{s.name}: {s.value} (source={s.source})"
@@ -274,6 +276,10 @@ class ContextAssembler:
                     f" [{status}; normal<={s.normal_max},"
                     f" warn>={s.warning_threshold}, crit>={s.critical_threshold}]"
                 )
+            unchanged = staleness.get(s.name, 0)
+            if unchanged >= 2:
+                hours = unchanged * tick_interval_min / 60
+                line += f" (persistent ~{hours:.1f}h)"
             lines.append(line)
         return "\n".join(lines)
 

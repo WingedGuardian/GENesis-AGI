@@ -64,8 +64,9 @@ class TestProbeOllama:
     @pytest.mark.asyncio
     async def test_healthy(self, aiohttp_mock, monkeypatch):
         monkeypatch.delenv("OLLAMA_URL", raising=False)
-        aiohttp_mock.get("http://localhost:11434/api/tags", status=200)
-        result = await probe_ollama(clock=FROZEN_CLOCK)
+        test_url = "http://localhost:11434/api/tags"
+        aiohttp_mock.get(test_url, status=200)
+        result = await probe_ollama(url=test_url, clock=FROZEN_CLOCK)
         assert result.status == ProbeStatus.HEALTHY
 
     @pytest.mark.asyncio

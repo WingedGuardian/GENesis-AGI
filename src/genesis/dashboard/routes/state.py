@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json as _json
 from datetime import UTC, datetime
+from pathlib import Path
 
 from flask import jsonify, request
 
@@ -258,6 +259,20 @@ async def autonomy_config():
     drives = [dict(r) for r in await cursor.fetchall()]
 
     return jsonify({"drives": drives, "thresholds": thresholds})
+
+
+@blueprint.route("/api/genesis/essential-knowledge")
+def essential_knowledge_endpoint():
+    """Return essential knowledge markdown content."""
+    ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
+    if not ek_path.exists():
+        return jsonify({"content": None, "error": "Essential knowledge not generated yet"})
+    try:
+        content = ek_path.read_text()
+        mtime = datetime.fromtimestamp(ek_path.stat().st_mtime, tz=UTC).isoformat()
+        return jsonify({"content": content, "updated_at": mtime})
+    except OSError as e:
+        return jsonify({"content": None, "error": str(e)})
 
 
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])

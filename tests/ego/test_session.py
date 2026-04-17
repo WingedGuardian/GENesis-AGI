@@ -74,7 +74,7 @@ async def db():
     """In-memory DB with ego tables."""
     async with aiosqlite.connect(":memory:") as conn:
         conn.row_factory = aiosqlite.Row
-        for table in ("ego_cycles", "ego_proposals", "ego_state"):
+        for table in ("ego_cycles", "ego_proposals", "ego_state", "follow_ups"):
             await conn.execute(TABLES[table])
         yield conn
 
@@ -184,7 +184,7 @@ class TestEgoSession:
 
         pending = await dispatcher.get_pending_follow_ups()
         assert len(pending) == 1
-        assert pending[0]["text"] == "check backlog tomorrow"
+        assert pending[0]["content"] == "check backlog tomorrow"
 
     async def test_run_cycle_morning_report(self, ego_session, mock_invoker):
         """Morning report flag appears in the user prompt."""

@@ -181,33 +181,23 @@ def _trigger_essential_knowledge_regen() -> None:
     """Spawn background subprocess to regenerate essential knowledge.
 
     Fire-and-forget — must not block the 1500ms hook budget.
-    Uses subprocess.Popen (non-blocking) to run an inline Python script
-    that imports and calls the generator.
+    Calls scripts/regen_essential_knowledge.py as a detached subprocess.
     """
     import subprocess
 
-    script = (
-        "import sys; "
-        "from pathlib import Path; "
-        "sys.path.insert(0, str(Path.home() / 'genesis' / 'src')); "
-        "import asyncio; import aiosqlite; "
-        "from genesis.memory.essential_knowledge import generate_and_write; "
-        "async def _run(): "
-        "  db = await aiosqlite.connect(str(Path.home() / 'genesis/data/genesis.db')); "
-        "  await generate_and_write(db); "
-        "  await db.close(); "
-        "asyncio.run(_run())"
-    )
-    # Log to file instead of DEVNULL so failures are diagnosable
+    regen_script = Path(__file__).resolve().parent / "regen_essential_knowledge.py"
+    if not regen_script.exists():
+        return
+
+
     _LOG_DIR = _GENESIS_DIR / "logs"
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
     _log_file = _LOG_DIR / "ek_regen.log"
     import contextlib
     with contextlib.suppress(OSError):
-        # trunk-ignore: stderr goes to log file for observability
         log_fh = open(_log_file, "a")  # noqa: SIM115
         subprocess.Popen(
-            [sys.executable, "-c", script],
+            [sys.executable, str(regen_script)],
             stdout=subprocess.DEVNULL,
             stderr=log_fh,
             start_new_session=True,  # Detach from hook process group

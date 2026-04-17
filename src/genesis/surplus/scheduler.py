@@ -67,10 +67,17 @@ class SurplusScheduler:
         self._task_expiry_hours = task_expiry_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
+        self._code_index_executor: SurplusExecutor | None = None
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
+        self._model_eval_executor: SurplusExecutor | None = None
+        self._disk_cleanup_executor: SurplusExecutor | None = None
+        self._backup_verification_executor: SurplusExecutor | None = None
+        self._dead_letter_replay_executor: SurplusExecutor | None = None
+        self._db_maintenance_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
+        self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
         self._scheduler = AsyncIOScheduler()
 
     def set_executor(self, executor) -> None:
@@ -82,9 +89,35 @@ class SurplusScheduler:
         """Set a dedicated executor for CODE_AUDIT tasks."""
         self._code_audit_executor = executor
 
+    def set_code_index_executor(self, executor: SurplusExecutor) -> None:
+        """Set a dedicated executor for CODE_INDEX tasks (no LLM, pure AST)."""
+        self._code_index_executor = executor
+
     def set_bookmark_enrichment_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for BOOKMARK_ENRICHMENT tasks."""
         self._bookmark_enrichment_executor = executor
+
+    def set_model_eval_executor(self, executor: SurplusExecutor) -> None:
+        """Set a dedicated executor for MODEL_EVAL tasks."""
+        self._model_eval_executor = executor
+
+    def set_maintenance_executors(
+        self,
+        *,
+        disk_cleanup: SurplusExecutor | None = None,
+        backup_verification: SurplusExecutor | None = None,
+        dead_letter_replay: SurplusExecutor | None = None,
+        db_maintenance: SurplusExecutor | None = None,
+    ) -> None:
+        """Set dedicated executors for infrastructure maintenance tasks."""
+        if disk_cleanup:
+            self._disk_cleanup_executor = disk_cleanup
+        if backup_verification:
+            self._backup_verification_executor = backup_verification
+        if dead_letter_replay:
+            self._dead_letter_replay_executor = dead_letter_replay
+        if db_maintenance:
+            self._db_maintenance_executor = db_maintenance
 
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
@@ -99,6 +132,22 @@ class SurplusScheduler:
         """Set dependencies for the memory extraction job."""
         self._extraction_store = store
         self._extraction_router = router
+
+    def set_follow_up_dispatcher(self, dispatcher) -> None:
+        """Set the follow-up dispatcher for accountability tracking.
+
+        Registers the dispatch job if the scheduler is already running.
+        """
+        self._follow_up_dispatcher = dispatcher
+        # Register the job if the scheduler is already running (late wiring)
+        if self._scheduler.running and not self._scheduler.get_job("follow_up_dispatch"):
+            self._scheduler.add_job(
+                self.dispatch_follow_ups,
+                IntervalTrigger(minutes=self._dispatch_interval),
+                id="follow_up_dispatch",
+                max_instances=1,
+                misfire_grace_time=60,
+            )
 
     async def start(self) -> None:
         """Start the surplus scheduler with brainstorm check and dispatch jobs."""
@@ -128,6 +177,13 @@ class SurplusScheduler:
         else:
             logger.info("Code audits disabled — skipping job registration")
         self._scheduler.add_job(
+            self.schedule_code_index,
+            IntervalTrigger(hours=4),
+            id="schedule_code_index",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        self._scheduler.add_job(
             self.schedule_infra_monitor,
             IntervalTrigger(hours=2),
             id="schedule_infra_monitor",
@@ -141,6 +197,21 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        self._scheduler.add_job(
+            self.schedule_maintenance,
+            IntervalTrigger(hours=6),
+            id="schedule_maintenance",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+        if self._follow_up_dispatcher is not None:
+            self._scheduler.add_job(
+                self.dispatch_follow_ups,
+                IntervalTrigger(minutes=self._dispatch_interval),
+                id="follow_up_dispatch",
+                max_instances=1,
+                misfire_grace_time=60,
+            )
         self._scheduler.start()
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
@@ -148,8 +219,10 @@ class SurplusScheduler:
         # otherwise they only fire after their IntervalTrigger elapses.
         if self._enable_code_audits:
             await self.schedule_code_audit()
+        await self.schedule_code_index()
         await self.schedule_infra_monitor()
         await self.run_recon_gather()
+        await self.schedule_maintenance()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
             self._dispatch_interval, self._brainstorm_interval,
@@ -216,6 +289,29 @@ class SurplusScheduler:
             except Exception:
                 pass
 
+    async def schedule_code_index(self) -> None:
+        """Enqueue a code index task if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            pending = await self._queue.pending_by_type(TaskType.CODE_INDEX)
+            if pending == 0:
+                await self._queue.enqueue(
+                    TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.3, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_code_index")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Code index scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_code_index", str(exc))
+            except Exception:
+                pass
+
     async def schedule_infra_monitor(self) -> None:
         """Enqueue an infrastructure monitor task if none pending/running."""
         try:
@@ -236,6 +332,73 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_infra_monitor", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_maintenance(self) -> None:
+        """Enqueue infrastructure maintenance tasks if none pending."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            # Each task: check pending, enqueue if zero
+            # Infrastructure maintenance (no LLM needed)
+            maintenance_tasks = [
+                (TaskType.DISK_CLEANUP, 0.4, "preservation"),
+                (TaskType.BACKUP_VERIFICATION, 0.7, "preservation"),
+                (TaskType.DEAD_LETTER_REPLAY, 0.5, "cooperation"),
+                (TaskType.DB_MAINTENANCE, 0.3, "competence"),
+                # Tier 1 LLM tasks — observation-only analysis via ReflectionEngine
+                (TaskType.GAP_CLUSTERING, 0.4, "competence"),
+                (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
+                (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
+            ]
+            for task_type, priority, drive in maintenance_tasks:
+                pending = await self._queue.pending_by_type(task_type)
+                if pending == 0:
+                    await self._queue.enqueue(
+                        task_type, ComputeTier.FREE_API, priority, drive,
+                    )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_maintenance")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Maintenance scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_maintenance", str(exc))
+            except Exception:
+                pass
+
+    async def dispatch_follow_ups(self) -> None:
+        """Run the follow-up dispatcher cycle (always-on, not idle-gated)."""
+        if self._follow_up_dispatcher is None:
+            return
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Follow-up dispatch skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
+        try:
+            summary = await self._follow_up_dispatcher.run_cycle()
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("follow_up_dispatch")
+            except Exception:
+                pass
+            if summary.get("failures_detected", 0) > 0:
+                logger.warning(
+                    "Follow-up dispatch detected %d failure(s)",
+                    summary["failures_detected"],
+                )
+        except Exception as exc:
+            logger.exception("Follow-up dispatch failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("follow_up_dispatch", str(exc))
             except Exception:
                 pass
 
@@ -368,8 +531,20 @@ class SurplusScheduler:
         executor = self._executor
         if task.task_type == _TT.CODE_AUDIT and self._code_audit_executor is not None:
             executor = self._code_audit_executor
+        elif task.task_type == _TT.CODE_INDEX and self._code_index_executor is not None:
+            executor = self._code_index_executor
         elif task.task_type == _TT.BOOKMARK_ENRICHMENT and self._bookmark_enrichment_executor is not None:
             executor = self._bookmark_enrichment_executor
+        elif task.task_type == _TT.MODEL_EVAL and self._model_eval_executor is not None:
+            executor = self._model_eval_executor
+        elif task.task_type == _TT.DISK_CLEANUP and self._disk_cleanup_executor is not None:
+            executor = self._disk_cleanup_executor
+        elif task.task_type == _TT.BACKUP_VERIFICATION and self._backup_verification_executor is not None:
+            executor = self._backup_verification_executor
+        elif task.task_type == _TT.DEAD_LETTER_REPLAY and self._dead_letter_replay_executor is not None:
+            executor = self._dead_letter_replay_executor
+        elif task.task_type == _TT.DB_MAINTENANCE and self._db_maintenance_executor is not None:
+            executor = self._db_maintenance_executor
 
         try:
             result = await executor.execute(task)

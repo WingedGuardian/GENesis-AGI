@@ -51,6 +51,9 @@ _TYPE_TO_PREFIX: dict[str, str] = {
     "minimax": "openai",  # MiniMax — OpenAI-compatible with base_url
     "deepseek": "deepseek",  # DeepSeek — native LiteLLM support
     "xai": "xai",  # xAI/Grok — native LiteLLM support
+    "cerebras": "cerebras",  # Cerebras — native LiteLLM support
+    "github": "github",  # GitHub Models — native LiteLLM support (Azure-backed)
+    "sambanova": "sambanova",  # SambaNova — native LiteLLM support
 }
 
 

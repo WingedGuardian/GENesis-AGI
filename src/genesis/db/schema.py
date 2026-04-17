@@ -939,8 +939,8 @@ SIGNAL_WEIGHTS_SEED = [
     ("recon_findings_pending", "recon_mcp", 0.35, 0.35, 0.0, 1.0, '["Light","Deep"]'),
     ("unprocessed_memory_backlog", "memory_mcp", 0.30, 0.30, 0.0, 1.0, '["Deep"]'),
     ("budget_pct_consumed", "health_mcp", 0.40, 0.40, 0.0, 1.0, '["Light","Deep"]'),
-    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro","Light"]'),
-    ("critical_failure", "health_mcp", 0.90, 0.90, 0.0, 1.0, '["Light"]'),
+    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
+    ("critical_failure", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
     ("time_since_last_strategic", "clock", 0.50, 0.50, 0.0, 1.0, '["Strategic"]'),
     ("micro_count_since_light", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Light"]'),
     ("cc_version_changed", "awareness_loop", 0.60, 0.60, 0.0, 1.0, '["Light"]'),
@@ -952,7 +952,7 @@ DEPTH_THRESHOLDS_SEED = [
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
     ("Micro", 0.30, 1800, 2, 3600),         # floor 30min, max 2/hr
-    ("Light", 0.60, 21600, 1, 3600),         # floor 6h, max 1/hr
+    ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
     ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk
 ]

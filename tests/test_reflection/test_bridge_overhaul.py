@@ -132,6 +132,15 @@ class TestReflectEnriched:
         gatherer = ContextGatherer()
         router = OutputRouter()
 
+        # Seed a fresh cognitive state so cognitive_regeneration=False
+        now = datetime.now(UTC).isoformat()
+        await db.execute(
+            "INSERT INTO cognitive_state (id, section, content, created_at) "
+            "VALUES ('test-cog', 'active_context', 'test state', ?)",
+            (now,),
+        )
+        await db.commit()
+
         bridge = CCReflectionBridge(
             session_manager=mock_session_manager,
             invoker=mock_invoker,

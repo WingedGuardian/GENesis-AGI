@@ -287,6 +287,39 @@ body {
 .config-editor .feedback-ok { background: rgba(34,197,94,0.15); color: #4ade80; }
 .config-editor .feedback-err { background: rgba(239,68,68,0.15); color: #f87171; }
 
+/* Surplus detail panel (expandable inside subsystem box) */
+.surplus-detail-toggle {
+    cursor: pointer; color: #4ade80; font-size: 11px; font-weight: 600;
+    padding: 4px 0; display: flex; justify-content: space-between; align-items: center;
+    margin-top: 8px; border-top: 1px solid rgba(74, 222, 128, 0.2); padding-top: 8px;
+}
+.surplus-detail-toggle:hover { text-decoration: underline; }
+.surplus-detail-toggle .arrow { font-size: 8px; transition: transform 0.2s; }
+.surplus-detail-toggle .arrow.open { transform: rotate(90deg); }
+.surplus-detail-content { display: none; margin-top: 4px; }
+.surplus-detail-content.open { display: block; }
+.surplus-detail-content .detail-section {
+    margin: 8px 0; padding: 6px 0; border-top: 1px solid rgba(51, 65, 85, 0.5);
+}
+.surplus-detail-content .detail-section h4 {
+    font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px;
+    margin: 0 0 4px 0;
+}
+.surplus-task-row {
+    display: flex; gap: 6px; align-items: center;
+    font-size: 10px; color: var(--color-text-secondary); padding: 2px 0;
+}
+.surplus-task-row .task-type { flex: 1; }
+.surplus-task-row .task-status { font-weight: 600; }
+.surplus-task-row .task-time { color: #64748b; }
+.follow-up-badge {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 10px; font-weight: 600; margin-left: 4px;
+}
+.follow-up-badge.pending { background: rgba(250,204,21,0.15); color: #fbbf24; }
+.follow-up-badge.failed { background: rgba(239,68,68,0.15); color: #ef4444; }
+.follow-up-badge.blocked { background: rgba(251,146,60,0.15); color: #fb923c; }
+
 /* Discarded items */
 .discarded-toggle {
     cursor: pointer; color: #ef4444; font-size: 11px; font-weight: 600;
@@ -1798,6 +1831,128 @@ function updateSurplus(data) {
     // Standalone surplus box removed — data shown in Surplus subsystem box
 }
 
+async function loadSurplusDetail(container) {
+    container.replaceChildren();
+    container.appendChild(el('div', null, 'Loading...'));
+
+    try {
+        const resp = await fetch('/api/genesis/surplus/config');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const data = await resp.json();
+        container.replaceChildren();
+
+        // Section 1: Task Catalog
+        const catSection = el('div', 'detail-section');
+        catSection.appendChild(el('h4', null, 'Task Catalog'));
+        const catalog = data.catalog || [];
+        for (const item of catalog) {
+            const row = el('div', 'surplus-task-row');
+            const typeName = el('span', 'task-type', item.type.replace(/_/g, ' '));
+            row.appendChild(typeName);
+            if (item.last_status) {
+                const st = el('span', 'task-status', item.last_status);
+                const sc = { completed: '#4ade80', failed: '#ef4444', pending: '#fbbf24', running: '#38bdf8' };
+                st.style.color = sc[item.last_status] || '#888';
+                row.appendChild(st);
+            }
+            if (item.last_run) {
+                const age = Math.round((Date.now() - new Date(item.last_run).getTime()) / 1000);
+                row.appendChild(el('span', 'task-time', formatAge(age) + ' ago'));
+            }
+            catSection.appendChild(row);
+        }
+        container.appendChild(catSection);
+
+        // Section 2: Drive Weights
+        const drives = data.drives || [];
+        if (drives.length > 0) {
+            const driveSection = el('div', 'detail-section');
+            driveSection.appendChild(el('h4', null, 'Drive Weights'));
+            for (const d of drives) {
+                const name = d.drive_name || d[0];
+                const weight = d.current_weight != null ? d.current_weight : d[1];
+                const min = d.min_weight != null ? d.min_weight : 0.1;
+                const max = d.max_weight != null ? d.max_weight : 0.5;
+                const pct = max > min ? Math.round(((weight - min) / (max - min)) * 100) : 50;
+                const row = el('div', 'section-row');
+                row.appendChild(el('span', 'label', name));
+                const bar = el('span', 'value');
+                bar.innerHTML = '<span style="display:inline-block;width:60px;height:6px;background:#334155;border-radius:3px;vertical-align:middle;">' +
+                    '<span style="display:block;width:' + pct + '%;height:100%;background:#4ade80;border-radius:3px;"></span></span> ' +
+                    weight.toFixed(2);
+                row.appendChild(bar);
+                driveSection.appendChild(row);
+            }
+            container.appendChild(driveSection);
+        }
+
+        // Section 3: Eval Staleness
+        const evalData = data.eval_staleness || {};
+        const providers = evalData.providers || [];
+        if (providers.length > 0) {
+            const evalSection = el('div', 'detail-section');
+            evalSection.appendChild(el('h4', null, 'Eval Freshness'));
+            for (const p of providers) {
+                const row = el('div', 'surplus-task-row');
+                row.appendChild(el('span', 'task-type', p.provider));
+                const age = p.days_ago != null ? p.days_ago + 'd ago' : 'no data';
+                const ageColor = p.stale ? '#ef4444' : p.days_ago > 14 ? '#fbbf24' : '#4ade80';
+                const ageEl = el('span', 'task-time', age);
+                ageEl.style.color = ageColor;
+                row.appendChild(ageEl);
+                if (p.unreliable) {
+                    const badge = el('span', 'follow-up-badge failed', 'unreliable');
+                    row.appendChild(badge);
+                }
+                evalSection.appendChild(row);
+            }
+            container.appendChild(evalSection);
+        }
+
+        // Section 4: Follow-ups
+        await loadFollowUpsBadge(container);
+
+    } catch (e) {
+        container.replaceChildren();
+        container.appendChild(el('div', null, 'Failed to load: ' + e.message));
+        container.firstChild.style.cssText = 'color:#ef4444;font-size:11px;';
+    }
+}
+
+async function loadFollowUpsBadge(container) {
+    try {
+        const resp = await fetch('/api/genesis/follow-ups/summary');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const counts = data.counts || {};
+        const total = data.total || 0;
+        if (total === 0) return;
+
+        const section = el('div', 'detail-section');
+        section.appendChild(el('h4', null, 'Follow-ups'));
+
+        const row = el('div', 'surplus-task-row');
+        row.appendChild(el('span', 'task-type', total + ' total'));
+
+        if (counts.pending) {
+            const badge = el('span', 'follow-up-badge pending', counts.pending + ' pending');
+            row.appendChild(badge);
+        }
+        if (counts.failed) {
+            const badge = el('span', 'follow-up-badge failed', counts.failed + ' failed');
+            row.appendChild(badge);
+        }
+        if (counts.blocked) {
+            const badge = el('span', 'follow-up-badge blocked', counts.blocked + ' blocked');
+            row.appendChild(badge);
+        }
+        section.appendChild(row);
+        container.appendChild(section);
+    } catch (e) {
+        // Non-critical — silently skip
+    }
+}
+
 // ── Subsystem group boxes ────────────────────────────────────────────
 
 const SUBSYSTEM_GROUPS = {
@@ -1935,9 +2090,94 @@ function updateSubsystemGrid(data) {
         }
         if (key === 'memory') {
             const q = data.queues || {};
-            if (q.pending_embeddings !== undefined) box.appendChild(sectionRow('Pending', String(q.pending_embeddings)));
+            const mh = data.memory_health || {};
+            const pm = data.proactive_memory || {};
+
+            // Header line: total vectors + links
+            const links = mh.links || {};
+            if (q.embedded_total || links.total) {
+                const parts = [];
+                if (q.embedded_total) parts.push(q.embedded_total + ' vectors');
+                if (links.total) parts.push(links.total.toLocaleString() + ' links');
+                box.appendChild(sectionRow('Store', parts.join(' · ')));
+            }
+
+            // L1 Essential Knowledge
+            const ek = mh.essential_knowledge || {};
+            if (ek.age_hours !== null && ek.age_hours !== undefined) {
+                const age = ek.age_hours;
+                const c = age > 24 ? 'color:#ef4444' : age > 6 ? 'color:#ffe600' : 'color:#4ade80';
+                const size = ek.size_bytes ? ' · ' + (ek.size_bytes / 1024).toFixed(1) + 'KB' : '';
+                box.appendChild(sectionRow('L1 EK', age.toFixed(1) + 'h ago' + size, c));
+            }
+
+            // L2 Proactive Hook
+            if (pm.latency_ms !== undefined) {
+                const lat = pm.latency_ms;
+                const fts = pm.fts5_results || 0;
+                const vec = pm.vector_results || 0;
+                const fused = pm.fused_results || 0;
+                box.appendChild(sectionRow('L2 Hook', lat + 'ms · FTS:' + fts + ' Vec:' + vec + ' → ' + fused));
+            }
+
+            // Wing distribution
+            const wings = mh.wings || [];
+            if (wings.length > 0) {
+                const wStr = wings.slice(0, 5).map(w => w[0] + ':' + w[1]).join(' ');
+                box.appendChild(sectionRow('Wings', wStr));
+            }
+
+            // Class distribution
+            const classes = mh.classes || [];
+            if (classes.length > 0) {
+                const cStr = classes.map(c => c[0] + ':' + c[1]).join(' ');
+                box.appendChild(sectionRow('Classes', cStr));
+            }
+
+            // Confidence distribution
+            const conf = mh.confidence || {};
+            if (conf.high !== undefined) {
+                box.appendChild(sectionRow('Confidence', 'hi:' + conf.high + ' med:' + conf.medium + ' lo:' + conf.low));
+            }
+
+            // Link types (top)
+            if (links.by_type && links.by_type.length > 0) {
+                const lStr = links.by_type.slice(0, 4).map(l => l[0] + ':' + l[1]).join(' ');
+                box.appendChild(sectionRow('Link Types', lStr));
+            }
+
+            // Extraction pipeline
+            const ext = mh.extraction || {};
+            if (ext.total_sessions !== undefined) {
+                const c = ext.coverage_pct >= 90 ? 'color:#4ade80' : ext.coverage_pct >= 50 ? 'color:#ffe600' : 'color:#ef4444';
+                box.appendChild(sectionRow('Extraction', ext.extracted + '/' + ext.total_sessions + ' · ' + ext.coverage_pct + '%', c));
+            }
+
+            // Code index
+            const ci = mh.code_index || {};
+            if (ci.modules) {
+                const age = ci.age_hours;
+                const c = age > 24 ? 'color:#ffe600' : 'color:#4ade80';
+                box.appendChild(sectionRow('Code Index', ci.modules + ' mod · ' + (ci.symbols || 0).toLocaleString() + ' sym · ' + (age ? age + 'h' : '?'), c));
+            }
+
+            // Embedding queue
+            if (q.pending_embeddings) box.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600'));
             if (q.failed_embeddings) box.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444'));
-            if (q.embedded_total !== undefined) box.appendChild(sectionRow('Total Stored', String(q.embedded_total)));
+
+            // Growth
+            if (mh.growth) {
+                const g = mh.growth;
+                if (g.last_7d !== undefined) box.appendChild(sectionRow('+7d', String(g.last_7d)));
+                if (g.avg_per_day_7d !== undefined) box.appendChild(sectionRow('Avg/day', String(g.avg_per_day_7d)));
+            }
+
+            // Orphans
+            if (mh.orphans && mh.orphans.orphan_pct !== undefined) {
+                const pct = mh.orphans.orphan_pct;
+                const c = pct > 50 ? 'color:#ef4444' : pct > 30 ? 'color:#ffe600' : 'color:#4ade80';
+                box.appendChild(sectionRow('Orphans', pct.toFixed(1) + '%', c));
+            }
         }
         if (key === 'surplus') {
             const s = data.surplus || {};
@@ -1947,6 +2187,26 @@ function updateSubsystemGrid(data) {
             }
             if (s.queue_depth !== undefined) box.appendChild(sectionRow('Queue', String(s.queue_depth)));
             if (s.tasks_completed_24h !== undefined) box.appendChild(sectionRow('Done/24h', String(s.tasks_completed_24h)));
+            if (s.tasks_failed_24h) box.appendChild(sectionRow('Failed/24h', String(s.tasks_failed_24h), 'color:#ef4444'));
+
+            // Expandable detail toggle
+            const toggle = el('div', 'surplus-detail-toggle');
+            toggle.appendChild(el('span', null, 'Details'));
+            const arrow = el('span', 'arrow', '\u25B6');
+            toggle.appendChild(arrow);
+            box.appendChild(toggle);
+
+            const detailContent = el('div', 'surplus-detail-content');
+            box.appendChild(detailContent);
+
+            toggle.addEventListener('click', function() {
+                const isOpen = detailContent.classList.toggle('open');
+                arrow.classList.toggle('open', isOpen);
+                if (isOpen && !detailContent.dataset.loaded) {
+                    detailContent.dataset.loaded = '1';
+                    loadSurplusDetail(detailContent);
+                }
+            });
         }
         if (key === 'outreach') {
             const o = data.outreach_stats || {};

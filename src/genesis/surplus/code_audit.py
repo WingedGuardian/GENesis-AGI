@@ -98,25 +98,48 @@ class CodebaseContextGatherer:
             logger.warning("Failed to fetch previous findings", exc_info=True)
             return ""
 
+    async def _get_index_summary(self) -> str:
+        """Get structured codebase summary from code_modules index (if available)."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT package, COUNT(*) AS cnt, SUM(loc) AS total_loc "
+                "FROM code_modules GROUP BY package ORDER BY total_loc DESC LIMIT 20"
+            )
+            rows = await cursor.fetchall()
+            if not rows:
+                return ""
+            lines = [f"{pkg}: {cnt} modules, {loc} LOC" for pkg, cnt, loc in rows]
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
     async def gather(self) -> str:
-        """Assemble codebase context, capped at ~4000 chars."""
-        git_log, git_diff, file_tree, prev_findings = await asyncio.gather(
+        """Assemble codebase context, capped at ~4000 chars.
+
+        Prefers the code_modules index (fast, structured) over subprocess
+        calls. Falls back to subprocess if the index is empty.
+        """
+        git_log, git_diff, index_summary, prev_findings = await asyncio.gather(
             self._run_cmd("git", "log", "--oneline", "-20"),
             self._run_cmd("git", "diff", "HEAD~5", "--stat"),
-            self._run_cmd(
-                "find", "src/genesis", "-name", "*.py", "-type", "f",
-            ),
+            self._get_index_summary(),
             self._get_previous_findings(),
         )
 
-        # Truncate file tree to first 100 lines
-        tree_lines = file_tree.splitlines()[:100]
-        file_tree = "\n".join(tree_lines)
+        # Use index-based summary if available, otherwise fall back to find
+        if index_summary:
+            file_section = "## Codebase Structure (from index)\n" + index_summary
+        else:
+            file_tree = await self._run_cmd(
+                "find", "src/genesis", "-name", "*.py", "-type", "f",
+            )
+            tree_lines = file_tree.splitlines()[:100]
+            file_section = "## Source Files\n" + ("\n".join(tree_lines) or "(none)")
 
         sections = []
         sections.append("## Recent Commits\n" + (git_log or "(none)"))
         sections.append("## Recent Changes (stat)\n" + (git_diff or "(none)"))
-        sections.append("## Source Files\n" + (file_tree or "(none)"))
+        sections.append(file_section)
         if prev_findings:
             sections.append("## Previous Unresolved Findings\n" + prev_findings)
 
