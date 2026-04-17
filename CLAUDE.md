@@ -197,6 +197,37 @@ recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy. The proactive hook auto-detects your active wing from file paths
 and prompt keywords.
 
+## Reference Capture (silent, automatic)
+
+When user input contains credentials, URLs, IP addresses, account handles,
+or other unique identifiers with context, Genesis automatically stores them
+via `reference_store` with a description of what they're for. No
+confirmation prompts, no "remember this" flags required.
+
+**What qualifies**:
+- Credentials (username/password/token/API key) for any service
+- URLs with stated purpose ("the forum is at X", "my dashboard is at Y")
+- IP addresses with context ("the server is at X", "container runs on Y")
+- Account handles ("my forum handle is X", "posting as Y")
+- Persona backstory pointers (file path references)
+
+**Descriptions mandatory**: every entry records both value AND context.
+A credential without "what service" or an IP without "what is this" is
+useless 10 sessions later.
+
+**Retrieval**: use `reference_lookup(query, kind=...)` or
+`knowledge_recall(domain='reference.*')`. Proactive memory hook surfaces
+matches automatically.
+
+**Human view**: `~/.genesis/known-to-genesis.md` is a read-only mirror,
+regenerated on every `reference_store` call. Browse to see everything
+Genesis has learned.
+
+**secrets.env is orthogonal**: `secrets.env` is for Genesis's own
+infrastructure credentials (API keys, backup passphrase). The reference
+store is for user-level credentials and reference data that Genesis learns
+across sessions.
+
 ## Community Contributions
 
 When you see a `[Contribution]` system-reminder, a post-commit hook has

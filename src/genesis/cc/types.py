@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
@@ -96,6 +97,9 @@ class CCInvocation:
     bare: bool = False
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
+    on_spawn: Callable[[int], Awaitable[None]] | None = field(
+        default=None, compare=False, repr=False,
+    )
 
 
 # Background CC session isolation.  Background sessions run from a

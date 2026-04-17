@@ -30,6 +30,7 @@ class FakeCCOutput:
     output_tokens: int = 50
     model_requested: str = ""
     downgraded: bool = False
+    session_id: str = "fake-cc-session"
 
 
 @pytest.fixture

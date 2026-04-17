@@ -51,6 +51,7 @@ def _git_result(*args: str, timeout: int = 10) -> tuple[str | None, str]:
         return None, str(exc)
 
 
+
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query against genesis.db. Returns list of row dicts."""
     if not _DB_PATH.is_file():
@@ -119,6 +120,7 @@ def update_status():
             last_update["status"] = "success"
             last_update["failure_reason"] = None
             last_update["reconciled"] = True
+
 
     # Failure context file (persists until next successful update)
     last_failure = None
@@ -692,7 +694,7 @@ def update_progress():
     failed = (
         not in_progress
         and summary is not None
-        and not summary.startswith("success")
+        and not summary.lower().startswith("success")
     )
 
     stale = False
@@ -710,6 +712,7 @@ def update_progress():
         if stale:
             with contextlib.suppress(OSError):
                 _STATE_FILE.unlink()
+
 
     return jsonify({
         "in_progress": in_progress,

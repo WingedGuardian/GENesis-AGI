@@ -58,17 +58,6 @@ V3 is the foundation that makes this possible. What's already here is a full cog
 
 ---
 
-## Genesis in 30 seconds
-
-- **It remembers.** 4-layer memory (vector + keyword search + knowledge graph + relational) that compounds with every interaction. Day 180 is architecturally different from day 1.
-- **It learns.** A six-stage pipeline classifies outcomes, attributes causes, and extracts reusable procedures after every session — Laplace-smoothed confidence, not vibes.
-- **It runs on its own.** Background cognition, surplus compute research, email triage, proactive Telegram messages — keeps working when you're not there.
-- **It earns its autonomy.** Trust is granted per action category through demonstrated competence. Mess up twice, drop a level. Earn it back through performance.
-
-[**Get started →**](#getting-started)
-
----
-
 ## What this is
 
 Genesis is a cognitive architecture that aspires to *earn* the title of "AGI." Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.

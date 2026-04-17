@@ -604,9 +604,23 @@ TABLES = {
             ingested_at      TEXT NOT NULL,
             qdrant_id        TEXT,
             embedding_model  TEXT,
-            retrieved_count  INTEGER NOT NULL DEFAULT 0
+            retrieved_count  INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(project_type, domain, concept)
         )
     """,
+    "credential_access_log": """
+        CREATE TABLE IF NOT EXISTS credential_access_log (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            unit_id           TEXT NOT NULL,
+            accessor_context  TEXT,
+            accessed_at       TEXT NOT NULL,
+            query_match_score REAL
+        )
+    """,
+    # NOTE: intentionally NO foreign key to knowledge_units. Audit rows
+    # outlive the entries they describe — deleting a reference entry (e.g.
+    # password rotation: delete + re-store) must not cascade away the
+    # access history.  The unit_id is a soft reference only.
     "evolution_proposals": """
         CREATE TABLE IF NOT EXISTS evolution_proposals (
             id                    TEXT PRIMARY KEY,
@@ -927,6 +941,8 @@ INDEXES = [
     # memory links
     "CREATE INDEX IF NOT EXISTS idx_memory_links_source ON memory_links(source_id)",
     "CREATE INDEX IF NOT EXISTS idx_memory_links_target ON memory_links(target_id)",
+    # credential access log (audit trail for reference store credential lookups)
+    "CREATE INDEX IF NOT EXISTS idx_credential_access_unit ON credential_access_log(unit_id, accessed_at)",
     # inbox items
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_status ON inbox_items(status)",
     "CREATE INDEX IF NOT EXISTS idx_inbox_items_file_path ON inbox_items(file_path)",

@@ -85,6 +85,33 @@ encrypt_file() {
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
 }
 
+# ── Encryption helpers ───────────────────────────────────────────────
+# All PII-bearing payloads (SQLite dump, transcripts, memory) use the
+# same GPG symmetric passphrase as secrets. If the passphrase is unset,
+# encrypted sections are SKIPPED rather than falling back to plaintext
+# (the memory system is designed to hold credentials — plaintext leak
+# to a private repo is not acceptable).
+_BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
+_ENCRYPT_READY=false
+if [ -n "$_BACKUP_PASSPHRASE" ]; then
+    _ENCRYPT_READY=true
+fi
+
+# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
+encrypt_stdin() {
+    local out="$1"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
+}
+
+# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+encrypt_file() {
+    local src="$1"
+    local dst="$2"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+}
+
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
     # Determine backup repo URL: env var → auto-detect from existing clone → fail

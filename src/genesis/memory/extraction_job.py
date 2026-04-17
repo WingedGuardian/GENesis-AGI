@@ -27,6 +27,7 @@ from genesis.memory.extraction import (
     extractions_to_store_kwargs,
     parse_extraction_response_full,
 )
+from genesis.memory.reference_extraction import extract_references_from_chunk
 from genesis.util.jsonl import (
     chunk_messages,
     format_chunk_for_extraction,
@@ -56,26 +57,50 @@ async def run_extraction_cycle(
     transcript_dir: Path = _TRANSCRIPT_DIR,
     chunk_size: int = 50,
     max_retries: int = 2,
+    reference_only_mode: bool = False,
+    start_line_override: int | None = None,
+    session_filter: set[str] | None = None,
 ) -> dict:
     """Run one extraction cycle across all eligible sessions.
 
     Returns a summary dict with counts for observability.
+
+    ``reference_only_mode`` (default False): when True, the cycle runs the
+    LLM extraction AND reference classifier, but SKIPS episodic memory
+    storage, watermark updates, and session-index updates. Used by the
+    one-shot history mining CLI to pull reference data out of historical
+    transcripts without polluting episodic memory with duplicates.
+
+    ``start_line_override`` (default None): when set, ignores the per-session
+    ``last_extracted_line`` watermark and starts from this line instead.
+    Combined with ``reference_only_mode=True``, this lets the history mining
+    script re-read transcripts from the beginning without touching production
+    extraction state.
+
+    ``session_filter`` (default None): when set, only process sessions whose
+    id is in this set. Used to scope history mining to specific sessions.
     """
     summary = {
         "sessions_processed": 0,
         "chunks_processed": 0,
         "entities_extracted": 0,
+        "references_captured": 0,
         "zero_entity_chunks": 0,
         "errors": 0,
     }
 
     # Find sessions with unextracted content (includes filesystem discovery)
     sessions = await _find_extractable_sessions(db, transcript_dir=transcript_dir)
+    if session_filter is not None:
+        sessions = [s for s in sessions if s["id"] in session_filter]
 
     for session in sessions:
         session_id = session["id"]
         cc_session_id = session.get("cc_session_id") or session_id
-        last_line = session.get("last_extracted_line") or 0
+        if start_line_override is not None:
+            last_line = start_line_override
+        else:
+            last_line = session.get("last_extracted_line") or 0
         transcript_path = _find_transcript(transcript_dir, cc_session_id)
 
         if not transcript_path:
@@ -129,6 +154,33 @@ async def run_extraction_cycle(
                 )
                 continue
 
+            # Silent auto-capture: classify each extraction for reference
+            # shape (credentials, URLs, IPs, etc.) and promote matches to
+            # the reference store. Runs in BOTH normal and reference-only
+            # modes — this is the dominant path that populates the
+            # reference store from historical conversations.
+            try:
+                ref_count = await extract_references_from_chunk(
+                    result.extractions,
+                    store=store,
+                    db=db,
+                    source_session_id=cc_session_id,
+                )
+                summary["references_captured"] += ref_count
+            except Exception:
+                # Reference extraction must never break the main extraction
+                # pipeline — log and continue.
+                logger.warning(
+                    "Reference extractor failed on session %s chunk %d-%d",
+                    session_id, chunk_start, chunk_end, exc_info=True,
+                )
+
+            if reference_only_mode:
+                # Skip the episodic storage loop — history mining uses this
+                # path to populate the reference store without duplicating
+                # episodic memory rows that already exist from prior cycles.
+                continue
+
             # Store each extraction with provenance
             for extraction in result.extractions:
                 kwargs = extractions_to_store_kwargs(
@@ -160,12 +212,16 @@ async def run_extraction_cycle(
                     )
 
         # Update watermark + session keywords/topic
-        await _update_watermark(db, session_id, max_line)
-        if all_keywords or latest_topic:
-            await _update_session_index(
-                db, session_id,
-                keywords=all_keywords, topic=latest_topic,
-            )
+        # Skip both in reference_only_mode so the history mining run leaves
+        # production extraction state untouched — the next regular cycle
+        # will still pick up the same transcripts for episodic storage.
+        if not reference_only_mode:
+            await _update_watermark(db, session_id, max_line)
+            if all_keywords or latest_topic:
+                await _update_session_index(
+                    db, session_id,
+                    keywords=all_keywords, topic=latest_topic,
+                )
         summary["sessions_processed"] += 1
 
     return summary

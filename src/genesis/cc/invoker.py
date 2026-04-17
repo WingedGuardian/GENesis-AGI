@@ -235,6 +235,14 @@ class CCInvoker:
             )
             self._active_proc = proc
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
+            if invocation.on_spawn is not None:
+                try:
+                    await invocation.on_spawn(proc.pid)
+                except Exception:
+                    logger.warning(
+                        "on_spawn callback failed for PID %s",
+                        proc.pid, exc_info=True,
+                    )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=invocation.prompt.encode()),
                 timeout=invocation.timeout_s,
@@ -342,6 +350,14 @@ class CCInvoker:
             ) from None
         self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
+        if invocation.on_spawn is not None:
+            try:
+                await invocation.on_spawn(proc.pid)
+            except Exception:
+                logger.warning(
+                    "on_spawn callback failed for PID %s",
+                    proc.pid, exc_info=True,
+                )
         # Feed prompt via stdin, then close to signal EOF
         if proc.stdin is not None:
             proc.stdin.write(invocation.prompt.encode())

@@ -558,35 +558,69 @@ if "$VENV_DIR/bin/python" -c "import genesis.db.migrations" 2>/dev/null; then
     echo ""
 fi
 
-# ── Fix Network Identity (if unresolved template vars) ────
-_claude_md="$GENESIS_ROOT/CLAUDE.md"
-if grep -qE '\$\{|:-localhost\}' "$_claude_md" 2>/dev/null; then
-    echo "--- Fixing Network Identity in CLAUDE.md ---"
-    _c_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-    _c_ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || true)
-    _host_ip=$("$VENV_DIR/bin/python" -c "
+# ── Refresh Network Identity in user-level CLAUDE.md ────
+# Always refresh ~/.claude/CLAUDE.md with current IPs (unconditional — the
+# user-level file should always be current). Uses sentinel blocks.
+_user_claude="$HOME/.claude/CLAUDE.md"
+mkdir -p "$HOME/.claude"
+# Seed file if missing (migration from an older install without user-level file)
+if [ ! -f "$_user_claude" ]; then
+    cat > "$_user_claude" <<'UCLSEED'
+# This Genesis Install — User-Level Configuration
+
+Install-specific overlay to the project CLAUDE.md. Populated by
+scripts/host-setup.sh and refreshed by scripts/update.sh. The
+<!-- begin:SECTION --> / <!-- end:SECTION --> blocks below are
+managed by install scripts — edit at your own risk. The "Personal Notes"
+section is safe to hand-edit; install scripts preserve it.
+
+<!-- begin:container-specs -->
+## Container
+- **Specs**: (run host-setup.sh to detect and populate)
+<!-- end:container-specs -->
+
+<!-- begin:network-identity -->
+<!-- end:network-identity -->
+
+<!-- begin:github-config -->
+## GitHub
+- **Working Repo**: (set by installer)
+- **Backups Repo**: (set by installer)
+- **Public Distribution**: (set by installer)
+<!-- end:github-config -->
+
+## Personal Notes
+
+(Install scripts preserve this section. Add any machine-specific
+reminders here.)
+UCLSEED
+fi
+echo "--- Refreshing Network Identity in ~/.claude/CLAUDE.md ---"
+_c_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+_c_ipv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || true)
+_host_ip=$("$VENV_DIR/bin/python" -c "
 import yaml, pathlib
 p = pathlib.Path.home() / '.genesis' / 'guardian_remote.yaml'
 if p.exists():
     cfg = yaml.safe_load(p.read_text())
     print(cfg.get('host_ip', ''))
 " 2>/dev/null || true)
-    [ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
+[ -z "$_host_ip" ] && _host_ip=$(ip route | grep default | awk '{print $3}' || true)
 
-    sed -i '/^## Network Identity/,$d' "$_claude_md"
-    {
-        echo ""
-        echo "## Network Identity"
-        echo ""
-        printf -- "- **Container IP**: %s" "${_c_ip:-localhost}"
-        [ -n "$_c_ipv6" ] && printf " (v6: %s)" "$_c_ipv6"
-        echo ""
-        printf -- "- **Host VM IP**: %s\n" "${_host_ip:-localhost}"
-        printf -- "- **Dashboard**: http://%s:5000 (via proxy device)\n" "${_host_ip:-localhost}"
-    } >> "$_claude_md"
-    echo "  Network identity updated in CLAUDE.md"
+sed -i '/<!-- begin:network-identity -->/,/<!-- end:network-identity -->/d' "$_user_claude"
+{
+    echo "<!-- begin:network-identity -->"
+    echo "## Network Identity"
     echo ""
-fi
+    printf -- "- **Container IP**: %s" "${_c_ip:-localhost}"
+    [ -n "$_c_ipv6" ] && printf " (v6: %s)" "$_c_ipv6"
+    echo ""
+    printf -- "- **Host VM IP**: %s\n" "${_host_ip:-localhost}"
+    printf -- "- **Dashboard**: http://%s:5000 (via proxy device)\n" "${_host_ip:-localhost}"
+    echo "<!-- end:network-identity -->"
+} >> "$_user_claude"
+echo "  Network identity updated in ~/.claude/CLAUDE.md"
+echo ""
 
 _write_state "health_check"
 
@@ -707,8 +741,10 @@ _record_update_history "success" "" ""
 
 _write_state "done"
 
-# Clean up state file — successful update, nothing to recover
+# Clean up state files — successful update, nothing to recover
 rm -f "$STATE_FILE"
+rm -f "$HOME/.genesis/update_conflicts.json"
+rm -f "$HOME/.genesis/last_update_summary.txt"
 # Clean up PID file
 rm -f "$HOME/.genesis/update_in_progress.pid"
 

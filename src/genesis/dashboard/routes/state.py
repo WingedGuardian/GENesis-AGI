@@ -276,6 +276,7 @@ def essential_knowledge_endpoint():
 
 
 
+
 @blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
 @_async_route
 async def settings_timezone():

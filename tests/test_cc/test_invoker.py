@@ -866,3 +866,110 @@ def test_build_args_bare_with_other_flags(invoker):
     assert "--bare" in args
     assert "--dangerously-skip-permissions" in args
     assert "--mcp-config" in args
+
+
+# --- on_spawn callback tests ---
+
+
+def test_invocation_on_spawn_construction():
+    """CCInvocation accepts on_spawn as a callable field."""
+    async def my_callback(pid: int) -> None:
+        pass
+
+    inv = CCInvocation(prompt="hello", on_spawn=my_callback)
+    assert inv.on_spawn is my_callback
+
+
+def test_invocation_on_spawn_excluded_from_eq():
+    """on_spawn is excluded from __eq__ (compare=False)."""
+    async def cb1(pid: int) -> None:
+        pass
+
+    async def cb2(pid: int) -> None:
+        pass
+
+    inv1 = CCInvocation(prompt="hello", on_spawn=cb1)
+    inv2 = CCInvocation(prompt="hello", on_spawn=cb2)
+    assert inv1 == inv2  # compare=False means callbacks don't affect equality
+
+
+def test_invocation_on_spawn_excluded_from_repr():
+    """on_spawn is excluded from repr (repr=False)."""
+    async def cb(pid: int) -> None:
+        pass
+
+    inv = CCInvocation(prompt="hello", on_spawn=cb)
+    assert "on_spawn" not in repr(inv)
+
+
+@pytest.mark.asyncio
+async def test_run_fires_on_spawn_with_pid(invoker):
+    """on_spawn callback is called with the subprocess PID."""
+    spawned_pids: list[int] = []
+
+    async def on_spawn(pid: int) -> None:
+        spawned_pids.append(pid)
+
+    result_json = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
+        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
+        "modelUsage": {},
+    })
+    mock_proc = AsyncMock()
+    mock_proc.pid = 42000
+    mock_proc.communicate = AsyncMock(
+        return_value=(result_json.encode(), b"")
+    )
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        await invoker.run(CCInvocation(prompt="hello", on_spawn=on_spawn))
+
+    assert spawned_pids == [42000]
+
+
+@pytest.mark.asyncio
+async def test_run_on_spawn_exception_does_not_abort(invoker):
+    """on_spawn failure must not kill the subprocess or abort the run."""
+    async def bad_callback(pid: int) -> None:
+        raise RuntimeError("DB write failed")
+
+    result_json = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
+        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
+        "modelUsage": {},
+    })
+    mock_proc = AsyncMock()
+    mock_proc.pid = 42001
+    mock_proc.communicate = AsyncMock(
+        return_value=(result_json.encode(), b"")
+    )
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run(CCInvocation(prompt="hello", on_spawn=bad_callback))
+
+    assert output.text == "ok"  # Run completed despite callback failure
+
+
+@pytest.mark.asyncio
+async def test_run_no_on_spawn_callback(invoker):
+    """Without on_spawn, run() works exactly as before (backward compat)."""
+    result_json = json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": "ok", "session_id": "s1", "total_cost_usd": 0.01,
+        "duration_ms": 100, "usage": {"input_tokens": 5, "output_tokens": 2},
+        "modelUsage": {},
+    })
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(
+        return_value=(result_json.encode(), b"")
+    )
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run(CCInvocation(prompt="hello"))
+
+    assert output.text == "ok"
