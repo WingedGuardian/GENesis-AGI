@@ -447,8 +447,8 @@ async def main(args: argparse.Namespace) -> None:
         for name, entries in sources:
             for e in entries:
                 logger.info(
-                    "  [%s] %-18s %s → %s",
-                    name, e.kind, e.identifier[:50], e.value[:60],
+                    "  [%s] %-18s %s",
+                    name, e.kind, e.identifier[:30] + "..." if len(e.identifier) > 30 else e.identifier,
                 )
         logger.info("Dry run complete. Re-run without --dry-run to ingest.")
         return
@@ -485,13 +485,13 @@ async def main(args: argparse.Namespace) -> None:
                 try:
                     unit_id, _ = await _ingest_entry(entry, store=store, db=db)
                     logger.info(
-                        "  [%s] upserted %s → unit_id=%s",
-                        name, entry.identifier[:60], unit_id[:12],
+                        "  [%s] upserted kind=%s → unit_id=%s",
+                        name, entry.kind, unit_id[:12],
                     )
                     succeeded += 1
                 except Exception:
                     logger.exception(
-                        "  [%s] failed to ingest %s", name, entry.identifier,
+                        "  [%s] failed to ingest kind=%s", name, entry.kind,
                     )
                     failed += 1
 

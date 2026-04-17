@@ -123,8 +123,8 @@ async def ingest_knowledge_unit(
     )
 
     logger.info(
-        "Knowledge unit %s: %s (project=%s, domain=%s)",
+        "Knowledge unit %s (project=%s, domain=%s)",
         "ingested" if inserted else "updated",
-        actual_id, project, domain,
+        project, domain,
     )
     return actual_id

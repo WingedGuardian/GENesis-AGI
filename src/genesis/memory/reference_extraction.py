@@ -329,14 +329,14 @@ async def ingest_reference_from_extraction(
         )
     except Exception:
         logger.warning(
-            "reference extractor ingest failed for kind=%s identifier=%s",
-            kind, identifier, exc_info=True,
+            "reference extractor ingest failed for kind=%s identifier=<redacted>",
+            kind, exc_info=True,
         )
         return None
 
     logger.info(
-        "Auto-captured reference: kind=%s identifier=%s session=%s",
-        kind, identifier, source_session_id or "unknown",
+        "Auto-captured reference: kind=%s identifier=<redacted> session=%s",
+        kind, source_session_id or "unknown",
     )
     return unit_id
 
