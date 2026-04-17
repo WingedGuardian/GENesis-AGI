@@ -135,22 +135,26 @@ class TestBudgetEventThrottle:
         assert len(warning_calls) == 1
 
     @pytest.mark.asyncio
-    async def test_event_re_emits_after_throttle_expires(self, db, clock):
+    async def test_event_re_emits_in_new_period(self, db):
+        """Event emits again when the budget period rolls over."""
         bus = AsyncMock()
-        tracker = CostTracker(db, clock=clock, event_bus=bus)
-        tracker._EVENT_THROTTLE_S = 0.0  # disable throttle → every call emits
-
+        # Day 1
+        day1 = datetime(2026, 3, 4, 14, 0, 0, tzinfo=UTC)
+        tracker = CostTracker(db, clock=lambda: day1, event_bus=bus)
         await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=3.00))
+        await tracker.check_budget()
 
-        await tracker.check_budget()
-        await tracker.check_budget()
+        # Day 2 — new period boundary, should emit again
+        day2 = datetime(2026, 3, 5, 10, 0, 0, tzinfo=UTC)
+        tracker._clock = lambda: day2
+        await tracker.record("2_triage", "anthropic", CallResult(success=True, cost_usd=3.00))
         await tracker.check_budget()
 
         exceeded_calls = [
             c for c in bus.emit.call_args_list
             if c.args[2] == "budget.exceeded"
         ]
-        assert len(exceeded_calls) == 3  # all emitted with throttle=0
+        assert len(exceeded_calls) == 2  # once per day
 
     @pytest.mark.asyncio
     async def test_no_event_bus_still_returns_status(self, db, clock):

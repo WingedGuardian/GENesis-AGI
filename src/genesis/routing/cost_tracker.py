@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -23,13 +22,11 @@ _BUDGET_PERIOD = {
 
 
 class CostTracker:
-    _EVENT_THROTTLE_S = 300.0  # 5 min between identical budget events
-
     def __init__(self, db: aiosqlite.Connection, *, clock=None, event_bus: GenesisEventBus | None = None):
         self.db = db
         self._clock = clock or (lambda: datetime.now(UTC))
         self._event_bus = event_bus
-        self._last_event_at: dict[str, float] = {}  # "daily_exceeded" -> monotonic time
+        self._emitted_events: set[str] = set()  # "daily_exceeded@2026-04-17T00:00:00+00:00"
 
     async def record(
         self, call_site_id: str, provider: str, result: CallResult,
@@ -78,9 +75,8 @@ class CostTracker:
         limit_usd = budget["limit_usd"]
         warning_pct = budget["warning_pct"]
         if total >= limit_usd:
-            event_key = f"{budget_type}_exceeded"
-            now_mono = time.monotonic()
-            if now_mono - self._last_event_at.get(event_key, 0) >= self._EVENT_THROTTLE_S:
+            event_key = f"{budget_type}_exceeded@{since}"
+            if event_key not in self._emitted_events:
                 if self._event_bus:
                     await self._event_bus.emit(
                         Subsystem.ROUTING, Severity.ERROR,
@@ -88,12 +84,11 @@ class CostTracker:
                         f"{budget_type} budget exceeded: ${total:.4f} >= ${limit_usd:.4f}",
                         budget_type=budget_type, total=total, limit=limit_usd,
                     )
-                self._last_event_at[event_key] = now_mono
+                self._emitted_events.add(event_key)
             return BudgetStatus.EXCEEDED
         if total >= limit_usd * warning_pct:
-            event_key = f"{budget_type}_warning"
-            now_mono = time.monotonic()
-            if now_mono - self._last_event_at.get(event_key, 0) >= self._EVENT_THROTTLE_S:
+            event_key = f"{budget_type}_warning@{since}"
+            if event_key not in self._emitted_events:
                 if self._event_bus:
                     await self._event_bus.emit(
                         Subsystem.ROUTING, Severity.WARNING,
@@ -101,7 +96,7 @@ class CostTracker:
                         f"{budget_type} budget warning: ${total:.4f} / ${limit_usd:.4f}",
                         budget_type=budget_type, total=total, limit=limit_usd,
                     )
-                self._last_event_at[event_key] = now_mono
+                self._emitted_events.add(event_key)
             return BudgetStatus.WARNING
         return BudgetStatus.UNDER_LIMIT
 
