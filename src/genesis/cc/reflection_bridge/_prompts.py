@@ -122,7 +122,7 @@ _SOURCE_CATEGORIES: dict[str, str] = {
     "sentinel": "Sentinel", "sentinel_dispatch": "Sentinel",
     "guardian": "Guardian", "guardian_watchdog": "Guardian",
     "recon": "Recon", "recon_pipeline": "Recon", "recon_mcp": "Recon",
-    "surplus_promotion": "Surplus", "surplus": "Surplus",
+    "surplus_promotion": "Surplus", "surplus": "Surplus", "surplus_scheduler": "Surplus",
     "reflection": "Reflections", "light_reflection": "Reflections",
     "deep_reflection": "Reflections", "cc_reflection_deep": "Reflections",
     "cc_reflection_light": "Reflections", "cc_reflection_strategic": "Reflections",
