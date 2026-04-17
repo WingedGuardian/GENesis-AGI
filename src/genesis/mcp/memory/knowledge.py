@@ -6,6 +6,8 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from genesis.memory.reference_mirror import regenerate_mirror
+
 from ..memory import mcp
 
 
@@ -15,6 +17,19 @@ def _memory_mod():
     return memory_mod
 
 logger = logging.getLogger(__name__)
+
+
+async def _refresh_mirror_safe() -> None:
+    """Regenerate the markdown mirror, absorbing any failure."""
+    try:
+        memory_mod = _memory_mod()
+        if memory_mod._db is not None:
+            await regenerate_mirror(memory_mod._db)
+    except Exception:
+        logger.warning(
+            "reference_mirror: write failed — mirror may be stale",
+            exc_info=True,
+        )
 
 
 @mcp.tool()
@@ -339,6 +354,7 @@ async def reference_store(
         concept=identifier,
         tags_json=tags_json,
     )
+    await _refresh_mirror_safe()
     return unit_id
 
 
@@ -547,15 +563,18 @@ async def reference_delete(unit_id: str) -> bool:
 
     deleted = await memory_mod.knowledge.delete(memory_mod._db, unit_id)
     logger.info("Reference entry %s deleted: %s", unit_id, deleted)
+    await _refresh_mirror_safe()
     return deleted
 
 
 @mcp.tool()
 async def reference_export() -> dict:
-    """Export a summary of the reference store, grouped by kind.
+    """Export a summary of the reference store and regenerate the markdown mirror.
 
-    Returns counts per domain plus the total entry count. Used for the
-    markdown mirror generator and for manual inspection from a CC session.
+    Returns counts per domain plus the total entry count. Use for manual
+    inspection from a CC session — answers "what do I have stored?" without
+    exposing values. Use ``reference_lookup`` to retrieve actual entries.
+    Also regenerates ``~/.genesis/known-to-genesis.md``.
     Does NOT return values/bodies — use ``reference_lookup`` or
     ``knowledge_recall`` for that.
     """
@@ -566,6 +585,7 @@ async def reference_export() -> dict:
     stats_result = await memory_mod.knowledge.stats(
         memory_mod._db, project=_REFERENCE_PROJECT,
     )
+    await _refresh_mirror_safe()
     return {
         "project_type": _REFERENCE_PROJECT,
         "total": stats_result["total"],

@@ -272,6 +272,35 @@ async def stats(
     }
 
 
+async def list_by_domain(
+    db: aiosqlite.Connection,
+    *,
+    project_type: str,
+) -> dict[str, list[dict]]:
+    """Return all units for a project_type grouped by domain.
+
+    Used by the mirror generator. Returns ``{domain: [{id, concept, body,
+    ingested_at, tags}, ...]}`` sorted by domain then ingested_at desc.
+    """
+    cursor = await db.execute(
+        "SELECT id, domain, concept, body, ingested_at, tags "
+        "FROM knowledge_units WHERE project_type = ? "
+        "ORDER BY domain, ingested_at DESC",
+        (project_type,),
+    )
+    rows = await cursor.fetchall()
+    result: dict[str, list[dict]] = {}
+    for uid, domain, concept, body, ingested_at, tags in rows:
+        result.setdefault(domain, []).append({
+            "id": uid,
+            "concept": concept,
+            "body": body,
+            "ingested_at": ingested_at,
+            "tags": tags,
+        })
+    return result
+
+
 async def delete(db: aiosqlite.Connection, unit_id: str) -> bool:
     """Delete a knowledge unit from both knowledge_units and knowledge_fts."""
     cursor = await db.execute(
