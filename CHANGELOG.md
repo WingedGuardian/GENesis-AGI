@@ -63,7 +63,6 @@ scoring overhaul**, and **persistent reference store**.
 - **Backup passphrase, cost attribution, dashboard UX** (#63) — four
   fixes from post-Codex audit.
 - **OpenCode wrapper** (#61) — silent exit when no stale sessions exist.
-- README portfolio polish — TOC, call-site count, fallback framing (#69).
 
 ---
 
