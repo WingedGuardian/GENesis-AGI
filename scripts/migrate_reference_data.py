@@ -124,7 +124,7 @@ def _parse_network_identity(claude_md: Path) -> list[ReferenceEntry]:
     section = match.group(1)
 
     entries: list[ReferenceEntry] = []
-    # Match bullet lines like "- **Container IP**: 10.176.34.206 (..."
+    # Match bullet lines like "- **Container IP**: ${CONTAINER_IP:-localhost} (..."
     for bullet in re.finditer(
         r"^-\s+\*\*([^*]+)\*\*:\s*(.+?)(?=\n-\s|\Z)",
         section,
@@ -202,7 +202,7 @@ def _parse_model_routing_endpoints(path: Path) -> list[ReferenceEntry]:
     entries: list[ReferenceEntry] = []
     seen: set[str] = set()
     # Match lines like "    base_url: ${OLLAMA_URL:-http://localhost:11434}"
-    # or "    base_url: http://10.176.34.199:11434"
+    # or "    base_url: http://${OLLAMA_URL:-localhost:11434}"
     for match in re.finditer(
         r"^\s*base_url:\s*(\S+)\s*$", text, re.MULTILINE,
     ):

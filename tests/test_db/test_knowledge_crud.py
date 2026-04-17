@@ -240,7 +240,7 @@ async def test_upsert_update_path_preserves_id(db):
     uid_a, inserted_a = await knowledge.upsert(
         db, project_type="reference", domain="reference.network",
         source_doc="session-a", concept="Container IP",
-        body="10.176.34.206",
+        body="${CONTAINER_IP:-localhost}",
     )
     assert inserted_a is True
 
@@ -248,13 +248,13 @@ async def test_upsert_update_path_preserves_id(db):
     uid_b, inserted_b = await knowledge.upsert(
         db, project_type="reference", domain="reference.network",
         source_doc="session-b", concept="Container IP",
-        body="10.176.34.206 (Incus container running Genesis runtime)",
+        body="${CONTAINER_IP:-localhost} (Incus container running Genesis runtime)",
     )
     assert inserted_b is False
     assert uid_b == uid_a  # stable id on conflict
 
     row = await knowledge.get(db, uid_b)
-    assert row["body"] == "10.176.34.206 (Incus container running Genesis runtime)"
+    assert row["body"] == "${CONTAINER_IP:-localhost} (Incus container running Genesis runtime)"
     assert row["source_doc"] == "session-b"
 
 
