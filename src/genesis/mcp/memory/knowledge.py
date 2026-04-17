@@ -77,17 +77,21 @@ async def knowledge_recall(
             "source_pipeline": r.source_pipeline,
         })
 
-    for fts_row in fts_results:
+    for idx, fts_row in enumerate(fts_results):
         uid = fts_row["unit_id"]
         if uid not in seen_ids:
             seen_ids.add(uid)
+            # Normalize FTS rank into a 0-1 score so FTS results compete
+            # with vector results. FTS5 rank is negative (closer to 0 = better).
+            # Map rank position to score: first result ~0.8, decaying linearly.
+            fts_score = max(0.1, 0.8 - (idx * 0.05))
             merged.append({
                 "unit_id": uid,
                 "content": fts_row.get("body", ""),
                 "concept": fts_row.get("concept", ""),
                 "domain": fts_row.get("domain", ""),
                 "project_type": fts_row.get("project_type", ""),
-                "score": 0.0,
+                "score": fts_score,
                 "origin": "fts",
                 "source_pipeline": fts_row.get("source_pipeline"),
             })
