@@ -18,6 +18,28 @@ def _memory_mod():
 
 logger = logging.getLogger(__name__)
 
+# Authority tier multipliers for retrieval ranking.
+# Curated (user-directed) content outranks auto-discovered recon noise.
+_AUTHORITY_BOOST: dict[str, float] = {
+    "curated": 1.5,
+    "conversation": 1.0,
+    "recon": 0.5,
+}
+
+
+def _apply_authority_boost(merged: list[dict]) -> list[dict]:
+    """Apply authority-tier score multiplier and sort by boosted score."""
+    for item in merged:
+        pipeline = item.get("source_pipeline") or ""
+        boost = 1.0
+        for tier, multiplier in _AUTHORITY_BOOST.items():
+            if tier in pipeline:
+                boost = multiplier
+                break
+        item["score"] = item.get("score", 0.0) * boost
+    merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return merged
+
 
 async def _refresh_mirror_safe() -> None:
     """Regenerate the markdown mirror, absorbing any failure."""
@@ -66,6 +88,7 @@ async def knowledge_recall(
             "source": r.source,
             "score": r.score,
             "origin": "vector",
+            "source_pipeline": r.source_pipeline,
         })
 
     for fts_row in fts_results:
@@ -80,9 +103,10 @@ async def knowledge_recall(
                 "project_type": fts_row.get("project_type", ""),
                 "score": 0.0,
                 "origin": "fts",
+                "source_pipeline": fts_row.get("source_pipeline"),
             })
 
-    return merged[:limit]
+    return _apply_authority_boost(merged)[:limit]
 
 
 async def _ingest_knowledge_unit(
@@ -95,6 +119,8 @@ async def _ingest_knowledge_unit(
     memory_class: str | None = None,
     concept: str | None = None,
     tags_json: str | None = None,
+    purpose: list[str] | None = None,
+    ingestion_source: str | None = None,
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -122,6 +148,8 @@ async def _ingest_knowledge_unit(
         memory_class=memory_class,
         concept=concept,
         tags_json=tags_json,
+        purpose=purpose,
+        ingestion_source=ingestion_source,
     )
 
 
@@ -134,6 +162,8 @@ async def knowledge_ingest(
     provenance: dict | None = None,
     memory_class: str | None = None,
     concept: str | None = None,
+    purpose: list[str] | None = None,
+    ingestion_source: str | None = None,
 ) -> str:
     """Store distilled knowledge unit with provenance. Returns unit ID.
 
@@ -154,6 +184,10 @@ async def knowledge_ingest(
     (e.g. ``"ScarletAndRage forum login"``) so that the unique key
     ``(project_type, domain, concept)`` behaves like a dedup key on logical
     identity rather than raw content prefix.
+
+    ``purpose`` (optional): list of purpose tags (e.g., ["resume-prep", "cloud-eng"]).
+
+    ``ingestion_source`` (optional): original file path or URL for full provenance.
     """
     return await _ingest_knowledge_unit(
         content=content,
@@ -163,6 +197,8 @@ async def knowledge_ingest(
         provenance=provenance,
         memory_class=memory_class,
         concept=concept,
+        purpose=purpose,
+        ingestion_source=ingestion_source,
     )
 
 
@@ -170,7 +206,7 @@ async def knowledge_ingest(
 async def knowledge_status(
     project: str | None = None,
 ) -> dict:
-    """Collection stats, staleness report, project index."""
+    """Collection stats, staleness report, project index with tier breakdown."""
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -189,6 +225,7 @@ async def knowledge_status(
         "oldest_ingested": db_stats["oldest_ingested"],
         "newest_ingested": db_stats["newest_ingested"],
         "by_domain": db_stats["by_domain"],
+        "by_tier": db_stats.get("by_tier", {}),
         "qdrant_vectors": qdrant_info.get("points_count", 0) if qdrant_info else None,
     }
 
