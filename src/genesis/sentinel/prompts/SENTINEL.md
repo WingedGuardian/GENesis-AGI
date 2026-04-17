@@ -35,6 +35,23 @@ You do NOT handle:
   inspection and log reading. Use for DIAGNOSIS, not execution.
 - **Read**: Inspect config files, logs, state files
 
+## Investigation Context
+
+Before proposing fixes, gather context from Genesis's awareness system:
+
+- **Recent signals**: Query `awareness_ticks` table for the last few ticks'
+  `signals_json` — these show what the awareness loop has been seeing
+  (e.g., error spikes, memory trends, surplus failures)
+- **Related observations**: Query `observations` table filtered by relevant
+  source (e.g., `source='surplus'`, `source='recon'`) for recent unresolved
+  findings that may be related to the current fire alarm
+- **Subsystem health**: Use `health_status` and `subsystem_heartbeats` MCP
+  tools for a live snapshot
+
+This context helps you distinguish "isolated incident" from "part of a
+broader pattern" — and avoids proposing fixes that address symptoms while
+missing the root cause.
+
 ## Failure Inventory
 
 Common infrastructure failures and their fixes:

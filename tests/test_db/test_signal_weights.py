@@ -1,12 +1,12 @@
-"""Tests for signal_weights CRUD (uses seed data: 10 rows)."""
+"""Tests for signal_weights CRUD (uses seed data: 16 rows)."""
 
 from genesis.db.crud import signal_weights
 
 
 async def test_list_all(db):
     rows = await signal_weights.list_all(db)
-    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
-    assert len(rows) == 10
+    # 10 → 16 on 2026-04-17: +6 new signals (awareness scoring overhaul).
+    assert len(rows) == 16
 
 
 async def test_get_existing(db):
@@ -22,8 +22,8 @@ async def test_get_nonexistent(db):
 async def test_list_by_depth(db):
     rows = await signal_weights.list_by_depth(db, "Light")
     assert len(rows) > 0
-    # critical_failure feeds Light
-    assert any(r["signal_name"] == "critical_failure" for r in rows)
+    # micro_count_since_light feeds Light
+    assert any(r["signal_name"] == "micro_count_since_light" for r in rows)
 
 
 async def test_list_by_depth_empty(db):

@@ -35,12 +35,19 @@ async def init(rt: GenesisRuntime) -> None:
                 ContainerMemoryCollector,
                 StrategicTimerCollector,
             )
+            from genesis.learning.signals.autonomy_activity import (
+                AutonomyActivityCollector,
+            )
             from genesis.learning.signals.budget import BudgetCollector
             from genesis.learning.signals.conversation import ConversationCollector
             from genesis.learning.signals.critical_failure import (
                 CriticalFailureCollector,
             )
             from genesis.learning.signals.error_spike import ErrorSpikeCollector
+            from genesis.learning.signals.guardian_activity import (
+                GuardianActivityCollector,
+            )
+            from genesis.learning.signals.light_cascade import LightCascadeCollector
             from genesis.learning.signals.micro_cascade import MicroCascadeCollector
             from genesis.learning.signals.outreach_engagement import (
                 OutreachEngagementCollector,
@@ -50,6 +57,12 @@ async def init(rt: GenesisRuntime) -> None:
             )
             from genesis.learning.signals.recon_findings import (
                 ReconFindingsCollector,
+            )
+            from genesis.learning.signals.sentinel_activity import (
+                SentinelActivityCollector,
+            )
+            from genesis.learning.signals.surplus_activity import (
+                SurplusActivityCollector,
             )
             from genesis.learning.signals.task_quality import TaskQualityCollector
             from genesis.observability.health import (
@@ -79,6 +92,11 @@ async def init(rt: GenesisRuntime) -> None:
                 ContainerMemoryCollector(),
                 PendingItemCollector(rt._db),
                 MicroCascadeCollector(rt._db),
+                LightCascadeCollector(rt._db),
+                SentinelActivityCollector(),
+                GuardianActivityCollector(),
+                SurplusActivityCollector(rt._db),
+                AutonomyActivityCollector(rt._db),
                 CCVersionCollector(
                     rt._db, router=rt._router,
                     pipeline_getter=lambda: rt._outreach_pipeline,
