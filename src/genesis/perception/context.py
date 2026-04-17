@@ -24,6 +24,91 @@ _AGE_GUARD_HOURS: dict = {
     "strategic": 168,  # 7 days
 }
 
+# ── Source category mapping for citation-grouped rendering ──────────────
+
+_SOURCE_CATEGORIES: dict[str, str] = {
+    "sentinel": "Sentinel",
+    "sentinel_dispatch": "Sentinel",
+    "guardian": "Guardian",
+    "guardian_watchdog": "Guardian",
+    "recon": "Recon",
+    "recon_pipeline": "Recon",
+    "recon_mcp": "Recon",
+    "surplus_promotion": "Surplus",
+    "surplus": "Surplus",
+    "surplus_scheduler": "Surplus",
+    "reflection": "Reflections",
+    "light_reflection": "Reflections",
+    "deep_reflection": "Reflections",
+    "cc_reflection_deep": "Reflections",
+    "cc_reflection_light": "Reflections",
+    "cc_reflection_strategic": "Reflections",
+    "strategic_reflection": "Reflections",
+    "conversation": "Conversation",
+    "conversation_intent": "Conversation",
+    "conversation_analysis": "Conversation",
+    "conversation_followup": "Conversation",
+    "inbox_evaluation": "Inbox",
+}
+
+_CATEGORY_ORDER = [
+    "Sentinel", "Guardian", "Recon", "Reflections",
+    "Surplus", "Conversation", "Inbox", "Other",
+]
+
+
+def _categorize_source(source: str) -> str:
+    """Map an observation source to its display category."""
+    return _SOURCE_CATEGORIES.get(source, "Other")
+
+
+def _relative_age(created_at: str) -> str:
+    """Return a human-readable relative time string."""
+    try:
+        created = datetime.fromisoformat(created_at)
+        delta = datetime.now(UTC) - created
+        hours = delta.total_seconds() / 3600
+        if hours < 1:
+            return f"{int(delta.total_seconds() / 60)}m ago"
+        if hours < 24:
+            return f"{hours:.0f}h ago"
+        return f"{hours / 24:.0f}d ago"
+    except (ValueError, TypeError):
+        return ""
+
+
+def _format_observations_grouped(obs_list: list[dict]) -> list[str]:
+    """Group observations by source subsystem with citation anchors.
+
+    Returns formatted lines ready for prompt injection.
+    """
+    if not obs_list:
+        return []
+
+    # Group by category
+    groups: dict[str, list[dict]] = {}
+    for obs in obs_list:
+        cat = _categorize_source(obs.get("source", ""))
+        groups.setdefault(cat, []).append(obs)
+
+    lines: list[str] = ["## Subsystem Activity"]
+    for cat in _CATEGORY_ORDER:
+        if cat not in groups:
+            continue
+        lines.append(f"### {cat}")
+        for obs in groups[cat]:
+            oid = obs.get("id", "?")
+            short_id = oid[:8] if len(oid) > 8 else oid
+            priority = obs.get("priority", "?")
+            obs_type = obs.get("type", "?")
+            content = obs.get("content", "")
+            age = _relative_age(obs.get("created_at", ""))
+            age_suffix = f" ({age})" if age else ""
+            lines.append(f"- [#{short_id}] [{priority}] {obs_type}: {content}{age_suffix}")
+        lines.append("")  # blank line between groups
+
+    return lines
+
 
 class ContextAssembler:
     """Assembles context for prompt rendering based on depth.
@@ -181,16 +266,10 @@ class ContextAssembler:
         priority_order = {"high": 0, "medium": 1, "low": 2}
         merged.sort(key=lambda o: priority_order.get(o.get("priority", "low"), 3))
 
-        lines: list[str] = []
-        obs_ids: list[str] = []
-        for obs in merged:
-            oid = obs.get("id", "?")
-            obs_ids.append(oid)
-            priority = obs.get("priority", "?")
-            obs_type = obs.get("type", "?")
-            content = obs.get("content", "")
-            created = obs.get("created_at", "?")
-            lines.append(f"- [{priority}] {obs_type} ({created}): {content}")
+        obs_ids: list[str] = [obs.get("id", "") for obs in merged if obs.get("id")]
+
+        # Group by source subsystem for structured rendering
+        lines = _format_observations_grouped(merged)
 
         # Track retrieval and influence (displayed in prompt = influenced awareness)
         if obs_ids:

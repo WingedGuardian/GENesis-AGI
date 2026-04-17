@@ -92,8 +92,9 @@ async def test_no_unexpected_tables(db):
 async def test_signal_weights_seeded(db):
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
     count = (await cursor.fetchone())[0]
-    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
-    assert count == 10
+    # 10 → 16 on 2026-04-17: +6 new signals (light_cascade, sentinel,
+    # guardian, surplus, autonomy activity, stale_pending_items).
+    assert count == 16
 
 
 async def test_signal_weights_values(db):
@@ -103,9 +104,10 @@ async def test_signal_weights_values(db):
     )
     row = await cursor.fetchone()
     assert row is not None
-    assert row[1] == 0.90
+    # 2026-04-17: critical_failure moved to Micro-only at weight 0.70
+    assert row[1] == 0.70
     depths = json.loads(row[2])
-    assert "Light" in depths
+    assert "Micro" in depths
 
 
 async def test_unprocessed_memory_backlog_migration_removes_existing_row(db):
@@ -295,8 +297,8 @@ async def test_seed_is_idempotent(db):
     await seed_data(db)
     await db.commit()
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
-    # 11 → 10 on 2026-04-11 after unprocessed_memory_backlog removal.
-    assert (await cursor.fetchone())[0] == 10
+    # 10 → 16 on 2026-04-17: +6 new signals (awareness scoring overhaul).
+    assert (await cursor.fetchone())[0] == 16
     cursor = await db.execute("SELECT COUNT(*) FROM drive_weights")
     assert (await cursor.fetchone())[0] == 4
 
