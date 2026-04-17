@@ -165,6 +165,9 @@ async def run_extraction_cycle(
                     store=store,
                     db=db,
                     source_session_id=cc_session_id,
+                    # Normal: queue for paced embedding; history mining: embed
+                    # inline (one-shot CLI won't have recovery worker running)
+                    force_fts5_only=not reference_only_mode,
                 )
                 summary["references_captured"] += ref_count
             except Exception:
@@ -190,7 +193,13 @@ async def run_extraction_cycle(
                     source_line_range=(chunk_start, chunk_end),
                 )
                 try:
-                    memory_id = await store.store(**kwargs)
+                    # Queue-first: store FTS5-only, queue embedding for
+                    # the recovery worker's paced drain. Prevents the
+                    # extraction cycle from hammering the embedding backend
+                    # with hundreds of sequential calls.
+                    memory_id = await store.store(
+                        **kwargs, force_fts5_only=True,
+                    )
                     summary["entities_extracted"] += 1
 
                     # Create typed links from extraction relationships

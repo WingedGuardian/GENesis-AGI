@@ -112,9 +112,21 @@ class EmbeddingRecoveryWorker:
                             "Auto-link failed for %s, continuing", item["memory_id"],
                         )
 
-                # Mark completed
+                # Mark completed in pending_embeddings + update memory_metadata
                 now = datetime.now(UTC).isoformat()
                 await crud.mark_embedded(self._db, item["id"], embedded_at=now)
+                try:
+                    await self._db.execute(
+                        "UPDATE memory_metadata SET embedding_status = 'embedded' "
+                        "WHERE memory_id = ?",
+                        (item["memory_id"],),
+                    )
+                    await self._db.commit()
+                except Exception:
+                    logger.debug(
+                        "Failed to update embedding_status for %s",
+                        item["memory_id"], exc_info=True,
+                    )
                 processed += 1
 
             except Exception as exc:

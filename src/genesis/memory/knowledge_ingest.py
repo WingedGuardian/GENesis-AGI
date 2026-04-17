@@ -39,6 +39,7 @@ async def ingest_knowledge_unit(
     memory_class: str | None = None,
     concept: str | None = None,
     tags_json: str | None = None,
+    force_fts5_only: bool = False,
 ) -> str:
     """Ingest or upsert a knowledge unit, returning the stable unit_id.
 
@@ -87,6 +88,7 @@ async def ingest_knowledge_unit(
         source_pipeline=source_pipeline_val,
         memory_class=memory_class,
         source_session_id=source_session_id,
+        force_fts5_only=force_fts5_only,
     )
 
     # If we replaced an existing entry whose Qdrant point ID differs from

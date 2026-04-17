@@ -766,6 +766,9 @@ SYSTEMD_TEMPLATE_DIR="$REPO_DIR/scripts/systemd"
 SERVICES_GENERATED=0
 
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
+    # Detect Claude Code binary directory for systemd PATH injection
+    CC_BIN_DIR="$(dirname "$(command -v claude 2>/dev/null)" 2>/dev/null || echo "$HOME/.npm-global/bin")"
+
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue
         svc_name=$(basename "$template" .template)
@@ -777,6 +780,7 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             sed -e "s|__HOME__|$HOME|g" \
                 -e "s|__VENV__|$VENV_PATH|g" \
                 -e "s|__REPO_DIR__|$REPO_DIR|g" \
+                -e "s|__CC_BIN_DIR__|$CC_BIN_DIR|g" \
                 "$template" > "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1

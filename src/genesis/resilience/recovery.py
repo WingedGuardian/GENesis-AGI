@@ -109,8 +109,9 @@ class RecoveryOrchestrator:
             except Exception:
                 logger.warning("Failed to reset failed embeddings", exc_info=True)
 
-        # 2. Drain pending embeddings
-        report.embeddings_recovered = await self._embedding_worker.drain_pending(limit=100)
+        # 2. Drain pending embeddings — limit=500 to handle full extraction
+        # cycle output (extraction queues FTS5-only, recovery embeds at pace)
+        report.embeddings_recovered = await self._embedding_worker.drain_pending(limit=500)
 
         # 3. Drain deferred work by priority
         items = await self._deferred_queue.drain_by_priority(limit=50)

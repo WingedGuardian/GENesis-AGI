@@ -86,6 +86,7 @@ class MemoryStore:
         source_pipeline: str | None = None,
         wing: str | None = None,
         room: str | None = None,
+        force_fts5_only: bool = False,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -112,7 +113,7 @@ class MemoryStore:
         from genesis.perception.confidence import load_config as load_confidence_config
         from genesis.perception.confidence import should_gate
 
-        force_fts5_only = False
+        # force_fts5_only param skips embedding; confidence gate can also set it
         cfg = load_confidence_config()
         gated, gate_msg = should_gate(confidence, cfg.memory_upsertion)
         if gate_msg:

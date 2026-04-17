@@ -104,7 +104,7 @@ class TestRunRecovery:
         mocks["embedding_worker"].drain_pending = AsyncMock(return_value=5)
         report = await orchestrator.run_recovery()
         assert report.embeddings_recovered == 5
-        mocks["embedding_worker"].drain_pending.assert_awaited_once_with(limit=100)
+        mocks["embedding_worker"].drain_pending.assert_awaited_once_with(limit=500)
 
     async def test_processes_deferred_work(self, orchestrator, mocks):
         items = [{"id": "a"}, {"id": "b"}]
