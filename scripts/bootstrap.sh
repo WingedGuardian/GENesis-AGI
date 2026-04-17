@@ -473,6 +473,47 @@ if [[ -d "$BACKUP_DIR" ]]; then
     echo
 fi
 
+# --- User-level CLAUDE.md seed ---
+# CC auto-discovers ~/.claude/CLAUDE.md as user-level instructions alongside
+# the project-level file. Install scripts (host-setup.sh, update.sh) manage
+# the sentinel blocks; this seed provides the initial structure.
+if [ ! -f "$HOME/.claude/CLAUDE.md" ]; then
+    mkdir -p "$HOME/.claude"
+    cat > "$HOME/.claude/CLAUDE.md" <<'UCLSEED'
+# This Genesis Install — User-Level Configuration
+
+Install-specific overlay to the project CLAUDE.md. Populated by
+scripts/host-setup.sh and refreshed by scripts/update.sh. The
+<!-- begin:SECTION --> / <!-- end:SECTION --> blocks below are
+managed by install scripts — edit at your own risk. The "Personal Notes"
+section is safe to hand-edit; install scripts preserve it.
+
+<!-- begin:container-specs -->
+## Container
+- **Specs**: (run host-setup.sh to detect and populate)
+<!-- end:container-specs -->
+
+<!-- begin:network-identity -->
+## Network Identity
+- (run host-setup.sh or update.sh to populate)
+<!-- end:network-identity -->
+
+<!-- begin:github-config -->
+## GitHub
+- **Working Repo**: (set by installer)
+- **Backups Repo**: (set by installer)
+- **Public Distribution**: (set by installer)
+<!-- end:github-config -->
+
+## Personal Notes
+
+(Install scripts preserve this section. Add any machine-specific
+reminders here.)
+UCLSEED
+    echo "--- Seeded ~/.claude/CLAUDE.md (run host-setup.sh to populate) ---"
+    echo
+fi
+
 # --- Settings.local ---
 LOCAL_SETTINGS="$GENESIS_ROOT/.claude/settings.local.json"
 LOCAL_TEMPLATE="$GENESIS_ROOT/config/settings.local.json.template"
