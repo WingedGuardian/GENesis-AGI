@@ -630,3 +630,92 @@ async def reference_export() -> dict:
         "oldest": stats_result["oldest_ingested"],
         "newest": stats_result["newest_ingested"],
     }
+
+
+def _get_orchestrator():
+    """Lazily build the KnowledgeOrchestrator using the live runtime."""
+    from genesis.knowledge.distillation import DistillationPipeline
+    from genesis.knowledge.manifest import ManifestManager
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+    from genesis.knowledge.processors.registry import build_default_registry
+    from genesis.runtime._core import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if rt._router is None:
+        raise RuntimeError("Router not available — Genesis not fully bootstrapped")
+
+    return KnowledgeOrchestrator(
+        registry=build_default_registry(),
+        distillation=DistillationPipeline(router=rt._router),
+        manifest=ManifestManager(),
+    )
+
+
+@mcp.tool()
+async def knowledge_ingest_source(
+    source: str,
+    project_type: str,
+    domain: str = "auto",
+    purpose: list[str] | None = None,
+) -> dict:
+    """Ingest a file or URL into the knowledge base via the full pipeline.
+
+    Detects source type, extracts content, distills into knowledge units,
+    and stores with curated authority tier.
+
+    Args:
+        source: File path or URL to ingest.
+        project_type: Project classification (e.g., "professional", "cloud-eng").
+        domain: Knowledge domain (default "auto" — LLM determines).
+        purpose: Optional purpose tags (e.g., ["resume-prep"]).
+    """
+    orchestrator = _get_orchestrator()
+    result = await orchestrator.ingest_source(
+        source, project_type=project_type, domain=domain, purpose=purpose,
+    )
+    return {
+        "source": result.source,
+        "source_type": result.source_type,
+        "units_created": result.units_created,
+        "unit_ids": result.unit_ids,
+        "quality_flags": result.quality_flags,
+        "error": result.error,
+    }
+
+
+@mcp.tool()
+async def knowledge_ingest_batch(
+    directory: str,
+    project_type: str,
+    domain: str = "auto",
+    purpose: list[str] | None = None,
+    extensions: list[str] | None = None,
+) -> dict:
+    """Batch-ingest all supported files from a directory.
+
+    Args:
+        directory: Path to directory containing files to ingest.
+        project_type: Project classification for all ingested content.
+        domain: Knowledge domain (default "auto").
+        purpose: Optional purpose tags applied to all units.
+        extensions: Optional filter — only process files with these extensions.
+    """
+    orchestrator = _get_orchestrator()
+    results = await orchestrator.ingest_batch(
+        directory, project_type=project_type, domain=domain,
+        purpose=purpose, extensions=extensions,
+    )
+    return {
+        "total_sources": len(results),
+        "total_units": sum(r.units_created for r in results),
+        "results": [
+            {
+                "source": r.source,
+                "source_type": r.source_type,
+                "units_created": r.units_created,
+                "quality_flags": r.quality_flags,
+                "error": r.error,
+            }
+            for r in results
+        ],
+    }
