@@ -106,8 +106,15 @@ def update_status():
     # commit actually landed in HEAD, the update succeeded despite the
     # script's rollback (e.g. a CC tier completed it manually).
     if last_update and last_update.get("status") in ("rolled_back", "failed"):
+        # Try commit first, fall back to tag (commits may not exist after
+        # history rewrites like filter-repo).
+        landed = False
         new_commit = last_update.get("new_commit")
         if new_commit and _git("merge-base", "--is-ancestor", new_commit, "HEAD") is not None:
+            landed = True
+        elif last_update.get("new_tag"):
+            landed = _git("merge-base", "--is-ancestor", last_update["new_tag"], "HEAD") is not None
+        if landed:
             last_update = dict(last_update)
             last_update["status"] = "success"
             last_update["failure_reason"] = None
