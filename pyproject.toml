@@ -22,6 +22,7 @@ dependencies = [
     "fastmcp>=2.0,<3.0",  # 3.x has breaking API changes; CVE-2026-32871/27124/2025-64340 not exploitable
                          # (Genesis uses stdio transport only, no OpenAPI/OAuth/CLI features)
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
+    "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
 ]
 
 [project.optional-dependencies]

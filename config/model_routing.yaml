@@ -398,6 +398,30 @@ call_sites:
     default_paid: true
     retry_profile: background
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
+  40_knowledge_distillation:
+    chain:
+    - mistral-large-free
+    - groq-free
+    - gemini-free
+    - openrouter-free
+    retry_profile: background
+    description: "Knowledge pipeline — distill raw content into structured knowledge units"
+  41_resume_review_pass1:
+    chain:
+    - mistral-large-free
+    - gemini-free
+    - groq-free
+    - openrouter-free
+    retry_profile: background
+    description: "Resume review Pass 1 — native LLM structural analysis"
+  42_resume_review_pass2:
+    chain:
+    - mistral-large-free
+    - gemini-free
+    - groq-free
+    - openrouter-free
+    retry_profile: background
+    description: "Resume review Pass 2 — knowledge-augmented critique"
   contingency_foreground:
     chain:
     - kimi-k2.5

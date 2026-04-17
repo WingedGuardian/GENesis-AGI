@@ -37,8 +37,15 @@ async def insert(
     ingested_at: str | None = None,
     qdrant_id: str | None = None,
     embedding_model: str | None = None,
+    source_pipeline: str | None = None,
+    purpose: str | None = None,
+    ingestion_source: str | None = None,
+    _commit: bool = True,
 ) -> str:
-    """Insert a knowledge unit into both knowledge_units and knowledge_fts. Returns id."""
+    """Insert a knowledge unit into both knowledge_units and knowledge_fts. Returns id.
+
+    Pass _commit=False for batch operations where the caller manages the transaction.
+    """
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
 
@@ -46,11 +53,13 @@ async def insert(
         """INSERT INTO knowledge_units
            (id, project_type, domain, source_doc, source_platform, section_title,
             concept, body, relationships, caveats, tags, confidence,
-            source_date, ingested_at, qdrant_id, embedding_model)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source_date, ingested_at, qdrant_id, embedding_model,
+            source_pipeline, purpose, ingestion_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (unit_id, project_type, domain, source_doc, source_platform, section_title,
          concept, body, relationships, caveats, tags, confidence,
-         source_date, now_iso, qdrant_id, embedding_model),
+         source_date, now_iso, qdrant_id, embedding_model,
+         source_pipeline, purpose, ingestion_source),
     )
 
     await db.execute(
@@ -60,7 +69,8 @@ async def insert(
         (unit_id, concept, body, tags or "", domain, project_type),
     )
 
-    await db.commit()
+    if _commit:
+        await db.commit()
     return unit_id
 
 
@@ -120,6 +130,9 @@ async def upsert(
     ingested_at: str | None = None,
     qdrant_id: str | None = None,
     embedding_model: str | None = None,
+    source_pipeline: str | None = None,
+    purpose: str | None = None,
+    ingestion_source: str | None = None,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
 
@@ -154,8 +167,9 @@ async def upsert(
         """INSERT INTO knowledge_units
            (id, project_type, domain, source_doc, source_platform, section_title,
             concept, body, relationships, caveats, tags, confidence,
-            source_date, ingested_at, qdrant_id, embedding_model)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_date, ingested_at, qdrant_id, embedding_model,
+            source_pipeline, purpose, ingestion_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(project_type, domain, concept) DO UPDATE SET
                source_doc      = excluded.source_doc,
                source_platform = excluded.source_platform,
@@ -168,10 +182,14 @@ async def upsert(
                source_date     = excluded.source_date,
                ingested_at     = excluded.ingested_at,
                qdrant_id       = excluded.qdrant_id,
-               embedding_model = excluded.embedding_model""",
+               embedding_model = excluded.embedding_model,
+               source_pipeline = excluded.source_pipeline,
+               purpose         = excluded.purpose,
+               ingestion_source = excluded.ingestion_source""",
         (unit_id, project_type, domain, source_doc, source_platform, section_title,
          concept, body, relationships, caveats, tags, confidence,
-         source_date, now_iso, qdrant_id, embedding_model),
+         source_date, now_iso, qdrant_id, embedding_model,
+         source_pipeline, purpose, ingestion_source),
     )
 
     # Find the row that actually lives in the table — either the one we
@@ -212,22 +230,29 @@ async def search_fts(
     domain: str | None = None,
     limit: int = 10,
 ) -> list[dict]:
-    """Full-text search on knowledge content. Returns matching rows with rank."""
+    """Full-text search on knowledge content. Returns matching rows with rank.
+
+    JOINs back to knowledge_units to include source_pipeline for authority
+    boosting in the recall merge step.
+    """
     escaped = _escape_fts5(query)
     if not escaped:
         return []
     sql = (
-        "SELECT unit_id, concept, body, tags, domain, project_type, rank "
-        "FROM knowledge_fts WHERE knowledge_fts MATCH ?"
+        "SELECT f.unit_id, f.concept, f.body, f.tags, f.domain, f.project_type,"
+        " f.rank, k.source_pipeline"
+        " FROM knowledge_fts f"
+        " LEFT JOIN knowledge_units k ON k.id = f.unit_id"
+        " WHERE knowledge_fts MATCH ?"
     )
     params: list = [escaped]
     if project:
-        sql += " AND project_type = ?"
+        sql += " AND f.project_type = ?"
         params.append(project)
     if domain:
-        sql += " AND domain = ?"
+        sql += " AND f.domain = ?"
         params.append(domain)
-    sql += " ORDER BY rank LIMIT ?"
+    sql += " ORDER BY f.rank LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)
     rows = await cursor.fetchall()
@@ -235,6 +260,7 @@ async def search_fts(
         {
             "unit_id": r[0], "concept": r[1], "body": r[2],
             "tags": r[3], "domain": r[4], "project_type": r[5], "rank": r[6],
+            "source_pipeline": r[7],
         }
         for r in rows
     ]
@@ -246,36 +272,45 @@ async def stats(
     project: str | None = None,
 ) -> dict:
     """Aggregate stats for knowledge units."""
-    if project:
-        cursor = await db.execute(
-            """SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at)
-               FROM knowledge_units WHERE project_type = ?""",
-            (project,),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at) FROM knowledge_units"
-        )
+    where = "WHERE project_type = ?" if project else ""
+    params: tuple = (project,) if project else ()
+
+    cursor = await db.execute(
+        f"SELECT COUNT(*), MIN(ingested_at), MAX(ingested_at) FROM knowledge_units {where}",
+        params,
+    )
     row = await cursor.fetchone()
     total, oldest, newest = row
 
     # Domain breakdown
-    if project:
-        cursor = await db.execute(
-            "SELECT domain, COUNT(*) FROM knowledge_units WHERE project_type = ? GROUP BY domain",
-            (project,),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT domain, COUNT(*) FROM knowledge_units GROUP BY domain"
-        )
+    cursor = await db.execute(
+        f"SELECT domain, COUNT(*) FROM knowledge_units {where} GROUP BY domain",
+        params,
+    )
     domains = {r[0]: r[1] for r in await cursor.fetchall()}
+
+    # Tier breakdown (curated vs recon vs other)
+    cursor = await db.execute(
+        f"""SELECT
+                CASE
+                    WHEN source_pipeline = 'curated' THEN 'curated'
+                    WHEN source_pipeline = 'recon' THEN 'recon'
+                    WHEN source_pipeline IS NULL THEN 'unknown'
+                    ELSE source_pipeline
+                END AS tier,
+                COUNT(*)
+            FROM knowledge_units {where}
+            GROUP BY tier""",
+        params,
+    )
+    by_tier = {r[0]: r[1] for r in await cursor.fetchall()}
 
     return {
         "total": total,
         "oldest_ingested": oldest,
         "newest_ingested": newest,
         "by_domain": domains,
+        "by_tier": by_tier,
     }
 
 

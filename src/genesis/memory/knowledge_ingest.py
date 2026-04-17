@@ -40,6 +40,8 @@ async def ingest_knowledge_unit(
     concept: str | None = None,
     tags_json: str | None = None,
     force_fts5_only: bool = False,
+    purpose: list[str] | None = None,
+    ingestion_source: str | None = None,
 ) -> str:
     """Ingest or upsert a knowledge unit, returning the stable unit_id.
 
@@ -122,6 +124,9 @@ async def ingest_knowledge_unit(
         section_title=provenance.get("section_title") if provenance else None,
         source_date=provenance.get("source_date") if provenance else None,
         embedding_model=embedding_model,
+        source_pipeline=provenance.get("source_pipeline") if provenance else None,
+        purpose=json.dumps(purpose) if purpose else None,
+        ingestion_source=ingestion_source,
     )
 
     logger.info(

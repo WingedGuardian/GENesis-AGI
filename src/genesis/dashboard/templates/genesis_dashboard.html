@@ -21,7 +21,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, sessions: false, config: false, files: false, tasks: false, memory: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, sessions: false, config: false, files: false, tasks: false, memory: false, knowledge: false, backup: false },
 
         // State
         health: {},
@@ -148,6 +148,11 @@
         memoryRecent: { items: [], total: 0, loading: false },
         memoryStats: {},
         memoryDetail: null,
+        knowledgeQuery: "",
+        knowledgeSearchResults: [],
+        knowledgeRecent: [],
+        knowledgeStats: null,
+        knowledgeDetail: null,
 
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
@@ -221,12 +226,13 @@
           files:     [],
           tasks:     ["_tasksInterval"],
           memory:    [],
+          knowledge: [],
           backup:    [],
         },
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "sessions", "config", "files", "tasks", "memory", "backup"];
+          const valid = ["overview", "chat", "internals", "sessions", "config", "files", "tasks", "memory", "knowledge", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -286,6 +292,9 @@
               break;
             case "memory":
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
+              break;
+            case "knowledge":
+              if (first) { this.fetchKnowledgeRecent(); this.fetchKnowledgeStats(); }
               break;
             case "backup":
               if (first) { this.fetchBackupStatus(); this.fetchUpdateStatus(); this.fetchUpdateProgress(); }
@@ -640,6 +649,51 @@
             await this.fetchMemoryRecent();
             await this.fetchMemoryStats();
           } catch (e) { console.warn("Memory delete failed:", e); }
+        },
+
+        // ── Knowledge tab fetches ──────────────────────────────────
+        async fetchKnowledgeRecent() {
+          try {
+            const resp = await fetchApi("/api/genesis/knowledge/recent?limit=50");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.knowledgeRecent = data.units || [];
+            }
+          } catch (e) { console.warn("Knowledge recent failed:", e); }
+        },
+        async fetchKnowledgeStats() {
+          try {
+            const resp = await fetchApi("/api/genesis/knowledge/stats");
+            if (resp && resp.ok) { this.knowledgeStats = await resp.json(); }
+          } catch (e) { console.warn("Knowledge stats failed:", e); }
+        },
+        async searchKnowledge() {
+          if (!this.knowledgeQuery.trim()) return;
+          try {
+            const resp = await fetchApi(`/api/genesis/knowledge/search?q=${encodeURIComponent(this.knowledgeQuery)}&limit=30`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.knowledgeSearchResults = data.results || [];
+            }
+          } catch (e) { console.warn("Knowledge search failed:", e); }
+        },
+        async viewKnowledgeDetail(unitId) {
+          try {
+            const resp = await fetchApi(`/api/genesis/knowledge/${unitId}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.knowledgeDetail = data.unit;
+            }
+          } catch (e) { console.warn("Knowledge detail failed:", e); }
+        },
+        async deleteKnowledge(unitId) {
+          if (!confirm("Delete this knowledge unit?")) return;
+          try {
+            await fetchApi(`/api/genesis/knowledge/${unitId}`, { method: "DELETE" });
+            this.knowledgeDetail = null;
+            await this.fetchKnowledgeRecent();
+            await this.fetchKnowledgeStats();
+          } catch (e) { console.warn("Knowledge delete failed:", e); }
         },
 
         // ── Backup tab fetches ───────────────────────────────────
@@ -2983,6 +3037,8 @@
               @click="location.hash = 'tasks'">Tasks</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
               @click="location.hash = 'memory'">Memory</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
+              @click="location.hash = 'knowledge'">Knowledge</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>
@@ -6349,6 +6405,129 @@
           </template>
         </div>
       </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Knowledge Base [Tab: knowledge]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">school</span>
+        Knowledge Base
+      </div>
+
+      <!-- Stats Cards -->
+      <div class="stat-row" style="margin-bottom: 1.5rem;">
+        <div class="stat-card">
+          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.total ?? '—'"></div>
+          <div class="stat-label">Total Units</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
+          <div class="stat-label">Qdrant Vectors</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>
+          <div class="stat-label">Domains</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.by_tier?.curated ?? 0"></div>
+          <div class="stat-label">Curated</div>
+        </div>
+      </div>
+
+      <!-- Tier Breakdown -->
+      <template x-if="$store.genesisDashboard.knowledgeStats?.by_tier">
+        <div style="margin-bottom: 1rem;">
+          <strong>By Tier:</strong>
+          <template x-for="[tier, count] in Object.entries($store.genesisDashboard.knowledgeStats.by_tier)" :key="tier">
+            <span class="badge" style="margin: 0 .25rem;" x-text="tier + ': ' + count"></span>
+          </template>
+        </div>
+      </template>
+
+      <!-- Domain Breakdown -->
+      <template x-if="$store.genesisDashboard.knowledgeStats?.by_domain">
+        <div style="margin-bottom: 1.5rem;">
+          <strong>By Domain:</strong>
+          <template x-for="[domain, count] in Object.entries($store.genesisDashboard.knowledgeStats.by_domain)" :key="domain">
+            <span class="badge" style="margin: 0 .25rem;" x-text="domain + ': ' + count"></span>
+          </template>
+        </div>
+      </template>
+
+      <!-- Search -->
+      <div style="margin-bottom: 1rem; display: flex; gap: .5rem;">
+        <input type="text" x-model="$store.genesisDashboard.knowledgeQuery" placeholder="Search knowledge base..."
+               @keyup.enter="$store.genesisDashboard.searchKnowledge()"
+               style="flex: 1; padding: .5rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+        <button @click="$store.genesisDashboard.searchKnowledge()" class="btn-sm">Search</button>
+      </div>
+
+      <!-- Search Results -->
+      <template x-if="$store.genesisDashboard.knowledgeSearchResults.length > 0">
+        <div style="margin-bottom: 1.5rem;">
+          <h4 style="margin-bottom: .5rem;">Search Results</h4>
+          <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
+            <div class="card" style="margin-bottom: .5rem; cursor: pointer;" @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
+              <strong x-text="item.concept || item.unit_id"></strong>
+              <div style="font-size: .85em; color: var(--text-dim);">
+                <span x-text="item.domain"></span> |
+                <span x-text="item.source_pipeline || 'unknown'"></span>
+              </div>
+              <div style="font-size: .85em; margin-top: .25rem;" x-text="(item.body || item.content || '').substring(0, 200) + '...'"></div>
+            </div>
+          </template>
+        </div>
+      </template>
+
+      <!-- Recent Units -->
+      <h4 style="margin-bottom: .5rem;">Recent Knowledge Units</h4>
+      <template x-if="$store.genesisDashboard.knowledgeRecent.length === 0">
+        <p style="color: var(--text-dim);">No knowledge units ingested yet.</p>
+      </template>
+      <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
+        <div class="card" style="margin-bottom: .5rem; cursor: pointer;" @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <strong x-text="unit.concept || unit.id"></strong>
+            <span class="badge" x-text="unit.source_pipeline || 'unknown'"></span>
+          </div>
+          <div style="font-size: .85em; color: var(--text-dim);">
+            <span x-text="unit.domain"></span> |
+            <span x-text="unit.project_type"></span> |
+            <span x-text="unit.ingested_at?.substring(0, 10)"></span>
+          </div>
+          <div style="font-size: .85em; margin-top: .25rem;" x-text="(unit.body || '').substring(0, 200) + '...'"></div>
+        </div>
+      </template>
+
+      <!-- Detail Modal -->
+      <template x-if="$store.genesisDashboard.knowledgeDetail">
+        <div style="position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center;"
+             @click.self="$store.genesisDashboard.knowledgeDetail = null">
+          <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;">
+            <h3 x-text="$store.genesisDashboard.knowledgeDetail.concept"></h3>
+            <div style="margin: .75rem 0; font-size: .9em; color: var(--text-dim);">
+              <span x-text="'Domain: ' + $store.genesisDashboard.knowledgeDetail.domain"></span> |
+              <span x-text="'Project: ' + $store.genesisDashboard.knowledgeDetail.project_type"></span> |
+              <span x-text="'Pipeline: ' + ($store.genesisDashboard.knowledgeDetail.source_pipeline || 'unknown')"></span> |
+              <span x-text="'Confidence: ' + $store.genesisDashboard.knowledgeDetail.confidence"></span>
+            </div>
+            <template x-if="$store.genesisDashboard.knowledgeDetail.purpose">
+              <div style="margin-bottom: .5rem;"><strong>Purpose:</strong> <span x-text="$store.genesisDashboard.knowledgeDetail.purpose"></span></div>
+            </template>
+            <template x-if="$store.genesisDashboard.knowledgeDetail.ingestion_source">
+              <div style="margin-bottom: .5rem;"><strong>Source:</strong> <span x-text="$store.genesisDashboard.knowledgeDetail.ingestion_source"></span></div>
+            </template>
+            <div style="white-space: pre-wrap; font-family: monospace; font-size: .85em; background: var(--bg-tertiary); padding: 1rem; border-radius: 4px; margin: .75rem 0;"
+                 x-text="$store.genesisDashboard.knowledgeDetail.body"></div>
+            <div style="display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem;">
+              <button class="btn-sm btn-danger" @click="$store.genesisDashboard.deleteKnowledge($store.genesisDashboard.knowledgeDetail.id)">Delete</button>
+              <button class="btn-sm" @click="$store.genesisDashboard.knowledgeDetail = null">Close</button>
+            </div>
+          </div>
+        </div>
+      </template>
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════
