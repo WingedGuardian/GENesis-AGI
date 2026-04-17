@@ -32,8 +32,8 @@ class TestHookExtraction:
         hook_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(hook_mod)
 
-        info = hook_mod._extract_key_info("Read", {"file_path": "/home/ubuntu/genesis/src/foo.py"})
-        assert info["file_path"] == "/home/ubuntu/genesis/src/foo.py"
+        info = hook_mod._extract_key_info("Read", {"file_path": "${HOME}/genesis/src/foo.py"})
+        assert info["file_path"] == "${HOME}/genesis/src/foo.py"
 
     def test_extract_key_info_bash(self):
         import importlib.util
@@ -134,7 +134,7 @@ class TestInferWing:
         assert _infer_wing_from_files(["scripts/hooks/session_observer_hook.py"]) == "infrastructure"
 
     def test_infrastructure_config(self):
-        assert _infer_wing_from_files(["/home/ubuntu/genesis/config/model_routing.yaml"]) == "infrastructure"
+        assert _infer_wing_from_files(["${HOME}/genesis/config/model_routing.yaml"]) == "infrastructure"
 
     def test_no_match(self):
         assert _infer_wing_from_files(["README.md"]) is None

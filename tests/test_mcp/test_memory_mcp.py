@@ -418,7 +418,7 @@ async def test_reference_store_upsert_preserves_id():
             uid_a = await tools["reference_store"].fn(
                 kind="network",
                 identifier="Container IP",
-                value="10.176.34.206",
+                value="${CONTAINER_IP:-localhost}",
                 description="Incus container running Genesis runtime",
             )
 

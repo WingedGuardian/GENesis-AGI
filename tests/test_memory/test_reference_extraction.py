@@ -128,7 +128,7 @@ class TestClassifyUrl:
 class TestClassifyNetwork:
     def test_container_ip(self):
         ext = Extraction(
-            content="The Genesis container runs at IP address 10.176.34.206",
+            content="The Genesis container runs at IP address ${CONTAINER_IP:-localhost}",
             extraction_type="entity",
             confidence=0.9,
             entities=["Genesis container"],
@@ -136,11 +136,11 @@ class TestClassifyNetwork:
         ref = classify_as_reference(ext)
         assert ref is not None
         assert ref["kind"] == "network"
-        assert ref["value"] == "10.176.34.206"
+        assert ref["value"] == "${CONTAINER_IP:-localhost}"
 
     def test_ip_without_context_rejected(self):
         ext = Extraction(
-            content="Version 10.176.34.206 was released last week",
+            content="Version ${CONTAINER_IP:-localhost} was released last week",
             extraction_type="entity",
             confidence=0.9,
         )
@@ -149,7 +149,7 @@ class TestClassifyNetwork:
 
     def test_ip_with_port(self):
         ext = Extraction(
-            content="Ollama server listens on 10.176.34.199:11434 for embeddings",
+            content="Ollama server listens on ${OLLAMA_URL:-localhost:11434} for embeddings",
             extraction_type="entity",
             confidence=0.85,
             entities=["Ollama"],
@@ -157,7 +157,7 @@ class TestClassifyNetwork:
         ref = classify_as_reference(ext)
         assert ref is not None
         assert ref["kind"] == "network"
-        assert "10.176.34.199:11434" in ref["value"]
+        assert "${OLLAMA_URL:-localhost:11434}" in ref["value"]
 
 
 # ─── Classifier: non-reference extractions ───────────────────────────────────
@@ -270,7 +270,7 @@ async def test_ingest_non_reference_returns_none(db_with_schema, mock_store):
 async def test_ingest_upsert_on_duplicate(db_with_schema, mock_store):
     """Re-ingesting the same logical extraction updates in place."""
     ext1 = Extraction(
-        content="Container IP is 10.176.34.206 for the Genesis runtime container",
+        content="Container IP is ${CONTAINER_IP:-localhost} for the Genesis runtime container",
         extraction_type="entity",
         confidence=0.9,
         entities=["Genesis runtime"],
