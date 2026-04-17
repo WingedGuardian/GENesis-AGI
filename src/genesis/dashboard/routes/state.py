@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_approval_rows(rows: list[dict]) -> list[dict]:
@@ -272,7 +275,8 @@ def essential_knowledge_endpoint():
         mtime = datetime.fromtimestamp(ek_path.stat().st_mtime, tz=UTC).isoformat()
         return jsonify({"content": content, "updated_at": mtime})
     except OSError as e:
-        return jsonify({"content": None, "error": str(e)})
+        logger.warning("Failed to read essential knowledge: %s", e)
+        return jsonify({"content": None, "error": "Failed to read essential knowledge file"})
 
 
 
@@ -327,7 +331,8 @@ async def settings_timezone():
             os.unlink(tmp_path)
             raise
     except Exception as exc:
-        return jsonify({"error": f"Failed to write config: {exc}"}), 500
+        logger.error("Failed to write timezone config: %s", exc, exc_info=True)
+        return jsonify({"error": "Failed to write config"}), 500
 
     # Invalidate caches
     from genesis.env import _invalidate_local_config

@@ -145,7 +145,8 @@ def update_check():
     # (tag conflicts from history rewrites should not block the check).
     branch_out, branch_err = _git_result("fetch", "origin", "main", timeout=30)
     if branch_out is None:
-        return jsonify({"error": f"git fetch failed: {branch_err}"}), 502
+        logger.error("git fetch failed: %s", branch_err)
+        return jsonify({"error": "git fetch failed"}), 502
 
     # Best-effort tag sync — force to handle rewritten history
     if _git("fetch", "origin", "--tags", "--force", timeout=15) is None:
@@ -234,7 +235,7 @@ def _apply_direct(pid_file: Path) -> tuple:
         return jsonify({"status": "triggered", "pid": proc.pid, "supervised": False})
     except Exception as exc:
         logger.error("Failed to trigger update: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": "Failed to trigger update"}), 500
 
 
 # ── Three-tier CC update prompts ─────────────────────────────────────
