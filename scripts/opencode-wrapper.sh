@@ -11,7 +11,7 @@ OPENCODE_BIN="${HOME}/.npm-global/bin/opencode"
 
 kill_opencode() {
     local count
-    count=$(pgrep -f opencode-ai 2>/dev/null | wc -l)
+    count=$(pgrep -fc opencode-ai 2>/dev/null || true)
     if [ "$count" -gt 0 ]; then
         echo "[opencode-wrapper] Killing $count existing opencode process(es)..."
         pkill -f opencode-ai 2>/dev/null || true
