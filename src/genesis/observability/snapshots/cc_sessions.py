@@ -35,7 +35,10 @@ async def cc_sessions(
         counts = {}
 
     fg_active = counts.get("foreground", 0)
-    bg_active = counts.get("background", 0) + counts.get("reflection", 0)
+    bg_active = (
+        counts.get("background_reflection", 0)
+        + counts.get("background_task", 0)
+    )
 
     budget_str = "unknown"
     cc_status = "unknown"
