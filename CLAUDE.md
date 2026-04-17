@@ -197,6 +197,16 @@ recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy. The proactive hook auto-detects your active wing from file paths
 and prompt keywords.
 
+## Knowledge Ingestion (Conversational Path)
+
+When a user shares a file path or URL in conversation:
+- If they explicitly ask to ingest/store/learn it: confirm project_type
+  and domain, then call `knowledge_ingest_source` MCP tool.
+- If the context is ambiguous: ask "Would you like me to store this to
+  the knowledge base as an authoritative source?"
+- Never auto-ingest without explicit user confirmation.
+- The dashboard also supports drag-drop file upload on the Knowledge tab.
+
 ## Community Contributions
 
 When you see a `[Contribution]` system-reminder, a post-commit hook has

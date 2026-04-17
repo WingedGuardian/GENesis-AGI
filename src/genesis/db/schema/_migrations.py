@@ -633,6 +633,26 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE knowledge_units ADD COLUMN ingestion_source TEXT",
         "knowledge_units.ingestion_source")
 
+    # Knowledge upload tracking table (dashboard file uploads).
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS knowledge_uploads (
+            id            TEXT PRIMARY KEY,
+            filename      TEXT NOT NULL,
+            file_path     TEXT NOT NULL,
+            file_size     INTEGER NOT NULL,
+            mime_type     TEXT,
+            project_type  TEXT,
+            domain        TEXT,
+            purpose       TEXT,
+            status        TEXT NOT NULL DEFAULT 'uploaded'
+                          CHECK (status IN ('uploaded', 'processing', 'completed', 'failed')),
+            error_message TEXT,
+            unit_ids      TEXT,
+            created_at    TEXT NOT NULL,
+            completed_at  TEXT
+        )
+    """)
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.
