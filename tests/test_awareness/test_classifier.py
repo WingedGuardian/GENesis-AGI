@@ -86,3 +86,76 @@ async def test_bypass_ceiling_on_critical(db):
     result = await classify_depth(db, scores, bypass_ceiling=True)
     assert result is not None
     assert result.depth == Depth.MICRO
+
+
+async def test_floor_blocks_too_soon(db):
+    """If last tick at a depth was within floor_seconds, skip that depth."""
+    # Light floor is 10800s (3h). Insert a recent Light tick (5 min ago).
+    now = datetime.now(UTC)
+    await awareness_ticks.create(
+        db,
+        id="floor-test-light",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Light",
+        created_at=(now - timedelta(minutes=5)).isoformat(),
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.3, 0.5, False),
+        _score(Depth.LIGHT, 0.9, 0.6, True),   # triggered but within floor
+        _score(Depth.DEEP, 0.2, 0.45, False),
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    result = await classify_depth(db, scores)
+    assert result is None  # Light blocked by floor, nothing else triggered
+
+
+async def test_floor_allows_after_elapsed(db):
+    """If last tick at a depth was beyond floor_seconds, allow it."""
+    # Light floor is 10800s (3h). Insert a Light tick 4h ago.
+    now = datetime.now(UTC)
+    await awareness_ticks.create(
+        db,
+        id="floor-test-light-old",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Light",
+        created_at=(now - timedelta(hours=4)).isoformat(),
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.3, 0.5, False),
+        _score(Depth.LIGHT, 0.9, 0.6, True),   # triggered and past floor
+        _score(Depth.DEEP, 0.2, 0.45, False),
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    result = await classify_depth(db, scores)
+    assert result is not None
+    assert result.depth == Depth.LIGHT
+
+
+async def test_bypass_also_skips_floor(db):
+    """Critical bypass should skip floor check too."""
+    now = datetime.now(UTC)
+    await awareness_ticks.create(
+        db,
+        id="floor-bypass-test",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Micro",
+        created_at=(now - timedelta(minutes=1)).isoformat(),
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.6, 0.3, True),   # triggered, within floor
+        _score(Depth.LIGHT, 0.4, 0.6, False),
+        _score(Depth.DEEP, 0.2, 0.45, False),
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    result = await classify_depth(db, scores, bypass_ceiling=True)
+    assert result is not None
+    assert result.depth == Depth.MICRO

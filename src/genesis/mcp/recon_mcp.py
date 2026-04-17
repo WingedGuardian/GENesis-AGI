@@ -28,6 +28,7 @@ _SOURCES_PATH = _CONFIG_DIR / "recon_sources.yaml"
 
 _db: aiosqlite.Connection | None = None
 _router: object | None = None
+_surplus_queue: object | None = None
 _pipeline: object | None = None
 _memory_store: object | None = None
 
@@ -36,13 +37,15 @@ def init_recon_mcp(
     *, db: aiosqlite.Connection, router: object | None = None,
     activity_tracker=None, pipeline: object | None = None,
     memory_store: object | None = None,
+    surplus_queue: object | None = None,
 ) -> None:
     """Wire runtime dependencies. Called by GenesisRuntime."""
-    global _db, _router, _pipeline, _memory_store
+    global _db, _router, _pipeline, _memory_store, _surplus_queue
     _db = db
     _router = router
     _pipeline = pipeline
     _memory_store = memory_store
+    _surplus_queue = surplus_queue
 
     if activity_tracker is not None:
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
@@ -319,5 +322,7 @@ async def recon_run_model_intelligence() -> dict:
     except Exception:
         logger.debug("Profile registry load failed", exc_info=True)
 
-    job = ModelIntelligenceJob(db=_db, profile_registry=profile_registry)
+    job = ModelIntelligenceJob(
+        db=_db, profile_registry=profile_registry, surplus_queue=_surplus_queue,
+    )
     return await job.run()

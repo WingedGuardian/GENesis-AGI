@@ -536,6 +536,7 @@ class TestCollectAllSignals:
             patch("genesis.guardian.health_signals.check_tick_regularity", return_value=SuspiciousResult("tick_regularity", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_memory_pressure", return_value=SuspiciousResult("memory_pressure", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_tmp_usage", return_value=SuspiciousResult("tmp_usage", True, "ok", "t")),
+            patch("genesis.guardian.health_signals.check_cc_tmp_usage", return_value=SuspiciousResult("cc_tmp_usage", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_restart_count", return_value=SuspiciousResult("restart_count", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_error_spike", return_value=SuspiciousResult("error_spike", True, "ok", "t")),
         ):
@@ -544,7 +545,7 @@ class TestCollectAllSignals:
         assert snapshot.all_alive is True
         assert len(snapshot.signals) == 5
         # Suspicious checks run when all alive
-        assert len(snapshot.suspicious) == 5
+        assert len(snapshot.suspicious) == 6
 
     @pytest.mark.asyncio
     async def test_partial_failure_skips_suspicious(self, config: GuardianConfig) -> None:

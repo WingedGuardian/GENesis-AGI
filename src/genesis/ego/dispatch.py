@@ -1,100 +1,76 @@
-"""Ego follow-up dispatcher — records investigation requests for future dispatch.
+"""Ego follow-up dispatcher — records follow-ups in the accountability ledger.
 
-Step 1: stores follow_ups in ego_state KV. Does NOT dispatch CC sessions.
-Step 2 (future): dispatch investigation sessions via CC bridge.
+Ego follow-ups are stored in the follow_ups table (not ego_state KV).
+They persist until resolved — NOT cleared each cycle. The ego sees
+pending/failed follow-ups in its context and can act on them.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import uuid
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from genesis.db.crud import ego as ego_crud
+from genesis.db.crud import follow_ups as follow_up_crud
 
 if TYPE_CHECKING:
     import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-_FOLLOW_UP_PREFIX = "follow_up:"
-
 
 class EgoDispatcher:
-    """Records ego follow-up requests for future dispatch.
+    """Records ego follow-up requests in the follow_ups accountability table.
 
-    In Step 1 (proposal mode), the ego outputs ``follow_ups`` — open threads
-    it wants to revisit next cycle. This class stores them in ego_state KV
-    for retrieval during context assembly.
-
-    Actual CC session dispatch is deferred to Step 2 (after basic ego loop
-    is proven).
+    Follow-ups persist until resolved — the ego sees them in context each cycle
+    and can act on pending/failed items. No more clearing each cycle.
     """
 
     def __init__(self, *, db: aiosqlite.Connection) -> None:
         self._db = db
-
-    async def clear_all_follow_ups(self) -> int:
-        """Remove all follow_up entries from ego_state. Returns count removed."""
-        cursor = await self._db.execute(
-            "DELETE FROM ego_state WHERE key LIKE ?",
-            (f"{_FOLLOW_UP_PREFIX}%",),
-        )
-        await self._db.commit()
-        return cursor.rowcount
 
     async def record_follow_ups(
         self,
         follow_ups: list[str],
         cycle_id: str,
     ) -> int:
-        """Store follow_ups in ego_state, replacing any prior follow_ups.
+        """Store follow-ups from an ego cycle in the accountability ledger.
 
-        Old follow_ups are cleared first to prevent unbounded accumulation.
+        Unlike the old KV approach, follow-ups accumulate until resolved.
+        Each follow-up gets strategy='ego_judgment' so the dispatcher leaves
+        them for the ego to evaluate.
+
         Returns count stored.
         """
-        await self.clear_all_follow_ups()
-        now = datetime.now(UTC).isoformat()
         count = 0
         for text in follow_ups:
             if not text or not text.strip():
                 continue
-            key = f"{_FOLLOW_UP_PREFIX}{uuid.uuid4().hex[:12]}"
-            payload = json.dumps({
-                "text": text.strip(),
-                "cycle_id": cycle_id,
-                "created_at": now,
-            })
-            await ego_crud.set_state(self._db, key=key, value=payload)
+            await follow_up_crud.create(
+                self._db,
+                content=text.strip(),
+                source="ego_cycle",
+                source_session=cycle_id,
+                strategy="ego_judgment",
+                reason=f"Ego cycle {cycle_id} identified this as an open thread",
+            )
             count += 1
         if count:
-            logger.info("Recorded %d follow_ups from cycle %s", count, cycle_id)
+            logger.info("Recorded %d follow-ups from ego cycle %s", count, cycle_id)
         return count
 
     async def get_pending_follow_ups(self) -> list[dict]:
-        """List all pending follow_ups.
+        """List follow-ups from ego cycles that are still actionable.
 
-        Returns list of dicts with keys: key, text, cycle_id, created_at.
+        Returns pending, failed, and blocked follow-ups from ego source.
         """
-        rows = await self._db.execute_fetchall(
-            "SELECT key, value FROM ego_state WHERE key LIKE ?",
-            (f"{_FOLLOW_UP_PREFIX}%",),
-        )
-        results = []
-        for row in rows:
-            try:
-                data = json.loads(row[1])
-                data["key"] = row[0]
-                results.append(data)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Invalid follow_up payload for key %s", row[0])
-        return results
+        all_actionable = await follow_up_crud.get_actionable(self._db)
+        # Return all actionable follow-ups (not just ego-sourced), since
+        # the ego should see the full picture of what's pending.
+        return all_actionable
 
-    async def clear_follow_up(self, key: str) -> None:
-        """Remove a resolved follow_up from ego_state."""
-        await self._db.execute(
-            "DELETE FROM ego_state WHERE key = ?", (key,),
+    async def clear_follow_up(self, follow_up_id: str) -> None:
+        """Mark a follow-up as completed by the ego."""
+        await follow_up_crud.update_status(
+            self._db, follow_up_id, "completed",
+            resolution_notes="Resolved by ego cycle",
         )
-        await self._db.commit()

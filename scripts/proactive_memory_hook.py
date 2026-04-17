@@ -159,6 +159,64 @@ def _escape_fts5(query: str) -> str:
     return "".join(c if c.isalnum() or c.isspace() else " " for c in query)
 
 
+def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
+    """Search code_modules/code_symbols for relevant code entities.
+
+    Returns results in memory-like format for RRF fusion. ~5ms (SQLite).
+    Gracefully returns [] if code index tables don't exist yet.
+    """
+    if not keywords:
+        return []
+
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            # Search symbols by name match (exact prefix or contains)
+            # Escape SQL LIKE special chars in user-derived keywords
+            placeholders = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(keywords))
+            params = [f"%{k.replace('%', '\\%').replace('_', '\\_')}%" for k in keywords]
+            cursor = conn.execute(
+                f"""
+                SELECT cs.name, cs.symbol_type, cs.signature, cs.module_path,
+                       cs.parent_class, cm.package
+                FROM code_symbols cs
+                JOIN code_modules cm ON cs.module_path = cm.path
+                WHERE ({placeholders}) AND cs.is_public = 1
+                ORDER BY cs.line_start
+                LIMIT 6
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return []
+
+            results = []
+            for row in rows:
+                # Format as memory-like content for fusion
+                sig = row["signature"] or f"{row['symbol_type']} {row['name']}"
+                loc = row["module_path"]
+                if row["parent_class"]:
+                    loc = f"{row['module_path']}:{row['parent_class']}"
+                content = f"[Code] {sig} — {loc}"
+                results.append({
+                    "memory_id": f"code:{row['module_path']}:{row['name']}",
+                    "content": content,
+                    "source_type": "code_index",
+                    "memory_class": "fact",
+                })
+            return results
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet — index hasn't run
+        return []
+    except Exception as exc:
+        print(f"Code index search error: {exc}", file=sys.stderr)
+        return []
+
+
 def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
     """Search memory_fts using FTS5 with OR-joined keywords."""
     if not keywords:
@@ -294,12 +352,14 @@ def _rrf_fusion(
     fts_results: list[dict],
     vector_results: list[dict],
     wing_results: list[dict] | None = None,
+    code_results: list[dict] | None = None,
     k: int = 60,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion of FTS5, vector, and wing-filtered results.
+    """Reciprocal Rank Fusion of FTS5, vector, wing-filtered, and code index results.
 
     Wing-filtered results get a 1.5x bonus to prioritize domain-relevant
     content without exclusively filtering (cross-domain results still surface).
+    Code index results get a 0.5x weight (supplementary, not primary).
     """
     scores: dict[str, float] = {}
     content_map: dict[str, dict] = {}
@@ -329,6 +389,18 @@ def _rrf_fusion(
             scores[mid] = scores.get(mid, 0.0) + _WING_BOOST / (k + rank + 1)
             if mid not in content_map:
                 content_map[mid] = r
+
+    # Code index results — supplementary signal (0.5x weight)
+    if code_results:
+        _CODE_WEIGHT = 0.5
+        for rank, r in enumerate(code_results):
+            mid = r.get("memory_id", "")
+            if not mid:
+                continue
+            scores[mid] = scores.get(mid, 0.0) + _CODE_WEIGHT / (k + rank + 1)
+            if mid not in content_map:
+                content_map[mid] = r
+
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
@@ -494,6 +566,9 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # FTS5 search (synchronous, fast) — covers both episodic and knowledge
     fts_results = _search_fts5(_DB_PATH, keywords)
 
+    # Code index search (synchronous, fast) — structural code matches
+    code_results = _search_code_index(_DB_PATH, keywords)
+
     # Vector search (async, may timeout)
     vector_results: list[dict] = []
     wing_results: list[dict] = []
@@ -513,11 +588,15 @@ async def _run(prompt: str, session_id: str = "") -> None:
 
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
-    # Fuse results (with wing boost if available)
+    # Fuse results (with wing boost and code index if available)
     fused: list[dict] = []
     fused_count = 0
-    if fts_results or vector_results or wing_results:
-        fused = _rrf_fusion(fts_results, vector_results, wing_results=wing_results)
+    if fts_results or vector_results or wing_results or code_results:
+        fused = _rrf_fusion(
+            fts_results, vector_results,
+            wing_results=wing_results,
+            code_results=code_results or None,
+        )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
         fused_count = len(fused)
         output = _format_results(fused)

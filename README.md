@@ -169,6 +169,7 @@ Your Genesis install is one operational system: the public `GENesis-AGI` codebas
 
 ---
 
+
 ## How it thinks 🧠
 
 Genesis has three cognitive layers that work in a continuous loop:

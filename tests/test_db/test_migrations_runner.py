@@ -130,7 +130,7 @@ class TestAtomicity:
 
         # Now re-run with the original (working) migration
         results2 = await runner.run_pending()
-        assert len(results2) == 1 and results2[0].success
+        assert len(results2) >= 1 and all(r.success for r in results2)
 
         applied = await runner.get_applied()
         assert "0001" in applied

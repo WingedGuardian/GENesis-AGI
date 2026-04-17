@@ -19,6 +19,7 @@ venv/
 __pycache__/
 poetry.lock
 .pytest_cache/
+.pytest_tmp/
 botpy.log
 .worktrees/
 .claude/worktrees/
@@ -42,6 +43,7 @@ scripts/cc_cli_output/
 .firecrawl/
 .mcp.json
 config/.generated/
+config/*.local.yaml
 .gstack/
 .context/
 .playwright-mcp/
@@ -56,3 +58,11 @@ docs/actions/user/*.md
 data/genesis.db
 *.jsonl
 .config/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+*.bak
+
+# Personal/internal content (private by default)
+docs/reflections/
+docs/plans/
+docs/content/

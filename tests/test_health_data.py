@@ -157,15 +157,25 @@ class TestCost:
 
 class TestCCSessions:
     @pytest.mark.asyncio
-    async def test_cc_sessions_from_db(self):
-        db = AsyncMock()
-        cursor = AsyncMock()
-        cursor.fetchall = AsyncMock(return_value=[("foreground", 1), ("background", 3)])
-        db.execute = AsyncMock(return_value=cursor)
+    async def test_cc_sessions_from_db(self, db):
+        """Use real in-memory DB so all snapshot subsystem queries work."""
+        # Insert test cc_sessions rows
+        now = "2026-04-16T12:00:00"
+        base = (
+            "INSERT INTO cc_sessions "
+            "(id, session_type, model, effort, status, started_at, last_activity_at) "
+            "VALUES (?, ?, 'test', 'medium', 'active', ?, ?)"
+        )
+        await db.execute(base, ("s1", "foreground", now, now))
+        await db.execute(base, ("s2", "background_reflection", now, now))
+        await db.execute(base, ("s3", "background_reflection", now, now))
+        await db.execute(base, ("s4", "background_task", now, now))
+        await db.commit()
 
         svc = HealthDataService(db=db)
         snap = await svc.snapshot()
         assert snap["cc_sessions"]["foreground"]["active"] == 1
+        # 2 background_reflection + 1 background_task = 3 background
         assert snap["cc_sessions"]["background"]["active"] == 3
 
 

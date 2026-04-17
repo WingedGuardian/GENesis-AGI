@@ -67,6 +67,18 @@ async def init(rt: GenesisRuntime) -> None:
             logger.info("Surplus executor upgraded: ReflectionBasedSurplusExecutor")
 
         try:
+            from genesis.surplus.code_index import CodeIndexExecutor
+            code_index_executor = CodeIndexExecutor(db=rt._db)
+            rt._surplus_scheduler.set_code_index_executor(code_index_executor)
+            logger.info("CodeIndexExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire CodeIndexExecutor", exc_info=True)
+            await _degraded(rt, "CodeIndexExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring CodeIndexExecutor", exc_info=True)
+            await _degraded(rt, "CodeIndexExecutor")
+
+        try:
             from genesis.surplus.code_audit import CodeAuditExecutor
             if rt._router is not None:
                 code_audit_executor = CodeAuditExecutor(
@@ -106,6 +118,56 @@ async def init(rt: GenesisRuntime) -> None:
         except Exception:
             logger.error("Unexpected error wiring BookmarkEnrichmentExecutor", exc_info=True)
             await _degraded(rt, "BookmarkEnrichmentExecutor")
+
+        try:
+            from genesis.eval.surplus_executor import ModelEvalExecutor
+            model_eval_executor = ModelEvalExecutor(db=rt._db)
+            rt._surplus_scheduler.set_model_eval_executor(model_eval_executor)
+            logger.info("ModelEvalExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire ModelEvalExecutor", exc_info=True)
+            await _degraded(rt, "ModelEvalExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring ModelEvalExecutor", exc_info=True)
+            await _degraded(rt, "ModelEvalExecutor")
+
+        try:
+            from genesis.surplus.maintenance import (
+                BackupVerificationExecutor,
+                DbMaintenanceExecutor,
+                DeadLetterReplayExecutor,
+                DiskCleanupExecutor,
+            )
+            maint_kwargs: dict = {
+                "disk_cleanup": DiskCleanupExecutor(),
+                "backup_verification": BackupVerificationExecutor(),
+                "db_maintenance": DbMaintenanceExecutor(db=rt._db),
+            }
+            # DLQ replay needs both dead_letter_queue and router
+            if rt._dead_letter_queue is not None and rt._router is not None:
+                maint_kwargs["dead_letter_replay"] = DeadLetterReplayExecutor(
+                    dead_letter=rt._dead_letter_queue, router=rt._router,
+                )
+            rt._surplus_scheduler.set_maintenance_executors(**maint_kwargs)
+            logger.info("Maintenance executors wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire maintenance executors", exc_info=True)
+            await _degraded(rt, "MaintenanceExecutors")
+        except Exception:
+            logger.error("Unexpected error wiring maintenance executors", exc_info=True)
+            await _degraded(rt, "MaintenanceExecutors")
+
+        try:
+            from genesis.follow_ups.dispatcher import FollowUpDispatcher
+            follow_up_dispatcher = FollowUpDispatcher(db=rt._db, queue=queue)
+            rt._surplus_scheduler.set_follow_up_dispatcher(follow_up_dispatcher)
+            logger.info("FollowUpDispatcher wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire FollowUpDispatcher", exc_info=True)
+            await _degraded(rt, "FollowUpDispatcher")
+        except Exception:
+            logger.error("Unexpected error wiring FollowUpDispatcher", exc_info=True)
+            await _degraded(rt, "FollowUpDispatcher")
 
         try:
             from genesis.surplus.findings_bridge import FindingsBridge

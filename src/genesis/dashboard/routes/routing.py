@@ -39,12 +39,24 @@ def routing_config_read():
         cb = rt.router.breakers.get(name)
         cb_states[name] = cb.state.value if hasattr(cb, "state") else "closed"
 
-    # Read raw YAML for CC fields that may have been edited via the dashboard
+    # Read raw YAML + local overlay for CC fields edited via the dashboard.
+    # Local overlay (.local.yaml) contains user customizations that survive
+    # upstream git updates.
     yaml_cc: dict[str, dict] = {}
     config_path = Path(__file__).parent.parent.parent.parent.parent / "config" / "model_routing.yaml"
     if config_path.exists():
         try:
             raw = yaml.safe_load(config_path.read_text()) or {}
+            # Merge local overlay if present (with stale-provider sanitization)
+            from genesis.routing.config import (
+                _deep_merge,
+                _load_local_overlay,
+                _sanitize_local_overlay,
+            )
+            local_raw = _load_local_overlay(config_path)
+            if local_raw:
+                local_raw = _sanitize_local_overlay(raw, local_raw)
+                raw = _deep_merge(raw, local_raw)
             for cs_name, cs_raw in (raw.get("call_sites") or {}).items():
                 if isinstance(cs_raw, dict) and (cs_raw.get("dispatch") or cs_raw.get("cc_model")):
                     yaml_cc[cs_name] = cs_raw

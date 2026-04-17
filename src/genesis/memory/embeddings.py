@@ -208,7 +208,7 @@ class EmbeddingProvider:
         event_bus: GenesisEventBus | None = None,
         cache_dir: Path | None = _DEFAULT_CACHE_DIR,
     ) -> None:
-        self._backends = backends or self._build_default_chain()
+        self._backends = backends if backends is not None else self._build_default_chain()
         self._cache: dict[str, tuple[list[float], float]] = {}
         self._cache_ttl: float = 86400.0  # 24 hours
         self._cache_max: int = 2048

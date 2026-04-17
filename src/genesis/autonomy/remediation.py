@@ -403,5 +403,9 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
 
 def register_defaults(registry: RemediationRegistry) -> None:
     """Register all default remediation actions."""
+    from genesis.env import ollama_enabled
+
     for action in DEFAULT_REMEDIATIONS:
+        if action.name == "ollama_alert" and not ollama_enabled():
+            continue
         registry.register(action)

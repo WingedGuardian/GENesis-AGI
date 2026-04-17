@@ -23,7 +23,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.awareness.classifier import classify_depth
-from genesis.awareness.scorer import compute_scores
+from genesis.awareness.scorer import compute_scores, get_staleness_context
 from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.contingency import RATE_LIMIT_DEFERRAL_TTL_S
@@ -174,6 +174,7 @@ async def perform_tick(
         trigger_reason=trigger_reason,
         escalation_source=escalation_source,
         escalation_pending_id=escalation_pending_id,
+        signal_staleness=get_staleness_context(),
     )
 
     # 4. Store tick result
@@ -346,6 +347,7 @@ class AwarenessLoop:
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
+        self._session_observer_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
@@ -602,6 +604,18 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Sentinel fire alarm check failed", exc_info=True)
 
+            # Session observer — process pending tool observations into memories
+            if self._session_observer_fn:
+                try:
+                    obs_result = await self._session_observer_fn()
+                    if obs_result and obs_result.notes_stored > 0:
+                        logger.info(
+                            "Session observer: %d notes from %d observations",
+                            obs_result.notes_stored, obs_result.observations_read,
+                        )
+                except Exception:
+                    logger.warning("Session observer processing failed", exc_info=True)
+
         if result is None:
             return
 
@@ -637,6 +651,12 @@ class AwarenessLoop:
 
         tick_id = result.tick_id
         db = self._db
+        logger.info(
+            "Dispatch reflection: depth=%s, tick=%s, bridge=%s, engine=%s",
+            depth.value, tick_id[:8],
+            self._cc_reflection_bridge is not None,
+            self._reflection_engine is not None,
+        )
 
         if self._reflection_engine is not None and depth == Depth.MICRO:
             ref_result = None
@@ -894,6 +914,10 @@ class AwarenessLoop:
     def set_findings_ingest(self, fn) -> None:
         """Inject Guardian findings ingest for reading diagnosis results."""
         self._findings_ingest_fn = fn
+
+    def set_session_observer(self, fn) -> None:
+        """Inject session observer processor for tool activity notes."""
+        self._session_observer_fn = fn
 
     def replace_collectors(self, collectors: list) -> None:
         """Replace signal collectors (late-binding upgrade from stubs to real).

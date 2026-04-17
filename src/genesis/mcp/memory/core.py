@@ -1,4 +1,4 @@
-"""Core memory tools: recall, store, extract, proactive, core_facts, stats."""
+"""Core memory tools: recall, store, extract, proactive, core_facts, stats, expand."""
 
 from __future__ import annotations
 
@@ -26,20 +26,60 @@ async def memory_recall(
     source: str = "both",
     limit: int = 10,
     min_activation: float = 0.0,
+    compact: bool = False,
+    wing: str | None = None,
+    room: str | None = None,
+    include_graph: bool = True,
 ) -> list[dict]:
-    """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with graph enrichment."""
+    """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
+
+    Args:
+        compact: If True, return lightweight previews only (memory_id, preview,
+            score, wing, room, memory_class, source). Use memory_expand to
+            fetch full content for specific IDs. Saves tokens and ~500ms.
+        wing: Filter results to this structural domain (e.g., "infrastructure").
+        room: Filter results to this topic within a wing.
+        include_graph: If False, skip graph traversal (saves ~500ms per call).
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
+    # Over-fetch when filtering to compensate for post-retrieval filtering
+    fetch_limit = limit * 3 if (wing or room) else limit
     results = await memory_mod._retriever.recall(
-        query, source=source, limit=limit, min_activation=min_activation
+        query, source=source, limit=fetch_limit, min_activation=min_activation
     )
+
+    # Apply wing/room filters (post-retrieval — Qdrant doesn't support combined
+    # vector search + payload filter in a single recall path)
+    if wing:
+        results = [r for r in results if (r.payload.get("wing") or "") == wing]
+    if room:
+        results = [r for r in results if (r.payload.get("room") or "") == room]
+    results = results[:limit]
+
+    if compact:
+        return [
+            {
+                "memory_id": r.memory_id,
+                "preview": r.content[:150].replace("\n", " "),
+                "score": round(r.score, 3),
+                "activation": round(r.activation_score, 3),
+                "memory_class": r.memory_class,
+                "wing": r.payload.get("wing", ""),
+                "room": r.payload.get("room", ""),
+                "source": r.source,
+                "source_pipeline": r.source_pipeline or "",
+            }
+            for r in results
+        ]
+
     enriched = []
     graph_budget_ms = 500.0
     graph_elapsed_ms = 0.0
     for r in results:
         d = asdict(r)
-        if graph_elapsed_ms < graph_budget_ms:
+        if include_graph and graph_elapsed_ms < graph_budget_ms:
             try:
                 traversal = await graph_traverse(
                     memory_mod._db, r.memory_id, max_depth=2, min_strength=0.3,
@@ -61,6 +101,79 @@ async def memory_recall(
                 )
         enriched.append(d)
     return enriched
+
+
+@mcp.tool()
+async def memory_expand(
+    memory_ids: list[str],
+) -> list[dict]:
+    """Fetch full content + graph neighbors for specific memory IDs.
+
+    Use after a compact memory_recall to selectively expand interesting results.
+    Returns full RetrievalResult data with graph enrichment for each ID found.
+    """
+    memory_mod = _memory_mod()
+    memory_mod._require_init()
+    assert memory_mod._qdrant is not None and memory_mod._db is not None
+
+    # Batch retrieve all IDs in a single Qdrant call
+    try:
+        points = memory_mod._qdrant.retrieve(
+            collection_name="episodic_memory",
+            ids=memory_ids,
+            with_payload=True,
+        )
+    except Exception:
+        logger.warning("Qdrant batch retrieve failed", exc_info=True)
+        return []
+
+    found_ids = {str(p.id) for p in points}
+    not_found = [mid for mid in memory_ids if mid not in found_ids]
+
+    results = []
+    for point in points:
+        mid = str(point.id)
+        payload = point.payload or {}
+
+        d = {
+            "memory_id": mid,
+            "content": payload.get("content", ""),
+            "source": payload.get("source", ""),
+            "memory_type": payload.get("memory_type", "episodic"),
+            "memory_class": payload.get("memory_class", "fact"),
+            "wing": payload.get("wing", ""),
+            "room": payload.get("room", ""),
+            "confidence": payload.get("confidence"),
+            "tags": payload.get("tags", []),
+            "source_pipeline": payload.get("source_pipeline", ""),
+            "source_session_id": payload.get("source_session_id"),
+            "created_at": payload.get("created_at"),
+        }
+
+        # Graph enrichment
+        try:
+            traversal = await graph_traverse(
+                memory_mod._db, mid, max_depth=2, min_strength=0.3,
+            )
+            if traversal.nodes:
+                d["graph_neighbors"] = [
+                    {
+                        "memory_id": n.memory_id,
+                        "link_type": n.link_type,
+                        "depth": n.depth,
+                        "strength": n.strength,
+                    }
+                    for n in traversal.nodes[:5]
+                ]
+        except Exception:
+            logger.warning("Graph enrichment failed for %s", mid, exc_info=True)
+
+        results.append(d)
+
+    if not_found:
+        results.append({"not_found": not_found})
+
+    return results
 
 
 @mcp.tool()
@@ -138,56 +251,87 @@ async def memory_proactive(
 async def memory_core_facts(
     limit: int = 10,
 ) -> list[dict]:
-    """High-confidence items for system prompt injection."""
+    """High-confidence memories for system prompt injection.
+
+    Queries the memory store (Qdrant) for memories with confidence >= 0.7,
+    ranked by activation score. Returns compact summaries.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
-    assert memory_mod._db is not None
-    candidate_limit = limit * 3
-    facts = await memory_mod.observations.query(
-        memory_mod._db, type="learning", resolved=False, limit=candidate_limit
-    )
-    decisions = await memory_mod.observations.query(
-        memory_mod._db, type="reflection_observation", resolved=False, limit=candidate_limit
-    )
+    assert memory_mod._qdrant is not None and memory_mod._db is not None
 
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for obs in facts + decisions:
-        oid = obs["id"]
-        if oid not in seen:
-            seen.add(oid)
-            merged.append(obs)
+    # Query high-confidence memories across all wings
+    # Use a broad query to get candidates, then re-rank by activation
+    try:
+        from qdrant_client.models import FieldCondition, Filter, Range
+
+        points = memory_mod._qdrant.scroll(
+            collection_name="episodic_memory",
+            scroll_filter=Filter(must=[
+                FieldCondition(key="confidence", range=Range(gte=0.7)),
+            ]),
+            limit=limit * 3,
+            with_payload=True,
+        )[0]  # scroll returns (points, next_offset)
+    except Exception:
+        logger.warning("Qdrant scroll for core_facts failed", exc_info=True)
+        return []
 
     now_str = datetime.now(UTC).isoformat()
     scored: list[tuple[dict, float]] = []
-    for obs in merged:
-        link_count = await memory_mod.memory_links.count_links(memory_mod._db, obs["id"])
+    for point in points:
+        payload = point.payload or {}
+        mid = str(point.id)
+        link_count = await memory_mod.memory_links.count_links(memory_mod._db, mid)
         act = compute_activation(
-            confidence=0.8,
-            created_at=obs.get("created_at", now_str),
-            retrieved_count=obs.get("retrieved_count", 0),
+            confidence=payload.get("confidence", 0.7),
+            created_at=payload.get("created_at", now_str),
+            retrieved_count=payload.get("retrieved_count", 0),
             link_count=link_count,
-            source=obs.get("source", obs.get("type", "")),
+            source=payload.get("source", ""),
             now=now_str,
         )
-        scored.append((obs, act.final_score))
+        scored.append((
+            {
+                "memory_id": mid,
+                "content": payload.get("content", ""),
+                "source": payload.get("source", ""),
+                "memory_class": payload.get("memory_class", "fact"),
+                "wing": payload.get("wing", ""),
+                "room": payload.get("room", ""),
+                "confidence": payload.get("confidence"),
+                "activation_score": round(act.final_score, 3),
+            },
+            act.final_score,
+        ))
 
     scored.sort(key=lambda x: x[1], reverse=True)
-    top_items = scored[:limit]
+    top = scored[:limit]
 
-    top_ids = [item["id"] for item, _ in top_items]
-    if top_ids:
+    # Track retrieval so activation scores reflect actual usage
+    if top:
         try:
-            await memory_mod.observations.increment_retrieved_batch(memory_mod._db, top_ids)
+            for item, _ in top:
+                mid = item["memory_id"]
+                pts = memory_mod._qdrant.retrieve(
+                    collection_name="episodic_memory", ids=[mid], with_payload=True,
+                )
+                if pts:
+                    old_count = (pts[0].payload or {}).get("retrieved_count", 0)
+                    memory_mod._qdrant.set_payload(
+                        collection_name="episodic_memory",
+                        payload={"retrieved_count": old_count + 1},
+                        points=[mid],
+                    )
         except Exception:
-            logger.warning("Failed to track observation retrieval in core_facts", exc_info=True)
+            logger.debug("Failed to update retrieved_count for core_facts", exc_info=True)
 
-    return [item for item, _ in top_items]
+    return [item for item, _ in top]
 
 
 @mcp.tool()
 async def memory_stats() -> dict:
-    """Health and capacity metrics."""
+    """Health, capacity, and structural metrics for the memory system."""
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -212,11 +356,38 @@ async def memory_stats() -> dict:
     total_links_row = await total_links_cursor.fetchone()
     total_links = total_links_row[0] if total_links_row else 0
 
+    # Structural data from memory_health snapshot queries
+    wings = []
+    classes = []
+    extraction = {}
+    code_index = {}
+    ek_info = {}
+    try:
+        from genesis.observability.snapshots.memory_health import (
+            _class_distribution,
+            _code_index_stats,
+            _essential_knowledge_stats,
+            _extraction_coverage,
+            _wing_distribution,
+        )
+        wings = await _wing_distribution(memory_mod._db)
+        classes = await _class_distribution(memory_mod._db)
+        extraction = await _extraction_coverage(memory_mod._db)
+        code_index = await _code_index_stats(memory_mod._db)
+        ek_info = _essential_knowledge_stats()
+    except Exception:
+        logger.debug("Structural stats unavailable", exc_info=True)
+
     return {
         "episodic_count": episodic_info.get("points_count", 0) if episodic_info else None,
         "knowledge_count": knowledge_info.get("points_count", 0) if knowledge_info else None,
         "pending_deltas": len(pending_deltas),
         "total_links": total_links,
+        "wings": wings,
+        "classes": classes,
+        "extraction": extraction,
+        "code_index": code_index,
+        "essential_knowledge": ek_info,
     }
 
 

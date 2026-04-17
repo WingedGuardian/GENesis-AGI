@@ -1,0 +1,160 @@
+# Golden dataset: triage depth classification
+# Source: TRIAGE_CALIBRATION.md (8 examples) + supplemental cases
+#
+# Task: Given a scenario description, classify the triage depth (0-4).
+# Scorer: exact_match on the depth number.
+#
+# Depth scale:
+#   0 = SKIP (trivial, no learning value)
+#   1 = QUICK_NOTE (simple mechanical task)
+#   2 = WORTH_THINKING (exploration, multiple steps, no obstacles)
+#   3 = FULL_ANALYSIS (multi-step with iteration/debugging)
+#   4 = FULL_PLUS_WORKAROUND (complex with obstacles, workarounds)
+
+metadata:
+  name: triage_depth_classification
+  description: Classify interaction scenarios into triage depth levels 0-4
+  category: classification
+  default_scorer: exact_match
+  version: "1.0"
+  source: TRIAGE_CALIBRATION.md + supplemental
+
+cases:
+  # -- From TRIAGE_CALIBRATION.md --
+
+  - id: cal_01
+    description: "Trivial factual response"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks 'what time is it?' — Genesis responds with the current time.
+    expected: "0"
+
+  - id: cal_02
+    description: "Simple mechanical task"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to rename a variable across a file. Genesis uses a single Edit tool and succeeds.
+    expected: "1"
+
+  - id: cal_03
+    description: "Exploration with gaps"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to explain a module's architecture. Genesis reads several files and produces a summary, but the summary lacks depth and misses key components. The response includes a light analysis of gaps for future improvements.
+    expected: "2"
+
+  - id: cal_04
+    description: "Workflow analysis and permission change"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: The interaction involves a proposal for actionable tasks and a permission change. It requires analysis to understand the proposed workflows and the impact of the permission change, involving multi-step reasoning about workflow analysis and permission impact assessment.
+    expected: "3"
+
+  - id: cal_05
+    description: "Complex diagnostic with gap identification"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: This interaction involves a multi-step diagnostic analysis of a system's current state and the identification of gaps that need to be addressed for full functionality. The response outlines key components and areas needing improvement, with detailed outcome analysis and reusable insights.
+    expected: "4"
+
+  - id: cal_06
+    description: "Multi-step implementation with execution options"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: Multi-step implementation of a plan to fix gaps involves clear outcomes and diagnostic steps. The response provides a detailed multi-step solution with analysis of execution options, obstacles encountered, and workarounds applied.
+    expected: "4"
+
+  - id: cal_07
+    description: "Hooks structure analysis with workarounds"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: The interaction involves a multi-step outcome analysis of the current hooks structure and gaps. It includes identifying the issues (hardcoded paths for scripts and servers) and their status. The response highlights potential problems that need further investigation and proposes workarounds.
+    expected: "4"
+
+  - id: cal_08
+    description: "Social exchange"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User says 'thanks' — Genesis acknowledges.
+    expected: "0"
+
+  # -- Supplemental cases --
+
+  - id: sup_01
+    description: "Simple file read"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to read a config file and show its contents. Genesis reads the file and displays it.
+    expected: "1"
+
+  - id: sup_02
+    description: "Bug fix with iteration"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User reports a failing test. Genesis reads the test, identifies the assertion error, traces back to the source function, finds a missing null check, applies a fix, re-runs the test, and confirms it passes. Two iterations were needed — the first fix addressed the wrong branch.
+    expected: "3"
+
+  - id: sup_03
+    description: "Greeting"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User says 'good morning'. Genesis responds with a greeting.
+    expected: "0"
+
+  - id: sup_04
+    description: "Multi-file refactor with test updates"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to refactor a data pipeline from synchronous to async. Genesis modifies 6 files, updates 4 test files, encounters a race condition in the test suite, adds proper synchronization, and documents the migration pattern for future similar refactors.
+    expected: "4"
+
+  - id: sup_05
+    description: "Config change"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to change the log level from INFO to DEBUG in the config file. Genesis edits the single config entry.
+    expected: "1"
+
+  - id: sup_06
+    description: "Research and comparison"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User asks Genesis to research three different caching libraries and compare them for their use case. Genesis reads documentation, analyzes API differences, considers the project's constraints, and produces a comparison table with a recommendation.
+    expected: "2"
+
+  - id: sup_07
+    description: "Database debugging with workaround"
+    input: |
+      Classify the triage depth (0-4) for this interaction scenario.
+      Reply with ONLY the depth number.
+
+      Scenario: User reports slow database queries. Genesis profiles the queries, identifies missing indexes, discovers a table lock contention issue, applies indexes, works around the lock issue by restructuring a batch operation, and verifies query times improved from 3s to 50ms.
+    expected: "4"
