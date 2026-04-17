@@ -50,6 +50,14 @@ SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
 
+# Source secrets for backup passphrase (cron doesn't inherit shell env)
+if [ -f "$SECRETS_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+    set +a
+fi
+
 log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
 die() { log "FATAL: $*"; exit 1; }
@@ -279,5 +287,9 @@ else
     log "Backup committed and pushed"
 fi
 
-_SUCCESS=true
-log "Backup complete"
+if [ "$_SQLITE_LINES" -gt 0 ]; then
+    _SUCCESS=true
+else
+    log "WARNING: No SQLite data backed up — marking as failure"
+fi
+log "Backup complete (success=$_SUCCESS)"

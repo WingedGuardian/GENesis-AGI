@@ -78,7 +78,10 @@ def file_list():
     raw_path = request.args.get("path", str(_HOME / "genesis"))
     target = Path(raw_path).resolve()
 
-    if not _is_allowed(target):
+    # Allow listing the home directory for navigation between roots,
+    # but do NOT add _HOME to _ALLOWED_ROOTS (that would expose ~/.ssh etc.
+    # to read/write/delete endpoints). Only file_list gets this exception.
+    if target != _HOME.resolve() and not _is_allowed(target):
         return jsonify({"error": "Path not allowed"}), 403
 
     if not target.is_dir():
@@ -91,7 +94,7 @@ def file_list():
 
     items = []
     for entry in entries:
-        # Skip hidden files in top-level listing for cleanliness
+        # Skip hidden files except known safe directories
         if entry.name.startswith(".") and entry.name not in (".claude", ".genesis"):
             continue
         if entry.name.lower() in _BLOCKED_NAMES:
@@ -100,7 +103,7 @@ def file_list():
 
     return jsonify({
         "path": str(target),
-        "parent": str(target.parent) if target != target.parent else None,
+        "parent": str(target.parent) if target != target.parent and target.resolve() != _HOME.resolve() else None,
         "entries": items,
     })
 
