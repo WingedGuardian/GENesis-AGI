@@ -2,11 +2,10 @@
 
 The SessionStart hook (scripts/genesis_session_context.py) runs as a
 lightweight Python script with no DB access. It reads
-~/.genesis/session_config.json to display the current model/effort in the
+~/.genesis/session_config.json to display the current effort level in the
 session header. This module keeps that cache file in sync.
 
 Call sites:
-  - SessionManager.get_or_create_foreground() — writes defaults on new session
   - session_set_model / session_set_effort MCP tools — writes on explicit change
 """
 

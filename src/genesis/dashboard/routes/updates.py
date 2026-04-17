@@ -694,7 +694,7 @@ def update_progress():
     failed = (
         not in_progress
         and summary is not None
-        and "success" not in summary.lower()
+        and not summary.lower().startswith("success")
     )
 
     stale = False
