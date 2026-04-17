@@ -116,6 +116,67 @@ def _format_observations_json(observations: list[dict], *, max_count: int = _OBS
     ], indent=2)
 
 
+# Source category mapping — mirrors perception/context.py categories.
+# Acceptable duplication (10 lines) to avoid cross-module coupling.
+_SOURCE_CATEGORIES: dict[str, str] = {
+    "sentinel": "Sentinel", "sentinel_dispatch": "Sentinel",
+    "guardian": "Guardian", "guardian_watchdog": "Guardian",
+    "recon": "Recon", "recon_pipeline": "Recon", "recon_mcp": "Recon",
+    "surplus_promotion": "Surplus", "surplus": "Surplus",
+    "reflection": "Reflections", "light_reflection": "Reflections",
+    "deep_reflection": "Reflections", "cc_reflection_deep": "Reflections",
+    "cc_reflection_light": "Reflections", "cc_reflection_strategic": "Reflections",
+    "strategic_reflection": "Reflections",
+    "conversation": "Conversation", "conversation_intent": "Conversation",
+    "conversation_analysis": "Conversation", "conversation_followup": "Conversation",
+    "inbox_evaluation": "Inbox",
+}
+_CATEGORY_ORDER = [
+    "Sentinel", "Guardian", "Recon", "Reflections",
+    "Surplus", "Conversation", "Inbox", "Other",
+]
+
+
+def _format_observations_grouped(
+    observations: list[dict],
+    *,
+    max_count: int = _OBS_MAX_COUNT,
+) -> str:
+    """Format observations grouped by source subsystem with citation anchors.
+
+    Replaces flat JSON rendering for Deep/Strategic prompts with structured
+    markdown that makes subsystem provenance clear at a glance.
+    """
+    obs = observations[:max_count]
+    if not obs:
+        return ""
+
+    per_item = max(_OBS_MIN_PER_ITEM, _OBS_TOTAL_CHAR_BUDGET // len(obs))
+
+    # Group by category
+    groups: dict[str, list[dict]] = {}
+    for o in obs:
+        cat = _SOURCE_CATEGORIES.get(o.get("source", ""), "Other")
+        groups.setdefault(cat, []).append(o)
+
+    lines: list[str] = []
+    for cat in _CATEGORY_ORDER:
+        if cat not in groups:
+            continue
+        lines.append(f"### {cat}")
+        for o in groups[cat]:
+            oid = o.get("id", "?")
+            short_id = oid[:8] if len(oid) > 8 else oid
+            priority = o.get("priority", "?")
+            obs_type = o.get("type", "?")
+            content = o.get("content", "")[:per_item]
+            created = o.get("created_at", "?")
+            lines.append(f"- [#{short_id}] [{priority}] {obs_type} ({created}): {content}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # ── Data pointers ────────────────────────────────────────────────────
 
 
@@ -244,8 +305,8 @@ async def build_strategic_prompt_enriched(
     ]
 
     if bundle.recent_observations:
-        obs_summary = _format_observations_json(bundle.recent_observations)
-        parts.append(f"\n## Recent Observations\n```json\n{obs_summary}\n```")
+        obs_summary = _format_observations_grouped(bundle.recent_observations)
+        parts.append(f"\n## Recent Observations\n{obs_summary}")
 
     cost = bundle.cost_summary
     parts.append(
@@ -301,8 +362,8 @@ async def build_enriched_prompt(
         parts.append("\n## Active Jobs\n" + ", ".join(j.value for j in jobs))
 
     if bundle.recent_observations and bundle.pending_work.memory_consolidation:
-        obs_summary = _format_observations_json(bundle.recent_observations)
-        parts.append(f"\n## Recent Observations (for consolidation)\n```json\n{obs_summary}\n```")
+        obs_summary = _format_observations_grouped(bundle.recent_observations)
+        parts.append(f"\n## Recent Observations (for consolidation)\n{obs_summary}")
 
     if bundle.surplus_staging_items:
         _surplus_limit = max(200, _OBS_TOTAL_CHAR_BUDGET // max(len(bundle.surplus_staging_items), 1))

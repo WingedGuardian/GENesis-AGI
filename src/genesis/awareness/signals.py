@@ -129,6 +129,51 @@ class BudgetCollector:
         return _bootstrap_placeholder_reading(self.signal_name, "health_mcp")
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.light_cascade.LightCascadeCollector.
+class LightCascadeCollector:
+    signal_name = "light_count_since_deep"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "awareness_loop")
+
+
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.sentinel_activity.SentinelActivityCollector.
+class SentinelActivityCollector:
+    signal_name = "sentinel_activity"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "sentinel")
+
+
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.guardian_activity.GuardianActivityCollector.
+class GuardianActivityCollector:
+    signal_name = "guardian_activity"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "guardian")
+
+
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.surplus_activity.SurplusActivityCollector.
+class SurplusActivityCollector:
+    signal_name = "surplus_activity"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "surplus")
+
+
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.autonomy_activity.AutonomyActivityCollector.
+class AutonomyActivityCollector:
+    signal_name = "autonomy_activity"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "autonomy")
+
+
 class ErrorSpikeCollector:
     signal_name = "software_error_spike"
 

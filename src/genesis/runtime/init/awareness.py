@@ -16,15 +16,20 @@ async def init(rt: GenesisRuntime) -> None:
     try:
         from genesis.awareness.loop import AwarenessLoop
         from genesis.awareness.signals import (
+            AutonomyActivityCollector,
             BudgetCollector,
             ContainerMemoryCollector,
             ConversationCollector,
             CriticalFailureCollector,
             ErrorSpikeCollector,
+            GuardianActivityCollector,
             JobHealthCollector,
+            LightCascadeCollector,
             OutreachEngagementCollector,
             ReconFindingsCollector,
+            SentinelActivityCollector,
             StrategicTimerCollector,
+            SurplusActivityCollector,
             TaskQualityCollector,
         )
 
@@ -39,6 +44,11 @@ async def init(rt: GenesisRuntime) -> None:
             StrategicTimerCollector(),
             ContainerMemoryCollector(),
             JobHealthCollector(runtime=rt),
+            LightCascadeCollector(),
+            SentinelActivityCollector(),
+            GuardianActivityCollector(),
+            SurplusActivityCollector(),
+            AutonomyActivityCollector(),
         ]
 
         rt._awareness_loop = AwarenessLoop(

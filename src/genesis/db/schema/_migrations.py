@@ -621,6 +621,31 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "WHERE depth_name = 'Light' AND floor_seconds = 21600"
     )
 
+    # 2026-04-17: Signal redistribution — cc_version_changed to Micro-only.
+    # (critical_failure and software_error_spike already migrated above.)
+    await db.execute(
+        "UPDATE signal_weights SET feeds_depths = '[\"Micro\"]', "
+        "current_weight = 0.50, initial_weight = 0.50 "
+        "WHERE signal_name = 'cc_version_changed'"
+    )
+
+    # 2026-04-17: New signals — cascade bridge + subsystem activity + ghost activation.
+    # INSERT OR IGNORE so re-running is idempotent.
+    _new_signals = [
+        ("light_count_since_deep", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Deep"]'),
+        ("sentinel_activity", "sentinel", 0.60, 0.60, 0.0, 1.0, '["Micro"]'),
+        ("guardian_activity", "guardian", 0.50, 0.50, 0.0, 1.0, '["Micro"]'),
+        ("surplus_activity", "surplus", 0.45, 0.45, 0.0, 1.0, '["Micro"]'),
+        ("autonomy_activity", "autonomy", 0.60, 0.60, 0.0, 1.0, '["Micro"]'),
+        ("stale_pending_items", "cognitive_state", 0.35, 0.35, 0.0, 1.0, '["Micro"]'),
+    ]
+    for row in _new_signals:
+        await db.execute(
+            "INSERT OR IGNORE INTO signal_weights "
+            "(signal_name, source_mcp, current_weight, initial_weight, min_weight, max_weight, feeds_depths) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            row,
+        )
 
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories

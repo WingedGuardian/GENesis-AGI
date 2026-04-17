@@ -1019,11 +1019,22 @@ SIGNAL_WEIGHTS_SEED = [
     # Signal collectors and cognitive-state flag removed in the same sweep.
     # Existing rows cleaned up by _migrate_add_columns() on next boot.
     ("budget_pct_consumed", "health_mcp", 0.40, 0.40, 0.0, 1.0, '["Light","Deep"]'),
-    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro","Light"]'),
-    ("critical_failure", "health_mcp", 0.90, 0.90, 0.0, 1.0, '["Light"]'),
+    # 2026-04-17: health delta signals moved to Micro-only — they matter when
+    # they flip state, not as persistent conditions driving Light reflections.
+    ("software_error_spike", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
+    ("critical_failure", "health_mcp", 0.70, 0.70, 0.0, 1.0, '["Micro"]'),
     ("time_since_last_strategic", "clock", 0.50, 0.50, 0.0, 1.0, '["Strategic"]'),
     ("micro_count_since_light", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Light"]'),
-    ("cc_version_changed", "awareness_loop", 0.60, 0.60, 0.0, 1.0, '["Light"]'),
+    ("cc_version_changed", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Micro"]'),
+    # 2026-04-17: cascade bridge — Light accumulation triggers Deep
+    ("light_count_since_deep", "awareness_loop", 0.50, 0.50, 0.0, 1.0, '["Deep"]'),
+    # 2026-04-17: subsystem activity signals — Micro delta detection
+    ("sentinel_activity", "sentinel", 0.60, 0.60, 0.0, 1.0, '["Micro"]'),
+    ("guardian_activity", "guardian", 0.50, 0.50, 0.0, 1.0, '["Micro"]'),
+    ("surplus_activity", "surplus", 0.45, 0.45, 0.0, 1.0, '["Micro"]'),
+    ("autonomy_activity", "autonomy", 0.60, 0.60, 0.0, 1.0, '["Micro"]'),
+    # 2026-04-17: ghost signal activation — collector already exists, just needs weight
+    ("stale_pending_items", "cognitive_state", 0.35, 0.35, 0.0, 1.0, '["Micro"]'),
 ]
 
 DEPTH_THRESHOLDS_SEED = [
