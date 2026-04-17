@@ -15,7 +15,8 @@ STALE_THRESHOLD_DAYS = 3
 class PendingItemCollector:
     """Reads cognitive state pending actions, returns stale-item urgency signal.
 
-    Signal value: 0.0 = no stale items, 1.0 = items pending > 7 days.
+    Signal value: 1.0 = missing/error state (triggers deep reflection to generate it),
+    0.0 = no stale items, up to 1.0 = items pending > 7 days.
     Intermediate: linear interpolation between 3-day and 7-day thresholds.
     """
 
@@ -33,10 +34,10 @@ class PendingItemCollector:
             )
             row = await cursor.fetchone()
         except Exception:
-            return self._reading(0.0, "db_error")
+            return self._reading(1.0, "db_error")
 
         if not row:
-            return self._reading(0.0, "no_cognitive_state")
+            return self._reading(1.0, "no_cognitive_state")
 
         content, created_at_str = row
         try:
@@ -44,7 +45,7 @@ class PendingItemCollector:
             if created_at.tzinfo is None:
                 created_at = created_at.replace(tzinfo=UTC)
         except (ValueError, TypeError):
-            return self._reading(0.0, "bad_timestamp")
+            return self._reading(1.0, "bad_timestamp")
 
         age = now - created_at
         age_days = age.total_seconds() / 86400

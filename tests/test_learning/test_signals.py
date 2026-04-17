@@ -295,11 +295,11 @@ class TestPendingItemCollector:
         )
         await db.commit()
 
-    async def test_no_state_returns_zero(self, db):
+    async def test_no_state_returns_high_urgency(self, db):
         from genesis.learning.signals.pending_items import PendingItemCollector
         r = await PendingItemCollector(db).collect()
         assert r.name == "stale_pending_items"
-        assert r.value == 0.0
+        assert r.value == 1.0
 
     async def test_recent_items_return_zero(self, db):
         from genesis.learning.signals.pending_items import PendingItemCollector
