@@ -58,11 +58,17 @@ async def test_insert_with_all_fields(db):
         confidence=0.92,
         source_date="2026-01-15",
         embedding_model="qwen3-embedding:0.6b",
+        source_pipeline="curated",
+        purpose='["resume-prep"]',
+        ingestion_source="/home/user/docs/course.pdf",
     )
     row = await knowledge.get(db, uid)
     assert row["source_platform"] == "thinkific"
     assert row["confidence"] == 0.92
     assert '"ml"' in row["tags"]
+    assert row["source_pipeline"] == "curated"
+    assert row["purpose"] == '["resume-prep"]'
+    assert row["ingestion_source"] == "/home/user/docs/course.pdf"
 
 
 # ─── knowledge.search_fts ────────────────────────────────────────────────────
@@ -111,6 +117,17 @@ async def test_fts_search_with_domain_filter(db):
     assert all(r["domain"] == "gcp" for r in results)
 
 
+async def test_fts_search_returns_source_pipeline(db):
+    await knowledge.insert(
+        db, project_type="cloud", domain="aws", source_doc="m1",
+        concept="VPC", body="Virtual Private Cloud for network isolation",
+        source_pipeline="curated",
+    )
+    results = await knowledge.search_fts(db, "network isolation")
+    assert len(results) >= 1
+    assert results[0]["source_pipeline"] == "curated"
+
+
 # ─── knowledge.stats ─────────────────────────────────────────────────────────
 
 
@@ -123,11 +140,11 @@ async def test_stats_empty(db):
 async def test_stats_with_data(db):
     await knowledge.insert(
         db, project_type="cloud", domain="aws", source_doc="m1",
-        concept="VPC", body="vpc",
+        concept="VPC", body="vpc", source_pipeline="curated",
     )
     await knowledge.insert(
         db, project_type="cloud", domain="gcp", source_doc="m2",
-        concept="GKE", body="gke",
+        concept="GKE", body="gke", source_pipeline="recon",
     )
     await knowledge.insert(
         db, project_type="cloud", domain="aws", source_doc="m3",
@@ -138,6 +155,9 @@ async def test_stats_with_data(db):
     assert s["total"] == 3
     assert s["by_domain"]["aws"] == 2
     assert s["by_domain"]["gcp"] == 1
+    assert s["by_tier"]["curated"] == 1
+    assert s["by_tier"]["recon"] == 1
+    assert s["by_tier"]["unknown"] == 1
 
 
 async def test_stats_filtered_by_project(db):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -15,6 +16,28 @@ def _memory_mod():
     return memory_mod
 
 logger = logging.getLogger(__name__)
+
+# Authority tier multipliers for retrieval ranking.
+# Curated (user-directed) content outranks auto-discovered recon noise.
+_AUTHORITY_BOOST: dict[str, float] = {
+    "curated": 1.5,
+    "conversation": 1.0,
+    "recon": 0.5,
+}
+
+
+def _apply_authority_boost(merged: list[dict]) -> list[dict]:
+    """Apply authority-tier score multiplier and sort by boosted score."""
+    for item in merged:
+        pipeline = item.get("source_pipeline") or ""
+        boost = 1.0
+        for tier, multiplier in _AUTHORITY_BOOST.items():
+            if tier in pipeline:
+                boost = multiplier
+                break
+        item["score"] = item.get("score", 0.0) * boost
+    merged.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return merged
 
 
 @mcp.tool()
@@ -51,6 +74,7 @@ async def knowledge_recall(
             "source": r.source,
             "score": r.score,
             "origin": "vector",
+            "source_pipeline": r.source_pipeline,
         })
 
     for fts_row in fts_results:
@@ -65,9 +89,10 @@ async def knowledge_recall(
                 "project_type": fts_row.get("project_type", ""),
                 "score": 0.0,
                 "origin": "fts",
+                "source_pipeline": fts_row.get("source_pipeline"),
             })
 
-    return merged[:limit]
+    return _apply_authority_boost(merged)[:limit]
 
 
 @mcp.tool()
@@ -77,8 +102,20 @@ async def knowledge_ingest(
     domain: str,
     authority: str = "unknown",
     provenance: dict | None = None,
+    purpose: list[str] | None = None,
+    ingestion_source: str | None = None,
 ) -> str:
-    """Store distilled knowledge unit with provenance. Returns unit ID."""
+    """Store distilled knowledge unit with provenance. Returns unit ID.
+
+    Args:
+        content: The knowledge content to store.
+        project: Project classification (e.g., "professional", "cloud-eng").
+        domain: Knowledge domain (e.g., "aws", "resume-advice").
+        authority: Authority level (e.g., "curated", "unknown").
+        provenance: Optional dict with source_doc, source_pipeline, platform, etc.
+        purpose: Optional list of purpose tags (e.g., ["resume-prep", "cloud-eng"]).
+        ingestion_source: Original file path or URL for full provenance tracking.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._store is not None
@@ -103,6 +140,7 @@ async def knowledge_ingest(
         source_pipeline=source_pipeline_val,
     )
 
+    purpose_json = json.dumps(purpose) if purpose else None
     embedding_model = getattr(memory_mod._store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
     await memory_mod.knowledge.insert(
         memory_mod._db,
@@ -120,9 +158,13 @@ async def knowledge_ingest(
         section_title=provenance.get("section_title") if provenance else None,
         source_date=provenance.get("source_date") if provenance else None,
         embedding_model=embedding_model,
+        source_pipeline=source_pipeline_val,
+        purpose=purpose_json,
+        ingestion_source=ingestion_source,
     )
 
-    logger.info("Knowledge unit ingested: %s (project=%s, domain=%s)", unit_id, project, domain)
+    logger.info("Knowledge unit ingested: %s (project=%s, domain=%s, pipeline=%s)",
+                unit_id, project, domain, source_pipeline_val)
     return unit_id
 
 
@@ -130,7 +172,7 @@ async def knowledge_ingest(
 async def knowledge_status(
     project: str | None = None,
 ) -> dict:
-    """Collection stats, staleness report, project index."""
+    """Collection stats, staleness report, project index with tier breakdown."""
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
@@ -149,5 +191,6 @@ async def knowledge_status(
         "oldest_ingested": db_stats["oldest_ingested"],
         "newest_ingested": db_stats["newest_ingested"],
         "by_domain": db_stats["by_domain"],
+        "by_tier": db_stats.get("by_tier", {}),
         "qdrant_vectors": qdrant_info.get("points_count", 0) if qdrant_info else None,
     }

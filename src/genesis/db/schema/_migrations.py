@@ -622,6 +622,17 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     )
 
 
+    # Knowledge pipeline: source_pipeline, purpose, ingestion_source
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN source_pipeline TEXT",
+        "knowledge_units.source_pipeline")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN purpose TEXT",
+        "knowledge_units.purpose")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_units ADD COLUMN ingestion_source TEXT",
+        "knowledge_units.ingestion_source")
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

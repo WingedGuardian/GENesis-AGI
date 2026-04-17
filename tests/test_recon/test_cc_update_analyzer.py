@@ -37,7 +37,9 @@ async def db():
             "  concept TEXT, body TEXT, relationships TEXT,"
             "  caveats TEXT, tags TEXT, confidence REAL,"
             "  source_date TEXT, ingested_at TEXT,"
-            "  qdrant_id TEXT, embedding_model TEXT"
+            "  qdrant_id TEXT, embedding_model TEXT,"
+            "  retrieved_count INTEGER NOT NULL DEFAULT 0,"
+            "  source_pipeline TEXT, purpose TEXT, ingestion_source TEXT"
             ")"
         )
         await conn.execute(

@@ -604,7 +604,10 @@ TABLES = {
             ingested_at      TEXT NOT NULL,
             qdrant_id        TEXT,
             embedding_model  TEXT,
-            retrieved_count  INTEGER NOT NULL DEFAULT 0
+            retrieved_count  INTEGER NOT NULL DEFAULT 0,
+            source_pipeline  TEXT,
+            purpose          TEXT,
+            ingestion_source TEXT
         )
     """,
     "evolution_proposals": """
