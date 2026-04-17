@@ -36,6 +36,21 @@ def _git(*args: str, timeout: int = 10) -> str | None:
         return None
 
 
+def _git_result(*args: str, timeout: int = 10) -> tuple[str | None, str]:
+    """Like _git but also returns stderr for error diagnostics."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(_GENESIS_ROOT), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        stdout = result.stdout.strip() if result.returncode == 0 else None
+        return stdout, result.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return None, "git command timed out"
+    except OSError as exc:
+        return None, str(exc)
+
+
 def _query_db(sql: str, params: tuple = ()) -> list[dict]:
     """Run a read-only query against genesis.db. Returns list of row dicts."""
     if not _DB_PATH.is_file():
@@ -117,9 +132,15 @@ def update_status():
 @blueprint.route("/api/genesis/updates/check", methods=["POST"])
 def update_check():
     """Force an upstream check (git fetch + tag comparison)."""
-    # Fetch with tags so we can compare release versions
-    if _git("fetch", "origin", "main", "--tags", timeout=30) is None:
-        return jsonify({"error": "git fetch failed"}), 502
+    # Fetch branch first (must succeed), then force-update tags separately
+    # (tag conflicts from history rewrites should not block the check).
+    branch_out, branch_err = _git_result("fetch", "origin", "main", timeout=30)
+    if branch_out is None:
+        return jsonify({"error": f"git fetch failed: {branch_err}"}), 502
+
+    # Best-effort tag sync — force to handle rewritten history
+    if _git("fetch", "origin", "--tags", "--force", timeout=15) is None:
+        logger.warning("Tag fetch failed (non-fatal): tags may be stale")
 
     # Compare release tags (robust against squash-merge divergence)
     local_tag = _git("describe", "--tags", "--match", "v*", "--abbrev=0", "HEAD")
