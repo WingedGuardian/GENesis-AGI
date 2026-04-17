@@ -48,10 +48,10 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         for topic in sessions[:5]:
             parts.append(f"- {topic}")
 
-    # Recent decisions: observations of type 'decision' from last 7 days
+    # Key insights: meaningful observations from last 7 days
     decisions = await _recent_decisions(db, days=7)
     if decisions:
-        parts.append("\n### Recent Decisions (7d)")
+        parts.append("\n### Key Insights (7d)")
         for decision in decisions[:5]:
             parts.append(f"- {decision}")
 
@@ -121,24 +121,46 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
             (f"-{days} days",),
         )
         rows = await cursor.fetchall()
-        return [row[0][:100] for row in rows if row[0]]
+        return [row[0][:200] for row in rows if row[0]]
     except Exception:
         return []
 
 
 async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str]:
-    """Get recent decision observations."""
+    """Get recent meaningful observations (exclusion-based to capture future types)."""
+    # Exclude noisy/mechanical types; everything else surfaces.
+    _EXCLUDED_TYPES = (
+        "awareness_tick",
+        "genesis_version_change",
+        "cc_version_available",
+        "cc_version_baseline",
+        "genesis_update_available",
+        "genesis_version_baseline",
+        "genesis_update_failed",
+        "light_escalation_pending",
+        "light_escalation_resolved",
+        "memory_index",
+        "bugfix_committed",
+        "light_reflection",
+        "micro_reflection",
+        "reflection_output",
+        "user_model_delta",
+        "memory_operation_executed",
+        "memory_operation",
+        "cc_memory_file",
+    )
+    placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
         cursor = await db.execute(
             "SELECT content FROM observations "
-            "WHERE type IN ('decision', 'architecture_gap', 'learning') "
+            f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             "AND created_at > datetime('now', ?) "
             "ORDER BY created_at DESC LIMIT 10",
-            (f"-{days} days",),
+            (*_EXCLUDED_TYPES, f"-{days} days"),
         )
         rows = await cursor.fetchall()
-        return [row[0][:120] for row in rows if row[0]]
+        return [row[0][:250] for row in rows if row[0]]
     except Exception:
         return []
 
