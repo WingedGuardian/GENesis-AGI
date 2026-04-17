@@ -130,6 +130,9 @@ async def upsert(
     ingested_at: str | None = None,
     qdrant_id: str | None = None,
     embedding_model: str | None = None,
+    source_pipeline: str | None = None,
+    purpose: str | None = None,
+    ingestion_source: str | None = None,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
 
@@ -164,8 +167,9 @@ async def upsert(
         """INSERT INTO knowledge_units
            (id, project_type, domain, source_doc, source_platform, section_title,
             concept, body, relationships, caveats, tags, confidence,
-            source_date, ingested_at, qdrant_id, embedding_model)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            source_date, ingested_at, qdrant_id, embedding_model,
+            source_pipeline, purpose, ingestion_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(project_type, domain, concept) DO UPDATE SET
                source_doc      = excluded.source_doc,
                source_platform = excluded.source_platform,
@@ -178,10 +182,14 @@ async def upsert(
                source_date     = excluded.source_date,
                ingested_at     = excluded.ingested_at,
                qdrant_id       = excluded.qdrant_id,
-               embedding_model = excluded.embedding_model""",
+               embedding_model = excluded.embedding_model,
+               source_pipeline = excluded.source_pipeline,
+               purpose         = excluded.purpose,
+               ingestion_source = excluded.ingestion_source""",
         (unit_id, project_type, domain, source_doc, source_platform, section_title,
          concept, body, relationships, caveats, tags, confidence,
-         source_date, now_iso, qdrant_id, embedding_model),
+         source_date, now_iso, qdrant_id, embedding_model,
+         source_pipeline, purpose, ingestion_source),
     )
 
     # Find the row that actually lives in the table — either the one we
