@@ -79,6 +79,16 @@ async def list_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[dic
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def count_pending(db: aiosqlite.Connection) -> int:
+    """Return the total number of pending surplus insights."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM surplus_insights WHERE promotion_status = 'pending' "
+        "AND confidence > 0.0",
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
 async def promote(db: aiosqlite.Connection, id: str, *, promoted_to: str) -> bool:
     cursor = await db.execute(
         "UPDATE surplus_insights SET promotion_status = 'promoted', promoted_to = ? WHERE id = ?",

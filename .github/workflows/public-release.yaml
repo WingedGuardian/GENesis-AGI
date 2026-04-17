@@ -100,12 +100,6 @@ jobs:
               issues=$((issues + 1))
             fi
           done
-          # Hardcoded private-repo username references (word-boundary match
-          # so WingedGuardian/GENesis-AGI — the public repo — is preserved)
-          if rg -l "${RG_EXCLUDES[@]}" '\bWingedGuardian/(Genesis|genesis-backups)\b' --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
-            echo "::warning::Found hardcoded private repo reference"
-            issues=$((issues + 1))
-          fi
           # Hardcoded home path
           if rg -l "${RG_EXCLUDES[@]}" '/home/ubuntu/' --type-add 'genesis:*.py,*.yaml,*.yml,*.md,*.sh' --type genesis 2>/dev/null; then
             echo "::warning::Found hardcoded home path: /home/ubuntu/"

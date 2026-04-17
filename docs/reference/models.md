@@ -590,6 +590,54 @@ High for adversarial review (#20) — without changing application code.
 
 ---
 
+## Effort Level Assignments
+
+### Current State (as of 2026-04-12)
+
+Effort levels are set **per-invocation** in code, not per-call-site in routing config.
+
+| Dispatch Context | Model | Effort | Set In |
+|-----------------|-------|--------|--------|
+| Light reflection | Haiku | LOW | `reflection_bridge._effort_for_context()` |
+| Deep reflection | Sonnet | HIGH | `reflection_bridge._effort_for_context()` |
+| Strategic reflection | Opus | MAX | `reflection_bridge._effort_for_context()` |
+| Task execution | Sonnet | MEDIUM | `session_config.build_task_config()` |
+| Surplus compute | Sonnet | MEDIUM | `session_config.build_surplus_config()` |
+| Foreground (user) | User's choice | User's choice | `/model` command or MCP |
+
+### Research-Based Assessment
+
+Per SWE-bench data and community analysis (April 2026):
+- **Medium** is optimal for 80-90% of agentic coding (15-20% improvement over no-thinking)
+- **High/Max** shows diminishing returns except for cross-file refactoring and logical debugging
+- On simple tasks, High effort over-analyzes and over-engineers
+
+### Observations
+
+- **Deep reflection at HIGH seems correct** — reflections are multi-file analysis
+- **Task execution at MEDIUM seems correct** — most tasks are standard coding
+- **Surplus at MEDIUM seems correct** — brainstorms don't benefit from deep reasoning
+- **Light reflection at LOW seems correct** — just signal classification
+- **Strategic at MAX may be overkill** — only Opus already has high baseline logic; MAX adds nuance but at significant cost/latency. Worth testing HIGH instead.
+
+### Quick Wins (Code Changes Only)
+
+1. Test strategic reflections at HIGH instead of MAX — change one line in `_effort_for_context()`
+2. Consider MEDIUM for some deep reflections that are routine (e.g., daily memory flush)
+
+### V4 Path: Per-Call-Site Effort in Routing Config
+
+To enable per-call-site effort tuning:
+1. Add `effort_override: str | None` field to `CallSiteConfig` in `routing/types.py`
+2. Update `model_routing.yaml` schema to accept `effort:` per call site
+3. Have the CC invoker read effort from the routing config when dispatching
+4. Track effort level in `call_site_last_run` for empirical analysis
+
+This would allow: Low for fact extraction (#9), Medium for standard review (#17),
+High for adversarial review (#20) — without changing application code.
+
+---
+
 ## Last Reviewed
 2026-04-14 — added free tier benchmark comparison table; added Cerebras, GitHub
 Models, SambaNova free tier terms; updated OpenRouter with $10 balance info;

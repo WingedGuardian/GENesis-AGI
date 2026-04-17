@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # Genesis automated backup — runs every 6h via cron.
-# Backs up: SQLite DB, Qdrant snapshots, CC transcripts, auto-memory, secrets.
+# Writes your Genesis state to <your-gh-user>/genesis-backups.
+# All PII-bearing payloads are GPG-encrypted with GENESIS_BACKUP_PASSPHRASE.
 #
-# Environment variables (all optional):
-#   GENESIS_BACKUP_REPO  — Git URL for backup repo (auto-detected from existing clone)
-#   GENESIS_DIR          — Genesis repo root (default: ~/genesis)
-#   QDRANT_URL           — Qdrant server URL (default: http://localhost:6333)
-#   SECRETS_PATH         — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
+# Backs up: SQLite DB, Qdrant snapshots, CC transcripts, auto-memory,
+# local config overlays, secrets.
+#
+# Restore via scripts/restore.sh or `python -m genesis restore`.
+#
+# To scrub pre-encryption plaintext payloads from the backup repo's git
+# history, run scripts/migrate-backup-history.sh (one-shot, user-invoked).
+#
+# Environment variables (all optional unless noted):
+#   GENESIS_BACKUP_REPO        — Git URL for backup repo (auto-detected from existing clone)
+#   GENESIS_BACKUP_PASSPHRASE  — GPG passphrase (REQUIRED for secrets + encrypted payloads)
+#   GENESIS_DIR                — Genesis repo root (default: ~/genesis)
+#   QDRANT_URL                 — Qdrant server URL (default: http://localhost:6333)
+#   SECRETS_PATH               — Path to secrets.env (default: $GENESIS_DIR/secrets.env)
 set -euo pipefail
 
 # ── Status tracking ──────────────────────────────────────────────────
@@ -44,6 +54,33 @@ log() { echo "$LOG_PREFIX $(date -Iseconds) $*"; }
 
 die() { log "FATAL: $*"; exit 1; }
 
+# ── Encryption helpers ───────────────────────────────────────────────
+# All PII-bearing payloads (SQLite dump, transcripts, memory) use the
+# same GPG symmetric passphrase as secrets. If the passphrase is unset,
+# encrypted sections are SKIPPED rather than falling back to plaintext
+# (the memory system is designed to hold credentials — plaintext leak
+# to a private repo is not acceptable).
+_BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
+_ENCRYPT_READY=false
+if [ -n "$_BACKUP_PASSPHRASE" ]; then
+    _ENCRYPT_READY=true
+fi
+
+# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
+encrypt_stdin() {
+    local out="$1"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
+}
+
+# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
+encrypt_file() {
+    local src="$1"
+    local dst="$2"
+    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
+        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+}
+
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
     # Determine backup repo URL: env var → auto-detect from existing clone → fail
@@ -66,24 +103,42 @@ git config user.email "backup@genesis.local" 2>/dev/null || true
 
 git pull --rebase --quiet 2>/dev/null || log "WARNING: git pull failed, continuing with local state"
 
-# --- 1. SQLite dump (portable SQL text, diffs well in git) ---
+# --- 1. SQLite dump (encrypted — may hold memory-stored credentials/PII) ---
 log "Backing up SQLite database..."
 mkdir -p data
 DB_FILE="$GENESIS_DIR/data/genesis.db"
+# Purge any pre-encryption plaintext dumps so they don't persist in the
+# backup repo alongside the new encrypted form.
+rm -f data/genesis.sql data/genesis.db
 if [ -f "$DB_FILE" ]; then
-    sqlite3 "$DB_FILE" .dump > data/genesis.sql 2>/dev/null || {
-        log "WARNING: sqlite3 dump failed, copying raw DB"
-        cp "$DB_FILE" data/genesis.db
-    }
-    _SQLITE_LINES=$(wc -l < data/genesis.sql)
-    log "SQLite: $_SQLITE_LINES lines"
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping SQLite backup (refusing plaintext)"
+    else
+        _SQL_TMP=$(mktemp)
+        if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
+            _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
+            if encrypt_file "$_SQL_TMP" data/genesis.sql.gpg; then
+                log "SQLite: $_SQLITE_LINES lines (encrypted)"
+            else
+                log "WARNING: SQLite encryption failed"
+                _SQLITE_LINES=0
+            fi
+        else
+            log "WARNING: sqlite3 dump failed"
+        fi
+        rm -f "$_SQL_TMP"
+    fi
 else
     log "WARNING: genesis.db not found at $DB_FILE"
 fi
 
-# --- 2. Qdrant snapshots ---
+# --- 2. Qdrant snapshots (encrypted — snapshots contain embedding vectors
+#       and payloads derived from memory/DB content) ---
 log "Backing up Qdrant collections..."
 mkdir -p data/qdrant
+# Purge any pre-encryption plaintext snapshots so they don't persist
+# alongside the new encrypted form.
+find data/qdrant -maxdepth 1 -name '*.snapshot' -type f -delete 2>/dev/null || true
 for collection in episodic_memory knowledge_base; do
     # Create snapshot via Qdrant API
     snapshot_resp=$(curl -sf -X POST "$QDRANT_URL/collections/$collection/snapshots" 2>/dev/null) || {
@@ -100,36 +155,74 @@ for collection in episodic_memory knowledge_base; do
         log "WARNING: Could not download snapshot for $collection"
         continue
     }
-    _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
-    log "Qdrant: $collection snapshot saved ($(du -sh "data/qdrant/${collection}.snapshot" | cut -f1))"
+
+    # Encrypt. Refuse plaintext if no passphrase — Qdrant snapshots are
+    # not opaque enough to ship plaintext to the backup repo.
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping Qdrant snapshot for $collection (refusing plaintext)"
+        rm -f "data/qdrant/${collection}.snapshot"
+    elif encrypt_file "data/qdrant/${collection}.snapshot" "data/qdrant/${collection}.snapshot.gpg"; then
+        rm -f "data/qdrant/${collection}.snapshot"
+        _QDRANT_COUNT=$(( _QDRANT_COUNT + 1 ))
+        log "Qdrant: $collection ($(du -sh "data/qdrant/${collection}.snapshot.gpg" | cut -f1), encrypted)"
+    else
+        log "WARNING: Qdrant encryption failed for $collection"
+        rm -f "data/qdrant/${collection}.snapshot"
+    fi
 
     # Clean up snapshot from Qdrant server
     curl -sf -X DELETE "$QDRANT_URL/collections/$collection/snapshots/$snapshot_name" >/dev/null 2>&1 || true
 done
 
-# --- 3. CC session transcripts ---
+# --- 3. CC session transcripts (encrypted — contain conversation PII) ---
 log "Backing up CC transcripts..."
 mkdir -p transcripts
+# Purge any pre-encryption plaintext transcripts.
+find transcripts -maxdepth 1 -name '*.jsonl' -type f -delete 2>/dev/null || true
 if [ -d "$TRANSCRIPT_DIR" ]; then
-    # Copy only .jsonl files from the top-level directory (not subdirs like memory/)
-    find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -exec cp -u {} transcripts/ \; 2>/dev/null || {
-        log "WARNING: transcript copy failed"
-    }
-    _TRANSCRIPT_COUNT=$(find transcripts -name '*.jsonl' 2>/dev/null | wc -l)
-    log "Transcripts: $_TRANSCRIPT_COUNT files"
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping transcripts (refusing plaintext)"
+    else
+        # Encrypt each jsonl to transcripts/<name>.jsonl.gpg. Skip re-encryption
+        # when the encrypted copy is newer than the source (mirrors cp -u).
+        while IFS= read -r -d '' src; do
+            name=$(basename "$src")
+            dst="transcripts/${name}.gpg"
+            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                continue
+            fi
+            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $name"
+        done < <(find "$TRANSCRIPT_DIR" -maxdepth 1 -name '*.jsonl' -type f -print0)
+        _TRANSCRIPT_COUNT=$(find transcripts -maxdepth 1 -name '*.jsonl.gpg' 2>/dev/null | wc -l)
+        log "Transcripts: $_TRANSCRIPT_COUNT files (encrypted)"
+    fi
 else
     log "WARNING: transcript directory not found"
 fi
 
-# --- 4. Auto-memory files ---
+# --- 4. Auto-memory files (encrypted — auto-memory can hold credentials/PII) ---
 log "Backing up auto-memory..."
 mkdir -p memory
+# Purge any pre-encryption plaintext memory files.
+find memory -type f ! -name '*.gpg' -delete 2>/dev/null || true
 if [ -d "$MEMORY_DIR" ]; then
-    cp -ru "$MEMORY_DIR"/* memory/ 2>/dev/null || {
-        log "WARNING: memory copy failed"
-    }
-    _MEMORY_COUNT=$(find memory -type f 2>/dev/null | wc -l)
-    log "Memory: $_MEMORY_COUNT files"
+    if ! $_ENCRYPT_READY; then
+        log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping memory (refusing plaintext)"
+    else
+        # Walk the memory directory, preserve relative structure, encrypt each file.
+        # Skip re-encryption when the encrypted copy is newer than the source.
+        while IFS= read -r -d '' src; do
+            rel="${src#$MEMORY_DIR/}"
+            dst="memory/${rel}.gpg"
+            mkdir -p "$(dirname "$dst")"
+            if [ -f "$dst" ] && [ "$dst" -nt "$src" ]; then
+                continue
+            fi
+            encrypt_file "$src" "$dst" || log "WARNING: failed to encrypt $rel"
+        done < <(find "$MEMORY_DIR" -type f -print0)
+        _MEMORY_COUNT=$(find memory -type f -name '*.gpg' 2>/dev/null | wc -l)
+        log "Memory: $_MEMORY_COUNT files (encrypted)"
+    fi
 else
     log "WARNING: memory directory not found"
 fi
@@ -159,14 +252,13 @@ fi
 log "Backing up secrets (encrypted)..."
 mkdir -p secrets
 if [ -f "$SECRETS_FILE" ]; then
-    # Use a passphrase from environment or a fixed key file
-    BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
-    if [ -n "$BACKUP_PASSPHRASE" ]; then
-        echo "$BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-            --symmetric --cipher-algo AES256 \
-            -o secrets/secrets.env.gpg "$SECRETS_FILE" 2>/dev/null
-        _SECRETS_OK=true
-        log "Secrets: encrypted with GPG"
+    if $_ENCRYPT_READY; then
+        if encrypt_file "$SECRETS_FILE" secrets/secrets.env.gpg; then
+            _SECRETS_OK=true
+            log "Secrets: encrypted with GPG"
+        else
+            log "WARNING: secrets encryption failed"
+        fi
     else
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set, skipping secrets backup"
     fi

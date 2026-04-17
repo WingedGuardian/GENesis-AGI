@@ -114,8 +114,8 @@ class _InitDelegatesMixin:
     async def _init_outreach(self) -> None:
         await outreach.init(self)
 
-    def _init_autonomy(self) -> None:
-        autonomy.init(self)
+    async def _init_autonomy(self) -> None:
+        await autonomy.init(self)
 
     async def _init_tasks(self) -> None:
         await tasks.init(self)

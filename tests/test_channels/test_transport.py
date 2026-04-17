@@ -296,3 +296,99 @@ class TestFTS5Escape:
         result = _escape_fts5("café résumé naïve")
         assert result is not None
         assert "café" in result
+
+
+# ---- Adapter offset persistence debounce ----
+
+
+class TestAdapterOffsetDebounce:
+    """Regression coverage for the None-sentinel fix on _last_offset_write.
+
+    Previously `_last_offset_write: float = 0.0` paired with a 30s debounce
+    meant the first offset persist was suppressed on fresh processes where
+    system uptime (time.monotonic) was under 30 seconds — same bug class as
+    _should_log_failure in litellm_delegate. The fix uses None as the
+    "never persisted" sentinel.
+    """
+
+    def _make_adapter(self):
+        from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
+        return TelegramAdapterV2(token="t", conversation_loop=AsyncMock())
+
+    def test_sentinel_initialized_to_none(self):
+        adapter = self._make_adapter()
+        assert adapter._last_offset_write is None
+
+    def test_first_persist_not_suppressed_on_fresh_process(self):
+        """With system uptime < _OFFSET_PERSIST_INTERVAL_S (30s), first
+        _persist_offset call must still write — not be debounced away."""
+        adapter = self._make_adapter()
+        # Simulate an _app/updater with a non-zero offset
+        adapter._app = AsyncMock()
+        adapter._app.updater._last_update_id = 42
+        adapter._app.bot.id = 1234
+
+        with (
+            patch("genesis.channels.telegram.adapter_v2.time.monotonic", return_value=5.0),
+            patch("genesis.channels.telegram.adapter_v2.write_offset") as mock_write,
+        ):
+            adapter._persist_offset()
+            # First call must persist even though monotonic=5.0 < interval=30s
+            mock_write.assert_called_once_with("1234", 42)
+            assert adapter._last_offset_write == 5.0
+
+    def test_second_persist_within_interval_is_debounced(self):
+        adapter = self._make_adapter()
+        adapter._app = AsyncMock()
+        adapter._app.updater._last_update_id = 42
+        adapter._app.bot.id = 1234
+
+        with (
+            patch("genesis.channels.telegram.adapter_v2.time.monotonic", return_value=5.0),
+            patch("genesis.channels.telegram.adapter_v2.write_offset") as mock_write,
+        ):
+            adapter._persist_offset()
+            assert mock_write.call_count == 1
+            # Second call at same monotonic time → within debounce window
+            adapter._persist_offset()
+            assert mock_write.call_count == 1  # still 1, suppressed
+
+    def test_persist_after_interval_writes_again(self):
+        adapter = self._make_adapter()
+        adapter._app = AsyncMock()
+        adapter._app.updater._last_update_id = 42
+        adapter._app.bot.id = 1234
+
+        with (
+            patch("genesis.channels.telegram.adapter_v2.time.monotonic", return_value=5.0),
+            patch("genesis.channels.telegram.adapter_v2.write_offset") as mock_write,
+        ):
+            adapter._persist_offset()
+            assert mock_write.call_count == 1
+
+        interval = adapter._OFFSET_PERSIST_INTERVAL_S
+        with (
+            patch(
+                "genesis.channels.telegram.adapter_v2.time.monotonic",
+                return_value=5.0 + interval + 1.0,
+            ),
+            patch("genesis.channels.telegram.adapter_v2.write_offset") as mock_write,
+        ):
+            adapter._persist_offset()
+            assert mock_write.call_count == 1  # second persist after interval
+
+    def test_force_always_persists(self):
+        adapter = self._make_adapter()
+        adapter._app = AsyncMock()
+        adapter._app.updater._last_update_id = 42
+        adapter._app.bot.id = 1234
+
+        with (
+            patch("genesis.channels.telegram.adapter_v2.time.monotonic", return_value=5.0),
+            patch("genesis.channels.telegram.adapter_v2.write_offset") as mock_write,
+        ):
+            adapter._persist_offset(force=True)
+            assert mock_write.call_count == 1
+            # force=True bypasses the debounce check
+            adapter._persist_offset(force=True)
+            assert mock_write.call_count == 2

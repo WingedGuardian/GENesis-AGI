@@ -154,8 +154,13 @@ async def build_reflection_prompt(
     context_gatherer: ContextGatherer | None,
     context_assembler: ContextAssembler | None,
     prompt_dir: Path,
-) -> str:
-    """Build prompt — enriched if context_gatherer available, simple otherwise."""
+) -> tuple[str, tuple[str, ...]]:
+    """Build prompt — enriched if context_gatherer available, simple otherwise.
+
+    Returns (prompt_text, gathered_observation_ids). The IDs are used by
+    the caller to mark observations as influenced AFTER reflection produces
+    substantive output (not before).
+    """
 
     # Enriched paths — context_gatherer provides observations, surplus, etc.
     if context_gatherer and depth == Depth.STRATEGIC:
@@ -180,9 +185,10 @@ async def build_reflection_prompt(
         focus_instruction = LIGHT_FOCUS_INSTRUCTIONS.get(focus, LIGHT_FOCUS_INSTRUCTIONS["situation"])
 
         if context_assembler:
-            return await build_light_prompt_enriched(
+            prompt = await build_light_prompt_enriched(
                 tick, focus, focus_instruction, db=db, context_assembler=context_assembler,
             )
+            return prompt, ()
 
         # Fallback: thin prompt (when context_assembler not injected)
         return (
@@ -195,7 +201,7 @@ async def build_reflection_prompt(
             f"## Current Cognitive State\n\n{cog_state}\n\n"
             f"{focus_instruction}\n\n"
             f'Set "focus_area": "{focus}" in your JSON output.'
-        )
+        ), ()
 
     return (
         f"Perform a {depth.value} reflection.\n\n"
@@ -207,7 +213,7 @@ async def build_reflection_prompt(
         f"## Current Cognitive State\n\n{cog_state}\n\n"
         f"Analyze the current state, identify patterns and observations, "
         f"and provide actionable insights."
-    )
+    ), ()
 
 
 async def build_strategic_prompt_enriched(
@@ -215,7 +221,7 @@ async def build_strategic_prompt_enriched(
     *,
     db,
     context_gatherer: ContextGatherer,
-) -> str:
+) -> tuple[str, tuple[str, ...]]:
     """Build enriched strategic prompt with observations and data pointers."""
     bundle = await context_gatherer.gather(db)
 
@@ -224,10 +230,14 @@ async def build_strategic_prompt_enriched(
 
     signals_summary = _format_signals_from_tick(tick)
 
+    from genesis.env import user_timezone
+    tz_name = user_timezone()
+
     parts = [
         "Perform a Strategic reflection.\n",
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
+        f"User timezone: {tz_name}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}",
         f"Signals: {signals_summary}\n",
         f"## Current Cognitive State\n\n{cog_state}\n",
@@ -254,7 +264,7 @@ async def build_strategic_prompt_enriched(
         )
 
     parts.append(build_data_pointers())
-    return "\n".join(parts)
+    return "\n".join(parts), bundle.gathered_observation_ids
 
 
 async def build_enriched_prompt(
@@ -262,14 +272,21 @@ async def build_enriched_prompt(
     *,
     db,
     context_gatherer: ContextGatherer,
-) -> str:
-    """Build rich prompt using ContextGatherer data."""
+) -> tuple[str, tuple[str, ...]]:
+    """Build rich prompt using ContextGatherer data.
+
+    Returns (prompt_text, gathered_observation_ids).
+    """
     bundle = await context_gatherer.gather(db)
+
+    from genesis.env import user_timezone
+    tz_name = user_timezone()
 
     parts = [
         "Perform a Deep reflection.\n",
         f"Tick ID: {tick.tick_id}",
         f"Timestamp: {tick.timestamp}",
+        f"User timezone: {tz_name}",
         f"Trigger: {tick.trigger_reason or 'scheduled'}",
     ]
 
@@ -363,7 +380,7 @@ async def build_enriched_prompt(
         logger.error("Failed to gather evaluation context for deep reflection", exc_info=True)
 
     parts.append(build_data_pointers())
-    return "\n".join(parts)
+    return "\n".join(parts), bundle.gathered_observation_ids
 
 
 async def build_light_prompt_enriched(

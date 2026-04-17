@@ -401,6 +401,7 @@ def _rrf_fusion(
             if mid not in content_map:
                 content_map[mid] = r
 
+
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
 

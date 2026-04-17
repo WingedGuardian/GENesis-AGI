@@ -892,6 +892,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(source, content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_outreach_person ON outreach_history(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_person ON autonomy_state(person_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_category ON autonomy_state(category)",
     "CREATE INDEX IF NOT EXISTS idx_traces_person ON execution_traces(person_id)",
     # cost tracking
     "CREATE INDEX IF NOT EXISTS idx_cost_events_task ON cost_events(task_id)",

@@ -30,6 +30,24 @@ if [[ -z "$COMMIT_SHA" || -z "$COMMIT_SUBJECT" ]]; then
     exit 0
 fi
 
+# ─── Stale-branch cleanup on public releases ──────────────────────────────
+# When a commit with subject matching `Genesis v...public release` lands,
+# most feature branches whose work was squash-merged become orphaned. Run
+# the cleanup script with --auto-delete to reap them. Fail-open: errors
+# are logged and swallowed, never blocking the release commit.
+if [[ "$COMMIT_SUBJECT" =~ ^Genesis[[:space:]]+v[0-9]+.*public[[:space:]]release ]]; then
+    REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+    CLEANUP_SCRIPT="$REPO_ROOT/scripts/cleanup-stale-branches.sh"
+    if [[ -n "$REPO_ROOT" && -x "$CLEANUP_SCRIPT" ]]; then
+        _log "release detected (sha=$COMMIT_SHA), running stale-branch cleanup"
+        # Background it — branch cleanup touches refs but is idempotent.
+        ( bash "$CLEANUP_SCRIPT" --auto-delete >> "$LOG_FILE" 2>&1 ) &
+        disown 2>/dev/null || true
+    else
+        _log "release detected but cleanup script missing/not-executable: $CLEANUP_SCRIPT"
+    fi
+fi
+
 # Match `fix:` OR `fix(scope):` BUT NOT `fix(local):`.
 # The conventional commits spec allows scopes in parens; we reject scope `local`
 # as the opt-out mechanism.

@@ -12,7 +12,7 @@ Usage — add to ~/.openclaw/openclaw.json:
         providers: {
           genesis: {
             baseUrl: "http://127.0.0.1:5001/v1",
-            apiKey: "genesis-local",
+            apiKey: "genesis-local",  // pragma: allowlist secret
             api: "openai-completions",
             models: [{
               id: "genesis", name: "Genesis",

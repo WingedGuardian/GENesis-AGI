@@ -12,6 +12,7 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 
 
 def _parse_approval_rows(rows: list[dict]) -> list[dict]:
+    now = datetime.now(UTC)
     parsed: list[dict] = []
     for row in rows:
         entry = dict(row)
@@ -22,6 +23,27 @@ def _parse_approval_rows(rows: list[dict]) -> list[dict]:
         if not isinstance(context, dict):
             context = {}
         entry["context_data"] = context
+
+        # Staleness indicator for pending approvals
+        created = entry.get("created_at")
+        if created and entry.get("status") == "pending":
+            try:
+                created_dt = datetime.fromisoformat(created)
+                if created_dt.tzinfo is None:
+                    created_dt = created_dt.replace(tzinfo=UTC)
+                age = now - created_dt
+                age_hours = age.total_seconds() / 3600
+                entry["age_hours"] = round(age_hours, 1)
+                if age_hours < 4:
+                    entry["freshness"] = "fresh"
+                elif age_hours < 24:
+                    entry["freshness"] = "aging"
+                else:
+                    entry["freshness"] = "stale"
+            except (ValueError, TypeError):
+                entry["age_hours"] = None
+                entry["freshness"] = "unknown"
+
         parsed.append(entry)
     return parsed
 
@@ -251,3 +273,68 @@ def essential_knowledge_endpoint():
         return jsonify({"content": content, "updated_at": mtime})
     except OSError as e:
         return jsonify({"content": None, "error": str(e)})
+
+
+@blueprint.route("/api/genesis/settings/timezone", methods=["GET", "POST"])
+@_async_route
+async def settings_timezone():
+    """Get or set the user's display timezone.
+
+    GET: returns {"timezone": <IANA tz name>} — whatever the user configured
+         (defaults to "UTC" if unset).
+    POST: {"timezone": <IANA tz name>} → validates, writes to genesis.yaml,
+          invalidates caches. Takes effect immediately for display;
+          scheduler CronTrigger timezone updates on next restart.
+    """
+    from genesis.env import user_timezone
+
+    if request.method == "GET":
+        return jsonify({"timezone": user_timezone()})
+
+    payload = request.get_json(silent=True) or {}
+    new_tz = payload.get("timezone", "").strip()
+    if not new_tz:
+        return jsonify({"error": "timezone is required"}), 400
+
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        ZoneInfo(new_tz)
+    except (ZoneInfoNotFoundError, KeyError):
+        return jsonify({"error": f"Invalid timezone: {new_tz}"}), 400
+
+    # Write to genesis.yaml
+    import tempfile
+    from pathlib import Path
+    cfg_path = Path.home() / ".genesis" / "config" / "genesis.yaml"
+    try:
+        import yaml
+        existing = {}
+        if cfg_path.is_file():
+            with cfg_path.open() as fh:
+                existing = yaml.safe_load(fh) or {}
+        existing["timezone"] = new_tz
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=str(cfg_path.parent), suffix=".yaml.tmp",
+        )
+        try:
+            import os
+            with os.fdopen(tmp_fd, "w") as f:
+                yaml.dump(existing, f, default_flow_style=False)
+            os.replace(tmp_path, str(cfg_path))
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+    except Exception as exc:
+        return jsonify({"error": f"Failed to write config: {exc}"}), 500
+
+    # Invalidate caches
+    from genesis.env import _invalidate_local_config
+    _invalidate_local_config()
+
+    from genesis.util.tz import reload as tz_reload
+    effective = tz_reload()
+
+    return jsonify({
+        "timezone": effective,
+        "note": "Scheduler timezone updates on next restart",
+    })

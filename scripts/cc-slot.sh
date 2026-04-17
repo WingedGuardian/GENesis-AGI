@@ -71,6 +71,7 @@ export TMPDIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$TMPDIR"
 chmod 700 "$TMPDIR"
 
+
 exec tmux new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     "cd ${GENESIS_ROOT} && claude --dangerously-skip-permissions; exit"

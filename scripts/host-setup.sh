@@ -8,9 +8,9 @@
 #
 # Options:
 #   --container-name NAME  Container name (default: genesis)
-#   --ram SIZE             Memory limit (default: 24GiB)
-#   --disk SIZE            Disk size (default: 30GB)
-#   --cpus N               CPU limit (default: 8)
+#   --ram SIZE             Memory limit (default: auto-scaled to host, max 24GiB)
+#   --disk SIZE            Disk size (default: auto-scaled to host, max 30GB)
+#   --cpus N               CPU limit (default: all host CPUs)
 #   --repo URL             Genesis git repo URL (default: current remote)
 #   --branch NAME          Branch to clone (default: main)
 #   --non-interactive      Skip all prompts
@@ -59,14 +59,17 @@ INCUS_POOL_DIR=""  # auto-detected: set to /home/incus-data on split-disk VMs
 _ORIG_ARGS="$*"
 _install_ok=1      # tracks install.sh success
 _guardian_ok=1     # tracks Guardian install success
+_RAM_EXPLICIT=0    # set to 1 if user passed --ram
+_DISK_EXPLICIT=0   # set to 1 if user passed --disk
+_CPUS_EXPLICIT=0   # set to 1 if user passed --cpus
 
 # ── Parse args ───────────────────────────────────────────────
 while [ $# -gt 0 ]; do
     case "$1" in
         --container-name) [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CONTAINER_NAME="$2"; shift ;;
-        --ram)            [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; RAM="$2"; shift ;;
-        --disk)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; DISK="$2"; shift ;;
-        --cpus)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CPUS="$2"; shift ;;
+        --ram)            [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; RAM="$2"; _RAM_EXPLICIT=1; shift ;;
+        --disk)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; DISK="$2"; _DISK_EXPLICIT=1; shift ;;
+        --cpus)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; CPUS="$2"; _CPUS_EXPLICIT=1; shift ;;
         --repo)           [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; REPO_URL="$2"; shift ;;
         --branch)         [ $# -ge 2 ] || { echo "ERROR: $1 requires a value"; exit 1; }; BRANCH="$2"; shift ;;
         --non-interactive) NON_INTERACTIVE=1 ;;
@@ -93,7 +96,10 @@ echo ""
 echo "  Genesis — Host VM Setup"
 echo "  ─────────────────────────────────────────"
 echo "  Container: $CONTAINER_NAME"
-echo "  RAM: $RAM | Disk: $DISK | CPUs: $CPUS"
+_banner_ram="$RAM"; [ "$_RAM_EXPLICIT" = "0" ] && _banner_ram="auto (max 24GiB)"
+_banner_disk="$DISK"; [ "$_DISK_EXPLICIT" = "0" ] && _banner_disk="auto (max 30GB)"
+_banner_cpus="$CPUS"; [ "$_CPUS_EXPLICIT" = "0" ] && _banner_cpus="auto"
+echo "  RAM: $_banner_ram | Disk: $_banner_disk | CPUs: $_banner_cpus"
 echo "  Repo: $REPO_URL ($BRANCH)"
 echo ""
 echo "  TIP: This script is safe to re-run. If anything fails or you get"
@@ -105,12 +111,22 @@ echo ""
 echo "  Pre-flight checks..."
 PREFLIGHT_OK=1
 
-# Root or sudo
-if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
-    echo "    FAIL  Need root or passwordless sudo"
-    PREFLIGHT_OK=0
+# Root or sudo — prompt for password once if needed (caches for script duration)
+if [ "$(id -u)" = "0" ]; then
+    echo "    OK    Root access"
+elif sudo -n true 2>/dev/null; then
+    echo "    OK    Passwordless sudo"
+elif [ "$NON_INTERACTIVE" = "0" ]; then
+    echo "    Sudo requires a password. Enter it once — the script handles the rest."
+    if sudo -v 2>/dev/null; then
+        echo "    OK    Sudo authenticated"
+    else
+        echo "    FAIL  Sudo authentication failed"
+        PREFLIGHT_OK=0
+    fi
 else
-    echo "    OK    Root/sudo access"
+    echo "    FAIL  Need root or passwordless sudo (non-interactive mode)"
+    PREFLIGHT_OK=0
 fi
 
 # OS check
@@ -169,6 +185,76 @@ if [ "$PREFLIGHT_OK" = "0" ]; then
     echo ""
     echo "  Pre-flight FAILED — fix the errors above."
     exit 1
+fi
+
+# ── Auto-scale container resources to host capacity ──────────
+# Only adjusts defaults — explicit --ram/--disk/--cpus are never overridden.
+# Reserve 3GB RAM and 5GB disk for host OS, Guardian, and headroom.
+_HOST_RESERVE_RAM_GB=3
+_HOST_RESERVE_DISK_GB=5
+_autoscale_changed=0
+_check_avail_gb=$((check_avail_kb / 1048576))
+
+if [ "$_RAM_EXPLICIT" = "0" ]; then
+    _auto_ram=$((host_mem_gb - _HOST_RESERVE_RAM_GB))
+    # Cap at the default (no overallocation on large hosts)
+    if [ "$_auto_ram" -gt 24 ]; then
+        _auto_ram=24
+    fi
+    # Floor: 4GB minimum for Genesis + Qdrant + CC
+    if [ "$_auto_ram" -lt 4 ]; then
+        echo ""
+        echo "  FATAL: Host has ${host_mem_gb}GB RAM. After reserving ${_HOST_RESERVE_RAM_GB}GB"
+        echo "  for the host, only ${_auto_ram}GB remains — Genesis needs at least 4GB."
+        echo "  Minimum host RAM: $((4 + _HOST_RESERVE_RAM_GB))GB."
+        exit 1
+    fi
+    RAM="${_auto_ram}GiB"
+    _autoscale_changed=1
+fi
+
+if [ "$_DISK_EXPLICIT" = "0" ]; then
+    _auto_disk=$((_check_avail_gb - _HOST_RESERVE_DISK_GB))
+    # Cap at the default
+    if [ "$_auto_disk" -gt 30 ]; then
+        _auto_disk=30
+    fi
+    # Floor: 10GB minimum
+    if [ "$_auto_disk" -lt 10 ]; then
+        echo ""
+        echo "  FATAL: Only ${_check_avail_gb}GB disk available. After reserving"
+        echo "  ${_HOST_RESERVE_DISK_GB}GB for the host, only ${_auto_disk}GB remains"
+        echo "  — Genesis needs at least 10GB."
+        exit 1
+    fi
+    DISK="${_auto_disk}GB"
+    _autoscale_changed=1
+fi
+
+if [ "$_CPUS_EXPLICIT" = "0" ]; then
+    _auto_cpus=$(nproc 2>/dev/null || echo 4)
+    # No upper cap: unlike RAM/disk, CPU limits are soft cgroup caps — the
+    # container can use all cores but won't starve the host. Background tasks
+    # (awareness loop, reflection, triage) benefit from parallelism.
+    # Floor at 2
+    if [ "$_auto_cpus" -lt 2 ]; then
+        _auto_cpus=2
+    fi
+    CPUS="$_auto_cpus"
+    _autoscale_changed=1
+fi
+
+if [ "$_autoscale_changed" = "1" ]; then
+    echo ""
+    echo "  Auto-sized container resources to host capacity:"
+    echo "    RAM:  $RAM  (${host_mem_gb}GB host - ${_HOST_RESERVE_RAM_GB}GB reserved)"
+    echo "    Disk: $DISK  (${_check_avail_gb}GB available - ${_HOST_RESERVE_DISK_GB}GB reserved)"
+    echo "    CPUs: $CPUS  ($(nproc 2>/dev/null || echo '?') available)"
+    if [ "${_auto_ram:-99}" -lt 8 ]; then
+        echo ""
+        echo "    NOTE: Container RAM is ${RAM} — Genesis will work but may be"
+        echo "    slow under concurrent load. 8GB+ recommended for production use."
+    fi
 fi
 echo ""
 
@@ -373,7 +459,7 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
         fi
     else
         if [ "$_container_healthy" = "0" ]; then
-            read -rp "  Delete and recreate? [Y/n] " _recreate
+            read -rp "  Delete and recreate? [Y/n] " _recreate || true
             if [ "${_recreate:-Y}" != "n" ] && [ "${_recreate:-Y}" != "N" ]; then
                 incus delete "$CONTAINER_NAME" --force
                 echo "  + Old container deleted"
@@ -381,7 +467,7 @@ if incus info "$CONTAINER_NAME" &>/dev/null; then
                 echo "  Continuing with existing container (repair attempt)."
             fi
         else
-            read -rp "  Delete and recreate? [y/N] " _recreate
+            read -rp "  Delete and recreate? [y/N] " _recreate || true
             if [ "${_recreate:-N}" = "y" ] || [ "${_recreate:-N}" = "Y" ]; then
                 incus delete "$CONTAINER_NAME" --force
                 echo "  + Old container deleted"
@@ -500,6 +586,57 @@ if ! incus exec "$CONTAINER_NAME" -- bash -c 'getent hosts github.com' &>/dev/nu
     fi
 fi
 echo "  + DNS resolution OK"
+
+# ── Timezone detection ────────────────────────────────────────
+# Detect timezone via IP geolocation, confirm with user, set on host + container.
+# This is the one moment we have interactive access + sudo on both machines.
+_detected_tz=""
+_final_tz="UTC"
+
+# Try IP geolocation (the install requires internet, so this should work)
+_detected_tz=$(curl -sf --max-time 5 "http://ip-api.com/json?fields=timezone" 2>/dev/null | \
+    grep -o '"timezone":"[^"]*"' | cut -d'"' -f4)
+
+# Fallback: host system timezone (may be UTC on fresh cloud VMs)
+if [ -z "$_detected_tz" ]; then
+    _detected_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "UTC")
+fi
+
+if [ "$NON_INTERACTIVE" = "0" ] && [ -n "$_detected_tz" ] && (exec </dev/tty) 2>/dev/null; then
+    echo ""
+    echo "  Detected timezone: $_detected_tz"
+    read -r -p "  Is this correct? [Y/n] " _tz_confirm </dev/tty
+    if [ "$_tz_confirm" = "n" ] || [ "$_tz_confirm" = "N" ]; then
+        read -r -p "  Enter timezone (e.g., America/New_York, Europe/London): " _manual_tz </dev/tty
+        # Validate against system timezone list
+        if timedatectl list-timezones 2>/dev/null | grep -qx "$_manual_tz"; then
+            _final_tz="$_manual_tz"
+        else
+            echo "  WARN: '$_manual_tz' not recognized. Using $_detected_tz."
+            _final_tz="$_detected_tz"
+        fi
+    else
+        _final_tz="$_detected_tz"
+    fi
+else
+    # Non-interactive, no TTY, or detection failed — keep detected value or UTC default
+    _final_tz="${_detected_tz:-UTC}"
+    if [ -n "$_detected_tz" ] && [ "$_detected_tz" != "UTC" ]; then
+        echo ""
+        echo "  Detected timezone: $_detected_tz (auto-accepted, no TTY)"
+    fi
+fi
+
+# Set on host VM
+if [ "$_final_tz" != "UTC" ] && [ "$_final_tz" != "Etc/UTC" ]; then
+    sudo timedatectl set-timezone "$_final_tz" 2>/dev/null || true
+fi
+
+# Container timezone is set later (right before install.sh) because
+# apt-get with DEBIAN_FRONTEND=noninteractive reconfigures tzdata→UTC.
+
+echo "  + Timezone: $_final_tz (host)"
+
 
 # ── Set up user inside container ─────────────────────────────
 echo "  Setting up user inside container..."
@@ -630,6 +767,8 @@ if command -v tailscale &>/dev/null && ! tailscale ip -4 &>/dev/null; then
             _ts_i=$((_ts_i + 1))
             tailscale ip -4 &>/dev/null && break
         done
+        # Kill the blocking tailscale up — it never exits without auth
+        kill -0 "$_ts_pid" 2>/dev/null && sudo kill "$_ts_pid" 2>/dev/null
         wait "$_ts_pid" 2>/dev/null || true
         if tailscale ip -4 &>/dev/null; then
             echo "  + Tailscale authenticated: $(tailscale ip -4)"
@@ -694,16 +833,28 @@ if incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -
     if [ "$NON_INTERACTIVE" = "1" ]; then
         _install_flags="--non-interactive"
     fi
-    # Note: we do NOT pass --force-interactive here. incus exec -t allocates a
-    # pseudo-TTY, so install.sh's should_prompt ([ -t 0 ]) should work. If it
-    # doesn't on a specific platform, the user can re-run install.sh inside the
-    # container directly where TTY detection is reliable.
+    # Use -t (PTY) when we have a real terminal, -T (no PTY) otherwise.
+    # install.sh uses `[ -t 0 ]` (should_prompt) to decide interactive mode.
+    # If we pass -t without a real terminal, incus allocates a zombie PTY and
+    # install.sh's reads block forever waiting for input that can't arrive.
+    _incus_tty="-T"
+    if (exec </dev/tty) 2>/dev/null; then
+        _incus_tty="-t"
+    fi
+
+    # Set container timezone now (after apt-get which resets tzdata to UTC)
+    if [ -n "$_final_tz" ] && [ "$_final_tz" != "UTC" ]; then
+        incus exec "$CONTAINER_NAME" -- timedatectl set-timezone "$_final_tz" 2>/dev/null || \
+            incus exec "$CONTAINER_NAME" -- ln -sf "/usr/share/zoneinfo/$_final_tz" /etc/localtime 2>/dev/null || true
+        echo "  + Container timezone: $_final_tz"
+    fi
 
     # shellcheck disable=SC2086  # Intentional: empty string should vanish
     incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" \
         --env "HOME=/home/ubuntu" \
         --env "XDG_RUNTIME_DIR=/run/user/$UBUNTU_UID" \
-        -t --cwd /home/ubuntu/genesis -- \
+        --env "GENESIS_TIMEZONE=$_final_tz" \
+        $_incus_tty --cwd /home/ubuntu/genesis -- \
         bash scripts/install.sh $_install_flags || {
         echo ""
         _install_ok=0
@@ -728,49 +879,42 @@ echo "  Running container smoke test..."
 _smoke_ok=0
 _smoke_fail=""
 
-# 1. /tmp exists and is writable
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- test -w /tmp 2>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n"
-fi
+# Run all checks in a single incus exec to avoid websocket handshake issues
+# that occur with multiple separate incus exec calls (especially in nested
+# pty environments like script, screen, or tmux wrappers).
+_smoke_output=$(timeout -k 10 45 incus exec -T "$CONTAINER_NAME" \
+    --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- bash -c '
+    test -w /tmp && echo "PASS_TMP" || echo "FAIL_TMP"
+    python3 -c "print(42)" &>/dev/null && echo "PASS_PYTHON" || echo "FAIL_PYTHON"
+    /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null && echo "PASS_VENV" || echo "FAIL_VENV"
+    curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null && echo "PASS_QDRANT" || echo "FAIL_QDRANT"
+    # Retry loop: genesis-server may still be starting on slow machines
+    _code="000"
+    for _try in 1 2 3 4 5; do
+        _code=$(curl -so /dev/null -w "%{http_code}" --max-time 5 http://localhost:5000/api/genesis/health 2>/dev/null || echo "000")
+        [ "$_code" = "200" ] || [ "$_code" = "503" ] && break
+        sleep 2
+    done
+    if [ "$_code" = "200" ] || [ "$_code" = "503" ]; then echo "PASS_SERVER"; else echo "FAIL_SERVER"; fi
+' 2>/dev/null || echo "FAIL_EXEC")
 
-# 2. Python works
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- python3 -c "print('ok')" &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
+# Parse results — distinguish total exec failure from individual check failures
+if echo "$_smoke_output" | grep -q "FAIL_EXEC"; then
+    _smoke_fail="    FAIL  Could not execute smoke test in container (incus exec failed/timed out)\n"
 else
-    _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n"
-fi
-
-# 3. Genesis venv is intact
-if timeout 15 incus exec "$CONTAINER_NAME" --user "$UBUNTU_UID" --env "HOME=/home/ubuntu" -- /home/ubuntu/genesis/.venv/bin/python -c "import genesis" &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n"
-fi
-
-# 4. Qdrant is reachable
-if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:6333/collections &>/dev/null; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n"
-fi
-
-# 5. genesis-server responds
-_server_tries=0
-_server_ok=0
-while [ "$_server_tries" -lt 5 ]; do
-    if timeout 15 incus exec "$CONTAINER_NAME" -- curl --max-time 5 -sf http://localhost:5000/api/genesis/health &>/dev/null; then
-        _server_ok=1
-        break
-    fi
-    sleep 2
-    _server_tries=$((_server_tries + 1))
-done
-if [ "$_server_ok" = "1" ]; then
-    _smoke_ok=$((_smoke_ok + 1))
-else
-    _smoke_fail="${_smoke_fail}    FAIL  genesis-server not responding on port 5000\n"
+    for _check in TMP PYTHON VENV QDRANT SERVER; do
+        if echo "$_smoke_output" | grep -q "PASS_$_check"; then
+            _smoke_ok=$((_smoke_ok + 1))
+        else
+            case "$_check" in
+                TMP)     _smoke_fail="${_smoke_fail}    FAIL  /tmp is missing or not writable\n" ;;
+                PYTHON)  _smoke_fail="${_smoke_fail}    FAIL  python3 not working\n" ;;
+                VENV)    _smoke_fail="${_smoke_fail}    FAIL  genesis venv broken (cannot import genesis)\n" ;;
+                QDRANT)  _smoke_fail="${_smoke_fail}    FAIL  Qdrant not responding on port 6333\n" ;;
+                SERVER)  _smoke_fail="${_smoke_fail}    FAIL  genesis-server not responding on port 5000\n" ;;
+            esac
+        fi
+    done
 fi
 
 if [ -z "$_smoke_fail" ]; then

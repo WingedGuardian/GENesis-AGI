@@ -57,14 +57,12 @@ docs/actions/user/*.md
 !docs/actions/README.md
 data/genesis.db
 *.jsonl
-
-# Local-only configs (per-machine; never published)
-.config/gh/
+.config/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 *.bak
 
-# Personal/internal content (private by default; force-add specific files when sharing)
+# Personal/internal content (private by default)
 docs/reflections/
 docs/plans/
 docs/content/

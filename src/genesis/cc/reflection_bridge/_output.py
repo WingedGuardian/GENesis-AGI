@@ -22,11 +22,26 @@ from genesis.perception.types import MIN_DELTA_CONFIDENCE
 logger = logging.getLogger(__name__)
 
 
-async def route_deep_output(raw_text: str, *, db, output_router) -> None:
-    """Parse and route deep reflection output via OutputRouter."""
+async def route_deep_output(
+    raw_text: str,
+    *,
+    db,
+    output_router,
+    gathered_obs_ids: tuple[str, ...] = (),
+) -> dict:
+    """Parse and route deep reflection output via OutputRouter.
+
+    Returns the routing summary dict. Callers can check for
+    ``parse_failed`` or ``empty_output`` keys to detect failures
+    that the old code silently swallowed.
+
+    ``gathered_obs_ids`` are observation IDs that were fed into the
+    reflection context. They are marked as "influenced" only if routing
+    succeeds (non-empty, non-failed output).
+    """
     from genesis.reflection.output_router import parse_deep_reflection_output
     parsed = parse_deep_reflection_output(raw_text)
-    await output_router.route(parsed, db)
+    return await output_router.route(parsed, db, gathered_obs_ids=gathered_obs_ids)
 
 
 async def store_reflection_output(depth, tick, output, *, db) -> None:
