@@ -206,6 +206,10 @@ approved, invoke `genesis contribute <sha>`. If declined, do nothing.
 Full pipeline details are in the `genesis-development` skill's
 `references/contribution.md`.
 
+## Scheduling Reminders
+
+To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreach_send` with `preferred_timing` set to an ISO timestamp. This persists in the DB and fires via the Genesis outreach pipeline. Do NOT use the `/schedule` skill — that routes to Claude Code's remote cloud scheduler, not Genesis.
+
 ## Rules
 
 - **No silent timeouts.** Never add a new timeout (`asyncio.wait_for`,
