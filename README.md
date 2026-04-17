@@ -43,7 +43,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 V3 is the foundation that makes this possible. What's already here is a full cognitive copilot. What's on the [roadmap](#where-its-headed) — a cognitive cycle grounded in Global Workspace Theory and the LIDA architecture from consciousness research, autonomous codebase evolution, and a system that runs experiments on its own cognition — is where it gets ambitious enough that we'll need help building it.
 
-**Where things stand today:** Genesis is architecturally complete — 72,000+ lines, 37 subsystems, all V3 phases built and tested. What it needs now is the last mile. Features that are 95% there but need edge-case hardening. Wiring that works in isolation but hasn't been stress-tested end-to-end. The kind of work that's genuinely interesting if you like digging into complex systems, and genuinely tedious to do alone. If you install Genesis today, you will hit rough edges. That's not a caveat — it's the opportunity. Every bug you find and fix makes the system better for everyone. This is an active build, and using it means participating in it. If that sounds like your kind of project, [come build with us](#get-involved).
+**Where things stand today:** Genesis is architecturally complete — 100,000+ lines, 37 subsystems, all V3 phases built and tested. What it needs now is the last mile. Features that are 95% there but need edge-case hardening. Wiring that works in isolation but hasn't been stress-tested end-to-end. The kind of work that's genuinely interesting if you like digging into complex systems, and genuinely tedious to do alone. If you install Genesis today, you will hit rough edges. That's not a caveat — it's the opportunity. Every bug you find and fix makes the system better for everyone. This is an active build, and using it means participating in it. If that sounds like your kind of project, [come build with us](#get-involved).
 
 ---
 
@@ -72,7 +72,7 @@ Genesis serves as a layer that sits between Claude Code (as well as other AI mod
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-72,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Built to production by one person — which is exactly the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+100,000+ lines of Python. 37 subsystems. 4 MCP servers. 2 vector databases. Built to production by one person — which is exactly the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 ---
 
