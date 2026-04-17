@@ -160,8 +160,8 @@ class TestCCSessions:
     async def test_cc_sessions_from_db(self):
         db = AsyncMock()
         cursor = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=(1,))
         cursor.fetchall = AsyncMock(return_value=[("foreground", 1), ("background", 3)])
-        db.execute = AsyncMock(return_value=cursor)
 
         svc = HealthDataService(db=db)
         snap = await svc.snapshot()
