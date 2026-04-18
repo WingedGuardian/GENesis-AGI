@@ -49,14 +49,23 @@ class OutreachConfig:
             object.__setattr__(self, "delivery_routing", {"default": "supergroup"})
 
 
+def _default_tz() -> str:
+    """Resolve default timezone at call time, not import time."""
+    try:
+        from genesis.env import user_timezone
+        return user_timezone()
+    except Exception:
+        return os.environ.get("USER_TIMEZONE", "UTC")
+
+
 _DEFAULTS = OutreachConfig(
-    quiet_hours=QuietHours(start="22:00", end="07:00", timezone=os.environ.get("USER_TIMEZONE", "UTC")),
+    quiet_hours=QuietHours(start="22:00", end="07:00", timezone="UTC"),
     channel_preferences={"default": "telegram"},
     thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
     max_daily=5,
     surplus_daily=1,
     morning_report_time="07:00",
-    morning_report_timezone=os.environ.get("USER_TIMEZONE", "UTC"),
+    morning_report_timezone="UTC",
     engagement_timeout_hours=24,
     engagement_poll_minutes=60,
     immediate_escalation_alerts=(
@@ -179,18 +188,19 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
     qh = raw.get("quiet_hours", {})
+    tz = _default_tz()
     return OutreachConfig(
         quiet_hours=QuietHours(
             start=qh.get("start", "22:00"),
             end=qh.get("end", "07:00"),
-            timezone=qh.get("timezone", os.environ.get("USER_TIMEZONE", "UTC")),
+            timezone=qh.get("timezone") or tz,
         ),
         channel_preferences=raw.get("channel_preferences", {"default": "telegram"}),
         thresholds=raw.get("thresholds", _DEFAULTS.thresholds),
         max_daily=raw.get("rate_limits", {}).get("max_daily", 5),
         surplus_daily=raw.get("rate_limits", {}).get("surplus_daily", 1),
         morning_report_time=raw.get("morning_report", {}).get("trigger_time", "07:00"),
-        morning_report_timezone=raw.get("morning_report", {}).get("timezone", os.environ.get("USER_TIMEZONE", "UTC")),
+        morning_report_timezone=raw.get("morning_report", {}).get("timezone") or tz,
         engagement_timeout_hours=raw.get("engagement", {}).get("timeout_hours", 24),
         engagement_poll_minutes=raw.get("engagement", {}).get("poll_interval_minutes", 60),
         immediate_escalation_alerts=tuple(

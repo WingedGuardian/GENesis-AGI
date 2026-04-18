@@ -145,6 +145,7 @@ async def _cmd_run(args: argparse.Namespace) -> int:
 
             from genesis.env import genesis_db_path
             db = await aiosqlite.connect(str(genesis_db_path()))
+            await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
 
@@ -213,6 +214,7 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
             import aiosqlite  # noqa: I001
             from genesis.env import genesis_db_path
             db = await aiosqlite.connect(str(genesis_db_path()))
+            await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
         except Exception as e:
             print(f"warning: could not open DB ({e}), results won't be stored")
 
@@ -270,6 +272,7 @@ async def _cmd_results(args: argparse.Namespace) -> int:
         from genesis.eval.db import get_runs
 
         async with aiosqlite.connect(str(genesis_db_path())) as db:
+            await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
             runs = await get_runs(
                 db, model_id=args.model, dataset=args.dataset, limit=args.last,
             )
@@ -310,6 +313,7 @@ async def _cmd_compare(args: argparse.Namespace) -> int:
         results: dict[str, dict[str, tuple[int, int, int]]] = {}
 
         async with aiosqlite.connect(str(genesis_db_path())) as db:
+            await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
             for ds_name in datasets:
                 # Fetch enough rows so each provider can contribute up to args.last runs.
                 # We don't know the provider count upfront, so over-fetch generously.
@@ -362,6 +366,7 @@ async def _cmd_export(args: argparse.Namespace) -> int:
         provider_notes: dict[str, str] = {}
 
         async with aiosqlite.connect(str(genesis_db_path())) as db:
+            await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
             for ds_name in datasets:
                 runs = await get_runs(db, dataset=ds_name, limit=500)
                 seen: set[str] = set()

@@ -16,6 +16,15 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
+def _normalize_scheduled_at(iso_str: str | None) -> str | None:
+    """Normalize a scheduled_at ISO timestamp to UTC for safe DB comparison."""
+    if not iso_str:
+        return iso_str
+    dt = datetime.fromisoformat(iso_str)
+    dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+    return dt.isoformat()
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -36,7 +45,7 @@ async def create(
             scheduled_at, status, priority, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
         (fid, source, source_session, content, reason, strategy,
-         scheduled_at, priority, _now_iso()),
+         _normalize_scheduled_at(scheduled_at), priority, _now_iso()),
     )
     await db.commit()
     return fid
@@ -101,7 +110,7 @@ async def get_scheduled_due(db: aiosqlite.Connection) -> list[dict]:
         "SELECT * FROM follow_ups "
         "WHERE strategy = 'scheduled_task' AND status = 'pending' "
         "AND scheduled_at IS NOT NULL "
-        "AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now') "
+        "AND datetime(scheduled_at) <= datetime('now') "
         "ORDER BY scheduled_at ASC",
     )
     return [dict(row) for row in await cursor.fetchall()]

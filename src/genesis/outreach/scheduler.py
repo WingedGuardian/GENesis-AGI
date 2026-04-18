@@ -233,7 +233,7 @@ class OutreachScheduler:
         report, awareness signals). Multiple alerts are batched into one message.
         """
         try:
-            from datetime import UTC, datetime
+            from datetime import datetime
 
             from genesis.outreach.health_outreach import HealthOutreachBridge
 
@@ -252,9 +252,18 @@ class OutreachScheduler:
             for req in requests:
                 lines.append(f"\U0001f534 {req.context}")
             lines.append("")
+            from datetime import UTC
+            from zoneinfo import ZoneInfo
+
+            from genesis.env import user_timezone
+
+            try:
+                _alert_tz = ZoneInfo(user_timezone())
+            except Exception:
+                _alert_tz = UTC
             lines.append(
                 f"({len(requests)} critical alert(s) at "
-                f"{datetime.now(UTC).strftime('%H:%M UTC')})"
+                f"{datetime.now(_alert_tz).strftime('%H:%M %Z')})"
             )
             batched_text = "\n".join(lines)
 

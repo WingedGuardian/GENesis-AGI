@@ -3,7 +3,7 @@
 quiet_hours:
   start: "22:00"
   end: "07:00"
-  timezone: "UTC"
+  # timezone omitted — inherits from central genesis.yaml / USER_TIMEZONE
 
 channel_preferences:
   default: telegram
@@ -30,7 +30,7 @@ rate_limits:
 
 morning_report:
   trigger_time: "07:00"
-  timezone: "UTC"
+  # timezone omitted — inherits from central genesis.yaml / USER_TIMEZONE
 
 engagement:
   timeout_hours: 24
