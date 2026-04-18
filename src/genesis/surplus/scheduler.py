@@ -48,6 +48,13 @@ class SurplusScheduler:
         dispatch_interval_minutes: int = 5,
         brainstorm_check_hours: int = 12,
         task_expiry_hours: int = 72,
+        code_audit_hours: int = 12,
+        code_index_hours: int = 4,
+        infra_monitor_hours: int = 2,
+        recon_gather_hours: int = 84,
+        maintenance_hours: int = 6,
+        follow_up_dispatch_minutes: int | None = None,
+        memory_extraction_hours: int = 2,
         clock=None,
         event_bus: GenesisEventBus | None = None,
         enable_code_audits: bool = True,
@@ -65,6 +72,13 @@ class SurplusScheduler:
         self._dispatch_interval = dispatch_interval_minutes
         self._brainstorm_interval = brainstorm_check_hours
         self._task_expiry_hours = task_expiry_hours
+        self._code_audit_hours = code_audit_hours
+        self._code_index_hours = code_index_hours
+        self._infra_monitor_hours = infra_monitor_hours
+        self._recon_gather_hours = recon_gather_hours
+        self._maintenance_hours = maintenance_hours
+        self._follow_up_dispatch_minutes = follow_up_dispatch_minutes or dispatch_interval_minutes
+        self._memory_extraction_hours = memory_extraction_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
         self._code_index_executor: SurplusExecutor | None = None
@@ -143,7 +157,7 @@ class SurplusScheduler:
         if self._scheduler.running and not self._scheduler.get_job("follow_up_dispatch"):
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
-                IntervalTrigger(minutes=self._dispatch_interval),
+                IntervalTrigger(minutes=self._follow_up_dispatch_minutes),
                 id="follow_up_dispatch",
                 max_instances=1,
                 misfire_grace_time=60,
@@ -168,7 +182,7 @@ class SurplusScheduler:
         if self._enable_code_audits:
             self._scheduler.add_job(
                 self.schedule_code_audit,
-                IntervalTrigger(hours=12),
+                IntervalTrigger(hours=self._code_audit_hours),
                 id="schedule_code_audit",
                 max_instances=1,
                 misfire_grace_time=300,
@@ -178,28 +192,28 @@ class SurplusScheduler:
             logger.info("Code audits disabled — skipping job registration")
         self._scheduler.add_job(
             self.schedule_code_index,
-            IntervalTrigger(hours=4),
+            IntervalTrigger(hours=self._code_index_hours),
             id="schedule_code_index",
             max_instances=1,
             misfire_grace_time=300,
         )
         self._scheduler.add_job(
             self.schedule_infra_monitor,
-            IntervalTrigger(hours=2),
+            IntervalTrigger(hours=self._infra_monitor_hours),
             id="schedule_infra_monitor",
             max_instances=1,
             misfire_grace_time=300,
         )
         self._scheduler.add_job(
             self.run_recon_gather,
-            IntervalTrigger(hours=84),
+            IntervalTrigger(hours=self._recon_gather_hours),
             id="recon_gather",
             max_instances=1,
             misfire_grace_time=300,
         )
         self._scheduler.add_job(
             self.schedule_maintenance,
-            IntervalTrigger(hours=6),
+            IntervalTrigger(hours=self._maintenance_hours),
             id="schedule_maintenance",
             max_instances=1,
             misfire_grace_time=300,
@@ -207,7 +221,7 @@ class SurplusScheduler:
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
-                IntervalTrigger(minutes=self._dispatch_interval),
+                IntervalTrigger(minutes=self._follow_up_dispatch_minutes),
                 id="follow_up_dispatch",
                 max_instances=1,
                 misfire_grace_time=60,

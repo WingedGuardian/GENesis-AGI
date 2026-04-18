@@ -176,7 +176,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         description="Surplus compute scheduler (dispatch intervals, job frequencies, task defaults)",
         config_filename="surplus.yaml",
         readonly=False,
-        needs_restart=False,
+        needs_restart=True,
     ),
 }
 
