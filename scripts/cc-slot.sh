@@ -9,6 +9,9 @@
 
 set -euo pipefail
 
+# SSH RemoteCommand doesn't source .bashrc (interactive guard) — set PATH explicitly
+export PATH="$HOME/.n/bin:$HOME/.bun/bin:$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"
+
 GENESIS_ROOT="${HOME}/genesis"
 SESSION_PREFIX="cc"
 
