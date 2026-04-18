@@ -122,6 +122,51 @@ async def expire_timed_out(
     return cursor.rowcount
 
 
+async def mark_consumed(
+    db: aiosqlite.Connection, id: str, *, consumed_at: str,
+) -> bool:
+    """Mark an approved request as consumed (action was dispatched).
+
+    Atomic: only updates if consumed_at IS NULL, preventing double-dispatch.
+    Returns True if this call consumed it, False if already consumed.
+    """
+    cursor = await db.execute(
+        """UPDATE approval_requests
+           SET consumed_at = ?
+           WHERE id = ?
+             AND status = 'approved'
+             AND consumed_at IS NULL""",
+        (consumed_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def find_approved_unconsumed(
+    db: aiosqlite.Connection,
+    *,
+    subsystem: str,
+    policy_id: str,
+) -> dict | None:
+    """Find an approved request that hasn't been consumed yet.
+
+    Used by the resume mechanism: when an approval is granted (via Telegram
+    or dashboard), the blocked action can resume on the next tick.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM approval_requests
+           WHERE status = 'approved'
+             AND consumed_at IS NULL
+             AND json_extract(context, '$.subsystem') = ?
+             AND json_extract(context, '$.policy_id') = ?
+           ORDER BY resolved_at DESC
+           LIMIT 1""",
+        (subsystem, policy_id),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute(
         "DELETE FROM approval_requests WHERE id = ?", (id,)

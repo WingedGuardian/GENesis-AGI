@@ -351,6 +351,7 @@ class AwarenessLoop:
         self._stopping: bool = False
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
+        self._last_tick_result: TickResult | None = None
 
     def request_stop(self) -> None:
         """Signal that shutdown is imminent — skip deferred retries.
@@ -494,6 +495,7 @@ class AwarenessLoop:
                 )
                 self._tick_count += 1
                 self._last_tick_at = datetime.now(UTC).isoformat()
+                self._last_tick_result = result
                 if result.classified_depth:
                     logger.info(
                         "Tick triggered %s: %s",
@@ -643,6 +645,11 @@ class AwarenessLoop:
                 name=f"deferred-retry-{result.tick_id[:8]}",
                 subsystem=Subsystem.AWARENESS,
             )
+            tracked_task(
+                self._resume_approved_reflections(),
+                name=f"approval-resume-{result.tick_id[:8]}",
+                subsystem=Subsystem.AWARENESS,
+            )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
         depth = result.classified_depth
@@ -763,6 +770,54 @@ class AwarenessLoop:
             await self._retry_deferred_reflection(current_tick)
         except Exception:
             logger.warning("Deferred reflection retry failed", exc_info=True)
+
+    async def _resume_approved_reflections(self) -> None:
+        """Resume deep/strategic reflections whose approvals were granted.
+
+        When a user approves a deep reflection via Telegram or dashboard,
+        the awareness loop's scoring may never independently reach the "Deep"
+        threshold again. This method checks for approved-but-unconsumed
+        reflection approvals and dispatches them immediately.
+        """
+        if not self._cc_reflection_bridge:
+            return
+        # The autonomous dispatcher is set on the reflection bridge, not
+        # directly on the awareness loop. Access the gate via the bridge.
+        dispatcher = getattr(self._cc_reflection_bridge, "_autonomous_dispatcher", None)
+        if dispatcher is None:
+            return
+        gate = getattr(dispatcher, "approval_gate", None)
+        if gate is None:
+            return
+
+        tick = self._last_tick_result
+        if tick is None:
+            return  # No tick yet — can't build reflection prompt
+
+        for depth_name in ("deep", "strategic"):
+            try:
+                approved = await gate.find_recently_approved(
+                    subsystem="reflection",
+                    policy_id=f"reflection_{depth_name}",
+                )
+                if not approved:
+                    continue
+                # Atomic consume — prevents double-dispatch across ticks
+                consumed = await gate.mark_consumed(approved["id"])
+                if not consumed:
+                    continue  # Another tick already consumed it
+                depth = Depth.DEEP if depth_name == "deep" else Depth.STRATEGIC
+                logger.info(
+                    "Resuming %s reflection from approved request %s",
+                    depth_name, approved["id"][:8],
+                )
+                await self._cc_reflection_bridge.reflect(
+                    depth, tick, db=self._db,
+                )
+            except Exception:
+                logger.error(
+                    "Failed to resume %s reflection", depth_name, exc_info=True,
+                )
 
     async def _retry_deferred_reflection(self, current_tick: TickResult) -> None:
         """Retry ONE deferred reflection per tick using current tick's fresh data.

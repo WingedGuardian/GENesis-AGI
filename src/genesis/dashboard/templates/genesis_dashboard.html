@@ -233,9 +233,9 @@
 
         // Tab management
         _TAB_INTERVALS: {
-          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
+          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval", "_approvalsInterval"],
           chat:      [],
-          internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_approvalsInterval"],
+          internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval"],
           sessions:  ["_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
@@ -274,17 +274,17 @@
           this._tabInitialized[tab] = true;
           switch (tab) {
             case "overview":
-              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); }
+              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); this.fetchApprovals(); }
               this._cognitiveInterval = setInterval(() => this.fetchCognitive(), 60000);
               this._ekInterval = setInterval(() => this.fetchEssentialKnowledge(), 120000);
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
+              this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
             case "internals":
               if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); }
               this._awarenessInterval = setInterval(() => this.fetchAwarenessSignals(), 30000);
               this._routingInterval = setInterval(() => this.fetchRoutingConfig(), 15000);
               this._jobHealthInterval = setInterval(() => this.fetchJobHealth(), 60000);
-              this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
             case "sessions":
               if (first) { this.fetchActivity(); this.fetchSessions(); }
@@ -2456,7 +2456,7 @@
             items.push({ level: "warning", title: `${this.fallbackCallSiteCount} call site${this.fallbackCallSiteCount === 1 ? "" : "s"} on fallback`, detail: names, href: "#routing-health", tab: "internals", anchor: "routing-health" });
           }
           if (this.pendingApprovalCount > 0) {
-            items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#approval-queue", tab: "internals", anchor: "approval-queue" });
+            items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#approval-queue", tab: "overview", anchor: "approval-queue" });
           }
           if (this.badApiKeyCount > 0) {
             items.push({ level: "critical", title: `${this.badApiKeyCount} provider key issue${this.badApiKeyCount === 1 ? "" : "s"}`, detail: "missing or failed provider credentials detected", href: null });
@@ -3996,8 +3996,82 @@
       </div>
     </div>
 
+    <!-- Panel: Approval Queue (Collapsible) [Tab: overview] -->
+    <div class="panel" id="approval-queue" x-data="{ approvalsOpen: $store.genesisDashboard.pendingApprovalCount > 0 }" x-show="$store.genesisDashboard.activeTab === 'overview'">
+      <div class="panel-header" style="cursor: pointer;" @click="approvalsOpen = !approvalsOpen">
+        <span class="material-symbols-outlined" :style="approvalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">approval</span>
+        Approval Queue
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.pendingApprovalCount > 0">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="$store.genesisDashboard.pendingApprovalCount + ' pending'"></span>
+          </template>
+          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('approvals')}`"></span>
+          <span x-text="$store.genesisDashboard.panelStateLabel('approvals')"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="approvalsOpen" x-transition>
+        <template x-if="$store.genesisDashboard.panelStatusDetail('approvals')">
+          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('approvals')"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.approvals.length === 0">
+          <div class="empty-state">No pending approvals.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.approvals.length > 0">
+          <div style="display:grid; gap:0.6rem;">
+            <template x-for="req in $store.genesisDashboard.approvals" :key="req.id">
+              <div style="padding:0.65rem 0.75rem; border-radius:6px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03);">
+                <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.6rem; margin-bottom:0.35rem;">
+                  <div>
+                    <div style="font-size:0.8rem; font-weight:600;" x-text="$store.genesisDashboard.approvalActionLabel(req)"></div>
+                    <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-top:0.15rem;"
+                         x-text="(req.context_data?.subsystem || 'unknown subsystem') + ' · ' + $store.genesisDashboard.relativeTime(req.created_at)"></div>
+                  </div>
+                  <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
+                    <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Reason</div>
+                    <div x-text="$store.genesisDashboard.approvalReasonLabel(req)"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">API Route</div>
+                    <div x-text="req.context_data?.api_call_site_id || 'none'"></div>
+                  </div>
+                  <div>
+                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Channel</div>
+                    <div x-text="req.context_data?.channel || 'dashboard-only'"></div>
+                  </div>
+                </div>
+                <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">
+                  <button type="button"
+                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(76,175,80,0.28); color:#4caf50; background:transparent; cursor:pointer;"
+                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                          @click="$store.genesisDashboard.resolveApproval(req.id, 'approved')"
+                          x-text="$store.genesisDashboard.approvalActionState(req.id).saving ? 'Saving...' : 'Approve'"></button>
+                  <button type="button"
+                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.28); color:#d9534f; background:transparent; cursor:pointer;"
+                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                          @click="$store.genesisDashboard.resolveApproval(req.id, 'rejected')">Reject</button>
+                </div>
+                <template x-if="$store.genesisDashboard.approvalActionState(req.id).error">
+                  <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;"
+                       x-text="$store.genesisDashboard.approvalActionState(req.id).error"></div>
+                </template>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+    </div>
+
     <!-- Panel: Awareness Signals (Collapsible) [Tab: internals] -->
-    <div class="panel" x-data="{ sigOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+    <div class="panel" x-data="{ sigOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="sigOpen = !sigOpen">
         <span class="material-symbols-outlined" :style="sigOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
         <span class="material-symbols-outlined">sensors</span>
@@ -4069,7 +4143,7 @@
     </div>
 
     <!-- Panel: Routing Health (Collapsible) [Tab: internals] -->
-    <div class="panel" id="routing-health" x-data="{ routingOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+    <div class="panel" id="routing-health" x-data="{ routingOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="routingOpen = !routingOpen">
         <span class="material-symbols-outlined" :style="routingOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
         <span class="material-symbols-outlined">route</span>
@@ -4242,82 +4316,8 @@
       </div>
     </div>
 
-    <!-- Panel: Approval Queue (Collapsible) [Tab: internals] -->
-    <div class="panel" id="approval-queue" x-data="{ approvalsOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
-      <div class="panel-header" style="cursor: pointer;" @click="approvalsOpen = !approvalsOpen">
-        <span class="material-symbols-outlined" :style="approvalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
-        <span class="material-symbols-outlined">approval</span>
-        Approval Queue
-        <span class="panel-status">
-          <template x-if="$store.genesisDashboard.pendingApprovalCount > 0">
-            <span style="font-size: 0.68rem; opacity: 0.7;"
-                  x-text="$store.genesisDashboard.pendingApprovalCount + ' pending'"></span>
-          </template>
-          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('approvals')}`"></span>
-          <span x-text="$store.genesisDashboard.panelStateLabel('approvals')"></span>
-        </span>
-      </div>
-      <div class="panel-body" x-show="approvalsOpen" x-transition>
-        <template x-if="$store.genesisDashboard.panelStatusDetail('approvals')">
-          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('approvals')"></div>
-        </template>
-        <template x-if="$store.genesisDashboard.approvals.length === 0">
-          <div class="empty-state">No pending approvals.</div>
-        </template>
-        <template x-if="$store.genesisDashboard.approvals.length > 0">
-          <div style="display:grid; gap:0.6rem;">
-            <template x-for="req in $store.genesisDashboard.approvals" :key="req.id">
-              <div style="padding:0.65rem 0.75rem; border-radius:6px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03);">
-                <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.6rem; margin-bottom:0.35rem;">
-                  <div>
-                    <div style="font-size:0.8rem; font-weight:600;" x-text="$store.genesisDashboard.approvalActionLabel(req)"></div>
-                    <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-top:0.15rem;"
-                         x-text="(req.context_data?.subsystem || 'unknown subsystem') + ' · ' + $store.genesisDashboard.relativeTime(req.created_at)"></div>
-                  </div>
-                  <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
-                </div>
-                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
-                    <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Reason</div>
-                    <div x-text="$store.genesisDashboard.approvalReasonLabel(req)"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">API Route</div>
-                    <div x-text="req.context_data?.api_call_site_id || 'none'"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Channel</div>
-                    <div x-text="req.context_data?.channel || 'dashboard-only'"></div>
-                  </div>
-                </div>
-                <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">
-                  <button type="button"
-                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(76,175,80,0.28); color:#4caf50; background:transparent; cursor:pointer;"
-                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
-                          @click="$store.genesisDashboard.resolveApproval(req.id, 'approved')"
-                          x-text="$store.genesisDashboard.approvalActionState(req.id).saving ? 'Saving...' : 'Approve'"></button>
-                  <button type="button"
-                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.28); color:#d9534f; background:transparent; cursor:pointer;"
-                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
-                          @click="$store.genesisDashboard.resolveApproval(req.id, 'rejected')">Reject</button>
-                </div>
-                <template x-if="$store.genesisDashboard.approvalActionState(req.id).error">
-                  <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;"
-                       x-text="$store.genesisDashboard.approvalActionState(req.id).error"></div>
-                </template>
-              </div>
-            </template>
-          </div>
-        </template>
-      </div>
-    </div>
-
     <!-- Panel: Job Health (Collapsible) [Tab: internals] -->
-    <div class="panel" x-data="{ jobsOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+    <div class="panel" x-data="{ jobsOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="jobsOpen = !jobsOpen">
         <span class="material-symbols-outlined" :style="jobsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
         <span class="material-symbols-outlined">schedule</span>
@@ -4397,7 +4397,7 @@
     </div>
 
     <!-- Panel: Drives & Thresholds (Collapsible) [Tab: internals] -->
-    <div class="panel" x-data="{ drivesOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+    <div class="panel" x-data="{ drivesOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="drivesOpen = !drivesOpen">
         <span class="material-symbols-outlined" :style="drivesOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
         <span class="material-symbols-outlined">tune</span>
@@ -4582,7 +4582,7 @@
     </div>
 
     <!-- Panel: Operational Vitals (Collapsible) [Tab: internals] -->
-    <div class="panel" x-data="{ vitalsOpen: false, llmOpen: true, embedOpen: true, qdOpen: false, sqlOpen: false, mcpOpen: false, onpremOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+    <div class="panel" x-data="{ vitalsOpen: true, llmOpen: true, embedOpen: true, qdOpen: false, sqlOpen: false, mcpOpen: false, onpremOpen: false }" x-show="$store.genesisDashboard.activeTab === 'internals'">
       <div class="panel-header" style="cursor: pointer;" @click="vitalsOpen = !vitalsOpen">
         <span class="material-symbols-outlined" :style="vitalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
         <span class="material-symbols-outlined">monitoring</span>
@@ -5781,7 +5781,7 @@
                   <div>
                     <span style="font-weight: 600; font-size: 0.85rem;" x-text="msg.topic || msg.signal_type || 'Untitled'"></span>
                     <span style="font-size: 0.68rem; padding: 0.1rem 0.3rem; border-radius: 3px; margin-left: 0.3rem;"
-                          :style="`background: ${msg.category === 'blocker' ? '#d9534f33' : msg.category === 'alert' ? '#f0ad4e33' : msg.category === 'digest' ? '#2196F333' : '#4caf5033'}; color: ${msg.category === 'blocker' ? '#d9534f' : msg.category === 'alert' ? '#f0ad4e' : msg.category === 'digest' ? '#2196F3' : '#4caf50'}`"
+                          :style="`background: ${(msg.category === 'blocker' || msg.category === 'approval') ? '#d9534f33' : msg.category === 'alert' ? '#f0ad4e33' : msg.category === 'digest' ? '#2196F333' : '#4caf5033'}; color: ${(msg.category === 'blocker' || msg.category === 'approval') ? '#d9534f' : msg.category === 'alert' ? '#f0ad4e' : msg.category === 'digest' ? '#2196F3' : '#4caf50'}`"
                           x-text="msg.category"></span>
                   </div>
                   <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
@@ -5796,7 +5796,7 @@
                           x-text="'Currently: ' + (msg.engagement_outcome === 'ignored' ? 'ignored (auto)' : msg.user_response || msg.engagement_outcome)"></span>
                   </template>
                   <!-- Blocker: Approve/Deny — wire to approval API when matching -->
-                  <template x-if="msg.category === 'blocker'">
+                  <template x-if="msg.category === 'blocker' || msg.category === 'approval'">
                     <div style="display: flex; gap: 0.3rem; align-items: center;">
                       <template x-for="btn in [{value: 'approved', label: 'Approve', color: '#4caf50'}, {value: 'rejected', label: 'Deny', color: '#d9534f'}]" :key="btn.value">
                         <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
@@ -5817,7 +5817,7 @@
                             x-text="msg.engagement_outcome === 'useful' ? 'Acknowledged' : 'Acknowledge'"></button>
                   </template>
                   <!-- Digest/Surplus: Useful/Not Useful/Ambivalent -->
-                  <template x-if="msg.category !== 'blocker' && msg.category !== 'alert'">
+                  <template x-if="msg.category !== 'blocker' && msg.category !== 'alert' && msg.category !== 'approval'">
                     <div style="display: flex; gap: 0.3rem;">
                       <template x-for="btn in [{value: 'useful', label: 'Useful', color: '#4caf50'}, {value: 'not_useful', label: 'Not Useful', color: '#d9534f'}, {value: 'ambivalent', label: 'Ambivalent', color: '#888'}]" :key="btn.value">
                         <button style="font-size: 0.68rem; padding: 0.2rem 0.5rem; border-radius: 3px; cursor: pointer; transition: all 0.15s;"
@@ -5829,7 +5829,7 @@
                   </template>
                 </div>
                 <div style="font-size: 0.62rem; color: var(--color-text-secondary); margin-top: 0.15rem; opacity: 0.7;"
-                     x-text="msg.category === 'blocker' ? 'Approve or deny this request' : msg.category === 'alert' ? 'Acknowledge to dismiss' : msg.category === 'digest' ? 'Feedback shapes report content over time' : 'Feedback guides task prioritization'"></div>
+                     x-text="(msg.category === 'blocker' || msg.category === 'approval') ? 'Approve or deny this request' : msg.category === 'alert' ? 'Acknowledge to dismiss' : msg.category === 'digest' ? 'Feedback shapes report content over time' : 'Feedback guides task prioritization'"></div>
               </div>
             </template>
           </div>
