@@ -32,7 +32,7 @@ class TestFullPipeline:
         class FakeExecutor:
             async def execute(self, task):
                 return ExecutorResult(
-                    success=True, content="test insight",
+                    success=True, content="Test surplus insight with sufficient content length to pass the quality gate",
                     insights=[{"generating_model": "test-model", "confidence": 0.8}],
                 )
 
@@ -64,7 +64,7 @@ class TestFullPipeline:
         class FakeExecutor:
             async def execute(self, task):
                 return ExecutorResult(
-                    success=True, content="test insight",
+                    success=True, content="Test surplus insight with sufficient content length to pass the quality gate",
                     insights=[{"generating_model": "test-model", "confidence": 0.8}],
                 )
 
