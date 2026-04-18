@@ -533,6 +533,11 @@ class SentinelDispatcher:
 
         if status == "rejected":
             self._state.clear_pending()
+            self._state.transition(
+                SentinelState.ESCALATED,
+                reason="user rejected proposed actions",
+            )
+            save_state(self._state)
             append_log({"event": "actions_rejected", "request_id": request_id})
             return SentinelResult(
                 dispatched=True,
@@ -660,28 +665,29 @@ class SentinelDispatcher:
 
         Called by the awareness loop when it finds an approved sentinel
         approval row. Returns None if the state doesn't match (stale resume).
+        All state reads and mutations are lock-protected.
         """
         if status == "rejected":
             return await self.handle_approval_resolution(request_id, "rejected")
 
-        policy_id = self._state.pending_policy_id
-        if not policy_id or self._state.pending_request_id != request_id:
-            logger.warning(
-                "Sentinel resume: request_id %s doesn't match pending %s — skipping",
-                request_id, self._state.pending_request_id,
-            )
-            return None
-
-        pattern = self._state.pending_pattern
-        request = _deserialize_request(self._state.pending_request_json)
-        if request is None:
-            logger.error("Sentinel resume: failed to deserialize pending request")
-            self._state.clear_pending()
-            self._state.transition(SentinelState.HEALTHY, reason="resume failed: bad pending data")
-            save_state(self._state)
-            return None
-
         async with self._lock:
+            policy_id = self._state.pending_policy_id
+            if not policy_id or self._state.pending_request_id != request_id:
+                logger.warning(
+                    "Sentinel resume: request_id %s doesn't match pending %s — skipping",
+                    request_id, self._state.pending_request_id,
+                )
+                return None
+
+            pattern = self._state.pending_pattern
+            request = _deserialize_request(self._state.pending_request_json)
+            if request is None:
+                logger.error("Sentinel resume: failed to deserialize pending request")
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason="resume failed: bad pending data")
+                save_state(self._state)
+                return None
+
             if policy_id == "sentinel_dispatch":
                 logger.info("Resuming sentinel dispatch after approval %s", request_id)
                 return await self._phase2_cc_and_actions(request, pattern=pattern)
@@ -712,29 +718,31 @@ class SentinelDispatcher:
         """Handle a rejected or cancelled approval.
 
         Called by the awareness loop or alarm-clearing cancellation.
+        Lock-protected to prevent races with check_fire_alarms.
         """
-        if self._state.pending_request_id != request_id:
-            return None
+        async with self._lock:
+            if self._state.pending_request_id != request_id:
+                return None
 
-        pattern = self._state.pending_pattern
-        policy_id = self._state.pending_policy_id
+            pattern = self._state.pending_pattern
+            policy_id = self._state.pending_policy_id
 
-        if status == "rejected":
-            if pattern:
-                expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
-                self._state.rejected_patterns[pattern] = expiry
-            self._state.clear_pending()
-            self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} rejected by user")
-            save_state(self._state)
-            append_log({"event": f"{policy_id}_rejected", "request_id": request_id})
-            return SentinelResult(dispatched=False, reason=f"{policy_id} rejected")
+            if status == "rejected":
+                if pattern:
+                    expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+                    self._state.rejected_patterns[pattern] = expiry
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} rejected by user")
+                save_state(self._state)
+                append_log({"event": f"{policy_id}_rejected", "request_id": request_id})
+                return SentinelResult(dispatched=False, reason=f"{policy_id} rejected")
 
-        if status == "cancelled":
-            self._state.clear_pending()
-            self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} cancelled (alarm cleared)")
-            save_state(self._state)
-            append_log({"event": f"{policy_id}_cancelled", "request_id": request_id})
-            return SentinelResult(dispatched=False, reason=f"{policy_id} cancelled: alarm cleared")
+            if status == "cancelled":
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} cancelled (alarm cleared)")
+                save_state(self._state)
+                append_log({"event": f"{policy_id}_cancelled", "request_id": request_id})
+                return SentinelResult(dispatched=False, reason=f"{policy_id} cancelled: alarm cleared")
 
         return None
 
@@ -1259,9 +1267,10 @@ class SentinelDispatcher:
                 except Exception:
                     logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
             logger.info("Alarms cleared — cancelling pending sentinel approval %s", request_id)
-            self._state.clear_pending()
-            self._state.transition(SentinelState.HEALTHY, reason="alarms cleared while awaiting approval")
-            save_state(self._state)
+            async with self._lock:
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason="alarms cleared while awaiting approval")
+                save_state(self._state)
             return None
 
         if not alarms:

@@ -1,10 +1,12 @@
-"""Sentinel state machine — 4-state lifecycle for the container-side guardian.
+"""Sentinel state machine — 6-state lifecycle for the container-side guardian.
 
 States:
-  HEALTHY       — No fire alarms, everything normal
-  INVESTIGATING — Fire alarm detected, evaluating conditions and trying reflexes
-  REMEDIATING   — Reflexes failed, CC diagnosis session dispatched
-  ESCALATED     — CC failed, observation created for ego. Auto-resets after timeout.
+  HEALTHY                    — No fire alarms, everything normal
+  INVESTIGATING              — Fire alarm detected, evaluating conditions
+  REMEDIATING                — CC diagnosis session dispatched
+  ESCALATED                  — CC failed, observation created for ego
+  AWAITING_DISPATCH_APPROVAL — Dispatch approval pending (DB-backed)
+  AWAITING_ACTION_APPROVAL   — Action approval pending (DB-backed)
 
 Persistence: atomic JSON write to ~/.genesis/sentinel_state.json
 """
