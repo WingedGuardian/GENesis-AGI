@@ -297,7 +297,7 @@ class SurplusScheduler:
             pending = await self._queue.pending_by_type(TaskType.CODE_INDEX)
             if pending == 0:
                 await self._queue.enqueue(
-                    TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.3, "competence"
+                    TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.6, "competence"
                 )
             try:
                 from genesis.runtime import GenesisRuntime
