@@ -41,19 +41,20 @@ def _approval_key(
     subsystem: str,
     policy_id: str,
     action_label: str,
-    invocation: CCInvocation,
+    invocation: CCInvocation | None = None,
     extra: dict[str, Any] | None = None,
 ) -> str:
-    payload = {
+    payload: dict[str, Any] = {
         "subsystem": subsystem,
         "policy_id": policy_id,
         "action_label": action_label,
-        "prompt": invocation.prompt,
-        "model": str(invocation.model),
-        "effort": str(invocation.effort),
-        "system_prompt": invocation.system_prompt or "",
-        "working_dir": invocation.working_dir or "",
     }
+    if invocation is not None:
+        payload["prompt"] = invocation.prompt
+        payload["model"] = str(invocation.model)
+        payload["effort"] = str(invocation.effort)
+        payload["system_prompt"] = invocation.system_prompt or ""
+        payload["working_dir"] = invocation.working_dir or ""
     if extra:
         payload["extra"] = extra
     raw = json.dumps(payload, sort_keys=True)
@@ -169,14 +170,19 @@ class AutonomousCliApprovalGate:
         subsystem: str,
         policy_id: str,
         action_label: str,
-        invocation: CCInvocation,
-        api_call_site_id: str | None,
-        api_error: str | None,
+        invocation: CCInvocation | None = None,
+        api_call_site_id: str | None = None,
+        api_error: str | None = None,
         extra_context: dict[str, Any] | None = None,
+        action_type: str = "autonomous_cli_fallback",
     ) -> tuple[str, str | None, str]:
         """Return ``(status, request_id, reason)`` for CLI fallback.
 
         Status is one of: ``approved``, ``pending``, ``rejected``.
+
+        For sentinel approvals, pass ``action_type="sentinel_dispatch"``
+        or ``"sentinel_action"`` and include sentinel-specific details
+        in ``extra_context``.
         """
         policy = self._policy()
         if not policy.manual_approval_required:
@@ -202,14 +208,14 @@ class AutonomousCliApprovalGate:
                 self._delivery_to_request[str(delivery_id)] = request_id
             if status == "approved":
                 logger.info(
-                    "Autonomous CLI fallback pre-approved for %s (%s)",
-                    policy_id, request_id,
+                    "%s pre-approved for %s (%s)",
+                    action_type, policy_id, request_id,
                 )
                 return ("approved", request_id, "existing approval found")
             if status == "rejected":
                 logger.info(
-                    "Autonomous CLI fallback previously rejected for %s (%s)",
-                    policy_id, request_id,
+                    "%s previously rejected for %s (%s)",
+                    action_type, policy_id, request_id,
                 )
                 return ("rejected", request_id, "existing rejection found")
 
@@ -226,17 +232,22 @@ class AutonomousCliApprovalGate:
                 return ("pending", request_id, "approval pending; reminder sent")
             return ("pending", request_id, "approval pending")
 
-        description = f"Approve autonomous Claude Code fallback for {action_label}?"
+        description = (
+            f"Approve {action_label}?"
+            if action_type.startswith("sentinel_")
+            else f"Approve autonomous Claude Code fallback for {action_label}?"
+        )
         context = {
             "kind": "autonomous_cli_fallback",
             "approval_key": approval_key,
             "subsystem": subsystem,
             "policy_id": policy_id,
             "action_label": action_label,
+            "action_type": action_type,
             "api_call_site_id": api_call_site_id,
             "api_error": api_error,
-            "model": str(invocation.model),
-            "effort": str(invocation.effort),
+            "model": str(invocation.model) if invocation else None,
+            "effort": str(invocation.effort) if invocation else None,
             "channel": policy.approval_channel,
             "delivery_id": None,
             "last_sent_at": None,
@@ -246,7 +257,7 @@ class AutonomousCliApprovalGate:
             context["extra"] = extra_context
 
         request_id = await self._approval_manager.request_approval(
-            action_type="autonomous_cli_fallback",
+            action_type=action_type,
             action_class="costly_reversible",
             description=description,
             context=_context_dump(context),
@@ -485,15 +496,16 @@ class AutonomousCliApprovalGate:
         )
 
     async def get_pending_count(self) -> int:
-        """Return the count of pending autonomous_cli_fallback approvals.
+        """Return the count of pending approvals (CLI fallback + sentinel).
 
         Used by ``_send_request`` to decide whether to include the
         "✅✅ Approve all N pending" batch button in the inline keyboard.
         """
+        _GATED_TYPES = {"autonomous_cli_fallback", "sentinel_dispatch", "sentinel_action"}
         pending = await self._approval_manager.get_pending()
         return sum(
             1 for req in pending
-            if req.get("action_type") == "autonomous_cli_fallback"
+            if req.get("action_type") in _GATED_TYPES
         )
 
     async def _maybe_resend(
@@ -504,7 +516,7 @@ class AutonomousCliApprovalGate:
         subsystem: str,
         policy_id: str,
         action_label: str,
-        invocation: CCInvocation,
+        invocation: CCInvocation | None,
         api_error: str | None,
     ) -> bool:
         next_reask_at = context.get("next_reask_at")
@@ -534,7 +546,7 @@ class AutonomousCliApprovalGate:
         request_id: str,
         context: dict[str, Any],
         action_label: str,
-        invocation: CCInvocation,
+        invocation: CCInvocation | None,
         api_error: str | None,
     ) -> None:
         """Deliver an approval notification via the outreach pipeline.
@@ -587,6 +599,8 @@ class AutonomousCliApprovalGate:
                 invocation=invocation,
                 api_error=api_error,
                 pending_count=pending_count,
+                action_type=context.get("action_type", "autonomous_cli_fallback"),
+                extra_context=context.get("extra"),
             )
 
             # Build inline keyboard — lazy import to keep the module
@@ -673,24 +687,68 @@ class AutonomousCliApprovalGate:
         *,
         request_id: str,
         action_label: str,
-        invocation: CCInvocation,
+        invocation: CCInvocation | None,
         api_error: str | None,
         pending_count: int = 1,
+        action_type: str = "autonomous_cli_fallback",
+        extra_context: dict[str, Any] | None = None,
     ) -> str:
-        lines = [
-            "<b>Approval Needed</b>",
-            "",
-            f"Approve autonomous Claude Code fallback for <b>{action_label}</b>?",
-            f"Request ID: <code>{request_id}</code>",
-            f"Model: <code>{invocation.model}</code>",
-            f"Effort: <code>{invocation.effort}</code>",
-        ]
-        if api_error:
-            lines.extend([
+        extra = extra_context or {}
+
+        # Sentinel-specific message formatting
+        if action_type == "sentinel_dispatch":
+            tier_label = extra.get("tier_label", "Unknown tier")
+            trigger_source = extra.get("trigger_source", "unknown")
+            trigger_reason = extra.get("trigger_reason", "")
+            lines = [
+                "<b>Sentinel Activation Request</b>",
                 "",
-                "<b>Why CLI fallback is being considered</b>",
-                api_error[:500],
-            ])
+                f"The Sentinel detected a <b>{tier_label}</b> fire alarm and "
+                f"wants to investigate and fix the issue.",
+                "",
+                f"<b>Trigger:</b> {trigger_source}",
+                f"<b>Reason:</b> {trigger_reason}",
+                f"Request ID: <code>{request_id}</code>",
+            ]
+        elif action_type == "sentinel_action":
+            diagnosis = extra.get("diagnosis", "")[:200]
+            actions = extra.get("proposed_actions", [])
+            action_lines = []
+            for i, action in enumerate(actions[:5], 1):
+                desc = action.get("description", "Unknown action")
+                cmd = action.get("command", "")
+                safe = "safe" if action.get("safe") else "potentially unsafe"
+                action_lines.append(f"{i}. {desc}\n   <code>{cmd}</code> ({safe})")
+            lines = [
+                "<b>Sentinel Action Approval</b>",
+                "",
+                f"<b>Diagnosis:</b> {diagnosis}",
+                "",
+                "<b>Proposed actions:</b>",
+                *action_lines,
+                "",
+                f"Request ID: <code>{request_id}</code>",
+            ]
+        else:
+            # Default: autonomous CLI fallback message
+            lines = [
+                "<b>Approval Needed</b>",
+                "",
+                f"Approve autonomous Claude Code fallback for <b>{action_label}</b>?",
+                f"Request ID: <code>{request_id}</code>",
+            ]
+            if invocation:
+                lines.extend([
+                    f"Model: <code>{invocation.model}</code>",
+                    f"Effort: <code>{invocation.effort}</code>",
+                ])
+            if api_error:
+                lines.extend([
+                    "",
+                    "<b>Why CLI fallback is being considered</b>",
+                    api_error[:500],
+                ])
+
         lines.extend([
             "",
             "Tap ✅ below, or type <code>approve</code> in the Approvals "

@@ -30,6 +30,8 @@ class SentinelState(Enum):
     INVESTIGATING = "investigating"
     REMEDIATING = "remediating"
     ESCALATED = "escalated"
+    AWAITING_DISPATCH_APPROVAL = "awaiting_dispatch_approval"
+    AWAITING_ACTION_APPROVAL = "awaiting_action_approval"
 
 
 @dataclass
@@ -59,6 +61,14 @@ class SentinelStateData:
     # Rejection tracking — pattern → ISO timestamp when suppression expires.
     # Prevents rejected dispatch patterns from re-triggering within the window.
     rejected_patterns: dict[str, str] = field(default_factory=dict)
+
+    # Pending approval context — serialized so it survives restarts.
+    # Populated when entering AWAITING_DISPATCH_APPROVAL or AWAITING_ACTION_APPROVAL.
+    pending_request_id: str = ""
+    pending_policy_id: str = ""  # "sentinel_dispatch" or "sentinel_action"
+    pending_pattern: str = ""
+    pending_request_json: str = ""  # JSON-serialized SentinelRequest fields
+    pending_cc_result_json: str = ""  # JSON-serialized CC result (for action phase)
 
     # Bootstrap grace
     bootstrap_grace_s: int = 240
@@ -92,6 +102,14 @@ class SentinelStateData:
     def record_cc_dispatch(self) -> None:
         """Stamp the last dispatch time. Used for observability only."""
         self.last_cc_dispatch_at = datetime.now(UTC).isoformat()
+
+    def clear_pending(self) -> None:
+        """Clear all pending approval context fields."""
+        self.pending_request_id = ""
+        self.pending_policy_id = ""
+        self.pending_pattern = ""
+        self.pending_request_json = ""
+        self.pending_cc_result_json = ""
 
     def should_auto_reset_escalated(self) -> bool:
         """Check if ESCALATED state should auto-reset to HEALTHY."""
