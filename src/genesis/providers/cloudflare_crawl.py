@@ -1,4 +1,10 @@
-"""ToolProvider adapter for Cloudflare Browser Rendering /crawl endpoint."""
+"""ToolProvider adapter for Cloudflare Browser Run (formerly Browser Rendering).
+
+Supports:
+- /crawl — async multi-page crawl to Markdown (original)
+- /markdown — single-page JS-rendered markdown extraction (Quick Action)
+- /json — AI-powered structured data extraction (Quick Action)
+"""
 
 from __future__ import annotations
 
@@ -24,14 +30,14 @@ _POLL_TIMEOUT = 120.0
 
 
 class CloudflareCrawlAdapter:
-    """Cloudflare /crawl endpoint — whole-site crawl to Markdown."""
+    """Cloudflare Browser Run — crawl, markdown extraction, and structured data."""
 
     name = "cloudflare_crawl"
     capability = ProviderCapability(
-        content_types=("web_page", "crawl"),
+        content_types=("web_page", "crawl", "markdown", "structured_data"),
         categories=(ProviderCategory.WEB,),
         cost_tier=CostTier.FREE,
-        description="Cloudflare /crawl — whole-site crawling to Markdown",
+        description="Cloudflare Browser Run — crawl, markdown, and AI extraction",
     )
 
     def __init__(self) -> None:
@@ -50,8 +56,11 @@ class CloudflareCrawlAdapter:
             self._client = httpx.AsyncClient(timeout=30.0)
         return self._client
 
+    def _endpoint_url(self, account_id: str, endpoint: str) -> str:
+        return f"{_BASE_URL.format(account_id=account_id)}/{endpoint}"
+
     def _crawl_url(self, account_id: str) -> str:
-        return f"{_BASE_URL.format(account_id=account_id)}/crawl"
+        return self._endpoint_url(account_id, "crawl")
 
     async def check_health(self) -> ProviderStatus:
         """HEAD request to crawl endpoint to verify auth and availability."""
@@ -198,6 +207,82 @@ class CloudflareCrawlAdapter:
                 error=str(exc),
                 latency_ms=latency,
                 provider_name=self.name,
+            )
+
+    # ── Quick Actions (stateless, no polling) ───────────────────
+
+    async def fetch_markdown(self, url: str) -> ProviderResult:
+        """Render a URL via headless Chrome and return clean Markdown."""
+        return await self._quick_action("markdown", url)
+
+    async def fetch_json(
+        self, url: str, prompt: str, *, schema: dict | None = None,
+    ) -> ProviderResult:
+        """AI-powered structured data extraction from a rendered page."""
+        payload: dict = {"url": url, "prompt": prompt}
+        if schema:
+            payload["response_format"] = schema
+        return await self._quick_action("json", url, extra_payload=payload)
+
+    async def _quick_action(
+        self, endpoint: str, url: str, *, extra_payload: dict | None = None,
+    ) -> ProviderResult:
+        """POST to a Quick Actions endpoint and return the result."""
+        start = time.monotonic()
+        try:
+            api_key, account_id = self._get_config()
+        except ValueError as exc:
+            return ProviderResult(
+                success=False, error=str(exc),
+                latency_ms=round((time.monotonic() - start) * 1000, 2),
+                provider_name=self.name,
+            )
+
+        if not url.startswith(("http://", "https://")):
+            return ProviderResult(
+                success=False,
+                error=f"URL must use http:// or https:// scheme, got: {url[:50]}",
+                latency_ms=round((time.monotonic() - start) * 1000, 2),
+                provider_name=self.name,
+            )
+
+        payload = extra_payload or {"url": url}
+        if "url" not in payload:
+            payload["url"] = url
+
+        try:
+            client = self._get_client()
+            resp = await client.post(
+                self._endpoint_url(account_id, endpoint),
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            body = resp.json()
+            latency = round((time.monotonic() - start) * 1000, 2)
+
+            result_data = body.get("result", body.get("data", body))
+            return ProviderResult(
+                success=True, data=result_data,
+                latency_ms=latency, provider_name=self.name,
+            )
+        except httpx.HTTPStatusError as exc:
+            latency = round((time.monotonic() - start) * 1000, 2)
+            logger.error("Cloudflare %s HTTP error: %s", endpoint, exc.response.status_code)
+            return ProviderResult(
+                success=False,
+                error=f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+                latency_ms=latency, provider_name=self.name,
+            )
+        except Exception as exc:
+            latency = round((time.monotonic() - start) * 1000, 2)
+            logger.error("Cloudflare %s failed", endpoint, exc_info=True)
+            return ProviderResult(
+                success=False, error=str(exc),
+                latency_ms=latency, provider_name=self.name,
             )
 
     async def _poll_job(

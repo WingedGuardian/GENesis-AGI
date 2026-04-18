@@ -23,6 +23,8 @@ dependencies = [
                          # (Genesis uses stdio transport only, no OpenAPI/OAuth/CLI features)
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
+    "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
+    "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
 ]
 
 [project.optional-dependencies]
