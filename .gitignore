@@ -63,6 +63,10 @@ data/genesis.sql
 .claude/scheduled_tasks.lock
 *.bak
 
+# Local-only modules (not for public repo)
+src/genesis/modules/automaton_supervisor/
+config/modules/automaton-supervisor.yaml
+
 # Personal/internal content (private by default)
 docs/reflections/
 docs/plans/
