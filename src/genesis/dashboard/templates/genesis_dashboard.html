@@ -134,6 +134,7 @@
           fileDirty: false,
           saving: false,
           sidebarCollapsed: false,
+          _resizing: false,
         },
 
         // ── Tasks tab state ────────────────────────────────────────
@@ -585,6 +586,24 @@
             else { const d = await resp.json(); alert(d.error || "Save failed"); }
           } catch (e) { alert("Save failed: " + e.message); }
           this.fileBrowser.saving = false;
+        },
+        _startFileBrowserResize(e, sidebar) {
+          this.fileBrowser._resizing = true;
+          const startX = e.clientX;
+          const startW = sidebar.offsetWidth;
+          const container = sidebar.parentElement;
+          const maxW = container.offsetWidth * 0.6;
+          const onMove = (ev) => {
+            const newW = Math.max(150, Math.min(maxW, startW + ev.clientX - startX));
+            sidebar.style.flex = '0 0 ' + newW + 'px';
+          };
+          const onUp = () => {
+            this.fileBrowser._resizing = false;
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+          };
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
         },
 
         // ── Tasks tab fetches ─────────────────────────────────────
@@ -1245,6 +1264,22 @@
         },
         _settingDesc(key) {
           return this._SETTING_DESCS[key] || '';
+        },
+
+        // ── Color helpers for Knowledge & Memory tabs ──────────────
+        _domainColor(d) {
+          const m = {ai_research:'#60a5fa', professional:'#4ade80', genesis:'#a78bfa',
+                     security:'#f87171', finance:'#fbbf24', general:'#94a3b8',
+                     career:'#34d399', technology:'#38bdf8', science:'#c084fc'};
+          return m[d] || '#6b7280';
+        },
+        _tierColor(t) {
+          return {curated:'#fbbf24', validated:'#4ade80', raw:'#6b7280', promoted:'#60a5fa'}[t] || '#6b7280';
+        },
+        _memoryTypeColor(t) {
+          const m = {episodic_memory:'#60a5fa', semantic_memory:'#4ade80', procedural:'#f59e0b',
+                     core_fact:'#a78bfa', episodic:'#60a5fa', semantic:'#4ade80'};
+          return m[t] || '#6b7280';
         },
 
         async fetchRoutingConfig() {
@@ -5201,7 +5236,7 @@
               </div>
               <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.55rem;">
                 <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid rgba(33,150,243,0.28); color:#2196F3; background:transparent; cursor:pointer;"
-                        @click="$store.genesisDashboard.fetchSettingsData('autonomous_cli_policy'); $store.genesisDashboard.settingsEditing = 'autonomous_cli_policy'">Edit policy</button>
+                        @click="$store.genesisDashboard.fetchSettingsData('autonomous_cli_policy'); $store.genesisDashboard.settingsEditing = 'autonomous_cli_policy'; $nextTick(() => { const el = document.querySelector('[data-settings-domain=autonomous_cli_policy]'); if (el) el.scrollIntoView({behavior:'smooth', block:'center'}); })">Edit policy</button>
                 <button style="font-size:0.76rem; padding:0.28rem 0.55rem; border-radius:4px; border:1px solid var(--color-border); color:var(--color-text-secondary); background:transparent; cursor:pointer;"
                         @click="$store.genesisDashboard.fetchAutonomousCliPolicy()">Refresh status</button>
               </div>
@@ -5235,7 +5270,7 @@
           <div>
             <!-- Form domains (TTS, Ego, Inbox, Outreach) -->
             <template x-for="domain in $store.genesisDashboard.settingsDomains.filter(d => d.has_form)" :key="domain.name">
-              <div class="card" style="padding:1rem; margin-bottom:0.75rem;">
+              <div class="card" :data-settings-domain="domain.name" style="padding:1rem; margin-bottom:0.75rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
                   <div>
                     <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
@@ -5243,7 +5278,7 @@
                   </div>
                   <div style="display:flex; gap:0.5rem; align-items:center;">
                     <template x-if="domain.needs_restart">
-                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">Restart Genesis server to apply</span>
+                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>
                     </template>
                     <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
                       <button style="font-size:0.75rem; padding:2px 10px;" @click="$store.genesisDashboard.startEditSettings(domain.name)">Edit</button>
@@ -5401,7 +5436,7 @@
                           <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px;">locked</span>
                         </template>
                         <template x-if="domain.needs_restart && !domain.readonly">
-                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Restart Genesis server to apply</span>
+                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>
                         </template>
                         <template x-if="!domain.readonly && !domain.needs_restart">
                           <span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span>
@@ -6236,10 +6271,11 @@
                   x-text="$store.genesisDashboard.fileBrowser.sidebarCollapsed ? 'Show Files' : 'Hide Files'"></button>
         </div>
 
-        <div style="display:flex; gap:1rem;">
+        <div style="display:flex;">
           <!-- Directory listing -->
           <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
-               style="flex:0 0 30%; max-height:calc(100vh - 280px); overflow-y:auto; border-right:1px solid var(--color-border); padding-right:0.75rem;">
+               x-ref="fileBrowserSidebar"
+               style="flex:0 0 260px; max-height:calc(100vh - 280px); overflow-y:auto; padding-right:0.5rem;">
             <template x-if="$store.genesisDashboard.fileBrowser.loading">
               <div style="color:var(--color-text-secondary); font-size:0.75rem; padding:1rem;">Loading...</div>
             </template>
@@ -6259,6 +6295,15 @@
                       x-text="entry.size > 1024*1024 ? (entry.size/1024/1024).toFixed(1)+'MB' : entry.size > 1024 ? (entry.size/1024).toFixed(1)+'KB' : entry.size+'B'"></span>
               </div>
             </template>
+          </div>
+
+          <!-- Resize handle -->
+          <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
+               style="flex:0 0 4px; cursor:col-resize; background:var(--color-border); border-radius:2px;
+                      transition:background .15s; position:relative; z-index:5; margin:0 2px;"
+               @mouseenter="$el.style.background='var(--color-accent)'"
+               @mouseleave="if(!$store.genesisDashboard.fileBrowser._resizing) $el.style.background='var(--color-border)'"
+               @mousedown.prevent="$store.genesisDashboard._startFileBrowserResize($event, $refs.fileBrowserSidebar)">
           </div>
 
           <!-- File viewer -->
@@ -6481,10 +6526,16 @@
               Search Results (<span x-text="$store.genesisDashboard.memorySearch.results.length"></span>)
             </div>
             <template x-for="r in $store.genesisDashboard.memorySearch.results" :key="r.memory_id">
-              <div style="padding:0.5rem; border-top:1px solid var(--color-border); cursor:pointer;"
+              <div :style="`padding:0.5rem; border-top:1px solid var(--color-border); border-left:3px solid ${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)}; cursor:pointer; transition:background .15s;`"
+                   @mouseenter="$el.style.background='rgba(255,255,255,0.04)'"
+                   @mouseleave="$el.style.background=''"
                    @click="$store.genesisDashboard.viewMemoryDetail(r.memory_id)">
-                <div style="font-size:0.75rem; color:var(--color-accent);" x-text="r.memory_type + ' · score: ' + (r.score || '?')"></div>
-                <div style="font-size:0.85rem; white-space:pre-wrap; max-height:3rem; overflow:hidden;" x-text="r.content"></div>
+                <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.75rem;">
+                  <span :style="`padding:1px 5px; border-radius:3px; background:${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)}22; color:${$store.genesisDashboard._memoryTypeColor(r.memory_type || r.collection)};`"
+                        x-text="r.memory_type || r.collection"></span>
+                  <span style="color:var(--color-text-secondary);" x-text="'score: ' + (r.score || '?')"></span>
+                </div>
+                <div style="font-size:0.85rem; white-space:pre-wrap; max-height:3rem; overflow:hidden; margin-top:.25rem;" x-text="r.content"></div>
               </div>
             </template>
           </div>
@@ -6522,13 +6573,16 @@
             <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
           </template>
           <template x-for="m in $store.genesisDashboard.memoryRecent.items" :key="m.memory_id">
-            <div style="padding:0.5rem; border-top:1px solid var(--color-border); cursor:pointer;"
+            <div :style="`padding:0.5rem; border-top:1px solid var(--color-border); border-left:3px solid ${$store.genesisDashboard._memoryTypeColor(m.collection)}; cursor:pointer; transition:background .15s;`"
+                 @mouseenter="$el.style.background='rgba(255,255,255,0.04)'"
+                 @mouseleave="$el.style.background=''"
                  @click="$store.genesisDashboard.viewMemoryDetail(m.memory_id)">
-              <div style="display:flex; justify-content:space-between; font-size:0.7rem; color:var(--color-text-secondary);">
-                <span x-text="m.collection"></span>
-                <span x-text="m.created_at ? new Date(m.created_at).toLocaleString() : ''"></span>
+              <div style="display:flex; justify-content:space-between; align-items:center; font-size:0.7rem;">
+                <span :style="`padding:1px 5px; border-radius:3px; background:${$store.genesisDashboard._memoryTypeColor(m.collection)}22; color:${$store.genesisDashboard._memoryTypeColor(m.collection)};`"
+                      x-text="m.collection"></span>
+                <span style="color:var(--color-text-secondary);" x-text="m.created_at ? new Date(m.created_at).toLocaleString() : ''"></span>
               </div>
-              <div style="font-size:0.85rem; white-space:pre-wrap; max-height:2.5rem; overflow:hidden;" x-text="m.content"></div>
+              <div style="font-size:0.85rem; white-space:pre-wrap; max-height:2.5rem; overflow:hidden; margin-top:.25rem; line-height:1.4;" x-text="m.content"></div>
             </div>
           </template>
         </div>
@@ -6538,7 +6592,7 @@
     <!-- ═══════════════════════════════════════════════════════════
          Panel: Knowledge Base [Tab: knowledge]
          ═══════════════════════════════════════════════════════════ -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'" style="overflow: visible;">
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'" style="overflow-y: auto; max-height: calc(100vh - 180px);">
       <div class="panel-header">
         <span class="material-symbols-outlined">school</span>
         Knowledge Base
@@ -6699,14 +6753,17 @@
           <h4 style="margin-bottom: .5rem;">Search Results</h4>
           <div style="display: flex; flex-direction: column; gap: .5rem;">
             <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
-              <div style="background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem; cursor: pointer;"
+              <div :style="`background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(item.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+                   @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
+                   @mouseleave="$el.style.background=''"
                    @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
                 <div style="display: flex; justify-content: space-between; align-items: center;">
-                  <strong x-text="item.concept || item.unit_id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;"></strong>
-                  <span class="badge" x-text="item.domain"></span>
-                </div>
-                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;">
-                  <span x-text="item.source_pipeline || 'unknown'"></span>
+                  <strong x-text="item.concept || item.unit_id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%;"></strong>
+                  <div style="display:flex; gap:.35rem; align-items:center;">
+                    <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._domainColor(item.domain)}22; color:${$store.genesisDashboard._domainColor(item.domain)};`"
+                          x-text="item.domain"></span>
+                    <span class="badge" x-text="item.source_pipeline || 'unknown'"></span>
+                  </div>
                 </div>
                 <div style="font-size: .85em; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;"
                      x-text="(item.body || item.content || '').substring(0, 200)"></div>
@@ -6723,18 +6780,27 @@
       </template>
       <div style="display: flex; flex-direction: column; gap: .5rem;">
         <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
-          <div style="background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem; cursor: pointer;"
+          <div :style="`background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(unit.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+               @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
+               @mouseleave="$el.style.background=''"
                @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-              <strong x-text="unit.concept || unit.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;"></strong>
-              <span class="badge" x-text="unit.source_pipeline || 'unknown'"></span>
+              <strong x-text="unit.concept || unit.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%;"></strong>
+              <div style="display:flex; gap:.35rem; align-items:center;">
+                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._tierColor(unit.tier)}22; color:${$store.genesisDashboard._tierColor(unit.tier)};`"
+                      x-text="unit.tier || 'raw'"></span>
+                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._domainColor(unit.domain)}22; color:${$store.genesisDashboard._domainColor(unit.domain)};`"
+                      x-text="unit.domain"></span>
+              </div>
             </div>
-            <div style="font-size: .85em; color: var(--color-text-secondary);">
-              <span x-text="unit.domain"></span> |
-              <span x-text="unit.project_type"></span> |
-              <span x-text="unit.ingested_at?.substring(0, 10)"></span>
+            <div style="display:flex; justify-content:space-between; font-size: .8em; color: var(--color-text-secondary); margin-top:.25rem;">
+              <span>
+                <span x-text="unit.source_pipeline || 'unknown'" style="opacity:.7;"></span>
+                <span x-show="unit.project_type"> | <span x-text="unit.project_type"></span></span>
+              </span>
+              <span x-text="unit.ingested_at?.substring(0, 10)" style="opacity:.6;"></span>
             </div>
-            <div style="font-size: .85em; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;"
+            <div style="font-size: .85em; margin-top: .35rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height:1.4;"
                  x-text="(unit.body || '').substring(0, 200)"></div>
           </div>
         </template>
