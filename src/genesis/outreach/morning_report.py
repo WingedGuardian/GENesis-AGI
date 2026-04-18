@@ -206,6 +206,9 @@ class MorningReportGenerator:
             f"- Awareness: ticks_24h={awareness.get('ticks_24h', '?')}",
             f"- CC Sessions: foreground={cc.get('foreground_active', 0)}, background={cc.get('background_active', 0)}, failed_24h={cc.get('failed_24h', 0)}",
         ]
+        pending_embed = queues.get('pending_embeddings', 0)
+        if pending_embed and pending_embed > 100:
+            lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
         return "\n".join(lines)
 
     async def _get_activity_summary(self) -> str:
