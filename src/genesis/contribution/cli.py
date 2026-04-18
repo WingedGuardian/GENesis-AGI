@@ -231,6 +231,7 @@ async def _contribute_async(args: argparse.Namespace) -> int:
     san = scan_diff(
         commit.diff,
         protected_paths_yaml=repo_path / "config" / "protected_paths.yaml",
+        repo_root=repo_path,
     )
     print(f"  scanners run: {', '.join(san.scanners_run)}")
     print(f"  findings:     {len(san.findings)}")

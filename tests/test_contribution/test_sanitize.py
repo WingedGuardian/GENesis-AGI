@@ -409,6 +409,78 @@ def test_quoted_path_with_special_chars_normalized():
     assert normalized == "src/foo bar.py"
 
 
+def test_gitignored_path_blocks():
+    """Diff touching a gitignored path should be blocked when repo_root is set."""
+    diff = (
+        "diff --git a/src/genesis/modules/automaton_supervisor/module.py "
+        "b/src/genesis/modules/automaton_supervisor/module.py\n"
+        "--- a/src/genesis/modules/automaton_supervisor/module.py\n"
+        "+++ b/src/genesis/modules/automaton_supervisor/module.py\n"
+        "@@ -1 +1 @@\n+fix\n"
+    )
+    from pathlib import Path
+
+    r = sanitize.scan_diff(diff, repo_root=Path.cwd())
+    assert r.ok is False
+    assert any(f.kind == FindingKind.GITIGNORED_PATH for f in r.blocking())
+    assert "gitignored_paths" in r.scanners_run
+
+
+def test_gitignored_scanner_skips_without_repo_root():
+    """Without repo_root, the gitignored-paths scanner should not run."""
+    diff = (
+        "diff --git a/src/genesis/modules/automaton_supervisor/module.py "
+        "b/src/genesis/modules/automaton_supervisor/module.py\n"
+        "--- a/src/genesis/modules/automaton_supervisor/module.py\n"
+        "+++ b/src/genesis/modules/automaton_supervisor/module.py\n"
+        "@@ -1 +1 @@\n+fix\n"
+    )
+    r = sanitize.scan_diff(diff)
+    assert "gitignored_paths" not in r.scanners_run
+
+
+def test_non_gitignored_path_not_blocked():
+    """A normal tracked file should not trigger the gitignored-paths scanner."""
+    diff = (
+        "diff --git a/src/genesis/routing/cost_tracker.py "
+        "b/src/genesis/routing/cost_tracker.py\n"
+        "--- a/src/genesis/routing/cost_tracker.py\n"
+        "+++ b/src/genesis/routing/cost_tracker.py\n"
+        "@@ -1 +1 @@\n+fix\n"
+    )
+    from pathlib import Path
+
+    r = sanitize.scan_diff(diff, repo_root=Path.cwd())
+    assert "gitignored_paths" in r.scanners_run
+    gitignored_findings = [f for f in r.findings if f.kind == FindingKind.GITIGNORED_PATH]
+    assert gitignored_findings == []
+
+
+def test_gitignored_scanner_degrades_on_failure(monkeypatch):
+    """If git check-ignore fails, the scanner should return empty, not crash."""
+    import subprocess as _sp
+
+    diff = (
+        "diff --git a/foo.py b/foo.py\n"
+        "--- a/foo.py\n+++ b/foo.py\n@@ -1 +1 @@\n+fix\n"
+    )
+
+    original_run = sanitize.subprocess.run
+
+    def mock_run(cmd, *args, **kwargs):
+        if cmd and cmd[0] == "git" and "check-ignore" in cmd:
+            raise _sp.TimeoutExpired(cmd, 10)
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(sanitize.subprocess, "run", mock_run)
+    from pathlib import Path
+
+    r = sanitize.scan_diff(diff, repo_root=Path.cwd())
+    # Scanner ran but produced no findings due to timeout
+    gitignored_findings = [f for f in r.findings if f.kind == FindingKind.GITIGNORED_PATH]
+    assert gitignored_findings == []
+
+
 def test_detect_secrets_positive_blocks(clean_diff, monkeypatch):
     monkeypatch.setattr(sanitize.shutil, "which", lambda name: "/fake/detect-secrets"
                         if name == "detect-secrets" else None)

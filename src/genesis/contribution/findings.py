@@ -26,6 +26,7 @@ class FindingKind(StrEnum):
     FINGERPRINT = "fingerprint"        # user-defined fingerprints
     EMAIL = "email"                    # personal email (outside allowlist)
     FORBIDDEN_PATH = "forbidden_path"  # diff touches CONTRIBUTION_FORBIDDEN
+    GITIGNORED_PATH = "gitignored_path"  # diff touches a .gitignore-excluded path
     BINARY = "binary"                  # binary file in diff
     SIZE = "size"                      # diff too large
 

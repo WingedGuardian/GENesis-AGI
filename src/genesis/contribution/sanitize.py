@@ -71,6 +71,9 @@ DEFAULT_FORBIDDEN_GLOBS: tuple[str, ...] = (
     "**/.aws/**",
     "**/.ssh/**",
     "~/.genesis/release-fingerprints.txt",
+    # Local-only module paths (belt-and-suspenders with gitignore scanner)
+    "src/genesis/modules/automaton_supervisor/**",
+    "config/modules/automaton-supervisor.yaml",
 )
 
 # Portability patterns — things that should never appear in a
@@ -311,6 +314,50 @@ def _check_forbidden_paths(
     return hits
 
 
+def _check_gitignored_paths(
+    parsed: _ParsedDiff, repo_root: Path | None
+) -> list[Finding]:
+    """Block contributions that touch files excluded by .gitignore.
+
+    Uses ``git check-ignore --no-index`` to check paths against the
+    repo's gitignore rules regardless of tracking status.  This catches
+    local-only modules and configs that users have gitignored without
+    requiring manual forbidden-path maintenance.
+
+    Degrades gracefully: returns [] if *repo_root* is None or git fails.
+    """
+    if repo_root is None or not parsed.file_paths:
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "check-ignore", "--no-index", "--stdin"],
+            input="\n".join(parsed.file_paths),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return []
+    if not proc.stdout.strip():
+        return []
+    hits: list[Finding] = []
+    for ignored_path in proc.stdout.strip().splitlines():
+        ignored_path = ignored_path.strip()
+        if ignored_path:
+            hits.append(
+                Finding(
+                    kind=FindingKind.GITIGNORED_PATH,
+                    severity=Severity.BLOCK,
+                    message=f"Diff touches gitignored path: {ignored_path}",
+                    file=ignored_path,
+                    scanner="gitignored_paths",
+                    detail="path matches a .gitignore rule — local-only content",
+                )
+            )
+    return hits
+
+
 def _check_portability(parsed: _ParsedDiff) -> list[Finding]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
@@ -525,6 +572,7 @@ def scan_diff(
     *,
     protected_paths_yaml: Path | None = None,
     fingerprint_file: Path | None = None,
+    repo_root: Path | None = None,
 ) -> SanitizerResult:
     """Main entry point. Scan a unified diff and return a SanitizerResult.
 
@@ -536,6 +584,9 @@ def scan_diff(
         fingerprint_file: Path to user fingerprint list. Defaults to
             $GENESIS_RELEASE_FINGERPRINTS or
             ~/.genesis/release-fingerprints.txt.
+        repo_root: Path to the git repo root. When provided, enables
+            the gitignored-paths scanner which blocks contributions
+            touching files excluded by .gitignore.
     """
     if fingerprint_file is None:
         env_path = os.environ.get("GENESIS_RELEASE_FINGERPRINTS")
@@ -581,6 +632,11 @@ def scan_diff(
     globs = _load_forbidden_globs(protected_paths_yaml)
     findings.extend(_check_forbidden_paths(parsed, globs))
     scanners_run.append("forbidden_paths")
+
+    # 3b. Gitignored paths (only when repo_root provided)
+    if repo_root is not None:
+        findings.extend(_check_gitignored_paths(parsed, repo_root))
+        scanners_run.append("gitignored_paths")
 
     # 4. Portability
     findings.extend(_check_portability(parsed))
