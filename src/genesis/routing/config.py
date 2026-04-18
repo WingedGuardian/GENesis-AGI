@@ -128,7 +128,7 @@ def _sanitize_local_overlay(base_raw: dict, local_raw: dict) -> dict:
     return result
 
 
-def load_config(path: str | Path) -> RoutingConfig:
+def load_config(path: str | Path, *, check_api_keys: bool = True) -> RoutingConfig:
     """Load routing config from a YAML file path.
 
     Checks for a ``{stem}.local.yaml`` overlay in the same directory and
@@ -145,13 +145,13 @@ def load_config(path: str | Path) -> RoutingConfig:
         if local_raw:
             base_raw = _deep_merge(base_raw, local_raw)
 
-    return _parse(base_raw)
+    return _parse(base_raw, check_api_keys=check_api_keys)
 
 
-def load_config_from_string(text: str) -> RoutingConfig:
+def load_config_from_string(text: str, *, check_api_keys: bool = True) -> RoutingConfig:
     """Load routing config from a YAML string (no overlay support)."""
     raw = yaml.safe_load(_expand_env_vars(text))
-    return _parse(raw)
+    return _parse(raw, check_api_keys=check_api_keys)
 
 
 def _expand_env_vars(text: str) -> str:
@@ -165,7 +165,7 @@ def _expand_env_vars(text: str) -> str:
     return _ENV_PATTERN.sub(repl, text)
 
 
-def _parse(raw: dict) -> RoutingConfig:
+def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     """Parse raw YAML dict into a validated RoutingConfig."""
     if not isinstance(raw, dict):
         msg = "Config must be a YAML mapping"
@@ -218,7 +218,7 @@ def _parse(raw: dict) -> RoutingConfig:
 
         # Auto-disable providers with no API key configured.  Local
         # providers (ollama, lmstudio) don't need keys.
-        if not has_api_key(cfg):
+        if check_api_keys and not has_api_key(cfg):
             disabled_providers.add(name)
             logger.info("Provider '%s' disabled: no API key configured", name)
             continue

@@ -1,5 +1,7 @@
 """Shared fixtures for routing tests."""
 
+from unittest.mock import patch
+
 import pytest
 
 from genesis.routing.types import (
@@ -9,6 +11,13 @@ from genesis.routing.types import (
     RetryPolicy,
     RoutingConfig,
 )
+
+
+@pytest.fixture(autouse=True)
+def _skip_api_key_check():
+    """Tests don't have real API keys — bypass the check in config loading."""
+    with patch("genesis.observability.snapshots.api_keys.has_api_key", return_value=True):
+        yield
 
 
 class MockDelegate:
