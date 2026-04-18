@@ -85,7 +85,9 @@ class TTSConfigLoader:
             return self._cached
 
         try:
-            mtime = self._path.stat().st_mtime
+            from genesis._config_overlay import local_overlay_mtime
+
+            mtime = self._path.stat().st_mtime + local_overlay_mtime(self._path)
         except OSError:
             if self._cached is None:
                 self._cached = _config_from_env()
@@ -109,8 +111,11 @@ class TTSConfigLoader:
 
 def _load_from_yaml(path: Path) -> TTSConfig:
     """Parse YAML into TTSConfig, falling back to env vars for empty fields."""
+    from genesis._config_overlay import merge_local_overlay
+
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+    raw = merge_local_overlay(raw, path)
 
     el_raw = raw.get("elevenlabs", {}) or {}
     fish_raw = raw.get("fish_audio", {}) or {}

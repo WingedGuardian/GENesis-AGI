@@ -176,8 +176,11 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
     if not path.exists():
         logger.warning("Outreach config not found at %s — using UTC defaults", path)
         return _DEFAULTS
+    from genesis._config_overlay import merge_local_overlay
+
     with open(path) as f:
         raw = yaml.safe_load(f) or {}
+    raw = merge_local_overlay(raw, path)
     qh = raw.get("quiet_hours", {})
     return OutreachConfig(
         quiet_hours=QuietHours(

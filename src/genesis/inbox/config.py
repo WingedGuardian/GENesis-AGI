@@ -12,9 +12,17 @@ from genesis.inbox.types import InboxConfig
 
 
 def load_inbox_config(path: str | Path) -> InboxConfig:
-    """Load inbox config from a YAML file path."""
-    text = Path(path).read_text()
-    return load_inbox_config_from_string(text)
+    """Load inbox config from a YAML file path.
+
+    Merges ``config/inbox_monitor.local.yaml`` overlay (written by the
+    dashboard settings panel) on top of the base file when present.
+    """
+    from genesis._config_overlay import merge_local_overlay
+
+    base_path = Path(path)
+    raw = yaml.safe_load(base_path.read_text()) or {}
+    raw = merge_local_overlay(raw, base_path)
+    return _parse(raw)
 
 
 def load_inbox_config_from_string(text: str) -> InboxConfig:

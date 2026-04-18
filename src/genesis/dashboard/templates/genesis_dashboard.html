@@ -1011,7 +1011,7 @@
               if (domain === "autonomous_cli_policy") {
                 this.fetchAutonomousCliPolicy();
               }
-              if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Changes take effect after server restart."; }
+              if (d.needs_restart) { this.settingsRestartMessage = "Settings saved. Restart Genesis server to apply."; }
             } else {
               const err = await resp.json().catch(() => ({}));
               alert("Save failed: " + (err.details ? err.details.join(", ") : err.error || "Unknown error"));
@@ -1213,7 +1213,7 @@
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
           model: ['opus', 'sonnet', 'haiku'],
-          effort: ['low', 'medium', 'high'],
+          effort: ['low', 'medium', 'high', 'max'],
           approval_channel: ['telegram', 'email', 'dashboard'],
           default: ['telegram', 'email', 'dashboard'],
           blocker: ['telegram', 'email', 'dashboard'],
@@ -5243,7 +5243,7 @@
                   </div>
                   <div style="display:flex; gap:0.5rem; align-items:center;">
                     <template x-if="domain.needs_restart">
-                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">requires restart</span>
+                      <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes to this setting require a genesis-server restart to take effect">Restart Genesis server to apply</span>
                     </template>
                     <template x-if="$store.genesisDashboard.settingsEditing !== domain.name">
                       <button style="font-size:0.75rem; padding:2px 10px;" @click="$store.genesisDashboard.startEditSettings(domain.name)">Edit</button>
@@ -5401,7 +5401,7 @@
                           <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px;">locked</span>
                         </template>
                         <template x-if="domain.needs_restart && !domain.readonly">
-                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">requires restart</span>
+                          <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Restart Genesis server to apply</span>
                         </template>
                         <template x-if="!domain.readonly && !domain.needs_restart">
                           <span style="font-size:0.65rem; background:#d4edda; color:#155724; padding:2px 6px; border-radius:3px;">hot-reload</span>
@@ -6538,11 +6538,12 @@
     <!-- ═══════════════════════════════════════════════════════════
          Panel: Knowledge Base [Tab: knowledge]
          ═══════════════════════════════════════════════════════════ -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'">
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'knowledge'" style="overflow: visible;">
       <div class="panel-header">
         <span class="material-symbols-outlined">school</span>
         Knowledge Base
       </div>
+      <div style="padding: 1rem;">
 
       <!-- ── Upload Zone ─────────────────────────────────────── -->
       <div style="margin-bottom: 1.5rem;">
@@ -6645,22 +6646,22 @@
       </template>
 
       <!-- Stats Cards -->
-      <div class="stat-row" style="margin-bottom: 1.5rem;">
-        <div class="stat-card">
-          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.total ?? '—'"></div>
-          <div class="stat-label">Total Units</div>
+      <div style="display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.total ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Total Units</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
-          <div class="stat-label">Qdrant Vectors</div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Qdrant Vectors</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-value" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>
-          <div class="stat-label">Domains</div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Domains</div>
         </div>
-        <div class="stat-card">
-          <div class="stat-value" x-text="$store.genesisDashboard.knowledgeStats?.by_tier?.curated ?? 0"></div>
-          <div class="stat-label">Curated</div>
+        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+          <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.by_tier?.curated ?? 0"></div>
+          <div style="font-size: .75rem; color: var(--color-text-secondary);">Curated</div>
         </div>
       </div>
 
@@ -6688,7 +6689,7 @@
       <div style="margin-bottom: 1rem; display: flex; gap: .5rem;">
         <input type="text" x-model="$store.genesisDashboard.knowledgeQuery" placeholder="Search knowledge base..."
                @keyup.enter="$store.genesisDashboard.searchKnowledge()"
-               style="flex: 1; padding: .5rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+               style="flex: 1; padding: .5rem; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
         <button @click="$store.genesisDashboard.searchKnowledge()" class="btn-sm">Search</button>
       </div>
 
@@ -6696,38 +6697,48 @@
       <template x-if="$store.genesisDashboard.knowledgeSearchResults.length > 0">
         <div style="margin-bottom: 1.5rem;">
           <h4 style="margin-bottom: .5rem;">Search Results</h4>
-          <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
-            <div class="card" style="margin-bottom: .5rem; cursor: pointer;" @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
-              <strong x-text="item.concept || item.unit_id"></strong>
-              <div style="font-size: .85em; color: var(--text-dim);">
-                <span x-text="item.domain"></span> |
-                <span x-text="item.source_pipeline || 'unknown'"></span>
+          <div style="display: flex; flex-direction: column; gap: .5rem;">
+            <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
+              <div style="background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem; cursor: pointer;"
+                   @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                  <strong x-text="item.concept || item.unit_id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;"></strong>
+                  <span class="badge" x-text="item.domain"></span>
+                </div>
+                <div style="font-size: .85em; color: var(--color-text-secondary); margin-top: .25rem;">
+                  <span x-text="item.source_pipeline || 'unknown'"></span>
+                </div>
+                <div style="font-size: .85em; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;"
+                     x-text="(item.body || item.content || '').substring(0, 200)"></div>
               </div>
-              <div style="font-size: .85em; margin-top: .25rem;" x-text="(item.body || item.content || '').substring(0, 200) + '...'"></div>
-            </div>
-          </template>
+            </template>
+          </div>
         </div>
       </template>
 
       <!-- Recent Units -->
       <h4 style="margin-bottom: .5rem;">Recent Knowledge Units</h4>
       <template x-if="$store.genesisDashboard.knowledgeRecent.length === 0">
-        <p style="color: var(--text-dim);">No knowledge units ingested yet.</p>
+        <p style="color: var(--color-text-secondary);">No knowledge units ingested yet.</p>
       </template>
-      <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
-        <div class="card" style="margin-bottom: .5rem; cursor: pointer;" @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
-          <div style="display: flex; justify-content: space-between; align-items: center;">
-            <strong x-text="unit.concept || unit.id"></strong>
-            <span class="badge" x-text="unit.source_pipeline || 'unknown'"></span>
+      <div style="display: flex; flex-direction: column; gap: .5rem;">
+        <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
+          <div style="background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-radius: 6px; padding: .75rem; cursor: pointer;"
+               @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <strong x-text="unit.concept || unit.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 70%;"></strong>
+              <span class="badge" x-text="unit.source_pipeline || 'unknown'"></span>
+            </div>
+            <div style="font-size: .85em; color: var(--color-text-secondary);">
+              <span x-text="unit.domain"></span> |
+              <span x-text="unit.project_type"></span> |
+              <span x-text="unit.ingested_at?.substring(0, 10)"></span>
+            </div>
+            <div style="font-size: .85em; margin-top: .25rem; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;"
+                 x-text="(unit.body || '').substring(0, 200)"></div>
           </div>
-          <div style="font-size: .85em; color: var(--text-dim);">
-            <span x-text="unit.domain"></span> |
-            <span x-text="unit.project_type"></span> |
-            <span x-text="unit.ingested_at?.substring(0, 10)"></span>
-          </div>
-          <div style="font-size: .85em; margin-top: .25rem;" x-text="(unit.body || '').substring(0, 200) + '...'"></div>
-        </div>
-      </template>
+        </template>
+      </div>
 
       <!-- Detail Modal -->
       <template x-if="$store.genesisDashboard.knowledgeDetail">
@@ -6756,6 +6767,7 @@
           </div>
         </div>
       </template>
+      </div><!-- /panel-body padding -->
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════
