@@ -382,6 +382,12 @@ class AutonomousCliApprovalGate:
         the case where two concurrent schedulers build slightly different
         content hashes for the same call site and would otherwise each
         create their own approval.
+
+        Resume fallback: match any *approved* row for the same site.
+        This handles the approval-resume path: the user approved a
+        reflection, the resume triggers it on a new tick with different
+        prompt data (different approval_key), but the approved status
+        from the original request should still be honored.
         """
         recent = await self._approval_manager.get_recent(limit=200)
         # Pass 1: exact content-key match (preserves status-sensitive behavior).
@@ -397,6 +403,21 @@ class AutonomousCliApprovalGate:
             return None
         for row in recent:
             if str(row.get("status") or "") != "pending":
+                continue
+            context = _json_loads(row.get("context"))
+            if (
+                context.get("kind") == "autonomous_cli_fallback"
+                and context.get("subsystem") == subsystem
+                and context.get("policy_id") == policy_id
+            ):
+                return row
+        # Pass 3: resume fallback — approved rows for the same site.
+        # When a user approves a reflection/Sentinel dispatch and the
+        # resume path re-enters ensure_approval with different tick data,
+        # the approval_key won't match Pass 1. This pass picks up the
+        # approved row so the action can proceed without a second approval.
+        for row in recent:
+            if str(row.get("status") or "") != "approved":
                 continue
             context = _json_loads(row.get("context"))
             if (
@@ -432,6 +453,36 @@ class AutonomousCliApprovalGate:
             ):
                 return row
         return None
+
+    async def find_recently_approved(
+        self, *, subsystem: str, policy_id: str,
+    ) -> dict[str, Any] | None:
+        """Find an approved-but-unconsumed request for this call site.
+
+        Used by the resume mechanism: when a user approves a blocked action
+        (via Telegram/dashboard), the next awareness tick can pick it up and
+        dispatch the action without waiting for the original trigger to re-fire.
+        """
+        from genesis.db.crud import approval_requests as ar_crud
+
+        return await ar_crud.find_approved_unconsumed(
+            self._approval_manager._db,
+            subsystem=subsystem, policy_id=policy_id,
+        )
+
+    async def mark_consumed(self, request_id: str) -> bool:
+        """Mark an approved request as consumed (action dispatched).
+
+        Atomic: returns False if already consumed (double-dispatch guard).
+        """
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import approval_requests as ar_crud
+
+        return await ar_crud.mark_consumed(
+            self._approval_manager._db, request_id,
+            consumed_at=datetime.now(UTC).isoformat(),
+        )
 
     async def get_pending_count(self) -> int:
         """Return the count of pending autonomous_cli_fallback approvals.

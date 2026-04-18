@@ -903,9 +903,21 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             except Exception:
                 log.debug("Failed to edit message after callback resolution", exc_info=True)
         else:
-            # Don't edit if already processed (double-press would overwrite
-            # the "Approved"/"Rejected" label). Only log it.
-            log.info("Callback query for expired/processed waiter %s (user %s)", key, user.id)
+            # Waiter expired or already processed — still show user feedback
+            # so button presses aren't silently swallowed.
+            decision_label = "Approved" if action == "approve" else "Rejected"
+            log.info(
+                "Callback for expired/processed waiter %s: %s (user %s)",
+                key, decision_label, user.id,
+            )
+            try:
+                original = query.message.text_html or query.message.text or ""
+                await query.edit_message_text(
+                    text=f"{original}\n\n<b>{decision_label}</b> <i>(expired)</i>",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                log.debug("Failed to edit expired waiter message", exc_info=True)
 
 
 async def handle_voice(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):

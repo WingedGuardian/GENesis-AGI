@@ -746,6 +746,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
     """)
 
+    # Approval resume tracking — atomic consumed_at column
+    await _try_alter(db,
+        "ALTER TABLE approval_requests ADD COLUMN consumed_at TEXT",
+        "approval_requests.consumed_at")
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

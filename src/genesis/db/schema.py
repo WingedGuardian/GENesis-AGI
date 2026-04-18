@@ -550,7 +550,8 @@ TABLES = {
             timeout_at       TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now')),
             resolved_at      TEXT,
-            resolved_by      TEXT
+            resolved_by      TEXT,
+            consumed_at      TEXT
         )
     """,
     "task_states": """

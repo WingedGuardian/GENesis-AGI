@@ -130,6 +130,7 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
     """Get recent meaningful observations (exclusion-based to capture future types)."""
     # Exclude noisy/mechanical types; everything else surfaces.
     _EXCLUDED_TYPES = (
+        # Mechanical / tick-level
         "awareness_tick",
         "genesis_version_change",
         "cc_version_available",
@@ -148,6 +149,17 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         "memory_operation_executed",
         "memory_operation",
         "cc_memory_file",
+        # Raw JSON / non-human-readable content
+        "reflection_summary",
+        "finding",
+        "triage_depth_3",
+        "project_context",
+        "feedback_rule",
+        "reference_pointer",
+        "quarantined_reflection",
+        "self_assessment",
+        "quality_calibration",
+        "quality_drift",
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
