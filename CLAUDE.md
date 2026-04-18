@@ -169,7 +169,6 @@ Memories are tagged with a `wing` (top-level domain) and optional `room`
 recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy.
 
-<<<<<<< HEAD
 ## Reference Capture (silent, automatic)
 
 When user input contains credentials, URLs, IP addresses, account handles,
