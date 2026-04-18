@@ -865,7 +865,9 @@ TABLES = {
             completed_at     TEXT,
             resolution_notes TEXT,
             blocked_reason   TEXT,
-            escalated_to     TEXT
+            escalated_to     TEXT,
+            verified_at      TEXT,
+            verification_notes TEXT
         )
     """,
 }

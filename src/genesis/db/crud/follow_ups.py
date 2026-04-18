@@ -125,6 +125,8 @@ async def update_status(
     *,
     resolution_notes: str | None = None,
     blocked_reason: str | None = None,
+    verified_at: str | None = None,
+    verification_notes: str | None = None,
 ) -> bool:
     """Update follow-up status. Sets completed_at on terminal states."""
     parts = ["status = ?"]
@@ -138,6 +140,12 @@ async def update_status(
     if blocked_reason is not None:
         parts.append("blocked_reason = ?")
         params.append(blocked_reason)
+    if verified_at is not None:
+        parts.append("verified_at = ?")
+        params.append(verified_at)
+    if verification_notes is not None:
+        parts.append("verification_notes = ?")
+        params.append(verification_notes)
     params.append(id)
     cursor = await db.execute(
         f"UPDATE follow_ups SET {', '.join(parts)} WHERE id = ?",

@@ -17,8 +17,49 @@ logger = logging.getLogger(__name__)
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
 
-# Observation types that are relevant to the user (vs Genesis-internal telemetry).
-_USER_OBS_TYPES = ("finding", "user_model_gap", "pattern", "user_feedback")
+# Observation types that are Genesis-internal telemetry and should NOT surface
+# to the user.  Everything else surfaces by default — more robust as new types
+# are added (new types are user-visible unless explicitly excluded here).
+_INTERNAL_OBS_TYPES = (
+    # Reflection / awareness lifecycle
+    "awareness_tick",
+    "micro_reflection",
+    "light_reflection",
+    "deep_reflection",
+    "reflection_observation",
+    "reflection_summary",
+    "reflection_output",
+    "light_escalation_pending",
+    "light_escalation_resolved",
+    "light_reflection_candidate",
+    # Memory internals
+    "memory_operation_executed",
+    "memory_operation",
+    "memory_index",
+    "cc_memory_file",
+    "merged_observation",
+    # Version tracking internals
+    "version_current",
+    "version_change",
+    "genesis_version_change",
+    "cc_version_baseline",
+    "cc_version_available",
+    "genesis_version_baseline",
+    "genesis_update_available",
+    "genesis_update_failed",
+    # Build / project state
+    "build_state",
+    "project_context",
+    "model_downgrade",
+    # Triage telemetry
+    "triage_depth_3",
+    "triage_depth_4",
+    # Development internals
+    "bugfix_committed",
+    "interpretation_correction",
+    "scope_clarification",
+    "feedback_rule",
+)
 
 
 class MorningReportGenerator:
@@ -199,14 +240,14 @@ class MorningReportGenerator:
             lines.append(f"- Inbox items: {pending_fs} pending (filesystem), none processed in last 24h")
 
         # User-relevant observations with content preview (top 5)
-        placeholders = ",".join("?" for _ in _USER_OBS_TYPES)
+        placeholders = ",".join("?" for _ in _INTERNAL_OBS_TYPES)
         cursor = await self._db.execute(
             f"SELECT id, priority, type, content FROM observations "
-            f"WHERE resolved = 0 AND type IN ({placeholders}) "
+            f"WHERE resolved = 0 AND type NOT IN ({placeholders}) "
             "ORDER BY CASE priority "
             "  WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
             "created_at DESC LIMIT 5",
-            _USER_OBS_TYPES,
+            _INTERNAL_OBS_TYPES,
         )
         rows = await cursor.fetchall()
         if rows:
@@ -228,8 +269,8 @@ class MorningReportGenerator:
         # Genesis-internal observation count (single summary line)
         cursor = await self._db.execute(
             f"SELECT COUNT(*) FROM observations "
-            f"WHERE resolved = 0 AND type NOT IN ({placeholders})",
-            _USER_OBS_TYPES,
+            f"WHERE resolved = 0 AND type IN ({placeholders})",
+            _INTERNAL_OBS_TYPES,
         )
         row = await cursor.fetchone()
         internal_count = row[0] if row else 0

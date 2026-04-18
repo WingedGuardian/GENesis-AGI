@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from genesis.db.crud import follow_ups as follow_up_crud
+from genesis.db.crud import surplus as surplus_crud
 from genesis.db.crud import surplus_tasks as surplus_task_crud
 
 if TYPE_CHECKING:
@@ -198,9 +199,29 @@ class FollowUpDispatcher:
 
         status = task.get("status", "")
         if status == "completed":
+            # Verify linked task produced output
+            verified_at = None
+            verification_notes = None
+            staging_id = task.get("result_staging_id")
+            if staging_id:
+                insight = await surplus_crud.get_by_id(self._db, staging_id)
+                if insight and insight.get("content"):
+                    from datetime import UTC, datetime
+                    verified_at = datetime.now(UTC).isoformat()
+                    verification_notes = f"output: {len(insight['content'])} chars"
+                else:
+                    verification_notes = "no output from surplus task"
+                    logger.warning(
+                        "Follow-up %s: linked task %s completed but produced no output",
+                        fu["id"][:8], task_id[:8],
+                    )
+            else:
+                verification_notes = "no staging_id on completed task"
             await follow_up_crud.update_status(
                 self._db, fu["id"], "completed",
                 resolution_notes=f"Surplus task {task_id[:8]} completed successfully",
+                verified_at=verified_at,
+                verification_notes=verification_notes,
             )
             summary["completions_tracked"] += 1
             logger.info("Follow-up %s completed via surplus task %s", fu["id"][:8], task_id[:8])

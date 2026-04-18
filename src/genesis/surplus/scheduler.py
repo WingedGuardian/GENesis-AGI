@@ -590,27 +590,34 @@ class SurplusScheduler:
                 logger.debug("Autonomy correction signal failed (non-fatal)", exc_info=True)
             return False
 
-        # 6. Write to staging (with content-hash dedup)
+        # 6. Write to staging (with content-hash dedup + quality gate)
         staging_id = None
         if result.insights:
             insight = result.insights[0]
             content = result.content or ""
-            content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-            staging_id = f"{task.task_type.value}-{content_hash}"
-            now = self._clock()
-            ttl = (now + timedelta(days=7)).isoformat()
-            now_iso = now.isoformat()
-            await surplus_crud.upsert(
-                self._db,
-                id=staging_id,
-                content=content,
-                source_task_type=str(task.task_type),
-                generating_model=insight.get("generating_model", "unknown"),
-                drive_alignment=task.drive_alignment,
-                confidence=insight.get("confidence", 0.0),
-                created_at=now_iso,
-                ttl=ttl,
-            )
+            # Quality gate: skip trivially short or empty insights
+            if len(content.strip()) < 50:
+                logger.warning(
+                    "Surplus insight too short, skipping (%d chars, task=%s)",
+                    len(content.strip()), task.id[:8],
+                )
+            else:
+                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                staging_id = f"{task.task_type.value}-{content_hash}"
+                now = self._clock()
+                ttl = (now + timedelta(days=7)).isoformat()
+                now_iso = now.isoformat()
+                await surplus_crud.upsert(
+                    self._db,
+                    id=staging_id,
+                    content=content,
+                    source_task_type=str(task.task_type),
+                    generating_model=insight.get("generating_model", "unknown"),
+                    drive_alignment=task.drive_alignment,
+                    confidence=insight.get("confidence", 0.0),
+                    created_at=now_iso,
+                    ttl=ttl,
+                )
 
         await self._queue.mark_completed(task.id, staging_id=staging_id)
 

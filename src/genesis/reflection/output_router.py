@@ -206,6 +206,9 @@ class OutputRouter:
         self._surplus_queue = surplus_queue
         self._question_gate = question_gate
         self._outreach_pipeline = outreach_pipeline
+        # Novelty tracking: what % of observations are genuinely new vs deduped
+        self._obs_attempted = 0
+        self._obs_deduped = 0
 
     def set_outreach_pipeline(self, pipeline) -> None:
         """Late-bind outreach pipeline (outreach inits after reflection)."""
@@ -714,10 +717,17 @@ class OutputRouter:
         Returns observation ID on write, None if deduplicated.
         """
         content_hash = hashlib.sha256(content.encode()).hexdigest()
+        self._obs_attempted += 1
 
         if await observations.exists_by_hash(
             db, source=source, content_hash=content_hash, unresolved_only=True,
         ):
+            self._obs_deduped += 1
+            total = self._obs_attempted
+            if total % 10 == 0:
+                novel = total - self._obs_deduped
+                rate = (novel / total * 100) if total else 0
+                logger.info("Observation novelty: %d/%d (%.0f%% new)", novel, total, rate)
             logger.debug("Observation dedup: skipping %s/%s (hash=%s)", source, type, content_hash[:12])
             return None
 
