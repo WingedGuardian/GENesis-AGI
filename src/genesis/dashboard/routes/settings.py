@@ -31,6 +31,7 @@ async def settings_index():
             "name": domain.name,
             "description": domain.description,
             "readonly": domain.readonly,
+            "readonly_reason": domain.readonly_reason,
             "needs_restart": domain.needs_restart,
             "dedicated_tool": domain.dedicated_tool,
             "has_form": domain.name in _FORM_DOMAINS,

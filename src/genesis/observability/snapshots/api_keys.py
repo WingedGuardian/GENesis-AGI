@@ -31,6 +31,8 @@ def has_api_key(provider_cfg) -> bool:
     ptype = provider_cfg.provider_type
     if ptype in _LOCAL_TYPES:
         return True
+    if ptype in _CC_MANAGED_TYPES:
+        return True  # CC handles auth — no API key needed
     service = ptype.upper()
     for pattern in [f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"]:
         val = os.environ.get(pattern)
@@ -95,6 +97,13 @@ def api_key_health(routing_config: RoutingConfig | None) -> dict:
             else:
                 entry["status"] = "configured"
         results[name] = entry
+
+    # Include providers that were disabled at config load (no API key, etc.)
+    # so they still appear in the dashboard as "not configured".
+    for name, ptype in getattr(routing_config, "disabled_providers", {}).items():
+        if name not in results:
+            results[name] = {"status": "missing", "provider_type": ptype}
+
     return results
 
 

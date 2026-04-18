@@ -190,6 +190,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
 
     providers: dict[str, ProviderConfig] = {}
     disabled_providers: set[str] = set()
+    disabled_provider_types: dict[str, str] = {}  # name → provider_type
     for name, p in (raw.get("providers") or {}).items():
         # Parse enabled field — supports bool, string from env var expansion
         enabled_raw = p.get("enabled", True)
@@ -200,6 +201,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
 
         if not enabled:
             disabled_providers.add(name)
+            disabled_provider_types[name] = p.get("type", "unknown")
             logger.info("Provider '%s' disabled via config", name)
             continue
 
@@ -220,6 +222,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
         # providers (ollama, lmstudio) don't need keys.
         if check_api_keys and not has_api_key(cfg):
             disabled_providers.add(name)
+            disabled_provider_types[name] = cfg.provider_type
             logger.info("Provider '%s' disabled: no API key configured", name)
             continue
 
@@ -265,6 +268,7 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
         providers=providers,
         call_sites=call_sites,
         retry_profiles=retry_profiles,
+        disabled_providers=disabled_provider_types,
     )
 
 

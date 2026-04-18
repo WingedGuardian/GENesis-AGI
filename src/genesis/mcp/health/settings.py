@@ -37,6 +37,7 @@ class SettingsDomain:
     readonly: bool
     needs_restart: bool
     dedicated_tool: str | None = None
+    readonly_reason: str = ""
 
 
 _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
@@ -63,45 +64,51 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     ),
     "autonomy": SettingsDomain(
         name="autonomy",
-        description="Autonomy levels, ceilings, approval policy, watchdog (read-only — CRITICAL)",
+        description="Autonomy levels, ceilings, approval policy, watchdog",
         config_filename="autonomy.yaml",
         readonly=True,
         needs_restart=True,
+        readonly_reason="Controls autonomous action limits and approval requirements. Ask Genesis to review and adjust.",
     ),
     "guardian": SettingsDomain(
         name="guardian",
-        description="Host VM guardian health monitoring thresholds (read-only — host-side)",
+        description="Host VM guardian health monitoring thresholds",
         config_filename="guardian.yaml",
         readonly=True,
         needs_restart=True,
+        readonly_reason="Configured on the host VM during Guardian installation. Not editable from the container.",
     ),
     "autonomy_rules": SettingsDomain(
         name="autonomy_rules",
-        description="Data-driven autonomy decision rules (read-only — evaluated by RuleEngine)",
+        description="Data-driven autonomy decision rules evaluated by RuleEngine",
         config_filename="autonomy_rules.yaml",
         readonly=True,
         needs_restart=False,
+        readonly_reason="Decision rules that gate autonomous actions. Ask Genesis to review changes.",
     ),
     "content_sanitization": SettingsDomain(
         name="content_sanitization",
-        description="Content sanitization injection detection patterns (read-only)",
+        description="Content sanitization and injection detection patterns",
         config_filename="content_sanitization.yaml",
         readonly=True,
         needs_restart=True,
+        readonly_reason="Security filters for prompt injection detection. Changes require careful review — ask Genesis.",
     ),
     "model_profiles": SettingsDomain(
         name="model_profiles",
-        description="Model intelligence tiers, costs, and capabilities (read-only)",
+        description="Model intelligence tiers, costs, and capabilities",
         config_filename="model_profiles.yaml",
         readonly=True,
         needs_restart=False,
+        readonly_reason="System reference data — model capabilities, costs, and intelligence tiers.",
     ),
     "model_routing": SettingsDomain(
         name="model_routing",
-        description="Model routing call sites, provider chains, retry profiles (read-only — use dashboard for edits)",
+        description="Model routing call sites, provider chains, retry profiles",
         config_filename="model_routing.yaml",
         readonly=True,
         needs_restart=False,
+        readonly_reason="Managed in the Routing panel on the Internals tab.",
     ),
     "outreach": SettingsDomain(
         name="outreach",
@@ -121,11 +128,12 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     ),
     "recon_watchlist": SettingsDomain(
         name="recon_watchlist",
-        description="Recon project watchlist (read-only)",
+        description="Recon project watchlist",
         config_filename="recon_watchlist.yaml",
         readonly=True,
         needs_restart=False,
         dedicated_tool="recon_watchlist",
+        readonly_reason="Editable via the watchlist tool — ask Genesis to add or remove items.",
     ),
     "recon_sources": SettingsDomain(
         name="recon_sources",
@@ -552,6 +560,7 @@ async def _impl_settings_list() -> list[dict]:
             "domain": d.name,
             "description": d.description,
             "readonly": d.readonly,
+            "readonly_reason": d.readonly_reason,
             "needs_restart": d.needs_restart,
             "dedicated_tool": d.dedicated_tool,
         }
