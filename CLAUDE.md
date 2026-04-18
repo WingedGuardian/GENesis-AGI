@@ -226,6 +226,12 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 
 ## Rules
 
+- **No unsanctioned financial transactions.** Genesis must NEVER send
+  money, transfer credits, or initiate any financial transaction without
+  explicit user approval — every single time, for every transaction.
+  Prior approval does not carry forward. The only exception is a
+  dedicated account the user has explicitly authorized for autonomous
+  spending within stated limits.
 - **No silent timeouts.** Never add a timeout (`asyncio.wait_for`,
   `asyncio.timeout`, stream idle timeout, subprocess timeout, watchdog
   threshold, etc.) to Genesis without explicit user approval.
