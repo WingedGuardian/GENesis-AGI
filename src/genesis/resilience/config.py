@@ -63,8 +63,11 @@ def load_config(path: Path | None = None) -> ResilienceConfig:
         logger.info("Resilience config not found at %s, using defaults", config_path)
         return ResilienceConfig()
 
+    from genesis._config_overlay import merge_local_overlay
+
     with open(config_path) as f:
         raw = yaml.safe_load(f) or {}
+    raw = merge_local_overlay(raw, config_path)
 
     return ResilienceConfig(
         flapping=FlappingConfig(**raw.get("flapping", {})),

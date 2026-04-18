@@ -42,8 +42,11 @@ def _load_updates_config() -> dict:
     """Load config/updates.yaml. Returns defaults if missing."""
     path = _CONFIG_DIR / "updates.yaml"
     if path.is_file():
+        from genesis._config_overlay import merge_local_overlay
+
         with open(path) as f:
-            return yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        return merge_local_overlay(raw, path)
     return {"check": {"enabled": True, "interval_hours": 6}}
 
 

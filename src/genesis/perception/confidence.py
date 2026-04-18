@@ -68,8 +68,11 @@ def load_config(path: Path | None = None) -> ConfidenceGatesConfig:
         result = ConfidenceGatesConfig()
     else:
         try:
+            from genesis._config_overlay import merge_local_overlay
+
             with open(config_path) as f:
                 raw = yaml.safe_load(f) or {}
+            raw = merge_local_overlay(raw, config_path)
             result = ConfidenceGatesConfig(
                 observation_write=GateConfig(**raw.get("observation_write", {})),
                 memory_upsertion=GateConfig(**raw.get("memory_upsertion", {})),

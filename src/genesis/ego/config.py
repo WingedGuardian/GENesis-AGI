@@ -33,8 +33,11 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
         return EgoConfig()
 
     try:
+        from genesis._config_overlay import merge_local_overlay
+
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
+        raw = merge_local_overlay(raw, path)
     except Exception:
         logger.error("Failed to read ego config from %s", path, exc_info=True)
         return EgoConfig()

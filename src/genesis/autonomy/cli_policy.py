@@ -79,7 +79,10 @@ def load_autonomous_cli_policy(path: Path | None = None) -> AutonomousCliPolicy:
         return defaults
 
     try:
+        from genesis._config_overlay import merge_local_overlay
+
         raw = yaml.safe_load(cfg_path.read_text()) or {}
+        raw = merge_local_overlay(raw, cfg_path)
     except Exception:
         logger.warning(
             "Failed to load autonomous CLI policy from %s; using env defaults",
