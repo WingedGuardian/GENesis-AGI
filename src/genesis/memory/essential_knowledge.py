@@ -160,6 +160,9 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         "self_assessment",
         "quality_calibration",
         "quality_drift",
+        "code_audit",
+        "version_change",
+        "tech_debt",
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
