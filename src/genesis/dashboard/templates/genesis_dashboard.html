@@ -3199,9 +3199,9 @@
         </div>
       </template>
       <!-- Resilience degradation banner -->
-      <template x-if="$store.genesisDashboard.health.resilience && $store.genesisDashboard.health.resilience !== 'L0' && $store.genesisDashboard.health.resilience !== 'not configured'">
-        <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;`"
-             x-text="'Resilience: ' + $store.genesisDashboard.health.resilience + ' — system is operating in degraded mode'">
+      <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">
+        <div :style="`background: ${['L3', 'L4', 'L5', 'error'].includes($store.genesisDashboard.health.resilience.level) ? '#d9534f' : '#f0ad4e'}; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;`"
+             x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
         </div>
       </template>
       <div class="panel-body">

@@ -1640,9 +1640,12 @@ function updateSidePanel(data) {
     const resEl = document.getElementById('resilience-content');
     if (resEl) {
         resEl.replaceChildren();
-        const resState = data.resilience || 'not configured';
+        const resObj = data.resilience || {};
+        const resState = resObj.level || resObj || 'not configured';
+        const resSummary = resObj.summary || '';
         const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#ffe600';
-        resEl.appendChild(sectionRow('State', String(resState), rColor + ';font-weight:600'));
+        const resLabel = resSummary ? `${resState} — ${resSummary}` : String(resState);
+        resEl.appendChild(sectionRow('State', resLabel, rColor + ';font-weight:600'));
 
         // Provider summary: X/Y call sites healthy
         // Excludes idle (groundwork) and disabled (no API key) sites — these
@@ -2243,7 +2246,8 @@ function updateHeaderBadges(data) {
     // Resilience badge
     const hbRes = document.getElementById('hb-resilience');
     if (hbRes) {
-        const res = data.resilience || 'unknown';
+        const resObj = data.resilience || {};
+        const res = (typeof resObj === 'object' ? resObj.level : resObj) || 'unknown';
         const isOk = res === 'L0' || res === 'normal' || res === 'not configured';
         hbRes.style.display = 'inline-flex';
         hbRes.style.background = isOk ? 'rgba(22,101,52,0.5)' : 'rgba(133,77,14,0.5)';

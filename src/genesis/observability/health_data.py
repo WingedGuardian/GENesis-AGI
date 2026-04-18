@@ -144,11 +144,11 @@ class HealthDataService:
             for name, r in self._provider_health.results.items()
         }
 
-    def _resilience_state(self) -> str:
-        """Compute resilience state from circuit breaker registry."""
-        from genesis.observability.snapshots.infrastructure import resilience_state
+    def _resilience_state(self) -> dict:
+        """Compute resilience state with detail from circuit breaker registry."""
+        from genesis.observability.snapshots.infrastructure import resilience_state_detail
 
-        return resilience_state(self._breakers, self._state_machine)
+        return resilience_state_detail(self._breakers, self._state_machine)
 
     async def validate_api_keys(self) -> None:
         """Test each provider's API key with a lightweight call. Cache results."""

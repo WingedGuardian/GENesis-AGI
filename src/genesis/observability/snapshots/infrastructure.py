@@ -263,6 +263,26 @@ def resilience_state(
         return "error"
 
 
+def resilience_state_detail(
+    breakers,  # CircuitBreakerRegistry | None
+    state_machine,  # ResilienceStateMachine | None
+) -> dict:
+    """Compute resilience state with human-readable detail."""
+    level = resilience_state(breakers, state_machine)
+    summary = ""
+    if breakers:
+        try:
+            down = [
+                name for name, cb in breakers._breakers.items()
+                if not cb.is_available()
+            ]
+            if down:
+                summary = f"Providers down: {', '.join(sorted(down))}"
+        except Exception:
+            pass
+    return {"level": level, "summary": summary}
+
+
 def _update_cloud_axis(state_machine, level: DegradationLevel) -> None:
     if state_machine is None:
         return

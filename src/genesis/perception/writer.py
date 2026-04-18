@@ -131,6 +131,16 @@ class ResultWriter:
         if gated:
             return
 
+        # Cooldown gate: skip if a light_reflection from this source was
+        # created within the last 30 minutes.  Prevents near-duplicate
+        # observations where the LLM generates different wording for the
+        # same system state.
+        if await observations.exists_recent_by_type(
+            db, source="reflection", type="light_reflection", window_minutes=30,
+        ):
+            logger.debug("Light reflection cooldown: skipping (recent exists within 30m)")
+            return
+
         content = json.dumps({
             "assessment": output.assessment,
             "patterns": output.patterns,

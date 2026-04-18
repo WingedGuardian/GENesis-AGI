@@ -252,9 +252,13 @@ async def init(rt: GenesisRuntime) -> None:
         async def _observation_expiry_sweep() -> None:
             try:
                 count = await observations.resolve_expired(rt._db)
+                stale = await observations.resolve_stale_persistent(rt._db, max_age_days=60)
                 rt.record_job_success("observation_expiry_sweep")
-                if count:
-                    logger.info("Observation expiry sweep: resolved %d expired observations", count)
+                if count or stale:
+                    logger.info(
+                        "Observation expiry sweep: resolved %d expired, %d stale persistent",
+                        count, stale,
+                    )
             except Exception as exc:
                 rt.record_job_failure("observation_expiry_sweep", str(exc))
                 logger.exception("Observation expiry sweep failed")

@@ -51,31 +51,40 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
     now = datetime.now(UTC).isoformat()
     source = f"cc_reflection_{depth.value.lower()}"
 
-    # Primary reflection output (with dedup)
-    content = json.dumps({
-        "tick_id": tick.tick_id,
-        "depth": depth.value,
-        "cc_output": output.text[:2000],
-        "model_used": output.model_used,
-        "cost_usd": output.cost_usd,
-        "input_tokens": output.input_tokens,
-        "output_tokens": output.output_tokens,
-    }, sort_keys=True)
-    content_hash = hashlib.sha256(content.encode()).hexdigest()
-    if not await observations.exists_by_hash(
-        db, source=source, content_hash=content_hash, unresolved_only=True,
-    ):
-        await observations.create(
-            db,
-            id=str(uuid.uuid4()),
-            source=source,
-            type="reflection_output",
-            content=content,
-            priority="high" if depth == Depth.STRATEGIC else "medium",
-            created_at=now,
-            content_hash=content_hash,
-            skip_if_duplicate=True,
-        )
+    # Cooldown gate: skip primary observation if one of the same type+source
+    # was created within the last 30 minutes.  Still process sub-outputs
+    # (light escalations, deltas, surplus) and strategic focus.
+    skip_primary = await observations.exists_recent_by_type(
+        db, source=source, type="reflection_output", window_minutes=30,
+    )
+    if skip_primary:
+        logger.debug("Reflection output cooldown: skipping (recent %s exists within 30m)", source)
+    else:
+        # Primary reflection output (with dedup)
+        content = json.dumps({
+            "tick_id": tick.tick_id,
+            "depth": depth.value,
+            "cc_output": output.text[:2000],
+            "model_used": output.model_used,
+            "cost_usd": output.cost_usd,
+            "input_tokens": output.input_tokens,
+            "output_tokens": output.output_tokens,
+        }, sort_keys=True)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        if not await observations.exists_by_hash(
+            db, source=source, content_hash=content_hash, unresolved_only=True,
+        ):
+            await observations.create(
+                db,
+                id=str(uuid.uuid4()),
+                source=source,
+                type="reflection_output",
+                content=content,
+                priority="high" if depth == Depth.STRATEGIC else "medium",
+                created_at=now,
+                content_hash=content_hash,
+                skip_if_duplicate=True,
+            )
 
     # Light: parse JSON for escalation, user_model_deltas, surplus_candidates
     if depth == Depth.LIGHT:
@@ -260,6 +269,13 @@ async def _store_reflection_summary(output, *, source: str, now: str, db) -> Non
         if output.text.strip():
             summary_parts.append(output.text[:2000])
     if summary_parts:
+        # Cooldown: skip if a reflection_summary from this source exists
+        # within the last 30 minutes.
+        if await observations.exists_recent_by_type(
+            db, source=source, type="reflection_summary", window_minutes=30,
+        ):
+            logger.debug("Reflection summary cooldown: skipping (recent exists within 30m)")
+            return
         summary_text = "\n\n".join(summary_parts)[:4000]
         summary_hash = hashlib.sha256(summary_text.encode()).hexdigest()
         if not await observations.exists_by_hash(

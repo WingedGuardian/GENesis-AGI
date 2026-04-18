@@ -637,6 +637,68 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.warning("Expired observation sweep skipped", exc_info=True)
 
+    # 2026-04-18: Backfill expires_at on pre-TTL observations that have no
+    # expiry despite belonging to a TTL-governed type, then resolve any whose
+    # computed expiry is already past.  Also resolve stale persistent
+    # observations (>60 days, low/medium priority).  Idempotent.
+    try:
+        from datetime import UTC, datetime, timedelta
+
+        from genesis.db.crud.observations import _TTL_BY_TYPE, _TTL_PREFIX
+
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+
+        # Phase 1: backfill expires_at per type
+        backfilled = 0
+        for obs_type, ttl in _TTL_BY_TYPE.items():
+            secs = int(ttl.total_seconds())
+            cursor = await db.execute(
+                "UPDATE observations SET expires_at = datetime(created_at, ? || ' seconds') "
+                "WHERE resolved = 0 AND expires_at IS NULL AND type = ?",
+                (str(secs), obs_type),
+            )
+            backfilled += cursor.rowcount
+        for prefix, ttl in _TTL_PREFIX:
+            secs = int(ttl.total_seconds())
+            cursor = await db.execute(
+                "UPDATE observations SET expires_at = datetime(created_at, ? || ' seconds') "
+                "WHERE resolved = 0 AND expires_at IS NULL AND type LIKE ?",
+                (str(secs), f"{prefix}%"),
+            )
+            backfilled += cursor.rowcount
+        if backfilled:
+            await db.commit()
+            logger.info("Backfilled expires_at on %d pre-TTL observations", backfilled)
+
+        # Phase 2: resolve any that are now past their backfilled expiry
+        cursor = await db.execute(
+            "UPDATE observations SET resolved = 1, resolved_at = ?, "
+            "resolution_notes = 'auto-expired (TTL backfill)' "
+            "WHERE resolved = 0 AND expires_at IS NOT NULL AND expires_at < ?",
+            (now_iso, now_iso),
+        )
+        newly_expired = cursor.rowcount
+        if newly_expired:
+            await db.commit()
+            logger.info("Resolved %d observations past backfilled TTL", newly_expired)
+
+        # Phase 3: resolve stale persistent-type observations (>60 days, low/medium)
+        stale_cutoff = (now - timedelta(days=60)).isoformat()
+        cursor = await db.execute(
+            "UPDATE observations SET resolved = 1, resolved_at = ?, "
+            "resolution_notes = 'auto-resolved (stale persistent, >60 days)' "
+            "WHERE resolved = 0 AND expires_at IS NULL "
+            "AND created_at < ? AND priority IN ('low', 'medium')",
+            (now_iso, stale_cutoff),
+        )
+        stale_resolved = cursor.rowcount
+        if stale_resolved:
+            await db.commit()
+            logger.info("Resolved %d stale persistent observations (>60d)", stale_resolved)
+    except Exception:
+        logger.warning("Observation TTL backfill migration skipped", exc_info=True)
+
     # Memory rebalance: purge orphaned memory_links whose source/target
     # memories were deleted but links were never cascade-cleaned.  MemoryStore
     # .delete() now cascades, but ~1,600 stale links accumulated before that.
