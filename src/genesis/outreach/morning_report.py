@@ -21,6 +21,7 @@ _PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_RE
 # to the user.  Everything else surfaces by default — more robust as new types
 # are added (new types are user-visible unless explicitly excluded here).
 _INTERNAL_OBS_TYPES = (
+    # Reflection / awareness lifecycle
     "awareness_tick",
     "micro_reflection",
     "light_reflection",
@@ -30,18 +31,34 @@ _INTERNAL_OBS_TYPES = (
     "reflection_output",
     "light_escalation_pending",
     "light_escalation_resolved",
+    "light_reflection_candidate",
+    # Memory internals
     "memory_operation_executed",
-    "model_downgrade",
-    "build_state",
-    "project_context",
-    "version_current",
+    "memory_operation",
+    "memory_index",
     "cc_memory_file",
     "merged_observation",
+    # Version tracking internals
+    "version_current",
+    "version_change",
+    "genesis_version_change",
     "cc_version_baseline",
     "cc_version_available",
     "genesis_version_baseline",
     "genesis_update_available",
     "genesis_update_failed",
+    # Build / project state
+    "build_state",
+    "project_context",
+    "model_downgrade",
+    # Triage telemetry
+    "triage_depth_3",
+    "triage_depth_4",
+    # Development internals
+    "bugfix_committed",
+    "interpretation_correction",
+    "scope_clarification",
+    "feedback_rule",
 )
 
 
