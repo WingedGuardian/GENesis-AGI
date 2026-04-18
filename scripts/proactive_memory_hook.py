@@ -19,6 +19,7 @@ Reads hook input from stdin as JSON:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import json
 import os
@@ -215,6 +216,78 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
     except Exception as exc:
         print(f"Code index search error: {exc}", file=sys.stderr)
         return []
+
+
+# Observation types that are Genesis-internal telemetry — should NOT surface
+# to the user in proactive hook output.  Mirrors the list in morning_report.py.
+_INTERNAL_OBS_TYPES = (
+    "awareness_tick", "micro_reflection", "light_reflection",
+    "deep_reflection", "reflection_observation", "reflection_summary",
+    "reflection_output", "light_escalation_pending",
+    "light_escalation_resolved", "memory_operation_executed",
+    "model_downgrade", "build_state", "project_context",
+    "version_current", "cc_memory_file", "merged_observation",
+    "cc_version_baseline", "cc_version_available",
+    "genesis_version_baseline", "genesis_update_available",
+    "genesis_update_failed",
+)
+
+
+def _search_observations(db_path: Path) -> list[dict]:
+    """Surface high-priority unresolved observations.
+
+    No keyword matching — high/critical unresolved observations are few enough
+    to always surface.  ~1ms (SQLite, indexed on priority + resolved).
+    """
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in _INTERNAL_OBS_TYPES)
+            cursor = conn.execute(
+                f"SELECT id, type, priority, content, created_at "
+                f"FROM observations "
+                f"WHERE resolved = 0 "
+                f"  AND priority IN ('high', 'critical') "
+                f"  AND type NOT IN ({placeholders}) "
+                f"ORDER BY "
+                f"  CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 END, "
+                f"  created_at DESC "
+                f"LIMIT 3",
+                _INTERNAL_OBS_TYPES,
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                return []
+
+            results = []
+            for row in rows:
+                content = (row["content"] or "")[:200]
+                results.append({
+                    "obs_id": row["id"],
+                    "type": row["type"],
+                    "priority": row["priority"],
+                    "content": content,
+                    "created_at": row["created_at"],
+                })
+            return results
+        finally:
+            conn.close()
+    except sqlite3.OperationalError:
+        return []
+    except Exception as exc:
+        print(f"Observation search error: {exc}", file=sys.stderr)
+        return []
+
+
+def _format_observations(results: list[dict]) -> str:
+    """Format observations for injection as [Observation] tags."""
+    if not results:
+        return ""
+    lines = []
+    for r in results:
+        lines.append(f"[Observation] [{r['priority']}] {r['type']}: {r['content']}")
+    return "\n".join(lines)
 
 
 def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
@@ -603,6 +676,24 @@ async def _run(prompt: str, session_id: str = "") -> None:
         if output:
             print(output)
             sys.stdout.flush()
+
+    # Surface high-priority unresolved observations — once per session only.
+    # Uses a state file to avoid repeating the same observations on every prompt.
+    _obs_state = Path.home() / ".genesis" / "proactive_obs_session.txt"
+    _already_surfaced = False
+    if session_id:
+        with contextlib.suppress(FileNotFoundError):
+            _already_surfaced = _obs_state.read_text().strip() == session_id
+    if not _already_surfaced:
+        obs_results = _search_observations(_DB_PATH)
+        if obs_results:
+            obs_output = _format_observations(obs_results)
+            if obs_output:
+                print(obs_output)
+                sys.stdout.flush()
+        if session_id:
+            with contextlib.suppress(OSError):
+                _obs_state.write_text(session_id)
 
     # Post-output: increment retrieved_count (fire-and-forget, after flush)
     if fused:
