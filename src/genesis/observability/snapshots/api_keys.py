@@ -21,6 +21,24 @@ _CC_MANAGED_TYPES = frozenset({"anthropic"})
 _api_validation_cache: dict[str, dict] = {}
 
 
+def has_api_key(provider_cfg) -> bool:
+    """Check if a provider has a non-empty API key in the environment.
+
+    Local providers (ollama, lmstudio) always return True — they don't
+    need cloud API keys.  Used by the config loader to auto-disable
+    providers that have no credentials configured.
+    """
+    ptype = provider_cfg.provider_type
+    if ptype in _LOCAL_TYPES:
+        return True
+    service = ptype.upper()
+    for pattern in [f"API_KEY_{service}", f"{service}_API_KEY", f"{service}_API_TOKEN"]:
+        val = os.environ.get(pattern)
+        if val and val not in ("None", "NA", ""):
+            return True
+    return False
+
+
 def api_key_health(routing_config: RoutingConfig | None) -> dict:
     """Check which configured providers have API keys present + validation status."""
     if not routing_config:

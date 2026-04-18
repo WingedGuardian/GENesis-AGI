@@ -186,6 +186,8 @@ def _parse(raw: dict) -> RoutingConfig:
         retry_profiles["default"] = RetryPolicy()
 
     # --- Providers ---
+    from genesis.observability.snapshots.api_keys import has_api_key
+
     providers: dict[str, ProviderConfig] = {}
     disabled_providers: set[str] = set()
     for name, p in (raw.get("providers") or {}).items():
@@ -201,7 +203,7 @@ def _parse(raw: dict) -> RoutingConfig:
             logger.info("Provider '%s' disabled via config", name)
             continue
 
-        providers[name] = ProviderConfig(
+        cfg = ProviderConfig(
             name=name,
             provider_type=p["type"],
             model_id=p["model"],
@@ -213,6 +215,15 @@ def _parse(raw: dict) -> RoutingConfig:
             enabled=True,
             profile=p.get("profile"),
         )
+
+        # Auto-disable providers with no API key configured.  Local
+        # providers (ollama, lmstudio) don't need keys.
+        if not has_api_key(cfg):
+            disabled_providers.add(name)
+            logger.info("Provider '%s' disabled: no API key configured", name)
+            continue
+
+        providers[name] = cfg
 
     # --- Call sites ---
     call_sites: dict[str, CallSiteConfig] = {}
