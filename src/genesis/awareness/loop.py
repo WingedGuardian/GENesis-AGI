@@ -352,6 +352,7 @@ class AwarenessLoop:
         self._tick_count: int = 0
         self._last_tick_at: str | None = None
         self._last_tick_result: TickResult | None = None
+        self._last_degradation_level: DegradationLevel | None = None
 
     def request_stop(self) -> None:
         """Signal that shutdown is imminent — skip deferred retries.
@@ -375,6 +376,37 @@ class AwarenessLoop:
     def set_circuit_breakers(self, breakers: CircuitBreakerRegistry) -> None:
         """Inject circuit breaker registry for resilience state updates."""
         self._circuit_breakers = breakers
+
+    async def _update_resilience_cognitive_state(self, level: DegradationLevel) -> None:
+        """Write or clear cognitive state when resilience level changes."""
+        try:
+            from genesis.db.crud import cognitive_state
+
+            now = datetime.now(UTC).isoformat()
+            if level == DegradationLevel.NORMAL:
+                content = "All providers normal — no degradation."
+            else:
+                # Identify which providers are down
+                down = []
+                if self._circuit_breakers:
+                    down = [
+                        name for name, cb in self._circuit_breakers._breakers.items()
+                        if not cb.is_available()
+                    ]
+                detail = f"Providers down: {', '.join(sorted(down))}" if down else ""
+                content = f"Resilience {level.value}: {detail}"
+
+            await cognitive_state.replace_section(
+                self._db,
+                section="resilience_degradation",
+                id=str(uuid.uuid4()),
+                content=content,
+                generated_by="awareness_loop",
+                created_at=now,
+            )
+            logger.info("Resilience cognitive state updated: %s → %s", self._last_degradation_level, level)
+        except Exception:
+            logger.warning("Failed to update resilience cognitive state", exc_info=True)
 
     async def start(self) -> None:
         """Start the scheduler with the tick job.
@@ -537,6 +569,11 @@ class AwarenessLoop:
                         logger.warning("Unknown degradation level %s, defaulting to OFFLINE", level)
                         cloud = CloudStatus.OFFLINE
                     self._resilience_state_machine.update_cloud(cloud)
+
+                    # Track degradation transitions in cognitive state
+                    if level != self._last_degradation_level:
+                        await self._update_resilience_cognitive_state(level)
+                        self._last_degradation_level = level
                 except Exception:
                     logger.warning("Resilience state update failed", exc_info=True)
 
