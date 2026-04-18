@@ -170,14 +170,17 @@ async def knowledge_stats():
         stats = await knowledge.stats(rt.db)
 
         qdrant_count = None
-        if rt.qdrant_client:
-            try:
-                from genesis.qdrant.collections import get_collection_info
+        try:
+            from qdrant_client import QdrantClient
 
-                info = get_collection_info(rt.qdrant_client, "knowledge_base")
-                qdrant_count = info.get("points_count", 0) if info else None
-            except Exception:
-                pass
+            from genesis.env import qdrant_url
+            from genesis.qdrant.collections import get_collection_info
+
+            qdrant = QdrantClient(url=qdrant_url(), timeout=3)
+            info = get_collection_info(qdrant, "knowledge_base")
+            qdrant_count = info.get("points_count", 0) if info else None
+        except Exception:
+            pass
 
         return jsonify({
             **stats,
