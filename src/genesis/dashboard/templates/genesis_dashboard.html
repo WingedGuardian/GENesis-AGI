@@ -1986,9 +1986,15 @@
               || (queues.deferred_stuck || 0) > 0 || (queues.failed_embeddings || 0) > 0) {
             return { state: "error", reason: "stuck/failed items or dead letters require attention" };
           }
-          if ((queues.deferred_work || 0) > 0 || (queues.pending_embeddings || 0) > 0
-              || (queues.deferred_processing || 0) > 0) {
-            return { state: "degraded", reason: "work is backing up in deferred or embedding queues" };
+          if ((queues.deferred_work || 0) > 0 || (queues.deferred_processing || 0) > 0) {
+            return { state: "degraded", reason: "work is backing up in deferred queues" };
+          }
+          const pe = queues.pending_embeddings || 0;
+          if (pe > 2000) {
+            return { state: "error", reason: `embedding queue critically backed up (${pe} pending)` };
+          }
+          if (pe > 500) {
+            return { state: "degraded", reason: `embedding queue backed up (${pe} pending)` };
           }
           if (Array.isArray(queues.errors) && queues.errors.length > 0) {
             return { state: "unknown", reason: "some queue counters could not be collected" };

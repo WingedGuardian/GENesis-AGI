@@ -36,12 +36,23 @@ For each extraction, provide:
     categorized_as, related_to, succeeded_by, preceded_by
 - temporal: Date or time reference if mentioned (ISO format preferred)
 
-Focus on SUBSTANCE — what was discussed, decided, evaluated, or planned.
-Skip: greetings, filler, acknowledgments.
-DO extract: tool/project names discussed, opinions expressed, decisions made,
-action items created, evaluations of external things, errors encountered,
-file paths mentioned, technical concepts introduced.
-Extract generously — 5-15 facts per conversation segment is normal.
+Focus on DURABLE KNOWLEDGE — facts, decisions, and insights that will be
+valuable weeks or months from now. Target 3-8 high-quality extractions per
+segment. Quality over quantity.
+
+DO extract: architectural decisions, design rationale, bug root causes,
+tool/project evaluations, user preferences, external concepts introduced,
+lessons learned, non-obvious technical insights.
+
+DO NOT extract:
+- Session narration ("merged to main", "committed changes", "pushed to remote")
+- Test/build status ("67 tests passed", "all checks green", "batch 3 committed")
+- Point-in-time metrics (memory %, budget numbers, CPU usage, queue depths)
+- Investigation play-by-play ("[investigation] checked X", "searched for Y")
+- Model/session configuration ("Opus set for session", "effort set to high")
+- File path inventories without context ("Files to modify: src/a.py, src/b.py")
+- Git operations (commit hashes, merge descriptions, branch operations)
+- Routine procedural decisions ("decided to create new commit instead of amending")
 
 Respond with a JSON object inside backticks containing:
 1. "extractions" — array of extracted facts

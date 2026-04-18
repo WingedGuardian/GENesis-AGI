@@ -60,6 +60,7 @@ async def run_extraction_cycle(
     reference_only_mode: bool = False,
     start_line_override: int | None = None,
     session_filter: set[str] | None = None,
+    max_extractions_per_session: int = 30,
 ) -> dict:
     """Run one extraction cycle across all eligible sessions.
 
@@ -118,6 +119,7 @@ async def run_extraction_cycle(
         max_line = last_line
         all_keywords: set[str] = set()
         latest_topic = ""
+        session_extraction_count = 0
 
         for chunk in chunks:
             chunk_start = chunk[0].line_number
@@ -201,6 +203,7 @@ async def run_extraction_cycle(
                         **kwargs, force_fts5_only=True,
                     )
                     summary["entities_extracted"] += 1
+                    session_extraction_count += 1
 
                     # Create typed links from extraction relationships
                     if linker and extraction.relationships:
@@ -219,6 +222,15 @@ async def run_extraction_cycle(
                         "Failed to store extraction from session %s",
                         session_id, exc_info=True,
                     )
+
+            # Check per-session cap after storing this chunk's extractions
+            if session_extraction_count >= max_extractions_per_session:
+                logger.info(
+                    "Hit per-session extraction cap (%d) for session %s, "
+                    "skipping remaining chunks",
+                    max_extractions_per_session, session_id,
+                )
+                break
 
         # Update watermark + session keywords/topic
         # Skip both in reference_only_mode so the history mining run leaves
