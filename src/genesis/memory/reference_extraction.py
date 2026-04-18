@@ -73,6 +73,13 @@ _IPV4_PATTERN = re.compile(
     r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?::\d{1,5})?\b"
 )
 
+# Shell template variable — ${VAR_NAME} or ${VAR_NAME:-default}.
+# Matched as a fallback when no literal IPv4 is present but the content
+# contains network context words (same gate as IPv4).
+_ENV_VAR_PATTERN = re.compile(
+    r"\$\{[A-Z_][A-Z0-9_]*(?::[-+]?[^}]*)?\}"
+)
+
 # Words that signal "this IP is for something specific" rather than just
 # a random number that looks like an IP (e.g. "10.0.0 percent uptime").
 _NETWORK_CONTEXT_WORDS = frozenset({
@@ -207,17 +214,22 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
                 "tags": tags,
             }
 
-    # 4. IP address with network context
+    # 4. IP address or env-var placeholder with network context
     ip_match = _IPV4_PATTERN.search(content)
-    if ip_match:
-        lower = content.lower()
+    env_match = _ENV_VAR_PATTERN.search(content) if not ip_match else None
+    net_match = ip_match or env_match
+    if net_match:
+        # For env-var matches, strip the match itself before checking context
+        # to avoid false positives from defaults like "localhost" containing "host".
+        ctx = content if ip_match else content.replace(net_match.group(0), "")
+        lower = ctx.lower()
         if any(word in lower for word in _NETWORK_CONTEXT_WORDS):
             return {
                 "kind": "network",
                 "identifier": _derive_identifier(
-                    extraction, default_prefix=ip_match.group(0),
+                    extraction, default_prefix=net_match.group(0),
                 ),
-                "value": ip_match.group(0),
+                "value": net_match.group(0),
                 "description": content,
                 "tags": tags,
             }

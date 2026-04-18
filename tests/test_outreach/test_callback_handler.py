@@ -87,7 +87,7 @@ async def test_callback_unauthorized():
 
 @pytest.mark.asyncio
 async def test_callback_expired_waiter():
-    """Button press on expired/processed waiter is silently ignored (no edit)."""
+    """Button press on expired/processed waiter edits message with feedback."""
     waiter = ReplyWaiter()
     # Don't register — waiter doesn't exist
     ctx = _make_ctx(reply_waiter=waiter, allowed_users={12345})
@@ -97,8 +97,8 @@ async def test_callback_expired_waiter():
     await handle_callback_query(ctx, update, MagicMock())
 
     update.callback_query.answer.assert_awaited_once()
-    # Should NOT edit message (avoids overwriting "Approved" on double-press)
-    update.callback_query.edit_message_text.assert_not_awaited()
+    # Should edit message to show decision label with (expired) tag
+    update.callback_query.edit_message_text.assert_awaited_once()
 
 
 @pytest.mark.asyncio

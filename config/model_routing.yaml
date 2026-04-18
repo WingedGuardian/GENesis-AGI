@@ -239,6 +239,9 @@ call_sites:
     - claude-opus
     default_paid: true
     retry_profile: background
+    cc_model: Opus
+    dispatch: cli
+    cc_position: 1
   7_ego_cycle_api:
     chain:
     - claude-sonnet
