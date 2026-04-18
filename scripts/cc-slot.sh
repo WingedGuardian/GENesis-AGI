@@ -47,7 +47,7 @@ max_sessions=$ram_cap
 [[ $max_sessions -gt $CPU_CAP ]] && max_sessions=$CPU_CAP
 
 existing=$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
-           | grep -c "^${SESSION_PREFIX}-" || echo 0)
+           | grep -c "^${SESSION_PREFIX}-" || true)
 
 # Reattaching to existing session — always allow
 if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
