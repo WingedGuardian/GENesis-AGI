@@ -13,13 +13,6 @@ phase: 10
 skill_type: workflow
 ---
 
-## Workflow Pattern
-
-Domain-Specific Knowledge Injection (pattern #5 per
-`docs/reference/genesis-skill-conventions.md`). This skill injects
-Genesis-specific context, rules, and anti-patterns. Not a sequential
-pipeline.
-
 ## Load Gate
 
 Before reading any reference, confirm the task is Genesis-*development*,
@@ -49,12 +42,6 @@ Mark nothing "done" below Level 3.
 Code tagged `# GROUNDWORK(feature-id): why` is intentional future
 investment. Never delete or refactor it as dead code. Only remove when
 the feature is fully active or the user explicitly cancels it.
-
-### Procedure System
-
-Before multi-step tasks, check `procedure_recall` for relevant
-procedures. Procedures are empirically validated and override general
-skill guidance where they conflict.
 
 ### Architecture Review
 
@@ -154,26 +141,24 @@ references on every trigger.
 verify structural claims against current code. If a package status or
 gotcha has changed, flag to user before acting on stale assumptions.
 
-## Examples: Fire vs. Don't Fire
+## Public Repo & Release Workflow
 
-### Fire
+Genesis uses a dual-repo model. The public repo (`GENesis-AGI`) is
+primary. Key differences from a standard single-repo workflow:
 
-**Input:** "fix the retry logic in src/genesis/outreach/scheduler.py"
-**Action:** Load skill. Read `codebase-map.md` for outreach package
-context + `observability.md` for logging patterns.
-
-**Input:** "Genesis isn't starting, something about the bridge"
-**Action:** Load skill. Read `codebase-map.md` (debugging ladder section)
-+ `build-state.md` for recent incidents.
-
-**Input:** "add a new MCP tool for reminders"
-**Action:** Load skill. Read `environment.md` + `architecture.md` +
-`codebase-map.md` for MCP server organization.
-
-### Don't Fire
-
-**Input:** "use Genesis to pull the latest Anthropic blog posts"
-**Reason:** Genesis-as-tool, not development work. Do not load.
-
-**Input:** "what's the best way to structure a React component"
-**Reason:** Unrelated to Genesis internals. Do not load.
+- **Squash merges only** — merge commits are disabled on the public repo.
+  Always `git pull --rebase origin main` after merging a PR before
+  committing locally, or push will be rejected (non-fast-forward).
+- **Release pipeline** — `prepare-public-release.sh` strips user-specific
+  content (IPs, voice data, research profiles), then
+  `push-public-release.sh --version vX.Y` creates a PR on the public
+  repo. Merge the PR, then create the GitHub release with `gh release
+  create`. The release script has safety gates (voice data, secret scan,
+  portability scan) — fix failures, don't bypass them.
+- **README is public-authoritative** — the public repo's `README.md` is
+  hand-crafted and must NEVER be overwritten by the private repo version.
+  The release script preserves it automatically.
+- **CHANGELOG audience is users** — only include entries a user updating
+  their install would care about. No internal refactors, README changes,
+  CI tweaks, or process artifacts. Lead with the user-visible effect, not
+  the implementation technique.
