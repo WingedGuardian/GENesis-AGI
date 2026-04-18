@@ -178,7 +178,16 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             current_ids.add(alert_id)
 
     queues = snap.get("queues", {})
+    # Only check fields that represent actual queue depths — exclude
+    # cumulative counters (embedded_total), timestamps, error messages, etc.
+    _QUEUE_DEPTH_FIELDS = {
+        "pending_embeddings", "dead_letters", "deferred_work",
+        "deferred_processing", "deferred_stuck", "failed_embeddings",
+        "discarded_count",
+    }
     for queue_name, depth in queues.items():
+        if queue_name not in _QUEUE_DEPTH_FIELDS:
+            continue
         if isinstance(depth, int) and depth > 100:
             alert_id = f"queue:{queue_name}"
             alerts.append({

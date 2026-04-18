@@ -598,6 +598,11 @@ function infraStatusClass(probe) {
     if (status === 'healthy' || status === 'active') return 'status-healthy';
     if (status === 'degraded' || status === 'warning') return 'status-degraded';
     if (status === 'down') return 'status-down';
+    // cc_tmp uses tier (green/orange/red) instead of status
+    const tier = probe?.tier || probe?.cc_tier;
+    if (tier === 'green') return 'status-healthy';
+    if (tier === 'orange') return 'status-degraded';
+    if (tier === 'red') return 'status-down';
     if (probe?.free_pct != null) {
         if (probe.free_pct > 20) return 'status-healthy';
         if (probe.free_pct > 10) return 'status-degraded';

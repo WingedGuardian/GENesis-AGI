@@ -1274,7 +1274,9 @@
           return m[d] || '#6b7280';
         },
         _tierColor(t) {
-          return {curated:'#fbbf24', validated:'#4ade80', raw:'#6b7280', promoted:'#60a5fa'}[t] || '#6b7280';
+          return {curated:'#fbbf24', validated:'#4ade80', raw:'#6b7280', promoted:'#60a5fa',
+                  extraction_job:'#38bdf8', recon:'#f59e0b', manual:'#a78bfa',
+                  ingestion:'#34d399', conversation:'#f472b6', unknown:'#6b7280'}[t] || '#6b7280';
         },
         _memoryTypeColor(t) {
           const m = {episodic_memory:'#60a5fa', semantic_memory:'#4ade80', procedural:'#f59e0b',
@@ -5428,12 +5430,15 @@
                           <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update ' + domain.name.replace(/_/g, ' ') + ' settings&quot;'"></em></span>
                         </template>
                         <template x-if="domain.readonly">
-                          <span style="color:var(--color-text-secondary);">Read-only</span>
+                          <span style="color:var(--color-text-secondary); cursor:help;"
+                                :title="domain.readonly_reason || 'This setting cannot be edited from the dashboard'"
+                                x-text="domain.readonly_reason || 'Read-only'"></span>
                         </template>
                       </td>
                       <td style="padding:4px 8px;">
                         <template x-if="domain.readonly">
-                          <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px;">locked</span>
+                          <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px; cursor:help;"
+                                :title="domain.readonly_reason || 'Not editable from the dashboard'">view only</span>
                         </template>
                         <template x-if="domain.needs_restart && !domain.readonly">
                           <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>
@@ -6275,7 +6280,7 @@
           <!-- Directory listing -->
           <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
                x-ref="fileBrowserSidebar"
-               style="flex:0 0 260px; max-height:calc(100vh - 280px); overflow-y:auto; padding-right:0.5rem;">
+               style="flex:0 0 28%; max-height:calc(100vh - 280px); overflow-y:auto; padding-right:0.5rem;">
             <template x-if="$store.genesisDashboard.fileBrowser.loading">
               <div style="color:var(--color-text-secondary); font-size:0.75rem; padding:1rem;">Loading...</div>
             </template>
@@ -6299,11 +6304,14 @@
 
           <!-- Resize handle -->
           <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
-               style="flex:0 0 4px; cursor:col-resize; background:var(--color-border); border-radius:2px;
-                      transition:background .15s; position:relative; z-index:5; margin:0 2px;"
-               @mouseenter="$el.style.background='var(--color-accent)'"
-               @mouseleave="if(!$store.genesisDashboard.fileBrowser._resizing) $el.style.background='var(--color-border)'"
+               style="flex:0 0 8px; cursor:col-resize; background:var(--color-bg-tertiary);
+                      display:flex; align-items:center; justify-content:center;
+                      border-left:1px solid var(--color-border); border-right:1px solid var(--color-border);
+                      transition:background .15s; position:relative; z-index:5;"
+               @mouseenter="$el.style.background='rgba(99,102,241,0.25)'"
+               @mouseleave="if(!$store.genesisDashboard.fileBrowser._resizing) $el.style.background='var(--color-bg-tertiary)'"
                @mousedown.prevent="$store.genesisDashboard._startFileBrowserResize($event, $refs.fileBrowserSidebar)">
+            <span style="color:var(--color-text-secondary); font-size:0.55rem; pointer-events:none; opacity:0.6;">&#x22EE;</span>
           </div>
 
           <!-- File viewer -->
@@ -6787,8 +6795,8 @@
             <div style="display: flex; justify-content: space-between; align-items: center;">
               <strong x-text="unit.concept || unit.id" style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 55%;"></strong>
               <div style="display:flex; gap:.35rem; align-items:center;">
-                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._tierColor(unit.tier)}22; color:${$store.genesisDashboard._tierColor(unit.tier)};`"
-                      x-text="unit.tier || 'raw'"></span>
+                <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._tierColor(unit.source_pipeline)}22; color:${$store.genesisDashboard._tierColor(unit.source_pipeline)};`"
+                      x-text="unit.source_pipeline || 'unknown'"></span>
                 <span :style="`font-size:.65rem; padding:1px 6px; border-radius:3px; background:${$store.genesisDashboard._domainColor(unit.domain)}22; color:${$store.genesisDashboard._domainColor(unit.domain)};`"
                       x-text="unit.domain"></span>
               </div>

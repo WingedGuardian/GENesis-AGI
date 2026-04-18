@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
@@ -113,6 +113,9 @@ class RoutingConfig:
     providers: dict[str, ProviderConfig]
     call_sites: dict[str, CallSiteConfig]
     retry_profiles: dict[str, RetryPolicy]
+    # Provider name → provider_type for providers disabled at config load
+    # (e.g., no API key). Stored for the API keys dashboard display.
+    disabled_providers: dict[str, str] = field(default_factory=dict)
 
 
 class CallDelegate(Protocol):
