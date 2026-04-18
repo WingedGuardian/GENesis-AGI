@@ -186,15 +186,6 @@ async def run_extraction_cycle(
                 # episodic memory rows that already exist from prior cycles.
                 continue
 
-            # Check per-session cap before storing more extractions
-            if session_extraction_count >= max_extractions_per_session:
-                logger.info(
-                    "Hit per-session extraction cap (%d) for session %s, "
-                    "skipping remaining chunks",
-                    max_extractions_per_session, session_id,
-                )
-                break
-
             # Store each extraction with provenance
             for extraction in result.extractions:
                 kwargs = extractions_to_store_kwargs(
@@ -231,6 +222,15 @@ async def run_extraction_cycle(
                         "Failed to store extraction from session %s",
                         session_id, exc_info=True,
                     )
+
+            # Check per-session cap after storing this chunk's extractions
+            if session_extraction_count >= max_extractions_per_session:
+                logger.info(
+                    "Hit per-session extraction cap (%d) for session %s, "
+                    "skipping remaining chunks",
+                    max_extractions_per_session, session_id,
+                )
+                break
 
         # Update watermark + session keywords/topic
         # Skip both in reference_only_mode so the history mining run leaves
