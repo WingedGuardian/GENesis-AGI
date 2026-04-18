@@ -343,13 +343,17 @@ async def exists_recent_by_type(
 
     Used as a cooldown gate to prevent near-duplicate observations from
     LLM reflections that produce different wording for the same system state.
+
+    Uses Python-side ISO cutoff (not SQLite ``datetime('now')``) so the
+    comparison works correctly with ISO 8601 timestamps stored in created_at.
     """
+    cutoff = (datetime.now(UTC) - timedelta(minutes=window_minutes)).isoformat()
     cursor = await db.execute(
         "SELECT 1 FROM observations "
         "WHERE source = ? AND type = ? AND resolved = 0 "
-        "AND created_at > datetime('now', ? || ' minutes') "
+        "AND created_at > ? "
         "LIMIT 1",
-        (source, type, str(-window_minutes)),
+        (source, type, cutoff),
     )
     return (await cursor.fetchone()) is not None
 

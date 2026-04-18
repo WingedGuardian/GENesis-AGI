@@ -2247,7 +2247,7 @@ function updateHeaderBadges(data) {
     const hbRes = document.getElementById('hb-resilience');
     if (hbRes) {
         const resObj = data.resilience || {};
-        const res = resObj.level || resObj || 'unknown';
+        const res = (typeof resObj === 'object' ? resObj.level : resObj) || 'unknown';
         const isOk = res === 'L0' || res === 'normal' || res === 'not configured';
         hbRes.style.display = 'inline-flex';
         hbRes.style.background = isOk ? 'rgba(22,101,52,0.5)' : 'rgba(133,77,14,0.5)';
