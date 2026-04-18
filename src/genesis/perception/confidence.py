@@ -16,9 +16,11 @@ logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "confidence_gates.yaml"
 
-# Module-level cache with TTL — avoids re-reading YAML on every gate call
+# Module-level cache — avoids re-reading YAML on every gate call.
+# Invalidates on TTL expiry OR file mtime change (whichever comes first).
 _cached_config: ConfidenceGatesConfig | None = None
 _cache_ts: float = 0.0
+_cached_mtime: float = 0.0
 _CACHE_TTL = 60.0  # seconds
 
 
@@ -55,15 +57,23 @@ def load_config(path: Path | None = None) -> ConfidenceGatesConfig:
     call (multiple gates fire per awareness tick). Cache is bypassed when an
     explicit path is provided (e.g., in tests).
     """
-    global _cached_config, _cache_ts  # noqa: PLW0603
+    global _cached_config, _cache_ts, _cached_mtime  # noqa: PLW0603
 
     import time
 
-    now = time.monotonic()
-    if path is None and _cached_config is not None and (now - _cache_ts) < _CACHE_TTL:
-        return _cached_config
+    from genesis._config_overlay import local_overlay_mtime
 
+    now = time.monotonic()
     config_path = path or _CONFIG_PATH
+
+    # Invalidate cache if file changed (mtime check) even within TTL window
+    if path is None and _cached_config is not None:
+        try:
+            cur_mtime = config_path.stat().st_mtime + local_overlay_mtime(config_path)
+        except OSError:
+            cur_mtime = 0.0
+        if cur_mtime == _cached_mtime and (now - _cache_ts) < _CACHE_TTL:
+            return _cached_config
     if not config_path.exists():
         result = ConfidenceGatesConfig()
     else:
@@ -85,6 +95,10 @@ def load_config(path: Path | None = None) -> ConfidenceGatesConfig:
     if path is None:
         _cached_config = result
         _cache_ts = now
+        try:
+            _cached_mtime = config_path.stat().st_mtime + local_overlay_mtime(config_path)
+        except OSError:
+            _cached_mtime = 0.0
     return result
 
 
