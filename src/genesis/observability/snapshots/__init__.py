@@ -16,6 +16,7 @@ from genesis.observability.snapshots.eval_staleness import eval_staleness
 from genesis.observability.snapshots.infrastructure import (
     infrastructure,
     resilience_state,
+    resilience_state_detail,
 )
 from genesis.observability.snapshots.memory_health import memory_health
 from genesis.observability.snapshots.outreach import outreach_stats
@@ -41,6 +42,7 @@ __all__ = [
     "provider_activity",
     "queues",
     "resilience_state",
+    "resilience_state_detail",
     "services",
     "surplus_status",
     "validate_api_keys",
