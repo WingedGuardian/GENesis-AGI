@@ -928,6 +928,7 @@ INDEXES = [
     # GROUNDWORK(multi-person)
     "CREATE INDEX IF NOT EXISTS idx_observations_person ON observations(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(source, content_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_observations_type_source_created ON observations(type, source, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_outreach_person ON outreach_history(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_person ON autonomy_state(person_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_category ON autonomy_state(category)",

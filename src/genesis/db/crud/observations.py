@@ -309,6 +309,51 @@ async def resolve_expired(db: aiosqlite.Connection) -> int:
     return cursor.rowcount
 
 
+async def resolve_stale_persistent(
+    db: aiosqlite.Connection,
+    *,
+    max_age_days: int = 60,
+) -> int:
+    """Resolve unresolved persistent observations older than *max_age_days*.
+
+    Only targets low/medium priority.  High/critical persist until manually
+    resolved so they remain visible for human review.
+    """
+    now = datetime.now(UTC).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, "
+        "resolution_notes = 'auto-resolved (stale persistent)' "
+        "WHERE resolved = 0 AND expires_at IS NULL "
+        "AND created_at < ? AND priority IN ('low', 'medium')",
+        (now, cutoff),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def exists_recent_by_type(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+    window_minutes: int = 30,
+) -> bool:
+    """Check if an unresolved observation of this source+type was created recently.
+
+    Used as a cooldown gate to prevent near-duplicate observations from
+    LLM reflections that produce different wording for the same system state.
+    """
+    cursor = await db.execute(
+        "SELECT 1 FROM observations "
+        "WHERE source = ? AND type = ? AND resolved = 0 "
+        "AND created_at > datetime('now', ? || ' minutes') "
+        "LIMIT 1",
+        (source, type, str(-window_minutes)),
+    )
+    return (await cursor.fetchone()) is not None
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM observations WHERE id = ?", (id,))
     await db.commit()
