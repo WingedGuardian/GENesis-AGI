@@ -32,6 +32,7 @@ async def init_sentinel(rt) -> None:
         event_bus=getattr(rt, "_event_bus", None),
         health_data=getattr(rt, "_health_data", None),
         outreach_pipeline=getattr(rt, "_outreach_pipeline", None),
+        approval_gate=getattr(rt, "_autonomous_cli_approval_gate", None),
     )
     rt._sentinel = sentinel
 

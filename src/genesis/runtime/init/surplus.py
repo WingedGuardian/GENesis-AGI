@@ -10,6 +10,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("genesis.runtime")
 
+_CONFIG_DIR = __import__("pathlib").Path(__file__).resolve().parents[3] / "config"
+
+
+def _load_surplus_config() -> dict:
+    """Load surplus config from YAML with .local.yaml overlay."""
+    from pathlib import Path
+
+    import yaml
+
+    from genesis._config_overlay import merge_local_overlay
+
+    config_path = _CONFIG_DIR / "surplus.yaml"
+    if not config_path.exists():
+        logger.info("Surplus config not found at %s — using defaults", config_path)
+        return {}
+    try:
+        raw = yaml.safe_load(Path(config_path).read_text()) or {}
+        return merge_local_overlay(raw, config_path)
+    except Exception:
+        logger.error("Failed to read surplus config from %s", config_path, exc_info=True)
+        return {}
+
 
 async def _degraded(rt: GenesisRuntime, component: str, error: str = "failed to wire") -> None:
     """Record a surplus init degradation."""
@@ -28,6 +50,11 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.surplus.queue import SurplusQueue
         from genesis.surplus.scheduler import SurplusScheduler
 
+        # Load surplus config (base + .local.yaml overlay from dashboard)
+        cfg = _load_surplus_config()
+        dispatch = cfg.get("dispatch", {})
+        jobs = cfg.get("jobs", {})
+
         queue = SurplusQueue(db=rt._db)
         rt._surplus_queue = queue
         idle_detector = IdleDetector()
@@ -41,6 +68,16 @@ async def init(rt: GenesisRuntime) -> None:
             compute_availability=compute,
             event_bus=rt._event_bus,
             enable_code_audits=False,
+            dispatch_interval_minutes=int(dispatch.get("interval_minutes", 5)),
+            brainstorm_check_hours=int(jobs.get("brainstorm_check_hours", 12)),
+            task_expiry_hours=int(dispatch.get("task_expiry_hours", 72)),
+            code_audit_hours=int(jobs.get("code_audit_hours", 12)),
+            code_index_hours=int(jobs.get("code_index_hours", 4)),
+            infra_monitor_hours=int(jobs.get("infra_monitor_hours", 2)),
+            recon_gather_hours=int(jobs.get("recon_gather_hours", 84)),
+            maintenance_hours=int(jobs.get("maintenance_hours", 6)),
+            follow_up_dispatch_minutes=int(jobs.get("follow_up_dispatch_minutes", 5)),
+            memory_extraction_hours=int(jobs.get("memory_extraction_hours", 2)),
         )
 
         try:
@@ -189,14 +226,15 @@ async def init(rt: GenesisRuntime) -> None:
                 from apscheduler.triggers.interval import (
                     IntervalTrigger as _ExtIvlTrig,
                 )
+                extraction_hours = rt._surplus_scheduler._memory_extraction_hours
                 rt._surplus_scheduler._scheduler.add_job(
                     rt._surplus_scheduler.run_memory_extraction,
-                    _ExtIvlTrig(hours=2),
+                    _ExtIvlTrig(hours=extraction_hours),
                     id="memory_extraction",
                     max_instances=1,
                     misfire_grace_time=300,
                 )
-                logger.info("Memory extraction job wired (2h interval)")
+                logger.info("Memory extraction job wired (%dh interval)", extraction_hours)
         except (ImportError, AttributeError):
             logger.error("Failed to wire memory extraction", exc_info=True)
             await _degraded(rt, "memory_extraction")

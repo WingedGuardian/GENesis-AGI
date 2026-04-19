@@ -3679,7 +3679,7 @@
                   <span style="width:3rem; text-align:right; font-weight:600;"
                         :style="`color: ${$store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50'}`"
                         x-text="$store.genesisDashboard.health.infrastructure.container_memory.used_pct.toFixed(0) + '%'"></span>
-                  <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
                     <div style="height:100%; border-radius:3px; transition:width 0.3s;"
                          :style="'width:' + $store.genesisDashboard.health.infrastructure.container_memory.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50')"></div>
                   </div>
@@ -3700,7 +3700,7 @@
                     <span style="width:3rem; text-align:right; font-size:0.7rem; color:var(--color-text-secondary);">—</span>
                   </template>
                   <template x-if="$store.genesisDashboard.health.infrastructure.cpu.used_pct != null">
-                    <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                    <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
                       <div style="height:100%; border-radius:3px; transition:width 0.3s;"
                            :style="'width:' + $store.genesisDashboard.health.infrastructure.cpu.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.cpu.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.cpu.used_pct > 60 ? '#f0ad4e' : '#4caf50')"></div>
                     </div>
@@ -3719,7 +3719,7 @@
                   <span style="width:3rem; text-align:right; font-weight:600;"
                         :style="`color: ${(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50'}`"
                         x-text="(100 - $store.genesisDashboard.health.infrastructure.disk.free_pct).toFixed(0) + '%'"></span>
-                  <div style="flex:1; height:6px; background:var(--color-bg-tertiary); border-radius:3px; min-width:40px;">
+                  <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
                     <div style="height:100%; border-radius:3px; transition:width 0.3s;"
                          :style="'width:' + (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) + '%; background:' + ((100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 90 ? '#d9534f' : (100 - $store.genesisDashboard.health.infrastructure.disk.free_pct) > 85 ? '#f0ad4e' : '#4caf50')"></div>
                   </div>
@@ -5485,7 +5485,7 @@
                       </td>
                       <td style="padding:4px 8px;">
                         <template x-if="domain.readonly">
-                          <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px; cursor:pointer;"
+                          <span style="font-size:0.65rem; background:var(--color-background); padding:2px 6px; border-radius:3px; cursor:pointer;"
                                 @click.stop="$store.genesisDashboard.viewSettings(domain.name)"
                                 x-text="$store.genesisDashboard.settingsViewing === domain.name ? '\u25BC viewing' : '\u25B6 view'"></span>
                         </template>
@@ -6607,7 +6607,7 @@
                 <button @click="$store.genesisDashboard.deleteMemory($store.genesisDashboard.memoryDetail.memory_id)"
                         style="background:rgba(239,154,154,0.2); color:#ef9a9a; border:1px solid rgba(239,154,154,0.3); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Delete</button>
                 <button @click="$store.genesisDashboard.memoryDetail = null"
-                        style="background:var(--color-bg-tertiary); color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Close</button>
+                        style="background:var(--color-background); color:var(--color-text-secondary); border:1px solid var(--color-border); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Close</button>
               </div>
             </div>
             <div style="padding:0.75rem; border-top:1px solid var(--color-border);">
@@ -6664,30 +6664,30 @@
              @dragleave.prevent="$store.genesisDashboard.knowledgeUpload.dragging = false"
              @drop.prevent="$store.genesisDashboard.handleKnowledgeFileDrop($event)"
              @click="$refs.knowledgeFileInput.click()"
-             :style="`border: 2px dashed ${$store.genesisDashboard.knowledgeUpload.dragging ? 'var(--accent)' : 'var(--border)'}; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: ${$store.genesisDashboard.knowledgeUpload.dragging ? 'rgba(99,102,241,.08)' : 'transparent'};`">
-          <span class="material-symbols-outlined" style="font-size: 2rem; color: var(--text-dim);">upload_file</span>
-          <div style="margin-top: .5rem; color: var(--text-dim);" x-text="$store.genesisDashboard.knowledgeUpload.uploading ? 'Uploading...' : 'Drop files here or click to browse'"></div>
-          <div style="font-size: .8em; color: var(--text-dim); margin-top: .25rem;">PDF, text, audio, video — up to 500 MB</div>
+             :style="`border: 2px dashed ${$store.genesisDashboard.knowledgeUpload.dragging ? 'var(--color-accent)' : 'var(--color-border)'}; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: border-color .2s; background: ${$store.genesisDashboard.knowledgeUpload.dragging ? 'rgba(99,102,241,.08)' : 'transparent'};`">
+          <span class="material-symbols-outlined" style="font-size: 2rem; color: var(--color-text-secondary);">upload_file</span>
+          <div style="margin-top: .5rem; color: var(--color-text-secondary);" x-text="$store.genesisDashboard.knowledgeUpload.uploading ? 'Uploading...' : 'Drop files here or click to browse'"></div>
+          <div style="font-size: .8em; color: var(--color-text-secondary); margin-top: .25rem;">PDF, text, audio, video — up to 500 MB</div>
           <input type="file" x-ref="knowledgeFileInput" style="display:none"
                  @change="$store.genesisDashboard.handleKnowledgeFileDrop($event)">
         </div>
 
         <!-- Confirmation Card -->
         <template x-if="$store.genesisDashboard.knowledgeUpload.confirm">
-          <div class="card" style="border: 1px solid var(--accent); padding: 1.25rem;">
+          <div class="card" style="border: 1px solid var(--color-accent); padding: 1.25rem;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem;">
               <strong>Store to Knowledge Base</strong>
               <span class="badge" x-text="$store.genesisDashboard.knowledgeUpload.file?.mime || 'unknown'"></span>
             </div>
-            <div style="margin-bottom: .75rem; color: var(--text-dim);">
+            <div style="margin-bottom: .75rem; color: var(--color-text-secondary);">
               <span x-text="$store.genesisDashboard.knowledgeUpload.file?.name"></span>
               (<span x-text="$store.genesisDashboard._formatFileSize($store.genesisDashboard.knowledgeUpload.file?.size)"></span>)
             </div>
             <div style="display: flex; gap: .5rem; margin-bottom: .75rem;">
               <div style="flex: 1;">
-                <label style="font-size: .8em; color: var(--text-dim);">Project Type *</label>
+                <label style="font-size: .8em; color: var(--color-text-secondary);">Project Type *</label>
                 <input type="text" list="kb-project-types" x-model="$store.genesisDashboard.knowledgeUpload.projectType"
-                       placeholder="e.g. professional" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+                       placeholder="e.g. professional" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
                 <datalist id="kb-project-types">
                   <template x-for="pt in $store.genesisDashboard.knowledgeTaxonomy.project_types" :key="pt">
                     <option :value="pt"></option>
@@ -6695,9 +6695,9 @@
                 </datalist>
               </div>
               <div style="flex: 1;">
-                <label style="font-size: .8em; color: var(--text-dim);">Domain</label>
+                <label style="font-size: .8em; color: var(--color-text-secondary);">Domain</label>
                 <input type="text" list="kb-domains" x-model="$store.genesisDashboard.knowledgeUpload.domain"
-                       placeholder="auto" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+                       placeholder="auto" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
                 <datalist id="kb-domains">
                   <template x-for="d in $store.genesisDashboard.knowledgeTaxonomy.domains" :key="d">
                     <option :value="d"></option>
@@ -6706,23 +6706,23 @@
               </div>
             </div>
             <div style="margin-bottom: .75rem;">
-              <label style="font-size: .8em; color: var(--text-dim);">Purpose (optional, comma-separated)</label>
+              <label style="font-size: .8em; color: var(--color-text-secondary);">Purpose (optional, comma-separated)</label>
               <input type="text" x-model="$store.genesisDashboard.knowledgeUpload.purpose"
-                     placeholder="e.g. resume-prep, cloud-eng" style="width: 100%; padding: .4rem; background: var(--bg-tertiary); border: 1px solid var(--border); color: var(--text); border-radius: 4px;">
+                     placeholder="e.g. resume-prep, cloud-eng" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
             </div>
             <template x-if="$store.genesisDashboard.knowledgeUpload.error">
-              <div style="color: var(--error); margin-bottom: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+              <div style="color: var(--color-error-text); margin-bottom: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
             </template>
             <div style="display: flex; gap: .5rem; justify-content: flex-end;">
               <button class="btn-sm" style="opacity: .7;" @click="$store.genesisDashboard.cancelKnowledgeUpload()">Cancel</button>
-              <button class="btn-sm" style="background: var(--accent); color: #fff;" @click="$store.genesisDashboard.confirmKnowledgeIngest()">Store</button>
+              <button class="btn-sm" style="background: var(--color-accent); color: #fff;" @click="$store.genesisDashboard.confirmKnowledgeIngest()">Store</button>
             </div>
           </div>
         </template>
 
         <!-- Upload error outside confirmation -->
         <template x-if="$store.genesisDashboard.knowledgeUpload.error && !$store.genesisDashboard.knowledgeUpload.confirm">
-          <div style="color: var(--error); margin-top: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
+          <div style="color: var(--color-error-text); margin-top: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
         </template>
       </div>
 
@@ -6734,18 +6734,18 @@
             <div class="card" style="margin-bottom: .4rem; padding: .6rem .8rem; display: flex; justify-content: space-between; align-items: center;">
               <div>
                 <span x-text="upload.filename" style="font-weight: 500;"></span>
-                <span style="font-size: .8em; color: var(--text-dim); margin-left: .5rem;"
+                <span style="font-size: .8em; color: var(--color-text-secondary); margin-left: .5rem;"
                       x-text="$store.genesisDashboard._formatFileSize(upload.file_size)"></span>
               </div>
               <div style="display: flex; align-items: center; gap: .5rem;">
                 <template x-if="upload.status === 'processing'">
-                  <span class="badge" style="background: var(--warning); color: #000;">processing</span>
+                  <span class="badge" style="background: var(--color-warning-text); color: #000;">processing</span>
                 </template>
                 <template x-if="upload.status === 'completed'">
-                  <span class="badge" style="background: var(--success); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
+                  <span class="badge" style="background: var(--color-primary); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
                 </template>
                 <template x-if="upload.status === 'failed'">
-                  <span class="badge" style="background: var(--error); color: #fff;" :title="upload.error_message">failed</span>
+                  <span class="badge" style="background: var(--color-error-text); color: #fff;" :title="upload.error_message">failed</span>
                 </template>
                 <template x-if="upload.status === 'uploaded'">
                   <span class="badge">uploaded</span>
@@ -6758,19 +6758,19 @@
 
       <!-- Stats Cards -->
       <div style="display: flex; gap: 1rem; margin-bottom: 1.5rem; flex-wrap: wrap;">
-        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.total ?? '—'"></div>
           <div style="font-size: .75rem; color: var(--color-text-secondary);">Total Units</div>
         </div>
-        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.qdrant_vectors ?? '—'"></div>
           <div style="font-size: .75rem; color: var(--color-text-secondary);">Qdrant Vectors</div>
         </div>
-        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="Object.keys($store.genesisDashboard.knowledgeStats?.by_domain ?? {}).length"></div>
           <div style="font-size: .75rem; color: var(--color-text-secondary);">Domains</div>
         </div>
-        <div style="flex: 1; min-width: 100px; background: var(--color-bg-tertiary); border-radius: 6px; padding: .75rem; text-align: center;">
+        <div style="flex: 1; min-width: 100px; background: var(--color-background); border-radius: 6px; padding: .75rem; text-align: center;">
           <div style="font-size: 1.4rem; font-weight: 700;" x-text="$store.genesisDashboard.knowledgeStats?.by_tier?.curated ?? 0"></div>
           <div style="font-size: .75rem; color: var(--color-text-secondary);">Curated</div>
         </div>
@@ -6800,7 +6800,7 @@
       <div style="margin-bottom: 1rem; display: flex; gap: .5rem;">
         <input type="text" x-model="$store.genesisDashboard.knowledgeQuery" placeholder="Search knowledge base..."
                @keyup.enter="$store.genesisDashboard.searchKnowledge()"
-               style="flex: 1; padding: .5rem; background: var(--color-bg-tertiary); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+               style="flex: 1; padding: .5rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
         <button @click="$store.genesisDashboard.searchKnowledge()" class="btn-sm">Search</button>
       </div>
 
@@ -6810,7 +6810,7 @@
           <h4 style="margin-bottom: .5rem;">Search Results</h4>
           <div style="display: flex; flex-direction: column; gap: .5rem;">
             <template x-for="item in $store.genesisDashboard.knowledgeSearchResults" :key="item.unit_id">
-              <div :style="`background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(item.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+              <div :style="`background: var(--color-background); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(item.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
                    @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
                    @mouseleave="$el.style.background=''"
                    @click="$store.genesisDashboard.viewKnowledgeDetail(item.unit_id)">
@@ -6837,7 +6837,7 @@
       </template>
       <div style="display: flex; flex-direction: column; gap: .5rem;">
         <template x-for="unit in $store.genesisDashboard.knowledgeRecent" :key="unit.id">
-          <div :style="`background: var(--color-bg-tertiary); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(unit.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
+          <div :style="`background: var(--color-background); border: 1px solid var(--color-border); border-left: 3px solid ${$store.genesisDashboard._domainColor(unit.domain)}; border-radius: 6px; padding: .75rem; cursor: pointer; transition: background .15s;`"
                @mouseenter="$el.style.background='rgba(255,255,255,0.06)'"
                @mouseleave="$el.style.background=''"
                @click="$store.genesisDashboard.viewKnowledgeDetail(unit.id)">
@@ -6867,9 +6867,9 @@
       <template x-if="$store.genesisDashboard.knowledgeDetail">
         <div style="position: fixed; inset: 0; background: rgba(0,0,0,.6); z-index: 100; display: flex; align-items: center; justify-content: center;"
              @click.self="$store.genesisDashboard.knowledgeDetail = null">
-          <div style="background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;">
+          <div style="background: var(--color-panel); border: 1px solid var(--color-border); border-radius: 8px; padding: 1.5rem; max-width: 700px; width: 90%; max-height: 80vh; overflow-y: auto;">
             <h3 x-text="$store.genesisDashboard.knowledgeDetail.concept"></h3>
-            <div style="margin: .75rem 0; font-size: .9em; color: var(--text-dim);">
+            <div style="margin: .75rem 0; font-size: .9em; color: var(--color-text-secondary);">
               <span x-text="'Domain: ' + $store.genesisDashboard.knowledgeDetail.domain"></span> |
               <span x-text="'Project: ' + $store.genesisDashboard.knowledgeDetail.project_type"></span> |
               <span x-text="'Pipeline: ' + ($store.genesisDashboard.knowledgeDetail.source_pipeline || 'unknown')"></span> |
@@ -6881,7 +6881,7 @@
             <template x-if="$store.genesisDashboard.knowledgeDetail.ingestion_source">
               <div style="margin-bottom: .5rem;"><strong>Source:</strong> <span x-text="$store.genesisDashboard.knowledgeDetail.ingestion_source"></span></div>
             </template>
-            <div style="white-space: pre-wrap; font-family: monospace; font-size: .85em; background: var(--bg-tertiary); padding: 1rem; border-radius: 4px; margin: .75rem 0;"
+            <div style="white-space: pre-wrap; font-family: monospace; font-size: .85em; background: var(--color-background); padding: 1rem; border-radius: 4px; margin: .75rem 0;"
                  x-text="$store.genesisDashboard.knowledgeDetail.body"></div>
             <div style="display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem;">
               <button class="btn-sm btn-danger" @click="$store.genesisDashboard.deleteKnowledge($store.genesisDashboard.knowledgeDetail.id)">Delete</button>

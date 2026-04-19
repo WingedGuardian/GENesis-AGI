@@ -687,6 +687,11 @@ class AwarenessLoop:
                 name=f"approval-resume-{result.tick_id[:8]}",
                 subsystem=Subsystem.AWARENESS,
             )
+            tracked_task(
+                self._resume_approved_sentinel_dispatches(),
+                name=f"sentinel-resume-{result.tick_id[:8]}",
+                subsystem=Subsystem.AWARENESS,
+            )
 
     async def _dispatch_reflection(self, result: TickResult) -> None:
         depth = result.classified_depth
@@ -854,6 +859,53 @@ class AwarenessLoop:
             except Exception:
                 logger.error(
                     "Failed to resume %s reflection", depth_name, exc_info=True,
+                )
+
+    async def _resume_approved_sentinel_dispatches(self) -> None:
+        """Resume sentinel dispatches whose approvals were granted.
+
+        Mirrors _resume_approved_reflections: checks for approved-but-
+        unconsumed sentinel approvals and resumes the dispatcher.
+        """
+        if self._sentinel is None:
+            return
+
+        # Access the approval gate via the sentinel dispatcher
+        gate = getattr(self._sentinel, "_approval_gate", None)
+        if gate is None:
+            return
+
+        from genesis.sentinel.state import SentinelState as _SS
+
+        # Only resume if sentinel is actually waiting for an approval
+        state = self._sentinel.state
+        if state.state not in (_SS.AWAITING_DISPATCH_APPROVAL, _SS.AWAITING_ACTION_APPROVAL):
+            return
+
+        for policy_id in ("sentinel_dispatch", "sentinel_action"):
+            try:
+                approved = await gate.find_recently_approved(
+                    subsystem="sentinel",
+                    policy_id=policy_id,
+                )
+                if not approved:
+                    continue
+
+                # Atomic consume — prevents double-dispatch
+                consumed = await gate.mark_consumed(approved["id"])
+                if not consumed:
+                    continue
+
+                logger.info(
+                    "Resuming sentinel %s from approved request %s",
+                    policy_id, approved["id"][:8],
+                )
+                await self._sentinel.resume_from_approval(
+                    approved["id"], "approved",
+                )
+            except Exception:
+                logger.error(
+                    "Failed to resume sentinel %s", policy_id, exc_info=True,
                 )
 
     async def _retry_deferred_reflection(self, current_tick: TickResult) -> None:

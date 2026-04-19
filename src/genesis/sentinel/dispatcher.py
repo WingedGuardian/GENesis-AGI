@@ -61,6 +61,70 @@ _ALARM_RING_SIZE = 3
 _ALARM_CONFIRMATION_COUNT = 2
 
 
+def _serialize_request(request: SentinelRequest) -> str:
+    """Serialize a SentinelRequest to JSON for state persistence."""
+    import json
+    return json.dumps({
+        "trigger_source": request.trigger_source,
+        "trigger_reason": request.trigger_reason,
+        "tier": request.tier,
+        "alarms": [asdict(a) for a in request.alarms],
+        "context": request.context,
+    })
+
+
+def _deserialize_request(raw: str) -> SentinelRequest | None:
+    """Deserialize a SentinelRequest from JSON. Returns None on failure."""
+    if not raw:
+        return None
+    try:
+        import json
+        data = json.loads(raw)
+        alarms = [FireAlarm(**a) for a in data.get("alarms", [])]
+        return SentinelRequest(
+            trigger_source=data["trigger_source"],
+            trigger_reason=data["trigger_reason"],
+            tier=data.get("tier"),
+            alarms=alarms,
+            context=data.get("context", {}),
+        )
+    except Exception:
+        logger.error("Failed to deserialize SentinelRequest", exc_info=True)
+        return None
+
+
+def _serialize_result(result: SentinelResult) -> str:
+    """Serialize a SentinelResult to JSON for state persistence."""
+    import json
+    return json.dumps({
+        "dispatched": result.dispatched,
+        "session_id": result.session_id,
+        "diagnosis": result.diagnosis,
+        "actions_taken": result.actions_taken,
+        "proposed_actions": result.proposed_actions,
+        "resolved": result.resolved,
+        "observation_id": result.observation_id,
+        "reason": result.reason,
+        "duration_s": result.duration_s,
+    })
+
+
+def _deserialize_result(raw: str) -> SentinelResult | None:
+    """Deserialize a SentinelResult from JSON. Returns None on failure."""
+    if not raw:
+        return None
+    try:
+        import json
+        data = json.loads(raw)
+        return SentinelResult(**{
+            k: v for k, v in data.items()
+            if k in SentinelResult.__dataclass_fields__
+        })
+    except Exception:
+        logger.error("Failed to deserialize SentinelResult", exc_info=True)
+        return None
+
+
 @dataclass(frozen=True)
 class SentinelRequest:
     """Request to wake the Sentinel."""
@@ -120,6 +184,7 @@ class SentinelDispatcher:
         event_bus: GenesisEventBus | None = None,
         health_data: HealthDataService | None = None,
         outreach_pipeline=None,
+        approval_gate=None,
     ) -> None:
         self._session_manager = session_manager
         self._invoker = invoker
@@ -128,6 +193,7 @@ class SentinelDispatcher:
         self._event_bus = event_bus
         self._health_data = health_data
         self._outreach_pipeline = outreach_pipeline
+        self._approval_gate = approval_gate  # AutonomousCliApprovalGate or None
         self._lock = asyncio.Lock()
         self._active_session_id: str | None = None
         self._state = load_state()
@@ -148,7 +214,7 @@ class SentinelDispatcher:
         # dispatching. Prevents single-tick flaps from waking the Sentinel.
         self._recent_alarm_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
 
-        # Load dispatch approval policy
+        # Load dispatch approval policy (legacy path, used when approval_gate is None)
         try:
             from genesis.autonomy.cli_policy import load_autonomous_cli_policy
             policy = load_autonomous_cli_policy()
@@ -157,6 +223,21 @@ class SentinelDispatcher:
             )
         except Exception:
             self._require_approval = True
+
+        # On startup, clean up stale AWAITING_* states if no matching
+        # approval row exists in the DB. This handles restarts where the
+        # approval was resolved while the process was down.
+        if self._state.state in (
+            SentinelState.AWAITING_DISPATCH_APPROVAL,
+            SentinelState.AWAITING_ACTION_APPROVAL,
+        ) and not self._state.pending_request_id:
+            logger.info(
+                "Clearing stale %s state (no pending request id)",
+                self._state.current_state,
+            )
+            self._state.clear_pending()
+            self._state.transition(SentinelState.HEALTHY, reason="stale pending cleared on startup")
+            save_state(self._state)
 
     async def dispatch(self, request: SentinelRequest) -> SentinelResult:
         """Main entry point. Evaluate request, manage state, dispatch CC if needed.
@@ -188,7 +269,17 @@ class SentinelDispatcher:
                 reason="In bootstrap grace period — skipping",
             )
 
-        # Gate 2: Concurrent limit
+        # Gate 2: Awaiting approval (non-blocking gate)
+        if self._state.state in (
+            SentinelState.AWAITING_DISPATCH_APPROVAL,
+            SentinelState.AWAITING_ACTION_APPROVAL,
+        ):
+            return SentinelResult(
+                dispatched=False,
+                reason=f"Sentinel awaiting approval ({self._state.pending_policy_id})",
+            )
+
+        # Gate 3: Concurrent limit
         if self._active_session_id is not None:
             return SentinelResult(
                 dispatched=False,
@@ -225,15 +316,75 @@ class SentinelDispatcher:
     async def _execute_dispatch(
         self, request: SentinelRequest, *, pattern: str = "",
     ) -> SentinelResult:
-        """Execute the actual CC dispatch with state management."""
+        """Execute the actual CC dispatch with state management.
+
+        Three-phase flow when approval_gate is present:
+          Phase 1: ensure_approval(sentinel_dispatch) → park if pending
+          Phase 2: CC session → get diagnosis + proposed actions
+          Phase 3: ensure_approval(sentinel_action) → park if pending, then execute
+        Legacy path (approval_gate is None): blocking Telegram approval.
+        """
         start = time.monotonic()
 
-        # Dispatch approval — ask user via Telegram before activating CC
-        if self._require_approval and self._outreach_pipeline:
+        # ── Phase 1: Dispatch approval ──────────────────────────────
+        if self._approval_gate is not None:
+            try:
+                status, request_id, reason = await self._approval_gate.ensure_approval(
+                    subsystem="sentinel",
+                    policy_id="sentinel_dispatch",
+                    action_label=f"Sentinel dispatch: {request.trigger_reason[:60]}",
+                    action_type="sentinel_dispatch",
+                    extra_context={
+                        "tier_label": f"Tier {request.tier}" if request.tier else "Unknown tier",
+                        "trigger_source": request.trigger_source,
+                        "trigger_reason": request.trigger_reason,
+                        "alarm_count": len(request.alarms),
+                    },
+                )
+                if status == "pending":
+                    # Park: save context and wait for awareness loop resume
+                    self._state.pending_request_id = request_id or ""
+                    self._state.pending_policy_id = "sentinel_dispatch"
+                    self._state.pending_pattern = pattern
+                    self._state.pending_request_json = _serialize_request(request)
+                    self._state.transition(
+                        SentinelState.AWAITING_DISPATCH_APPROVAL,
+                        reason=f"dispatch approval pending ({request_id})",
+                    )
+                    save_state(self._state)
+                    append_log({"event": "dispatch_approval_pending", "request_id": request_id})
+                    return SentinelResult(
+                        dispatched=False,
+                        reason=f"Dispatch approval pending: {reason}",
+                        duration_s=time.monotonic() - start,
+                    )
+                if status == "rejected":
+                    expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+                    self._state.rejected_patterns[pattern] = expiry
+                    self._state.clear_pending()
+                    self._state.transition(SentinelState.HEALTHY, reason="dispatch rejected via approval gate")
+                    save_state(self._state)
+                    append_log({"event": "dispatch_rejected", "request_id": request_id})
+                    return SentinelResult(
+                        dispatched=False,
+                        reason="User rejected Sentinel dispatch",
+                        duration_s=time.monotonic() - start,
+                    )
+                # status == "approved" — continue to Phase 2
+                logger.info("Sentinel dispatch approved (%s)", request_id)
+                append_log({"event": "dispatch_approved", "request_id": request_id})
+            except Exception:
+                logger.error("Sentinel dispatch approval failed", exc_info=True)
+                return SentinelResult(
+                    dispatched=False,
+                    reason="Dispatch approval mechanism failed",
+                    duration_s=time.monotonic() - start,
+                )
+        elif self._require_approval and self._outreach_pipeline:
+            # Legacy blocking path
             try:
                 approved = await self._request_dispatch_approval(request)
                 if not approved:
-                    # Record rejection with 24h suppression window
                     expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
                     self._state.rejected_patterns[pattern] = expiry
                     self._state.transition(SentinelState.HEALTHY, reason="dispatch rejected by user")
@@ -251,12 +402,27 @@ class SentinelDispatcher:
                     duration_s=time.monotonic() - start,
                 )
 
+        # ── Phase 2: CC session ─────────────────────────────────────
+        return await self._phase2_cc_and_actions(request, pattern=pattern, start=start)
+
+    async def _phase2_cc_and_actions(
+        self, request: SentinelRequest, *, pattern: str = "", start: float = 0.0,
+    ) -> SentinelResult:
+        """Phase 2-3: Run CC session, then request action approval and execute.
+
+        Split from _execute_dispatch so the awareness loop can resume here
+        after a dispatch approval is granted.
+        """
+        if start == 0.0:
+            start = time.monotonic()
+
         # Transition to INVESTIGATING
         self._state.transition(
             SentinelState.INVESTIGATING,
             reason=f"{request.trigger_source}: {request.trigger_reason}",
         )
         self._state.last_trigger_source = request.trigger_source
+        self._state.clear_pending()
         save_state(self._state)
 
         # Log the dispatch
@@ -290,16 +456,144 @@ class SentinelDispatcher:
                 reason=f"CC dispatch error: {exc}",
             )
 
-        # If CC proposed actions, send them to user for approval and execute
+        # ── Phase 3: Action approval + execution ───────────────────
         if result.dispatched and result.proposed_actions:
-            try:
-                executed = await self._approve_and_execute_actions(result)
-                if executed:
-                    result.resolved = True
-                    result.actions_taken = [a["command"] for a in executed]
-            except Exception:
-                logger.error("Sentinel action approval/execution failed", exc_info=True)
+            if self._approval_gate is not None:
+                try:
+                    action_result = await self._gated_action_approval(result, request, pattern)
+                    if action_result is not None:
+                        # Pending or rejected — return the phase-3 result
+                        action_result.duration_s = time.monotonic() - start
+                        return action_result
+                    # None means approved — continue to execution below
+                except Exception:
+                    logger.error("Sentinel action approval/execution failed", exc_info=True)
+            elif self._outreach_pipeline:
+                # Legacy blocking path
+                try:
+                    executed = await self._approve_and_execute_actions(result)
+                    if executed:
+                        result.resolved = True
+                        result.actions_taken = [a["command"] for a in executed]
+                except Exception:
+                    logger.error("Sentinel action approval/execution failed", exc_info=True)
 
+            # Execute approved actions (gated path)
+            if self._approval_gate is not None and result.proposed_actions and not result.resolved:
+                try:
+                    executed = await self._execute_approved_actions(result.proposed_actions)
+                    if executed:
+                        result.resolved = True
+                        result.actions_taken = [a["command"] for a in executed]
+                except Exception:
+                    logger.error("Sentinel action execution failed", exc_info=True)
+
+        return await self._finalize_dispatch(request, result, pattern=pattern, start=start)
+
+    async def _gated_action_approval(
+        self, result: SentinelResult, request: SentinelRequest, pattern: str,
+    ) -> SentinelResult | None:
+        """Phase 3 approval gate for proposed actions.
+
+        Returns SentinelResult if pending/rejected (caller should return it).
+        Returns None if approved (caller should proceed to execute actions).
+        """
+        status, request_id, reason = await self._approval_gate.ensure_approval(
+            subsystem="sentinel",
+            policy_id="sentinel_action",
+            action_label=f"Sentinel actions: {result.diagnosis[:40]}",
+            action_type="sentinel_action",
+            extra_context={
+                "diagnosis": result.diagnosis,
+                "proposed_actions": result.proposed_actions,
+                "session_id": result.session_id,
+            },
+        )
+
+        if status == "pending":
+            # Park: save CC result for resume
+            self._state.pending_request_id = request_id or ""
+            self._state.pending_policy_id = "sentinel_action"
+            self._state.pending_pattern = pattern
+            self._state.pending_request_json = _serialize_request(request)
+            self._state.pending_cc_result_json = _serialize_result(result)
+            self._state.transition(
+                SentinelState.AWAITING_ACTION_APPROVAL,
+                reason=f"action approval pending ({request_id})",
+            )
+            save_state(self._state)
+            append_log({"event": "action_approval_pending", "request_id": request_id})
+            return SentinelResult(
+                dispatched=True,
+                session_id=result.session_id,
+                diagnosis=result.diagnosis,
+                proposed_actions=result.proposed_actions,
+                reason=f"Action approval pending: {reason}",
+            )
+
+        if status == "rejected":
+            self._state.clear_pending()
+            self._state.transition(
+                SentinelState.ESCALATED,
+                reason="user rejected proposed actions",
+            )
+            save_state(self._state)
+            append_log({"event": "actions_rejected", "request_id": request_id})
+            return SentinelResult(
+                dispatched=True,
+                session_id=result.session_id,
+                diagnosis=result.diagnosis,
+                reason="User rejected Sentinel actions",
+            )
+
+        # Approved — return None so caller executes actions
+        logger.info("Sentinel actions approved (%s)", request_id)
+        append_log({"event": "actions_approved", "request_id": request_id})
+        return None
+
+    async def _execute_approved_actions(self, proposed_actions: list[dict]) -> list[dict]:
+        """Execute a list of approved shell commands."""
+        executed = []
+        for action in proposed_actions:
+            cmd = action.get("command", "")
+            if not cmd:
+                continue
+            try:
+                logger.info("Sentinel executing: %s", cmd)
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=60.0,
+                )
+                success = proc.returncode == 0
+                action["success"] = success
+                action["stdout"] = stdout.decode("utf-8", errors="replace")[:500]
+                action["stderr"] = stderr.decode("utf-8", errors="replace")[:500]
+                executed.append(action)
+                if success:
+                    logger.info("Sentinel action succeeded: %s", cmd)
+                else:
+                    logger.error(
+                        "Sentinel action failed (rc=%d): %s — %s",
+                        proc.returncode, cmd, stderr.decode("utf-8", errors="replace")[:200],
+                    )
+            except TimeoutError:
+                logger.error("Sentinel action timed out: %s", cmd)
+                action["success"] = False
+                action["stderr"] = "Timed out after 60s"
+                executed.append(action)
+            except OSError as exc:
+                logger.error("Sentinel action OS error: %s — %s", cmd, exc)
+        return executed
+
+    async def _finalize_dispatch(
+        self, request: SentinelRequest, result: SentinelResult,
+        *, pattern: str = "", start: float = 0.0,
+    ) -> SentinelResult:
+        """Common finalization: state transitions, logging, observation creation."""
         duration = time.monotonic() - start
         result.duration_s = duration
 
@@ -320,6 +614,7 @@ class SentinelDispatcher:
         else:
             self._state.transition(SentinelState.ESCALATED, reason=result.reason or "dispatch failed")
 
+        self._state.clear_pending()
         self._state.record_cc_dispatch()
         save_state(self._state)
         write_state_for_guardian(asdict(self._state))
@@ -364,6 +659,92 @@ class SentinelDispatcher:
             )
 
         return result
+
+    async def resume_from_approval(self, request_id: str, status: str) -> SentinelResult | None:
+        """Resume a parked dispatch after the user grants approval.
+
+        Called by the awareness loop when it finds an approved sentinel
+        approval row. Returns None if the state doesn't match (stale resume).
+        All state reads and mutations are lock-protected.
+        """
+        if status == "rejected":
+            return await self.handle_approval_resolution(request_id, "rejected")
+
+        async with self._lock:
+            policy_id = self._state.pending_policy_id
+            if not policy_id or self._state.pending_request_id != request_id:
+                logger.warning(
+                    "Sentinel resume: request_id %s doesn't match pending %s — skipping",
+                    request_id, self._state.pending_request_id,
+                )
+                return None
+
+            pattern = self._state.pending_pattern
+            request = _deserialize_request(self._state.pending_request_json)
+            if request is None:
+                logger.error("Sentinel resume: failed to deserialize pending request")
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason="resume failed: bad pending data")
+                save_state(self._state)
+                return None
+
+            if policy_id == "sentinel_dispatch":
+                logger.info("Resuming sentinel dispatch after approval %s", request_id)
+                return await self._phase2_cc_and_actions(request, pattern=pattern)
+            if policy_id == "sentinel_action":
+                logger.info("Resuming sentinel actions after approval %s", request_id)
+                cc_result = _deserialize_result(self._state.pending_cc_result_json)
+                if cc_result is None:
+                    logger.error("Sentinel resume: failed to deserialize CC result")
+                    self._state.clear_pending()
+                    self._state.transition(SentinelState.HEALTHY, reason="resume failed: bad CC result")
+                    save_state(self._state)
+                    return None
+                # Execute the approved actions
+                try:
+                    executed = await self._execute_approved_actions(cc_result.proposed_actions)
+                    if executed:
+                        cc_result.resolved = True
+                        cc_result.actions_taken = [a["command"] for a in executed]
+                except Exception:
+                    logger.error("Sentinel action execution failed on resume", exc_info=True)
+                return await self._finalize_dispatch(request, cc_result, pattern=pattern)
+
+        return None
+
+    async def handle_approval_resolution(
+        self, request_id: str, status: str,
+    ) -> SentinelResult | None:
+        """Handle a rejected or cancelled approval.
+
+        Called by the awareness loop or alarm-clearing cancellation.
+        Lock-protected to prevent races with check_fire_alarms.
+        """
+        async with self._lock:
+            if self._state.pending_request_id != request_id:
+                return None
+
+            pattern = self._state.pending_pattern
+            policy_id = self._state.pending_policy_id
+
+            if status == "rejected":
+                if pattern:
+                    expiry = (datetime.now(UTC) + timedelta(hours=24)).isoformat()
+                    self._state.rejected_patterns[pattern] = expiry
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} rejected by user")
+                save_state(self._state)
+                append_log({"event": f"{policy_id}_rejected", "request_id": request_id})
+                return SentinelResult(dispatched=False, reason=f"{policy_id} rejected")
+
+            if status == "cancelled":
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason=f"{policy_id} cancelled (alarm cleared)")
+                save_state(self._state)
+                append_log({"event": f"{policy_id}_cancelled", "request_id": request_id})
+                return SentinelResult(dispatched=False, reason=f"{policy_id} cancelled: alarm cleared")
+
+        return None
 
     async def _request_dispatch_approval(self, request: SentinelRequest) -> bool:
         """Send Telegram approval request with inline buttons and wait.
@@ -870,6 +1251,27 @@ class SentinelDispatcher:
         # Update the ring buffer with this tick's alarm ids (always — even
         # if empty, an empty set is data that confirms absence).
         self._recent_alarm_sets.append(current_ids)
+
+        # If alarms have cleared while we're waiting for approval, cancel
+        # the pending approval and go back to HEALTHY.
+        if not alarms and self._state.state in (
+            SentinelState.AWAITING_DISPATCH_APPROVAL,
+            SentinelState.AWAITING_ACTION_APPROVAL,
+        ):
+            request_id = self._state.pending_request_id
+            if request_id and self._approval_gate is not None:
+                try:
+                    await self._approval_gate.resolve_request(
+                        request_id, decision="cancelled", resolved_by="alarm_cleared",
+                    )
+                except Exception:
+                    logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
+            logger.info("Alarms cleared — cancelling pending sentinel approval %s", request_id)
+            async with self._lock:
+                self._state.clear_pending()
+                self._state.transition(SentinelState.HEALTHY, reason="alarms cleared while awaiting approval")
+                save_state(self._state)
+            return None
 
         if not alarms:
             return None
