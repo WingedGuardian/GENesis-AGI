@@ -406,24 +406,94 @@ def _rrf_fusion(
     return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
 
 
-def _format_results(results: list[dict]) -> str:
-    """Format surfaced memories for injection.
+def _format_age(iso_str: str) -> str:
+    """Format ISO datetime as human-readable age (e.g., '3d', '2w', '4mo')."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        delta = datetime.now(UTC) - dt
+        days = delta.days
+        if days < 1:
+            return "<1d"
+        if days < 7:
+            return f"{days}d"
+        if days < 30:
+            return f"{days // 7}w"
+        if days < 365:
+            return f"{days // 30}mo"
+        return f"{days // 365}y"
+    except (ValueError, TypeError):
+        return "?"
 
-    Two-tier output: rank 1 and rules always get full content (200 chars).
-    Rank 2+ non-rules get compact format (80 chars) to reduce noise.
+
+def _enrich_with_metadata(results: list[dict]) -> None:
+    """Backfill created_at and wing from SQLite memory_metadata.
+
+    After RRF fusion, results may come from FTS5 (which lacks wing/created_at)
+    or Qdrant (which has wing but not created_at in the extracted fields).
+    This single batch query fills gaps uniformly for all sources.
+    """
+    ids = [
+        r.get("memory_id", "")
+        for r in results
+        if r.get("memory_id", "") and not r["memory_id"].startswith("code:")
+    ]
+    if not ids:
+        return
+    try:
+        conn = sqlite3.connect(str(_DB_PATH), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            placeholders = ",".join("?" for _ in ids)
+            rows = conn.execute(
+                f"SELECT memory_id, created_at, wing FROM memory_metadata"  # noqa: S608
+                f" WHERE memory_id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            meta = {row["memory_id"]: dict(row) for row in rows}
+            for r in results:
+                mid = r.get("memory_id", "")
+                if mid in meta:
+                    r.setdefault("_created_at", meta[mid].get("created_at"))
+                    if not r.get("_wing"):
+                        r["_wing"] = meta[mid].get("wing")
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Best-effort enrichment — never block the hook
+
+
+def _format_results(results: list[dict]) -> str:
+    """Format surfaced memories for injection with age, wing, and ID.
+
+    Enriched format gives the model staleness awareness (age), domain
+    context (wing), and a handle for targeted recall (memory ID).
+    Rank 1 and rules get 200 chars; rank 2+ non-rules get 120 chars.
     """
     if not results:
         return ""
 
+    _enrich_with_metadata(results)
+
     lines = []
     for rank, r in enumerate(results):
         is_rule = r.get("memory_class") == "rule"
-        # Full content for rank 1 or rules; compact for lower-ranked non-rules
-        max_len = 200 if (rank == 0 or is_rule) else 80
+        max_len = 200 if (rank == 0 or is_rule) else 120
         content = r.get("content", "")[:max_len]
-        session_id = r.get("source_session_id", "")
-        session_hint = f" (session: {session_id[:8]})" if session_id else ""
-        lines.append(f"[Memory] {content}{session_hint}")
+
+        mid = r.get("memory_id", "")
+        age = _format_age(r.get("_created_at", ""))
+        wing = r.get("_wing") or ""
+
+        parts = ["Memory"]
+        if age != "?":
+            parts.append(age)
+        if wing:
+            parts.append(wing)
+        if mid and not mid.startswith("code:"):
+            parts.append(f"id:{mid[:8]}")
+
+        tag = " | ".join(parts)
+        lines.append(f"[{tag}] {content}")
 
     # Remind the session about deeper search options beyond this hook
     lines.append(

@@ -87,7 +87,12 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 - **Verify against actual code** — Docs describe intent; code describes reality.
 - **CAPS markdown convention** — User-editable files that shape LLM behavior use
   UPPERCASE filenames (e.g., `SOUL.md`, `USER.md`). Transparency breeds trust.
-  Additional Genesis-specific design principles (tool scoping, hook
+- **Cognitive architecture is not a service** — Genesis's LLM call sites,
+  routing chains, and extraction pipelines serve its own cognitive processes
+  (memory, reflection, triage, learning). Module work uses external tools and
+  APIs, not Genesis internals. Genesis provides research capabilities (search,
+  fetch, crawl) but its thinking infrastructure is its own.
+- Additional Genesis-specific design principles (tool scoping, hook
   patterns, `$CLAUDE_PROJECT_DIR` usage) are in the `genesis-development`
   skill's `references/architecture.md`.
 
@@ -152,8 +157,14 @@ index. If this answers "what are we working on," don't burn a recall.
 
 **L2 — Proactive Recall (automatic per prompt):**
 The UserPromptSubmit hook searches FTS5 + Qdrant based on your prompt keywords
-and injects `[Memory]` tags. Check these first before doing explicit recall.
-Results are biased toward the active wing (domain) when detectable.
+and injects `[Memory | age | wing | id:xxx]` tags. Check these first before
+doing explicit recall. Results are biased toward the active wing (domain) when
+detectable. Use the `id:` handle with `memory_expand` for full context without
+re-searching. Proactive hook results are keyword-matched fragments, not curated
+context. They may be ambiguous, conditional, or outdated when detached from
+their source document. Treat them as leads to investigate, not facts to act on.
+When a memory snippet makes a factual claim (X is broken, Y is exhausted, Z is
+deprecated), verify before incorporating into your reasoning.
 
 **L3 — Deep Search (on demand):**
 Use `memory_recall` MCP for full hybrid retrieval. Use when L1-L2 don't answer
