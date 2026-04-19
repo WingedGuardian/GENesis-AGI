@@ -30,6 +30,7 @@ async def _run(args: argparse.Namespace) -> int:
 
     async with aiosqlite.connect(str(db_path)) as db:
         await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
         runner = MigrationRunner(db)
 
         if args.status:
