@@ -2,21 +2,10 @@
 
 Genesis v3 is an autonomous AI agent system.
 
-## Communication Style
-
-Be gravity for this project. Attack weak points in reasoning, challenge
-assumptions, expose what's missing. Don't sugarcoat. When there's a grounded
-opportunity to improve an idea, take it — don't just agree.
-
-**Cover the user's back.** Actively look for critical gaps in code changes,
-architecture decisions, or technical direction. Challenge where needed, flag
-what could go wrong, identify what's missing. The user expects you to catch
-what they miss — that's part of your job.
-
 ## Environment
 
 - **Python**: 3.12 (venv at `~/genesis/.venv`)
-- **Node**: 20.x
+- **Node**: 22.x
 - **Host VM**: Configured in `~/.genesis/guardian_remote.yaml` (set by
   `install_guardian.sh`). Guardian runs here. SSH access is Guardian-only
   via the `guardian-gateway.sh` command dispatcher. NOT the Ollama server.
@@ -64,9 +53,7 @@ Full decision guide: `.claude/docs/serena-guide.md`
 When the task involves modifying Genesis itself — fixing bugs, implementing
 features, refactoring subsystems, debugging the runtime, or wiring new
 components — invoke the `genesis-development` skill via the Skill tool
-immediately. It contains worktree discipline, observability rules,
-architecture context, the contribution pipeline, a codebase map, and an
-adaptive review protocol. Do NOT load it for Genesis-as-tool work (using
+immediately. Do NOT load it for Genesis-as-tool work (using
 Genesis to research, summarize, write content, or do non-Genesis tasks).
 
 ## Design Principles
@@ -169,23 +156,11 @@ Memories are tagged with a `wing` (top-level domain) and optional `room`
 recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy.
 
-## Reference Capture (silent, automatic)
+## Reference Capture
 
 When user input contains credentials, URLs, IP addresses, account handles,
 or other unique identifiers with context, Genesis automatically stores them
-via `reference_store` with a description of what they're for. No
-confirmation prompts, no "remember this" flags required.
-
-**What qualifies**:
-- Credentials (username/password/token/API key) for any service
-- URLs with stated purpose ("the forum is at X", "my dashboard is at Y")
-- IP addresses with context ("the server is at X", "container runs on Y")
-- Account handles ("my forum handle is X", "posting as Y")
-- Persona backstory pointers (file path references)
-
-**Descriptions mandatory**: every entry records both value AND context.
-A credential without "what service" or an IP without "what is this" is
-useless 10 sessions later.
+via `reference_store` with a description of what they're for.
 
 **Retrieval**: use `reference_lookup(query, kind=...)` or
 `knowledge_recall(domain='reference.*')`. Proactive memory hook surfaces
@@ -196,7 +171,7 @@ regenerated on every `reference_store` call. Browse to see everything
 Genesis has learned.
 
 **secrets.env is orthogonal**: `secrets.env` is for Genesis's own
-infrastructure credentials (API keys, backup passphrase). The reference
+infrastructure credentials. The reference
 store is for user-level credentials and reference data that Genesis learns
 across sessions.
 
@@ -249,6 +224,7 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   genesis-development skill.
 - **Code review after code changes.** Dispatch superpowers:code-reviewer.
   Protocol in genesis-development skill.
+- **Codex will review your output once you finish.**
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
   The user is the only human on this project — uncommitted work is invisible
   work, and invisible work is lost work.
@@ -300,8 +276,3 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Bugs you see get fixed or tracked — never ignored.** Every bug you
   encounter during any work must be either fixed inline or filed as a
   follow-up AND raised in your next user-facing report.
-
-## Network Identity
-
-Network configuration is install-specific. Run `python -m genesis.env` to display
-current resolved values, or check `~/.genesis/config/genesis.yaml`.
