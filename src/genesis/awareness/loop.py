@@ -723,22 +723,21 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Failed to emit reflection heartbeat", exc_info=True)
 
-            # Post micro reflection to supergroup topic (respect salience gate)
+            # Post micro reflection to supergroup topic
             if ref_result and ref_result.success and ref_result.output and self._topic_manager:
                 micro = ref_result.output
-                if micro.salience >= 0.45 or micro.anomaly:
-                    try:
-                        anomaly_flag = " [ANOMALY]" if micro.anomaly else ""
-                        tags_str = ", ".join(micro.tags[:5]) if micro.tags else ""
-                        text = (
-                            f"<b>Micro Reflection</b>{anomaly_flag}\n\n"
-                            f"{micro.summary}\n\n"
-                            f"<i>Salience: {micro.salience:.2f}"
-                            f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
-                        )
-                        await self._topic_manager.send_to_category("reflection_micro", text)
-                    except Exception:
-                        logger.warning("Failed to post micro reflection to topic", exc_info=True)
+                try:
+                    anomaly_flag = " [ANOMALY]" if micro.anomaly else ""
+                    tags_str = ", ".join(micro.tags[:5]) if micro.tags else ""
+                    text = (
+                        f"<b>Micro Reflection</b>{anomaly_flag}\n\n"
+                        f"{micro.summary}\n\n"
+                        f"<i>Salience: {micro.salience:.2f}"
+                        f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
+                    )
+                    await self._topic_manager.send_to_category("reflection_micro", text)
+                except Exception:
+                    logger.warning("Failed to post micro reflection to topic", exc_info=True)
 
             if (ref_result is None or not ref_result.success) and self._deferred_queue:
                 try:
