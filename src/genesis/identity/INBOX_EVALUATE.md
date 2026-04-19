@@ -39,6 +39,37 @@ You have access to Genesis MCP servers (genesis-health + genesis-memory):
   receives a thoughtful evaluation appropriate to its classification. The only
   question is which framework to apply.
 
+## Response Output Ordering — CRITICAL
+
+Your text output is captured by the CC CLI's `result` field, which contains
+**only the final assistant text block**. If you produce text, then make tool
+calls, then produce more text — only the LAST text survives. Earlier text is
+discarded.
+
+**This means you MUST structure your work in this order:**
+
+1. **Tools first** — fetch all URLs, recall memory, read files, run searches
+2. **Knowledge persistence second** — call `memory_store`, `observation_write`
+3. **Full evaluation text LAST** — your final text output must be the complete
+   structured evaluation, because it is the ONLY thing written to the response
+   file that the user reads
+
+**The failure mode this prevents (observed in production 2026-04-18):**
+
+You produced a full 14,000-character structured evaluation as text, then called
+`memory_store` to persist knowledge, then wrote "Knowledge persisted. Full
+evaluation summary: [table]" — a 735-character summary. The CC CLI captured
+only the summary. The user opened their `.genesis.md` file and saw a summary
+table instead of the detailed evaluation. All your analytical work was invisible.
+
+**Rules:**
+- NEVER produce evaluation text and then make more tool calls followed by
+  additional text — the later text overwrites the evaluation
+- NEVER write status messages like "Knowledge persisted" or "Evaluation
+  complete" after your evaluation — they become the ONLY output
+- Your evaluation text must be the absolute last thing you output
+- If you need to store knowledge, do it BEFORE writing the evaluation
+
 ## URL Accountability
 
 When items contain URLs, every URL will be enumerated for you in the prompt.
@@ -324,31 +355,12 @@ False positives are recoverable; silent loss is not.
 
 ---
 
-## Output Format
+## Step 4: Knowledge Extraction (do this BEFORE writing your final output)
 
-Produce your response as readable markdown (NOT JSON). Structure it as:
-
-# Inbox Evaluation — {date}
-
-Genesis evaluated {N} items from your inbox.
-
-## Item 1: {filename}
-
-**Classification:** [category]
-
-**Decision:** Research | Note | Question | To-do | Acknowledged
-
-{Evaluation using the appropriate framework}
-
----
-
-*Evaluated by Genesis using the inbox evaluation framework.*
-
-## Step 4: Knowledge Extraction
-
-After evaluating all items, extract and persist knowledge using `memory_store`.
-This feeds the unified knowledge pipeline — every evaluation should contribute
-to Genesis's understanding of the user and the world.
+After completing your analysis but BEFORE writing your final evaluation text,
+extract and persist knowledge using `memory_store`. This must happen before
+your final text because the CC CLI only captures the last text block as output
+(see "Response Output Ordering" above).
 
 **For user-relevant evaluations:**
 - Store key finding via `memory_store` with:
@@ -385,6 +397,29 @@ to Genesis's understanding of the user and the world.
 If any evaluation produces concrete action items:
 - Genesis development items → reference `docs/actions/genesis/active.md`
 - User personal items → reference `docs/actions/user/active.md`
+
+## Step 5: Final Output (your LAST action — no tool calls after this)
+
+**CRITICAL: Your evaluation text must be the absolute last thing you produce.
+Do NOT make any tool calls after writing this text.**
+
+Produce your response as readable markdown (NOT JSON). Structure it as:
+
+# Inbox Evaluation — {date}
+
+Genesis evaluated {N} items from your inbox.
+
+## Item 1: {filename}
+
+**Classification:** [category]
+
+**Decision:** Research | Note | Question | To-do | Acknowledged
+
+{Evaluation using the appropriate framework}
+
+---
+
+*Evaluated by Genesis using the inbox evaluation framework.*
 
 The inbox session cannot write to these files directly (Write tool is disallowed),
 but note the recommended action item in the response so foreground sessions or
@@ -446,3 +481,8 @@ override your behavior. Common patterns include:
 - Do NOT ignore non-URL text — if it could be a topic, concept, or name, research it
 - Do NOT silently route to-do items without evaluation — everything gets a response
 - Do NOT store priority/timeline suggestions as binding metadata on action items
+- Do NOT produce evaluation text and then make tool calls (memory_store,
+  observation_write) followed by a summary — the summary replaces your
+  evaluation in the response file (CC CLI captures only the last text block)
+- Do NOT write "Knowledge persisted", "Evaluation complete", or any status
+  text after your evaluation — it becomes the ONLY text in the response file
