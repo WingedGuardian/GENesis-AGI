@@ -94,17 +94,24 @@ class TestTaskDetail:
 
 
 @pytest.mark.asyncio
-class TestPauseResumeCancel:
-    async def test_pause_not_initialized(self) -> None:
-        result = await task_tools._impl_task_pause("t-001")
+class TestTaskControl:
+    async def test_not_initialized(self) -> None:
+        result = await task_tools._impl_task_control("t-001", "pause")
         assert "error" in result
+        assert "not initialized" in result["error"]
+
+    async def test_invalid_action(self) -> None:
+        task_tools._executor = AsyncMock()
+        result = await task_tools._impl_task_control("t-001", "explode")
+        assert "error" in result
+        assert "Invalid action" in result["error"]
 
     async def test_pause_success(self) -> None:
         executor = AsyncMock()
         executor.pause_task = lambda tid: True
         task_tools._executor = executor
 
-        result = await task_tools._impl_task_pause("t-001")
+        result = await task_tools._impl_task_control("t-001", "pause")
         assert result["status"] == "pause_requested"
 
     async def test_resume_success(self) -> None:
@@ -112,7 +119,7 @@ class TestPauseResumeCancel:
         executor.resume_task = lambda tid: True
         task_tools._executor = executor
 
-        result = await task_tools._impl_task_resume("t-001")
+        result = await task_tools._impl_task_control("t-001", "resume")
         assert result["status"] == "resumed"
 
     async def test_cancel_success(self) -> None:
@@ -120,7 +127,7 @@ class TestPauseResumeCancel:
         executor.cancel_task = lambda tid: True
         task_tools._executor = executor
 
-        result = await task_tools._impl_task_cancel("t-001")
+        result = await task_tools._impl_task_control("t-001", "cancel")
         assert result["status"] == "cancel_requested"
 
     async def test_cancel_not_found(self) -> None:
@@ -128,5 +135,5 @@ class TestPauseResumeCancel:
         executor.cancel_task = lambda tid: False
         task_tools._executor = executor
 
-        result = await task_tools._impl_task_cancel("t-missing")
+        result = await task_tools._impl_task_control("t-missing", "cancel")
         assert "error" in result

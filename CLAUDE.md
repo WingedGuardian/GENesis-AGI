@@ -66,6 +66,12 @@ Use for symbol references, definitions, type hierarchies, and safe refactoring.
 Use Grep instead for non-Python (config, YAML, shell, SQL, mocks).
 Full decision guide: `.claude/docs/serena-guide.md`
 
+## Web Tools
+
+CC WebSearch for general lookups, SearXNG for structured/bulk queries,
+Crawl4AI for JS-rendered pages, ATS APIs for job listings.
+Full decision guide: `.claude/docs/web-tools-guide.md`
+
 ## Genesis Development Work
 
 When the task involves modifying Genesis itself — fixing bugs, implementing
@@ -103,20 +109,9 @@ codebase, your private fork for customizations, and your private
 `genesis-backups` repo for encrypted data. Full model:
 `.claude/docs/your-genesis.md`.
 
-## Documentation
-
-| What | Location |
-|------|----------|
-| Conventions & commands | `CLAUDE.md` (this file) |
-| Architecture & design | `docs/architecture/` |
-| Session-to-session learnings | `~/.claude/projects/.../memory/MEMORY.md` |
-| Lessons learned, project rules | `docs/reference/` |
-
-Session transcripts: `~/.claude/projects/{project-id}/*.jsonl` (project-id =
-repo path with `/` replaced by `-`, derivable via `cc_project_dir()` from
-`genesis.env`). Search with Grep/Read on demand. Background session transcripts
-(reflections, inbox, surplus) are stored under `~/.genesis/background-sessions/`
-(outside the repo, so CC's resume picker doesn't include them).
+Background session transcripts (reflections, inbox, surplus) are stored
+under `~/.genesis/background-sessions/` (outside the repo, so CC's resume
+picker doesn't include them).
 
 ## Confidence Framework
 
@@ -188,22 +183,9 @@ autonomy.
 
 ## Reference Capture
 
-When user input contains credentials, URLs, IP addresses, account handles,
-or other unique identifiers with context, Genesis automatically stores them
-via `reference_store` with a description of what they're for.
-
-**Retrieval**: use `reference_lookup(query, kind=...)` or
-`knowledge_recall(domain='reference.*')`. Proactive memory hook surfaces
-matches automatically.
-
-**Human view**: `~/.genesis/known-to-genesis.md` is a read-only mirror,
-regenerated on every `reference_store` call. Browse to see everything
-Genesis has learned.
-
-**secrets.env is orthogonal**: `secrets.env` is for Genesis's own
-infrastructure credentials. The reference
-store is for user-level credentials and reference data that Genesis learns
-across sessions.
+Credentials, URLs, IPs, and identifiers shared in conversation are
+auto-stored via `reference_store`. Retrieve with `reference_lookup` or
+`knowledge_recall(domain='reference.*')`. Human view: `~/.genesis/known-to-genesis.md`.
 
 ## Knowledge Ingestion (Conversational Path)
 

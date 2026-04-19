@@ -1,7 +1,7 @@
 """MCP tools for autonomous task management.
 
-Provides task_submit, task_list, task_detail, task_pause, task_resume,
-and task_cancel tools for the health MCP server.
+Provides task_submit, task_list, task_detail, and task_control tools
+for the health MCP server.
 """
 
 from __future__ import annotations
@@ -142,37 +142,31 @@ async def _impl_task_detail(task_id: str) -> dict:
         return {"error": f"Failed to get task detail: {type(exc).__name__}: {exc}"}
 
 
-async def _impl_task_pause(task_id: str) -> dict:
-    """Pause a running task at its next checkpoint."""
+_TASK_CONTROL_ACTIONS = {
+    "pause": ("pause_task", "pause_requested", "not found or not active"),
+    "resume": ("resume_task", "resumed", "not found or not paused"),
+    "cancel": ("cancel_task", "cancel_requested", "not found or not active"),
+}
+
+
+async def _impl_task_control(task_id: str, action: str) -> dict:
+    """Pause, resume, or cancel a task."""
     if _executor is None:
         return {"error": "Task executor not initialized"}
 
-    success = _executor.pause_task(task_id)
+    action = action.lower().strip()
+    if action not in _TASK_CONTROL_ACTIONS:
+        return {"error": f"Invalid action '{action}'. Must be one of: pause, resume, cancel"}
+
+    method_name, success_status, fail_msg = _TASK_CONTROL_ACTIONS[action]
+    method = getattr(_executor, method_name, None)
+    if method is None:
+        return {"error": f"Executor does not support '{action}'"}
+
+    success = method(task_id)
     if success:
-        return {"task_id": task_id, "status": "pause_requested"}
-    return {"error": f"Task {task_id} not found or not active"}
-
-
-async def _impl_task_resume(task_id: str) -> dict:
-    """Resume a paused task."""
-    if _executor is None:
-        return {"error": "Task executor not initialized"}
-
-    success = _executor.resume_task(task_id)
-    if success:
-        return {"task_id": task_id, "status": "resumed"}
-    return {"error": f"Task {task_id} not found or not paused"}
-
-
-async def _impl_task_cancel(task_id: str) -> dict:
-    """Cancel a running or paused task."""
-    if _executor is None:
-        return {"error": "Task executor not initialized"}
-
-    success = _executor.cancel_task(task_id)
-    if success:
-        return {"task_id": task_id, "status": "cancel_requested"}
-    return {"error": f"Task {task_id} not found or not active"}
+        return {"task_id": task_id, "status": success_status}
+    return {"error": f"Task {task_id} {fail_msg}"}
 
 
 # ---------------------------------------------------------------------------
@@ -215,27 +209,13 @@ async def task_detail(task_id: str) -> dict:
 
 
 @mcp.tool()
-async def task_pause(task_id: str) -> dict:
-    """Pause a running task at its next checkpoint.
+async def task_control(task_id: str, action: str) -> dict:
+    """Control a running task: pause, resume, or cancel.
 
-    Uses the global pause mechanism (runtime.paused). Per-task pause
-    is not yet implemented — this pauses all background execution.
-    Use task_resume to continue.
+    Actions:
+    - **pause**: Pause at next checkpoint. Use action='resume' to continue.
+    - **resume**: Resume a paused task from where it left off.
+    - **cancel**: Cancel the task. It will be marked cancelled at next checkpoint
+      and any worktree will be cleaned up.
     """
-    return await _impl_task_pause(task_id)
-
-
-@mcp.tool()
-async def task_resume(task_id: str) -> dict:
-    """Resume a paused task from where it left off."""
-    return await _impl_task_resume(task_id)
-
-
-@mcp.tool()
-async def task_cancel(task_id: str) -> dict:
-    """Cancel a running or paused task.
-
-    The task will be marked as cancelled at its next checkpoint.
-    Any worktree created for the task will be cleaned up.
-    """
-    return await _impl_task_cancel(task_id)
+    return await _impl_task_control(task_id, action)

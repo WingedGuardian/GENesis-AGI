@@ -70,10 +70,33 @@ def init(rt: GenesisRuntime) -> None:
 
             rt._provider_registry.register(CloudflareCrawlAdapter())
 
+        try:
+            from genesis.providers.crawl4ai_adapter import Crawl4AIAdapter
+
+            rt._provider_registry.register(Crawl4AIAdapter())
+        except ImportError:
+            pass  # crawl4ai not installed — skip silently
+
         if os.environ.get("API_KEY_PERPLEXITY"):
             from genesis.research.perplexity import PerplexityAdapter
 
             rt._provider_registry.register(PerplexityAdapter())
+
+        if os.environ.get("API_KEY_TAVILY"):
+            try:
+                from genesis.providers.tavily_adapter import TavilyAdapter
+
+                rt._provider_registry.register(TavilyAdapter())
+            except ImportError:
+                pass  # tavily-python not installed
+
+        if os.environ.get("API_KEY_EXA"):
+            try:
+                from genesis.providers.exa_adapter import ExaAdapter
+
+                rt._provider_registry.register(ExaAdapter())
+            except ImportError:
+                pass  # exa-py not installed
 
         from genesis.providers.health import QdrantProbeAdapter
 
