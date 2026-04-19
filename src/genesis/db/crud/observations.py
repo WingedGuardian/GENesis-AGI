@@ -10,36 +10,94 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-# TTL per observation type. Types not listed here never expire (persistent).
-# Canonical source — observation_writer.py imports from here.
+# Types that should NEVER expire — the observation IS the authoritative record.
+_PERMANENT_TYPES: frozenset[str] = frozenset({
+    "feedback_rule",             # Learned behavioral rules
+    "genesis_version_baseline",  # Single reference point, replaced on next version
+    "cc_version_baseline",       # Single reference point, replaced on next version
+})
+
+# Default TTL for types not explicitly listed. Any new type that appears without
+# an entry in _TTL_BY_TYPE gets this default + a warning log so we notice and
+# categorize it properly.
+_DEFAULT_TTL = timedelta(days=14)
+
+# TTL per observation type. Canonical source — observation_writer.py imports from here.
 _TTL_BY_TYPE: dict[str, timedelta] = {
+    # ── 3-day (ephemeral) ──────────────────────────────────────────────
     "awareness_tick": timedelta(days=3),
-    "micro_reflection": timedelta(days=7),
-    "build_state": timedelta(days=14),
-    "project_context": timedelta(days=14),
-    "version_current": timedelta(days=7),
-    "cc_memory_file": timedelta(days=7),
     "light_reflection": timedelta(days=3),
+    "reflection_summary": timedelta(days=3),
+    "reflection_output": timedelta(days=3),
+    "surplus_candidate": timedelta(days=3),
+    "memory_operation_executed": timedelta(days=3),
+    "cc_version_available": timedelta(days=3),
+    "version_change": timedelta(days=3),
+    "dead_letter_replay": timedelta(days=3),
+    "light_reflection_candidate": timedelta(days=3),
+    # ── 1-day (transient) ──────────────────────────────────────────────
+    "light_escalation_resolved": timedelta(days=1),
+    "light_escalation_pending": timedelta(days=1),
+    "task_detected": timedelta(days=1),
+    "model_downgrade": timedelta(days=1),
+    # ── 7-day (version tracking, operational) ──────────────────────────
+    "genesis_version_change": timedelta(days=7),
+    "memory_index": timedelta(days=7),
+    "operational_alert": timedelta(days=7),
+    "db_maintenance": timedelta(days=7),
+    "backup_verification": timedelta(days=7),
+    "scheduled_review": timedelta(days=7),
+    "strategic_reflection": timedelta(days=7),
+    "micro_reflection": timedelta(days=7),
     "deep_reflection": timedelta(days=7),
     "reflection_observation": timedelta(days=7),
-    "reflection_summary": timedelta(days=3),
-    "surplus_candidate": timedelta(days=3),
-    "learning": timedelta(days=14),
-    "memory_operation_executed": timedelta(days=3),
-    "light_escalation_resolved": timedelta(days=1),
+    "version_current": timedelta(days=7),
+    "cc_memory_file": timedelta(days=7),
     "contradiction": timedelta(days=7),
-    "reflection_output": timedelta(days=3),
-    "task_detected": timedelta(days=1),
     "pending_question": timedelta(days=7),
     "question_response": timedelta(days=7),
     "init_degradation": timedelta(days=7),
     "procedure_quarantined": timedelta(days=7),
+    # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
+    "build_state": timedelta(days=14),
+    "project_context": timedelta(days=14),
+    "learning": timedelta(days=14),
     "learning_regression": timedelta(days=14),
     "skill_evolution": timedelta(days=14),
     "skill_proposal": timedelta(days=14),
-    "light_escalation_pending": timedelta(days=1),
-    "model_downgrade": timedelta(days=1),
+    "scope_clarification": timedelta(days=14),
+    "interpretation_correction": timedelta(days=14),
+    "merged_observation": timedelta(days=14),
+    "self_assessment": timedelta(days=14),
+    "quality_drift": timedelta(days=14),
+    "quality_calibration": timedelta(days=14),
+    "user_model_delta": timedelta(days=14),
+    "capability_improvement": timedelta(days=14),
+    "strategic_analysis": timedelta(days=14),
+    # ── 30-day (intake signals, need processing time) ──────────────────
+    "finding": timedelta(days=30),
+    "bugfix_committed": timedelta(days=30),
+    "sentinel_escalated": timedelta(days=30),
+    "user_signal": timedelta(days=30),
+    "user_model_gap": timedelta(days=30),
+    "reference_pointer": timedelta(days=30),
+    "user_profile": timedelta(days=30),
+    "test_isolation_gap": timedelta(days=30),
+    "operational_gap": timedelta(days=30),
+    "interaction_theme": timedelta(days=30),
     "guardian_diagnosis": timedelta(days=30),
+    # ── 60-day (action-required, real issues) ──────────────────────────
+    "bug_identified": timedelta(days=60),
+    "tech_debt": timedelta(days=60),
+    "architecture_risk": timedelta(days=60),
+    "concurrency_risk": timedelta(days=60),
+    # ── Special: genesis update tracking ───────────────────────────────
+    "genesis_update_available": timedelta(days=30),
+    "genesis_update_failed": timedelta(days=30),
+    # ── Memory operations ──────────────────────────────────────────────
+    "memory_operation": timedelta(days=3),
+    "quarantined_reflection": timedelta(days=14),
+    "code_audit": timedelta(days=14),
 }
 _TTL_PREFIX: list[tuple[str, timedelta]] = [
     ("triage_depth_", timedelta(days=30)),
@@ -47,13 +105,28 @@ _TTL_PREFIX: list[tuple[str, timedelta]] = [
 
 
 def _compute_ttl(obs_type: str) -> timedelta | None:
-    """Look up TTL for an observation type. Returns None if persistent."""
+    """Look up TTL for an observation type.
+
+    Returns None only for types in _PERMANENT_TYPES. All other unknown
+    types get _DEFAULT_TTL (14 days) with a warning log.
+    """
+    if obs_type in _PERMANENT_TYPES:
+        return None
+
     ttl = _TTL_BY_TYPE.get(obs_type)
-    if ttl is None:
-        for prefix, prefix_ttl in _TTL_PREFIX:
-            if obs_type.startswith(prefix):
-                return prefix_ttl
-    return ttl
+    if ttl is not None:
+        return ttl
+
+    for prefix, prefix_ttl in _TTL_PREFIX:
+        if obs_type.startswith(prefix):
+            return prefix_ttl
+
+    logger.warning(
+        "Unknown observation type %r — assigning default TTL of %d days. "
+        "Add it to _TTL_BY_TYPE for explicit categorization.",
+        obs_type, _DEFAULT_TTL.days,
+    )
+    return _DEFAULT_TTL
 
 
 async def create(
