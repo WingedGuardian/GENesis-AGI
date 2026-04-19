@@ -18,6 +18,7 @@ from genesis.mcp.health import mcp
 logger = logging.getLogger(__name__)
 
 _MODULES_DIR = Path(__file__).resolve().parents[4] / "config" / "modules"
+_LOCAL_MODULES_DIR = Path.home() / ".genesis" / "config" / "modules"
 
 # Cache of loaded configs + IPC adapters (lazy, per-process lifetime)
 _adapters: dict | None = None
@@ -50,10 +51,16 @@ def _get_adapters() -> dict:
     from genesis.modules.external.config import ProgramConfig
 
     _adapters = {}
-    if not _MODULES_DIR.is_dir():
-        return _adapters
 
-    for yaml_path in sorted(_MODULES_DIR.glob("*.yaml")):
+    # Collect configs: repo defaults first, local overlay wins on same filename
+    # (mirrors genesis.runtime.init.modules._load_modules_from_yaml)
+    config_files: dict[str, Path] = {}
+    for d in (_MODULES_DIR, _LOCAL_MODULES_DIR):
+        if d.is_dir():
+            for p in sorted(d.glob("*.yaml")):
+                config_files[p.name] = p
+
+    for yaml_path in sorted(config_files.values(), key=lambda p: p.name):
         try:
             data = yaml.safe_load(yaml_path.read_text())
             if not data or data.get("type") != "external":
