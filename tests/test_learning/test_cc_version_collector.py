@@ -20,6 +20,7 @@ async def db(tmp_path):
         await conn.execute(
             "CREATE TABLE observations ("
             "  id TEXT PRIMARY KEY,"
+            "  person_id TEXT,"
             "  source TEXT NOT NULL, type TEXT NOT NULL, category TEXT,"
             "  content TEXT NOT NULL,"
             "  priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high', 'critical')),"
@@ -308,34 +309,16 @@ class TestAnalyzerIntegration:
 
 
 class TestRegistryCheck:
-    """Remote npm registry version monitoring."""
+    """Remote npm registry version monitoring.
+
+    _check_registry_version() is now a no-op — Genesis is pegged to a
+    specific CC version. These tests verify it produces no observations.
+    """
 
     @pytest.mark.asyncio
-    async def test_newer_version_stores_observation(self, collector, db) -> None:
-        """When npm has a newer version, an observation is stored."""
-        with patch.object(
-            CCVersionCollector, "_get_registry_version",
-            new_callable=AsyncMock, return_value="2.0.0",
-        ):
-            await collector._check_registry_version("1.0.0")
-
-        cursor = await db.execute(
-            "SELECT content FROM observations WHERE type = 'cc_version_available'",
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        data = json.loads(row["content"])
-        assert data["installed_version"] == "1.0.0"
-        assert data["available_version"] == "2.0.0"
-
-    @pytest.mark.asyncio
-    async def test_same_version_no_observation(self, collector, db) -> None:
-        """When npm version matches installed, nothing stored."""
-        with patch.object(
-            CCVersionCollector, "_get_registry_version",
-            new_callable=AsyncMock, return_value="1.0.0",
-        ):
-            await collector._check_registry_version("1.0.0")
+    async def test_registry_check_is_noop(self, collector, db) -> None:
+        """_check_registry_version is a no-op — no observations stored."""
+        await collector._check_registry_version("1.0.0")
 
         cursor = await db.execute(
             "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
@@ -344,44 +327,9 @@ class TestRegistryCheck:
         assert row[0] == 0
 
     @pytest.mark.asyncio
-    async def test_older_registry_version_no_observation(self, collector, db) -> None:
-        """When npm version is older than installed (pinned), nothing stored."""
-        with patch.object(
-            CCVersionCollector, "_get_registry_version",
-            new_callable=AsyncMock, return_value="0.9.0",
-        ):
-            await collector._check_registry_version("1.0.0")
-
-        cursor = await db.execute(
-            "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
-        )
-        row = await cursor.fetchone()
-        assert row[0] == 0
-
-    @pytest.mark.asyncio
-    async def test_dedup_same_available_version(self, collector, db) -> None:
-        """Second check for same available version does not duplicate."""
-        with patch.object(
-            CCVersionCollector, "_get_registry_version",
-            new_callable=AsyncMock, return_value="2.0.0",
-        ):
-            await collector._check_registry_version("1.0.0")
-            await collector._check_registry_version("1.0.0")
-
-        cursor = await db.execute(
-            "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
-        )
-        row = await cursor.fetchone()
-        assert row[0] == 1
-
-    @pytest.mark.asyncio
-    async def test_registry_failure_silent(self, collector, db) -> None:
-        """npm failure doesn't raise — just returns silently."""
-        with patch.object(
-            CCVersionCollector, "_get_registry_version",
-            new_callable=AsyncMock, side_effect=OSError("network down"),
-        ):
-            await collector._check_registry_version("1.0.0")  # Should not raise
+    async def test_registry_check_silent(self, collector, db) -> None:
+        """No-op doesn't raise regardless of input."""
+        await collector._check_registry_version("1.0.0")  # Should not raise
 
         cursor = await db.execute(
             "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
