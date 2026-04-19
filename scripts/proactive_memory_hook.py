@@ -477,7 +477,7 @@ def _format_results(results: list[dict]) -> str:
     lines = []
     for rank, r in enumerate(results):
         is_rule = r.get("memory_class") == "rule"
-        max_len = 200 if (rank == 0 or is_rule) else 120
+        max_len = 200 if (rank == 0 or is_rule) else 150
         content = r.get("content", "")
         # Strip extraction-pipeline prefixes like [discovery], [feature], etc.
         # These are baked into stored content but waste display chars.
