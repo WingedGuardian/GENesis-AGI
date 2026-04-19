@@ -601,6 +601,7 @@ def _record_detail(
         "total_latency_ms": total_latency_ms,
         "fts_only_fallback": fts_only_fallback,
         "heartbeat_ms": round(heartbeat_ms, 1),
+        "budget_exceeded": total_latency_ms > 1650,
     }
     try:
         _METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)

@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,7 +45,8 @@ def main() -> int:
         _TTL_PREFIX,
     )
 
-    db_path = Path.home() / "genesis" / "data" / "genesis.db"
+    db_override = os.environ.get("GENESIS_DB_PATH")
+    db_path = Path(db_override) if db_override else Path.home() / "genesis" / "data" / "genesis.db"
     if not db_path.exists():
         print(f"Database not found at {db_path}")
         return 1
