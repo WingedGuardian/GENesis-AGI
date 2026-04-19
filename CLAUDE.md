@@ -23,52 +23,21 @@ Genesis v3 is an autonomous AI agent system.
 
 ## Process Management
 
-All Genesis services are **systemd user units**. NEVER start services with
-`nohup`, `&`, or bare `python -m genesis serve`. NEVER `kill` a service
-process directly — use `systemctl --user stop`. The server has a process lock
-(`~/.genesis/genesis-server.lock`); a bare process blocks the systemd unit.
-
-| Unit | Purpose | Expected State |
-|------|---------|----------------|
-| `genesis-server.service` | Main server (port 5000) | `active (running)` |
-| `genesis-bridge.service` | Telegram CC conversation relay | `inactive` (start on demand) |
-| `genesis-tmp-watchgod.service` | /tmp filesystem protection | `active (running)` |
-| `genesis-watchdog.timer` | Periodic health check | `active (waiting)` |
+All Genesis services are **systemd user units** (`~/.config/systemd/user/`).
+NEVER use `nohup` or bare `python -m genesis serve` — a bare process holds
+the lock file and blocks the systemd unit.
 
 ```bash
-systemctl --user status genesis-server           # Check server
-systemctl --user restart genesis-server          # Restart server
-systemctl --user stop genesis-server             # Stop server
-journalctl --user -u genesis-server -n 50        # Recent logs
-systemctl --user list-units 'genesis-*' --all    # All Genesis units
+systemctl --user restart genesis-server          # Restart (NEVER nohup)
+systemctl --user status genesis-server           # Check
+journalctl --user -u genesis-server -n 50        # Logs
+systemctl --user list-units 'genesis-*' --all    # All units
 ```
 
-The server loads `secrets.env` via `EnvironmentFile=`. It depends on
-`qdrant.service` (system unit). Exit code 200 = lock held by another
-instance (won't auto-restart). Exit code 2 = missing config (won't
-auto-restart).
-
-## MCP Server Lifecycle
-
-Genesis has 4 MCP servers: `genesis-health`, `genesis-memory`,
-`genesis-outreach`, `genesis-recon`. They are **Claude Code child
-processes** — started automatically when CC needs them, NOT systemd
-services.
-
-- MCP servers cache state per-process (e.g., module adapter cache).
-- Code changes to MCP tools take effect on **next CC session start**.
-- MCP servers read module configs from both `config/modules/` (repo)
-  and `~/.genesis/config/modules/` (local overlay). Local wins on
-  same filename.
-
-## Config Layering
-
-Module YAML configs and other settings use a two-directory overlay:
-- **Repo defaults**: `~/genesis/config/modules/*.yaml`
-- **Local overrides**: `~/.genesis/config/modules/*.yaml`
-
-Local takes precedence on same filename. The Career Agent config lives
-in the local overlay (install-specific, not committed to repo).
+Other units: `genesis-bridge.service` (Telegram relay, on-demand),
+`genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
+(health check). MCP servers are CC child processes (not systemd) — code
+changes take effect on next CC session start.
 
 ## New Machine Setup
 
