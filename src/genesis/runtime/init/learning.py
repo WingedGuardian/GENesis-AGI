@@ -524,53 +524,100 @@ async def init(rt: GenesisRuntime) -> None:
         )
 
         async def _reap_stale_processes() -> None:
-            """Kill leaked opencode-ai processes older than 24 hours."""
-            import asyncio
+            """Kill leaked processes older than their configured threshold.
 
-            try:
+            Targets:
+              - opencode-ai: 24 hours (pgrep -f, matches command line)
+              - claude: 7 days (pgrep -x, matches exact process name)
+
+            Kills the full descendant tree (children, grandchildren) of each
+            stale process to prevent orphaned MCP servers, Playwright, etc.
+            """
+            import asyncio
+            import os
+
+            # (pgrep_flag, pattern, max_age_hours, label)
+            targets = [
+                ("-f", "opencode-ai", 24, "opencode-ai"),
+                ("-x", "claude", 168, "claude"),  # 7 days
+            ]
+            my_pid = os.getpid()
+            my_ppid = os.getppid()
+            protected = {my_pid, my_ppid}
+
+            async def _get_descendants(pid: int, depth: int = 0) -> list[int]:
+                """Return all descendant PIDs (children-first / bottom-up)."""
+                if depth >= 10:
+                    return []
                 proc = await asyncio.create_subprocess_exec(
-                    "pgrep", "-f", "opencode-ai",
+                    "pgrep", "-P", str(pid),
                     stdout=asyncio.subprocess.PIPE,
                 )
                 stdout, _ = await proc.communicate()
                 if not stdout.strip():
-                    rt.record_job_success("process_reaper")
-                    return
+                    return []
+                children = [
+                    int(p.strip()) for p in stdout.decode().strip().split("\n")
+                    if p.strip()
+                ]
+                result: list[int] = []
+                for child in children:
+                    result.extend(await _get_descendants(child, depth + 1))
+                result.extend(children)
+                return result
 
-                pids = stdout.decode().strip().split("\n")
-                killed = []
-                for pid_str in pids:
-                    pid = int(pid_str.strip())
-                    # Check process age via /proc/<pid>/stat
-                    try:
-                        stat_path = Path(f"/proc/{pid}/stat")
-                        if not stat_path.exists():
-                            continue
-                        # Get process start time (field 22) and system uptime
-                        import os
-                        clock_ticks = os.sysconf("SC_CLK_TCK")
-                        with open(f"/proc/{pid}/stat") as f:
-                            fields = f.read().split()
-                        start_ticks = int(fields[21])
-                        with open("/proc/uptime") as f:
-                            uptime_secs = float(f.read().split()[0])
-                        age_secs = uptime_secs - (start_ticks / clock_ticks)
-                        max_age = 24 * 3600  # 24 hours
-                        if age_secs > max_age and pid > 1:
-                            os.kill(pid, 15)  # SIGTERM
-                            killed.append(pid)
-                    except (ProcessLookupError, FileNotFoundError, ValueError):
+            try:
+                all_killed: list[tuple[int, str]] = []
+                for flag, pattern, max_age_h, label in targets:
+                    proc = await asyncio.create_subprocess_exec(
+                        "pgrep", flag, pattern,
+                        stdout=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await proc.communicate()
+                    if not stdout.strip():
                         continue
 
-                if killed:
-                    # Give them a moment, then force-kill survivors
+                    max_age = max_age_h * 3600
+                    clock_ticks = os.sysconf("SC_CLK_TCK")
+
+                    for pid_str in stdout.decode().strip().split("\n"):
+                        pid = int(pid_str.strip())
+                        if pid <= 1 or pid in protected:
+                            continue
+                        try:
+                            if not Path(f"/proc/{pid}/stat").exists():
+                                continue
+                            with open(f"/proc/{pid}/stat") as f:
+                                raw = f.read()
+                            # comm field (field 2) is in parens and may
+                            # contain spaces; split after the last ')'.
+                            after_comm = raw[raw.rfind(")") + 2:]
+                            start_ticks = int(after_comm.split()[19])
+                            with open("/proc/uptime") as f:
+                                uptime_secs = float(f.read().split()[0])
+                            age_secs = uptime_secs - (start_ticks / clock_ticks)
+                            if age_secs > max_age:
+                                # Collect descendants bottom-up, then the root
+                                tree = await _get_descendants(pid)
+                                tree.append(pid)
+                                for p in tree:
+                                    if p <= 1 or p in protected:
+                                        continue
+                                    with contextlib.suppress(ProcessLookupError):
+                                        os.kill(p, 15)  # SIGTERM
+                                    all_killed.append((p, label))
+                        except (ProcessLookupError, FileNotFoundError, ValueError):
+                            continue
+
+                if all_killed:
                     await asyncio.sleep(2)
-                    for pid in killed:
+                    for pid, _ in all_killed:
                         with contextlib.suppress(ProcessLookupError):
                             os.kill(pid, 9)  # SIGKILL
                     logger.info(
-                        "Process reaper: killed %d stale opencode-ai process(es): %s",
-                        len(killed), killed,
+                        "Process reaper: killed %d stale process(es): %s",
+                        len(all_killed),
+                        all_killed,
                     )
                 rt.record_job_success("process_reaper")
             except Exception as exc:
