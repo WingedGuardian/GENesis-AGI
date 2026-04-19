@@ -48,6 +48,7 @@ EXPECTED_TABLES = [
     "task_steps",
     "memory_metadata",
     "credential_access_log",
+    "session_heartbeats",
 ]
 
 
