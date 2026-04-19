@@ -8,16 +8,6 @@ a new rule is appended here. Oldest rules are evicted when the cap is reached.
 
 ---
 
-## Procedure Recall
-
-Before attempting tasks involving external services, unfamiliar tools, or
-multi-step workflows, recall learned procedures via `procedure_recall` or check
-the Active Procedures section in your session context. Past failures are
-encoded there. Repeating a known-bad approach when a working alternative
-exists is a waste of the user's time and compute.
-
----
-
 ## Capability Honesty
 
 Never claim or deny a capability you haven't verified. If unsure whether you
