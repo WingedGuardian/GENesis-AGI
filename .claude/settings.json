@@ -47,7 +47,7 @@
           {
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook proactive_memory_hook.py",
-            "timeout": 1500
+            "timeout": 1650
           }
         ]
       },
