@@ -66,6 +66,12 @@ Use for symbol references, definitions, type hierarchies, and safe refactoring.
 Use Grep instead for non-Python (config, YAML, shell, SQL, mocks).
 Full decision guide: `.claude/docs/serena-guide.md`
 
+## Web Tools
+
+CC WebSearch for general lookups, SearXNG for structured/bulk queries,
+Crawl4AI for JS-rendered pages, ATS APIs for job listings.
+Full decision guide: `.claude/docs/web-tools-guide.md`
+
 ## Genesis Development Work
 
 When the task involves modifying Genesis itself — fixing bugs, implementing
@@ -103,6 +109,9 @@ codebase, your private fork for customizations, and your private
 `genesis-backups` repo for encrypted data. Full model:
 `.claude/docs/your-genesis.md`.
 
+Background session transcripts (reflections, inbox, surplus) are stored
+under `~/.genesis/background-sessions/` (outside the repo, so CC's resume
+picker doesn't include them).
 
 ## Confidence Framework
 
