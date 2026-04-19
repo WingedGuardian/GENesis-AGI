@@ -70,6 +70,13 @@ def init(rt: GenesisRuntime) -> None:
 
             rt._provider_registry.register(CloudflareCrawlAdapter())
 
+        try:
+            from genesis.providers.crawl4ai_adapter import Crawl4AIAdapter
+
+            rt._provider_registry.register(Crawl4AIAdapter())
+        except ImportError:
+            pass  # crawl4ai not installed — skip silently
+
         if os.environ.get("API_KEY_PERPLEXITY"):
             from genesis.research.perplexity import PerplexityAdapter
 
