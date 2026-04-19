@@ -497,7 +497,7 @@ def _format_results(results: list[dict]) -> str:
 
     # Remind the session about deeper search options beyond this hook
     lines.append(
-        "[Memory] Need more? Use `memory_recall` MCP (semantic search) "
+        "Need more? Use `memory_recall` MCP (semantic search) "
         "or query `cc_sessions` in SQLite. Grep transcripts is last resort."
     )
 
