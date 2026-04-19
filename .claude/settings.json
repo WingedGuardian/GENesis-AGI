@@ -86,7 +86,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"rm -rf /\"*|*\"rm -rf ~\"*|*\"rm -rf .\"*|*\"rm -rf ..\"*) echo \"BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user.\" >&2; exit 2;; *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; *\"git merge\"*) current_branch=$(git branch --show-current 2>/dev/null); if [ \"$current_branch\" = \"main\" ] || [ \"$current_branch\" = \"master\" ]; then echo \"BLOCKED: Do not merge directly to main. Use PR workflow.\" >&2; exit 2; fi;; *\"git push\"*\"origin main\"*|*\"git push\"*\"origin master\"*) echo \"BLOCKED: Do not push directly to main. Use gh pr merge.\" >&2; exit 2;; esac'"
+            "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"rm -rf /\"*|*\"rm -rf ~\"*|*\"rm -rf .\"*|*\"rm -rf ..\"*) echo \"BLOCKED: rm -rf on broad paths is not allowed. Be specific or ask the user.\" >&2; exit 2;; *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/git_push_guard.py",
+            "timeout": 2000
           }
         ]
       },
