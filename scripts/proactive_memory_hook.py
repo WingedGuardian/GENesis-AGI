@@ -478,7 +478,12 @@ def _format_results(results: list[dict]) -> str:
     for rank, r in enumerate(results):
         is_rule = r.get("memory_class") == "rule"
         max_len = 200 if (rank == 0 or is_rule) else 120
-        content = r.get("content", "")[:max_len]
+        content = r.get("content", "")
+        # Strip extraction-pipeline prefixes like [discovery], [feature], etc.
+        # These are baked into stored content but waste display chars.
+        if content.startswith("[") and "] " in content[:30]:
+            content = content[content.index("] ") + 2:]
+        content = content[:max_len]
 
         mid = r.get("memory_id", "")
         age = _format_age(r.get("_created_at", ""))
@@ -487,7 +492,7 @@ def _format_results(results: list[dict]) -> str:
         parts = ["Memory"]
         if age != "?":
             parts.append(age)
-        if wing:
+        if wing and wing != "memory":
             parts.append(wing)
         if mid and not mid.startswith("code:"):
             parts.append(f"id:{mid[:8]}")
