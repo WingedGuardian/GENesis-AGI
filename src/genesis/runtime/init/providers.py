@@ -82,6 +82,22 @@ def init(rt: GenesisRuntime) -> None:
 
             rt._provider_registry.register(PerplexityAdapter())
 
+        if os.environ.get("API_KEY_TAVILY"):
+            try:
+                from genesis.providers.tavily_adapter import TavilyAdapter
+
+                rt._provider_registry.register(TavilyAdapter())
+            except ImportError:
+                pass  # tavily-python not installed
+
+        if os.environ.get("API_KEY_EXA"):
+            try:
+                from genesis.providers.exa_adapter import ExaAdapter
+
+                rt._provider_registry.register(ExaAdapter())
+            except ImportError:
+                pass  # exa-py not installed
+
         from genesis.providers.health import QdrantProbeAdapter
 
         rt._provider_registry.register(QdrantProbeAdapter())
