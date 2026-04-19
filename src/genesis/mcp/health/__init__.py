@@ -97,9 +97,7 @@ _impl_health_status = _status._impl_health_status
 _impl_task_submit = _task_tools._impl_task_submit
 _impl_task_list = _task_tools._impl_task_list
 _impl_task_detail = _task_tools._impl_task_detail
-_impl_task_pause = _task_tools._impl_task_pause
-_impl_task_resume = _task_tools._impl_task_resume
-_impl_task_cancel = _task_tools._impl_task_cancel
+_impl_task_control = _task_tools._impl_task_control
 _impl_module_call = _module_ops._impl_module_call
 _impl_module_list = _module_ops._impl_module_list
 _impl_browser_navigate = _browser._impl_browser_navigate
@@ -141,9 +139,7 @@ __all__ = [
     "_impl_task_submit",
     "_impl_task_list",
     "_impl_task_detail",
-    "_impl_task_pause",
-    "_impl_task_resume",
-    "_impl_task_cancel",
+    "_impl_task_control",
     "db_schema",
     "errors",
     "manifest",

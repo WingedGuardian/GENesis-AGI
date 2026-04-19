@@ -163,7 +163,7 @@ _identity_tools = importlib.import_module(".identity", __name__)  # noqa: F401
 _knowledge_tools = importlib.import_module(".knowledge", __name__)  # noqa: F401
 _observations_tools = importlib.import_module(".observations", __name__)  # noqa: F401
 _procedural_tools = importlib.import_module(".procedural", __name__)  # noqa: F401
-_skills_tools = importlib.import_module(".skills", __name__)  # noqa: F401
+
 
 # Backward-compatible patch points expected by tests and callers.
 knowledge = knowledge_crud
