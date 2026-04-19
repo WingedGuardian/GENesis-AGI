@@ -955,6 +955,7 @@ class AutonomousDispatchRouter:
                 api_error=api_error,
             )
 
+        request_id: str | None = None
         if request.approval_required_for_cli:
             status, request_id, reason = await self._approval_gate.ensure_approval(
                 subsystem=request.subsystem,
@@ -980,5 +981,6 @@ class AutonomousDispatchRouter:
         return AutonomousDispatchDecision(
             mode="cli_approved",
             reason="CLI fallback approved",
+            approval_request_id=request_id,
             api_error=api_error,
         )
