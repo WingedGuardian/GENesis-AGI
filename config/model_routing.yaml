@@ -209,15 +209,15 @@ call_sites:
   3_micro_reflection:
     chain:
     - mistral-small-free
-    - groq-free
-    - mistral-large-free
-    - gemini-free
     - openrouter-free
+    - mistral-large-free
+    - groq-free
+    - gemini-free
     retry_profile: background
   4_light_reflection:
     chain:
-    - mistral-large-free
     - groq-free
+    - mistral-large-free
     - gemini-free
     - openrouter-free
     default_paid: false

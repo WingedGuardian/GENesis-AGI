@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Genesis Neural Monitor</title>
+<link rel="icon" type="image/svg+xml" href="/public/favicon.svg">
 <link rel="stylesheet" href="/index.css">
 <style>
 :root { --color-text-secondary: var(--color-text-muted, #d4d4d4e4); }
@@ -932,75 +933,6 @@ function showDetail(item) {
         content.appendChild(sectionRow('Active Provider', item.data.active_provider));
     }
 
-    // Provider chain
-    if (item.data.chain_health && item.data.chain_health.length > 0) {
-        const chainSection = el('div', 'detail-section');
-        const chainHead = el('h4', null, 'Provider Chain');
-        chainSection.appendChild(chainHead);
-
-        for (const c of item.data.chain_health) {
-            // Most-negative-opinion: CB is routing authority, probe is reachability.
-            // 'not_configured' is a SEPARATE state from down/unreachable — it means
-            // no API key, which is a deployment config, not a failure.
-            const cbDown = c.state === 'open' || c.state === 'error';
-            const cbSuspect = c.state === 'half_open';
-            const ps = c.probe_status;
-            const dotColor = ps === 'not_configured' ? '#888'
-                : cbDown ? '#ef4444'
-                : cbSuspect ? '#facc15'
-                : ps === 'unreachable' ? '#ef4444'
-                : ps === 'rate_limited' ? '#facc15'
-                : '#4ade80';
-            const chainItem = el('div', 'chain-item');
-            const dot = el('span', 'status-dot');
-            dot.style.background = dotColor;
-            chainItem.appendChild(dot);
-            // CC entries get a badge
-            if (c.is_cc) {
-                chainItem.appendChild(el('span', 'cc-badge', 'CC'));
-            }
-            // Display name with routing info
-            let displayName = c.provider;
-            if (!c.is_cc && c.provider.startsWith('claude-')) {
-                displayName = c.provider.replace('claude-', 'anthropic-');
-            } else if (c.type === 'openrouter') {
-                displayName = c.provider + ' (via OpenRouter)';
-            } else if (c.type === 'zenmux') {
-                displayName = c.provider + ' (via ZenMux)';
-            } else if (c.type === 'lmstudio') {
-                displayName = c.provider + ' (LM Studio)';
-            }
-            const nameSpan = el('span', null, displayName);
-            nameSpan.style.flex = '1';
-            chainItem.appendChild(nameSpan);
-            // Model name (subtle, right-aligned)
-            if (c.model && !c.is_cc) {
-                const modelSpan = el('span', null, c.model);
-                modelSpan.style.color = '#64748b';
-                modelSpan.style.fontSize = '10px';
-                modelSpan.style.marginRight = '8px';
-                chainItem.appendChild(modelSpan);
-            }
-            // CB state text — colorized. 'not_configured' overrides display
-            // so users see "no API key" instead of a misleading "closed" state.
-            let stateText, stateColor;
-            if (c.probe_status === 'not_configured') {
-                stateText = 'no API key';
-                stateColor = '#888';
-            } else {
-                stateText = c.state + (c.failures > 0 ? ' (' + c.failures + ' fails)' : '');
-                stateColor = c.state === 'open' || c.state === 'error' ? '#ef4444'
-                    : c.state === 'half_open' ? '#facc15' : '#4ade80';
-            }
-            const stateSpan = el('span', null, stateText);
-            stateSpan.style.color = stateColor;
-            stateSpan.style.fontSize = '11px';
-            chainItem.appendChild(stateSpan);
-            chainSection.appendChild(chainItem);
-        }
-        content.appendChild(chainSection);
-    }
-
     // CC session details
     if (item.data.active !== undefined) {
         content.appendChild(sectionRow('Active Sessions', String(item.data.active)));
@@ -1042,7 +974,7 @@ function showDetail(item) {
     // Routing config editor — loads live config from API
     if (item.data.chain_health && item.data.chain_health.length > 0) {
         const editorDiv = el('div', 'config-editor');
-        editorDiv.appendChild(el('div', 'chain-label', 'Routing Config'));
+        editorDiv.appendChild(el('div', 'chain-label', 'Chain Config'));
 
         // Static info — prefer backend-derived data over static SITE_META
         const edCostPolicy = item.data.cost_policy || SITE_META[item.id]?.costPolicy || 'unknown';
@@ -1137,7 +1069,7 @@ function showDetail(item) {
         content.appendChild(editorDiv);
 
         // Load config from API and populate editor
-        _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv, modeSelect, modeHint);
+        _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv, modeSelect, modeHint, item.data.chain_health);
     }
 }
 
@@ -1145,7 +1077,7 @@ function showDetail(item) {
 
 let _editorState = {};  // {chain, originalChain, allProviders, cbStates, default_paid, never_pays, original_dp, original_np}
 
-async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackEl, modeSelect, modeHint) {
+async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackEl, modeSelect, modeHint, chainHealth) {
     try {
         const resp = await fetch('/api/genesis/routing/config');
         if (!resp.ok) throw new Error('API error');
@@ -1182,12 +1114,21 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             }
         }
 
+        // Build chain_health lookup: provider_name → health object
+        const chainHealthMap = {};
+        if (chainHealth) {
+            for (const ch of chainHealth) {
+                chainHealthMap[ch.provider] = ch;
+            }
+        }
+
         _editorState = {
             callSiteId,
             chain: editorChain,
             originalChain: [...editorChain],
             allProviders: cfg.providers,
             cbStates: cfg.cb_states || {},
+            chainHealth: chainHealthMap,
             default_paid: site.default_paid,
             never_pays: site.never_pays,
             original_dp: site.default_paid,
@@ -1312,16 +1253,31 @@ function _renderChainList(listEl) {
             };
             li.appendChild(select);
         } else {
-            // API provider entry
+            // API provider entry — combined CB + probe health dot
+            const ch = _editorState.chainHealth?.[prov];
+            const cbState = _editorState.cbStates[prov] || ch?.state || 'closed';
+            const ps = ch?.probe_status;
+            const cbDown = cbState === 'open' || cbState === 'error';
+            const cbSuspect = cbState === 'half_open';
+            const dotColor = ps === 'not_configured' ? '#888'
+                : cbDown ? '#ef4444'
+                : cbSuspect ? '#facc15'
+                : ps === 'unreachable' ? '#ef4444'
+                : ps === 'rate_limited' ? '#facc15'
+                : '#4ade80';
+
             const dot = document.createElement('span');
             dot.className = 'cb-dot';
-            const cbState = _editorState.cbStates[prov] || 'closed';
-            dot.style.background = cbState === 'open' ? '#ef4444' : cbState === 'half_open' ? '#ffe600' : '#4ade80';
-            dot.title = 'CB: ' + cbState;
+            dot.style.background = dotColor;
+            dot.title = ps === 'not_configured' ? 'No API key' : 'CB: ' + cbState + (ps ? ', probe: ' + ps : '');
             li.appendChild(dot);
 
             const provCfg = _editorState.allProviders[prov];
-            const edDisplayName = prov.startsWith('claude-') ? prov.replace('claude-', 'anthropic-') : prov;
+            let edDisplayName = prov.startsWith('claude-') ? prov.replace('claude-', 'anthropic-') : prov;
+            const provType = ch?.type || provCfg?.provider_type;
+            if (provType === 'openrouter') edDisplayName += ' (via OpenRouter)';
+            else if (provType === 'zenmux') edDisplayName += ' (via ZenMux)';
+            else if (provType === 'lmstudio') edDisplayName += ' (LM Studio)';
             const nameText = edDisplayName + (provCfg?.free ? ' [free]' : '');
             const nameSpan = el('span', 'provider-name', nameText);
             if (provCfg?.free) nameSpan.style.color = '#4ade80';
@@ -1331,6 +1287,20 @@ function _renderChainList(listEl) {
                 modelSpan.style.cssText = 'color:#64748b;font-size:10px;margin-left:6px;';
                 li.appendChild(modelSpan);
             }
+
+            // CB state text with failure count
+            let stateText, stateColor;
+            if (ps === 'not_configured') {
+                stateText = 'no API key';
+                stateColor = '#888';
+            } else {
+                const failures = ch?.failures || 0;
+                stateText = cbState + (failures > 0 ? ' (' + failures + ' fails)' : '');
+                stateColor = cbDown ? '#ef4444' : cbSuspect ? '#facc15' : '#4ade80';
+            }
+            const stateSpan = el('span', null, stateText);
+            stateSpan.style.cssText = 'color:' + stateColor + ';font-size:10px;margin-left:auto;margin-right:6px;';
+            li.appendChild(stateSpan);
         }
 
         // Move up

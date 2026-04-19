@@ -300,7 +300,7 @@ def update_call_site_in_yaml(
       - None   → leave the existing yaml value unchanged
     """
     path = Path(path)
-    base_raw = yaml.safe_load(path.read_text())
+    base_raw = yaml.safe_load(_expand_env_vars(path.read_text()))
 
     if call_site_id not in (base_raw.get("call_sites") or {}):
         msg = f"Unknown call site: {call_site_id}"
