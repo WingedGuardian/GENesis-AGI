@@ -7,6 +7,66 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a7] - 2026-04-19
+
+25-commit release. Themes: **dashboard and settings overhaul**, **web
+fetching upgrade**, **timezone correctness**, and **operational
+documentation**.
+
+### Added
+
+- **Scrapling TLS fingerprinting** (#75) — web fetcher upgraded with
+  anti-bot bypass via `curl_cffi` TLS impersonation. Cloudflare Quick
+  Actions (`/markdown`, `/json`) for JS-rendered content extraction.
+- **Observation surfacing + output verification** (#77) — autonomous
+  task executor now verifies its own output against success criteria.
+  Observations surface in dashboard and outreach.
+- **Surplus config wiring + DB-backed approvals** (#84) — surplus
+  compute settings configurable via dashboard. Sentinel approvals
+  persisted to database (survive restarts).
+- **MCP module config overlay** (#94) — MCP tools now discover modules
+  from both repo and local config directories, matching runtime behavior.
+- **Contribution sanitizer** — auto-blocks gitignored paths from upstream
+  PRs.
+
+### Changed
+
+- **Identity file deduplication** (#93) — consolidated overlapping
+  content across CLAUDE.md, SOUL.md, STEERING.md, and CONVERSATION.md.
+  Each file now has a distinct scope with no redundancy.
+- **Settings panel functional** (#82, #89) — settings viewer, routing
+  panel consolidation, environment variable expansion fix. Previously
+  read-only, now editable.
+- **Approval queue** — moved from dedicated page to dashboard overview
+  with inline resume mechanism.
+- **Knowledge and Memory UI** (#86) — resizable file browser, improved
+  layout, tmux compatibility fix.
+- **Process management docs** — CLAUDE.md documents systemd units, MCP
+  server lifecycle, and the nohup prohibition.
+
+### Fixed
+
+- **Timezone across the board** (#79) — outreach scheduling, alert
+  timestamps, and follow-up due dates now respect the configured user
+  timezone instead of defaulting to UTC.
+- **Neural monitor accuracy** (#92) — disabled providers excluded from
+  health display and dropdown. Accuracy metrics cleaned up.
+- **Anthropic provider regression** (#88) — providers restored after
+  routing config change accidentally dropped them. False queue-empty
+  alerts eliminated.
+- **SSH PATH** (#87) — Claude CLI now found in SSH RemoteCommand context
+  (Guardian diagnosis sessions).
+- **Knowledge tab** (#82, #83) — stats endpoint AttributeError fixed,
+  CSS corrected, tab fully functional.
+- **Strategic reflection routing** (#81) — reflection sessions now route
+  to correct providers. Essential knowledge noise reduced.
+- **Morning report** (#85) — formatting, missing data handling, and
+  observation inclusion fixes.
+- **Extraction quality** (#76) — dashboard thresholds tuned, code index
+  priority corrected.
+
+---
+
 ## [v3.0a6] - 2026-04-17
 
 137-commit release. Major themes: **knowledge ingestion pipeline**,
