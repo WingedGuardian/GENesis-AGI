@@ -186,6 +186,7 @@
         settingsDomains: null,
         settingsData: {},         // domain_name → config object
         settingsEditing: null,    // domain being edited
+        settingsViewing: null,    // readonly domain being viewed
         settingsSaving: false,
         settingsRestartMessage: null,
 
@@ -1041,6 +1042,11 @@
         startEditSettings(domain) {
           if (!this.settingsData[domain]) { this.fetchSettingsData(domain); }
           this.settingsEditing = domain;
+        },
+        viewSettings(domain) {
+          if (this.settingsViewing === domain) { this.settingsViewing = null; return; }
+          if (!this.settingsData[domain]) { this.fetchSettingsData(domain); }
+          this.settingsViewing = domain;
         },
 
         // ── Provider Keys methods ────────────────────────────────
@@ -5414,10 +5420,52 @@
                 </thead>
                 <tbody>
                   <template x-for="domain in $store.genesisDashboard.settingsDomains" :key="domain.name">
-                    <tr style="border-bottom:1px solid var(--color-border);">
+                    <tr style="border-bottom:1px solid var(--color-border);"
+                        :style="domain.readonly ? 'cursor:pointer;' : ''"
+                        @click="domain.readonly && $store.genesisDashboard.viewSettings(domain.name)">
                       <td style="padding:4px 8px;">
                         <strong x-text="$store.genesisDashboard._DOMAIN_LABELS[domain.name] || domain.name"></strong>
                         <div style="font-size:0.7rem; color:var(--color-text-secondary);" x-text="domain.description"></div>
+                        <!-- Expandable readonly config viewer -->
+                        <template x-if="domain.readonly && $store.genesisDashboard.settingsViewing === domain.name">
+                          <div style="margin-top:0.4rem; padding:0.5rem; background:var(--color-bg-secondary); border:1px solid var(--color-border); border-radius:4px;" @click.stop>
+                            <template x-if="!$store.genesisDashboard.settingsData[domain.name]">
+                              <span style="font-size:0.72rem; color:var(--color-text-secondary);">Loading...</span>
+                            </template>
+                            <template x-if="domain.dedicated_tool && $store.genesisDashboard.settingsData[domain.name]">
+                              <div style="font-size:0.72rem; color:var(--color-text-secondary);">
+                                Managed by a dedicated tool. Ask Genesis: <em x-text="'&quot;show my ' + domain.name.replace(/_/g, ' ') + '&quot;'"></em>
+                              </div>
+                            </template>
+                            <template x-if="!domain.dedicated_tool && $store.genesisDashboard.settingsData[domain.name]">
+                              <div>
+                                <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.3rem 1rem; font-size:0.72rem;">
+                                  <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v !== 'object' && !k.startsWith('_'))" :key="key">
+                                    <div>
+                                      <span style="color:var(--color-text-secondary);" x-text="$store.genesisDashboard._settingLabel(key) + ':'"></span>
+                                      <span style="margin-left:0.25rem;" x-text="String(val)"></span>
+                                    </div>
+                                  </template>
+                                </div>
+                                <template x-for="[key, val] in Object.entries($store.genesisDashboard.settingsData[domain.name]).filter(([k, v]) => typeof v === 'object' && v !== null && !k.startsWith('_'))" :key="key">
+                                  <div style="margin-top:0.35rem;">
+                                    <div style="font-size:0.68rem; color:var(--color-text-secondary); font-weight:600; margin-bottom:2px;" x-text="$store.genesisDashboard._settingLabel(key)"></div>
+                                    <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:0.2rem 1rem; font-size:0.72rem; padding-left:0.5rem;">
+                                      <template x-for="[sk, sv] in Object.entries(val)" :key="sk">
+                                        <div>
+                                          <span style="color:var(--color-text-secondary);" x-text="$store.genesisDashboard._settingLabel(sk) + ':'"></span>
+                                          <span style="margin-left:0.25rem;" x-text="typeof sv === 'object' ? JSON.stringify(sv) : String(sv)"></span>
+                                        </div>
+                                      </template>
+                                    </div>
+                                  </div>
+                                </template>
+                                <div x-show="domain.readonly_reason" style="font-size:0.65rem; color:var(--color-text-secondary); margin-top:0.4rem; padding-top:0.3rem; border-top:1px solid var(--color-border);"
+                                     x-text="domain.readonly_reason"></div>
+                              </div>
+                            </template>
+                          </div>
+                        </template>
                       </td>
                       <td style="padding:4px 8px;">
                         <template x-if="domain.has_form">
@@ -5437,8 +5485,9 @@
                       </td>
                       <td style="padding:4px 8px;">
                         <template x-if="domain.readonly">
-                          <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px; cursor:help;"
-                                :title="domain.readonly_reason || 'Not editable from the dashboard'">view only</span>
+                          <span style="font-size:0.65rem; background:var(--color-bg-tertiary); padding:2px 6px; border-radius:3px; cursor:pointer;"
+                                @click.stop="$store.genesisDashboard.viewSettings(domain.name)"
+                                x-text="$store.genesisDashboard.settingsViewing === domain.name ? '\u25BC viewing' : '\u25B6 view'"></span>
                         </template>
                         <template x-if="domain.needs_restart && !domain.readonly">
                           <span style="font-size:0.65rem; background:#fff3cd; color:#856404; padding:2px 6px; border-radius:3px;" title="Changes require a genesis-server restart to take effect">Changing these settings requires a restart to apply</span>

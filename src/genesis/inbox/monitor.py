@@ -879,6 +879,22 @@ class InboxMonitor:
                     )
                 continue
 
+            # Short-output warning: if the batch has URLs but the response
+            # is suspiciously short, the model likely produced a full
+            # evaluation as an intermediate text block that was overwritten
+            # by a post-tool-call summary.  The CC CLI result field captures
+            # only the final text block.  (Observed 2026-04-18: 14K eval
+            # replaced by 735-char "Knowledge persisted" summary.)
+            batch_content_for_urls = "\n".join(item.content for item in batch)
+            urls_in_batch = len(_extract_urls(batch_content_for_urls))
+            if urls_in_batch > 0 and output.text and len(output.text.strip()) < 1000:
+                logger.warning(
+                    "Inbox batch %s: response is only %d chars for %d URLs "
+                    "— possible intermediate evaluation overwrite (CC result "
+                    "captures only the final text block)",
+                    batch_id[:8], len(output.text.strip()), urls_in_batch,
+                )
+
             # Check if LLM classified as Acknowledged (context absorbed,
             # no response file needed).  Still store evaluated_content so
             # future delta computation works correctly.
