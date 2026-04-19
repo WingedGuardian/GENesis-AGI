@@ -259,10 +259,7 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   The user is the only human on this project — uncommitted work is invisible
   work, and invisible work is lost work.
 - **NEVER push to main or merge into main without a PR and user approval.**
-  All code changes go through PRs. Push to a feature branch, create a PR
-  with `gh pr create`, then wait for user go-ahead before merging. The only
-  merge path is `gh pr merge --squash --admin` after explicit approval.
-  Enforced by PreToolUse hook (`git_push_guard.py`).
+  Enforced by PreToolUse hook. Details in genesis-development skill.
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope is optional: `feat(ego): add cadence manager`.
   Keep subject line under 72 characters. Dominant category wins if mixed.
