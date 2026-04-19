@@ -589,6 +589,7 @@ def _record_detail(
     embed_latency_ms: float | None,
     total_latency_ms: float,
     fts_only_fallback: bool,
+    heartbeat_ms: float = 0.0,
 ) -> None:
     """Atomic JSON write — latest invocation detail for health dashboard."""
     data = {
@@ -599,6 +600,7 @@ def _record_detail(
         "embed_latency_ms": embed_latency_ms,
         "total_latency_ms": total_latency_ms,
         "fts_only_fallback": fts_only_fallback,
+        "heartbeat_ms": round(heartbeat_ms, 1),
     }
     try:
         _METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -612,9 +614,156 @@ def _record_detail(
         pass  # Never block user prompt
 
 
+def _extract_genesis_summary(session_id: str) -> str | None:
+    """Extract what Genesis was doing from tool_observations.jsonl.
+
+    Reads the last 5 entries from the session's tool observation log
+    and produces a compact summary like "Grep observations.py, Read
+    essential_knowledge.py, Bash ran tests".
+
+    Returns None if file doesn't exist or is empty.
+    """
+    if not session_id:
+        return None
+
+    obs_path = Path.home() / ".genesis" / "sessions" / session_id / "tool_observations.jsonl"
+    if not obs_path.exists():
+        return None
+
+    try:
+        # Read last 5 lines efficiently
+        lines: list[str] = []
+        with open(obs_path, "rb") as f:
+            # Seek from end to find last N lines
+            try:
+                f.seek(0, 2)
+                size = f.tell()
+                # Read last 4KB — should contain 5+ entries
+                read_size = min(size, 4096)
+                f.seek(size - read_size)
+                chunk = f.read().decode("utf-8", errors="replace")
+                lines = [ln for ln in chunk.strip().split("\n") if ln.strip()][-5:]
+            except Exception:
+                return None
+
+        if not lines:
+            return None
+
+        tools: list[str] = []
+        for line in lines:
+            try:
+                entry = json.loads(line)
+                tool_name = entry.get("tool_name", "")
+                key_info = entry.get("key_info", {})
+                if tool_name == "Grep":
+                    pattern = key_info.get("pattern", "")[:30]
+                    tools.append(f"Grep {pattern}")
+                elif tool_name == "Read":
+                    path = key_info.get("file_path", "")
+                    fname = path.rsplit("/", 1)[-1] if "/" in path else path
+                    tools.append(f"Read {fname}")
+                elif tool_name == "Bash":
+                    cmd = key_info.get("command", "")[:25]
+                    tools.append(f"Bash {cmd}")
+                elif tool_name == "Edit":
+                    path = key_info.get("file_path", "")
+                    fname = path.rsplit("/", 1)[-1] if "/" in path else path
+                    tools.append(f"Edit {fname}")
+                elif tool_name:
+                    tools.append(tool_name)
+            except (json.JSONDecodeError, AttributeError):
+                continue
+
+        return ", ".join(tools[-3:]) if tools else None
+    except Exception:
+        return None
+
+
+def _heartbeat_write(
+    db_path: Path,
+    session_id: str,
+    prompt: str,
+) -> float:
+    """Write session heartbeat. Returns elapsed ms. Best-effort."""
+    hb_start = time.monotonic()
+    if not session_id or not db_path.exists():
+        return 0.0
+
+    try:
+        user_summary = prompt[:120].replace("\n", " ").strip()
+        genesis_summary = _extract_genesis_summary(session_id)
+
+        from genesis.db.crud.session_heartbeats import upsert_sync
+        upsert_sync(
+            str(db_path),
+            cc_session_id=session_id,
+            user_summary=user_summary,
+            genesis_summary=genesis_summary,
+        )
+    except Exception:
+        pass  # Best-effort — never block
+
+    return (time.monotonic() - hb_start) * 1000
+
+
+def _heartbeat_read_and_inject(
+    db_path: Path,
+    session_id: str,
+) -> float:
+    """Read concurrent sessions and print [Concurrent] tags. Returns elapsed ms."""
+    hb_start = time.monotonic()
+    if not session_id or not db_path.exists():
+        return 0.0
+
+    try:
+        from genesis.db.crud.session_heartbeats import get_active_sync
+        active = get_active_sync(str(db_path), exclude_session=session_id)
+
+        for s in active:
+            parts = []
+            src = s.get("source_tag", "")
+            if src and src != "foreground":
+                parts.append(src)
+            model = s.get("model", "")
+            if model:
+                parts.append(model)
+
+            detail = ""
+            genesis_summary = s.get("genesis_summary", "")
+            user_summary = s.get("user_summary", "")
+            if genesis_summary:
+                detail = genesis_summary[:80]
+            elif user_summary:
+                detail = user_summary[:80]
+
+            sid_short = s.get("cc_session_id", "")[:8]
+            tag_parts = ["Concurrent"]
+            if parts:
+                tag_parts.append(" ".join(parts))
+            tag_parts.append(sid_short)
+            tag = " | ".join(tag_parts)
+
+            if detail:
+                print(f"[{tag}] {detail}")
+            else:
+                print(f"[{tag}]")
+
+        if active:
+            sys.stdout.flush()
+    except Exception:
+        pass  # Best-effort — never block
+
+    return (time.monotonic() - hb_start) * 1000
+
+
 async def _run(prompt: str, session_id: str = "") -> None:
     """Main async entry point."""
     start = time.monotonic()
+
+    # ── Heartbeat ops (BEFORE memory recall — always complete) ─────
+    heartbeat_ms = 0.0
+    heartbeat_ms += _heartbeat_write(_DB_PATH, session_id, prompt)
+    heartbeat_ms += _heartbeat_read_and_inject(_DB_PATH, session_id)
 
     keywords = _extract_keywords(prompt)
 
@@ -702,6 +851,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
         embed_latency_ms=embed_latency_ms,
         total_latency_ms=total_ms,
         fts_only_fallback=fts_only_fallback,
+        heartbeat_ms=heartbeat_ms,
     )
 
 
