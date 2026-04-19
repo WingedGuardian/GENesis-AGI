@@ -88,6 +88,7 @@ def routing_config_read():
         "providers": providers,
         "cb_states": cb_states,
         "call_sites": call_sites,
+        "disabled_providers": dict(cfg.disabled_providers),
     })
 
 
