@@ -480,7 +480,9 @@ const SITE_META = {
     'email_triage': { name: 'Email Filter', category: 'classification' },
     '13_morning_report': { name: 'Morning Rpt', category: 'content' },
     'bookmark_enrichment': { name: 'Bookmark Enrich', category: 'content' },
-    'embedding_recovery': { name: 'Embed Recovery', category: 'embedding' },
+    '40_knowledge_distillation': { name: 'Knowledge Distill', category: 'learning' },
+    '41_resume_review_pass1': { name: 'Resume Review P1', category: 'memory' },
+    '42_resume_review_pass2': { name: 'Resume Review P2', category: 'memory' },
     // Partially wired
     '27_pre_execution_assessment': { name: 'Pre-Exec', category: 'reasoning' },
     '33_skill_refiner': { name: 'Skill Refine', category: 'content' },
@@ -502,7 +504,6 @@ const SITE_META = {
     '28_observation_sweep': { name: 'Obs Sweep', category: 'processing' },
     '34_research_synthesis': { name: 'Research Synth', category: 'content' },
     '37_infrastructure_monitor': { name: 'Infra Monitor', category: 'surplus' },
-    'outreach_fallback': { name: 'Outreach Retry', category: 'content' },
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
 };
 
@@ -1128,6 +1129,7 @@ async function _loadChainEditor(callSiteId, listEl, selectEl, addBtn, dpCheck, n
             chain: editorChain,
             originalChain: [...editorChain],
             allProviders: cfg.providers,
+            disabledProviders: cfg.disabled_providers || {},
             cbStates: cfg.cb_states || {},
             chainHealth: chainHealthMap,
             default_paid: site.default_paid,
@@ -1379,6 +1381,17 @@ function _populateAddSelect(selectEl) {
             selectEl.appendChild(opt);
         }
     }
+    // Disabled providers (no API key) — shown grayed out for visibility
+    for (const [name, provType] of Object.entries(_editorState.disabledProviders || {})) {
+        if (!_editorState.chain.includes(name)) {
+            const opt = document.createElement('option');
+            opt.value = '';
+            opt.disabled = true;
+            opt.textContent = name + ' \u2014 no API key (' + provType + ')';
+            opt.style.color = '#64748b';
+            selectEl.appendChild(opt);
+        }
+    }
     // CC dispatch options (only if no CC entry already in chain)
     const hasCC = _editorState.chain.some(_isCC);
     if (!hasCC) {
@@ -1524,10 +1537,11 @@ function updateSidePanel(data) {
             svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#ffe600'));
         }
 
-        const tmpfs = (data.infrastructure || {}).tmpfs || {};
-        if (tmpfs.free_pct != null) {
-            const tmpColor = tmpfs.free_pct > 20 ? 'color:#4ade80' : tmpfs.free_pct > 10 ? 'color:#ffe600' : 'color:#ef4444';
-            svcEl.appendChild(sectionRow('/tmp', Math.round(tmpfs.free_mb) + 'MB free (' + Math.round(tmpfs.free_pct) + '%)', tmpColor));
+        const ccTmp = (data.infrastructure || {}).cc_tmp;
+        if (ccTmp && ccTmp.cc_used_mb != null) {
+            const ccTier = ccTmp.cc_tier || 'unknown';
+            const ccColor = ccTier === 'green' ? 'color:#4ade80' : ccTier === 'orange' ? 'color:#ffe600' : ccTier === 'red' ? 'color:#ef4444' : 'color:#888';
+            svcEl.appendChild(sectionRow('CC Tmp', ccTmp.cc_used_mb + 'MB / ' + ccTmp.cc_budget_mb + 'MB', ccColor));
         }
     }
 
@@ -1536,8 +1550,8 @@ function updateSidePanel(data) {
     const infraEl = document.getElementById('infra-content');
     infraEl.replaceChildren();
     for (const [name, info] of Object.entries(infra)) {
-        // tmpfs is rendered in the Services section — skip here to avoid duplication
-        if (name === 'tmpfs') continue;
+        // cc_tmp rendered in Services — skip here to avoid duplication
+        if (name === 'cc_tmp') continue;
         const row = el('div', 'section-row');
         const labelSpan = el('span', 'label');
         const dot = el('span', 'status-dot ' + infraStatusClass(info));
@@ -1942,7 +1956,8 @@ const SUBSYSTEM_GROUPS = {
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
-        sites: ['8_ego_compaction', '9_fact_extraction', '21_embeddings', '21b_query_embedding', 'embedding_recovery'],
+        sites: ['8_ego_compaction', '9_fact_extraction', '21_embeddings', '21b_query_embedding',
+                '41_resume_review_pass1', '42_resume_review_pass2'],
     },
     surplus: {
         name: 'Surplus', domId: 'sub-surplus',
@@ -1950,7 +1965,7 @@ const SUBSYSTEM_GROUPS = {
     },
     outreach: {
         name: 'Outreach', domId: 'sub-outreach',
-        sites: ['13_morning_report', '23_fresh_eyes_review', 'outreach_fallback'],
+        sites: ['13_morning_report', '23_fresh_eyes_review'],
     },
     executor: {
         name: 'Executor', domId: 'sub-executor',
@@ -1963,7 +1978,7 @@ const SUBSYSTEM_GROUPS = {
         name: 'Learning', domId: 'sub-learning',
         sites: ['2_triage', '29_retrospective_triage',
                 '30_triage_calibration', '31_outcome_classification', '32_delta_assessment',
-                '33_skill_refiner', '38_procedure_extraction'],
+                '33_skill_refiner', '38_procedure_extraction', '40_knowledge_distillation'],
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
