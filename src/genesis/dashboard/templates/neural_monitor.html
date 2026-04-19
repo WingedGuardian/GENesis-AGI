@@ -933,48 +933,10 @@ function showDetail(item) {
         content.appendChild(sectionRow('Active Provider', item.data.active_provider));
     }
 
-    // CC session details
-    if (item.data.active !== undefined) {
-        content.appendChild(sectionRow('Active Sessions', String(item.data.active)));
-    }
-    if (item.data.hourly_budget) {
-        content.appendChild(sectionRow('Hourly Budget', item.data.hourly_budget));
-    }
-
-    // Last run info
-    if (item.data.last_run_at) {
-        const lastRunSection = el('div', 'detail-section');
-        lastRunSection.appendChild(el('h4', null, 'Last Run'));
-        const runTime = new Date(item.data.last_run_at);
-        const runStr = runTime.toLocaleDateString('en-US', {month: 'short', day: 'numeric'})
-            + ' ' + runTime.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
-        lastRunSection.appendChild(sectionRow('Time', runStr));
-        if (item.data.last_run_provider) {
-            lastRunSection.appendChild(sectionRow('Provider', item.data.last_run_provider + (item.data.last_run_model ? ' (' + item.data.last_run_model + ')' : '')));
-        }
-        if (item.data.last_run_tokens) {
-            lastRunSection.appendChild(sectionRow('Tokens', String(item.data.last_run_tokens)));
-        }
-        content.appendChild(lastRunSection);
-
-        // Full response in scrollable box
-        if (item.data.last_response) {
-            const respSection = el('div', 'detail-section');
-            respSection.appendChild(el('h4', null, 'Last Response'));
-            const respBox = document.createElement('pre');
-            respBox.textContent = item.data.last_response;
-            respBox.style.cssText = 'font-size: 11px; max-height: 200px; overflow-y: auto; background: #1e293b; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; margin: 4px 0; color: #e2e8f0;';
-            respSection.appendChild(respBox);
-            content.appendChild(respSection);
-        }
-    } else {
-        content.appendChild(sectionRow('Last Run', 'No runs recorded'));
-    }
-
-    // Routing config editor — loads live config from API
+    // Routing Chain Config — consolidated editor with health dots
     if (item.data.chain_health && item.data.chain_health.length > 0) {
         const editorDiv = el('div', 'config-editor');
-        editorDiv.appendChild(el('div', 'chain-label', 'Chain Config'));
+        editorDiv.appendChild(el('div', 'chain-label', 'Routing Chain Config'));
 
         // Static info — prefer backend-derived data over static SITE_META
         const edCostPolicy = item.data.cost_policy || SITE_META[item.id]?.costPolicy || 'unknown';
@@ -1071,6 +1033,45 @@ function showDetail(item) {
         // Load config from API and populate editor
         _loadChainEditor(item.id, chainList, addSelect, addBtn, dpCheck, npCheck, saveBtn, revertBtn, feedbackDiv, modeSelect, modeHint, item.data.chain_health);
     }
+
+    // CC session details
+    if (item.data.active !== undefined) {
+        content.appendChild(sectionRow('Active Sessions', String(item.data.active)));
+    }
+    if (item.data.hourly_budget) {
+        content.appendChild(sectionRow('Hourly Budget', item.data.hourly_budget));
+    }
+
+    // Last run info
+    if (item.data.last_run_at) {
+        const lastRunSection = el('div', 'detail-section');
+        lastRunSection.appendChild(el('h4', null, 'Last Run'));
+        const runTime = new Date(item.data.last_run_at);
+        const runStr = runTime.toLocaleDateString('en-US', {month: 'short', day: 'numeric'})
+            + ' ' + runTime.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
+        lastRunSection.appendChild(sectionRow('Time', runStr));
+        if (item.data.last_run_provider) {
+            lastRunSection.appendChild(sectionRow('Provider', item.data.last_run_provider + (item.data.last_run_model ? ' (' + item.data.last_run_model + ')' : '')));
+        }
+        if (item.data.last_run_tokens) {
+            lastRunSection.appendChild(sectionRow('Tokens', String(item.data.last_run_tokens)));
+        }
+        content.appendChild(lastRunSection);
+
+        // Full response in scrollable box
+        if (item.data.last_response) {
+            const respSection = el('div', 'detail-section');
+            respSection.appendChild(el('h4', null, 'Last Response'));
+            const respBox = document.createElement('pre');
+            respBox.textContent = item.data.last_response;
+            respBox.style.cssText = 'font-size: 11px; max-height: 200px; overflow-y: auto; background: #1e293b; padding: 8px; border-radius: 4px; white-space: pre-wrap; word-break: break-word; margin: 4px 0; color: #e2e8f0;';
+            respSection.appendChild(respBox);
+            content.appendChild(respSection);
+        }
+    } else {
+        content.appendChild(sectionRow('Last Run', 'No runs recorded'));
+    }
+
 }
 
 // ── Chain editor logic ───────────────────────────────────────────────
