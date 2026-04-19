@@ -477,13 +477,21 @@ def _format_results(results: list[dict]) -> str:
     lines = []
     for rank, r in enumerate(results):
         is_rule = r.get("memory_class") == "rule"
-        max_len = 200 if (rank == 0 or is_rule) else 150
+        max_len = 300 if (rank == 0 or is_rule) else 200
         content = r.get("content", "")
         # Strip extraction-pipeline prefixes like [discovery], [feature], etc.
         # These are baked into stored content but waste display chars.
         if content.startswith("[") and "] " in content[:30]:
             content = content[content.index("] ") + 2:]
-        content = content[:max_len]
+        # Smart truncation: cut at last sentence boundary before limit
+        if len(content) > max_len:
+            for i in range(max_len - 1, max(max_len - 60, 0), -1):
+                if content[i] in ".!?":
+                    content = content[: i + 1]
+                    break
+            else:
+                content = content[:max_len]
+
 
         mid = r.get("memory_id", "")
         age = _format_age(r.get("_created_at", ""))
