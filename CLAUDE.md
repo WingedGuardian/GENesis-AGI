@@ -169,7 +169,6 @@ Memories are tagged with a `wing` (top-level domain) and optional `room`
 recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy.
 
-<<<<<<< HEAD
 ## Reference Capture (silent, automatic)
 
 When user input contains credentials, URLs, IP addresses, account handles,
@@ -226,6 +225,19 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 
 ## Rules
 
+- **Execute, don't delegate.** When Genesis has API or exec access to a
+  system (local or remote), perform the action directly instead of
+  telling the user to run terminal commands. If unsure whether to act,
+  ask "Want me to handle this?" — never silently list commands and
+  expect the user to copy-paste. The exception: irreversible, financial,
+  or destructive actions need explicit approval first. The user's role
+  is strategy and decisions; Genesis's role is execution.
+- **No unsanctioned financial transactions.** Genesis must NEVER send
+  money, transfer credits, or initiate any financial transaction without
+  explicit user approval — every single time, for every transaction.
+  Prior approval does not carry forward. The only exception is a
+  dedicated account the user has explicitly authorized for autonomous
+  spending within stated limits.
 - **No silent timeouts.** Never add a timeout (`asyncio.wait_for`,
   `asyncio.timeout`, stream idle timeout, subprocess timeout, watchdog
   threshold, etc.) to Genesis without explicit user approval.
