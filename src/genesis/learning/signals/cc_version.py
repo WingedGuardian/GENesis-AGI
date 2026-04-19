@@ -147,43 +147,39 @@ class CCVersionCollector:
 
     async def _store_version(self, version: str) -> None:
         """Store current version as baseline in observations table."""
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
         # Remove previous baselines to keep exactly one current
         await self._db.execute(
             "DELETE FROM observations "
             "WHERE source = 'cc_version' AND type = 'cc_version_baseline'",
         )
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "cc_version",
-                "cc_version_baseline",
-                json.dumps({"version": version}),
-                "low",
-                now,
-            ),
-        )
         await self._db.commit()
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="cc_version",
+            type="cc_version_baseline",
+            content=json.dumps({"version": version}),
+            priority="low",
+            created_at=now,
+        )
 
     async def _store_version_change(self, old: str, new: str) -> None:
         """Store version change observation and update current."""
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
-        # Store change event
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "cc_version",
-                "version_change",
-                json.dumps({"old_version": old, "new_version": new, "detected_at": now}),
-                "medium",
-                now,
-            ),
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="cc_version",
+            type="version_change",
+            content=json.dumps({"old_version": old, "new_version": new, "detected_at": now}),
+            priority="medium",
+            created_at=now,
         )
-        await self._db.commit()
         # Update baseline so next collect() sees the new version
         await self._store_version(new)
 
@@ -220,24 +216,22 @@ class CCVersionCollector:
         if await cursor.fetchone():
             return
 
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "cc_version",
-                "cc_version_available",
-                json.dumps({
-                    "installed_version": installed,
-                    "available_version": available,
-                    "detected_at": now,
-                }),
-                "medium",
-                now,
-            ),
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="cc_version",
+            type="cc_version_available",
+            content=json.dumps({
+                "installed_version": installed,
+                "available_version": available,
+                "detected_at": now,
+            }),
+            priority="medium",
+            created_at=now,
         )
-        await self._db.commit()
         logger.info(
             "CC version %s available on npm (installed: %s)", available, installed,
         )

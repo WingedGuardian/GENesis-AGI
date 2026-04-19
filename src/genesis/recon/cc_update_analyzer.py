@@ -330,12 +330,18 @@ class CCUpdateAnalyzer:
 
         priority = "high" if impact in (IMPACT_ACTION_NEEDED, IMPACT_BREAKING) else "low"
 
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, category, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (finding_id, "recon", "finding", "cc_update", content, priority, now),
+        from genesis.db.crud import observations
+
+        await observations.create(
+            self._db,
+            id=finding_id,
+            source="recon",
+            type="finding",
+            content=content,
+            priority=priority,
+            created_at=now,
+            category="cc_update",
         )
-        await self._db.commit()
 
         # Ingest to knowledge base (best-effort — observation is already stored)
         await self._ingest_to_knowledge(new_version, analysis, changelog)

@@ -400,12 +400,18 @@ class ModelIntelligenceJob:
         _MEDIUM_TYPES = ("pricing_change", "new_model", "new_free_model", "free_model_removed")
         priority = "medium" if finding_type in _MEDIUM_TYPES else "low"
 
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, category, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (finding_id, "recon", "finding", "model_intelligence", content, priority, now),
+        from genesis.db.crud import observations
+
+        await observations.create(
+            self._db,
+            id=finding_id,
+            source="recon",
+            type="finding",
+            content=content,
+            priority=priority,
+            created_at=now,
+            category="model_intelligence",
         )
-        await self._db.commit()
         return finding_id
 
     async def _create_benchmark_follow_up(

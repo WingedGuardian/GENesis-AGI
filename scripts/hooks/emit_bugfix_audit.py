@@ -19,7 +19,7 @@ import os
 import sqlite3
 import sys
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -73,12 +73,18 @@ def emit(sha: str, subject: str) -> int:
                 print(f"emit_bugfix_audit: dedup hit for sha={sha[:12]}", file=sys.stderr)
                 return 0
 
+            # Compute TTL inline (can't use async CRUD in sync hook).
+            # bugfix_committed → 30-day TTL, matching observations._TTL_BY_TYPE.
+            expires_at = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+
             conn.execute(
                 """
                 INSERT INTO observations
-                    (id, source, type, category, content, priority, created_at, content_hash)
+                    (id, source, type, category, content, priority,
+                     created_at, content_hash, expires_at)
                 VALUES
-                    (?,  ?,      ?,    ?,        ?,       ?,        ?,          ?)
+                    (?,  ?,      ?,    ?,        ?,       ?,
+                     ?,          ?,            ?)
                 """,
                 (
                     obs_id,
@@ -89,6 +95,7 @@ def emit(sha: str, subject: str) -> int:
                     "low",  # audit only, not actionable on its own
                     now,
                     chash,
+                    expires_at,
                 ),
             )
             conn.commit()
