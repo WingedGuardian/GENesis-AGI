@@ -157,10 +157,11 @@ index. If this answers "what are we working on," don't burn a recall.
 
 **L2 — Proactive Recall (automatic per prompt):**
 The UserPromptSubmit hook searches FTS5 + Qdrant based on your prompt keywords
-and injects `[Memory | age | wing | id:xxx]` tags. Check these first before
-doing explicit recall. Results are biased toward the active wing (domain) when
-detectable. Use the `id:` handle with `memory_expand` for full context without
-re-searching. Proactive hook results are keyword-matched fragments, not curated
+and injects `[Memory | age | wing | id:xxx]` tags (200/150 chars, rank 1/2-3).
+Check these first before doing explicit recall. Results are biased toward the
+active wing (domain) when detectable. Use the `id:` handle with `memory_expand`
+for full context without re-searching. Proactive hook results are keyword-matched
+fragments, not curated
 context. They may be ambiguous, conditional, or outdated when detached from
 their source document. Treat them as leads to investigate, not facts to act on.
 When a memory snippet makes a factual claim (X is broken, Y is exhausted, Z is
