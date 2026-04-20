@@ -736,8 +736,14 @@ class AwarenessLoop:
                         f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
                     )
                     await self._topic_manager.send_to_category("reflection_micro", text)
+                    logger.info(
+                        "Posted micro reflection to Telegram (tick=%s, salience=%.2f)",
+                        tick_id[:8], micro.salience,
+                    )
                 except Exception:
                     logger.warning("Failed to post micro reflection to topic", exc_info=True)
+            elif ref_result and ref_result.success and ref_result.output and not self._topic_manager:
+                logger.warning("Micro reflection completed but topic_manager not set")
 
             if (ref_result is None or not ref_result.success) and self._deferred_queue:
                 try:

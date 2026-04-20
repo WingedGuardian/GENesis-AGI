@@ -92,12 +92,22 @@ class SurplusScheduler:
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
+        self._topic_manager = None
         self._scheduler = AsyncIOScheduler()
+
+    def set_topic_manager(self, manager) -> None:
+        """Set TopicManager for routing surplus reflections to Telegram topics."""
+        self._topic_manager = manager
+        if hasattr(self._executor, "set_topic_manager"):
+            self._executor.set_topic_manager(manager)
 
     def set_executor(self, executor) -> None:
         """Replace the current executor (e.g., swap StubExecutor for a real one)."""
         self._executor = executor
         self._brainstorm_runner._executor = executor
+        # Propagate topic_manager to the new executor
+        if self._topic_manager and hasattr(executor, "set_topic_manager"):
+            executor.set_topic_manager(self._topic_manager)
 
     def set_code_audit_executor(self, executor) -> None:
         """Set a dedicated executor for CODE_AUDIT tasks."""

@@ -469,6 +469,8 @@ class StandaloneAdapter:
                     rt.outreach_pipeline.set_forum_chat_id(config["forum_chat_id"])
                 if rt.awareness_loop:
                     rt.awareness_loop.set_topic_manager(topic_manager)
+                if rt.surplus_scheduler:
+                    rt.surplus_scheduler.set_topic_manager(topic_manager)
 
                 logger.info(
                     "Forum topics enabled (chat_id=%s) — %d categories",

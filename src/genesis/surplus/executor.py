@@ -129,6 +129,11 @@ class ReflectionBasedSurplusExecutor:
     def __init__(self, engine: ReflectionEngine, *, db: aiosqlite.Connection) -> None:
         self._engine = engine
         self._db = db
+        self._topic_manager = None
+
+    def set_topic_manager(self, manager) -> None:
+        """Set TopicManager for posting surplus reflections to Telegram."""
+        self._topic_manager = manager
 
     async def execute(self, task: SurplusTask) -> ExecutorResult:
         depth = _DEPTH_MAP.get(task.task_type, Depth.LIGHT)
@@ -174,6 +179,10 @@ class ReflectionBasedSurplusExecutor:
         if not result.success:
             return ExecutorResult(success=False, error=result.reason)
 
+        # Post to Telegram topic (mirrors awareness loop delivery path)
+        if result.output and self._topic_manager:
+            await self._post_to_telegram(result.output, depth, task)
+
         content = _extract_content(result)
         confidence = getattr(result.output, "confidence", 0.5) if result.output else 0.3
         model = "reflection_engine"
@@ -194,3 +203,47 @@ class ReflectionBasedSurplusExecutor:
                 logger.warning("Failed to mark prior findings as influenced", exc_info=True)
 
         return ExecutorResult(success=True, content=content, insights=insights)
+
+    async def _post_to_telegram(self, output, depth: Depth, task: SurplusTask) -> None:
+        """Format and send reflection output to the appropriate Telegram topic."""
+        try:
+            from html import escape
+
+            from genesis.perception.types import LightOutput, MicroOutput
+
+            if isinstance(output, MicroOutput):
+                anomaly_flag = " [ANOMALY]" if output.anomaly else ""
+                tags_str = ", ".join(output.tags[:5]) if output.tags else ""
+                summary = escape(output.summary)
+                text = (
+                    f"<b>Micro Reflection</b> [surplus]{anomaly_flag}\n\n"
+                    f"{summary}\n\n"
+                    f"<i>Salience: {output.salience:.2f}"
+                    f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
+                )
+                category = "reflection_micro"
+
+            elif isinstance(output, LightOutput):
+                assessment = escape(output.assessment[:2000])
+                recs = ""
+                if output.recommendations:
+                    items = [escape(r if isinstance(r, str) else str(r)) for r in output.recommendations]
+                    recs = "\n\n<b>Recommendations:</b>\n" + "\n".join(f"• {r}" for r in items)
+                text = (
+                    f"<b>Light Reflection</b> [surplus]\n\n"
+                    f"{assessment}{recs}\n\n"
+                    f"<i>Focus: {escape(output.focus_area)} | "
+                    f"Confidence: {output.confidence:.2f}</i>"
+                )
+                category = "reflection_light"
+
+            else:
+                return
+
+            await self._topic_manager.send_to_category(category, text)
+            logger.info(
+                "Posted surplus %s reflection to Telegram (task=%s)",
+                depth.value, task.task_type,
+            )
+        except Exception:
+            logger.warning("Failed to post surplus reflection to Telegram", exc_info=True)
