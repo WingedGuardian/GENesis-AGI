@@ -125,25 +125,21 @@ body {
 .region-enrichment .section-row .label,
 .region-enrichment .section-row .value { font-size: 11px; }
 
-/* Battleship-style flat dot grid */
-/* Tile map: square-ish subsystem regions, call sites front and center */
+/* Battleship-style flat dot grid — single square, column-fill */
 .battleship-grid {
-    display: flex; flex-wrap: wrap; gap: 12px; padding: 14px;
+    display: grid;
+    grid-template-rows: repeat(7, auto);
+    grid-auto-flow: column;
+    grid-auto-columns: 72px;
+    gap: 4px; padding: 14px;
     background: rgba(15, 23, 42, 0.5);
     border-radius: 8px; border: 1px solid var(--color-border, #334155);
 }
-.bg-tile {
-    padding: 10px 12px; border-radius: 6px;
-    border: 1px solid rgba(51, 65, 85, 0.2);
-}
-.bg-cells {
-    display: flex; flex-wrap: wrap; gap: 8px;
-    max-width: calc(3 * 72px + 2 * 8px); /* wrap at 3 cells → square-ish tiles */
-}
 .bg-cell {
     display: flex; flex-direction: column; align-items: center; gap: 4px;
-    width: 72px;
+    padding: 6px 4px; border-radius: 4px;
 }
+.bg-cell-empty { width: 72px; height: 72px; }
 .bg-cell-label {
     font-size: 10px; color: #94a3b8; text-align: center;
     line-height: 1.2; width: 100%; word-break: break-word;
@@ -1761,64 +1757,6 @@ const SUBSYSTEM_BORDER_COLORS = {
     contingency: '#f87171', utility: '#94a3b8',
 };
 
-function renderBattleshipGroup(group, data, groupKey) {
-    const callSites = data.call_sites || {};
-
-    // Tile: colored region for this subsystem — no label, just tint
-    const tile = el('div', 'bg-tile bg-' + groupKey);
-    tile.title = group.name; // accessible on hover, not displayed
-
-    const cells = el('div', 'bg-cells');
-    for (const siteId of group.sites) {
-        const siteData = callSites[siteId] || {};
-        const meta = getMeta(siteId);
-        const status = siteData.status || 'unknown';
-
-        const cell = el('div', 'bg-cell');
-
-        const dot = el('div', 'grid-dot ' + gridDotClass(status));
-        dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
-
-        // Tooltip data (shared #shared-tip on hover — supplementary to visible label)
-        const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
-        if (status === 'idle') tipRows.push({ text: 'Groundwork' });
-        else if (status === 'disabled') tipRows.push({ text: 'No API key' });
-        else tipRows.push({ text: status });
-        if (siteData.active_provider) tipRows.push({ text: siteData.active_provider });
-        if (siteData.recent_failures) {
-            const failAge = siteData.last_failure_at
-                ? formatAge(Math.round((Date.now() - new Date(siteData.last_failure_at).getTime()) / 1000)) + ' ago'
-                : 'recently';
-            tipRows.push({ text: siteData.recent_failures + ' failure(s) in 30min, latest ' + failAge, style: 'color:#f59e0b' });
-        }
-        const descText = siteData.description || meta.desc;
-        if (descText) tipRows.push({ text: descText, style: 'color:#94a3b8;margin-top:3px' });
-        if (siteData.chain_health) {
-            const apiChain = siteData.chain_health.filter(c => !c.is_cc);
-            const ccChain = siteData.chain_health.filter(c => c.is_cc);
-            const apiUp = apiChain.filter(c => {
-                const ps = c.probe_status;
-                return ps ? ps === 'reachable' : c.state !== 'open';
-            }).length;
-            let chainSummary = apiUp + '/' + apiChain.length + ' API';
-            if (ccChain.length > 0) {
-                const ccPs = ccChain[0].probe_status;
-                const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
-                chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
-            }
-            tipRows.push({ text: chainSummary });
-        }
-        dot.dataset.tip = JSON.stringify(tipRows);
-        dot.addEventListener('mouseenter', () => showTip(dot));
-        dot.addEventListener('mouseleave', hideTip);
-
-        cell.appendChild(dot);
-        cell.appendChild(el('div', 'bg-cell-label', meta.name));
-        cells.appendChild(cell);
-    }
-    tile.appendChild(cells);
-    return tile;
-}
 
 function updateSubsystemGrid(data) {
     const container = document.getElementById('monitor-grid');
@@ -1839,8 +1777,49 @@ function updateSubsystemGrid(data) {
     const callSites = data.call_sites || {};
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
-        // ── Top: battleship dot group ────────────────────────────────────
-        bgGrid.appendChild(renderBattleshipGroup(group, data, key));
+        // ── Top: flat grid cells for this subsystem (column-fill square) ──
+        for (const siteId of group.sites) {
+            const siteData = callSites[siteId] || {};
+            const meta = getMeta(siteId);
+            const status = siteData.status || 'unknown';
+            const cell = el('div', 'bg-cell bg-' + key);
+            const dot = el('div', 'grid-dot ' + gridDotClass(status));
+            dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
+            const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
+            if (status === 'idle') tipRows.push({ text: 'Groundwork' });
+            else if (status === 'disabled') tipRows.push({ text: 'No API key' });
+            else tipRows.push({ text: status });
+            if (siteData.active_provider) tipRows.push({ text: siteData.active_provider });
+            if (siteData.recent_failures) {
+                const failAge = siteData.last_failure_at
+                    ? formatAge(Math.round((Date.now() - new Date(siteData.last_failure_at).getTime()) / 1000)) + ' ago'
+                    : 'recently';
+                tipRows.push({ text: siteData.recent_failures + ' failure(s) in 30min, latest ' + failAge, style: 'color:#f59e0b' });
+            }
+            const descText = siteData.description || meta.desc;
+            if (descText) tipRows.push({ text: descText, style: 'color:#94a3b8;margin-top:3px' });
+            if (siteData.chain_health) {
+                const apiChain = siteData.chain_health.filter(c => !c.is_cc);
+                const ccChain = siteData.chain_health.filter(c => c.is_cc);
+                const apiUp = apiChain.filter(c => {
+                    const ps = c.probe_status;
+                    return ps ? ps === 'reachable' : c.state !== 'open';
+                }).length;
+                let chainSummary = apiUp + '/' + apiChain.length + ' API';
+                if (ccChain.length > 0) {
+                    const ccPs = ccChain[0].probe_status;
+                    const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
+                    chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
+                }
+                tipRows.push({ text: chainSummary });
+            }
+            dot.dataset.tip = JSON.stringify(tipRows);
+            dot.addEventListener('mouseenter', () => showTip(dot));
+            dot.addEventListener('mouseleave', hideTip);
+            cell.appendChild(dot);
+            cell.appendChild(el('div', 'bg-cell-label', meta.name));
+            bgGrid.appendChild(cell);
+        }
 
         // ── Bottom: enrichment card ──────────────────────────────────────
         const bColor = SUBSYSTEM_BORDER_COLORS[key] || '#475569';
@@ -2091,6 +2070,12 @@ function updateSubsystemGrid(data) {
 
         if (hasEnrichment) card.appendChild(enrichment);
         enrichGrid.appendChild(card);
+    }
+    // Pad last column to 7 rows
+    const totalSites = Object.values(SUBSYSTEM_GROUPS).reduce((n, g) => n + g.sites.length, 0);
+    const gridTotal = Math.ceil(totalSites / 7) * 7;
+    for (let i = totalSites; i < gridTotal; i++) {
+        bgGrid.appendChild(el('div', 'bg-cell-empty'));
     }
 }
 
