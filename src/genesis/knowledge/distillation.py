@@ -157,8 +157,8 @@ class DistillationPipeline:
             domain: Knowledge domain (or "auto" for LLM detection).
             user_context: Optional user-provided context about the document
                 (e.g., "This is a proposed plan, not established fact").
-            on_chunk_done: Optional async callback(chunk_index, units) called
-                after each chunk completes. Used for checkpoint progress.
+            on_chunk_done: Optional async callback(chunk_index, total_chunks, units)
+                called after each chunk completes. Used for progress tracking.
         """
         if not content.text.strip():
             return []
@@ -211,7 +211,7 @@ class DistillationPipeline:
                 # Notify caller of chunk completion (for checkpointing)
                 if on_chunk_done is not None:
                     try:
-                        await on_chunk_done(i, units)
+                        await on_chunk_done(i, len(chunks), units)
                     except Exception:
                         logger.warning("on_chunk_done callback failed for chunk %d", i, exc_info=True)
 

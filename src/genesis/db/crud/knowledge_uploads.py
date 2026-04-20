@@ -153,6 +153,36 @@ async def atomic_transition(
     return cursor.rowcount > 0
 
 
+async def update_chunk_progress(
+    db: aiosqlite.Connection,
+    upload_id: str,
+    *,
+    chunks_total: int | None = None,
+) -> None:
+    """Increment chunk completion count for a processing upload.
+
+    Called once per chunk from parallel callbacks — uses atomic increment
+    so completion order doesn't matter. Commits immediately; must not be
+    called during a _commit=False batch on the same connection.
+    """
+    if chunks_total is not None:
+        await db.execute(
+            """UPDATE knowledge_uploads
+               SET chunks_done = COALESCE(chunks_done, 0) + 1,
+                   chunks_total = ?
+               WHERE id = ?""",
+            (chunks_total, upload_id),
+        )
+    else:
+        await db.execute(
+            """UPDATE knowledge_uploads
+               SET chunks_done = COALESCE(chunks_done, 0) + 1
+               WHERE id = ?""",
+            (upload_id,),
+        )
+    await db.commit()
+
+
 async def list_processing_before(
     db: aiosqlite.Connection,
     cutoff_iso: str,

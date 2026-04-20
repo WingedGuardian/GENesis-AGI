@@ -639,6 +639,8 @@ TABLES = {
                           CHECK (status IN ('uploaded', 'processing', 'completed', 'failed')),
             error_message TEXT,
             unit_ids      TEXT,
+            chunks_total  INTEGER,
+            chunks_done   INTEGER DEFAULT 0,
             created_at    TEXT NOT NULL,
             completed_at  TEXT
         )

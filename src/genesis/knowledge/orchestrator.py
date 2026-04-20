@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,7 @@ class KnowledgeOrchestrator:
         domain: str = "auto",
         purpose: list[str] | None = None,
         user_context: str | None = None,
+        on_chunk_done: typing.Callable | None = None,
     ) -> IngestResult:
         """Ingest a single source (file path or URL) into the knowledge base."""
         # 1. Check for duplicate
@@ -110,6 +112,7 @@ class KnowledgeOrchestrator:
         units = await self._distillation.distill(
             content, project_type=project_type, domain=domain,
             user_context=user_context,
+            on_chunk_done=on_chunk_done,
         )
 
         if not units:

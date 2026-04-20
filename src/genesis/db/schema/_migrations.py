@@ -827,6 +827,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
     """)
 
+    # Knowledge upload chunk progress tracking
+    await _try_alter(db,
+        "ALTER TABLE knowledge_uploads ADD COLUMN chunks_total INTEGER",
+        "knowledge_uploads.chunks_total")
+    await _try_alter(db,
+        "ALTER TABLE knowledge_uploads ADD COLUMN chunks_done INTEGER DEFAULT 0",
+        "knowledge_uploads.chunks_done")
+
     # Approval resume tracking — atomic consumed_at column
     await _try_alter(db,
         "ALTER TABLE approval_requests ADD COLUMN consumed_at TEXT",

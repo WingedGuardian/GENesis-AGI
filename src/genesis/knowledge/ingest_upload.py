@@ -194,9 +194,22 @@ async def _extract_with_pipeline(
     context: str,
 ) -> list[str]:
     """Run the full extraction pipeline with context injection."""
+    from genesis.db.crud import knowledge_uploads
     from genesis.mcp.memory.knowledge import _get_orchestrator
+    from genesis.runtime import GenesisRuntime
 
+    rt = GenesisRuntime.instance()
     orchestrator = _get_orchestrator()
+
+    async def _on_chunk_done(
+        chunk_index: int, total_chunks: int, units: list,
+    ) -> None:
+        """Update chunk progress in DB after each chunk completes."""
+        if rt.db is not None:
+            await knowledge_uploads.update_chunk_progress(
+                rt.db, upload_id,
+                chunks_total=total_chunks,
+            )
 
     result = await orchestrator.ingest_source(
         file_path,
@@ -204,6 +217,7 @@ async def _extract_with_pipeline(
         domain=domain,
         purpose=purpose,
         user_context=context if context else None,
+        on_chunk_done=_on_chunk_done,
     )
 
     if result.error:
