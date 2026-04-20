@@ -322,6 +322,10 @@ def file_upload():
     if not file.filename:
         return jsonify({"error": "Empty filename"}), 400
 
+    # Pre-check content length before saving to disk
+    if request.content_length and request.content_length > _MAX_UPLOAD_SIZE:
+        return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
+
     safe_name = _sanitize_filename(file.filename)
 
     # Ensure uploads directory exists
@@ -335,7 +339,7 @@ def file_upload():
     if not _is_allowed(dest):
         return jsonify({"error": "Path not allowed"}), 403
 
-    # Save and check size
+    # Save and verify size (content_length can be spoofed, so double-check)
     file.save(str(dest))
     file_size = dest.stat().st_size
 

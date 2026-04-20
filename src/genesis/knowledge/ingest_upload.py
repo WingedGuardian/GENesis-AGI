@@ -84,13 +84,13 @@ async def run_ingest(
             filename, len(unit_ids), mode,
         )
 
-    except Exception:
+    except Exception as exc:
         logger.exception("Ingest worker failed for upload %s", upload_id)
         try:
             await knowledge_uploads.update_status(
                 rt.db, upload_id,
                 status="failed",
-                error_message="Internal error during ingestion",
+                error_message=str(exc) or "Internal error during ingestion",
             )
         except Exception:
             logger.exception("Failed to update upload status after error")
@@ -117,8 +117,13 @@ async def _store_as_is(
 
     from genesis.db.crud import knowledge as knowledge_crud
 
-    # Read file content
+    # Read file content (cap at 2MB for single-unit storage)
     path = Path(file_path)
+    if path.stat().st_size > 2 * 1024 * 1024:
+        raise RuntimeError(
+            "File too large for store-as-is mode (>2MB). "
+            "Use 'Extract & distill' for large documents."
+        )
     file_content = path.read_text(encoding="utf-8", errors="replace")
 
     # Use context or filename as concept
@@ -189,11 +194,7 @@ async def _extract_with_pipeline(
     context: str,
 ) -> list[str]:
     """Run the full extraction pipeline with context injection."""
-    from genesis.db.crud import knowledge_uploads
     from genesis.mcp.memory.knowledge import _get_orchestrator
-    from genesis.runtime import GenesisRuntime
-
-    rt = GenesisRuntime.instance()
 
     orchestrator = _get_orchestrator()
 
@@ -206,12 +207,7 @@ async def _extract_with_pipeline(
     )
 
     if result.error:
-        await knowledge_uploads.update_status(
-            rt.db, upload_id,
-            status="failed",
-            error_message=result.error,
-        )
-        raise RuntimeError(f"Extraction failed: {result.error}")
+        raise RuntimeError(result.error)
 
     return result.unit_ids
 

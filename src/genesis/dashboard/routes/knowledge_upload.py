@@ -117,6 +117,9 @@ async def knowledge_ingest_upload():
     if not upload_id or not project_type:
         return jsonify({"error": "upload_id and project_type required"}), 400
 
+    if mode not in ("extract", "store"):
+        return jsonify({"error": "mode must be 'extract' or 'store'"}), 400
+
     # Atomic status transition: uploaded -> processing (prevents double-ingestion)
     purpose_list = [p.strip() for p in purpose.split(",")] if purpose else None
     transitioned = await knowledge_uploads.atomic_transition(

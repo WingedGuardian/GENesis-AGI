@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import typing
 from dataclasses import dataclass, field
 
 from genesis.knowledge.processors.base import ProcessedContent
@@ -146,7 +147,7 @@ class DistillationPipeline:
         project_type: str,
         domain: str = "auto",
         user_context: str | None = None,
-        on_chunk_done: object | None = None,
+        on_chunk_done: typing.Callable | None = None,
     ) -> list[KnowledgeUnit]:
         """Distill processed content into knowledge units.
 
