@@ -29,9 +29,34 @@ body {
 }
 .header-badge .hb-dot { width: 6px; height: 6px; border-radius: 50%; }
 
+/* Layout: main panel + side panel */
+.nm-container {
+    display: flex; min-height: calc(100vh - 92px);
+}
+.main-panel {
+    flex: 1; padding: 0 24px 60px; overflow-y: auto;
+}
+.side-panel {
+    width: 380px; min-width: 380px; border-left: 1px solid var(--color-border, #1e293b);
+    padding: 18px; overflow-y: auto;
+    scrollbar-width: thin; scrollbar-color: #334155 transparent;
+}
+.section {
+    margin-bottom: 20px; padding: 10px 12px; border-radius: 6px;
+    background: rgba(30, 41, 59, 0.3); border: 1px solid rgba(51, 65, 85, 0.3);
+}
+.section h3 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--color-text-secondary); margin-bottom: 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--color-border, #1e293b);
+    border-left: 3px solid var(--color-accent, #27875e); padding-left: 8px;
+}
+.detail-panel { display: none; }
+.detail-panel.active { display: block; }
+
 /* Grid topology */
 .monitor-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
     max-width: 1200px; margin: 0 auto; padding: 0 16px;
 }
 
@@ -53,11 +78,11 @@ body {
 
 /* Dot grid within region */
 .dot-grid {
-    display: grid; grid-template-columns: repeat(4, 24px); gap: 12px;
+    display: grid; grid-template-columns: repeat(4, 28px); gap: 16px;
     padding: 4px 0;
 }
 .grid-dot {
-    width: 8px; height: 8px; border-radius: 50%; cursor: pointer;
+    width: 14px; height: 14px; border-radius: 50%; cursor: pointer;
     transition: transform 0.15s, box-shadow 0.2s;
     position: relative;
 }
@@ -99,18 +124,12 @@ body {
 .region-enrichment .section-row .label,
 .region-enrichment .section-row .value { font-size: 11px; }
 
-/* Ops strip */
-.ops-strip {
-    display: flex; gap: 12px; flex-wrap: wrap; padding: 12px 16px;
-    margin-bottom: 16px; max-width: 1200px; margin-left: auto; margin-right: auto;
+/* Ego region — centered full-width above grid */
+.region-ego {
+    grid-column: 1 / -1; max-width: 400px; margin: 0 auto 8px;
+    border-left-color: #c084fc !important;
+    background: linear-gradient(135deg, rgba(192, 132, 252, 0.06), rgba(30, 41, 59, 1));
 }
-.ops-chip {
-    display: flex; align-items: center; gap: 6px; padding: 5px 10px;
-    border-radius: 5px; background: rgba(30,41,59,0.4);
-    border: 1px solid rgba(51,65,85,0.3); font-size: 12px;
-}
-.chip-label { color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; }
-.chip-value { color: var(--color-text); font-weight: 600; }
 
 /* CC badge */
 .cc-badge {
@@ -148,22 +167,6 @@ body {
 .cat-health { font-size: 11px; color: var(--color-text-secondary); padding: 2px 0; }
 .cat-health .cat-name { text-transform: capitalize; }
 .cat-health .cat-count { float: right; font-weight: 600; }
-
-/* Detail overlay (slides in from right) */
-.detail-overlay {
-    position: fixed; top: 0; right: 0; bottom: 0; width: 420px; max-width: 90vw;
-    background: var(--color-background, #0f172a);
-    border-left: 1px solid var(--color-border, #1e293b);
-    z-index: 500; overflow-y: auto; padding: 20px;
-    transform: translateX(100%); transition: transform 0.25s ease;
-    box-shadow: -4px 0 20px rgba(0,0,0,0.3);
-}
-.detail-overlay.open { transform: translateX(0); }
-.detail-overlay-backdrop {
-    position: fixed; inset: 0; background: rgba(0,0,0,0.3);
-    z-index: 499; display: none;
-}
-.detail-overlay-backdrop.open { display: block; }
 
 .detail-back {
     cursor: pointer; color: #60a5fa; font-size: 12px; margin-bottom: 12px;
@@ -317,10 +320,12 @@ body {
 .genesis-nav a.active { color: var(--color-accent, #27875e); border-bottom: 2px solid var(--color-accent, #27875e); }
 
 /* Responsive */
-@media (max-width: 1000px) { .monitor-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 1000px) {
+    .nm-container { flex-direction: column; }
+    .side-panel { width: 100%; min-width: 0; border-left: none; border-top: 1px solid var(--color-border, #1e293b); }
+}
 @media (max-width: 600px) {
     .monitor-grid { grid-template-columns: 1fr; }
-    .ops-strip { flex-direction: column; }
 }
 </style>
 </head>
@@ -343,27 +348,57 @@ body {
     </div>
 </div>
 
-<div style="min-height: calc(100vh - 92px); padding: 0 24px 60px;">
-    <div id="loading" class="loading">Connecting...</div>
-    <div id="ops-strip" class="ops-strip" style="display:none;"></div>
-    <div id="ops-extra" style="display:none; max-width:1200px; margin:0 auto 16px; padding:0 16px;"></div>
-    <div id="monitor-grid" class="monitor-grid" style="display:none;">
-        <div id="sub-reflection" class="region"></div>
-        <div id="sub-memory" class="region"></div>
-        <div id="sub-learning" class="region"></div>
-        <div id="sub-executor" class="region"></div>
-        <div id="sub-surplus" class="region"></div>
-        <div id="sub-outreach" class="region"></div>
-        <div id="sub-utility" class="region"></div>
-        <div id="sub-contingency" class="region"></div>
+<div class="nm-container">
+    <div class="main-panel">
+        <div id="loading" class="loading">Connecting...</div>
+        <div id="monitor-grid" class="monitor-grid" style="display:none;">
+            <div id="sub-ego" class="region region-ego"></div>
+            <div id="sub-reflection" class="region"></div>
+            <div id="sub-memory" class="region"></div>
+            <div id="sub-learning" class="region"></div>
+            <div id="sub-executor" class="region"></div>
+            <div id="sub-surplus" class="region"></div>
+            <div id="sub-outreach" class="region"></div>
+            <div id="sub-utility" class="region"></div>
+            <div id="sub-contingency" class="region"></div>
+        </div>
     </div>
-</div>
-
-<!-- Detail overlay -->
-<div id="detail-backdrop" class="detail-overlay-backdrop"></div>
-<div id="detail-overlay" class="detail-overlay">
-    <span class="detail-back" id="detail-back-btn">&larr; Back</span>
-    <div id="detail-content"></div>
+    <div class="side-panel">
+        <div id="side-default">
+            <div class="section">
+                <h3>Awareness Loop</h3>
+                <div id="awareness-content"></div>
+            </div>
+            <div class="section">
+                <h3>Services</h3>
+                <div id="services-content"></div>
+            </div>
+            <div class="section">
+                <h3>Infrastructure</h3>
+                <div id="infra-content"></div>
+            </div>
+            <div class="section">
+                <h3>Resilience</h3>
+                <div id="resilience-content"></div>
+            </div>
+            <div class="section">
+                <h3>G. Sessions</h3>
+                <div id="cc-content"></div>
+            </div>
+            <div class="section">
+                <h3>Queues</h3>
+                <div id="queue-content"></div>
+            </div>
+            <div class="section">
+                <h3>Cost</h3>
+                <div id="cost-content"></div>
+            </div>
+        </div>
+        <div id="side-detail" class="detail-panel">
+            <span class="detail-back" id="detail-back-btn">&larr; Back</span>
+            <div id="detail-content"></div>
+        </div>
+    </div>
 </div>
 
 <script>
@@ -447,7 +482,6 @@ let lastData = null;
 let lastFetchTime = 0;
 
 document.getElementById('detail-back-btn').addEventListener('click', showDefaultPanel);
-document.getElementById('detail-backdrop').addEventListener('click', showDefaultPanel);
 
 function getMeta(siteId) {
     return SITE_META[siteId] || { name: siteId, desc: '', category: 'unknown', frequency: '', costPolicy: '' };
@@ -504,98 +538,233 @@ function sectionRow(label, value, valueStyle) {
     return row;
 }
 
-// ── Ops Summary Strip ─────────────────────────────────────────────────
+// ── Side Panel ────────────────────────────────────────────────────────
 
-function buildOpsStrip(data) {
-    const strip = document.getElementById('ops-strip');
-    strip.replaceChildren();
-    strip.style.display = 'flex';
-
-    function chip(label, value, color) {
-        const c = el('div', 'ops-chip');
-        c.appendChild(el('span', 'chip-label', label));
-        const v = el('span', 'chip-value', value);
-        if (color) v.style.color = color;
-        c.appendChild(v);
-        return c;
-    }
-
-    // Awareness
-    const aw = data.awareness || {};
-    const awStatus = aw.status || 'unknown';
-    const awColor = awStatus === 'healthy' ? '#4ade80' : awStatus === 'stale' ? '#ffe600' : '#6b7280';
-    let awText = awStatus;
-    if (aw.ticks_24h !== undefined) awText += ' \u00B7 ' + aw.ticks_24h + ' ticks';
-    if (aw.time_since_last_tick_seconds != null) {
-        const secs = Math.round(aw.time_since_last_tick_seconds);
-        awText += ' \u00B7 ' + (secs < 120 ? secs + 's' : Math.round(secs / 60) + 'm') + ' ago';
-    }
-    strip.appendChild(chip('Awareness', awText, awColor));
-
-    // Infrastructure
-    const infra = data.infrastructure || {};
-    const infraKeys = Object.keys(infra).filter(k => k !== 'cc_tmp');
-    const infraOk = infraKeys.filter(k => infraStatusClass(infra[k]) === 'status-healthy').length;
-    const infraColor = infraOk === infraKeys.length ? '#4ade80' : infraOk > 0 ? '#ffe600' : '#ef4444';
-    strip.appendChild(chip('Infra', infraOk + '/' + infraKeys.length, infraColor));
-
-    // Resilience
-    const resObj = data.resilience || {};
-    const resLevel = (typeof resObj === 'object' ? resObj.level : resObj) || 'unknown';
-    const resColor = (resLevel === 'L0' || resLevel === 'normal' || resLevel === 'not configured') ? '#4ade80' : '#ffe600';
-    strip.appendChild(chip('Resilience', resLevel, resColor));
-
-    // Sessions
-    const cc = data.cc_sessions || {};
-    const fgActive = cc.foreground?.active || 0;
-    const bgActive = cc.background?.active || 0;
-    strip.appendChild(chip('Sessions', 'FG:' + fgActive + ' BG:' + bgActive));
-
-    // Queues
-    const q = data.queues || {};
-    const pending = q.pending_embeddings || 0;
-    const failed = q.failed_embeddings || 0;
-    const qColor = failed > 0 ? '#ef4444' : pending > 0 ? '#ffe600' : '#4ade80';
-    const qText = failed > 0 ? failed + ' failed' : pending > 0 ? pending + ' pending' : 'clear';
-    strip.appendChild(chip('Queues', qText, qColor));
-
-    // Cost
-    const cost = data.cost || {};
-    const todayStr = cost.daily_usd !== undefined ? '$' + cost.daily_usd.toFixed(3) : '--';
-    const monthStr = cost.monthly_usd !== undefined ? '$' + cost.monthly_usd.toFixed(2) : '--';
-    strip.appendChild(chip('Cost', todayStr + ' / ' + monthStr));
-
+function updateSidePanel(data) {
     // Services
     const services = data.services || {};
-    const bridge = services.bridge || {};
-    const bridgeState = bridge.active_state || 'unknown';
-    const svcColor = bridgeState === 'active' ? '#4ade80' : '#ef4444';
-    let svcText = bridgeState;
-    if (bridge.uptime_seconds != null) svcText += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
-    strip.appendChild(chip('Server', svcText, svcColor));
+    const svcEl = document.getElementById('services-content');
+    if (svcEl) {
+        svcEl.replaceChildren();
+        const bridge = services.bridge || {};
+        const bridgeState = bridge.active_state || 'unknown';
+        const bridgeColor = bridgeState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
+        let bridgeDetail = bridgeState;
+        if (bridge.uptime_seconds != null) {
+            bridgeDetail += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
+        }
+        svcEl.appendChild(sectionRow('Server', bridgeDetail, bridgeColor + ';font-weight:600'));
 
-    // Deferred + discarded items below ops strip
-    const extra = document.getElementById('ops-extra');
-    extra.replaceChildren();
-    const queues = data.queues || {};
+        const timer = services.watchdog_timer || {};
+        const timerState = timer.active_state || 'unknown';
+        const timerColor = timerState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
+        svcEl.appendChild(sectionRow('Watchdog', timerState, timerColor));
 
-    // Deferred items
-    if (queues.deferred_items && queues.deferred_items.length > 0) {
-        extra.style.display = 'block';
-        for (const item of queues.deferred_items) {
-            const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
-            const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
-            extra.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
+        const wd = services.watchdog || {};
+        if (wd.consecutive_failures > 0) {
+            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#ffe600;font-weight:600'));
+        }
+        if (wd.in_backoff) {
+            svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#ffe600'));
+        }
+
+        const ccTmp = (data.infrastructure || {}).cc_tmp;
+        if (ccTmp && ccTmp.cc_used_mb != null) {
+            const ccTier = ccTmp.cc_tier || 'unknown';
+            const ccColor = ccTier === 'green' ? 'color:#4ade80' : ccTier === 'orange' ? 'color:#ffe600' : ccTier === 'red' ? 'color:#ef4444' : 'color:#888';
+            svcEl.appendChild(sectionRow('CC Tmp', ccTmp.cc_used_mb + 'MB / ' + ccTmp.cc_budget_mb + 'MB', ccColor));
         }
     }
 
-    // Discarded items
-    if (queues.discarded_count > 0 || (queues.discarded_items && queues.discarded_items.length > 0)) {
-        extra.style.display = 'block';
-        renderDiscardedItems(extra, queues);
+    // Infrastructure
+    const infra = data.infrastructure || {};
+    const infraEl = document.getElementById('infra-content');
+    if (infraEl) {
+        infraEl.replaceChildren();
+        for (const [name, info] of Object.entries(infra)) {
+            if (name === 'cc_tmp') continue;
+            const row = el('div', 'section-row');
+            const labelSpan = el('span', 'label');
+            const dot = el('span', 'status-dot ' + infraStatusClass(info));
+            labelSpan.appendChild(dot);
+            labelSpan.appendChild(document.createTextNode(name));
+            row.appendChild(labelSpan);
+            let detail = '';
+            if (info.latency_ms !== undefined) {
+                detail = (info.status || 'ok') + ' (' + Math.round(info.latency_ms) + 'ms)';
+            } else if (info.free_pct !== undefined) {
+                const freeVal = info.free_gb != null
+                    ? info.free_gb.toFixed(1) + ' GB'
+                    : info.free_mb != null
+                    ? Math.round(info.free_mb) + ' MB'
+                    : '?';
+                detail = freeVal + ' free (' + Math.round(info.free_pct) + '%)';
+            } else {
+                detail = info.status || 'ok';
+            }
+            row.appendChild(el('span', 'value', detail));
+            infraEl.appendChild(row);
+        }
+        if (!Object.keys(infra).length) infraEl.appendChild(el('div', null, 'No data'));
+        // CC dispatch policy — cached, refreshed every 5 min
+        const _renderCcPolicy = (policy) => {
+            const row = el('div', 'section-row');
+            const label = el('span', 'label');
+            if (!policy) {
+                label.appendChild(el('span', 'status-dot status-unknown'));
+                label.appendChild(document.createTextNode('CC Background'));
+                row.appendChild(label);
+                row.appendChild(el('span', 'value', 'unknown'));
+            } else {
+                const dot = el('span', 'status-dot ' + (policy.cli ? 'status-healthy' : 'status-down'));
+                label.appendChild(dot);
+                label.appendChild(document.createTextNode('CC Background'));
+                row.appendChild(label);
+                const detail = policy.cli
+                    ? (policy.approval ? 'Approval required' : 'Auto-dispatch')
+                    : 'Disabled';
+                row.appendChild(el('span', 'value', detail));
+            }
+            infraEl.appendChild(row);
+        };
+        if (window._ccPolicyCache && (Date.now() - window._ccPolicyCacheTs) < 300000) {
+            _renderCcPolicy(window._ccPolicyCache);
+        } else {
+            fetch('/api/genesis/settings/autonomous_cli_policy').then(r => r.ok ? r.json() : null).then(d => {
+                if (d && d.config) {
+                    window._ccPolicyCache = { cli: d.config.autonomous_cli_fallback_enabled, approval: d.config.manual_approval_required };
+                    window._ccPolicyCacheTs = Date.now();
+                }
+                _renderCcPolicy(window._ccPolicyCache || null);
+            }).catch(() => _renderCcPolicy(null));
+        }
     }
 
-    if (!extra.hasChildNodes()) extra.style.display = 'none';
+    // Awareness Loop
+    const awareness = data.awareness || {};
+    const awarenessEl = document.getElementById('awareness-content');
+    if (awarenessEl) {
+        awarenessEl.replaceChildren();
+        const aStatus = awareness.status || 'unknown';
+        const aColor = aStatus === 'healthy' ? 'color:#4ade80' : aStatus === 'stale' ? 'color:#ffe600' : 'color:#6b7280';
+        awarenessEl.appendChild(sectionRow('Status', aStatus, aColor + ';font-weight:600'));
+        if (awareness.ticks_24h !== undefined) awarenessEl.appendChild(sectionRow('Ticks/24h', String(awareness.ticks_24h)));
+        if (awareness.time_since_last_tick_seconds !== undefined) {
+            const secs = Math.round(awareness.time_since_last_tick_seconds);
+            awarenessEl.appendChild(sectionRow('Last tick', secs < 120 ? secs + 's ago' : Math.round(secs / 60) + 'm ago'));
+        }
+        if (awareness.critical_bypasses_24h) {
+            awarenessEl.appendChild(sectionRow('Critical bypasses', String(awareness.critical_bypasses_24h), 'color:#ffe600'));
+        }
+    }
+
+    // Resilience
+    const resEl = document.getElementById('resilience-content');
+    if (resEl) {
+        resEl.replaceChildren();
+        const resObj = data.resilience || {};
+        const resState = resObj.level || resObj || 'not configured';
+        const resSummary = resObj.summary || '';
+        const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#ffe600';
+        const resLabel = resSummary ? resState + ' \u2014 ' + resSummary : String(resState);
+        resEl.appendChild(sectionRow('State', resLabel, rColor + ';font-weight:600'));
+
+        const sites = data.call_sites || {};
+        const siteIds = Object.keys(sites);
+        const activeSiteIds = siteIds.filter(id => sites[id].status !== 'idle' && sites[id].status !== 'disabled');
+        const totalSites = activeSiteIds.length;
+        const healthySites = activeSiteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active' || sites[id].status === 'warning').length;
+        if (totalSites > 0) {
+            const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#ffe600' : 'color:#ef4444';
+            resEl.appendChild(sectionRow('Call sites', healthySites + '/' + totalSites + ' healthy', summaryColor));
+        }
+
+        const catHealth = {};
+        for (const [siteId, info] of Object.entries(sites)) {
+            if (info.status === 'idle' || info.status === 'disabled') continue;
+            const meta = getMeta(siteId);
+            const cat = meta.category;
+            if (!catHealth[cat]) catHealth[cat] = { total: 0, healthy: 0 };
+            catHealth[cat].total++;
+            if (info.status === 'healthy' || info.status === 'active' || info.status === 'warning') catHealth[cat].healthy++;
+        }
+        const cats = Object.keys(catHealth).sort();
+        if (cats.length > 0) {
+            const catHeader = el('div', 'section-row');
+            catHeader.style.cssText = 'margin-top:8px;padding-bottom:4px;border-bottom:1px solid #1e293b';
+            catHeader.appendChild(el('span', 'label', 'By Category'));
+            catHeader.appendChild(el('span', 'value', ''));
+            resEl.appendChild(catHeader);
+
+            for (const cat of cats) {
+                const c = catHealth[cat];
+                const row = el('div', 'cat-health');
+                const nameSpan = el('span', 'cat-name', cat);
+                const countSpan = el('span', 'cat-count', c.healthy + '/' + c.total);
+                countSpan.style.color = c.healthy === c.total ? '#4ade80' : '#ffe600';
+                row.appendChild(nameSpan);
+                row.appendChild(countSpan);
+                resEl.appendChild(row);
+            }
+        }
+    }
+
+    // CC Sessions
+    const cc = data.cc_sessions || {};
+    const ccEl = document.getElementById('cc-content');
+    if (ccEl) {
+        ccEl.replaceChildren();
+        if (cc.foreground) ccEl.appendChild(sectionRow('Foreground', (cc.foreground.active || 0) + ' active'));
+        if (cc.background) {
+            ccEl.appendChild(sectionRow('Background', (cc.background.active || 0) + ' active'));
+            if (cc.background.hourly_budget) ccEl.appendChild(sectionRow('Budget', cc.background.hourly_budget + '/hr'));
+        }
+        if (cc.failed_24h) ccEl.appendChild(sectionRow('Failed/24h', String(cc.failed_24h), 'color:#ef4444'));
+    }
+
+    // Queues
+    const queues = data.queues || {};
+    const qEl = document.getElementById('queue-content');
+    if (qEl) {
+        qEl.replaceChildren();
+        for (const [name, val] of Object.entries(queues)) {
+            if (typeof val !== 'number' && val !== null) continue;
+            if (name.endsWith('_age_seconds')) {
+                if (val == null) continue;
+                const label = name.replace(/_age_seconds$/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+                qEl.appendChild(sectionRow(label + ' Age', formatAge(val), 'color:#94a3b8'));
+                continue;
+            }
+            if (typeof val !== 'number') continue;
+            const label = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+            const color = val > 0 ? 'color:#ffe600' : 'color:#4ade80';
+            qEl.appendChild(sectionRow(label, String(val), color));
+        }
+        if (queues.deferred_items && queues.deferred_items.length > 0) {
+            for (const item of queues.deferred_items) {
+                const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
+                const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
+                qEl.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
+            }
+        }
+        renderDiscardedItems(qEl, queues);
+    }
+
+    // Cost
+    const cost = data.cost || {};
+    const costEl = document.getElementById('cost-content');
+    if (costEl) {
+        costEl.replaceChildren();
+        if (cost.monthly_usd !== undefined) costEl.appendChild(sectionRow('Month', '$' + cost.monthly_usd.toFixed(2)));
+        if (cost.daily_usd !== undefined) costEl.appendChild(sectionRow('Today', '$' + cost.daily_usd.toFixed(3)));
+        if (cost.budget_status) {
+            const cls = cost.budget_status === 'UNDER_LIMIT' ? 'badge-normal' : cost.budget_status === 'WARNING' ? 'badge-warning' : 'badge-critical';
+            const row = el('div', 'section-row');
+            row.appendChild(el('span', 'label', 'Status'));
+            row.appendChild(el('span', 'badge ' + cls, cost.budget_status));
+            costEl.appendChild(row);
+        }
+    }
 }
 
 // ── Detail panel ─────────────────────────────────────────────────────
@@ -798,9 +967,9 @@ function showDetail(item) {
         content.appendChild(sectionRow('Last Run', 'No runs recorded'));
     }
 
-    // Open overlay
-    document.getElementById('detail-overlay').classList.add('open');
-    document.getElementById('detail-backdrop').classList.add('open');
+    // Switch side panel to detail view
+    document.getElementById('side-default').style.display = 'none';
+    document.getElementById('side-detail').classList.add('active');
 }
 
 // ── Chain editor logic ───────────────────────────────────────────────
@@ -1228,8 +1397,8 @@ async function _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn) {
 }
 
 function showDefaultPanel() {
-    document.getElementById('detail-overlay').classList.remove('open');
-    document.getElementById('detail-backdrop').classList.remove('open');
+    document.getElementById('side-detail').classList.remove('active');
+    document.getElementById('side-default').style.display = 'block';
 }
 
 // ── Discarded items — iLO-style expand/clear ────────────────────────
@@ -1440,6 +1609,10 @@ async function loadFollowUpsBadge(container) {
 // ── Subsystem group definitions ─────────────────────────────────────
 
 const SUBSYSTEM_GROUPS = {
+    ego: {
+        name: 'Ego', domId: 'sub-ego',
+        sites: ['7_ego_cycle', '7_ego_cycle_api', '8_ego_compaction'],
+    },
     reflection: {
         name: 'Reflection', domId: 'sub-reflection',
         sites: ['3_micro_reflection', '4_light_reflection', '5_deep_reflection',
@@ -1447,7 +1620,7 @@ const SUBSYSTEM_GROUPS = {
     },
     memory: {
         name: 'Memory', domId: 'sub-memory',
-        sites: ['8_ego_compaction', '9_fact_extraction', '21_embeddings', '21b_query_embedding',
+        sites: ['9_fact_extraction', '21_embeddings', '21b_query_embedding',
                 '41_resume_review_pass1', '42_resume_review_pass2'],
     },
     surplus: {
@@ -1460,10 +1633,8 @@ const SUBSYSTEM_GROUPS = {
     },
     executor: {
         name: 'Executor', domId: 'sub-executor',
-        // contingency_foreground and contingency_micro belong to Contingency group
         sites: ['27_pre_execution_assessment', '17_fresh_eyes_review',
-                '20_adversarial_counterargument', 'autonomous_executor_reasoning',
-                '7_ego_cycle', '7_ego_cycle_api'],
+                '20_adversarial_counterargument', 'autonomous_executor_reasoning'],
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
@@ -1502,8 +1673,9 @@ function statusDotColor(status) {
 }
 
 const SUBSYSTEM_BORDER_COLORS = {
-    reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80', outreach: '#fbbf24',
-    executor: '#a78bfa', learning: '#fb923c', contingency: '#f87171', utility: '#94a3b8',
+    ego: '#c084fc', reflection: '#818cf8', memory: '#38bdf8', surplus: '#4ade80',
+    outreach: '#fbbf24', executor: '#a78bfa', learning: '#fb923c',
+    contingency: '#f87171', utility: '#94a3b8',
 };
 
 function renderSubsystemBox(group, data, groupKey) {
@@ -1591,6 +1763,10 @@ function updateSubsystemGrid(data) {
         let hasEnrichment = false;
 
         // Subsystem-specific enrichment from snapshot data
+        if (key === 'ego') {
+            enrichment.appendChild(sectionRow('Status', 'Groundwork', 'color:#c084fc;font-style:italic'));
+            hasEnrichment = true;
+        }
         if (key === 'reflection') {
             const aw = data.awareness || {};
             if (aw.ticks_24h !== undefined) { enrichment.appendChild(sectionRow('Ticks/24h', String(aw.ticks_24h))); hasEnrichment = true; }
@@ -1737,13 +1913,45 @@ function updateSubsystemGrid(data) {
                 hasEnrichment = true;
             }
         }
-        if (key === 'learning') {
-            const calSite = callSites['30_triage_calibration'] || {};
-            if (calSite.last_run_at) {
-                const age = Math.round((Date.now() - new Date(calSite.last_run_at).getTime()) / 1000);
-                enrichment.appendChild(sectionRow('Last Calibration', formatAge(age) + ' ago'));
+
+        // Per-call-site enrichment: last run times, active providers, cost
+        // (applies to all subsystems including previously blank ones)
+        const siteRuns = [];
+        for (const siteId of group.sites) {
+            const sd = callSites[siteId] || {};
+            if (sd.last_run_at) {
+                const age = Math.round((Date.now() - new Date(sd.last_run_at).getTime()) / 1000);
+                siteRuns.push({ id: siteId, age, provider: sd.active_provider || sd.last_run_provider });
+            }
+        }
+        if (siteRuns.length > 0) {
+            // Most recent run for this subsystem
+            siteRuns.sort((a, b) => a.age - b.age);
+            const latest = siteRuns[0];
+            const meta = getMeta(latest.id);
+            enrichment.appendChild(sectionRow('Last Run', meta.name + ' ' + formatAge(latest.age) + ' ago'));
+            hasEnrichment = true;
+            // Active providers (unique)
+            const providers = [...new Set(siteRuns.map(r => r.provider).filter(Boolean))];
+            if (providers.length > 0) {
+                enrichment.appendChild(sectionRow('Providers', providers.slice(0, 3).join(', ')));
                 hasEnrichment = true;
             }
+        }
+
+        // Cost aggregation from cost_by_call_site
+        const costBySite = (data.cost || {}).cost_by_call_site || [];
+        const siteSet = new Set(group.sites);
+        let groupCalls = 0, groupCost = 0;
+        for (const entry of costBySite) {
+            if (siteSet.has(entry.call_site)) {
+                groupCalls += entry.calls || 0;
+                groupCost += entry.month_usd || 0;
+            }
+        }
+        if (groupCalls > 0) {
+            enrichment.appendChild(sectionRow('Calls', String(groupCalls) + ' \u00B7 $' + groupCost.toFixed(3)));
+            hasEnrichment = true;
         }
 
         if (hasEnrichment) box.appendChild(enrichment);
@@ -1803,7 +2011,7 @@ async function fetchHealth() {
         lastFetchTime = Date.now();
 
         document.getElementById('loading').style.display = 'none';
-        buildOpsStrip(lastData);
+        updateSidePanel(lastData);
         updateSubsystemGrid(lastData);
         updateHeaderBadges(lastData);
     } catch (e) {
