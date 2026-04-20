@@ -71,14 +71,17 @@ def _execute_db(sql: str, params: tuple = ()) -> bool:
     """Run a write query against genesis.db. Returns True on success."""
     if not _DB_PATH.is_file():
         return False
+    conn = None
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=5)
         conn.execute(sql, params)
         conn.commit()
-        conn.close()
         return True
     except (sqlite3.Error, OSError):
         return False
+    finally:
+        if conn:
+            conn.close()
 
 
 @blueprint.route("/api/genesis/updates/status")
