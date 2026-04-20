@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -35,6 +36,36 @@ _BLOCKED_NAMES = frozenset({
 })
 
 _MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB read/write limit
+_MAX_UPLOAD_SIZE = 50 * 1024 * 1024  # 50 MB upload limit
+_UPLOAD_DIR = _HOME / ".genesis" / "uploads"
+
+# Sanitize filenames: allow alphanumeric, dots, hyphens, underscores, spaces.
+_SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9._\- ]")
+_MAX_FILENAME_LEN = 255
+
+
+def _sanitize_filename(name: str) -> str:
+    """Sanitize an uploaded filename to prevent path traversal."""
+    name = Path(name).name
+    name = _SAFE_FILENAME_RE.sub("_", name)
+    name = name.strip(". ")
+    if len(name) > _MAX_FILENAME_LEN:
+        stem = Path(name).stem[: _MAX_FILENAME_LEN - len(Path(name).suffix) - 1]
+        name = stem + Path(name).suffix
+    return name or "unnamed"
+
+
+def _deduplicate_filename(directory: Path, name: str) -> str:
+    """If *name* already exists in *directory*, append -1, -2, etc."""
+    dest = directory / name
+    if not dest.exists():
+        return name
+    stem = Path(name).stem
+    suffix = Path(name).suffix
+    counter = 1
+    while (directory / f"{stem}-{counter}{suffix}").exists():
+        counter += 1
+    return f"{stem}-{counter}{suffix}"
 
 
 def _is_allowed(path: Path) -> bool:
@@ -276,3 +307,46 @@ def file_delete():
         return jsonify({"error": str(exc)}), 500
 
     return jsonify({"status": "ok", "path": str(raw_path)})
+
+
+@blueprint.route("/api/genesis/files/upload", methods=["POST"])
+def file_upload():
+    """Upload a file to ~/.genesis/uploads/ via multipart form.
+
+    No processing or knowledge base involvement — just filesystem storage.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename:
+        return jsonify({"error": "Empty filename"}), 400
+
+    safe_name = _sanitize_filename(file.filename)
+
+    # Ensure uploads directory exists
+    _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Deduplicate filename
+    safe_name = _deduplicate_filename(_UPLOAD_DIR, safe_name)
+    dest = _UPLOAD_DIR / safe_name
+
+    # Security check
+    if not _is_allowed(dest):
+        return jsonify({"error": "Path not allowed"}), 403
+
+    # Save and check size
+    file.save(str(dest))
+    file_size = dest.stat().st_size
+
+    if file_size > _MAX_UPLOAD_SIZE:
+        dest.unlink()
+        return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
+
+    logger.info("File uploaded: %s (%d bytes)", safe_name, file_size)
+
+    return jsonify({
+        "path": str(dest),
+        "filename": safe_name,
+        "size": file_size,
+    })

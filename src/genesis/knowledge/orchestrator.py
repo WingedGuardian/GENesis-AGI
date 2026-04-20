@@ -52,6 +52,7 @@ class KnowledgeOrchestrator:
         project_type: str,
         domain: str = "auto",
         purpose: list[str] | None = None,
+        user_context: str | None = None,
     ) -> IngestResult:
         """Ingest a single source (file path or URL) into the knowledge base."""
         # 1. Check for duplicate
@@ -107,7 +108,8 @@ class KnowledgeOrchestrator:
 
         # 6. Distill
         units = await self._distillation.distill(
-            content, project_type=project_type, domain=domain
+            content, project_type=project_type, domain=domain,
+            user_context=user_context,
         )
 
         if not units:

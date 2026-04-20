@@ -111,6 +111,8 @@ async def knowledge_ingest_upload():
     project_type = data.get("project_type")
     domain = data.get("domain", "auto")
     purpose = data.get("purpose")
+    context = data.get("context", "")  # User-provided document context
+    mode = data.get("mode", "extract")  # "extract" or "store"
 
     if not upload_id or not project_type:
         return jsonify({"error": "upload_id and project_type required"}), 400
@@ -138,13 +140,27 @@ async def knowledge_ingest_upload():
     event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
     if event_loop and event_loop.is_running():
         asyncio.run_coroutine_threadsafe(
-            run_ingest(upload_id, project_type=project_type, domain=domain, purpose=purpose_list),
+            run_ingest(
+                upload_id,
+                project_type=project_type,
+                domain=domain,
+                purpose=purpose_list,
+                context=context,
+                mode=mode,
+            ),
             event_loop,
         )
     else:
         # Fallback: run in current request's event loop (blocks until done)
         logger.warning("Main event loop unavailable — running ingest synchronously")
-        await run_ingest(upload_id, project_type=project_type, domain=domain, purpose=purpose_list)
+        await run_ingest(
+            upload_id,
+            project_type=project_type,
+            domain=domain,
+            purpose=purpose_list,
+            context=context,
+            mode=mode,
+        )
 
     return jsonify({
         "upload_id": upload_id,
