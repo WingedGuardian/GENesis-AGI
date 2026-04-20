@@ -126,35 +126,29 @@ body {
 .region-enrichment .section-row .value { font-size: 11px; }
 
 /* Battleship-style flat dot grid */
-/* Battleship-style status board: Y=subsystem rows, X=call site cells */
+/* Tile map: square-ish subsystem regions, call sites front and center */
 .battleship-grid {
-    display: flex; flex-direction: column; gap: 4px; padding: 14px;
+    display: flex; flex-wrap: wrap; gap: 12px; padding: 14px;
     background: rgba(15, 23, 42, 0.5);
     border-radius: 8px; border: 1px solid var(--color-border, #334155);
 }
-.bg-row {
-    display: flex; align-items: flex-start;
-    border-radius: 6px; padding: 6px 8px;
+.bg-tile {
+    padding: 10px 12px; border-radius: 6px;
     border: 1px solid rgba(51, 65, 85, 0.2);
 }
-.bg-row-label {
-    width: 88px; min-width: 88px;
-    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
-    color: #64748b; font-weight: 600;
-    display: flex; align-items: center; gap: 5px;
-    padding-top: 10px;
+.bg-cells {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    max-width: calc(3 * 72px + 2 * 8px); /* wrap at 3 cells → square-ish tiles */
 }
-.bg-row-label .agg-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.bg-cells { display: flex; flex-wrap: wrap; gap: 8px; }
 .bg-cell {
-    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
     width: 72px;
 }
 .bg-cell-label {
-    font-size: 9px; color: #64748b; text-align: center;
+    font-size: 10px; color: #94a3b8; text-align: center;
     line-height: 1.2; width: 100%; word-break: break-word;
 }
-/* Per-subsystem row tints */
+/* Per-subsystem tints */
 .bg-ego        { background: rgba(192,132,252,0.08); }
 .bg-reflection { background: rgba(129,140,248,0.08); }
 .bg-memory     { background: rgba(56,189,248,0.08); }
@@ -1770,20 +1764,10 @@ const SUBSYSTEM_BORDER_COLORS = {
 function renderBattleshipGroup(group, data, groupKey) {
     const callSites = data.call_sites || {};
 
-    const memberStatuses = group.sites.map(id => (callSites[id] || {}).status || 'unknown');
-    const aggStatus = aggregateStatus(memberStatuses);
+    // Tile: colored region for this subsystem — no label, just tint
+    const tile = el('div', 'bg-tile bg-' + groupKey);
+    tile.title = group.name; // accessible on hover, not displayed
 
-    const row = el('div', 'bg-row bg-' + groupKey);
-
-    // Left: Y-axis label with aggregate status dot
-    const rowLabel = el('div', 'bg-row-label');
-    const aggDot = el('span', 'agg-dot');
-    aggDot.style.background = statusDotColor(aggStatus);
-    rowLabel.appendChild(aggDot);
-    rowLabel.appendChild(document.createTextNode(group.name));
-    row.appendChild(rowLabel);
-
-    // Right: cells — one per call site (dot + visible name label)
     const cells = el('div', 'bg-cells');
     for (const siteId of group.sites) {
         const siteData = callSites[siteId] || {};
@@ -1832,8 +1816,8 @@ function renderBattleshipGroup(group, data, groupKey) {
         cell.appendChild(el('div', 'bg-cell-label', meta.name));
         cells.appendChild(cell);
     }
-    row.appendChild(cells);
-    return row;
+    tile.appendChild(cells);
+    return tile;
 }
 
 function updateSubsystemGrid(data) {
