@@ -56,8 +56,8 @@ body {
 
 /* Grid topology */
 .monitor-grid {
-    display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px;
-    max-width: 1200px; margin: 0 auto; padding: 0 16px;
+    display: flex; flex-direction: column; gap: 20px;
+    max-width: 1200px; margin: 0 auto; padding: 16px;
 }
 
 /* Subsystem region */
@@ -125,11 +125,43 @@ body {
 .region-enrichment .section-row .label,
 .region-enrichment .section-row .value { font-size: 11px; }
 
-/* Ego region — centered full-width above grid */
-.region-ego {
-    grid-column: 1 / -1; max-width: 400px; margin: 0 auto 8px;
-    border-left-color: #c084fc !important;
-    background: linear-gradient(135deg, rgba(192, 132, 252, 0.06), rgba(30, 41, 59, 1));
+/* Battleship-style flat dot grid */
+.battleship-grid {
+    display: flex; flex-wrap: wrap; gap: 10px; padding: 14px;
+    background: rgba(15, 23, 42, 0.5);
+    border-radius: 8px; border: 1px solid var(--color-border, #334155);
+}
+.bg-group {
+    padding: 8px 10px; border-radius: 6px; min-width: 60px;
+    border: 1px solid rgba(51, 65, 85, 0.25);
+}
+.bg-label {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
+    color: #64748b; margin-bottom: 7px; font-weight: 600;
+    display: flex; align-items: center; gap: 5px;
+}
+.bg-label .agg-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.bg-dots { display: flex; flex-wrap: wrap; gap: 10px; }
+/* Per-subsystem tints */
+.bg-ego        { background: rgba(192,132,252,0.08); }
+.bg-reflection { background: rgba(129,140,248,0.08); }
+.bg-memory     { background: rgba(56,189,248,0.08); }
+.bg-surplus    { background: rgba(74,222,128,0.08); }
+.bg-outreach   { background: rgba(251,191,36,0.08); }
+.bg-executor   { background: rgba(167,139,250,0.08); }
+.bg-learning   { background: rgba(251,146,60,0.08); }
+.bg-contingency{ background: rgba(248,113,113,0.08); }
+.bg-utility    { background: rgba(148,163,184,0.08); }
+/* Ego dots slightly larger */
+.bg-ego .grid-dot { width: 20px; height: 20px; }
+
+/* Enrichment cards grid below battleship */
+.enrichment-cards {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px;
+}
+.enrich-card {
+    background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
+    border-radius: 8px; padding: 12px 14px; border-left: 3px solid #475569;
 }
 
 /* CC badge */
@@ -353,15 +385,8 @@ body {
     <div class="main-panel">
         <div id="loading" class="loading">Connecting...</div>
         <div id="monitor-grid" class="monitor-grid" style="display:none;">
-            <div id="sub-ego" class="region region-ego"></div>
-            <div id="sub-reflection" class="region"></div>
-            <div id="sub-memory" class="region"></div>
-            <div id="sub-learning" class="region"></div>
-            <div id="sub-executor" class="region"></div>
-            <div id="sub-surplus" class="region"></div>
-            <div id="sub-outreach" class="region"></div>
-            <div id="sub-utility" class="region"></div>
-            <div id="sub-contingency" class="region"></div>
+            <div id="battleship-grid" class="battleship-grid"></div>
+            <div id="enrichment-cards" class="enrichment-cards"></div>
         </div>
     </div>
     <div class="side-panel">
@@ -1732,35 +1757,24 @@ const SUBSYSTEM_BORDER_COLORS = {
     contingency: '#f87171', utility: '#94a3b8',
 };
 
-function renderSubsystemBox(group, data, groupKey) {
-    const box = document.getElementById(group.domId);
-    if (!box) return;
-    box.replaceChildren();
-    const bColor = SUBSYSTEM_BORDER_COLORS[groupKey] || '#475569';
-    box.style.borderLeftColor = bColor;
+function renderBattleshipGroup(group, data, groupKey) {
     const callSites = data.call_sites || {};
 
-    // Collect member statuses
     const memberStatuses = group.sites.map(id => (callSites[id] || {}).status || 'unknown');
     const aggStatus = aggregateStatus(memberStatuses);
 
-    // Header with aggregate status dot + count
-    const header = el('div', 'region-header');
+    const grp = el('div', 'bg-group bg-' + groupKey);
+
+    // Label: aggregate dot + subsystem name
+    const label = el('div', 'bg-label');
     const aggDot = el('span', 'agg-dot');
     aggDot.style.background = statusDotColor(aggStatus);
-    header.appendChild(aggDot);
-    header.appendChild(el('h3', null, group.name));
-    const activeCount = memberStatuses.filter(s => s === 'healthy' || s === 'active').length;
-    header.appendChild(el('span', 'region-count', activeCount + '/' + group.sites.length));
-    box.appendChild(header);
+    label.appendChild(aggDot);
+    label.appendChild(document.createTextNode(group.name));
+    grp.appendChild(label);
 
-    // Subsystem description
-    if (group.desc) {
-        box.appendChild(el('div', 'region-desc', group.desc));
-    }
-
-    // Dot grid
-    const grid = el('div', 'dot-grid');
+    // Dots
+    const dots = el('div', 'bg-dots');
     for (const siteId of group.sites) {
         const siteData = callSites[siteId] || {};
         const meta = getMeta(siteId);
@@ -1769,23 +1783,20 @@ function renderSubsystemBox(group, data, groupKey) {
         const dot = el('div', 'grid-dot ' + gridDotClass(status));
         dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
 
-        // Tooltip data (rendered by shared #shared-tip on hover)
+        // Tooltip data (shared #shared-tip on hover)
         const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
         if (status === 'idle') tipRows.push({ text: 'Groundwork' });
         else if (status === 'disabled') tipRows.push({ text: 'No API key' });
         else tipRows.push({ text: status });
         if (siteData.active_provider) tipRows.push({ text: siteData.active_provider });
-        // Warning/failure reason
         if (siteData.recent_failures) {
             const failAge = siteData.last_failure_at
                 ? formatAge(Math.round((Date.now() - new Date(siteData.last_failure_at).getTime()) / 1000)) + ' ago'
                 : 'recently';
             tipRows.push({ text: siteData.recent_failures + ' failure(s) in 30min, latest ' + failAge, style: 'color:#f59e0b' });
         }
-        // Call site description
         const descText = siteData.description || meta.desc;
         if (descText) tipRows.push({ text: descText, style: 'color:#94a3b8;margin-top:3px' });
-        // Chain summary
         if (siteData.chain_health) {
             const apiChain = siteData.chain_health.filter(c => !c.is_cc);
             const ccChain = siteData.chain_health.filter(c => c.is_cc);
@@ -1805,32 +1816,58 @@ function renderSubsystemBox(group, data, groupKey) {
         dot.addEventListener('mouseenter', () => showTip(dot));
         dot.addEventListener('mouseleave', hideTip);
 
-        grid.appendChild(dot);
+        dots.appendChild(dot);
     }
-    box.appendChild(grid);
-
-    return box;
+    grp.appendChild(dots);
+    return grp;
 }
 
 function updateSubsystemGrid(data) {
-    const grid = document.getElementById('monitor-grid');
-    if (!grid) return;
-    grid.style.display = 'grid';
+    const container = document.getElementById('monitor-grid');
+    if (!container) return;
+    container.style.display = 'flex';
+
+    const bgGrid = document.getElementById('battleship-grid');
+    const enrichGrid = document.getElementById('enrichment-cards');
+    if (!bgGrid || !enrichGrid) return;
+
+    // Preserve surplus detail state before clearing
+    const oldSurplus = document.getElementById('enrich-surplus');
+    const surplusWasOpen = oldSurplus && oldSurplus.querySelector('.surplus-detail-content.open');
+
+    bgGrid.replaceChildren();
+    enrichGrid.replaceChildren();
+
     const callSites = data.call_sites || {};
 
     for (const [key, group] of Object.entries(SUBSYSTEM_GROUPS)) {
-        // Preserve expanded surplus detail state before re-render
-        const box0 = document.getElementById(group.domId);
-        const surplusWasOpen = key === 'surplus' && box0 && box0.querySelector('.surplus-detail-content.open');
+        // ── Top: battleship dot group ────────────────────────────────────
+        bgGrid.appendChild(renderBattleshipGroup(group, data, key));
 
-        const box = renderSubsystemBox(group, data, key);
-        if (!box) continue;
+        // ── Bottom: enrichment card ──────────────────────────────────────
+        const bColor = SUBSYSTEM_BORDER_COLORS[key] || '#475569';
+        const card = el('div', 'enrich-card');
+        card.id = 'enrich-' + key;
+        card.style.borderLeftColor = bColor;
 
-        // Enrichment wrapper
+        // Card header: agg dot + name + count
+        const memberStatuses = group.sites.map(id => (callSites[id] || {}).status || 'unknown');
+        const aggStatus = aggregateStatus(memberStatuses);
+        const activeCount = memberStatuses.filter(s => s === 'healthy' || s === 'active').length;
+
+        const header = el('div', 'region-header');
+        const aggDot = el('span', 'agg-dot');
+        aggDot.style.background = statusDotColor(aggStatus);
+        header.appendChild(aggDot);
+        header.appendChild(el('h3', null, group.name));
+        header.appendChild(el('span', 'region-count', activeCount + '/' + group.sites.length));
+        card.appendChild(header);
+
+        if (group.desc) card.appendChild(el('div', 'region-desc', group.desc));
+
         const enrichment = el('div', 'region-enrichment');
         let hasEnrichment = false;
 
-        // Subsystem-specific enrichment from snapshot data
         if (key === 'ego') {
             enrichment.appendChild(sectionRow('Status', 'Groundwork', 'color:#c084fc;font-style:italic'));
             hasEnrichment = true;
@@ -1947,7 +1984,6 @@ function updateSubsystemGrid(data) {
             if (s.tasks_completed_24h !== undefined) { enrichment.appendChild(sectionRow('Done/24h', String(s.tasks_completed_24h))); hasEnrichment = true; }
             if (s.tasks_failed_24h) { enrichment.appendChild(sectionRow('Failed/24h', String(s.tasks_failed_24h), 'color:#ef4444')); hasEnrichment = true; }
 
-            // Expandable detail toggle
             const toggle = el('div', 'surplus-detail-toggle');
             toggle.appendChild(el('span', null, 'Details'));
             const arrow = el('span', 'arrow', '\u25B6');
@@ -1967,7 +2003,6 @@ function updateSubsystemGrid(data) {
                 }
             });
 
-            // Restore expanded state if it was open before re-render
             if (surplusWasOpen) {
                 detailContent.classList.add('open');
                 arrow.classList.add('open');
@@ -1990,8 +2025,7 @@ function updateSubsystemGrid(data) {
             }
         }
 
-        // Per-call-site enrichment: last run times, active providers, cost
-        // (applies to all subsystems including previously blank ones)
+        // Per-call-site enrichment: last run, providers, cost, routing, status
         const siteRuns = [];
         for (const siteId of group.sites) {
             const sd = callSites[siteId] || {};
@@ -2001,13 +2035,11 @@ function updateSubsystemGrid(data) {
             }
         }
         if (siteRuns.length > 0) {
-            // Most recent run for this subsystem
             siteRuns.sort((a, b) => a.age - b.age);
             const latest = siteRuns[0];
             const meta = getMeta(latest.id);
             enrichment.appendChild(sectionRow('Last Run', meta.name + ' ' + formatAge(latest.age) + ' ago'));
             hasEnrichment = true;
-            // Active providers (unique)
             const providers = [...new Set(siteRuns.map(r => r.provider).filter(Boolean))];
             if (providers.length > 0) {
                 enrichment.appendChild(sectionRow('Providers', providers.slice(0, 3).join(', ')));
@@ -2015,7 +2047,6 @@ function updateSubsystemGrid(data) {
             }
         }
 
-        // Cost aggregation from cost_by_call_site
         const costBySite = (data.cost || {}).cost_by_call_site || [];
         const siteSet = new Set(group.sites);
         let groupCalls = 0, groupCost = 0;
@@ -2030,7 +2061,6 @@ function updateSubsystemGrid(data) {
             hasEnrichment = true;
         }
 
-        // Chain readiness: count reachable providers across the group's sites
         let totalProviders = 0, reachableProviders = 0;
         for (const siteId of group.sites) {
             const sd = callSites[siteId] || {};
@@ -2049,7 +2079,6 @@ function updateSubsystemGrid(data) {
             hasEnrichment = true;
         }
 
-        // Status summary: healthy/total count for the subsystem
         const statusCounts = {};
         for (const siteId of group.sites) {
             const st = (callSites[siteId] || {}).status || 'unknown';
@@ -2062,7 +2091,8 @@ function updateSubsystemGrid(data) {
             hasEnrichment = true;
         }
 
-        if (hasEnrichment) box.appendChild(enrichment);
+        if (hasEnrichment) card.appendChild(enrichment);
+        enrichGrid.appendChild(card);
     }
 }
 
