@@ -126,23 +126,35 @@ body {
 .region-enrichment .section-row .value { font-size: 11px; }
 
 /* Battleship-style flat dot grid */
+/* Battleship-style status board: Y=subsystem rows, X=call site cells */
 .battleship-grid {
-    display: flex; flex-wrap: wrap; gap: 10px; padding: 14px;
+    display: flex; flex-direction: column; gap: 4px; padding: 14px;
     background: rgba(15, 23, 42, 0.5);
     border-radius: 8px; border: 1px solid var(--color-border, #334155);
 }
-.bg-group {
-    padding: 8px 10px; border-radius: 6px; min-width: 60px;
-    border: 1px solid rgba(51, 65, 85, 0.25);
+.bg-row {
+    display: flex; align-items: flex-start;
+    border-radius: 6px; padding: 6px 8px;
+    border: 1px solid rgba(51, 65, 85, 0.2);
 }
-.bg-label {
-    font-size: 9px; text-transform: uppercase; letter-spacing: 1px;
-    color: #64748b; margin-bottom: 7px; font-weight: 600;
+.bg-row-label {
+    width: 88px; min-width: 88px;
+    font-size: 10px; text-transform: uppercase; letter-spacing: 1px;
+    color: #64748b; font-weight: 600;
     display: flex; align-items: center; gap: 5px;
+    padding-top: 10px;
 }
-.bg-label .agg-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
-.bg-dots { display: flex; flex-wrap: wrap; gap: 10px; }
-/* Per-subsystem tints */
+.bg-row-label .agg-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.bg-cells { display: flex; flex-wrap: wrap; gap: 8px; }
+.bg-cell {
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    width: 72px;
+}
+.bg-cell-label {
+    font-size: 9px; color: #64748b; text-align: center;
+    line-height: 1.2; width: 100%; word-break: break-word;
+}
+/* Per-subsystem row tints */
 .bg-ego        { background: rgba(192,132,252,0.08); }
 .bg-reflection { background: rgba(129,140,248,0.08); }
 .bg-memory     { background: rgba(56,189,248,0.08); }
@@ -152,8 +164,6 @@ body {
 .bg-learning   { background: rgba(251,146,60,0.08); }
 .bg-contingency{ background: rgba(248,113,113,0.08); }
 .bg-utility    { background: rgba(148,163,184,0.08); }
-/* Ego dots slightly larger */
-.bg-ego .grid-dot { width: 20px; height: 20px; }
 
 /* Enrichment cards grid below battleship */
 .enrichment-cards {
@@ -1763,27 +1773,29 @@ function renderBattleshipGroup(group, data, groupKey) {
     const memberStatuses = group.sites.map(id => (callSites[id] || {}).status || 'unknown');
     const aggStatus = aggregateStatus(memberStatuses);
 
-    const grp = el('div', 'bg-group bg-' + groupKey);
+    const row = el('div', 'bg-row bg-' + groupKey);
 
-    // Label: aggregate dot + subsystem name
-    const label = el('div', 'bg-label');
+    // Left: Y-axis label with aggregate status dot
+    const rowLabel = el('div', 'bg-row-label');
     const aggDot = el('span', 'agg-dot');
     aggDot.style.background = statusDotColor(aggStatus);
-    label.appendChild(aggDot);
-    label.appendChild(document.createTextNode(group.name));
-    grp.appendChild(label);
+    rowLabel.appendChild(aggDot);
+    rowLabel.appendChild(document.createTextNode(group.name));
+    row.appendChild(rowLabel);
 
-    // Dots
-    const dots = el('div', 'bg-dots');
+    // Right: cells — one per call site (dot + visible name label)
+    const cells = el('div', 'bg-cells');
     for (const siteId of group.sites) {
         const siteData = callSites[siteId] || {};
         const meta = getMeta(siteId);
         const status = siteData.status || 'unknown';
 
+        const cell = el('div', 'bg-cell');
+
         const dot = el('div', 'grid-dot ' + gridDotClass(status));
         dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
 
-        // Tooltip data (shared #shared-tip on hover)
+        // Tooltip data (shared #shared-tip on hover — supplementary to visible label)
         const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
         if (status === 'idle') tipRows.push({ text: 'Groundwork' });
         else if (status === 'disabled') tipRows.push({ text: 'No API key' });
@@ -1816,10 +1828,12 @@ function renderBattleshipGroup(group, data, groupKey) {
         dot.addEventListener('mouseenter', () => showTip(dot));
         dot.addEventListener('mouseleave', hideTip);
 
-        dots.appendChild(dot);
+        cell.appendChild(dot);
+        cell.appendChild(el('div', 'bg-cell-label', meta.name));
+        cells.appendChild(cell);
     }
-    grp.appendChild(dots);
-    return grp;
+    row.appendChild(cells);
+    return row;
 }
 
 function updateSubsystemGrid(data) {
