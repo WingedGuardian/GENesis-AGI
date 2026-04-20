@@ -103,17 +103,16 @@ body {
 }
 .grid-dot:hover { animation: none; }
 
-/* Dot tooltip */
-.dot-tip {
-    display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
-    transform: translateX(-50%); background: var(--color-panel, #1e293b);
+/* Shared tooltip (fixed position, page-level) */
+#shared-tip {
+    display: none; position: fixed; z-index: 9999;
+    background: var(--color-panel, #1e293b);
     border: 1px solid var(--color-border, #334155); border-radius: 5px;
-    padding: 8px 12px; z-index: 100;
-    font-size: 11px; pointer-events: none; min-width: 150px; max-width: 260px;
-    word-wrap: break-word;
+    padding: 8px 12px; font-size: 11px; pointer-events: none;
+    min-width: 150px; max-width: 260px; word-wrap: break-word;
     box-shadow: 0 4px 12px rgba(0,0,0,0.3);
 }
-.grid-dot:hover .dot-tip { display: block; }
+#shared-tip.visible { display: block; }
 .dot-tip-name { color: var(--color-text); font-weight: 600; margin-bottom: 3px; }
 .dot-tip-row { color: var(--color-text-secondary); font-size: 10px; }
 
@@ -403,6 +402,8 @@ body {
     </div>
 </div>
 
+<div id="shared-tip"></div>
+
 <script>
 // NOTE: All data rendered in this dashboard originates from Genesis's internal
 // health API (local-only Flask server). No user-supplied or external content
@@ -538,6 +539,40 @@ function sectionRow(label, value, valueStyle) {
     if (valueStyle) val.style.cssText = valueStyle;
     row.appendChild(val);
     return row;
+}
+
+// ── Shared Tooltip ────────────────────────────────────────────────────
+
+const _tip = document.getElementById('shared-tip');
+
+function showTip(dotEl) {
+    // Populate from data attributes stored on the dot
+    _tip.replaceChildren();
+    const rows = JSON.parse(dotEl.dataset.tip || '[]');
+    for (const r of rows) {
+        const d = el('div', r.cls || 'dot-tip-row', r.text);
+        if (r.style) d.style.cssText = r.style;
+        _tip.appendChild(d);
+    }
+
+    // Position: prefer above the dot, flip below if clipping top
+    const rect = dotEl.getBoundingClientRect();
+    _tip.classList.add('visible');
+    const tipRect = _tip.getBoundingClientRect();
+
+    let top = rect.top - tipRect.height - 8;
+    if (top < 8) top = rect.bottom + 8; // flip below
+
+    let left = rect.left + rect.width / 2 - tipRect.width / 2;
+    if (left < 4) left = 4; // clamp left
+    if (left + tipRect.width > window.innerWidth - 4) left = window.innerWidth - tipRect.width - 4; // clamp right
+
+    _tip.style.top = top + 'px';
+    _tip.style.left = left + 'px';
+}
+
+function hideTip() {
+    _tip.classList.remove('visible');
 }
 
 // ── Side Panel ────────────────────────────────────────────────────────
@@ -811,6 +846,14 @@ function showDetail(item) {
         const banner = el('div', null, reason);
         banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
         content.appendChild(banner);
+    }
+    // Warning/failure details
+    if (item.data.recent_failures) {
+        content.appendChild(sectionRow('Recent Failures', item.data.recent_failures + ' in last 30 min', 'color:#f59e0b;font-weight:600'));
+        if (item.data.last_failure_at) {
+            const failAge = Math.round((Date.now() - new Date(item.data.last_failure_at).getTime()) / 1000);
+            content.appendChild(sectionRow('Last Failure', formatAge(failAge) + ' ago', 'color:#f59e0b'));
+        }
     }
 
     // Metadata — prefer backend data over static SITE_META
@@ -1726,34 +1769,29 @@ function renderSubsystemBox(group, data, groupKey) {
         const dot = el('div', 'grid-dot ' + gridDotClass(status));
         dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
 
-        // Tooltip
-        const tip = el('div', 'dot-tip');
-        tip.appendChild(el('div', 'dot-tip-name', meta.name));
-        if (status === 'idle') {
-            tip.appendChild(el('div', 'dot-tip-row', 'Groundwork'));
-        } else if (status === 'disabled') {
-            tip.appendChild(el('div', 'dot-tip-row', 'No API key'));
-        } else {
-            tip.appendChild(el('div', 'dot-tip-row', status));
+        // Tooltip data (rendered by shared #shared-tip on hover)
+        const tipRows = [{ cls: 'dot-tip-name', text: meta.name }];
+        if (status === 'idle') tipRows.push({ text: 'Groundwork' });
+        else if (status === 'disabled') tipRows.push({ text: 'No API key' });
+        else tipRows.push({ text: status });
+        if (siteData.active_provider) tipRows.push({ text: siteData.active_provider });
+        // Warning/failure reason
+        if (siteData.recent_failures) {
+            const failAge = siteData.last_failure_at
+                ? formatAge(Math.round((Date.now() - new Date(siteData.last_failure_at).getTime()) / 1000)) + ' ago'
+                : 'recently';
+            tipRows.push({ text: siteData.recent_failures + ' failure(s) in 30min, latest ' + failAge, style: 'color:#f59e0b' });
         }
-        if (siteData.active_provider) {
-            tip.appendChild(el('div', 'dot-tip-row', siteData.active_provider));
-        }
-        // Call site description from backend or static metadata
+        // Call site description
         const descText = siteData.description || meta.desc;
-        if (descText) {
-            const descRow = el('div', 'dot-tip-row', descText);
-            descRow.style.color = '#94a3b8';
-            descRow.style.marginTop = '3px';
-            tip.appendChild(descRow);
-        }
+        if (descText) tipRows.push({ text: descText, style: 'color:#94a3b8;margin-top:3px' });
+        // Chain summary
         if (siteData.chain_health) {
             const apiChain = siteData.chain_health.filter(c => !c.is_cc);
             const ccChain = siteData.chain_health.filter(c => c.is_cc);
             const apiUp = apiChain.filter(c => {
                 const ps = c.probe_status;
-                if (ps) return ps === 'reachable';
-                return c.state !== 'open';
+                return ps ? ps === 'reachable' : c.state !== 'open';
             }).length;
             let chainSummary = apiUp + '/' + apiChain.length + ' API';
             if (ccChain.length > 0) {
@@ -1761,37 +1799,11 @@ function renderSubsystemBox(group, data, groupKey) {
                 const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
                 chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
             }
-            tip.appendChild(el('div', 'dot-tip-row', chainSummary));
+            tipRows.push({ text: chainSummary });
         }
-        dot.appendChild(tip);
-
-        // Reposition tooltip if it would clip viewport edges
-        dot.addEventListener('mouseenter', function() {
-            // Reset to default position first
-            tip.style.bottom = 'calc(100% + 8px)';
-            tip.style.top = '';
-            tip.style.left = '50%';
-            tip.style.right = '';
-            tip.style.transform = 'translateX(-50%)';
-            // Force layout to measure
-            const rect = tip.getBoundingClientRect();
-            // Flip below if clipping top (behind header ~92px)
-            if (rect.top < 92) {
-                tip.style.bottom = '';
-                tip.style.top = 'calc(100% + 8px)';
-            }
-            // Align left if clipping left edge
-            if (rect.left < 4) {
-                tip.style.left = '0';
-                tip.style.transform = 'none';
-            }
-            // Align right if clipping right edge
-            if (rect.right > window.innerWidth - 4) {
-                tip.style.left = 'auto';
-                tip.style.right = '0';
-                tip.style.transform = 'none';
-            }
-        });
+        dot.dataset.tip = JSON.stringify(tipRows);
+        dot.addEventListener('mouseenter', () => showTip(dot));
+        dot.addEventListener('mouseleave', hideTip);
 
         grid.appendChild(dot);
     }
