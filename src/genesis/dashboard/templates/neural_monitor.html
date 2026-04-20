@@ -28,162 +28,97 @@ body {
     border-radius: 4px; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
 }
 .header-badge .hb-dot { width: 6px; height: 6px; border-radius: 50%; }
-.container { display: flex; min-height: calc(100vh - 92px); }
-.main-panel { flex: 1; padding: 24px; overflow-y: auto; }
-.side-panel {
-    width: 380px; min-width: 380px; border-left: 1px solid var(--color-border, #1e293b);
-    padding: 18px; overflow-y: auto;
-    scrollbar-width: thin; scrollbar-color: #334155 transparent;
+
+/* Grid topology */
+.monitor-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    max-width: 1200px; margin: 0 auto; padding: 0 16px;
 }
 
-/* Neural Map — constellation map layout */
-.neural-map {
-    position: relative; width: 100%;
-    margin: 0 auto;
-    min-height: 800px;
+/* Subsystem region */
+.region {
+    background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
+    border-radius: 8px; padding: 14px 16px; border-left: 3px solid #475569;
 }
-
-.dot {
-    border-radius: 50%; cursor: pointer;
-    position: absolute;
-    transition: background-color 0.3s, transform 0.15s, box-shadow 0.3s;
-    display: flex; align-items: center; justify-content: center;
+.region-header {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+    padding-bottom: 6px; border-bottom: 1px solid var(--color-border, #334155);
 }
-.dot:hover { transform: scale(1.5); z-index: 10; }
-.dot-inner { width: 16px; height: 16px; margin-left: -8px; margin-top: -8px; }
-.dot-outer { width: 16px; height: 16px; margin-left: -8px; margin-top: -8px; }
-.dot-periphery { width: 12px; height: 12px; margin-left: -6px; margin-top: -6px; }
-
-.dot-healthy { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
-.dot-active { background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.6), 0 0 14px rgba(74,222,128,0.2); animation: pulse 3s ease-in-out infinite; }
-.dot-degraded { background: #facc15; box-shadow: 0 0 6px rgba(250,204,21,0.6), 0 0 14px rgba(250,204,21,0.2); }
-.dot-down { background: #ef4444; box-shadow: 0 0 8px rgba(239,68,68,0.7), 0 0 20px rgba(239,68,68,0.3); animation: pulse-alert 1.5s ease-in-out infinite; }
-.dot-warning { background: #f59e0b; box-shadow: 0 0 6px rgba(245,158,11,0.5), 0 0 14px rgba(245,158,11,0.2); }
-.dot-idle { background: #555; opacity: 0.7; }
-.dot-unknown { background: #555; opacity: 0.7; }
-
-@keyframes pulse {
-    0%, 100% { transform: scale(1); opacity: 1; }
-    50% { transform: scale(1.06); opacity: 0.9; }
+.region-header h3 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--color-text-secondary); margin: 0; flex: 1;
 }
+.region-header .agg-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.region-count { font-size: 10px; color: #64748b; }
+
+/* Dot grid within region */
+.dot-grid {
+    display: grid; grid-template-columns: repeat(4, 24px); gap: 12px;
+    padding: 4px 0;
+}
+.grid-dot {
+    width: 8px; height: 8px; border-radius: 50%; cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.2s;
+    position: relative;
+}
+.grid-dot:hover { transform: scale(1.8); z-index: 10; }
+.grid-dot-healthy { background: #4ade80; box-shadow: 0 0 4px rgba(74,222,128,0.4); }
+.grid-dot-active { background: #4ade80; box-shadow: 0 0 4px rgba(74,222,128,0.4); }
+.grid-dot-degraded { background: #facc15; box-shadow: 0 0 4px rgba(250,204,21,0.4); }
+.grid-dot-down { background: #ef4444; box-shadow: 0 0 6px rgba(239,68,68,0.5); animation: pulse-alert 1.5s ease-in-out infinite; }
+.grid-dot-warning { background: #f59e0b; box-shadow: 0 0 4px rgba(245,158,11,0.4); }
+.grid-dot-idle { background: #555; opacity: 0.5; }
+.grid-dot-disabled { background: #555; opacity: 0.5; }
+.grid-dot-unknown { background: #555; opacity: 0.5; }
+
 @keyframes pulse-alert {
     0%, 100% { transform: scale(1); opacity: 1; }
     50% { transform: scale(1.12); opacity: 0.85; }
 }
-/* Override pulse on hover (hover has its own transform) */
-.dot:hover { animation: none; }
+.grid-dot:hover { animation: none; }
 
-/* Category border colors — layered with status glow via outline */
-.dot-cat-reflection { outline: 2px solid rgba(129, 140, 248, 0.5); outline-offset: 1px; }
-.dot-cat-reasoning { outline: 2px solid rgba(167, 139, 250, 0.5); outline-offset: 1px; }
-.dot-cat-processing { outline: 2px solid rgba(251, 146, 60, 0.4); outline-offset: 1px; }
-.dot-cat-calibration { outline: 2px solid rgba(251, 191, 36, 0.4); outline-offset: 1px; }
-.dot-cat-content { outline: 2px solid rgba(52, 211, 153, 0.35); outline-offset: 1px; }
-.dot-cat-embedding { outline: 2px solid rgba(34, 211, 238, 0.5); outline-offset: 1px; }
-.dot-cat-classification { outline: 2px solid rgba(148, 163, 184, 0.4); outline-offset: 1px; }
-.dot-cat-assessment { outline: 2px solid rgba(244, 114, 182, 0.4); outline-offset: 1px; }
-.dot-cat-core { outline: 2px solid rgba(96, 165, 250, 0.5); outline-offset: 1px; }
-.dot-cat-surplus { outline: 2px solid rgba(163, 230, 53, 0.4); outline-offset: 1px; }
+/* Dot tooltip */
+.dot-tip {
+    display: none; position: absolute; bottom: calc(100% + 8px); left: 50%;
+    transform: translateX(-50%); background: var(--color-panel, #1e293b);
+    border: 1px solid var(--color-border, #334155); border-radius: 5px;
+    padding: 8px 12px; white-space: nowrap; z-index: 100;
+    font-size: 11px; pointer-events: none; min-width: 150px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+}
+.grid-dot:hover .dot-tip { display: block; }
+.dot-tip-name { color: var(--color-text); font-weight: 600; margin-bottom: 3px; }
+.dot-tip-row { color: var(--color-text-secondary); font-size: 10px; }
 
-/* CC badge — standard visual language: CC/ entries across chain panels, tooltips, subsystem boxes */
+/* Enrichment below dots */
+.region-enrichment {
+    margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid rgba(51,65,85,0.3);
+}
+.region-enrichment .section-row { padding: 2px 0; }
+.region-enrichment .section-row .label,
+.region-enrichment .section-row .value { font-size: 11px; }
+
+/* Ops strip */
+.ops-strip {
+    display: flex; gap: 12px; flex-wrap: wrap; padding: 12px 16px;
+    margin-bottom: 16px; max-width: 1200px; margin-left: auto; margin-right: auto;
+}
+.ops-chip {
+    display: flex; align-items: center; gap: 6px; padding: 5px 10px;
+    border-radius: 5px; background: rgba(30,41,59,0.4);
+    border: 1px solid rgba(51,65,85,0.3); font-size: 12px;
+}
+.chip-label { color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; font-size: 10px; }
+.chip-value { color: var(--color-text); font-weight: 600; }
+
+/* CC badge */
 .cc-badge {
     background: #60a5fa; color: #0f172a; font-size: 9px; padding: 1px 4px;
     border-radius: 3px; font-weight: 700; margin-right: 4px; display: inline-block;
 }
 
-/* Tooltip */
-.tooltip {
-    display: none; position: absolute; bottom: calc(100% + 10px); left: 50%;
-    transform: translateX(-50%); background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
-    border-radius: 6px; padding: 10px 14px; white-space: nowrap; z-index: 100;
-    font-size: 11px; pointer-events: none; min-width: 180px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-}
-.dot:hover .tooltip { display: block; }
-.tooltip .tt-name { color: var(--color-text, #f8fafc); font-weight: 600; margin-bottom: 4px; }
-.tooltip .tt-desc { color: #94a3b8; font-size: 10px; margin-bottom: 6px; white-space: normal; max-width: 220px; }
-.tooltip .tt-row { color: var(--color-text-secondary); }
-.tooltip .tt-cat { display: inline-block; padding: 1px 5px; border-radius: 3px; font-size: 9px; margin-bottom: 4px; background: rgba(255,255,255,0.08); }
-
-/* Dot labels — all hover-only, sector labels provide orientation */
-.dot-label {
-    position: absolute; top: calc(100% + 3px); left: 50%;
-    transform: translateX(-50%); font-size: 9px; color: var(--color-text-secondary);
-    white-space: nowrap; pointer-events: none; text-align: center;
-    max-width: 80px; overflow: hidden; text-overflow: ellipsis;
-    opacity: 0; transition: opacity 0.15s;
-}
-.dot:hover .dot-label { opacity: 1; }
-
-/* Surplus box (legacy — kept for backward compat) */
-.surplus-box {
-    background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155); border-radius: 8px;
-    padding: 12px 16px; margin-top: 24px; max-width: 600px; margin-left: auto; margin-right: auto;
-}
-.surplus-box h3 { font-size: 12px; color: var(--color-text-secondary); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 1px; }
-.surplus-row { display: flex; justify-content: space-between; color: var(--color-text, #cbd5e1); margin: 4px 0; }
-
-/* Subsystem grid */
-.subsystem-grid {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 16px;
-    max-width: 900px; margin: 24px auto; padding: 0 16px;
-}
-.subsystem-box {
-    background: var(--color-panel, #1e293b); border: 1px solid var(--color-border, #334155);
-    border-radius: 8px; padding: 14px 18px; border-left: 3px solid #475569;
-}
-.subsystem-box .sub-header {
-    display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
-    padding-bottom: 6px; border-bottom: 1px solid var(--color-border, #334155);
-}
-.subsystem-box .sub-header h3 {
-    font-size: 12px; color: var(--color-text-secondary); text-transform: uppercase;
-    letter-spacing: 1px; margin: 0; flex: 1;
-}
-.subsystem-box .sub-header .agg-dot {
-    width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0;
-}
-.subsystem-box .mini-dots { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
-.subsystem-box .mini-dot {
-    width: 8px; height: 8px; border-radius: 50%; cursor: pointer;
-    transition: transform 0.15s, box-shadow 0.3s;
-}
-.subsystem-box .mini-dot-healthy { box-shadow: 0 0 4px rgba(74,222,128,0.5); }
-.subsystem-box .mini-dot-down { box-shadow: 0 0 4px rgba(239,68,68,0.6); }
-.subsystem-box .mini-dot-degraded { box-shadow: 0 0 4px rgba(250,204,21,0.5); }
-.subsystem-box .mini-dot:hover { transform: scale(1.5); }
-.subsystem-box .mini-dot-label {
-    font-size: 9px; color: var(--color-text-secondary); display: flex;
-    align-items: center; gap: 3px;
-}
-@media (max-width: 700px) { .subsystem-grid { grid-template-columns: 1fr; } }
-
-/* Legend */
-.legend {
-    display: flex; gap: 14px; flex-wrap: wrap; justify-content: center;
-    margin-top: 16px; padding: 10px; font-size: 11px; color: var(--color-text-secondary);
-}
-.legend-item { display: flex; align-items: center; gap: 4px; }
-.legend-dot {
-    width: 8px; height: 8px; border-radius: 50%;
-    display: inline-block;
-}
-
-/* Side panel sections */
-.section {
-    margin-bottom: 20px; padding: 10px 12px; border-radius: 6px;
-    background: rgba(30, 41, 59, 0.3); border: 1px solid rgba(51, 65, 85, 0.3);
-}
-.section h3 {
-    font-size: 12px; text-transform: uppercase; letter-spacing: 1.2px;
-    color: var(--color-text-secondary); margin-bottom: 10px; padding-bottom: 6px;
-    border-bottom: 1px solid var(--color-border, #1e293b);
-    border-left: 3px solid var(--color-accent, #27875e); padding-left: 8px;
-}
-.section-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
-.section-row .label { color: var(--color-text-secondary); font-size: 13px; }
-.section-row .value { font-weight: 600; font-size: 13px; }
-
+/* Status dots (inline) */
 .status-dot {
     display: inline-block; width: 8px; height: 8px; border-radius: 50%;
     margin-right: 6px; vertical-align: middle;
@@ -204,14 +139,32 @@ body {
 .badge-warning { background: #854d0e; color: #ffe600; }
 .badge-critical { background: #991b1b; color: #ef4444; }
 
+/* Section rows (reused in ops strip, enrichment, detail panel) */
+.section-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+.section-row .label { color: var(--color-text-secondary); font-size: 13px; }
+.section-row .value { font-weight: 600; font-size: 13px; }
+
 /* Category health summary */
 .cat-health { font-size: 11px; color: var(--color-text-secondary); padding: 2px 0; }
 .cat-health .cat-name { text-transform: capitalize; }
 .cat-health .cat-count { float: right; font-weight: 600; }
 
-/* Detail panel (replaces side panel on click) */
-.detail-panel { display: none; }
-.detail-panel.active { display: block; }
+/* Detail overlay (slides in from right) */
+.detail-overlay {
+    position: fixed; top: 0; right: 0; bottom: 0; width: 420px; max-width: 90vw;
+    background: var(--color-background, #0f172a);
+    border-left: 1px solid var(--color-border, #1e293b);
+    z-index: 500; overflow-y: auto; padding: 20px;
+    transform: translateX(100%); transition: transform 0.25s ease;
+    box-shadow: -4px 0 20px rgba(0,0,0,0.3);
+}
+.detail-overlay.open { transform: translateX(0); }
+.detail-overlay-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.3);
+    z-index: 499; display: none;
+}
+.detail-overlay-backdrop.open { display: block; }
+
 .detail-back {
     cursor: pointer; color: #60a5fa; font-size: 12px; margin-bottom: 12px;
     display: inline-block;
@@ -362,6 +315,13 @@ body {
 }
 .genesis-nav a:hover { color: var(--color-text); }
 .genesis-nav a.active { color: var(--color-accent, #27875e); border-bottom: 2px solid var(--color-accent, #27875e); }
+
+/* Responsive */
+@media (max-width: 1000px) { .monitor-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 600px) {
+    .monitor-grid { grid-template-columns: 1fr; }
+    .ops-strip { flex-direction: column; }
+}
 </style>
 </head>
 <body>
@@ -383,59 +343,27 @@ body {
     </div>
 </div>
 
-<div class="container">
-    <div class="main-panel">
-        <div id="loading" class="loading">Connecting...</div>
-        <div id="neural-map" class="neural-map" style="display:none;"></div>
-        <div id="legend" class="legend" style="display:none;"></div>
-        <!-- Surplus box removed — data shown in Surplus subsystem box -->
-        <div id="subsystem-grid" class="subsystem-grid" style="display:none;">
-            <div id="sub-reflection" class="subsystem-box"></div>
-            <div id="sub-memory" class="subsystem-box"></div>
-            <div id="sub-surplus" class="subsystem-box"></div>
-            <div id="sub-outreach" class="subsystem-box"></div>
-            <div id="sub-executor" class="subsystem-box"></div>
-            <div id="sub-learning" class="subsystem-box"></div>
-            <div id="sub-contingency" class="subsystem-box"></div>
-            <div id="sub-utility" class="subsystem-box"></div>
-        </div>
+<div style="min-height: calc(100vh - 92px); padding: 0 24px 60px;">
+    <div id="loading" class="loading">Connecting...</div>
+    <div id="ops-strip" class="ops-strip" style="display:none;"></div>
+    <div id="ops-extra" style="display:none; max-width:1200px; margin:0 auto 16px; padding:0 16px;"></div>
+    <div id="monitor-grid" class="monitor-grid" style="display:none;">
+        <div id="sub-reflection" class="region"></div>
+        <div id="sub-memory" class="region"></div>
+        <div id="sub-learning" class="region"></div>
+        <div id="sub-executor" class="region"></div>
+        <div id="sub-surplus" class="region"></div>
+        <div id="sub-outreach" class="region"></div>
+        <div id="sub-utility" class="region"></div>
+        <div id="sub-contingency" class="region"></div>
     </div>
-    <div class="side-panel">
-        <div id="side-default">
-            <div class="section">
-                <h3>Awareness Loop</h3>
-                <div id="awareness-content"></div>
-            </div>
-            <div class="section">
-                <h3>Services</h3>
-                <div id="services-content"></div>
-            </div>
-            <div class="section">
-                <h3>Infrastructure</h3>
-                <div id="infra-content"></div>
-            </div>
-            <div class="section">
-                <h3>Resilience</h3>
-                <div id="resilience-content"></div>
-            </div>
-            <div class="section">
-                <h3>G. Sessions</h3>
-                <div id="cc-content"></div>
-            </div>
-            <div class="section">
-                <h3>Queues</h3>
-                <div id="queue-content"></div>
-            </div>
-            <div class="section">
-                <h3>Cost</h3>
-                <div id="cost-content"></div>
-            </div>
-        </div>
-        <div id="side-detail" class="detail-panel">
-            <span class="detail-back" id="detail-back-btn">&larr; Back</span>
-            <div id="detail-content"></div>
-        </div>
-    </div>
+</div>
+
+<!-- Detail overlay -->
+<div id="detail-backdrop" class="detail-overlay-backdrop"></div>
+<div id="detail-overlay" class="detail-overlay">
+    <span class="detail-back" id="detail-back-btn">&larr; Back</span>
+    <div id="detail-content"></div>
 </div>
 
 <script>
@@ -507,92 +435,32 @@ const SITE_META = {
     'autonomous_executor_reasoning': { name: 'Executor', category: 'reasoning' },
 };
 
-// ── Constellation layout ────────────────────────────────────────────────
-const CONSTELLATION_ANCHORS = {
-    reflection:  { x: 0.30, y: 0.18 },
-    memory:      { x: 0.72, y: 0.20 },
-    learning:    { x: 0.50, y: 0.42 },
-    executor:    { x: 0.20, y: 0.50 },
-    contingency: { x: 0.16, y: 0.72 },
-    outreach:    { x: 0.80, y: 0.42 },
-    surplus:     { x: 0.76, y: 0.62 },
-    utility:     { x: 0.50, y: 0.80 },
-};
-
-// Render order — contingency first to claim shared sites before executor
-const CONSTELLATION_ORDER = [
-    'contingency', 'reflection', 'executor', 'learning',
-    'memory', 'surplus', 'outreach', 'utility',
-];
-
-// Architectural connections between subsystems (faint dashed lines)
-const CONSTELLATION_CONNECTIONS = [
-    ['reflection', 'learning'],
-    ['reflection', 'memory'],
-    ['reflection', 'executor'],
-    ['learning', 'memory'],
-    ['executor', 'contingency'],
-    ['memory', 'surplus'],
-    ['executor', 'outreach'],
-];
-
-// Constellation label colors
-const CONSTELLATION_COLORS = {
-    reflection:  'rgba(129,140,248,0.6)',
-    executor:    'rgba(167,139,250,0.6)',
-    learning:    'rgba(251,146,60,0.5)',
-    memory:      'rgba(56,189,248,0.5)',
-    surplus:     'rgba(74,222,128,0.5)',
-    outreach:    'rgba(251,191,36,0.5)',
-    utility:     'rgba(148,163,184,0.5)',
-    contingency: 'rgba(167,139,250,0.4)',
-};
-
-// Core sites get 16px dots; everything else gets 12px
-const CORE_SITES = new Set([
-    '5_deep_reflection', '6_strategic_reflection',
-    '2_triage',
-    '8_ego_compaction', '21_embeddings',
-    '7_ego_cycle', 'autonomous_executor_reasoning',
-    '10_cognitive_state',
-    '12_surplus_brainstorm',
-    '13_morning_report',
-]);
-
-const GOLDEN_ANGLE = 137.508 * Math.PI / 180;
-
-// Category colors for legend
+// Category colors (used in detail panel category badge)
 const CAT_COLORS = {
     core: '#60a5fa', reflection: '#818cf8', reasoning: '#a78bfa',
     processing: '#fb923c', calibration: '#fbbf24', content: '#34d399',
     embedding: '#22d3ee', classification: '#94a3b8', assessment: '#f472b6',
-    surplus: '#a3e635',
+    surplus: '#a3e635', learning: '#fb923c', memory: '#38bdf8',
 };
-
-const DOT_SIZES = { inner: 'dot-inner', outer: 'dot-outer', periphery: 'dot-periphery' };
 
 let lastData = null;
 let lastFetchTime = 0;
 
 document.getElementById('detail-back-btn').addEventListener('click', showDefaultPanel);
+document.getElementById('detail-backdrop').addEventListener('click', showDefaultPanel);
 
 function getMeta(siteId) {
     return SITE_META[siteId] || { name: siteId, desc: '', category: 'unknown', frequency: '', costPolicy: '' };
 }
 
-function statusClass(status) {
-    if (status === 'healthy') return 'dot-healthy';
-    if (status === 'active') return 'dot-active';
-    if (status === 'degraded') return 'dot-degraded';
-    if (status === 'down') return 'dot-down';
-    if (status === 'warning') return 'dot-warning';
-    if (status === 'idle') return 'dot-idle';
-    if (status === 'disabled') return 'dot-idle'; // Same gray as idle — config state, not failure
-    return 'dot-unknown';
-}
-
-function catClass(category) {
-    return 'dot-cat-' + (category || 'unknown');
+function gridDotClass(status) {
+    const map = {
+        healthy: 'grid-dot-healthy', active: 'grid-dot-active',
+        degraded: 'grid-dot-degraded', down: 'grid-dot-down',
+        warning: 'grid-dot-warning', idle: 'grid-dot-idle',
+        disabled: 'grid-dot-disabled',
+    };
+    return map[status] || 'grid-dot-unknown';
 }
 
 function infraStatusClass(probe) {
@@ -636,246 +504,103 @@ function sectionRow(label, value, valueStyle) {
     return row;
 }
 
-// ── Neural Map ────────────────────────────────────────────────────────
+// ── Ops Summary Strip ─────────────────────────────────────────────────
 
-// ── Constellation helpers ────────────────────────────────────────────
+function buildOpsStrip(data) {
+    const strip = document.getElementById('ops-strip');
+    strip.replaceChildren();
+    strip.style.display = 'flex';
 
-function _spiralPositions(count, anchorX, anchorY, spacing) {
-    const positions = [];
-    for (let i = 0; i < count; i++) {
-        const angle = i * GOLDEN_ANGLE;
-        const radius = spacing * Math.sqrt(i + 1);
-        positions.push({
-            x: anchorX + radius * Math.cos(angle),
-            y: anchorY + radius * Math.sin(angle),
-        });
-    }
-    return positions;
-}
-
-function _buildConstellationSVG(map, w, h, anchors, constellationDots) {
-    const ns = 'http://www.w3.org/2000/svg';
-    const svg = document.createElementNS(ns, 'svg');
-    svg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:0;';
-    svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
-
-    // Inter-constellation connections (dashed, very faint)
-    for (const [from, to] of CONSTELLATION_CONNECTIONS) {
-        const a = anchors[from], b = anchors[to];
-        if (!a || !b) continue;
-        const line = document.createElementNS(ns, 'line');
-        line.setAttribute('x1', String(a.x)); line.setAttribute('y1', String(a.y));
-        line.setAttribute('x2', String(b.x)); line.setAttribute('y2', String(b.y));
-        line.setAttribute('stroke', 'rgba(148,163,184,0.06)');
-        line.setAttribute('stroke-width', '1');
-        line.setAttribute('stroke-dasharray', '4 8');
-        svg.appendChild(line);
+    function chip(label, value, color) {
+        const c = el('div', 'ops-chip');
+        c.appendChild(el('span', 'chip-label', label));
+        const v = el('span', 'chip-value', value);
+        if (color) v.style.color = color;
+        c.appendChild(v);
+        return c;
     }
 
-    // Intra-constellation connections (solid, chain pattern)
-    for (const [name, dots] of Object.entries(constellationDots)) {
-        if (dots.length < 2) continue;
-        for (let i = 0; i < dots.length - 1; i++) {
-            const line = document.createElementNS(ns, 'line');
-            line.setAttribute('x1', String(dots[i].x)); line.setAttribute('y1', String(dots[i].y));
-            line.setAttribute('x2', String(dots[i + 1].x)); line.setAttribute('y2', String(dots[i + 1].y));
-            line.setAttribute('stroke', 'rgba(148,163,184,0.10)');
-            line.setAttribute('stroke-width', '1');
-            svg.appendChild(line);
-        }
-        // Close the loop for clusters of 4+
-        if (dots.length >= 4) {
-            const line = document.createElementNS(ns, 'line');
-            line.setAttribute('x1', String(dots[dots.length - 1].x));
-            line.setAttribute('y1', String(dots[dots.length - 1].y));
-            line.setAttribute('x2', String(dots[0].x));
-            line.setAttribute('y2', String(dots[0].y));
-            line.setAttribute('stroke', 'rgba(148,163,184,0.10)');
-            line.setAttribute('stroke-width', '1');
-            svg.appendChild(line);
-        }
+    // Awareness
+    const aw = data.awareness || {};
+    const awStatus = aw.status || 'unknown';
+    const awColor = awStatus === 'healthy' ? '#4ade80' : awStatus === 'stale' ? '#ffe600' : '#6b7280';
+    let awText = awStatus;
+    if (aw.ticks_24h !== undefined) awText += ' \u00B7 ' + aw.ticks_24h + ' ticks';
+    if (aw.time_since_last_tick_seconds != null) {
+        const secs = Math.round(aw.time_since_last_tick_seconds);
+        awText += ' \u00B7 ' + (secs < 120 ? secs + 's' : Math.round(secs / 60) + 'm') + ' ago';
     }
+    strip.appendChild(chip('Awareness', awText, awColor));
 
-    // Constellation labels
-    for (const [name, anchor] of Object.entries(anchors)) {
-        const group = SUBSYSTEM_GROUPS[name];
-        if (!group) continue;
-        const label = document.createElementNS(ns, 'text');
-        label.setAttribute('x', String(anchor.x));
-        label.setAttribute('y', String(anchor.y - 45));
-        label.setAttribute('text-anchor', 'middle');
-        label.setAttribute('dominant-baseline', 'middle');
-        label.setAttribute('fill', CONSTELLATION_COLORS[name] || 'rgba(148,163,184,0.5)');
-        label.setAttribute('font-size', '11');
-        label.setAttribute('font-family', 'inherit');
-        label.setAttribute('letter-spacing', '1.5');
-        label.textContent = group.name.toUpperCase();
-        svg.appendChild(label);
-    }
+    // Infrastructure
+    const infra = data.infrastructure || {};
+    const infraKeys = Object.keys(infra).filter(k => k !== 'cc_tmp');
+    const infraOk = infraKeys.filter(k => infraStatusClass(infra[k]) === 'status-healthy').length;
+    const infraColor = infraOk === infraKeys.length ? '#4ade80' : infraOk > 0 ? '#ffe600' : '#ef4444';
+    strip.appendChild(chip('Infra', infraOk + '/' + infraKeys.length, infraColor));
 
-    map.appendChild(svg);
-}
+    // Resilience
+    const resObj = data.resilience || {};
+    const resLevel = (typeof resObj === 'object' ? resObj.level : resObj) || 'unknown';
+    const resColor = (resLevel === 'L0' || resLevel === 'normal' || resLevel === 'not configured') ? '#4ade80' : '#ffe600';
+    strip.appendChild(chip('Resilience', resLevel, resColor));
 
-function _makeDot(item, x, y, sizeClass) {
-    const meta = getMeta(item.id);
-    const dot = el('div', 'dot ' + sizeClass + ' ' + statusClass(item.status) + ' ' + catClass(meta.category));
-    dot.style.left = x + 'px';
-    dot.style.top = y + 'px';
-    dot.style.zIndex = '1';
-    dot.addEventListener('click', () => showDetail(item));
+    // Sessions
+    const cc = data.cc_sessions || {};
+    const fgActive = cc.foreground?.active || 0;
+    const bgActive = cc.background?.active || 0;
+    strip.appendChild(chip('Sessions', 'FG:' + fgActive + ' BG:' + bgActive));
 
-    // Tooltip
-    const tooltip = el('div', 'tooltip');
-    tooltip.appendChild(el('div', 'tt-name', meta.name));
-    tooltip.appendChild(el('div', 'tt-desc', item.data.description || meta.desc || ''));
-    if (item.status === 'idle') {
-        const disabledTag = el('span', 'tt-cat', 'Disabled');
-        disabledTag.style.background = 'rgba(136,136,136,0.2)';
-        disabledTag.style.color = '#888';
-        tooltip.appendChild(disabledTag);
-    } else if (item.status === 'disabled') {
-        const disabledTag = el('span', 'tt-cat', 'No API key');
-        disabledTag.style.background = 'rgba(136,136,136,0.2)';
-        disabledTag.style.color = '#888';
-        tooltip.appendChild(disabledTag);
-        const reasonNote = el('div', 'tt-row',
-            'No API key configured for any provider in this chain.');
-        reasonNote.style.fontSize = '10px';
-        reasonNote.style.color = '#888';
-        tooltip.appendChild(reasonNote);
-    } else {
-        tooltip.appendChild(el('span', 'tt-cat', meta.category));
-    }
-    if (item.data.active_provider) {
-        tooltip.appendChild(el('div', 'tt-row', 'Provider: ' + item.data.active_provider));
-    }
-    if (item.data.chain_health) {
-        const apiChain = item.data.chain_health.filter(c => !c.is_cc);
-        const ccChain = item.data.chain_health.filter(c => c.is_cc);
-        const apiUp = apiChain.filter(c => {
-            const ps = c.probe_status;
-            if (ps) return ps === 'reachable';
-            return c.state !== 'open';
-        }).length;
-        let chainSummary = apiUp + '/' + apiChain.length + ' API reachable';
-        if (ccChain.length > 0) {
-            const ccPs = ccChain[0].probe_status;
-            const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
-            chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
-        }
-        tooltip.appendChild(el('div', 'tt-row', chainSummary));
-    }
-    if (item.data.active !== undefined) {
-        tooltip.appendChild(el('div', 'tt-row', 'Active: ' + item.data.active));
-    }
-    if (item.data.hourly_budget) {
-        tooltip.appendChild(el('div', 'tt-row', 'Budget: ' + item.data.hourly_budget));
-    }
-    dot.appendChild(tooltip);
-    dot.appendChild(el('div', 'dot-label', meta.name));
-    return dot;
-}
+    // Queues
+    const q = data.queues || {};
+    const pending = q.pending_embeddings || 0;
+    const failed = q.failed_embeddings || 0;
+    const qColor = failed > 0 ? '#ef4444' : pending > 0 ? '#ffe600' : '#4ade80';
+    const qText = failed > 0 ? failed + ' failed' : pending > 0 ? pending + ' pending' : 'clear';
+    strip.appendChild(chip('Queues', qText, qColor));
 
-function buildNeuralMap(data) {
-    const map = document.getElementById('neural-map');
-    map.replaceChildren();
-    map.style.display = 'block';
+    // Cost
+    const cost = data.cost || {};
+    const todayStr = cost.daily_usd !== undefined ? '$' + cost.daily_usd.toFixed(3) : '--';
+    const monthStr = cost.monthly_usd !== undefined ? '$' + cost.monthly_usd.toFixed(2) : '--';
+    strip.appendChild(chip('Cost', todayStr + ' / ' + monthStr));
 
-    const mapW = map.clientWidth || 700;
-    const mapH = Math.max(map.clientHeight, 800);
+    // Services
+    const services = data.services || {};
+    const bridge = services.bridge || {};
+    const bridgeState = bridge.active_state || 'unknown';
+    const svcColor = bridgeState === 'active' ? '#4ade80' : '#ef4444';
+    let svcText = bridgeState;
+    if (bridge.uptime_seconds != null) svcText += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
+    strip.appendChild(chip('Server', svcText, svcColor));
 
-    // Compute absolute anchor positions from percentages
-    const anchors = {};
-    for (const [name, pct] of Object.entries(CONSTELLATION_ANCHORS)) {
-        anchors[name] = { x: pct.x * mapW, y: pct.y * mapH };
-    }
+    // Deferred + discarded items below ops strip
+    const extra = document.getElementById('ops-extra');
+    extra.replaceChildren();
+    const queues = data.queues || {};
 
-    // CC sessions are NOT rendered on the map — shown in header badge + side panel only
-
-    // ── Build site items from call_sites data ──
-    const callSites = data.call_sites || {};
-    const siteItems = {};
-    for (const [siteId, info] of Object.entries(callSites)) {
-        if (siteId === 'cc_foreground' || siteId === 'cc_background') continue;
-        siteItems[siteId] = { id: siteId, status: info.status, data: info };
-    }
-
-    // ── Place sites by constellation (golden-angle spiral from anchor) ──
-    const placed = new Set();
-    const constellationDots = {};
-
-    for (const name of CONSTELLATION_ORDER) {
-        const group = SUBSYSTEM_GROUPS[name];
-        if (!group) continue;
-        const sites = group.sites.filter(id => siteItems[id] && !placed.has(id));
-        if (sites.length === 0) continue;
-
-        const anchor = anchors[name];
-        if (!anchor) continue;
-        const positions = _spiralPositions(sites.length, anchor.x, anchor.y, 28);
-        const dots = [];
-
-        for (let i = 0; i < sites.length; i++) {
-            const item = siteItems[sites[i]];
-            dots.push({ x: positions[i].x, y: positions[i].y, item });
-            placed.add(sites[i]);
-        }
-        constellationDots[name] = dots;
-    }
-
-    // SVG layer (connection lines + labels) — rendered before dots
-    _buildConstellationSVG(map, mapW, mapH, anchors, constellationDots);
-
-    // Render dots on top
-    for (const name of CONSTELLATION_ORDER) {
-        const dots = constellationDots[name];
-        if (!dots) continue;
-        for (const d of dots) {
-            const sz = CORE_SITES.has(d.item.id) ? DOT_SIZES.inner : DOT_SIZES.periphery;
-            map.appendChild(_makeDot(d.item, d.x, d.y, sz));
+    // Deferred items
+    if (queues.deferred_items && queues.deferred_items.length > 0) {
+        extra.style.display = 'block';
+        for (const item of queues.deferred_items) {
+            const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
+            const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
+            extra.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
         }
     }
 
-    // ── Unassigned sites → scatter along bottom ──
-    const unassigned = Object.values(siteItems).filter(item => !placed.has(item.id));
-    if (unassigned.length > 0) {
-        for (let i = 0; i < unassigned.length; i++) {
-            const x = (i + 1) / (unassigned.length + 1) * mapW;
-            const y = mapH - 40;
-            map.appendChild(_makeDot(unassigned[i], x, y, DOT_SIZES.periphery));
-        }
+    // Discarded items
+    if (queues.discarded_count > 0 || (queues.discarded_items && queues.discarded_items.length > 0)) {
+        extra.style.display = 'block';
+        renderDiscardedItems(extra, queues);
     }
 
-    // Build legend
-    buildLegend();
-}
-
-function buildLegend() {
-    const legend = document.getElementById('legend');
-    legend.replaceChildren();
-    legend.style.display = 'flex';
-
-    // Category legend
-    const seen = new Set();
-    for (const meta of Object.values(SITE_META)) {
-        if (seen.has(meta.category)) continue;
-        seen.add(meta.category);
-        const item = el('div', 'legend-item');
-        const dot = el('span', 'legend-dot');
-        dot.style.background = CAT_COLORS[meta.category] || '#6b7280';
-        item.appendChild(dot);
-        item.appendChild(el('span', null, meta.category));
-        legend.appendChild(item);
-    }
+    if (!extra.hasChildNodes()) extra.style.display = 'none';
 }
 
 // ── Detail panel ─────────────────────────────────────────────────────
 
 function showDetail(item) {
-    document.getElementById('side-default').style.display = 'none';
-    const detail = document.getElementById('side-detail');
-    detail.classList.add('active');
-
     const content = document.getElementById('detail-content');
     content.replaceChildren();
     const meta = getMeta(item.id);
@@ -905,7 +630,7 @@ function showDetail(item) {
     else if (item.status === 'disabled') statusLabel = 'Disabled (no API key)';
     content.appendChild(sectionRow('Status', statusLabel, 'color:' + statusColor));
     if (item.status === 'idle') {
-        const banner = el('div', null, 'This call site is groundwork — config exists but no code invokes it yet.');
+        const banner = el('div', null, 'This call site is groundwork \u2014 config exists but no code invokes it yet.');
         banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
         content.appendChild(banner);
     } else if (item.status === 'disabled') {
@@ -1073,6 +798,9 @@ function showDetail(item) {
         content.appendChild(sectionRow('Last Run', 'No runs recorded'));
     }
 
+    // Open overlay
+    document.getElementById('detail-overlay').classList.add('open');
+    document.getElementById('detail-backdrop').classList.add('open');
 }
 
 // ── Chain editor logic ───────────────────────────────────────────────
@@ -1210,9 +938,9 @@ function _ccModelFromEntry(prov) { return prov.replace('CC/', ''); }
 function _renderModeHint(hintEl, mode) {
     if (!hintEl) return;
     if (mode === 'api') {
-        hintEl.textContent = 'API chain only — no CC subprocess';
+        hintEl.textContent = 'API chain only \u2014 no CC subprocess';
     } else if (mode === 'cli') {
-        hintEl.textContent = 'CC subprocess only — API chain unused';
+        hintEl.textContent = 'CC subprocess only \u2014 API chain unused';
     } else {
         hintEl.textContent = 'Dispatcher auto-decides';
     }
@@ -1226,7 +954,6 @@ function _renderChainList(listEl) {
         const isCC = _isCC(prov);
 
         if (isCC) {
-            // CC entry — blue badge + model dropdown
             const dot = document.createElement('span');
             dot.className = 'cb-dot';
             dot.style.background = '#818cf8';
@@ -1256,7 +983,6 @@ function _renderChainList(listEl) {
             };
             li.appendChild(select);
         } else {
-            // API provider entry — combined CB + probe health dot
             const ch = _editorState.chainHealth?.[prov];
             const cbState = _editorState.cbStates[prov] || ch?.state || 'closed';
             const ps = ch?.probe_status;
@@ -1291,7 +1017,6 @@ function _renderChainList(listEl) {
                 li.appendChild(modelSpan);
             }
 
-            // CB state text with failure count
             let stateText, stateColor;
             if (ps === 'not_configured') {
                 stateText = 'no API key';
@@ -1377,7 +1102,7 @@ function _populateAddSelect(selectEl) {
             const opt = document.createElement('option');
             opt.value = name;
             const edName = name.startsWith('claude-') ? name.replace('claude-', 'anthropic-') : name;
-            opt.textContent = edName + (prov.free ? ' [free]' : '') + (prov.model ? ' — ' + prov.model : '');
+            opt.textContent = edName + (prov.free ? ' [free]' : '') + (prov.model ? ' \u2014 ' + prov.model : '');
             selectEl.appendChild(opt);
         }
     }
@@ -1503,238 +1228,8 @@ async function _saveConfig(saveBtn, feedbackEl, listEl, selectEl, revertBtn) {
 }
 
 function showDefaultPanel() {
-    document.getElementById('side-detail').classList.remove('active');
-    document.getElementById('side-default').style.display = 'block';
-}
-
-// ── Side panel ───────────────────────────────────────────────────────
-
-function updateSidePanel(data) {
-    // Services
-    const services = data.services || {};
-    const svcEl = document.getElementById('services-content');
-    if (svcEl) {
-        svcEl.replaceChildren();
-        const bridge = services.bridge || {};
-        const bridgeState = bridge.active_state || 'unknown';
-        const bridgeColor = bridgeState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
-        let bridgeDetail = bridgeState;
-        if (bridge.uptime_seconds != null) {
-            bridgeDetail += ' (' + Math.round(bridge.uptime_seconds / 60) + 'm)';
-        }
-        svcEl.appendChild(sectionRow('Server', bridgeDetail, bridgeColor + ';font-weight:600'));
-
-        const timer = services.watchdog_timer || {};
-        const timerState = timer.active_state || 'unknown';
-        const timerColor = timerState === 'active' ? 'color:#4ade80' : 'color:#ef4444';
-        svcEl.appendChild(sectionRow('Watchdog', timerState, timerColor));
-
-        const wd = services.watchdog || {};
-        if (wd.consecutive_failures > 0) {
-            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#ffe600;font-weight:600'));
-        }
-        if (wd.in_backoff) {
-            svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#ffe600'));
-        }
-
-        const ccTmp = (data.infrastructure || {}).cc_tmp;
-        if (ccTmp && ccTmp.cc_used_mb != null) {
-            const ccTier = ccTmp.cc_tier || 'unknown';
-            const ccColor = ccTier === 'green' ? 'color:#4ade80' : ccTier === 'orange' ? 'color:#ffe600' : ccTier === 'red' ? 'color:#ef4444' : 'color:#888';
-            svcEl.appendChild(sectionRow('CC Tmp', ccTmp.cc_used_mb + 'MB / ' + ccTmp.cc_budget_mb + 'MB', ccColor));
-        }
-    }
-
-    // Infrastructure
-    const infra = data.infrastructure || {};
-    const infraEl = document.getElementById('infra-content');
-    infraEl.replaceChildren();
-    for (const [name, info] of Object.entries(infra)) {
-        // cc_tmp rendered in Services — skip here to avoid duplication
-        if (name === 'cc_tmp') continue;
-        const row = el('div', 'section-row');
-        const labelSpan = el('span', 'label');
-        const dot = el('span', 'status-dot ' + infraStatusClass(info));
-        labelSpan.appendChild(dot);
-        labelSpan.appendChild(document.createTextNode(name));
-        row.appendChild(labelSpan);
-        let detail = '';
-        if (info.latency_ms !== undefined) {
-            detail = (info.status || 'ok') + ' (' + Math.round(info.latency_ms) + 'ms)';
-        } else if (info.free_pct !== undefined) {
-            const freeVal = info.free_gb != null
-                ? info.free_gb.toFixed(1) + ' GB'
-                : info.free_mb != null
-                ? Math.round(info.free_mb) + ' MB'
-                : '?';
-            detail = freeVal + ' free (' + Math.round(info.free_pct) + '%)';
-        } else {
-            detail = info.status || 'ok';
-        }
-        row.appendChild(el('span', 'value', detail));
-        infraEl.appendChild(row);
-    }
-    if (!Object.keys(infra).length) infraEl.appendChild(el('div', null, 'No data'));
-    // CC dispatch policy — cached, refreshed every 5 min (setting rarely changes)
-    const _renderCcPolicy = (policy) => {
-        const row = el('div', 'section-row');
-        const label = el('span', 'label');
-        if (!policy) {
-            label.appendChild(el('span', 'status-dot status-unknown'));
-            label.appendChild(document.createTextNode('CC Background'));
-            row.appendChild(label);
-            row.appendChild(el('span', 'value', 'unknown'));
-        } else {
-            const dot = el('span', 'status-dot ' + (policy.cli ? 'status-healthy' : 'status-down'));
-            label.appendChild(dot);
-            label.appendChild(document.createTextNode('CC Background'));
-            row.appendChild(label);
-            const detail = policy.cli
-                ? (policy.approval ? 'Approval required' : 'Auto-dispatch')
-                : 'Disabled';
-            row.appendChild(el('span', 'value', detail));
-        }
-        infraEl.appendChild(row);
-    };
-    if (window._ccPolicyCache && (Date.now() - window._ccPolicyCacheTs) < 300000) {
-        _renderCcPolicy(window._ccPolicyCache);
-    } else {
-        fetch('/api/genesis/settings/autonomous_cli_policy').then(r => r.ok ? r.json() : null).then(d => {
-            if (d && d.config) {
-                window._ccPolicyCache = { cli: d.config.autonomous_cli_fallback_enabled, approval: d.config.manual_approval_required };
-                window._ccPolicyCacheTs = Date.now();
-            }
-            _renderCcPolicy(window._ccPolicyCache || null);
-        }).catch(() => _renderCcPolicy(null));
-    }
-
-    // Awareness Loop
-    const awareness = data.awareness || {};
-    const awarenessEl = document.getElementById('awareness-content');
-    if (awarenessEl) {
-        awarenessEl.replaceChildren();
-        const aStatus = awareness.status || 'unknown';
-        const aColor = aStatus === 'healthy' ? 'color:#4ade80' : aStatus === 'stale' ? 'color:#ffe600' : 'color:#6b7280';
-        awarenessEl.appendChild(sectionRow('Status', aStatus, aColor + ';font-weight:600'));
-        if (awareness.ticks_24h !== undefined) awarenessEl.appendChild(sectionRow('Ticks/24h', String(awareness.ticks_24h)));
-        if (awareness.time_since_last_tick_seconds !== undefined) {
-            const secs = Math.round(awareness.time_since_last_tick_seconds);
-            awarenessEl.appendChild(sectionRow('Last tick', secs < 120 ? secs + 's ago' : Math.round(secs / 60) + 'm ago'));
-        }
-        if (awareness.critical_bypasses_24h) {
-            awarenessEl.appendChild(sectionRow('Critical bypasses', String(awareness.critical_bypasses_24h), 'color:#ffe600'));
-        }
-    }
-
-    // Resilience — enriched with provider summary and per-category health
-    const resEl = document.getElementById('resilience-content');
-    if (resEl) {
-        resEl.replaceChildren();
-        const resObj = data.resilience || {};
-        const resState = resObj.level || resObj || 'not configured';
-        const resSummary = resObj.summary || '';
-        const rColor = (resState === 'L0' || resState === 'normal') ? 'color:#4ade80' : resState === 'not configured' ? 'color:#6b7280' : 'color:#ffe600';
-        const resLabel = resSummary ? `${resState} — ${resSummary}` : String(resState);
-        resEl.appendChild(sectionRow('State', resLabel, rColor + ';font-weight:600'));
-
-        // Provider summary: X/Y call sites healthy
-        // Excludes idle (groundwork) and disabled (no API key) sites — these
-        // are deployment config states, not infrastructure failures.
-        const sites = data.call_sites || {};
-        const siteIds = Object.keys(sites);
-        const activeSiteIds = siteIds.filter(id => sites[id].status !== 'idle' && sites[id].status !== 'disabled');
-        const totalSites = activeSiteIds.length;
-        const healthySites = activeSiteIds.filter(id => sites[id].status === 'healthy' || sites[id].status === 'active' || sites[id].status === 'warning').length;
-        if (totalSites > 0) {
-            const summaryColor = healthySites === totalSites ? 'color:#4ade80' : healthySites > totalSites * 0.5 ? 'color:#ffe600' : 'color:#ef4444';
-            resEl.appendChild(sectionRow('Call sites', healthySites + '/' + totalSites + ' healthy', summaryColor));
-        }
-
-        // Per-category health — also excludes idle/disabled
-        const catHealth = {};
-        for (const [siteId, info] of Object.entries(sites)) {
-            if (info.status === 'idle' || info.status === 'disabled') continue;
-            const meta = getMeta(siteId);
-            const cat = meta.category;
-            if (!catHealth[cat]) catHealth[cat] = { total: 0, healthy: 0 };
-            catHealth[cat].total++;
-            if (info.status === 'healthy' || info.status === 'active' || info.status === 'warning') catHealth[cat].healthy++;
-        }
-        const cats = Object.keys(catHealth).sort();
-        if (cats.length > 0) {
-            const catHeader = el('div', 'section-row');
-            catHeader.style.cssText = 'margin-top:8px;padding-bottom:4px;border-bottom:1px solid #1e293b';
-            catHeader.appendChild(el('span', 'label', 'By Category'));
-            catHeader.appendChild(el('span', 'value', ''));
-            resEl.appendChild(catHeader);
-
-            for (const cat of cats) {
-                const c = catHealth[cat];
-                const row = el('div', 'cat-health');
-                const nameSpan = el('span', 'cat-name', cat);
-                const countSpan = el('span', 'cat-count', c.healthy + '/' + c.total);
-                countSpan.style.color = c.healthy === c.total ? '#4ade80' : '#ffe600';
-                row.appendChild(nameSpan);
-                row.appendChild(countSpan);
-                resEl.appendChild(row);
-            }
-        }
-    }
-
-    // CC Sessions
-    const cc = data.cc_sessions || {};
-    const ccEl = document.getElementById('cc-content');
-    ccEl.replaceChildren();
-    if (cc.foreground) ccEl.appendChild(sectionRow('Foreground', (cc.foreground.active || 0) + ' active'));
-    if (cc.background) {
-        ccEl.appendChild(sectionRow('Background', (cc.background.active || 0) + ' active'));
-        if (cc.background.hourly_budget) ccEl.appendChild(sectionRow('Budget', cc.background.hourly_budget + '/hr'));
-    }
-    if (cc.failed_24h) ccEl.appendChild(sectionRow('Failed/24h', String(cc.failed_24h), 'color:#ef4444'));
-
-    // Queues
-    const queues = data.queues || {};
-    const qEl = document.getElementById('queue-content');
-    qEl.replaceChildren();
-    for (const [name, val] of Object.entries(queues)) {
-        // Skip non-scalar and array fields
-        if (typeof val !== 'number' && val !== null) continue;
-        // Format age fields as human-readable
-        if (name.endsWith('_age_seconds')) {
-            if (val == null) continue;
-            const label = name.replace(/_age_seconds$/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-            qEl.appendChild(sectionRow(label + ' Age', formatAge(val), 'color:#94a3b8'));
-            continue;
-        }
-        if (typeof val !== 'number') continue;
-        const label = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-        const color = val > 0 ? 'color:#ffe600' : 'color:#4ade80';
-        qEl.appendChild(sectionRow(label, String(val), color));
-    }
-    // Show pending deferred item details
-    if (queues.deferred_items && queues.deferred_items.length > 0) {
-        for (const item of queues.deferred_items) {
-            const desc = (item.site || item.type) + ' \u2014 ' + item.reason;
-            const age = formatAge(item.age_s) + (item.attempts > 0 ? ', ' + item.attempts + ' retries' : '');
-            qEl.appendChild(sectionRow(desc, age, 'color:#94a3b8;font-size:10px'));
-        }
-    }
-    // Discarded/expired items — iLO-style: always visible, expandable, user-clearable
-    renderDiscardedItems(qEl, queues);
-
-    // Cost
-    const cost = data.cost || {};
-    const costEl = document.getElementById('cost-content');
-    costEl.replaceChildren();
-    if (cost.monthly_usd !== undefined) costEl.appendChild(sectionRow('Month', '$' + cost.monthly_usd.toFixed(2)));
-    if (cost.daily_usd !== undefined) costEl.appendChild(sectionRow('Today', '$' + cost.daily_usd.toFixed(3)));
-    if (cost.budget_status) {
-        const cls = cost.budget_status === 'UNDER_LIMIT' ? 'badge-normal' : cost.budget_status === 'WARNING' ? 'badge-warning' : 'badge-critical';
-        const row = el('div', 'section-row');
-        row.appendChild(el('span', 'label', 'Status'));
-        row.appendChild(el('span', 'badge ' + cls, cost.budget_status));
-        costEl.appendChild(row);
-    }
+    document.getElementById('detail-overlay').classList.remove('open');
+    document.getElementById('detail-backdrop').classList.remove('open');
 }
 
 // ── Discarded items — iLO-style expand/clear ────────────────────────
@@ -1818,11 +1313,7 @@ async function clearDiscardedItem(itemId) {
     }
 }
 
-// ── Surplus — enriched ──────────────────────────────────────────────
-
-function updateSurplus(data) {
-    // Standalone surplus box removed — data shown in Surplus subsystem box
-}
+// ── Surplus detail (expandable) ─────────────────────────────────────
 
 async function loadSurplusDetail(container) {
     container.replaceChildren();
@@ -1946,7 +1437,7 @@ async function loadFollowUpsBadge(container) {
     }
 }
 
-// ── Subsystem group boxes ────────────────────────────────────────────
+// ── Subsystem group definitions ─────────────────────────────────────
 
 const SUBSYSTEM_GROUPS = {
     reflection: {
@@ -1969,10 +1460,10 @@ const SUBSYSTEM_GROUPS = {
     },
     executor: {
         name: 'Executor', domId: 'sub-executor',
+        // contingency_foreground and contingency_micro belong to Contingency group
         sites: ['27_pre_execution_assessment', '17_fresh_eyes_review',
                 '20_adversarial_counterargument', 'autonomous_executor_reasoning',
-                '7_ego_cycle', '7_ego_cycle_api',
-                'contingency_foreground', 'contingency_micro'],
+                '7_ego_cycle', '7_ego_cycle_api'],
     },
     learning: {
         name: 'Learning', domId: 'sub-learning',
@@ -1993,11 +1484,9 @@ const SUBSYSTEM_GROUPS = {
 };
 
 function aggregateStatus(statuses) {
-    // Filter out idle/disabled/unknown sites — these are config states, not
-    // operational health signals, and must not pull a subsystem down to red.
     const active = statuses.filter(s => s !== 'idle' && s !== 'disabled' && s !== 'unknown');
     if (active.length === 0) {
-        if (statuses.includes('disabled')) return 'idle';  // surface as gray
+        if (statuses.includes('disabled')) return 'idle';
         if (statuses.includes('idle')) return 'idle';
         return 'unknown';
     }
@@ -2029,40 +1518,66 @@ function renderSubsystemBox(group, data, groupKey) {
     const memberStatuses = group.sites.map(id => (callSites[id] || {}).status || 'unknown');
     const aggStatus = aggregateStatus(memberStatuses);
 
-    // Header with aggregate status dot
-    const header = el('div', 'sub-header');
+    // Header with aggregate status dot + count
+    const header = el('div', 'region-header');
     const aggDot = el('span', 'agg-dot');
     aggDot.style.background = statusDotColor(aggStatus);
     header.appendChild(aggDot);
     header.appendChild(el('h3', null, group.name));
+    const activeCount = memberStatuses.filter(s => s === 'healthy' || s === 'active').length;
+    header.appendChild(el('span', 'region-count', activeCount + '/' + group.sites.length));
     box.appendChild(header);
 
-    // Mini-dots for each member call site
-    const dotsContainer = el('div', 'mini-dots');
-    for (let i = 0; i < group.sites.length; i++) {
-        const siteId = group.sites[i];
+    // Dot grid
+    const grid = el('div', 'dot-grid');
+    for (const siteId of group.sites) {
         const siteData = callSites[siteId] || {};
         const meta = getMeta(siteId);
-        const label = el('span', 'mini-dot-label');
-        const dot = el('span', 'mini-dot');
-        const _st = siteData.status || 'unknown';
-        dot.style.background = statusDotColor(_st);
-        if (_st === 'healthy' || _st === 'active') dot.classList.add('mini-dot-healthy');
-        else if (_st === 'down') dot.classList.add('mini-dot-down');
-        else if (_st === 'degraded' || _st === 'warning') dot.classList.add('mini-dot-degraded');
-        dot.title = meta.name + ' — ' + _st;
-        dot.addEventListener('click', () => showDetail({ id: siteId, status: siteData.status || 'unknown', data: siteData }));
-        label.appendChild(dot);
-        label.appendChild(document.createTextNode(meta.name));
-        dotsContainer.appendChild(label);
+        const status = siteData.status || 'unknown';
+
+        const dot = el('div', 'grid-dot ' + gridDotClass(status));
+        dot.addEventListener('click', () => showDetail({ id: siteId, status, data: siteData }));
+
+        // Tooltip
+        const tip = el('div', 'dot-tip');
+        tip.appendChild(el('div', 'dot-tip-name', meta.name));
+        if (status === 'idle') {
+            tip.appendChild(el('div', 'dot-tip-row', 'Groundwork'));
+        } else if (status === 'disabled') {
+            tip.appendChild(el('div', 'dot-tip-row', 'No API key'));
+        } else {
+            tip.appendChild(el('div', 'dot-tip-row', status));
+        }
+        if (siteData.active_provider) {
+            tip.appendChild(el('div', 'dot-tip-row', siteData.active_provider));
+        }
+        if (siteData.chain_health) {
+            const apiChain = siteData.chain_health.filter(c => !c.is_cc);
+            const ccChain = siteData.chain_health.filter(c => c.is_cc);
+            const apiUp = apiChain.filter(c => {
+                const ps = c.probe_status;
+                if (ps) return ps === 'reachable';
+                return c.state !== 'open';
+            }).length;
+            let chainSummary = apiUp + '/' + apiChain.length + ' API';
+            if (ccChain.length > 0) {
+                const ccPs = ccChain[0].probe_status;
+                const ccOk = ccPs ? ccPs !== 'unreachable' : ccChain[0].state !== 'open';
+                chainSummary += ', CC ' + (ccOk ? 'up' : 'down');
+            }
+            tip.appendChild(el('div', 'dot-tip-row', chainSummary));
+        }
+        dot.appendChild(tip);
+
+        grid.appendChild(dot);
     }
-    box.appendChild(dotsContainer);
+    box.appendChild(grid);
 
     return box;
 }
 
 function updateSubsystemGrid(data) {
-    const grid = document.getElementById('subsystem-grid');
+    const grid = document.getElementById('monitor-grid');
     if (!grid) return;
     grid.style.display = 'grid';
     const callSites = data.call_sites || {};
@@ -2071,15 +1586,21 @@ function updateSubsystemGrid(data) {
         const box = renderSubsystemBox(group, data, key);
         if (!box) continue;
 
+        // Enrichment wrapper
+        const enrichment = el('div', 'region-enrichment');
+        let hasEnrichment = false;
+
         // Subsystem-specific enrichment from snapshot data
         if (key === 'reflection') {
             const aw = data.awareness || {};
-            if (aw.ticks_24h !== undefined) box.appendChild(sectionRow('Ticks/24h', String(aw.ticks_24h)));
-            if (aw.time_since_last_tick_seconds != null)
-                box.appendChild(sectionRow('Last Tick', formatAge(aw.time_since_last_tick_seconds) + ' ago'));
+            if (aw.ticks_24h !== undefined) { enrichment.appendChild(sectionRow('Ticks/24h', String(aw.ticks_24h))); hasEnrichment = true; }
+            if (aw.time_since_last_tick_seconds != null) {
+                enrichment.appendChild(sectionRow('Last Tick', formatAge(aw.time_since_last_tick_seconds) + ' ago'));
+                hasEnrichment = true;
+            }
             if (aw.depth_distribution_24h) {
                 const dist = Object.entries(aw.depth_distribution_24h).map(([k,v]) => k + ':' + v).join(', ');
-                if (dist) box.appendChild(sectionRow('Depths', dist));
+                if (dist) { enrichment.appendChild(sectionRow('Depths', dist)); hasEnrichment = true; }
             }
         }
         if (key === 'memory') {
@@ -2087,111 +1608,111 @@ function updateSubsystemGrid(data) {
             const mh = data.memory_health || {};
             const pm = data.proactive_memory || {};
 
-            // Header line: total vectors + links
             const links = mh.links || {};
             if (q.embedded_total || links.total) {
                 const parts = [];
                 if (q.embedded_total) parts.push(q.embedded_total + ' vectors');
                 if (links.total) parts.push(links.total.toLocaleString() + ' links');
-                box.appendChild(sectionRow('Store', parts.join(' · ')));
+                enrichment.appendChild(sectionRow('Store', parts.join(' \u00B7 ')));
+                hasEnrichment = true;
             }
 
-            // L1 Essential Knowledge
             const ek = mh.essential_knowledge || {};
             if (ek.age_hours !== null && ek.age_hours !== undefined) {
                 const age = ek.age_hours;
                 const c = age > 24 ? 'color:#ef4444' : age > 6 ? 'color:#ffe600' : 'color:#4ade80';
-                const size = ek.size_bytes ? ' · ' + (ek.size_bytes / 1024).toFixed(1) + 'KB' : '';
-                box.appendChild(sectionRow('L1 EK', age.toFixed(1) + 'h ago' + size, c));
+                const size = ek.size_bytes ? ' \u00B7 ' + (ek.size_bytes / 1024).toFixed(1) + 'KB' : '';
+                enrichment.appendChild(sectionRow('L1 EK', age.toFixed(1) + 'h ago' + size, c));
+                hasEnrichment = true;
             }
 
-            // L2 Proactive Hook
             if (pm.latency_ms !== undefined) {
                 const lat = pm.latency_ms;
                 const fts = pm.fts5_results || 0;
                 const vec = pm.vector_results || 0;
                 const fused = pm.fused_results || 0;
-                box.appendChild(sectionRow('L2 Hook', lat + 'ms · FTS:' + fts + ' Vec:' + vec + ' → ' + fused));
+                enrichment.appendChild(sectionRow('L2 Hook', lat + 'ms \u00B7 FTS:' + fts + ' Vec:' + vec + ' \u2192 ' + fused));
+                hasEnrichment = true;
             }
 
-            // Wing distribution
             const wings = mh.wings || [];
             if (wings.length > 0) {
                 const wStr = wings.slice(0, 5).map(w => w[0] + ':' + w[1]).join(' ');
-                box.appendChild(sectionRow('Wings', wStr));
+                enrichment.appendChild(sectionRow('Wings', wStr));
+                hasEnrichment = true;
             }
 
-            // Class distribution
             const classes = mh.classes || [];
             if (classes.length > 0) {
                 const cStr = classes.map(c => c[0] + ':' + c[1]).join(' ');
-                box.appendChild(sectionRow('Classes', cStr));
+                enrichment.appendChild(sectionRow('Classes', cStr));
+                hasEnrichment = true;
             }
 
-            // Confidence distribution
             const conf = mh.confidence || {};
             if (conf.high !== undefined) {
-                box.appendChild(sectionRow('Confidence', 'hi:' + conf.high + ' med:' + conf.medium + ' lo:' + conf.low));
+                enrichment.appendChild(sectionRow('Confidence', 'hi:' + conf.high + ' med:' + conf.medium + ' lo:' + conf.low));
+                hasEnrichment = true;
             }
 
-            // Link types (top)
             if (links.by_type && links.by_type.length > 0) {
                 const lStr = links.by_type.slice(0, 4).map(l => l[0] + ':' + l[1]).join(' ');
-                box.appendChild(sectionRow('Link Types', lStr));
+                enrichment.appendChild(sectionRow('Link Types', lStr));
+                hasEnrichment = true;
             }
 
-            // Extraction pipeline
             const ext = mh.extraction || {};
             if (ext.total_sessions !== undefined) {
                 const c = ext.coverage_pct >= 90 ? 'color:#4ade80' : ext.coverage_pct >= 50 ? 'color:#ffe600' : 'color:#ef4444';
-                box.appendChild(sectionRow('Extraction', ext.extracted + '/' + ext.total_sessions + ' · ' + ext.coverage_pct + '%', c));
+                enrichment.appendChild(sectionRow('Extraction', ext.extracted + '/' + ext.total_sessions + ' \u00B7 ' + ext.coverage_pct + '%', c));
+                hasEnrichment = true;
             }
 
-            // Code index
             const ci = mh.code_index || {};
             if (ci.modules) {
                 const age = ci.age_hours;
                 const c = age > 24 ? 'color:#ffe600' : 'color:#4ade80';
-                box.appendChild(sectionRow('Code Index', ci.modules + ' mod · ' + (ci.symbols || 0).toLocaleString() + ' sym · ' + (age ? age + 'h' : '?'), c));
+                enrichment.appendChild(sectionRow('Code Index', ci.modules + ' mod \u00B7 ' + (ci.symbols || 0).toLocaleString() + ' sym \u00B7 ' + (age ? age + 'h' : '?'), c));
+                hasEnrichment = true;
             }
 
-            // Embedding queue
-            if (q.pending_embeddings) box.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600'));
-            if (q.failed_embeddings) box.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444'));
+            if (q.pending_embeddings) { enrichment.appendChild(sectionRow('Pending', String(q.pending_embeddings), 'color:#ffe600')); hasEnrichment = true; }
+            if (q.failed_embeddings) { enrichment.appendChild(sectionRow('Failed', String(q.failed_embeddings), 'color:#ef4444')); hasEnrichment = true; }
 
-            // Growth
             if (mh.growth) {
                 const g = mh.growth;
-                if (g.last_7d !== undefined) box.appendChild(sectionRow('+7d', String(g.last_7d)));
-                if (g.avg_per_day_7d !== undefined) box.appendChild(sectionRow('Avg/day', String(g.avg_per_day_7d)));
+                if (g.last_7d !== undefined) { enrichment.appendChild(sectionRow('+7d', String(g.last_7d))); hasEnrichment = true; }
+                if (g.avg_per_day_7d !== undefined) { enrichment.appendChild(sectionRow('Avg/day', String(g.avg_per_day_7d))); hasEnrichment = true; }
             }
 
-            // Orphans
             if (mh.orphans && mh.orphans.orphan_pct !== undefined) {
                 const pct = mh.orphans.orphan_pct;
                 const c = pct > 50 ? 'color:#ef4444' : pct > 30 ? 'color:#ffe600' : 'color:#4ade80';
-                box.appendChild(sectionRow('Orphans', pct.toFixed(1) + '%', c));
+                enrichment.appendChild(sectionRow('Orphans', pct.toFixed(1) + '%', c));
+                hasEnrichment = true;
             }
         }
         if (key === 'surplus') {
             const s = data.surplus || {};
             if (s.status && s.status !== 'unknown') {
                 const c = s.status === 'idle' ? '#4ade80' : s.status === 'dispatching' ? '#ffe600' : '#888';
-                box.appendChild(sectionRow('Scheduler', s.status, 'color:' + c));
+                enrichment.appendChild(sectionRow('Scheduler', s.status, 'color:' + c));
+                hasEnrichment = true;
             }
-            if (s.queue_depth !== undefined) box.appendChild(sectionRow('Queue', String(s.queue_depth)));
-            if (s.tasks_completed_24h !== undefined) box.appendChild(sectionRow('Done/24h', String(s.tasks_completed_24h)));
-            if (s.tasks_failed_24h) box.appendChild(sectionRow('Failed/24h', String(s.tasks_failed_24h), 'color:#ef4444'));
+            if (s.queue_depth !== undefined) { enrichment.appendChild(sectionRow('Queue', String(s.queue_depth))); hasEnrichment = true; }
+            if (s.tasks_completed_24h !== undefined) { enrichment.appendChild(sectionRow('Done/24h', String(s.tasks_completed_24h))); hasEnrichment = true; }
+            if (s.tasks_failed_24h) { enrichment.appendChild(sectionRow('Failed/24h', String(s.tasks_failed_24h), 'color:#ef4444')); hasEnrichment = true; }
 
             // Expandable detail toggle
             const toggle = el('div', 'surplus-detail-toggle');
             toggle.appendChild(el('span', null, 'Details'));
             const arrow = el('span', 'arrow', '\u25B6');
             toggle.appendChild(arrow);
-            box.appendChild(toggle);
+            enrichment.appendChild(toggle);
+            hasEnrichment = true;
 
             const detailContent = el('div', 'surplus-detail-content');
-            box.appendChild(detailContent);
+            enrichment.appendChild(detailContent);
 
             toggle.addEventListener('click', function() {
                 const isOpen = detailContent.classList.toggle('open');
@@ -2204,25 +1725,28 @@ function updateSubsystemGrid(data) {
         }
         if (key === 'outreach') {
             const o = data.outreach_stats || {};
-            if (o.total !== undefined) box.appendChild(sectionRow('Sent (7d)', String(o.total)));
-            if (o.delivery_rate != null) box.appendChild(sectionRow('Delivery', Math.round(o.delivery_rate * 100) + '%'));
-            if (o.open_rate != null) box.appendChild(sectionRow('Open Rate', Math.round(o.open_rate * 100) + '%'));
+            if (o.total !== undefined) { enrichment.appendChild(sectionRow('Sent (7d)', String(o.total))); hasEnrichment = true; }
+            if (o.delivery_rate != null) { enrichment.appendChild(sectionRow('Delivery', Math.round(o.delivery_rate * 100) + '%')); hasEnrichment = true; }
+            if (o.open_rate != null) { enrichment.appendChild(sectionRow('Open Rate', Math.round(o.open_rate * 100) + '%')); hasEnrichment = true; }
         }
         if (key === 'contingency') {
             const cc = data.cc_sessions || {};
             if (cc.realtime_status) {
                 const c = cc.realtime_status === 'NORMAL' ? '#4ade80' : '#ffe600';
-                box.appendChild(sectionRow('CC Status', cc.realtime_status, 'color:' + c));
+                enrichment.appendChild(sectionRow('CC Status', cc.realtime_status, 'color:' + c));
+                hasEnrichment = true;
             }
         }
         if (key === 'learning') {
-            // Show last calibration from call site data
             const calSite = callSites['30_triage_calibration'] || {};
             if (calSite.last_run_at) {
                 const age = Math.round((Date.now() - new Date(calSite.last_run_at).getTime()) / 1000);
-                box.appendChild(sectionRow('Last Calibration', formatAge(age) + ' ago'));
+                enrichment.appendChild(sectionRow('Last Calibration', formatAge(age) + ' ago'));
+                hasEnrichment = true;
             }
         }
+
+        if (hasEnrichment) box.appendChild(enrichment);
     }
 }
 
@@ -2279,9 +1803,7 @@ async function fetchHealth() {
         lastFetchTime = Date.now();
 
         document.getElementById('loading').style.display = 'none';
-        buildNeuralMap(lastData);
-        updateSidePanel(lastData);
-        updateSurplus(lastData);
+        buildOpsStrip(lastData);
         updateSubsystemGrid(lastData);
         updateHeaderBadges(lastData);
     } catch (e) {
