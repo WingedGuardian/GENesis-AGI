@@ -4,8 +4,9 @@ Provides lightweight, on-demand browser tools with lazy initialization.
 The browser launches only when the first navigation/interaction tool is called,
 stays warm for the session, and shuts down when the MCP server exits.
 
-Uses a persistent Chrome profile at ~/.genesis/browser-profile/ so cookies,
-localStorage, and login sessions survive across MCP restarts.
+Primary browser: Camoufox (anti-detection Firefox). Persistent profile at
+~/.genesis/camoufox-profile/ so cookies, localStorage, and login sessions
+survive across MCP restarts. Chromium is the fallback for compatibility.
 
 Token-efficient: returns accessibility tree snapshots (YAML-like text) instead
 of raw DOM or screenshots by default.
@@ -21,7 +22,8 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
-_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
+_PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+_CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
 _playwright = None
@@ -69,17 +71,18 @@ async def async_cleanup():
 
 
 async def _ensure_browser():
-    """Lazily initialize the Playwright browser with persistent profile.
+    """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if playwright is not installed.
+    Returns the active page. Raises ImportError if camoufox is not installed.
     In collaborate mode, launches headed on virtual display :99 for VNC sharing.
+    Uses anti-detection Firefox by default for all browsing.
     """
-    global _playwright, _context, _page
+    global _stealth_cm, _stealth_browser, _stealth_page
 
-    if _page is not None:
-        return _page
+    if _stealth_page is not None:
+        return _stealth_page
 
-    from playwright.async_api import async_playwright
+    from camoufox.async_api import AsyncCamoufox
 
     _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -93,47 +96,64 @@ async def _ensure_browser():
     elif "DISPLAY" in os.environ:
         del os.environ["DISPLAY"]
 
+    _stealth_cm = AsyncCamoufox(
+        headless=not headed,
+        persistent_context=True,
+        user_data_dir=str(_PROFILE_DIR),
+    )
+    _stealth_browser = await _stealth_cm.__aenter__()
+    # With persistent_context, browser IS the context
+    _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+    mode_str = "headed (collaborate)" if headed else "headless"
+    logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
+    return _stealth_page
+
+
+async def _ensure_chromium_fallback():
+    """Lazily initialize Playwright Chromium as fallback browser.
+
+    Use only when Camoufox fails on a specific site. Persistent profile at
+    ~/.genesis/browser-profile/ (separate from Camoufox profile).
+    """
+    global _playwright, _context, _page
+
+    if _page is not None:
+        return _page
+
+    from playwright.async_api import async_playwright
+
+    _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+    headed = _collaborate_mode
+    if headed:
+        os.environ["DISPLAY"] = _VNC_DISPLAY
+
     _playwright = await async_playwright().start()
     _context = await _playwright.chromium.launch_persistent_context(
-        user_data_dir=str(_PROFILE_DIR),
+        user_data_dir=str(_CHROMIUM_PROFILE_DIR),
         headless=not headed,
         args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
         + (["--start-maximized"] if headed else []),
-        viewport={"width": 1920, "height": 1080} if headed else None,
+        viewport={"width": 1280, "height": 720} if headed else None,
     )
     _page = _context.pages[0] if _context.pages else await _context.new_page()
     mode_str = "headed (collaborate)" if headed else "headless"
-    logger.info("Browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
+    logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
     return _page
-
-
-async def _ensure_stealth_browser():
-    """Lazily initialize Camoufox for anti-detection browsing.
-
-    Returns the active stealth page. Raises ImportError if camoufox is not installed.
-    """
-    global _stealth_cm, _stealth_browser, _stealth_page
-
-    if _stealth_page is not None:
-        return _stealth_page
-
-    from camoufox.async_api import AsyncCamoufox
-
-    _stealth_cm = AsyncCamoufox(headless=True)
-    _stealth_browser = await _stealth_cm.__aenter__()
-    _stealth_page = await _stealth_browser.new_page()
-    logger.info("Camoufox stealth browser launched")
-    return _stealth_page
 
 
 async def _get_page(stealth: bool = False):
     """Get the appropriate browser page based on mode.
 
+    Default (stealth=False): Camoufox (anti-detection, primary).
+    Fallback (stealth=True): Chromium (for Camoufox-incompatible sites).
+    Note: 'stealth' param is inverted from its old meaning for API compat.
+
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
     use whichever browser was last navigated.
     """
     global _active_page
-    _active_page = await _ensure_stealth_browser() if stealth else await _ensure_browser()
+    _active_page = await _ensure_chromium_fallback() if stealth else await _ensure_browser()
     return _active_page
 
 
@@ -282,11 +302,11 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
 async def browser_navigate(url: str, stealth: bool = False) -> dict:
     """Navigate to a URL and return an accessibility tree snapshot.
 
-    The browser uses a persistent profile at ~/.genesis/browser-profile/ so
-    cookies and login sessions survive across calls.
+    Uses Camoufox (anti-detection Firefox) by default with a persistent profile
+    at ~/.genesis/camoufox-profile/ so cookies and logins survive across calls.
 
-    Set stealth=True to use Camoufox (anti-detection Firefox) for sites that
-    block automated browsers. Stealth mode uses a separate profile.
+    Set stealth=True to use Chromium fallback for sites incompatible with
+    Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
     """
     return await _impl_browser_navigate(url, stealth)
 
