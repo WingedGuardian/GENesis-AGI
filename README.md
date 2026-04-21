@@ -96,7 +96,7 @@ Genesis serves as a layer that sits between Claude Code (as well as other AI mod
 
 ## Getting started
 
-**Alpha release — you're joining the build.** Genesis v3-alpha is architecturally complete but actively stabilizing. You will encounter experimental features, edge cases that need hardening, and subsystems that are 95% wired but need that last touch. This is by design — Genesis is being built in the open, and every person who installs it, hits a rough edge, and fixes it (or reports it) is making the system better. The good news: you can tell Genesis to diagnose and fix its own issues via Claude Code. If you're the kind of engineer who finds that exciting rather than frustrating, you're exactly who this project is for. If you want a polished turnkey experience, check back when we hit beta.
+**Alpha release — you're joining the build.** Genesis v3-alpha is architecturally complete but actively stabilizing. You will encounter experimental features, edge cases that need hardening, and subsystems that are 95% wired but need that last touch. This is by design — Genesis is being built in the open, and every person who installs it, hits a rough edge, and fixes it (or reports it) contributes to making the system better. The good news: you can simply tell Genesis to diagnose and fix its own issues (it's Claude Code under the hood afterall). If you're the kind of engineer who finds that exciting rather than frustrating, you're exactly who this project is for. If you want a polished turnkey experience, check back when we hit beta.
 
 ### System requirements
 
