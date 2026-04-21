@@ -333,6 +333,16 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         await self._run_init_step_async("memory", self._init_memory)
 
+        # Recover knowledge uploads stuck in 'processing' from prior crash
+        if self._db is not None:
+            try:
+                from genesis.knowledge.ingest_upload import recover_stale_processing
+                recovered = await recover_stale_processing()
+                if recovered:
+                    logger.info("Recovered %d stale knowledge uploads", recovered)
+            except Exception:
+                logger.warning("Knowledge upload recovery failed", exc_info=True)
+
         if _full:
             await self._run_init_step_async("pipeline", self._init_pipeline)
 

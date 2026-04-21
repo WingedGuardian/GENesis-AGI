@@ -136,6 +136,7 @@
           sidebarCollapsed: false,
           _resizing: false,
         },
+        fileUpload: { dragging: false, uploading: false, error: null },
 
         // ── Tasks tab state ────────────────────────────────────────
         taskList: [],
@@ -164,11 +165,16 @@
           projectType: "",
           domain: "",
           purpose: "",
+          context: "",
+          mode: "extract",
           error: null,
         },
         knowledgeUploads: [],
         knowledgeTaxonomy: { project_types: [], domains: [] },
         _uploadPollInterval: null,
+
+        // ── Confirm modal state ──────────────────────────────────
+        confirmModal: { show: false, title: '', message: '', _resolve: null },
 
         // ── Backup tab state ──────────────────────────────────────
         backupStatus: null,
@@ -588,6 +594,27 @@
           } catch (e) { alert("Save failed: " + e.message); }
           this.fileBrowser.saving = false;
         },
+        async uploadFile(event) {
+          event.preventDefault();
+          this.fileUpload.dragging = false;
+          this.fileUpload.error = null;
+          const files = event.dataTransfer?.files || event.target?.files;
+          if (!files || files.length === 0) return;
+          this.fileUpload.uploading = true;
+          try {
+            const form = new FormData();
+            form.append("file", files[0]);
+            const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.fetchFiles(data.path.substring(0, data.path.lastIndexOf("/")));
+            } else {
+              const err = resp ? await resp.json() : {};
+              this.fileUpload.error = err.error || "Upload failed";
+            }
+          } catch (e) { this.fileUpload.error = "Upload failed: " + e.message; }
+          this.fileUpload.uploading = false;
+        },
         _startFileBrowserResize(e, sidebar) {
           this.fileBrowser._resizing = true;
           const startX = e.clientX;
@@ -679,7 +706,6 @@
           } catch (e) { console.warn("Memory detail failed:", e); }
         },
         async deleteMemory(memId) {
-          if (!confirm("Delete this memory from all layers?")) return;
           try {
             await fetchApi(`/api/genesis/memory/${memId}`, { method: "DELETE" });
             this.memoryDetail = null;
@@ -724,7 +750,6 @@
           } catch (e) { console.warn("Knowledge detail failed:", e); }
         },
         async deleteKnowledge(unitId) {
-          if (!confirm("Delete this knowledge unit?")) return;
           try {
             await fetchApi(`/api/genesis/knowledge/${unitId}`, { method: "DELETE" });
             this.knowledgeDetail = null;
@@ -783,6 +808,8 @@
                 project_type: u.projectType.trim(),
                 domain: u.domain.trim() || "auto",
                 purpose: u.purpose.trim() || null,
+                context: u.context.trim() || "",
+                mode: u.mode || "extract",
               }),
             });
             if (!resp.ok) {
@@ -800,7 +827,7 @@
           const uploadId = this.knowledgeUpload.uploadId;
           this.knowledgeUpload = {
             dragging: false, file: null, uploading: false, confirm: false,
-            uploadId: null, projectType: "", domain: "", purpose: "", error: null,
+            uploadId: null, projectType: "", domain: "", purpose: "", context: "", mode: "extract", error: null,
           };
           // Clean up server-side file + DB record
           if (uploadId) {
@@ -836,6 +863,17 @@
           if (bytes < 1024) return bytes + " B";
           if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
           return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+        },
+
+        // ── Confirm modal ─────────────────────────────────────
+        showConfirm(title, message) {
+          return new Promise(resolve => {
+            this.confirmModal = { show: true, title, message, _resolve: resolve };
+          });
+        },
+        _confirmModalResolve(result) {
+          if (this.confirmModal._resolve) this.confirmModal._resolve(result);
+          this.confirmModal = { show: false, title: '', message: '', _resolve: null };
         },
 
         // ── Backup tab fetches ───────────────────────────────────
@@ -907,7 +945,7 @@
         },
         async applyUpdate() {
           const msg = "Apply Genesis update?\n\nA background session will:\n\u2022 Back up data\n\u2022 Merge latest code\n\u2022 Resolve trivial conflicts automatically\n\u2022 Run migrations & restart services\n\u2022 Verify health\n\nContinue?";
-          if (!confirm(msg)) return;
+          if (!(await this.showConfirm("Apply Update", msg))) return;
           this._updating = true;
           try {
             await fetchApi("/api/genesis/updates/apply", {
@@ -965,7 +1003,7 @@
           }, 5000);
         },
         async resolveConflicts() {
-          if (!confirm("Spawn an Opus session to resolve deep merge conflicts?\n\nThis may take a few minutes.")) return;
+          if (!(await this.showConfirm("Resolve Conflicts", "Spawn an Opus session to resolve deep merge conflicts?\n\nThis may take a few minutes."))) return;
           this._resolvingConflicts = true;
           try {
             const resp = await fetchApi("/api/genesis/updates/resolve", { method: "POST" });
@@ -1432,7 +1470,7 @@
           const action = newState ? "Pause" : "Resume";
           const pauseMsg = "Pause Genesis?\n\nThis will stop ALL background activity:\n• Reflections\n• Surplus tasks\n• Outreach\n• Inbox monitoring\n\nConversations still work but without background enrichment.\nYou must manually resume via this button or /pause off in Telegram.";
           const resumeMsg = "Resume Genesis?\n\nAll background activity will restart\n(reflections, surplus tasks, outreach, inbox monitoring).";
-          if (!confirm(newState ? pauseMsg : resumeMsg)) return;
+          if (!(await this.showConfirm(action + " Genesis", newState ? pauseMsg : resumeMsg))) return;
           this.pauseState.toggling = true;
           try {
             const resp = await fetchApi("/api/genesis/pause", {
@@ -1450,7 +1488,7 @@
         // Service restarts
         async restartBridge() {
           const label = this.health.services?.bridge?.service_label || "Genesis";
-          if (!confirm(`Restart Genesis ${label}?`)) return;
+          if (!(await this.showConfirm("Restart", `Restart Genesis ${label}?`))) return;
           this._restartingBridge = true;
           try {
             const resp = await fetchApi("/api/genesis/restart/bridge", { method: "POST" });
@@ -1475,7 +1513,7 @@
 
         async restartHostFramework() {
           const name = this.health.services?.host_framework?.name || "host framework";
-          if (!confirm(`Restart ${name}? The dashboard will reload.`)) return;
+          if (!(await this.showConfirm("Restart", `Restart ${name}? The dashboard will reload.`))) return;
           this._restartingHF = true;
           try {
             fetchApi("/api/genesis/restart/host-framework", { method: "POST" });
@@ -1782,7 +1820,7 @@
 
         async deleteConfigFile() {
           if (!this.configModal.deletable) return;
-          if (!confirm(`Delete ${this.configModal.name}? This cannot be undone.`)) return;
+          if (!(await this.showConfirm("Delete File", `Delete ${this.configModal.name}? This cannot be undone.`))) return;
           try {
             const resp = await fetchApi(
               `/api/genesis/config-files/${this.configModal.name.split('/').map(encodeURIComponent).join('/')}`,
@@ -1800,8 +1838,8 @@
           }
         },
 
-        closeConfigModal() {
-          if (this.configModal.dirty && !confirm("You have unsaved changes. Discard?")) return;
+        async closeConfigModal() {
+          if (this.configModal.dirty && !(await this.showConfirm("Discard Changes", "You have unsaved changes. Discard?"))) return;
           if (this._configEditor) { this._configEditor.destroy(); this._configEditor = null; }
           this.configModal.open = false;
           this.configModal.dirty = false;
@@ -6308,6 +6346,19 @@
         File Browser
       </div>
       <div class="panel-body">
+        <!-- File upload drop zone -->
+        <div @dragover.prevent="$store.genesisDashboard.fileUpload.dragging = true"
+             @dragleave.prevent="$store.genesisDashboard.fileUpload.dragging = false"
+             @drop.prevent="$store.genesisDashboard.uploadFile($event)"
+             @click="$refs.fileUploadInput.click()"
+             :style="`border: 1px dashed ${$store.genesisDashboard.fileUpload.dragging ? 'var(--color-accent)' : 'var(--color-border)'}; border-radius: 6px; padding: 0.6rem 1rem; text-align: center; cursor: pointer; margin-bottom: 0.75rem; transition: border-color .2s; background: ${$store.genesisDashboard.fileUpload.dragging ? 'rgba(99,102,241,.06)' : 'transparent'};`">
+          <span style="font-size: .8rem; color: var(--color-text-secondary);"
+                x-text="$store.genesisDashboard.fileUpload.uploading ? 'Uploading...' : 'Drop files here to upload — no processing, just storage'"></span>
+          <input type="file" x-ref="fileUploadInput" style="display:none" @change="$store.genesisDashboard.uploadFile($event)">
+        </div>
+        <template x-if="$store.genesisDashboard.fileUpload.error">
+          <div style="color: var(--color-error-text); font-size: .8rem; margin-bottom: .5rem;" x-text="$store.genesisDashboard.fileUpload.error"></div>
+        </template>
         <!-- Breadcrumb / path bar -->
         <div style="display:flex; gap:0.3rem; align-items:center; margin-bottom:0.75rem; font-size:0.75rem; flex-wrap:wrap;">
           <template x-if="$store.genesisDashboard.fileBrowser.parent">
@@ -6603,7 +6654,7 @@
           <div class="card" style="margin-bottom:1rem; border:1px solid var(--color-accent);">
             <div style="padding:0.75rem; display:flex; justify-content:space-between; align-items:center;">
               <span style="font-size:0.8rem; color:var(--color-accent);" x-text="'ID: ' + $store.genesisDashboard.memoryDetail.memory_id"></span>
-              <div style="display:flex; gap:0.5rem;">
+              <div style="display:flex; gap:0.5rem; justify-content:space-between;">
                 <button @click="$store.genesisDashboard.deleteMemory($store.genesisDashboard.memoryDetail.memory_id)"
                         style="background:rgba(239,154,154,0.2); color:#ef9a9a; border:1px solid rgba(239,154,154,0.3); padding:0.25rem 0.5rem; border-radius:4px; cursor:pointer; font-size:0.75rem;">Delete</button>
                 <button @click="$store.genesisDashboard.memoryDetail = null"
@@ -6668,6 +6719,7 @@
           <span class="material-symbols-outlined" style="font-size: 2rem; color: var(--color-text-secondary);">upload_file</span>
           <div style="margin-top: .5rem; color: var(--color-text-secondary);" x-text="$store.genesisDashboard.knowledgeUpload.uploading ? 'Uploading...' : 'Drop files here or click to browse'"></div>
           <div style="font-size: .8em; color: var(--color-text-secondary); margin-top: .25rem;">PDF, text, audio, video — up to 500 MB</div>
+          <div style="font-size: .7em; color: var(--color-text-secondary); margin-top: .15rem; opacity: .7;">Stores to knowledge base for long-term recall. For simple file sharing, use the Files tab.</div>
           <input type="file" x-ref="knowledgeFileInput" style="display:none"
                  @change="$store.genesisDashboard.handleKnowledgeFileDrop($event)">
         </div>
@@ -6683,6 +6735,26 @@
               <span x-text="$store.genesisDashboard.knowledgeUpload.file?.name"></span>
               (<span x-text="$store.genesisDashboard._formatFileSize($store.genesisDashboard.knowledgeUpload.file?.size)"></span>)
             </div>
+            <!-- Context message -->
+            <div style="margin-bottom: .75rem;">
+              <label style="font-size: .8em; color: var(--color-text-secondary);">Context</label>
+              <textarea x-model="$store.genesisDashboard.knowledgeUpload.context" rows="3"
+                        placeholder="Tell Genesis about this document — what is it, how should it be understood? (optional)"
+                        style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px; font-size: .85rem; resize: vertical;"></textarea>
+            </div>
+            <!-- Processing mode -->
+            <div style="margin-bottom: .75rem; display: flex; gap: 1rem;">
+              <label style="font-size: .8em; cursor: pointer; display: flex; align-items: center; gap: .3rem;">
+                <input type="radio" value="extract" x-model="$store.genesisDashboard.knowledgeUpload.mode">
+                <span style="color: var(--color-text-secondary);">Extract &amp; distill</span>
+                <span style="font-size: .7em; color: var(--color-text-secondary); opacity: .7;">— AI breaks into searchable concepts</span>
+              </label>
+              <label style="font-size: .8em; cursor: pointer; display: flex; align-items: center; gap: .3rem;">
+                <input type="radio" value="store" x-model="$store.genesisDashboard.knowledgeUpload.mode">
+                <span style="color: var(--color-text-secondary);">Store as-is</span>
+                <span style="font-size: .7em; color: var(--color-text-secondary); opacity: .7;">— full document, one unit, instant</span>
+              </label>
+            </div>
             <div style="display: flex; gap: .5rem; margin-bottom: .75rem;">
               <div style="flex: 1;">
                 <label style="font-size: .8em; color: var(--color-text-secondary);">Project Type *</label>
@@ -6693,6 +6765,7 @@
                     <option :value="pt"></option>
                   </template>
                 </datalist>
+                <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Workspace scope (e.g., 'genesis', 'career')</div>
               </div>
               <div style="flex: 1;">
                 <label style="font-size: .8em; color: var(--color-text-secondary);">Domain</label>
@@ -6703,12 +6776,14 @@
                     <option :value="d"></option>
                   </template>
                 </datalist>
+                <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Topic filter. Leave 'auto' for AI detection.</div>
               </div>
             </div>
             <div style="margin-bottom: .75rem;">
               <label style="font-size: .8em; color: var(--color-text-secondary);">Purpose (optional, comma-separated)</label>
               <input type="text" x-model="$store.genesisDashboard.knowledgeUpload.purpose"
                      placeholder="e.g. resume-prep, cloud-eng" style="width: 100%; padding: .4rem; background: var(--color-background); border: 1px solid var(--color-border); color: var(--color-text); border-radius: 4px;">
+              <div style="font-size: .65em; color: var(--color-text-secondary); margin-top: 2px; opacity: .7;">Usage tags (e.g., 'planning', 'reference')</div>
             </div>
             <template x-if="$store.genesisDashboard.knowledgeUpload.error">
               <div style="color: var(--color-error-text); margin-bottom: .5rem; font-size: .9em;" x-text="$store.genesisDashboard.knowledgeUpload.error"></div>
@@ -6739,7 +6814,8 @@
               </div>
               <div style="display: flex; align-items: center; gap: .5rem;">
                 <template x-if="upload.status === 'processing'">
-                  <span class="badge" style="background: var(--color-warning-text); color: #000;">processing</span>
+                  <span class="badge" style="background: var(--color-warning-text); color: #000;"
+                        x-text="upload.chunks_total ? 'processing ' + (upload.chunks_done || 0) + '/' + upload.chunks_total : 'processing'"></span>
                 </template>
                 <template x-if="upload.status === 'completed'">
                   <span class="badge" style="background: var(--color-primary); color: #fff;" x-text="'completed (' + (JSON.parse(upload.unit_ids || '[]')).length + ' units)'"></span>
@@ -6883,7 +6959,7 @@
             </template>
             <div style="white-space: pre-wrap; font-family: monospace; font-size: .85em; background: var(--color-background); padding: 1rem; border-radius: 4px; margin: .75rem 0;"
                  x-text="$store.genesisDashboard.knowledgeDetail.body"></div>
-            <div style="display: flex; gap: .5rem; justify-content: flex-end; margin-top: 1rem;">
+            <div style="display: flex; gap: .5rem; justify-content: space-between; margin-top: 1rem;">
               <button class="btn-sm btn-danger" @click="$store.genesisDashboard.deleteKnowledge($store.genesisDashboard.knowledgeDetail.id)">Delete</button>
               <button class="btn-sm" @click="$store.genesisDashboard.knowledgeDetail = null">Close</button>
             </div>
@@ -7132,6 +7208,24 @@
         </template>
       </div>
     </div>
+
+    <!-- ═══════════════════════════════════════════════════════════════
+         Confirm Modal (replaces window.confirm)
+         ═══════════════════════════════════════════════════════════════ -->
+    <template x-if="$store.genesisDashboard.confirmModal.show">
+      <div style="position:fixed; inset:0; z-index:9999; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.6);"
+           @click.self="$store.genesisDashboard._confirmModalResolve(false)">
+        <div style="background:var(--color-bg-secondary); border:1px solid var(--color-border); border-radius:8px; padding:1.5rem; max-width:420px; width:90%; box-shadow:0 8px 32px rgba(0,0,0,0.4);">
+          <h3 style="margin:0 0 0.75rem 0; font-size:1rem;" x-text="$store.genesisDashboard.confirmModal.title"></h3>
+          <p style="color:var(--color-text-secondary); font-size:0.85rem; white-space:pre-line; margin:0 0 1.25rem 0; line-height:1.5;"
+             x-text="$store.genesisDashboard.confirmModal.message"></p>
+          <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
+            <button class="btn-sm" style="opacity:.7;" @click="$store.genesisDashboard._confirmModalResolve(false)">Cancel</button>
+            <button class="btn-sm" style="background:var(--color-accent); color:#fff;" @click="$store.genesisDashboard._confirmModalResolve(true)">Confirm</button>
+          </div>
+        </div>
+      </div>
+    </template>
 
   <!-- Extra bottom padding so content isn't hidden behind the fixed footer -->
   <div style="height: 50px;"></div>

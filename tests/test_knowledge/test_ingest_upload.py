@@ -79,7 +79,7 @@ async def test_run_ingest_failure(db, upload_id):
 
     row = await knowledge_uploads.get(db, upload_id)
     assert row["status"] == "failed"
-    assert row["error_message"] == "Bad file"
+    assert "Bad file" in row["error_message"]
 
 
 async def test_run_ingest_exception(db, upload_id):

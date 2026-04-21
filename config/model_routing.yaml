@@ -255,6 +255,7 @@ call_sites:
     default_paid: true
   8_ego_compaction:
     chain:
+    - cerebras-qwen
     - mistral-large-free
     - groq-free
     - gemini-free
@@ -264,6 +265,7 @@ call_sites:
     - mistral-large-free
     - groq-free
     - gemini-free
+    - cerebras-qwen
     - openrouter-free
   10_cognitive_state:
     chain:
@@ -279,6 +281,7 @@ call_sites:
     retry_profile: background
   12_surplus_brainstorm:
     chain:
+    - cerebras-qwen
     - gemini-free
     - mistral-large-free
     - groq-free
@@ -406,6 +409,7 @@ call_sites:
     - mistral-large-free
     - groq-free
     - gemini-free
+    - cerebras-qwen
     - openrouter-free
     retry_profile: background
     description: "Knowledge pipeline — distill raw content into structured knowledge units"
@@ -414,11 +418,13 @@ call_sites:
     - mistral-large-free
     - gemini-free
     - groq-free
+    - cerebras-qwen
     - openrouter-free
     retry_profile: background
     description: "Resume review Pass 1 — native LLM structural analysis"
   42_resume_review_pass2:
     chain:
+    - cerebras-qwen
     - mistral-large-free
     - gemini-free
     - groq-free
