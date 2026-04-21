@@ -30,7 +30,6 @@ def _launch(pw):
     context = pw.chromium.launch_persistent_context(
         user_data_dir=str(USER_DATA_DIR),
         headless=True,
-        executable_path="/usr/bin/google-chrome",
         args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
     )
     page = context.pages[0] if context.pages else context.new_page()
