@@ -96,7 +96,8 @@ class TestRegistration:
 
     def test_register_defaults(self):
         reg = RemediationRegistry()
-        register_defaults(reg)
+        with patch("genesis.env.ollama_enabled", return_value=True):
+            register_defaults(reg)
         assert len(reg.actions) == len(DEFAULT_REMEDIATIONS)
         names = {a.name for a in reg.actions}
         assert "qdrant_restart" in names

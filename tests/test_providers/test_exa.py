@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip("exa_py")
+
 from genesis.providers.exa_adapter import ExaAdapter
 from genesis.providers.protocol import ToolProvider
 from genesis.providers.types import (

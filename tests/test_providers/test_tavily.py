@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+pytest.importorskip("tavily")
+
 from genesis.providers.protocol import ToolProvider
 from genesis.providers.tavily_adapter import TavilyAdapter
 from genesis.providers.types import (
