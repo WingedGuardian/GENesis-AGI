@@ -7,6 +7,60 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a8] - 2026-04-21
+
+21-commit release. Themes: **knowledge dashboard UX**, **browser
+automation upgrade**, **cross-session awareness**, and **CI/security
+hardening**.
+
+### Added
+
+- **Knowledge dashboard overhaul** (#104) — in-page confirm modals
+  (immune to browser dialog blocking), drag-drop file upload, processing
+  mode toggle (extract vs store-as-is), parallel distillation pipeline
+  (4x concurrent), and crash recovery for stuck uploads.
+- **File modification audit trail** (#109) — PostToolUse hook records all
+  Write/Edit operations with session ID, file path, and file hash. Query
+  "what session modified this file?" in one SQL call.
+- **Browser collaborative mode** (#107) — side-panel extension for
+  real-time observation of automated browser sessions.
+- **Cross-session awareness** (#97) — awareness loop now tracks
+  observations across sessions with TTL-based hygiene.
+- **Output safety convention** (#112) — pre-commit hook warns when
+  non-code files are staged, directing to `~/.genesis/output/`.
+
+### Changed
+
+- **Camoufox as primary browser** (#108) — anti-fingerprint browser now
+  default for all automation. Chromium available as fallback.
+- **Neural monitor grid redesign** (#106) — reorganized dashboard grid
+  layout for better information density.
+- **Proactive memory enrichment** (#95, #96) — hook results now include
+  age, wing, and ID for expand-without-re-search. Limits bumped to
+  300/200 chars with smart sentence truncation.
+- **Cerebras-Qwen routing** (#104) — promoted to 6 call site chains
+  (3 primary, 3 fallback) for surplus and knowledge workloads.
+- **Sweep infrastructure** (#98, #102) — provider registry cleanup, MCP
+  audit, CLAUDE.md compression.
+
+### Fixed
+
+- **CI test suite** (#110) — resolved 30 pre-existing failures. Skip
+  guards for optional dependencies, mock fixes, routing assertion updates.
+- **Security hardening** (#111, #113) — prevent stack trace exposure in
+  file API responses, clear-text logging of sensitive reference data.
+- **Surplus Telegram delivery** (#105) — surplus-originated reflections
+  now reach Telegram instead of silently completing.
+- **Approval system** (#101) — micro-reflection salience gate removed
+  (user sees everything), approval_request_id now populated on
+  cli_approved.
+- **Stale update banner** (#103) — dashboard auto-resolves the
+  update-available banner after successful update.
+- **Process reaper** (#10aa9edc) — extended to kill stale Claude sessions
+  older than 7 days.
+
+---
+
 ## [v3.0a7] - 2026-04-19
 
 25-commit release. Themes: **dashboard and settings overhaul**, **web
