@@ -143,22 +143,18 @@ gotcha has changed, flag to user before acting on stale assumptions.
 
 ## Public Repo & Release Workflow
 
-Genesis uses a dual-repo model. The public repo (`GENesis-AGI`) is
-primary. Key differences from a standard single-repo workflow:
+The public repo (`GENesis-AGI`) is the primary development repo.
+Standard open-source workflow: PRs go directly to the public repo.
 
 - **Squash merges only** — merge commits are disabled on the public repo.
   Always `git pull --rebase origin main` after merging a PR before
   committing locally, or push will be rejected (non-fast-forward).
-- **Release pipeline** — `prepare-public-release.sh` strips user-specific
-  content (IPs, voice data, research profiles), then
-  `push-public-release.sh --version vX.Y` creates a PR on the public
-  repo. Merge the PR, then create the GitHub release with `gh release
-  create`. The release script has safety gates (voice data, secret scan,
-  portability scan) — fix failures, don't bypass them.
 - **README is public-authoritative** — the public repo's `README.md` is
-  hand-crafted and must NEVER be overwritten by the private repo version.
-  The release script preserves it automatically.
+  hand-crafted and must NEVER be overwritten.
 - **CHANGELOG audience is users** — only include entries a user updating
   their install would care about. No internal refactors, README changes,
   CI tweaks, or process artifacts. Lead with the user-visible effect, not
   the implementation technique.
+- **No sensitive data in commits** — voice data, research profiles, IPs,
+  and secrets must never enter the repo. User data lives in overlays
+  outside the repo (e.g., `~/.claude/skills/*/`, `~/.genesis/`).
