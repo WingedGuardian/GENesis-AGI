@@ -40,7 +40,7 @@ import json
 import os
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 
@@ -50,7 +50,7 @@ def _pending_dir() -> Path:
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _parse_fire_at(raw: str) -> datetime | None:
@@ -61,7 +61,7 @@ def _parse_fire_at(raw: str) -> datetime | None:
         return None
     if dt.tzinfo is None:
         return None
-    return dt.astimezone(timezone.utc)
+    return dt.astimezone(UTC)
 
 
 def _iter_markers(d: Path) -> list[Path]:

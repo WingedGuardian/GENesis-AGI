@@ -22,6 +22,7 @@ try:
 
     _HAS_SCRAPLING = True
 except ImportError:
+    _ScraplingFetcher = None  # type: ignore[misc,assignment]
     _HAS_SCRAPLING = False
 
 

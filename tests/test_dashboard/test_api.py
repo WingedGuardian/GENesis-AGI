@@ -455,6 +455,7 @@ def test_set_budget_rejects_invalid_budget_type(client):
 def test_routing_config_read_includes_call_sites(client):
     """Routing config read exposes configured call sites for the dashboard editor."""
     mock_cfg = SimpleNamespace()
+    mock_cfg.disabled_providers = {}
     mock_cfg.providers = {
         "claude-sonnet": SimpleNamespace(
             name="claude-sonnet",

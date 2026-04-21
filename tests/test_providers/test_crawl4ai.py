@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+pytest.importorskip("crawl4ai")
+
 from genesis.providers.crawl4ai_adapter import Crawl4AIAdapter
 from genesis.providers.protocol import ToolProvider
 from genesis.providers.types import (
