@@ -14,6 +14,7 @@ of raw DOM or screenshots by default.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from genesis.mcp.health import mcp
@@ -31,7 +32,12 @@ _stealth_browser = None
 _stealth_page = None
 _active_page = None  # Tracks whichever page was last navigated (standard or stealth)
 
+# Collaborative mode — when True, browser launches headed on virtual display :99.
+# User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
+_collaborate_mode = False
+
 _SCREENSHOT_DIR = Path.home() / "tmp"
+_VNC_DISPLAY = ":99"
 
 
 async def async_cleanup():
@@ -65,6 +71,7 @@ async def _ensure_browser():
     """Lazily initialize the Playwright browser with persistent profile.
 
     Returns the active page. Raises ImportError if playwright is not installed.
+    In collaborate mode, launches headed on virtual display :99 for VNC sharing.
     """
     global _playwright, _context, _page
 
@@ -75,15 +82,21 @@ async def _ensure_browser():
 
     _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
+    headed = _collaborate_mode
+    if headed:
+        os.environ["DISPLAY"] = _VNC_DISPLAY
+
     _playwright = await async_playwright().start()
     _context = await _playwright.chromium.launch_persistent_context(
         user_data_dir=str(_PROFILE_DIR),
-        headless=True,
-        executable_path="/usr/bin/google-chrome",
-        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+        headless=not headed,
+        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+        + (["--start-maximized"] if headed else []),
+        viewport={"width": 1920, "height": 1080} if headed else None,
     )
     _page = _context.pages[0] if _context.pages else await _context.new_page()
-    logger.info("Browser launched with persistent profile at %s", _PROFILE_DIR)
+    mode_str = "headed (collaborate)" if headed else "headless"
+    logger.info("Browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
     return _page
 
 
@@ -340,3 +353,53 @@ async def browser_clear_domain(domain: str) -> dict:
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
+
+
+@mcp.tool()
+async def browser_collaborate(enable: bool = True) -> dict:
+    """Toggle collaborative browser mode (headed + VNC).
+
+    When enabled, the browser runs visibly on a virtual display.
+    The user can watch and interact via noVNC in their browser.
+    Useful for tasks requiring human input (captchas, payments, 2FA).
+
+    When disabled, reverts to headless mode for faster automation.
+    Toggling restarts the browser — existing page state is lost.
+    """
+    global _collaborate_mode
+
+    if _collaborate_mode == enable:
+        return {
+            "mode": "collaborate" if enable else "headless",
+            "changed": False,
+            "vnc_url": _get_vnc_url() if enable else None,
+        }
+
+    _collaborate_mode = enable
+    await async_cleanup()  # Force browser restart on next tool call
+
+    return {
+        "mode": "collaborate" if enable else "headless",
+        "changed": True,
+        "vnc_url": _get_vnc_url() if enable else None,
+        "note": "Browser will relaunch in new mode on next navigation.",
+    }
+
+
+def _get_vnc_url() -> str:
+    """Derive the noVNC URL from Tailscale IP or fall back to localhost."""
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            ip = result.stdout.strip().split("\n")[0]
+            return f"http://{ip}:6080/vnc.html"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return "http://localhost:6080/vnc.html"
