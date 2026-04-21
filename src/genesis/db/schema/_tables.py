@@ -871,6 +871,17 @@ TABLES = {
             verification_notes TEXT
         )
     """,
+    "file_modifications": """
+        CREATE TABLE IF NOT EXISTS file_modifications (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT,
+            file_path        TEXT NOT NULL,
+            action           TEXT NOT NULL,
+            tool_name        TEXT,
+            file_hash        TEXT,
+            timestamp        TEXT NOT NULL
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1046,6 +1057,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_scheduled ON follow_ups(scheduled_at)",
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_source ON follow_ups(source)",
     "CREATE INDEX IF NOT EXISTS idx_follow_ups_linked_task ON follow_ups(linked_task_id)",
+    # file modification audit trail
+    "CREATE INDEX IF NOT EXISTS idx_file_mod_path ON file_modifications(file_path)",
+    "CREATE INDEX IF NOT EXISTS idx_file_mod_session ON file_modifications(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_file_mod_ts ON file_modifications(timestamp)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
