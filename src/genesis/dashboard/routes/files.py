@@ -277,8 +277,9 @@ def file_rename():
 
     try:
         source.rename(dest)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        logger.exception("Failed to rename %s", source)
+        return jsonify({"error": "Rename failed"}), 500
 
     return jsonify({"status": "ok", "old_path": str(source), "new_path": str(dest)})
 
@@ -303,8 +304,9 @@ def file_delete():
 
     try:
         target.unlink()
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        logger.exception("Failed to delete %s", target)
+        return jsonify({"error": "Delete failed"}), 500
 
     return jsonify({"status": "ok", "path": str(raw_path)})
 
