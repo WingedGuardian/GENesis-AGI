@@ -9,6 +9,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from flask import jsonify, request
@@ -66,6 +67,23 @@ def _query_db(sql: str, params: tuple = ()) -> list[dict]:
         return []
 
 
+def _execute_db(sql: str, params: tuple = ()) -> bool:
+    """Run a write query against genesis.db. Returns True on success."""
+    if not _DB_PATH.is_file():
+        return False
+    conn = None
+    try:
+        conn = sqlite3.connect(str(_DB_PATH), timeout=5)
+        conn.execute(sql, params)
+        conn.commit()
+        return True
+    except (sqlite3.Error, OSError):
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
 @blueprint.route("/api/genesis/updates/status")
 def update_status():
     """Current version, update availability, and last update result."""
@@ -92,6 +110,21 @@ def update_status():
             }
         except (json.JSONDecodeError, KeyError):
             pass
+
+    # Reconcile: if target_commit is already in HEAD, the update has been
+    # applied but GenesisVersionCollector hasn't run yet — auto-resolve.
+    if (
+        update_available
+        and update_available.get("target_commit")
+        and _git("merge-base", "--is-ancestor", update_available["target_commit"], "HEAD") is not None
+    ):
+        _execute_db(
+            "UPDATE observations SET resolved = 1, resolved_at = ?, "
+            "resolution_notes = 'auto-resolved: target_commit is ancestor of HEAD' "
+            "WHERE type = 'genesis_update_available' AND resolved = 0",
+            (datetime.now(UTC).isoformat(),),
+        )
+        update_available = None
 
     # Last update attempt
     last_update = None
