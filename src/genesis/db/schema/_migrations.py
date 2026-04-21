@@ -777,6 +777,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             row,
         )
 
+    # Cross-session awareness: heartbeat table for real-time session tracking.
+    # Separate from cc_sessions because hooks need simple fast UPSERT and
+    # cc_sessions rows may not exist for direct user CC sessions.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS session_heartbeats (
+            cc_session_id   TEXT PRIMARY KEY,
+            source_tag      TEXT NOT NULL DEFAULT 'foreground',
+            model           TEXT,
+            topic           TEXT,
+            user_summary    TEXT,
+            genesis_summary TEXT,
+            updated_at      TEXT NOT NULL
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_heartbeat_updated "
+        "ON session_heartbeats(updated_at)"
+    )
+
     # Knowledge pipeline: source_pipeline, purpose, ingestion_source
     await _try_alter(db,
         "ALTER TABLE knowledge_units ADD COLUMN source_pipeline TEXT",

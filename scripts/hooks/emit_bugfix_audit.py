@@ -19,7 +19,7 @@ import os
 import sqlite3
 import sys
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -35,17 +35,14 @@ def _db_path() -> Path:
     return Path.home() / "genesis" / "data" / "genesis.db"
 
 
-def _content_hash(source: str, content: str) -> str:
+def _content_hash(content: str) -> str:
     """Compute a stable content hash for dedup.
 
-    Matches the column semantics of observations.content_hash
-    (indexed on (source, content_hash)).
+    Must match observations.create() semantics: sha256(content) only.
+    The dedup query uses (source, content_hash) but the hash itself
+    is content-only so it stays consistent with the CRUD layer.
     """
-    h = hashlib.sha256()
-    h.update(source.encode("utf-8"))
-    h.update(b"\x00")
-    h.update(content.encode("utf-8"))
-    return h.hexdigest()
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
 def emit(sha: str, subject: str) -> int:
@@ -57,7 +54,7 @@ def emit(sha: str, subject: str) -> int:
     content = f"Bug fix committed: {sha[:12]} — {subject}"
     source = "post_commit_hook"
     obs_type = "bugfix_committed"
-    chash = _content_hash(source, content)
+    chash = _content_hash(content)
     now = datetime.now(UTC).isoformat()
     obs_id = str(uuid.uuid4())
 
@@ -73,12 +70,18 @@ def emit(sha: str, subject: str) -> int:
                 print(f"emit_bugfix_audit: dedup hit for sha={sha[:12]}", file=sys.stderr)
                 return 0
 
+            # Compute TTL inline (can't use async CRUD in sync hook).
+            # bugfix_committed → 30-day TTL, matching observations._TTL_BY_TYPE.
+            expires_at = (datetime.now(UTC) + timedelta(days=30)).isoformat()
+
             conn.execute(
                 """
                 INSERT INTO observations
-                    (id, source, type, category, content, priority, created_at, content_hash)
+                    (id, source, type, category, content, priority,
+                     created_at, content_hash, expires_at)
                 VALUES
-                    (?,  ?,      ?,    ?,        ?,       ?,        ?,          ?)
+                    (?,  ?,      ?,    ?,        ?,       ?,
+                     ?,          ?,            ?)
                 """,
                 (
                     obs_id,
@@ -89,6 +92,7 @@ def emit(sha: str, subject: str) -> int:
                     "low",  # audit only, not actionable on its own
                     now,
                     chash,
+                    expires_at,
                 ),
             )
             conn.commit()

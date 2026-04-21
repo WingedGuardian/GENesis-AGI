@@ -20,8 +20,11 @@ async def db():
         await conn.execute(
             "CREATE TABLE observations ("
             "  id TEXT PRIMARY KEY,"
+            "  person_id TEXT,"
             "  source TEXT, type TEXT, category TEXT,"
-            "  content TEXT, priority TEXT, created_at TEXT,"
+            "  content TEXT, priority TEXT, speculative INTEGER DEFAULT 0,"
+            "  created_at TEXT, expires_at TEXT, content_hash TEXT,"
+            "  resolved INTEGER DEFAULT 0,"
             "  resolved_at TEXT, resolution_notes TEXT"
             ")"
         )

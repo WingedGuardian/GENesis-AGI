@@ -27,9 +27,12 @@ Multiple Claude Code sessions may work on this repo simultaneously. Rules:
   file in the diff belongs to your work. If you see files you didn't modify,
   STOP and investigate.
 
-## Merge Hook Gap (Known)
+## Push/Merge Enforcement
 
-There is a pending infrastructure item to add a PreToolUse hook enforcing
-`git merge`/`git push` separation. Currently not implemented — relies on
-manual discipline and the `feedback_merge_push_chain.md` memory rule: each
-step (commit/merge/push) needs separate user confirmation.
+`git_push_guard.py` (PreToolUse hook) blocks:
+- `git push` to main/master (any variation — bare, with remote, with refspec)
+- `git merge` when on main/master
+
+All code changes must go through PRs. The only merge path is
+`gh pr merge --squash --admin` after explicit user approval. Each step
+(commit → push branch → create PR → merge) needs separate user confirmation.

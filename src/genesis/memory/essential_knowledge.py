@@ -41,6 +41,18 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         f"Store: {memory_count} memories | {obs_count} observations"
     )
 
+    # System state: ego focus + active sessions
+    ego_focus = await _ego_focus(db)
+    active_sessions = await _active_session_count(db)
+    state_lines: list[str] = []
+    if ego_focus:
+        state_lines.append(f"- Ego focus: {ego_focus}")
+    if active_sessions > 0:
+        state_lines.append(f"- Active sessions: {active_sessions}")
+    if state_lines:
+        parts.append("\n### System State")
+        parts.extend(state_lines)
+
     # Active context: recent session topics (last 7 days)
     sessions = await _recent_session_topics(db, days=7)
     if sessions:
@@ -178,6 +190,32 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         return [row[0][:250] for row in rows if row[0]]
     except Exception:
         return []
+
+
+async def _ego_focus(db: aiosqlite.Connection) -> str | None:
+    """Read ego focus summary from ego_state KV table."""
+    try:
+        cursor = await db.execute(
+            "SELECT value FROM ego_state WHERE key = 'ego_focus_summary'"
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return row[0][:200]
+        return None
+    except Exception:
+        return None
+
+
+async def _active_session_count(db: aiosqlite.Connection) -> int:
+    """Count currently active CC sessions."""
+    try:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM cc_sessions WHERE status = 'active'"
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+    except Exception:
+        return 0
 
 
 async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:

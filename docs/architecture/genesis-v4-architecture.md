@@ -803,6 +803,26 @@ incidents never reach the ego.
   - Mandatory escalations (filtered, critical only)
   - Anomalies from reflections (curiosity fuel)
   - User context (who it's serving)
+  - Session heartbeats (awareness of individual active sessions)
+
+- **Session heartbeat integration:** The `session_heartbeats` table provides
+  Layer 1 (mechanical, per-prompt) cross-session awareness. Each CC session
+  writes a heartbeat on every `UserPromptSubmit` with user summary, genesis
+  summary (from tool_observations.jsonl), and timestamp. The proactive memory
+  hook reads concurrent heartbeats and injects `[Concurrent]` tags. This works
+  independently of the ego — when the ego is wired, it can query heartbeats
+  for Layer 3 (periodic synthesis) awareness of what all sessions are doing.
+  Essential knowledge also surfaces active session count at generation time.
+
+- **Cross-session awareness layers:**
+  - **Layer 1 (mechanical, per-prompt):** Session heartbeats — write/read in
+    UserPromptSubmit hook, ~15ms overhead, always completes
+  - **Layer 2 (session state):** Essential knowledge — ego focus + active
+    session count, regenerated at SessionEnd
+  - **Layer 3 (ego synthesis, periodic):** Future — ego reads heartbeats and
+    synthesizes cross-session awareness during ego cycles
+  - **Layer 4 (persistent knowledge):** Memory store — durable cross-session
+    learnings stored via memory_store
 
 - **The 80/20 split:** Enforce architecturally (context budget — cap mandatory
   items to 20% of context tokens) or via prompt (tell the ego to prioritize

@@ -19,6 +19,7 @@ async def db(tmp_path):
         await conn.execute(
             "CREATE TABLE observations ("
             "  id TEXT PRIMARY KEY,"
+            "  person_id TEXT,"
             "  source TEXT NOT NULL, type TEXT NOT NULL, category TEXT,"
             "  content TEXT NOT NULL,"
             "  priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high', 'critical')),"

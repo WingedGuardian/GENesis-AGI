@@ -240,6 +240,8 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
   The user is the only human on this project — uncommitted work is invisible
   work, and invisible work is lost work.
+- **NEVER push to main or merge into main without a PR and user approval.**
+  Enforced by PreToolUse hook. Details in genesis-development skill.
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope is optional: `feat(ego): add cadence manager`.
   Keep subject line under 72 characters. Dominant category wins if mixed.

@@ -356,41 +356,38 @@ class GenesisVersionCollector:
 
     async def _store_baseline(self, version: str) -> None:
         """Store current HEAD as baseline."""
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
         await self._db.execute(
             "DELETE FROM observations "
             "WHERE source = 'genesis_version' AND type = 'genesis_version_baseline'",
         )
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "genesis_version",
-                "genesis_version_baseline",
-                json.dumps({"version": version}),
-                "low",
-                now,
-            ),
-        )
         await self._db.commit()
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="genesis_version",
+            type="genesis_version_baseline",
+            content=json.dumps({"version": version}),
+            priority="low",
+            created_at=now,
+        )
 
     async def _store_version_change(self, old: str, new: str) -> None:
         """Store local version change and update baseline."""
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "genesis_version",
-                "genesis_version_change",
-                json.dumps({"old_version": old, "new_version": new, "detected_at": now}),
-                "medium",
-                now,
-            ),
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="genesis_version",
+            type="genesis_version_change",
+            content=json.dumps({"old_version": old, "new_version": new, "detected_at": now}),
+            priority="medium",
+            created_at=now,
         )
-        await self._db.commit()
         await self._store_baseline(new)
 
     async def _resolve_pending_update_available(self, current_head: str) -> None:
@@ -440,6 +437,8 @@ class GenesisVersionCollector:
         if await cursor.fetchone():
             return False
 
+        from genesis.db.crud import observations as obs_crud
+
         now = datetime.now(UTC).isoformat()
 
         # Get target tag if available
@@ -452,26 +451,22 @@ class GenesisVersionCollector:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
         target_tag = stdout.decode().strip() if proc.returncode == 0 else "untagged"
 
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "genesis_version",
-                "genesis_update_available",
-                json.dumps({
-                    "current_commit": current,
-                    "target_commit": target,
-                    "target_tag": target_tag,
-                    "commits_behind": behind,
-                    "summary": summary,
-                    "detected_at": now,
-                }),
-                "medium",
-                now,
-            ),
+        await obs_crud.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="genesis_version",
+            type="genesis_update_available",
+            content=json.dumps({
+                "current_commit": current,
+                "target_commit": target,
+                "target_tag": target_tag,
+                "commits_behind": behind,
+                "summary": summary,
+                "detected_at": now,
+            }),
+            priority="medium",
+            created_at=now,
         )
-        await self._db.commit()
         logger.info(
             "Genesis update available: %d commits behind origin/main (%s)",
             behind, target_tag,
@@ -549,20 +544,18 @@ class GenesisVersionCollector:
             self._archive_failure_file()
             return
 
+        from genesis.db.crud import observations as obs_crud
+
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "INSERT INTO observations (id, source, type, content, priority, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                str(uuid.uuid4()),
-                "genesis_version",
-                "genesis_update_failed",
-                json.dumps(data),
-                "high",
-                now,
-            ),
+        await obs_crud.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="genesis_version",
+            type="genesis_update_failed",
+            content=json.dumps(data),
+            priority="high",
+            created_at=now,
         )
-        await self._db.commit()
         logger.error(
             "Detected update failure: %s -> %s (rolled back to %s)",
             data.get("old_tag"), data.get("new_tag"), data.get("rollback_tag"),
