@@ -261,6 +261,10 @@ async def main():
         if runtime.awareness_loop:
             runtime.awareness_loop.set_topic_manager(topic_manager)
 
+        # Wire into surplus scheduler for surplus reflection posting
+        if runtime.surplus_scheduler:
+            runtime.surplus_scheduler.set_topic_manager(topic_manager)
+
         # One-shot: close orphaned per-session topics from old code (March 24-27).
         # Checks DB for a sentinel category to avoid re-running on every restart.
         if topic_manager.get_thread_id("_orphan_cleanup_done") is None:
