@@ -617,7 +617,7 @@ Standalone libraries from the same portfolio — reusable on their own, stabiliz
 
 - [**copilot-router**](https://github.com/WingedGuardian/copilot-router) — LLM routing primitive. Circuit breakers, fallback chains, per-call-site provider config. What runs the ~40 call sites.
 - [**copilot-memory**](https://github.com/WingedGuardian/copilot-memory) — Hybrid memory primitive. Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.
-- [**cognitive-dissonance-dspy**](https://github.com/WingedGuardian/cognitive-dissonance-dspy) — Multi-agent adversarial-review prototype using DSPy with NL→Coq formal verification. The belief-conflict mechanism here informed Genesis's subsystem-disagreement resolution.
+- [**cognitive-dissonance-dspy**](https://github.com/evalops/cognitive-dissonance-dspy) — Multi-agent adversarial-review prototype using DSPy with NL→Coq formal verification. The belief-conflict mechanism here informed Genesis's subsystem-disagreement resolution.
 
 ---
 
