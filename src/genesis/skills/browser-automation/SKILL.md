@@ -39,6 +39,11 @@ that can accomplish the task. **Token cost increases with each layer.**
   Separate profile at `~/.genesis/camoufox-profile/`.
 - **Agent-owned accounts**: log into accounts created FOR the agent, never the
   user's personal accounts. Treat the agent like a new employee.
+- **Collaborate mode**: `browser_collaborate(enable=True)` switches to headed
+  mode on a virtual display. The user watches and interacts via noVNC in their
+  browser (URL returned by the tool). Use for tasks requiring human input:
+  captchas, payments, 2FA, OAuth flows. Genesis drives automation; user takes
+  VNC control when needed. Toggling mode restarts the browser.
 
 ### Layer 3: On-Demand MCP (heavy sessions — activate when needed)
 - Tools: Chrome DevTools MCP (29 tools) or Playwright MCP
@@ -59,6 +64,7 @@ that can accomplish the task. **Token cost increases with each layer.**
 | Search the web | Fetch | API-based, fast |
 | Fill a form on agent's account | Genesis Browser | Persistent login |
 | Site blocks automation | Genesis Browser (stealth) | Anti-detection |
+| CAPTCHA / payment / 2FA step | Genesis Browser (collaborate) | User takes VNC control |
 | Network inspection / Lighthouse | On-Demand MCP | Chrome DevTools |
 | Check user's Gmail | On-Demand MCP (remote) | CDP-over-SSH |
 | Take action in user's banking app | On-Demand MCP (remote) | MUST confirm |
@@ -111,7 +117,7 @@ button:has-text("Add to Cart")
 | Element not found | 1. Try alternative selector 2. Try visible text 3. Scroll page 4. Wait for dynamic load |
 | Page timeout | 1. Retry navigation 2. Check if URL redirected 3. Verify network connectivity |
 | Login required | Inform user. Ask for credentials. Never guess passwords. |
-| CAPTCHA | Cannot solve. Inform user. Suggest manual completion. |
+| CAPTCHA | Switch to collaborate mode. User solves via VNC. Resume automation after. |
 | Pop-up / modal | Click dismiss/close button. Look for `[aria-label="Close"]` or `.modal-close` |
 | Cookie consent | Click "Accept" or dismiss. Look for `#cookie-accept` or text="Accept All" |
 | Rate limited | Wait 30 seconds. Retry once. If still limited, back off exponentially. |
@@ -179,7 +185,7 @@ result: <task outcome description>
 
 - Genesis browser MCP tools: `browser_navigate`, `browser_click`, `browser_fill`,
   `browser_screenshot`, `browser_snapshot`, `browser_run_js`, `browser_sessions`,
-  `browser_clear_domain` (via genesis-health MCP)
+  `browser_clear_domain`, `browser_collaborate` (via genesis-health MCP)
 - `src/genesis/mcp/health/browser.py` — MCP tool implementations
 - `src/genesis/browser/profile.py` — BrowserProfileManager (cookie DB, sessions)
 - `scripts/browser.py` — Standalone CLI (opens/closes per command, for one-off use)
