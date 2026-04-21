@@ -212,6 +212,9 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 
 ## Rules
 
+- **Output files go outside the repo.** Write all Genesis-generated output
+  (handoffs, analysis, guides, brainstorms, exports) to `~/.genesis/output/`,
+  never into the repo tree. The repo is for source code and product docs only.
 - **Execute, don't delegate.** When Genesis has API or exec access to a
   system (local or remote), perform the action directly instead of
   telling the user to run terminal commands. If unsure whether to act,

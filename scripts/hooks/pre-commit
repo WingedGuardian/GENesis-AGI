@@ -64,6 +64,20 @@ if [ -n "$staged_py" ]; then
     fi
 fi
 
+# Warn on new non-code files (catch accidental LLM output in repo)
+ALLOWED_EXT='\.py$|\.pyi$|\.sh$|\.bash$|\.yaml$|\.yml$|\.json$|\.toml$|\.html$|\.css$|\.js$|\.cfg$|\.ini$|\.sql$|\.lock$'
+ALLOWED_NAMES='Makefile$|Dockerfile$|\.gitignore$|\.gitattributes$'
+new_noncodes=$(git diff --cached --name-only --diff-filter=A | grep -vE "$ALLOWED_EXT|$ALLOWED_NAMES" || true)
+if [ -n "$new_noncodes" ]; then
+    echo ""
+    echo "WARNING: New non-code file(s) staged:"
+    echo "$new_noncodes"
+    echo ""
+    echo "Genesis output files belong in ~/.genesis/output/, not the repo."
+    echo "If this file is intentional source/product content, proceed."
+    echo ""
+fi
+
 # Phase 6 — verify tracked hook changes are recorded in .genesis-hook-versions
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 if [ -n "$REPO_ROOT" ] && [ -x "$REPO_ROOT/scripts/check_hook_versions.sh" ]; then
