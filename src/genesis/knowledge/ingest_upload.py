@@ -90,7 +90,7 @@ async def run_ingest(
             await knowledge_uploads.update_status(
                 rt.db, upload_id,
                 status="failed",
-                error_message=str(exc) or "Internal error during ingestion",
+                error_message=f"Internal error during ingestion: {exc}",
             )
         except Exception:
             logger.exception("Failed to update upload status after error")

@@ -77,6 +77,7 @@ async def test_full_stack_fallback_chain(real_config, breakers, cost_tracker, de
 async def test_surplus_never_pays(real_config, breakers, cost_tracker, degradation):
     """12_surplus_brainstorm has never_pays — all free fail, no paid providers called."""
     delegate = MockDelegate(responses={
+        "cerebras-qwen": CallResult(success=False, error="down", status_code=503),
         "mistral-large-free": CallResult(success=False, error="down", status_code=503),
         "groq-free": CallResult(success=False, error="down", status_code=503),
         "gemini-free": CallResult(success=False, error="down", status_code=503),
