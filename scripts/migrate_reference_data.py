@@ -446,9 +446,10 @@ async def main(args: argparse.Namespace) -> None:
         logger.info("── DRY RUN — no database writes ──")
         for name, entries in sources:
             for e in entries:
+                kind = e.kind  # extract safe field; don't pass full entry to logger
                 logger.info(
                     "  [%s] %-18s (identifier redacted)",
-                    name, e.kind,
+                    name, kind,
                 )
         logger.info("Dry run complete. Re-run without --dry-run to ingest.")
         return
