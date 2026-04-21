@@ -35,6 +35,7 @@ _active_page = None  # Tracks whichever page was last navigated (standard or ste
 # Collaborative mode — when True, browser launches headed on virtual display :99.
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
+_original_display: str | None = None  # Saved DISPLAY before collaborate override
 
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
@@ -82,9 +83,15 @@ async def _ensure_browser():
 
     _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
+    global _original_display
     headed = _collaborate_mode
     if headed:
+        _original_display = os.environ.get("DISPLAY")
         os.environ["DISPLAY"] = _VNC_DISPLAY
+    elif _original_display is not None:
+        os.environ["DISPLAY"] = _original_display
+    elif "DISPLAY" in os.environ:
+        del os.environ["DISPLAY"]
 
     _playwright = await async_playwright().start()
     _context = await _playwright.chromium.launch_persistent_context(
@@ -378,6 +385,15 @@ async def browser_collaborate(enable: bool = True) -> dict:
     _collaborate_mode = enable
     await async_cleanup()  # Force browser restart on next tool call
 
+    if enable and not Path(f"/tmp/.X{_VNC_DISPLAY[1:]}-lock").exists():
+        return {
+            "mode": "collaborate",
+            "changed": True,
+            "vnc_url": None,
+            "warning": f"Virtual display {_VNC_DISPLAY} not running. "
+            "Start with: systemctl --user start genesis-xvfb genesis-vnc genesis-novnc",
+        }
+
     return {
         "mode": "collaborate" if enable else "headless",
         "changed": True,
@@ -395,7 +411,7 @@ def _get_vnc_url() -> str:
             ["tailscale", "ip", "-4"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=2,
         )
         if result.returncode == 0 and result.stdout.strip():
             ip = result.stdout.strip().split("\n")[0]
