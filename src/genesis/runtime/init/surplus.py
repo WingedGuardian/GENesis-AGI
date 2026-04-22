@@ -95,14 +95,14 @@ async def init(rt: GenesisRuntime) -> None:
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 
-        if rt._reflection_engine is not None and rt._db is not None:
-            from genesis.surplus.executor import ReflectionBasedSurplusExecutor
+        if rt._router is not None and rt._db is not None:
+            from genesis.surplus.executor import SurplusLLMExecutor
 
-            real_executor = ReflectionBasedSurplusExecutor(
-                rt._reflection_engine, db=rt._db,
+            real_executor = SurplusLLMExecutor(
+                rt._router, db=rt._db,
             )
             rt._surplus_scheduler.set_executor(real_executor)
-            logger.info("Surplus executor upgraded: ReflectionBasedSurplusExecutor")
+            logger.info("Surplus executor upgraded: SurplusLLMExecutor")
 
         try:
             from genesis.surplus.code_index import CodeIndexExecutor
