@@ -255,8 +255,8 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     p = Path(file_path)
-    if not p.exists():
-        return {"error": f"File not found: {file_path}"}
+    if not p.is_file():
+        return {"error": f"File not found or not a regular file: {file_path}"}
     try:
         await _human_delay()
         await _active_page.set_input_files(selector, str(p), timeout=10000)
