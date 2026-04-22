@@ -10,15 +10,15 @@ the reference store via :func:`ingest_knowledge_unit`.
 This is the SILENT AUTO-CAPTURE path — no user prompt, no explicit flag.
 Runs on the existing extraction cadence with zero new LLM calls.
 
-Classification is conservative:
-- High precision over recall. The primary capture path is the
-  ``reference_store`` MCP tool called by the session agent in real-time
-  with full conversational context. This background path is a fallback
-  that catches things the primary path missed.
+Classification errs on the side of capturing more:
+- False positives are harmless (unused entries sit idle). False negatives
+  lose credentials permanently. Multiple overlapping patterns are
+  intentional — if any one fires, we capture.
+- The primary capture path is the LLM calling ``reference_store`` in
+  real-time. This background path is a safety net that catches things
+  the primary path missed.
 - Regex-based detection. The LLM already did semantic extraction upstream;
   we just pattern-match on the resulting structured content.
-- When uncertain, do NOT store. False positives pollute the reference
-  store — the user has to delete them.
 """
 
 from __future__ import annotations
@@ -40,13 +40,14 @@ logger = logging.getLogger(__name__)
 
 
 # ─── Classification patterns ─────────────────────────────────────────────────
+# Strategy: ERR ON THE SIDE OF CAPTURING MORE. False positives in the
+# reference store are harmless (unused entries sit idle). False negatives
+# lose credentials permanently. Multiple overlapping patterns are
+# intentional — if any one fires, we capture.
 
-# Credential shape: user/pass pair in the same content window.
-# Matches variants like "username: X password: Y", "user=X pass=Y",
-# "login is X, password is Y". Case-insensitive.
-# The value captures use negative lookahead to skip label words so nested
-# "login: username: X" correctly picks X as the user token (not "username:").
-_LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle)"
+# A. Credential pair — broadened. Any credential-label word near a value.
+# Doesn't require BOTH user+pass — a single "password: X" is enough.
+_LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
     rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;]+)"
@@ -56,11 +57,73 @@ _CREDENTIAL_PAIR_PATTERN = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Standalone token/API key shape.
+# A2. Single credential label — catches "email X and password Y",
+# "password: Z", "account u/Name", etc. without requiring a pair.
+_SINGLE_CREDENTIAL_PATTERN = re.compile(
+    r"\b(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
+    r"\s*(?:is\s+|[:=]\s*|\s+)"
+    r"(?P<value>[^\s,;]{4,})",
+    re.IGNORECASE,
+)
+
+# A3. Email + password in natural language (the Reddit miss pattern).
+# "email X and password Y" or "email X ... password Y"
+_EMAIL_PASSWORD_PATTERN = re.compile(
+    r"\b(?:e-?mail)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"(?P<email>[^\s,;]+@[^\s,;]+)"
+    r".{0,200}?"
+    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"(?P<pass>[^\s,;]{4,})",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# B. Known key prefixes — format-only, no keyword needed.
+# These prefixes are near-certain indicators of real credentials.
+_KNOWN_KEY_PREFIX_PATTERN = re.compile(
+    r"(?P<token>"
+    r"ghp_[A-Za-z0-9]{30,}"       # GitHub personal access token
+    r"|gho_[A-Za-z0-9]{30,}"      # GitHub OAuth token
+    r"|sk-[A-Za-z0-9]{20,}"       # OpenAI / Anthropic
+    r"|xoxb-[A-Za-z0-9\-]{20,}"   # Slack bot token
+    r"|xoxp-[A-Za-z0-9\-]{20,}"   # Slack user token
+    r"|AKIA[A-Z0-9]{12,}"         # AWS access key
+    r"|AIza[A-Za-z0-9_\-]{30,}"   # Google API key
+    r"|di-[A-Za-z0-9]{20,}"       # DeepInfra
+    r")",
+)
+
+# C. Standalone token/API key shape (broadened labels).
 _CREDENTIAL_TOKEN_PATTERN = re.compile(
-    r"\b(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|secret[_\s-]?key)"
+    r"\b(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"
+    r"secret[_\s-]?key|auth[_\s-]?token|refresh[_\s-]?token|"
+    r"api[_\s-]?secret|private[_\s-]?key)"
     r"\s*(?:is\s*|[:=]\s*|\s+)(?P<token>[A-Za-z0-9_\-\.]{16,})",
     re.IGNORECASE,
+)
+
+# D. .env format — UPPER_SNAKE=value where value looks secret-like.
+_ENV_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(?P<key>[A-Z][A-Z0-9_]{3,})"
+    r"\s*=\s*"
+    r"(?P<val>[^\s]{8,})",
+)
+
+# E. SSH user@host pattern.
+_SSH_PATTERN = re.compile(
+    r"\bssh\s+(?:.*?\s)?(?P<userhost>[A-Za-z0-9_.\-]+@[A-Za-z0-9_.\-]+)",
+    re.IGNORECASE,
+)
+
+# F. Account lifecycle — "created account X with password Y".
+_ACCOUNT_LIFECYCLE_PATTERN = re.compile(
+    r"\b(?:created|registered|signed?\s*up|set\s*up)\s+"
+    r"(?:an?\s+)?(?:account|user|login)\s+"
+    r"(?:for\s+|named?\s+|called?\s+)?"
+    r"(?P<account>[^\s,;]{2,})"
+    r".{0,200}?"
+    r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*|\s+)"
+    r"(?P<pass>[^\s,;]{4,})",
+    re.IGNORECASE | re.DOTALL,
 )
 
 # URL shape — common http(s) URL, rejects trailing punctuation.
@@ -155,8 +218,8 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
     (``kind``, ``identifier``, ``value``, ``description``, ``tags``) if
     the extraction looks like persistent reference data, otherwise None.
 
-    Classification is conservative — prefers recall=0 (no false positives)
-    to recall=high (false positives pollute the store).
+    Errs on the side of capturing more — false positives are harmless,
+    false negatives lose credentials permanently.
     """
     content = extraction.content or ""
     if len(content) < _MIN_CONTENT_LENGTH:
@@ -166,7 +229,7 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
 
     tags = [e for e in extraction.entities if e and e.strip()]
 
-    # 1. Credential pair — highest priority
+    # 1. Credential pair — highest priority (user + password together)
     pair = _CREDENTIAL_PAIR_PATTERN.search(content)
     if pair:
         user = pair.group("user")
@@ -182,7 +245,68 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
                 "tags": tags,
             }
 
-    # 2. Standalone token / API key
+    # 1b. Email + password pattern (catches "email X and password Y")
+    email_pass = _EMAIL_PASSWORD_PATTERN.search(content)
+    if email_pass:
+        email = email_pass.group("email")
+        password = email_pass.group("pass")
+        if email and password and len(password) >= 4:
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix="login",
+                ),
+                "value": f"{email} / {password}",
+                "description": content,
+                "tags": tags,
+            }
+
+    # 1c. Account lifecycle (catches "created account X with password Y")
+    acct = _ACCOUNT_LIFECYCLE_PATTERN.search(content)
+    if acct:
+        account = acct.group("account")
+        password = acct.group("pass")
+        if account and password and len(password) >= 4:
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix="account",
+                ),
+                "value": f"{account} / {password}",
+                "description": content,
+                "tags": tags,
+            }
+
+    # 1d. Single password mention (no user required)
+    single = _SINGLE_CREDENTIAL_PATTERN.search(content)
+    if single:
+        password = single.group("value")
+        if password and len(password) >= 4:
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix="credential",
+                ),
+                "value": f"password: {password}",
+                "description": content,
+                "tags": tags,
+            }
+
+    # 2. Known key prefixes — format-only, near-zero false positive rate
+    known_key = _KNOWN_KEY_PREFIX_PATTERN.search(content)
+    if known_key:
+        tok_value = known_key.group("token")
+        return {
+            "kind": "credentials",
+            "identifier": _derive_identifier(
+                extraction, default_prefix="api_key",
+            ),
+            "value": f"token: {tok_value}",
+            "description": content,
+            "tags": tags,
+        }
+
+    # 3. Standalone token / API key (labeled)
     token = _CREDENTIAL_TOKEN_PATTERN.search(content)
     if token:
         tok_value = token.group("token")
@@ -192,6 +316,38 @@ def classify_as_reference(extraction: Extraction) -> dict | None:
                 extraction, default_prefix="token",
             ),
             "value": f"token: {tok_value}",
+            "description": content,
+            "tags": tags,
+        }
+
+    # 3b. .env format — UPPER_SNAKE=value
+    env = _ENV_ASSIGNMENT_PATTERN.search(content)
+    if env:
+        key = env.group("key")
+        val = env.group("val")
+        # Only capture if the key name suggests a credential
+        _CRED_KEY_WORDS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "AUTH", "API"}
+        if any(w in key.upper() for w in _CRED_KEY_WORDS):
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(
+                    extraction, default_prefix=key,
+                ),
+                "value": f"{key}={val}",
+                "description": content,
+                "tags": tags,
+            }
+
+    # 3c. SSH user@host
+    ssh = _SSH_PATTERN.search(content)
+    if ssh:
+        userhost = ssh.group("userhost")
+        return {
+            "kind": "network",
+            "identifier": _derive_identifier(
+                extraction, default_prefix=f"ssh {userhost}",
+            ),
+            "value": f"ssh {userhost}",
             "description": content,
             "tags": tags,
         }

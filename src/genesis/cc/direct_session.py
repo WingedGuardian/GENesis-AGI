@@ -349,6 +349,11 @@ class DirectSessionRunner:
             system_prompt = surplus_config.get("system_prompt", "")
         disallowed = PROFILES.get(request.profile, PROFILES["observe"])
 
+        # Give background sessions access to Genesis MCP servers (health + memory).
+        # Without this, the spawned CC process has no MCP tools (no browser, no
+        # memory_store, no observation_write).
+        mcp_config = self._config_builder.build_mcp_config(profile="reflection")
+
         return CCInvocation(
             prompt=request.prompt,
             model=request.model,
@@ -359,6 +364,7 @@ class DirectSessionRunner:
             skip_permissions=True,
             disallowed_tools=disallowed,
             working_dir=background_session_dir(),
+            mcp_config=mcp_config,
         )
 
     async def _store_result(

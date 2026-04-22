@@ -187,6 +187,12 @@ Credentials, URLs, IPs, and identifiers shared in conversation are
 auto-stored via `reference_store`. Retrieve with `reference_lookup` or
 `knowledge_recall(domain='reference.*')`. Human view: `~/.genesis/known-to-genesis.md`.
 
+**Real-time capture is your responsibility.** When you create an account,
+receive credentials, generate API keys, or encounter any login/token/secret
+in conversation, call `reference_store` immediately — don't rely on batch
+extraction to catch it later. You are the first line of defense; the
+extraction pipeline is the safety net.
+
 ## Knowledge Ingestion (Conversational Path)
 
 When a user shares a file path or URL in conversation:
