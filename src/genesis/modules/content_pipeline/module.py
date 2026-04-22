@@ -20,6 +20,10 @@ class ContentPipelineModule:
     Captures ideas from recon/manual/trends, plans content calendars,
     drafts scripts with voice calibration, manages publishing, and
     tracks analytics. Semi-autonomous: Genesis proposes, user approves.
+
+    Sub-features are independently toggleable from the dashboard module
+    settings panel. The module starts enabled with all auto-features OFF
+    so the user can turn them on individually as they're ready.
     """
 
     def __init__(self) -> None:
@@ -30,6 +34,13 @@ class ContentPipelineModule:
         self.script_engine: ScriptEngine | None = None
         self.publisher: PublishManager | None = None
         self.analytics: AnalyticsTracker | None = None
+
+        # Sub-feature toggles (all off by default)
+        self._auto_capture_recon: bool = False
+        self._auto_capture_trends: bool = False
+        self._autonomous_drafting: bool = False
+        self._platform_targets: list[str] = ["telegram"]
+        self._engagement_threshold: int = 50
 
     @property
     def name(self) -> str:
@@ -42,6 +53,25 @@ class ContentPipelineModule:
     @enabled.setter
     def enabled(self, value: bool) -> None:
         self._enabled = value
+
+    @property
+    def _drafter(self):
+        """Lazy-bind ContentDrafter from runtime.
+
+        The drafter is created during outreach init (after module init),
+        so it's not available at register() time. This property resolves
+        it on first use.
+        """
+        if self._runtime is not None:
+            return getattr(self._runtime, "content_drafter", None)
+        return None
+
+    @property
+    def _outreach_pipeline(self):
+        """Lazy-bind OutreachPipeline from runtime (created after module init)."""
+        if self._runtime is not None:
+            return getattr(self._runtime, "_outreach_pipeline", None)
+        return None
 
     async def register(self, runtime: Any) -> None:
         """Register with Genesis runtime and initialize components."""
@@ -65,12 +95,12 @@ class ContentPipelineModule:
         await publisher_mod.ensure_table(db)
         await analytics_mod.ensure_table(db)
 
-        # Get drafter if available
-        drafter = getattr(runtime, "content_drafter", None)
-
+        # Pass drafter=None at register time — ScriptEngine and Planner
+        # will use self._drafter (lazy property) when they need it.
+        # The drafter is created during outreach init which runs after modules.
         self.idea_bank = IdeaBank(db)
-        self.planner = ContentPlanner(db, drafter=drafter)
-        self.script_engine = ScriptEngine(db, drafter=drafter)
+        self.planner = ContentPlanner(db, drafter=None)
+        self.script_engine = ScriptEngine(db, drafter=None)
         self.publisher = PublishManager(db)
         self.analytics = AnalyticsTracker(db)
 
@@ -89,18 +119,37 @@ class ContentPipelineModule:
     def get_research_profile_name(self) -> str | None:
         return "content-pipeline"
 
+    def _inject_drafter(self) -> None:
+        """Push the lazy-resolved drafter into ScriptEngine and Planner.
+
+        Called before drafting operations to ensure they have the drafter
+        that wasn't available at register time.
+        """
+        drafter = self._drafter
+        if drafter is not None:
+            if self.script_engine is not None and self.script_engine._drafter is None:
+                self.script_engine._drafter = drafter
+            if self.planner is not None and self.planner._drafter is None:
+                self.planner._drafter = drafter
+
     async def handle_opportunity(self, opportunity: dict) -> dict | None:
         """Capture content-relevant opportunities as ideas.
 
-        Expects opportunity dicts with 'type' indicating relevance.
-        Content-relevant types: 'content_idea', 'trend', 'recon_finding'.
+        Gated by sub-feature toggles: auto_capture_recon and
+        auto_capture_trends must be enabled for their respective signal
+        types. Manual content_idea signals always pass through.
         """
         if self.idea_bank is None:
             return None
 
         opp_type = opportunity.get("type", "")
-        content_types = {"content_idea", "trend", "recon_finding"}
-        if opp_type not in content_types:
+
+        # Gate by sub-feature toggles
+        if opp_type == "recon_finding" and not self._auto_capture_recon:
+            return None
+        if opp_type == "trend" and not self._auto_capture_trends:
+            return None
+        if opp_type not in {"content_idea", "trend", "recon_finding"}:
             return None
 
         content = opportunity.get("content", opportunity.get("summary", ""))
@@ -157,8 +206,7 @@ class ContentPipelineModule:
         shares = outcome.get("shares", 0)
         engagement = views + likes * 5 + shares * 10
 
-        # Only extract lessons from notably good or bad outcomes
-        if engagement < 50:
+        if engagement < self._engagement_threshold:
             return None
 
         lessons = []
@@ -182,15 +230,38 @@ class ContentPipelineModule:
         return lessons if lessons else None
 
     def configurable_fields(self) -> list[dict]:
-        """Return user-editable configuration fields."""
+        """Return user-editable configuration fields for the dashboard."""
         return [
+            {"name": "auto_capture_recon", "label": "Auto-Capture Recon", "type": "bool",
+             "value": self._auto_capture_recon,
+             "description": "Automatically capture recon findings as content ideas"},
+            {"name": "auto_capture_trends", "label": "Auto-Capture Trends", "type": "bool",
+             "value": self._auto_capture_trends,
+             "description": "Automatically capture trend signals as content ideas"},
+            {"name": "autonomous_drafting", "label": "Autonomous Drafting", "type": "bool",
+             "value": self._autonomous_drafting,
+             "description": "Auto-draft scripts from ideas without explicit request"},
+            {"name": "platform_targets", "label": "Platform Targets", "type": "list",
+             "value": self._platform_targets,
+             "description": "Platforms to generate content for (telegram, linkedin, reddit, etc.)"},
             {"name": "engagement_threshold", "label": "Engagement Threshold", "type": "int",
-             "value": getattr(self, "_engagement_threshold", 50),
+             "value": self._engagement_threshold,
              "description": "Minimum engagement score to extract lessons from outcomes"},
         ]
 
     def update_config(self, updates: dict) -> dict:
-        """Apply configuration updates with bounds validation."""
+        """Apply configuration updates with type validation."""
+        if "auto_capture_recon" in updates:
+            self._auto_capture_recon = bool(updates["auto_capture_recon"])
+        if "auto_capture_trends" in updates:
+            self._auto_capture_trends = bool(updates["auto_capture_trends"])
+        if "autonomous_drafting" in updates:
+            self._autonomous_drafting = bool(updates["autonomous_drafting"])
+        if "platform_targets" in updates:
+            val = updates["platform_targets"]
+            if not isinstance(val, list):
+                raise TypeError("platform_targets must be a list")
+            self._platform_targets = [str(t) for t in val]
         if "engagement_threshold" in updates:
             val = int(updates["engagement_threshold"])
             if val < 0:

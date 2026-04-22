@@ -37,6 +37,7 @@ async def init(rt: GenesisRuntime) -> None:
         governance = GovernanceGate(config, rt._db)
         fresh_eyes = FreshEyesReview(rt._router) if rt._router else None
         drafter = ContentDrafter(rt._router)
+        rt.content_drafter = drafter  # Expose for content pipeline lazy-binding
         formatter = ContentFormatter()
 
         channels: dict = {}
