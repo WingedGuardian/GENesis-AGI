@@ -149,24 +149,23 @@ async def _ensure_browser():
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
+        # Always launch headed on VNC display :99.  The virtual display is
+        # always running (Xvfb systemd unit).  This means the browser is
+        # always observable via noVNC — no restart needed for CAPTCHA
+        # escalation or human-assisted tasks.
         global _original_display
-        headed = _collaborate_mode
-        if headed:
-            _original_display = os.environ.get("DISPLAY")
-            os.environ["DISPLAY"] = _VNC_DISPLAY
-        elif _original_display is not None:
-            os.environ["DISPLAY"] = _original_display
-        elif "DISPLAY" in os.environ:
-            del os.environ["DISPLAY"]
+        _original_display = os.environ.get("DISPLAY")
+        os.environ["DISPLAY"] = _VNC_DISPLAY
 
         _stealth_cm = AsyncCamoufox(
-            headless=not headed,
+            headless=False,
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
+            humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
             firefox_user_prefs={
                 # Camoufox disables session history (max_entries=0) for
                 # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
+                # works.
                 "browser.sessionhistory.max_entries": 10,
                 "browser.sessionhistory.max_total_viewers": -1,
             },
@@ -174,8 +173,7 @@ async def _ensure_browser():
         _stealth_browser = await _stealth_cm.__aenter__()
         # With persistent_context, browser IS the context
         _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
-        mode_str = "headed (collaborate)" if headed else "headless"
-        logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
+        logger.info("Camoufox browser launched headed on %s with persistent profile at %s", _VNC_DISPLAY, _PROFILE_DIR)
         return _stealth_page
 
 
@@ -311,6 +309,190 @@ async def _human_delay() -> None:
         await asyncio.sleep(delay)
 
 
+async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
+    """Human-like click: hover first, jitter position, realistic event chain.
+
+    When Camoufox is active, generates a mousemove trail to the element
+    before clicking with a slight offset from center.  This produces
+    mousemove → mouseenter → mousedown → mouseup → click event chains
+    that match real human behavior.
+
+    Falls back to plain page.click() when not in stealth mode.
+    """
+    if not _is_camoufox_active():
+        await page.click(selector, timeout=timeout)
+        return
+
+    try:
+        el = await page.wait_for_selector(selector, timeout=timeout)
+        if el is None:
+            raise Exception(f"Element not found: {selector}")
+        box = await el.bounding_box()
+        if box is None:
+            await page.click(selector, timeout=timeout)
+            return
+
+        # Jitter: click within central 60% of element, not dead center
+        jitter_x = random.uniform(box["width"] * 0.2, box["width"] * 0.8)
+        jitter_y = random.uniform(box["height"] * 0.2, box["height"] * 0.8)
+        target_x = box["x"] + jitter_x
+        target_y = box["y"] + jitter_y
+
+        # Hover first — generates mousemove trail to the element
+        await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
+        await asyncio.sleep(random.uniform(0.05, 0.2))
+
+        # Click with realistic mousedown/mouseup gap
+        await page.mouse.down()
+        await asyncio.sleep(random.uniform(0.04, 0.12))
+        await page.mouse.up()
+    except Exception:
+        logger.debug("Stealth click fallback for '%s'", selector)
+        await page.click(selector, timeout=timeout)
+
+
+async def _human_type(page, selector: str, value: str) -> None:
+    """Type text character-by-character with human-like timing.
+
+    Camoufox mode: clears field via fill(""), then types per-keystroke
+    with randomized inter-key intervals.  This fires the full
+    keydown → keypress/input → keyup event chain per character that
+    behavioral detection systems expect from real users.
+
+    Uses per-character randomization via keyboard.type() for true IKI
+    jitter (Playwright's page.type delay= is fixed across all chars).
+
+    Non-Camoufox: falls back to atomic page.fill() (no delay overhead).
+    """
+    if not _is_camoufox_active():
+        await page.fill(selector, value, timeout=10000)
+        return
+
+    # Clear field reliably (works on React controlled inputs)
+    await page.fill(selector, "", timeout=10000)
+    # Click to focus the field
+    await page.click(selector, timeout=10000)
+    # Type per-keystroke with TRUE per-character IKI jitter
+    for char in value:
+        await page.keyboard.type(char)
+        iki = random.uniform(0.05, 0.20)  # 50-200ms
+        # 5% chance of a "thinking pause" (300-1000ms)
+        if random.random() < 0.05:
+            iki = random.uniform(0.3, 1.0)
+        await asyncio.sleep(iki)
+
+
+async def _send_turnstile_alert(page_url: str) -> None:
+    """Send Telegram alert that a CAPTCHA needs human intervention.
+
+    Uses TelegramAlertChannel (stdlib urllib — no external deps).
+    Reads credentials from secrets.env.  Never raises — alert failure
+    must not crash the browser submission.
+    """
+    try:
+        from genesis.guardian.alert.base import Alert, AlertSeverity
+        from genesis.guardian.alert.telegram import TelegramAlertChannel
+
+        secrets_path = Path.home() / "genesis" / "secrets.env"
+        if not secrets_path.exists():
+            logger.warning("secrets.env not found — cannot send CAPTCHA alert")
+            return
+
+        secrets: dict[str, str] = {}
+        for line in secrets_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                secrets[k.strip()] = v.strip().strip("'\"")
+
+        bot_token = secrets.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = secrets.get("TELEGRAM_FORUM_CHAT_ID") or secrets.get("TELEGRAM_CHAT_ID", "")
+        if not bot_token or not chat_id:
+            logger.warning("Telegram credentials missing — cannot send CAPTCHA alert")
+            return
+
+        vnc_url = _get_vnc_url()
+        channel = TelegramAlertChannel(bot_token, chat_id)
+        alert = Alert(
+            severity=AlertSeverity.WARNING,
+            title="CAPTCHA Challenge Detected",
+            body=(
+                f"Browser at {page_url} hit a Cloudflare Turnstile challenge "
+                f"that won't auto-resolve.\n\n"
+                f"Open VNC to solve it: {vnc_url}"
+            ),
+        )
+        await channel.send(alert)
+        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+    except Exception:
+        logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
+
+
+async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
+    """Detect and handle Cloudflare Turnstile challenge.
+
+    Phase 1 (auto-resolve): Polls for up to ``timeout_ms`` for the Turnstile
+    iframe to produce a ``cf-turnstile-response`` token.  Many challenges
+    auto-resolve for legitimate-looking browsers.
+
+    Phase 2 (human escalation): If auto-resolve fails, sends a Telegram
+    alert and polls for up to 5 minutes for human intervention via VNC.
+    The browser is always headed on :99, so the human can see and interact
+    with it immediately — no restart needed.
+
+    Returns None if no Turnstile detected, or a status dict.
+    """
+    try:
+        turnstile = await page.query_selector(
+            'iframe[src*="challenges.cloudflare.com"]'
+        )
+        if turnstile is None:
+            return None
+
+        logger.info("Turnstile challenge detected — waiting for auto-resolve")
+
+        # Phase 1: auto-resolve (up to timeout_ms)
+        start = asyncio.get_event_loop().time()
+        while (asyncio.get_event_loop().time() - start) * 1000 < timeout_ms:
+            token = await page.evaluate("""() => {
+                const inp = document.querySelector(
+                    'input[name="cf-turnstile-response"]'
+                );
+                return inp ? inp.value : '';
+            }""")
+            if token:
+                logger.info("Turnstile auto-resolved")
+                await asyncio.sleep(random.uniform(1.0, 3.0))
+                return {"status": "resolved", "method": "auto"}
+            await asyncio.sleep(1.0)
+
+        # Phase 2: escalate to human
+        logger.warning("Turnstile did NOT auto-resolve — escalating to human via Telegram")
+        await _send_turnstile_alert(page.url)
+
+        # Poll for human resolution (up to 5 minutes)
+        escalation_start = asyncio.get_event_loop().time()
+        escalation_timeout = 300  # 5 minutes — user-requested
+        while (asyncio.get_event_loop().time() - escalation_start) < escalation_timeout:
+            token = await page.evaluate("""() => {
+                const inp = document.querySelector(
+                    'input[name="cf-turnstile-response"]'
+                );
+                return inp ? inp.value : '';
+            }""")
+            if token:
+                logger.info("Turnstile resolved by human intervention")
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+                return {"status": "resolved", "method": "human"}
+            await asyncio.sleep(5.0)
+
+        logger.warning("Turnstile NOT resolved after 5 min escalation")
+        return {"status": "blocked", "method": "timeout"}
+    except Exception as e:
+        logger.debug("Turnstile detection error: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations (testable without FastMCP)
 # ---------------------------------------------------------------------------
@@ -326,12 +508,26 @@ async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+        # Detect and handle Cloudflare Turnstile if present
+        turnstile_result = None
+        if _is_camoufox_active():
+            turnstile_result = await _wait_for_turnstile(page)
+
         snapshot = await _snapshot_page(page)
-        return {
+        result = {
             "url": page.url,
             "title": await page.title(),
             "snapshot": snapshot,
         }
+        if turnstile_result:
+            result["turnstile"] = turnstile_result
+            if turnstile_result["status"] == "blocked":
+                result["warning"] = (
+                    "Cloudflare Turnstile challenge did not resolve. "
+                    "A Telegram alert was sent. Check VNC if you can still assist."
+                )
+        return result
     except Exception as e:
         logger.error("browser_navigate failed: %s", e, exc_info=True)
         return {"error": str(e), "url": url}
@@ -344,7 +540,7 @@ async def _impl_browser_click(selector: str) -> dict:
         return {"error": "No page open. Call browser_navigate first."}
     try:
         await _human_delay()
-        await _active_page.click(selector, timeout=10000)
+        await _stealth_click(_active_page, selector)
         snapshot = await _snapshot_page(_active_page)
         return {"clicked": selector, "url": _active_page.url, "snapshot": snapshot}
     except Exception as e:
@@ -358,7 +554,7 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
         return {"error": "No page open. Call browser_navigate first."}
     try:
         await _human_delay()
-        await _active_page.fill(selector, value, timeout=10000)
+        await _human_type(_active_page, selector, value)
         return {"filled": selector, "url": _active_page.url}
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
@@ -569,42 +765,28 @@ async def browser_clear_domain(domain: str) -> dict:
 
 @mcp.tool()
 async def browser_collaborate(enable: bool = True) -> dict:
-    """Toggle collaborative browser mode (headed + VNC).
+    """Toggle collaborative timing mode.
 
-    When enabled, the browser runs visibly on a virtual display.
-    The user can watch and interact via noVNC in their browser.
-    Useful for tasks requiring human input (captchas, payments, 2FA).
+    Camoufox always runs headed on VNC display :99 — it's always observable.
+    This tool controls the TIMING profile, not visibility:
 
-    When disabled, reverts to headless mode for faster automation.
-    Toggling restarts the browser — existing page state is lost.
+    - enable=True (collaborate): faster timing (0.5-2s between actions).
+      Use when a human is actively watching via VNC.
+    - enable=False (background): stealth timing (1-15s between actions).
+      Use when nobody is watching — maximally human-like pace.
+
+    No browser restart. No page state loss. Just a timing change.
     """
     global _collaborate_mode
 
-    if _collaborate_mode == enable:
-        return {
-            "mode": "collaborate" if enable else "headless",
-            "changed": False,
-            "vnc_url": _get_vnc_url() if enable else None,
-        }
-
     _collaborate_mode = enable
-    async with _browser_lock:
-        await async_cleanup()  # Force browser restart on next tool call
 
-    if enable and not Path(f"/tmp/.X{_VNC_DISPLAY[1:]}-lock").exists():
-        return {
-            "mode": "collaborate",
-            "changed": True,
-            "vnc_url": None,
-            "warning": f"Virtual display {_VNC_DISPLAY} not running. "
-            "Start with: systemctl --user start genesis-xvfb genesis-vnc genesis-novnc",
-        }
-
+    vnc_url = _get_vnc_url()
     return {
-        "mode": "collaborate" if enable else "headless",
-        "changed": True,
-        "vnc_url": _get_vnc_url() if enable else None,
-        "note": "Browser will relaunch in new mode on next navigation.",
+        "mode": "collaborate" if enable else "background",
+        "timing": "fast (0.5-2s)" if enable else "stealth (1-15s)",
+        "vnc_url": vnc_url,
+        "note": "Browser is always headed on VNC. Open the URL above to watch/interact.",
     }
 
 
