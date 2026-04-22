@@ -44,7 +44,6 @@ _active_page = None  # Tracks whichever page was last navigated (standard or ste
 # Collaborative mode — when True, browser launches headed on virtual display :99.
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
-_original_display: str | None = None  # Saved DISPLAY before collaborate override
 
 # Idle timeout — auto-cleanup browser after 1 hour of no tool calls.
 # User-approved value (2026-04-21). Background asyncio task polls every 60s.
@@ -153,8 +152,6 @@ async def _ensure_browser():
         # always running (Xvfb systemd unit).  This means the browser is
         # always observable via noVNC — no restart needed for CAPTCHA
         # escalation or human-assisted tasks.
-        global _original_display
-        _original_display = os.environ.get("DISPLAY")
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
         _stealth_cm = AsyncCamoufox(
@@ -198,21 +195,19 @@ async def _ensure_chromium_fallback():
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        headed = _collaborate_mode
-        if headed:
-            os.environ["DISPLAY"] = _VNC_DISPLAY
+        # Always headed on VNC :99, consistent with Camoufox
+        os.environ["DISPLAY"] = _VNC_DISPLAY
 
         _playwright = await async_playwright().start()
         _context = await _playwright.chromium.launch_persistent_context(
             user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-            headless=not headed,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-            + (["--start-maximized"] if headed else []),
-            viewport={"width": 1280, "height": 720} if headed else None,
+            headless=False,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                   "--start-maximized"],
+            viewport={"width": 1280, "height": 720},
         )
         _page = _context.pages[0] if _context.pages else await _context.new_page()
-        mode_str = "headed (collaborate)" if headed else "headless"
-        logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
+        logger.info("Chromium fallback launched headed on %s with profile at %s", _VNC_DISPLAY, _CHROMIUM_PROFILE_DIR)
         return _page
 
 
@@ -347,7 +342,7 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         await asyncio.sleep(random.uniform(0.04, 0.12))
         await page.mouse.up()
     except Exception:
-        logger.debug("Stealth click fallback for '%s'", selector)
+        logger.warning("Stealth click fallback for '%s'", selector)
         await page.click(selector, timeout=timeout)
 
 
@@ -428,6 +423,22 @@ async def _send_turnstile_alert(page_url: str) -> None:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
 
+async def _poll_turnstile_token(page, timeout_s: float, interval_s: float) -> bool:
+    """Poll for Cloudflare Turnstile response token.  Returns True if found."""
+    start = asyncio.get_running_loop().time()
+    while (asyncio.get_running_loop().time() - start) < timeout_s:
+        token = await page.evaluate("""() => {
+            const inp = document.querySelector(
+                'input[name="cf-turnstile-response"]'
+            );
+            return inp ? inp.value : '';
+        }""")
+        if token:
+            return True
+        await asyncio.sleep(interval_s)
+    return False
+
+
 async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     """Detect and handle Cloudflare Turnstile challenge.
 
@@ -443,6 +454,9 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     Returns None if no Turnstile detected, or a status dict.
     """
     try:
+        # Brief delay for SPA-injected Turnstile iframes
+        await asyncio.sleep(0.8)
+
         turnstile = await page.query_selector(
             'iframe[src*="challenges.cloudflare.com"]'
         )
@@ -451,40 +465,20 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
 
         logger.info("Turnstile challenge detected — waiting for auto-resolve")
 
-        # Phase 1: auto-resolve (up to timeout_ms)
-        start = asyncio.get_event_loop().time()
-        while (asyncio.get_event_loop().time() - start) * 1000 < timeout_ms:
-            token = await page.evaluate("""() => {
-                const inp = document.querySelector(
-                    'input[name="cf-turnstile-response"]'
-                );
-                return inp ? inp.value : '';
-            }""")
-            if token:
-                logger.info("Turnstile auto-resolved")
-                await asyncio.sleep(random.uniform(1.0, 3.0))
-                return {"status": "resolved", "method": "auto"}
-            await asyncio.sleep(1.0)
+        # Phase 1: auto-resolve
+        if await _poll_turnstile_token(page, timeout_ms / 1000, 1.0):
+            logger.info("Turnstile auto-resolved")
+            await asyncio.sleep(random.uniform(1.0, 3.0))
+            return {"status": "resolved", "method": "auto"}
 
         # Phase 2: escalate to human
         logger.warning("Turnstile did NOT auto-resolve — escalating to human via Telegram")
         await _send_turnstile_alert(page.url)
 
-        # Poll for human resolution (up to 5 minutes)
-        escalation_start = asyncio.get_event_loop().time()
-        escalation_timeout = 300  # 5 minutes — user-requested
-        while (asyncio.get_event_loop().time() - escalation_start) < escalation_timeout:
-            token = await page.evaluate("""() => {
-                const inp = document.querySelector(
-                    'input[name="cf-turnstile-response"]'
-                );
-                return inp ? inp.value : '';
-            }""")
-            if token:
-                logger.info("Turnstile resolved by human intervention")
-                await asyncio.sleep(random.uniform(1.0, 2.0))
-                return {"status": "resolved", "method": "human"}
-            await asyncio.sleep(5.0)
+        if await _poll_turnstile_token(page, 300, 5.0):  # 5 minutes
+            logger.info("Turnstile resolved by human intervention")
+            await asyncio.sleep(random.uniform(1.0, 2.0))
+            return {"status": "resolved", "method": "human"}
 
         logger.warning("Turnstile NOT resolved after 5 min escalation")
         return {"status": "blocked", "method": "timeout"}
@@ -676,6 +670,11 @@ async def browser_navigate(url: str, stealth: bool = False) -> dict:
 
     Set stealth=True to use Chromium fallback for sites incompatible with
     Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
+
+    NOTE: If Cloudflare Turnstile is detected, this call may block for up to
+    ~5 minutes while waiting for human resolution via VNC. A Telegram alert
+    is sent automatically. The response will include a 'turnstile' field with
+    the resolution status.
     """
     return await _impl_browser_navigate(url, stealth)
 
