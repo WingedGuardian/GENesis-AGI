@@ -5,6 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+# pgrep patterns for detecting browser-related processes. Single source of truth
+# used by the awareness signal collector, health probe, process reaper, and
+# remediation registry. Verified against actual /proc/PID/cmdline entries —
+# they match only browser binaries, not the MCP server's Python process.
+BROWSER_PGREP_PATTERNS: tuple[str, ...] = (
+    "camoufox-bin",
+    r"ms-playwright.*chrome",
+    "playwright/driver/node",
+)
+
 
 class BrowserLayer(StrEnum):
     """Four layers of browser interaction, from lightweight to full control."""

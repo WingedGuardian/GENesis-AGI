@@ -398,6 +398,19 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         cooldown_s=86400,
         max_attempts=2,
     ),
+    RemediationAction(
+        name="stale_browser_alert",
+        probe_name="browser_processes",
+        condition="4+ browser-related processes detected (may be orphaned)",
+        command=[],  # Alert-only — no command. Process reaper handles actual
+        # killing with age-aware 4h threshold. L2 auto-kill is unsafe because
+        # a single Camoufox session spawns 7-9 child processes (parent +
+        # content procs), immediately exceeding the DOWN threshold.
+        governance_level=4,
+        reversible=True,
+        cooldown_s=3600,
+        max_attempts=1,
+    ),
 ]
 
 

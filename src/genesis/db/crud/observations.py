@@ -35,6 +35,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "version_change": timedelta(days=3),
     "dead_letter_replay": timedelta(days=3),
     "light_reflection_candidate": timedelta(days=3),
+    "process_reaper_kill": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
     "light_escalation_resolved": timedelta(days=1),
     "light_escalation_pending": timedelta(days=1),

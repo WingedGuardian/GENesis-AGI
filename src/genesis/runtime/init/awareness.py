@@ -26,6 +26,7 @@ async def init(rt: GenesisRuntime) -> None:
             JobHealthCollector,
             LightCascadeCollector,
             OutreachEngagementCollector,
+            ProcessHealthCollector,
             ReconFindingsCollector,
             SentinelActivityCollector,
             StrategicTimerCollector,
@@ -49,6 +50,7 @@ async def init(rt: GenesisRuntime) -> None:
             GuardianActivityCollector(),
             SurplusActivityCollector(),
             AutonomyActivityCollector(),
+            ProcessHealthCollector(),
         ]
 
         rt._awareness_loop = AwarenessLoop(

@@ -33,6 +33,7 @@ async def init(rt: GenesisRuntime) -> None:
         if rt._awareness_loop is not None:
             from genesis.awareness.signals import (
                 ContainerMemoryCollector,
+                ProcessHealthCollector,
                 StrategicTimerCollector,
             )
             from genesis.learning.signals.autonomy_activity import (
@@ -106,6 +107,7 @@ async def init(rt: GenesisRuntime) -> None:
                     rt._db,
                     pipeline_getter=lambda: rt._outreach_pipeline,
                 ),
+                ProcessHealthCollector(),
             ]
             rt._awareness_loop.replace_collectors(collectors)
             logger.info("Installed %d signal collectors", len(collectors))
@@ -536,11 +538,18 @@ async def init(rt: GenesisRuntime) -> None:
             import asyncio
             import os
 
+            from genesis.browser.types import BROWSER_PGREP_PATTERNS
+
             # (pgrep_flag, pattern, max_age_hours, label)
             targets = [
                 ("-f", "opencode-ai", 24, "opencode-ai"),
                 ("-x", "claude", 168, "claude"),  # 7 days
             ]
+            # Browser processes — 4h max age. Idle timeout fires at 1h,
+            # MCP lifespan fires on session end. A 4h-old browser process
+            # has survived both layers and is definitively orphaned.
+            for bp in BROWSER_PGREP_PATTERNS:
+                targets.append(("-f", bp, 4, f"browser:{bp}"))
             my_pid = os.getpid()
             my_ppid = os.getppid()
             protected = {my_pid, my_ppid}
@@ -610,7 +619,9 @@ async def init(rt: GenesisRuntime) -> None:
                             continue
 
                 if all_killed:
-                    await asyncio.sleep(2)
+                    # 5s grace period for graceful shutdown — browsers need
+                    # time to flush profile SQLite and release locks.
+                    await asyncio.sleep(5)
                     for pid, _ in all_killed:
                         with contextlib.suppress(ProcessLookupError):
                             os.kill(pid, 9)  # SIGKILL
@@ -619,6 +630,35 @@ async def init(rt: GenesisRuntime) -> None:
                         len(all_killed),
                         all_killed,
                     )
+                    # Create observation for visibility
+                    if rt._db is not None:
+                        try:
+                            import json
+                            from datetime import UTC, datetime
+                            from uuid import uuid4
+
+                            from genesis.db.crud import observations
+
+                            await observations.create(
+                                rt._db,
+                                id=f"reaper-{uuid4().hex[:8]}",
+                                source="process_reaper",
+                                type="process_reaper_kill",
+                                priority="low",
+                                content=json.dumps({
+                                    "killed_count": len(all_killed),
+                                    "processes": [
+                                        {"pid": p, "label": lbl}
+                                        for p, lbl in all_killed
+                                    ],
+                                }),
+                                created_at=datetime.now(UTC).isoformat(),
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to create reaper observation",
+                                exc_info=True,
+                            )
                 rt.record_job_success("process_reaper")
             except Exception as exc:
                 rt.record_job_failure("process_reaper", str(exc))
