@@ -884,6 +884,19 @@ TABLES = {
             timestamp        TEXT NOT NULL
         )
     """,
+    "direct_session_queue": """
+        CREATE TABLE IF NOT EXISTS direct_session_queue (
+            id              TEXT PRIMARY KEY,
+            payload_json    TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'claimed', 'dispatched', 'failed')),
+            session_id      TEXT,
+            error_message   TEXT,
+            created_at      TEXT NOT NULL,
+            claimed_at      TEXT,
+            dispatched_at   TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1063,6 +1076,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_file_mod_path ON file_modifications(file_path)",
     "CREATE INDEX IF NOT EXISTS idx_file_mod_session ON file_modifications(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_file_mod_ts ON file_modifications(timestamp)",
+    # direct session queue
+    "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

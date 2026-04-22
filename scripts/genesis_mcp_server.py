@@ -106,6 +106,32 @@ def _bootstrap_health() -> None:
             tracker = ProviderActivityTracker()
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
+
+            # Wire direct session tools with DB-only access.
+            # Standalone MCP enqueues to direct_session_queue;
+            # the Genesis server's poll loop handles dispatch.
+            # Ensure queue table exists (standalone doesn't call db.init()).
+            try:
+                from genesis.db.schema import TABLES
+
+                await db.execute(TABLES["direct_session_queue"])
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dsq_status_created "
+                    "ON direct_session_queue(status, created_at)"
+                )
+                await db.commit()
+
+                from genesis.mcp.health.direct_session_tools import (
+                    init_direct_session_tools,
+                )
+
+                init_direct_session_tools(db=db)
+            except Exception:
+                logger.warning(
+                    "Direct session tools not available in standalone MCP",
+                    exc_info=True,
+                )
+
             clear_mcp_crash("health")
             yield
         finally:

@@ -3,6 +3,12 @@
 Follows the ``task_tools.py`` pattern: module-level state, init function
 for runtime wiring, ``_impl_*`` functions (testable without FastMCP),
 and ``@mcp.tool()`` decorated public wrappers.
+
+Sessions are dispatched via a DB queue (``direct_session_queue`` table).
+The MCP tool enqueues the request; the Genesis server's poll loop in
+``runtime/init/direct_session.py`` claims and dispatches to
+``DirectSessionRunner.spawn()``.  This decouples the session lifecycle
+from the MCP server process — sessions outlive the calling CC session.
 """
 
 from __future__ import annotations
@@ -17,13 +23,25 @@ logger = logging.getLogger(__name__)
 
 # Module-level state (wired at runtime via init_direct_session_tools)
 _runner = None
+_db = None
 
 
-def init_direct_session_tools(runner) -> None:
-    """Wire the DirectSessionRunner. Called from runtime init."""
-    global _runner
+def init_direct_session_tools(*, db=None, runner=None) -> None:
+    """Wire direct session tools.
+
+    In runtime mode: both db and runner are provided. The poll loop
+    in runtime/init/direct_session.py handles dispatch.
+    In standalone MCP mode: only db is provided. Items are enqueued
+    for the Genesis server's poll loop to pick up.
+    """
+    global _runner, _db
+    _db = db
     _runner = runner
-    logger.info("Direct session MCP tools wired")
+    logger.info(
+        "Direct session MCP tools wired (db=%s, runner=%s)",
+        db is not None,
+        runner is not None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -39,9 +57,9 @@ async def _impl_direct_session_run(
     timeout_minutes: int = 15,
     notify: bool = True,
 ) -> dict:
-    """Spawn a directed background CC session."""
-    if _runner is None:
-        return {"error": "Direct session runner not initialized"}
+    """Enqueue a directed background CC session for dispatch."""
+    if _db is None:
+        return {"error": "Direct session tools not initialized (no DB)"}
 
     from genesis.cc.direct_session import VALID_PROFILES
     from genesis.cc.types import CCModel, EffortLevel
@@ -54,60 +72,107 @@ async def _impl_direct_session_run(
 
     model_lower = model.lower()
     try:
-        cc_model = CCModel(model_lower)
+        CCModel(model_lower)
     except ValueError:
         return {"error": f"Invalid model '{model}'. Must be one of: sonnet, opus, haiku"}
 
     effort_lower = effort.lower()
     try:
-        cc_effort = EffortLevel(effort_lower)
+        EffortLevel(effort_lower)
     except ValueError:
         return {"error": f"Invalid effort '{effort}'. Must be one of: low, medium, high, max"}
 
     try:
-        from genesis.cc.direct_session import DirectSessionRequest
+        from genesis.db.crud import direct_session_queue as dsq
 
-        request = DirectSessionRequest(
+        queue_id = await dsq.enqueue(
+            _db,
             prompt=prompt,
             profile=profile,
-            model=cc_model,
-            effort=cc_effort,
+            model=model_lower,
+            effort=effort_lower,
             timeout_s=min(timeout_minutes * 60, 3600),  # cap at 1 hour
             notify=notify,
             caller_context="mcp_tool",
         )
-        session_id = await _runner.spawn(request)
         return {
-            "session_id": session_id,
-            "status": "spawned",
+            "queue_id": queue_id,
+            "status": "queued",
             "profile": profile,
             "message": (
-                f"Background session started with '{profile}' profile. "
+                f"Session queued with '{profile}' profile. "
+                "The Genesis server will dispatch it within seconds. "
                 "You'll be notified via Telegram when it completes."
             ),
         }
     except Exception as exc:
         logger.error("direct_session_run failed", exc_info=True)
-        return {"error": f"Failed to spawn session: {exc}"}
+        return {"error": f"Failed to enqueue session: {exc}"}
 
 
-async def _impl_direct_session_status(session_id: str) -> dict:
-    """Check status of a direct session."""
+async def _get_db():
+    """Get a DB connection — prefer module-level, fall back to health service."""
+    if _db is not None:
+        return _db
     import genesis.mcp.health as health_mcp_mod
 
     svc = health_mcp_mod._service
     if svc is None:
-        return {"error": "Health service not available"}
+        return None
+    return getattr(svc, "_db", None)
 
-    db = getattr(svc, "_db", None)
+
+async def _impl_direct_session_status(lookup_id: str) -> dict:
+    """Check status of a direct session by queue_id or session_id."""
+    db = await _get_db()
     if db is None:
         return {"error": "Database not available"}
 
+    # If it looks like a queue_id, look up the queue row first
+    if lookup_id.startswith("dsq-"):
+        from genesis.db.crud import direct_session_queue as dsq
+
+        q_row = await dsq.get_by_id(db, lookup_id)
+        if q_row is None:
+            return {"error": f"Queue item {lookup_id} not found"}
+
+        payload = {}
+        with contextlib.suppress(json.JSONDecodeError, TypeError):
+            payload = json.loads(q_row.get("payload_json", "{}"))
+
+        result = {
+            "queue_id": lookup_id,
+            "queue_status": q_row["status"],
+            "created_at": q_row["created_at"],
+            "profile": payload.get("profile"),
+            "model": payload.get("model"),
+        }
+
+        # If dispatched, also include session details
+        if q_row.get("session_id"):
+            result["session_id"] = q_row["session_id"]
+            session_info = await _lookup_session(db, q_row["session_id"])
+            if session_info:
+                result.update(session_info)
+        elif q_row["status"] == "failed":
+            result["error"] = q_row.get("error_message")
+
+        return result
+
+    # Otherwise treat as session_id (backward compat)
+    session_info = await _lookup_session(db, lookup_id)
+    if session_info is None:
+        return {"error": f"Session {lookup_id} not found"}
+    return {"session_id": lookup_id, **session_info}
+
+
+async def _lookup_session(db, session_id: str) -> dict | None:
+    """Look up session details from cc_sessions."""
     from genesis.db.crud import cc_sessions
 
     row = await cc_sessions.get_by_id(db, session_id)
     if row is None:
-        return {"error": f"Session {session_id} not found"}
+        return None
 
     metadata = {}
     if row.get("metadata"):
@@ -115,7 +180,6 @@ async def _impl_direct_session_status(session_id: str) -> dict:
             metadata = json.loads(row["metadata"])
 
     return {
-        "session_id": session_id,
         "status": row.get("status", "unknown"),
         "source_tag": row.get("source_tag"),
         "model": row.get("model"),
@@ -138,13 +202,7 @@ async def _impl_direct_session_list(
     limit: int = 20,
 ) -> dict:
     """List recent direct sessions."""
-    import genesis.mcp.health as health_mcp_mod
-
-    svc = health_mcp_mod._service
-    if svc is None:
-        return {"error": "Health service not available"}
-
-    db = getattr(svc, "_db", None)
+    db = await _get_db()
     if db is None:
         return {"error": "Database not available"}
 
@@ -183,10 +241,20 @@ async def _impl_direct_session_list(
 
     active_count = _runner.active_count() if _runner else 0
 
+    # Include pending queue items
+    pending_count = 0
+    try:
+        from genesis.db.crud import direct_session_queue as dsq
+
+        pending_count = await dsq.count_pending(db)
+    except Exception:
+        pass
+
     return {
         "sessions": sessions,
         "count": len(sessions),
         "active_now": active_count,
+        "queued": pending_count,
     }
 
 
@@ -206,8 +274,8 @@ async def direct_session_run(
 ) -> dict:
     """Spawn a directed background CC session with profile-based tool restrictions.
 
-    The session runs independently and reports results via Telegram.
-    Returns immediately with a session_id for tracking.
+    The session is queued and dispatched by the Genesis server, so it
+    outlives this MCP session. Results are reported via Telegram.
 
     Profiles control what the session can do:
     - observe: Read everything, change nothing. Browser viewing, memory reads, web search.
@@ -230,15 +298,17 @@ async def direct_session_run(
 
 
 @mcp.tool()
-async def direct_session_status(session_id: str) -> dict:
+async def direct_session_status(lookup_id: str) -> dict:
     """Check the status and results of a direct background session.
 
-    Returns status, cost, duration, output preview, tools used, and any errors.
+    Accepts either a queue_id (dsq-...) from direct_session_run or a
+    session_id. Returns status, cost, duration, output preview, tools
+    used, and any errors.
 
     Args:
-        session_id: Session ID from direct_session_run
+        lookup_id: Queue ID or session ID from direct_session_run
     """
-    return await _impl_direct_session_status(session_id)
+    return await _impl_direct_session_status(lookup_id)
 
 
 @mcp.tool()
