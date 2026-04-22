@@ -84,6 +84,7 @@ async def test_no_unexpected_tables(db):
         "follow_ups", "surplus_tasks", "surplus_insights",
         "knowledge_uploads",
         "file_modifications",
+        "direct_session_queue",
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

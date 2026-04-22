@@ -230,6 +230,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_dispatcher: object | None = None
         self._task_dispatch_poll: asyncio.Task | None = None
         self._direct_session_runner: object | None = None
+        self._direct_session_poll: asyncio.Task | None = None
 
         # Global pause state — blocks all background dispatches when True.
         self._paused: bool = False
