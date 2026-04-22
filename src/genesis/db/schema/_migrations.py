@@ -975,6 +975,9 @@ async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
         if not row or "resilience_degradation" in (row[0] or ""):
             return  # Already up to date or table missing (fresh install handles it)
 
+        # Clean up orphaned temp table from a prior failed attempt
+        await db.execute("DROP TABLE IF EXISTS cognitive_state_new")
+
         await db.execute("""
             CREATE TABLE cognitive_state_new (
                 id           TEXT PRIMARY KEY,
@@ -988,17 +991,24 @@ async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
                 expires_at   TEXT
             )
         """)
+        # Only copy rows with valid section values (prevents CHECK violation
+        # from aborting the migration if a bug wrote an unexpected value)
         await db.execute("""
             INSERT INTO cognitive_state_new
                 (id, content, section, generated_by, created_at, expires_at)
             SELECT id, content, section, generated_by, created_at, expires_at
             FROM cognitive_state
+            WHERE section IN ('active_context', 'pending_actions', 'state_flags',
+                              'resilience_degradation')
         """)
         await db.execute("DROP TABLE cognitive_state")
         await db.execute("ALTER TABLE cognitive_state_new RENAME TO cognitive_state")
         await db.commit()
         logger.info("cognitive_state table rebuilt with resilience_degradation section")
     except Exception:
+        # Attempt cleanup on failure to prevent orphaned temp table
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS cognitive_state_new")
         logger.error("cognitive_state CHECK constraint migration failed", exc_info=True)
 
 

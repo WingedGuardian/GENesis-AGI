@@ -248,7 +248,17 @@ class SentinelDispatcher:
         3. Per-pattern exponential backoff (replaces global cooldown + daily budget)
         4. CC infrastructure available
         """
-        # Auto-reset ESCALATED if timeout expired
+        self._try_auto_reset_escalated()
+
+        async with self._lock:
+            return await self._gated_dispatch(request)
+
+    def _try_auto_reset_escalated(self) -> bool:
+        """Auto-reset from ESCALATED if timeout expired and count < max.
+
+        Called from both dispatch() and check_fire_alarms() to ensure the
+        sentinel recovers even when no new alarms trigger a dispatch.
+        """
         if self._state.should_auto_reset_escalated():
             self._state.escalated_count += 1
             self._state.transition(
@@ -256,9 +266,8 @@ class SentinelDispatcher:
                 reason=f"auto-reset from ESCALATED (count={self._state.escalated_count})",
             )
             save_state(self._state)
-
-        async with self._lock:
-            return await self._gated_dispatch(request)
+            return True
+        return False
 
     async def _gated_dispatch(self, request: SentinelRequest) -> SentinelResult:
         """Gate checks and dispatch, protected by asyncio.Lock."""
@@ -610,13 +619,18 @@ class SentinelDispatcher:
             and result.diagnosis
         ):
             diag_lower = result.diagnosis.lower()
-            if any(phrase in diag_lower for phrase in (
+            _NO_ACTION_PHRASES = (
                 "false positive", "no longer active", "already resolved",
                 "no active alerts", "alert cleared", "not an issue",
-            )):
+            )
+            matched = next((p for p in _NO_ACTION_PHRASES if p in diag_lower), None)
+            if matched:
                 resolved = True
                 result.resolved = True
-                logger.info("Sentinel treating dispatch as resolved (no-action diagnosis)")
+                logger.info(
+                    "Sentinel treating dispatch as resolved (no-action diagnosis, matched='%s')",
+                    matched,
+                )
 
         if resolved:
             self._state.transition(SentinelState.HEALTHY, reason="resolved after action execution")
@@ -1257,13 +1271,7 @@ class SentinelDispatcher:
         """
         # Auto-reset ESCALATED on every tick (not just on new dispatches).
         # Without this, the sentinel stays red forever if no new alarms fire.
-        if self._state.should_auto_reset_escalated():
-            self._state.escalated_count += 1
-            self._state.transition(
-                SentinelState.HEALTHY,
-                reason=f"auto-reset from ESCALATED (count={self._state.escalated_count})",
-            )
-            save_state(self._state)
+        self._try_auto_reset_escalated()
 
         if self._health_data is None:
             return None
