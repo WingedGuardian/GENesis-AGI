@@ -6,7 +6,7 @@ Staleness decay: signals whose value hasn't changed since the previous tick
 get exponentially reduced weight contribution. This prevents permanently-stuck
 signals (e.g. critical_failure=1.0 for hours) from triggering reflections
 every tick. First occurrence = full weight; each consecutive unchanged tick
-halves the contribution, flooring at 5%.
+halves the contribution, flooring at 25%.
 """
 
 from __future__ import annotations

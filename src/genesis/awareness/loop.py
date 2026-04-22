@@ -849,13 +849,17 @@ class AwarenessLoop:
                 )
                 if not approved:
                     continue
+                # Atomic consume — prevents double-dispatch across ticks.
+                # Must happen HERE, not inside route(), because skip_approval
+                # bypasses the approval gate (and its mark_consumed call).
+                consumed = await gate.mark_consumed(approved["id"])
+                if not consumed:
+                    continue  # Another tick already consumed it
                 depth = Depth.DEEP if depth_name == "deep" else Depth.STRATEGIC
                 logger.info(
                     "Resuming %s reflection from approved request %s",
                     depth_name, approved["id"][:8],
                 )
-                # skip_approval=True: the approval was already granted and
-                # will be consumed inside _cli_fallback_decision via route().
                 await self._cc_reflection_bridge.reflect(
                     depth, tick, db=self._db, skip_approval=True,
                 )
