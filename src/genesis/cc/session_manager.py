@@ -181,6 +181,7 @@ class SessionManager:
         "reflection_deep", "reflection_strategic",
         "brainstorm", "weekly_assessment", "quality_calibration",
         "code_audit", "infrastructure_monitor",
+        "direct_session",
     })
     # Source tags to NEVER auto-expire — currently empty. Only foreground
     # sessions are preserved (handled by the session_type check below).
