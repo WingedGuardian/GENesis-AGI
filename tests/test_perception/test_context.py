@@ -104,6 +104,8 @@ async def test_light_context_includes_user_and_cognitive_state(db, identity_dir)
 
 
 async def test_light_context_empty_cognitive_state_uses_bootstrap(db, identity_dir):
+    from unittest.mock import patch
+
     from genesis.identity.loader import IdentityLoader
     from genesis.perception.context import ContextAssembler
 
@@ -111,7 +113,9 @@ async def test_light_context_empty_cognitive_state_uses_bootstrap(db, identity_d
     assembler = ContextAssembler(identity_loader=loader)
     tick = _make_tick(depth=Depth.LIGHT)
 
-    ctx = await assembler.assemble(Depth.LIGHT, tick, db=db)
+    # Mock out session patches so production data doesn't leak into the test
+    with patch("genesis.db.crud.cognitive_state.load_session_patches", return_value=[]):
+        ctx = await assembler.assemble(Depth.LIGHT, tick, db=db)
 
     assert ctx.cognitive_state is not None
     assert "No cognitive state yet" in ctx.cognitive_state

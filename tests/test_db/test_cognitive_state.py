@@ -259,10 +259,11 @@ async def test_render_includes_stored_sections_and_focus(db):
     assert "Fix memory retrieval." in rendered
 
 
-async def test_render_empty_returns_bootstrap(db):
+async def test_render_empty_returns_bootstrap(db, tmp_path):
     from genesis.db.crud import cognitive_state
 
-    rendered = await cognitive_state.render(db)
+    # Use a non-existent patches file so production session data doesn't leak in
+    rendered = await cognitive_state.render(db, patches_file=tmp_path / "empty.json")
     assert "No cognitive state yet" in rendered
 
 
