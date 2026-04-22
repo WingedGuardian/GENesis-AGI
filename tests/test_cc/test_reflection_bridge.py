@@ -254,7 +254,9 @@ def test_model_specific_prompt_loaded(tmp_path):
         prompt_dir=tmp_path,
     )
     result = bridge._system_prompt_for_depth(Depth.LIGHT)
-    assert result == "haiku-optimized prompt"
+    # Light gets condensed identity prefix + depth-specific prompt
+    assert "haiku-optimized prompt" in result
+    assert "Genesis" in result  # condensed identity present
 
 
 def test_fallback_to_generic_prompt(tmp_path):
@@ -267,7 +269,28 @@ def test_fallback_to_generic_prompt(tmp_path):
         prompt_dir=tmp_path,
     )
     result = bridge._system_prompt_for_depth(Depth.LIGHT)
-    assert result == "generic prompt"
+    assert "generic prompt" in result
+
+
+def test_deep_prompt_includes_identity_when_files_exist(tmp_path):
+    """Deep/Strategic system prompt includes SOUL + USER + STEERING when present."""
+    (tmp_path / "SOUL.md").write_text("I am Genesis.")
+    (tmp_path / "USER.md").write_text("User context.")
+    (tmp_path / "STEERING.md").write_text("Hard constraints.")
+    (tmp_path / "REFLECTION_DEEP.md").write_text("Deep prompt content")
+    bridge = CCReflectionBridge(
+        session_manager=AsyncMock(),
+        invoker=AsyncMock(),
+        db=AsyncMock(),
+        prompt_dir=tmp_path,
+    )
+    result = bridge._system_prompt_for_depth(Depth.DEEP)
+    assert "I am Genesis." in result
+    assert "User context." in result
+    assert "Hard constraints." in result
+    assert "Deep prompt content" in result
+    # Identity comes before depth-specific prompt
+    assert result.index("I am Genesis.") < result.index("Deep prompt content")
 
 
 # ── Observation truncation fix ──────────────────────────────────────

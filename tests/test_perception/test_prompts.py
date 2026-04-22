@@ -21,7 +21,7 @@ def test_micro_rotation_tick_0():
     builder = PromptBuilder()
     ctx = _make_context(depth="Micro", tick_number=0)
     prompt = builder.build("Micro", ctx)
-    assert "reviewing system telemetry" in prompt
+    assert "signal classifier" in prompt
 
 
 def test_micro_rotation_tick_1():
@@ -110,9 +110,8 @@ def test_variable_substitution():
     builder = PromptBuilder()
     ctx = _make_context(depth="Micro", tick_number=0)
     prompt = builder.build("Micro", ctx)
-    assert "You are Genesis." in prompt
+    assert "signal classifier" in prompt
     assert "cpu_usage: 0.3" in prompt
-    assert "{identity}" not in prompt
     assert "{signals_text}" not in prompt
 
 
@@ -152,4 +151,4 @@ def test_identity_fallback_when_no_override(tmp_path):
     builder = PromptBuilder(identity_dir=empty_identity)
     ctx = _make_context(depth="Micro", tick_number=0)
     prompt = builder.build("Micro", ctx)
-    assert "reviewing system telemetry" in prompt
+    assert "signal classifier" in prompt

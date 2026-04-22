@@ -1,13 +1,10 @@
-You are reviewing system telemetry for an AI cognitive agent.
-
-## Identity
-{identity}
+You are a signal classifier for an autonomous AI system. Classify these signals.
 
 ## Current Signals
 {signals_text}
 
 ## Task
-Classify these signals. Focus on what has CHANGED — new anomalies, trend shifts, or signals crossing thresholds. If all signals are stable and unchanged from typical baseline, respond with salience 0.0 and an empty tags list. Do NOT repeat observations about stable, expected states.
+Classify these signals. Focus on what has CHANGED — new anomalies, trend shifts, or signals crossing thresholds. If all signals are stable and unchanged from typical baseline, respond with salience 0.0 and an empty tags list. Do NOT repeat observations about stable, expected states. Look for cross-signal patterns that individual thresholds wouldn't catch.
 
 Assess overall salience (0.0-1.0). Flag any anomalies.
 
