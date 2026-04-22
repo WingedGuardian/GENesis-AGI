@@ -7,6 +7,36 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a9] - 2026-04-22
+
+7-commit release. Themes: **background session spawner**, **content
+pipeline**, **browser reliability**, and **outreach fixes**.
+
+### Added
+
+- **Direct session spawner** (#118, #121) — spawn profile-constrained
+  background CC sessions via `direct_session_run` MCP tool. Three safety
+  profiles (observe, interact, research) control what each session can do.
+  DB-backed dispatch queue ensures sessions outlive the calling session.
+- **Content pipeline activation** (#117) — content module wired into
+  outreach system with CONTENT category for multi-platform publishing.
+- **Browser process hygiene** (#115) — idle timeout (1h auto-cleanup),
+  orphan process detection, background reaper for stuck browser processes.
+
+### Changed
+
+- **Browser stale context recovery** (#116) — detects dead browser pages
+  and transparently reconnects. Session history tracking and VNC
+  environment improvements.
+
+### Fixed
+
+- **Outreach pipeline** (#122) — approval reuse, alert routing, surplus
+  topic handling, staleness decay. Fixes pre-existing test failures in
+  cognitive state rendering.
+
+---
+
 ## [v3.0a8] - 2026-04-21
 
 21-commit release. Themes: **knowledge dashboard UX**, **browser
