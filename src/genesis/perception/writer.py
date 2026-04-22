@@ -164,6 +164,49 @@ class ResultWriter:
         else:
             logger.debug("Light observation dedup: skipping duplicate (hash=%s)", chash[:12])
 
+        # Escalation: if Light requests deep escalation, create a pending
+        # observation that the awareness loop will pick up to force Deep depth.
+        # Mirrors the CC bridge path (cc/reflection_bridge/_output.py).
+        if output.escalate_to_deep:
+            esc_reason = output.escalation_reason or output.assessment[:200]
+            _SUPPRESSION_HOURS = 12
+            _EMERGENCY_KEYWORDS = (
+                "critical_failure", "data_loss", "security_breach",
+                "all providers", "container memory critical",
+            )
+            esc_lower = esc_reason.lower()
+            is_emergency = any(kw in esc_lower for kw in _EMERGENCY_KEYWORDS)
+
+            suppress = False
+            if not is_emergency:
+                from genesis.db.crud import awareness_ticks
+                last_deep = await awareness_ticks.last_at_depth(db, "Deep")
+                if last_deep:
+                    try:
+                        last_deep_dt = datetime.fromisoformat(last_deep["created_at"])
+                        hours_since = (datetime.now(UTC) - last_deep_dt).total_seconds() / 3600
+                        if hours_since < _SUPPRESSION_HOURS:
+                            suppress = True
+                    except (ValueError, TypeError):
+                        pass
+
+            if not suppress:
+                esc_hash = self._content_hash(esc_reason)
+                if not await observations.exists_by_hash(
+                    db, source="reflection", content_hash=esc_hash, unresolved_only=True,
+                ):
+                    await observations.create(
+                        db,
+                        id=str(uuid.uuid4()),
+                        source="reflection",
+                        type="light_escalation_pending",
+                        content=esc_reason,
+                        priority="high",
+                        created_at=tick.timestamp,
+                        content_hash=esc_hash,
+                    )
+                    logger.info("Light escalation pending created: %s", esc_reason[:80])
+
         if self._memory_store:
             await self._memory_store.store(
                 output.assessment,

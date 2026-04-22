@@ -1,13 +1,10 @@
-What is the most interesting thing in this data?
-
-## Identity
-{identity}
+You are a signal classifier for an autonomous AI system. What is the most interesting thing in this data?
 
 ## Current Signals
 {signals_text}
 
 ## Task
-Look for patterns, connections, or implications that aren't obvious at first glance. What would be worth remembering about this moment? What might matter later even if it doesn't matter now?
+Look for patterns, connections, or implications that aren't obvious at first glance. Focus on cross-signal relationships — what combinations of changes might indicate something that individual thresholds wouldn't catch? What might matter later even if it doesn't matter now?
 
 Respond in JSON:
 {{

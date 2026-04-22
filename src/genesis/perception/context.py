@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -114,8 +115,8 @@ class ContextAssembler:
     """Assembles context for prompt rendering based on depth.
 
     Scopes context by relevance, not budget. Never truncates.
-    Micro: identity + signals only.
-    Light: + user profile + cognitive state + user model.
+    Micro: signals only (no identity — cheap model gets task instruction via template).
+    Light: full identity + user profile + cognitive state + user model.
     Deep/Strategic: + calibration feedback.
     """
 
@@ -138,11 +139,9 @@ class ContextAssembler:
         db: aiosqlite.Connection,
         prior_context: str | None = None,
     ) -> PromptContext:
-        # Micro: SOUL.md only. Light+: full identity block (SOUL.md + USER.md + STEERING.md).
-        if depth == Depth.MICRO:
-            identity = self._identity.soul()
-        else:
-            identity = self._identity.identity_block()
+        # Micro: no identity (cheap model overwhelmed by SOUL.md — just task instruction).
+        # Light+: full identity block (SOUL.md + USER.md + STEERING.md).
+        identity = "" if depth == Depth.MICRO else self._identity.identity_block()
         signals_text = self._format_signals(tick)
         tick_number = self._extract_tick_number(tick)
 
@@ -207,6 +206,8 @@ class ContextAssembler:
 
         Two-pass diversity query ensures reflection-source observations always
         get representation even under high-volume noise from other sources.
+        For Deep/Strategic: prepends a dedicated Light assessment section
+        grouped by focus area (the cumulative chain).
         Tracks retrieval via increment_retrieved_batch.
         """
         _REFLECTION_SOURCES = [
@@ -221,6 +222,14 @@ class ContextAssembler:
             "strategic": (10, 20),
         }
         refl_cap, other_cap = _MEMORY_CAPS.get(depth_value, (10, 20))
+
+        # Chain context: Deep/Strategic get all Light assessments since last
+        # run, grouped by focus area.  This is the cumulative chain — each
+        # level builds on the analysis below it rather than re-evaluating
+        # raw signals from scratch.
+        chain_section = ""
+        if depth_value in ("deep", "strategic"):
+            chain_section = await self._build_light_chain_context(db, depth_value)
 
         try:
             # Pass 1: reflection-origin observations
@@ -278,6 +287,64 @@ class ContextAssembler:
                 await observations.mark_influenced_batch(db, obs_ids)
             except Exception:
                 logger.warning("Failed to track observation retrieval in memory_hits", exc_info=True)
+
+        result = "\n".join(lines)
+        if chain_section:
+            result = chain_section + "\n\n" + result
+        return result
+
+    async def _build_light_chain_context(
+        self, db: aiosqlite.Connection, depth_value: str,
+    ) -> str:
+        """Build Light assessment chain context for Deep/Strategic.
+
+        Fetches all light_reflection observations since the last Deep/Strategic
+        tick, groups them by focus_area, and formats as a chain context section.
+        """
+        from genesis.db.crud import awareness_ticks
+
+        # Find cutoff: last tick at this depth
+        last_tick = await awareness_ticks.last_at_depth(db, depth_value.title())
+        if last_tick and last_tick.get("created_at"):
+            since = last_tick["created_at"]
+        else:
+            # No prior tick — use 48h for deep, 7d for strategic
+            hours = 48 if depth_value == "deep" else 168
+            since = (datetime.now(UTC) - timedelta(hours=hours)).isoformat()
+
+        try:
+            light_obs = await observations.query(
+                db, resolved=False, type="light_reflection", limit=15,
+            )
+            # Filter to observations since last run at this depth
+            light_obs = [o for o in light_obs if o.get("created_at", "") >= since]
+        except Exception:
+            logger.warning("Failed to query Light assessments for chain context", exc_info=True)
+            return ""
+
+        if not light_obs:
+            return ""
+
+        # Group by focus_area from content JSON
+        by_focus: dict[str, list[str]] = {}
+        for obs in light_obs:
+            try:
+                content = json.loads(obs.get("content", "{}"))
+                focus = content.get("focus_area", "unknown")
+                assessment = content.get("assessment", "")[:300]
+                if assessment:
+                    by_focus.setdefault(focus, []).append(assessment)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        if not by_focus:
+            return ""
+
+        lines = ["## Light Reflection Findings Since Last Run"]
+        for focus, assessments in sorted(by_focus.items()):
+            lines.append(f"\n### [{focus}]")
+            for a in assessments:
+                lines.append(f"- {a}")
 
         return "\n".join(lines)
 

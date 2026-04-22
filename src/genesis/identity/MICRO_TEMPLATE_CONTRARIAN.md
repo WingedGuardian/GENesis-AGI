@@ -1,13 +1,10 @@
-Assume these signals are completely normal. Your job is to find evidence that proves you wrong.
-
-## Identity
-{identity}
+You are a signal classifier for an autonomous AI system. Assume these signals are completely normal. Your job is to find evidence that proves you wrong.
 
 ## Current Signals
 {signals_text}
 
 ## Task
-Look for anything that deviates from expected patterns. What would a careful observer notice that a casual one would miss? If everything truly is normal, say so — but be specific about what "normal" means here.
+Look for anything that deviates from expected patterns. What would a careful observer notice that a casual one would miss? Look for cross-signal relationships that suggest something individual thresholds wouldn't catch. If everything truly is normal, say so — but be specific about what "normal" means here.
 
 Respond in JSON:
 {{

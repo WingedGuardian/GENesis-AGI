@@ -632,7 +632,32 @@ class CCReflectionBridge:
     # ── Prompt delegation ─────────────────────────────────────────────
 
     def _system_prompt_for_depth(self, depth: Depth) -> str:
-        return system_prompt_for_depth(depth, self._prompt_dir)
+        depth_prompt = system_prompt_for_depth(depth, self._prompt_dir)
+        # Deep/Strategic API path gets only the instruction file — no identity.
+        # Prepend SOUL.md + USER.md + STEERING.md so the model knows who it is.
+        if depth in (Depth.DEEP, Depth.STRATEGIC):
+            identity = self._load_identity_block()
+            if identity:
+                return f"{identity}\n\n---\n\n{depth_prompt}"
+        # Light: condensed identity — 32B model doesn't need full philosophy.
+        elif depth == Depth.LIGHT:
+            return (
+                "You are Genesis, an autonomous AI cognitive agent "
+                "analyzing system health for your user.\n\n---\n\n"
+                + depth_prompt
+            )
+        return depth_prompt
+
+    def _load_identity_block(self) -> str:
+        """Load SOUL.md + USER.md + STEERING.md from identity directory."""
+        parts: list[str] = []
+        for fname in ("SOUL.md", "USER.md", "STEERING.md"):
+            path = self._prompt_dir / fname
+            if path.exists():
+                content = path.read_text().strip()
+                if content:
+                    parts.append(content)
+        return "\n\n".join(parts)
 
     def _load_prompt_file(self, filename: str) -> str:
         return load_prompt_file(filename, self._prompt_dir)

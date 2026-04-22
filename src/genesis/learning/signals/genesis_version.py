@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -524,6 +525,23 @@ class GenesisVersionCollector:
 
         if not _FAILURE_FILE.exists():
             return
+
+        # Gate: if the update orchestrator is still running (multi-tier),
+        # defer the alarm. Tier 1 may fail and write this file, but Tier 2
+        # may succeed — don't fire a false alarm mid-orchestration.
+        _ORCHESTRATOR_PID_FILE = Path.home() / ".genesis" / "update_in_progress.pid"
+        if _ORCHESTRATOR_PID_FILE.exists():
+            try:
+                pid = int(_ORCHESTRATOR_PID_FILE.read_text().strip())
+                if pid > 1:
+                    os.kill(pid, 0)  # Check if alive (signal 0 = existence check)
+                    logger.debug(
+                        "Update failure file present but orchestrator still running "
+                        "(pid=%d) — deferring observation", pid,
+                    )
+                    return
+            except (ProcessLookupError, ValueError, OSError):
+                pass  # PID dead or invalid — orchestrator finished, proceed
 
         try:
             data = json.loads(_FAILURE_FILE.read_text())
