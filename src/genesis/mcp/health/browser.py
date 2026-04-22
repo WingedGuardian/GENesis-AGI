@@ -204,7 +204,9 @@ def _start_idle_watcher():
     """Start the idle watcher task if not already running."""
     global _idle_task
     if _idle_task is None or _idle_task.done():
-        _idle_task = asyncio.get_running_loop().create_task(
+        from genesis.util.tasks import tracked_task
+
+        _idle_task = tracked_task(
             _idle_watcher_loop(), name="browser-idle-watcher",
         )
 

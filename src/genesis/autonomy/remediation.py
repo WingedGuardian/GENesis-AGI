@@ -399,22 +399,17 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         max_attempts=2,
     ),
     RemediationAction(
-        name="stale_browser_kill",
+        name="stale_browser_alert",
         probe_name="browser_processes",
-        condition="4+ browser-related processes detected (likely orphaned)",
-        command=[
-            "bash", "-c",
-            # Patterns verified against /proc/PID/cmdline — match only browser
-            # binaries (camoufox-bin, ms-playwright chrome, playwright driver),
-            # NOT the MCP server's Python process.
-            "pkill -f 'camoufox-bin' || true; "
-            "pkill -f 'ms-playwright.*chrome' || true; "
-            "pkill -f 'playwright/driver/node' || true",
-        ],
-        governance_level=2,
+        condition="4+ browser-related processes detected (may be orphaned)",
+        command=[],  # Alert-only — no command. Process reaper handles actual
+        # killing with age-aware 4h threshold. L2 auto-kill is unsafe because
+        # a single Camoufox session spawns 7-9 child processes (parent +
+        # content procs), immediately exceeding the DOWN threshold.
+        governance_level=4,
         reversible=True,
-        cooldown_s=1800,
-        max_attempts=2,
+        cooldown_s=3600,
+        max_attempts=1,
     ),
 ]
 

@@ -538,17 +538,18 @@ async def init(rt: GenesisRuntime) -> None:
             import asyncio
             import os
 
+            from genesis.browser.types import BROWSER_PGREP_PATTERNS
+
             # (pgrep_flag, pattern, max_age_hours, label)
             targets = [
                 ("-f", "opencode-ai", 24, "opencode-ai"),
                 ("-x", "claude", 168, "claude"),  # 7 days
-                # Browser processes — 4h max age. Idle timeout fires at 1h,
-                # MCP lifespan fires on session end. A 4h-old browser process
-                # has survived both layers and is definitively orphaned.
-                ("-f", "camoufox-bin", 4, "camoufox"),
-                ("-f", r"ms-playwright.*chrome", 4, "chromium"),
-                ("-f", "playwright/driver/node", 4, "playwright-driver"),
             ]
+            # Browser processes — 4h max age. Idle timeout fires at 1h,
+            # MCP lifespan fires on session end. A 4h-old browser process
+            # has survived both layers and is definitively orphaned.
+            for bp in BROWSER_PGREP_PATTERNS:
+                targets.append(("-f", bp, 4, f"browser:{bp}"))
             my_pid = os.getpid()
             my_ppid = os.getppid()
             protected = {my_pid, my_ppid}

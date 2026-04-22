@@ -468,9 +468,11 @@ async def probe_browser_processes() -> ProbeResult:
     """
     import asyncio
 
+    from genesis.browser.types import BROWSER_PGREP_PATTERNS
+
     start = time.monotonic()
     count = 0
-    for pattern in ["camoufox-bin", "ms-playwright.*chrome", "playwright/driver/node"]:
+    for pattern in BROWSER_PGREP_PATTERNS:
         proc = await asyncio.create_subprocess_exec(
             "pgrep", "-fc", pattern,
             stdout=asyncio.subprocess.PIPE,

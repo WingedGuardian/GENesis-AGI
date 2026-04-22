@@ -301,12 +301,10 @@ class ProcessHealthCollector:
 
     async def collect(self) -> SignalReading:
         try:
+            from genesis.browser.types import BROWSER_PGREP_PATTERNS
+
             count = 0
-            for pattern in [
-                "camoufox-bin",
-                "ms-playwright.*chrome",
-                "playwright/driver/node",
-            ]:
+            for pattern in BROWSER_PGREP_PATTERNS:
                 proc = await asyncio.create_subprocess_exec(
                     "pgrep", "-fc", pattern,
                     stdout=asyncio.subprocess.PIPE,
