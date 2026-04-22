@@ -26,6 +26,7 @@ class OutreachConfig:
     thresholds: dict[str, float]
     max_daily: int
     surplus_daily: int
+    content_daily: int
     morning_report_time: str
     morning_report_timezone: str
     engagement_timeout_hours: int
@@ -64,6 +65,7 @@ _DEFAULTS = OutreachConfig(
     thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
     max_daily=5,
     surplus_daily=1,
+    content_daily=3,
     morning_report_time="07:00",
     morning_report_timezone="UTC",
     engagement_timeout_hours=24,
@@ -120,7 +122,7 @@ def validate_preferences(preferences: dict) -> list[str]:
 
     if "rate_limits" in preferences:
         rl = preferences["rate_limits"]
-        for field in ("max_daily", "surplus_daily"):
+        for field in ("max_daily", "surplus_daily", "content_daily"):
             val = rl.get(field)
             if val is not None:
                 try:
@@ -149,6 +151,7 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
         "rate_limits": {
             "max_daily": config.max_daily,
             "surplus_daily": config.surplus_daily,
+            "content_daily": config.content_daily,
         },
         "morning_report": {
             "trigger_time": config.morning_report_time,
@@ -202,6 +205,7 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
         thresholds=raw.get("thresholds", _DEFAULTS.thresholds),
         max_daily=raw.get("rate_limits", {}).get("max_daily", 5),
         surplus_daily=raw.get("rate_limits", {}).get("surplus_daily", 1),
+        content_daily=raw.get("rate_limits", {}).get("content_daily", 3),
         morning_report_time=raw.get("morning_report", {}).get("trigger_time", "07:00"),
         morning_report_timezone=raw.get("morning_report", {}).get("timezone") or tz,
         engagement_timeout_hours=raw.get("engagement", {}).get("timeout_hours", 24),

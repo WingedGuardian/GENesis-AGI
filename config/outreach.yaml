@@ -14,6 +14,8 @@ channel_preferences:
   # Autonomous CLI approval prompts route to Telegram so the user can tap
   # the inline ✅ button (or reply with "approve" in the Approvals topic).
   approval: telegram
+  # Content drafts for user review — routed to Content Review topic.
+  content: telegram
 
 thresholds:
   blocker: 0.0
@@ -23,10 +25,13 @@ thresholds:
   # Approvals bypass the salience gate entirely — if the approval gate
   # asked for confirmation, the user always needs to see it.
   approval: 0.0
+  # Content review always delivers — manual review is the quality gate.
+  content: 0.0
 
 rate_limits:
   max_daily: 5
   surplus_daily: 1
+  content_daily: 3
 
 morning_report:
   trigger_time: "07:00"
@@ -45,6 +50,8 @@ delivery_routing:
   # never DM.  Grouping them in one topic keeps the inline-button UX
   # coherent and makes the "approve all N pending" button meaningful.
   approval: supergroup
+  # Content review goes to dedicated topic — never DM.
+  content: supergroup
 
 health_alerts:
   # Only these alert IDs go to Telegram (CRITICAL severity only).

@@ -16,6 +16,9 @@ class OutreachCategory(StrEnum):
     # topic with inline ✅ buttons. Added via the outreach_history CHECK
     # constraint migration in db/schema/_migrations.py (_migrate_add_columns).
     APPROVAL = "approval"
+    # Content pipeline drafts for user review. Routed to the "Content Review"
+    # supergroup topic. User approves before external publishing.
+    CONTENT = "content"
 
 
 class OutreachStatus(StrEnum):
