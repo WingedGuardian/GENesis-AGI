@@ -112,13 +112,12 @@ def _bootstrap_health() -> None:
             # the Genesis server's poll loop handles dispatch.
             # Ensure queue table exists (standalone doesn't call db.init()).
             try:
-                from genesis.db.schema import TABLES
+                from genesis.db.schema import INDEXES, TABLES
 
                 await db.execute(TABLES["direct_session_queue"])
-                await db.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_dsq_status_created "
-                    "ON direct_session_queue(status, created_at)"
-                )
+                for idx_ddl in INDEXES:
+                    if "direct_session_queue" in idx_ddl:
+                        await db.execute(idx_ddl)
                 await db.commit()
 
                 from genesis.mcp.health.direct_session_tools import (

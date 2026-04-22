@@ -45,6 +45,13 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
     while True:
         try:
             await asyncio.sleep(_POLL_INTERVAL_S)
+
+            # Don't over-claim: if runner is at capacity, wait for a slot.
+            # spawn() returns immediately but sessions queue behind the
+            # internal Semaphore — claiming more just wastes queue items.
+            if runner.active_count() >= runner._MAX_CONCURRENT:
+                continue
+
             row = await dsq.claim_next(db)
             if row is None:
                 continue

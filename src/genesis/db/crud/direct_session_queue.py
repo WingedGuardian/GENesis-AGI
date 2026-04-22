@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -48,27 +48,27 @@ async def enqueue(
 
 
 async def claim_next(db: aiosqlite.Connection) -> dict | None:
-    """Claim the oldest pending queue item. Returns None if queue is empty."""
+    """Atomically claim the oldest pending queue item.
+
+    Uses UPDATE...RETURNING for a single atomic statement (SQLite 3.35+).
+    Returns None if the queue is empty.
+    """
+    now = _now()
     cursor = await db.execute(
-        """SELECT * FROM direct_session_queue
-           WHERE status = 'pending'
-           ORDER BY created_at
-           LIMIT 1""",
+        """UPDATE direct_session_queue
+           SET status = 'claimed', claimed_at = ?
+           WHERE id = (
+               SELECT id FROM direct_session_queue
+               WHERE status = 'pending'
+               ORDER BY created_at
+               LIMIT 1
+           )
+           RETURNING *""",
+        (now,),
     )
     row = await cursor.fetchone()
-    if row is None:
-        return None
-
-    row_dict = dict(row)
-    now = _now()
-    await db.execute(
-        "UPDATE direct_session_queue SET status = 'claimed', claimed_at = ? WHERE id = ?",
-        (now, row_dict["id"]),
-    )
     await db.commit()
-    row_dict["status"] = "claimed"
-    row_dict["claimed_at"] = now
-    return row_dict
+    return dict(row) if row else None
 
 
 async def mark_dispatched(
@@ -118,9 +118,7 @@ async def recover_stale_claims(
 
     Called on server startup to handle items claimed before a crash.
     """
-    cutoff = datetime.now(UTC).timestamp() - max_age_s
-    # SQLite datetime strings are ISO format — compare as strings
-    cutoff_iso = datetime.fromtimestamp(cutoff, tz=UTC).isoformat()
+    cutoff_iso = (datetime.now(UTC) - timedelta(seconds=max_age_s)).isoformat()
     cursor = await db.execute(
         """UPDATE direct_session_queue
            SET status = 'pending', claimed_at = NULL
