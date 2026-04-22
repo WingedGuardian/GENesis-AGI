@@ -943,10 +943,73 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE approval_requests ADD COLUMN consumed_at TEXT",
         "approval_requests.consumed_at")
 
+    # Follow-up verification audit trail
+    await _try_alter(db,
+        "ALTER TABLE follow_ups ADD COLUMN verified_at TEXT",
+        "follow_ups.verified_at")
+    await _try_alter(db,
+        "ALTER TABLE follow_ups ADD COLUMN verification_notes TEXT",
+        "follow_ups.verification_notes")
+
+    # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
+    # SQLite can't ALTER CHECK constraints — requires table rebuild.
+    await _migrate_cognitive_state_check(db)
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.
     await _migrate_backfill_memory_metadata(db)
+
+
+async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
+    """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
+
+    SQLite doesn't support ALTER CHECK — must rebuild the table.
+    Idempotent: skips if the constraint already includes the new section.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='cognitive_state'"
+        )
+        row = await cursor.fetchone()
+        if not row or "resilience_degradation" in (row[0] or ""):
+            return  # Already up to date or table missing (fresh install handles it)
+
+        # Clean up orphaned temp table from a prior failed attempt
+        await db.execute("DROP TABLE IF EXISTS cognitive_state_new")
+
+        await db.execute("""
+            CREATE TABLE cognitive_state_new (
+                id           TEXT PRIMARY KEY,
+                content      TEXT NOT NULL,
+                section      TEXT NOT NULL CHECK (section IN (
+                    'active_context', 'pending_actions', 'state_flags',
+                    'resilience_degradation'
+                )),
+                generated_by TEXT,
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT
+            )
+        """)
+        # Only copy rows with valid section values (prevents CHECK violation
+        # from aborting the migration if a bug wrote an unexpected value)
+        await db.execute("""
+            INSERT INTO cognitive_state_new
+                (id, content, section, generated_by, created_at, expires_at)
+            SELECT id, content, section, generated_by, created_at, expires_at
+            FROM cognitive_state
+            WHERE section IN ('active_context', 'pending_actions', 'state_flags',
+                              'resilience_degradation')
+        """)
+        await db.execute("DROP TABLE cognitive_state")
+        await db.execute("ALTER TABLE cognitive_state_new RENAME TO cognitive_state")
+        await db.commit()
+        logger.info("cognitive_state table rebuilt with resilience_degradation section")
+    except Exception:
+        # Attempt cleanup on failure to prevent orphaned temp table
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS cognitive_state_new")
+        logger.error("cognitive_state CHECK constraint migration failed", exc_info=True)
 
 
 async def _migrate_backfill_memory_metadata(db: aiosqlite.Connection) -> None:
