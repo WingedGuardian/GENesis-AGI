@@ -197,6 +197,7 @@ class CCReflectionBridge:
     async def reflect(
         self, depth: Depth, tick, *, db,
         escalation_source: str | None = None,
+        skip_approval: bool = False,
     ) -> ReflectionResult:
         """Run Deep or Strategic reflection via CC background session."""
         # Check CC budget before proceeding
@@ -263,34 +264,33 @@ class CCReflectionBridge:
         used_cli = True
         session_id = f"api:{depth.value.lower()}"
         if self._autonomous_dispatcher is not None:
-            # Call-site gating pre-check: if a reflection of this depth
-            # is already pending approval, skip scheduling a new one.
-            # Different depths are independently gated (deep/light/
-            # strategic each have their own policy_id), so light
-            # reflection continues even if deep is blocked.
             reflection_policy_id = f"reflection_{depth.value.lower()}"
-            try:
-                pending = await (
-                    self._autonomous_dispatcher.approval_gate.find_site_pending(
-                        subsystem="reflection",
-                        policy_id=reflection_policy_id,
+            if not skip_approval:
+                # Call-site gating pre-check: if a reflection of this depth
+                # is already pending approval, skip scheduling a new one.
+                # Skipped when skip_approval=True (resume path — already approved).
+                try:
+                    pending = await (
+                        self._autonomous_dispatcher.approval_gate.find_site_pending(
+                            subsystem="reflection",
+                            policy_id=reflection_policy_id,
+                        )
                     )
-                )
-            except Exception:
-                logger.warning(
-                    "find_site_pending failed for %s; proceeding without pre-check",
-                    reflection_policy_id, exc_info=True,
-                )
-                pending = None
-            if pending is not None:
-                logger.info(
-                    "%s reflection skipped — call site blocked on approval %s",
-                    depth.value.title(), pending.get("id"),
-                )
-                return ReflectionResult(
-                    success=False,
-                    reason=f"awaiting approval {pending.get('id')} for {depth.value} reflection",
-                )
+                except Exception:
+                    logger.warning(
+                        "find_site_pending failed for %s; proceeding without pre-check",
+                        reflection_policy_id, exc_info=True,
+                    )
+                    pending = None
+                if pending is not None:
+                    logger.info(
+                        "%s reflection skipped — call site blocked on approval %s",
+                        depth.value.title(), pending.get("id"),
+                    )
+                    return ReflectionResult(
+                        success=False,
+                        reason=f"awaiting approval {pending.get('id')} for {depth.value} reflection",
+                    )
 
             decision = await self._autonomous_dispatcher.route(
                 request=AutonomousDispatchRequest(
@@ -304,7 +304,7 @@ class CCReflectionBridge:
                     cli_invocation=invocation,
                     api_call_site_id=_DEPTH_CALL_SITE.get(depth),
                     cli_fallback_allowed=True,
-                    approval_required_for_cli=True,
+                    approval_required_for_cli=not skip_approval,
                     context={"depth": depth.value},
                 ),
             )

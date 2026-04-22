@@ -408,6 +408,9 @@ class AutonomousCliApprovalGate:
                 context.get("kind") == "autonomous_cli_fallback"
                 and context.get("approval_key") == approval_key
             ):
+                # Don't reuse consumed approvals — each dispatch needs its own.
+                if str(row.get("status") or "") == "approved" and row.get("consumed_at"):
+                    continue
                 return row
         # Pass 2: race-safety fallback — pending rows for the same site.
         if subsystem is None or policy_id is None:
@@ -422,13 +425,12 @@ class AutonomousCliApprovalGate:
                 and context.get("policy_id") == policy_id
             ):
                 return row
-        # Pass 3: resume fallback — approved rows for the same site.
-        # When a user approves a reflection/Sentinel dispatch and the
-        # resume path re-enters ensure_approval with different tick data,
-        # the approval_key won't match Pass 1. This pass picks up the
-        # approved row so the action can proceed without a second approval.
+        # Pass 3: resume fallback — unconsumed approved rows for the same site.
         for row in recent:
             if str(row.get("status") or "") != "approved":
+                continue
+            # Don't reuse consumed approvals — each dispatch needs its own.
+            if row.get("consumed_at"):
                 continue
             context = _json_loads(row.get("context"))
             if (
@@ -973,6 +975,16 @@ class AutonomousDispatchRouter:
                     approval_request_id=request_id,
                     api_error=api_error,
                 )
+            # Atomically consume — each dispatch needs its own approval.
+            if request_id:
+                consumed = await self._approval_gate.mark_consumed(request_id)
+                if not consumed:
+                    return AutonomousDispatchDecision(
+                        mode="blocked",
+                        reason="approval already consumed by concurrent dispatch",
+                        approval_request_id=request_id,
+                        api_error=api_error,
+                    )
 
         logger.info(
             "Autonomous dispatch %s approved for CLI fallback",
