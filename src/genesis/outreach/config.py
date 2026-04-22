@@ -38,6 +38,7 @@ class OutreachConfig:
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
         "awareness:tick_overdue",
+        "service:health_data_uninitialized",
     )
     # Delivery routing: per-category target — "supergroup", "dm", or "both".
     # Falls back to "default" key, then "supergroup" if unset.
@@ -76,6 +77,7 @@ _DEFAULTS = OutreachConfig(
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
         "awareness:tick_overdue",
+        "service:health_data_uninitialized",
     ),
     delivery_routing={"default": "supergroup"},
 )

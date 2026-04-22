@@ -135,7 +135,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     _alert_history = health_mcp_mod._alert_history
 
     if _service is None:
-        return [{"severity": "CRITICAL", "message": "HealthDataService not initialized"}]
+        return [{"id": "service:health_data_uninitialized", "severity": "CRITICAL", "message": "HealthDataService not initialized"}]
 
     snap = await _service.snapshot()
     alerts: list[dict] = []

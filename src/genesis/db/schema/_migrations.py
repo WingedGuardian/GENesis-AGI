@@ -777,6 +777,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             row,
         )
 
+    # Fix: stale_pending_items was INSERT OR IGNORE'd above but the row already
+    # existed from an earlier migration with ["Deep"]/0.45. UPDATE to the
+    # intended ["Micro"]/0.35 values from the PR #65 scoring overhaul.
+    await db.execute(
+        "UPDATE signal_weights "
+        "SET feeds_depths = '[\"Micro\"]', current_weight = 0.35, initial_weight = 0.35, "
+        "    source_mcp = 'cognitive_state' "
+        "WHERE signal_name = 'stale_pending_items'"
+    )
+
     # Cross-session awareness: heartbeat table for real-time session tracking.
     # Separate from cc_sessions because hooks need simple fast UPSERT and
     # cc_sessions rows may not exist for direct user CC sessions.

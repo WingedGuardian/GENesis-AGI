@@ -55,19 +55,21 @@ _CALL_SITE_OVERRIDE: dict[TaskType, str] = {
     TaskType.INFRASTRUCTURE_MONITOR: "37_infrastructure_monitor",
 }
 
-# Task type → reflection depth mapping
+# Task type → reflection depth mapping.
+# Micro = signal triage / baseline change detection (cheap, fast).
+# Light = structured assessment with recommendations (deeper analysis).
 _DEPTH_MAP: dict[TaskType, Depth] = {
+    TaskType.INFRASTRUCTURE_MONITOR: Depth.MICRO,
     TaskType.BRAINSTORM_USER: Depth.LIGHT,
     TaskType.BRAINSTORM_SELF: Depth.LIGHT,
     TaskType.META_BRAINSTORM: Depth.LIGHT,
-    TaskType.MEMORY_AUDIT: Depth.MICRO,
-    TaskType.PROCEDURE_AUDIT: Depth.MICRO,
+    TaskType.MEMORY_AUDIT: Depth.LIGHT,
+    TaskType.PROCEDURE_AUDIT: Depth.LIGHT,
     TaskType.GAP_CLUSTERING: Depth.LIGHT,
     TaskType.SELF_UNBLOCK: Depth.LIGHT,
     TaskType.ANTICIPATORY_RESEARCH: Depth.LIGHT,
-    TaskType.PROMPT_EFFECTIVENESS_REVIEW: Depth.MICRO,
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW: Depth.LIGHT,
     TaskType.CODE_AUDIT: Depth.LIGHT,
-    TaskType.INFRASTRUCTURE_MONITOR: Depth.LIGHT,
 }
 
 
@@ -221,7 +223,7 @@ class ReflectionBasedSurplusExecutor:
                     f"<i>Salience: {output.salience:.2f}"
                     f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
                 )
-                category = "reflection_micro"
+                category = "surplus"
 
             elif isinstance(output, LightOutput):
                 assessment = escape(output.assessment[:2000])
@@ -235,7 +237,7 @@ class ReflectionBasedSurplusExecutor:
                     f"<i>Focus: {escape(output.focus_area)} | "
                     f"Confidence: {output.confidence:.2f}</i>"
                 )
-                category = "reflection_light"
+                category = "surplus"
 
             else:
                 return
