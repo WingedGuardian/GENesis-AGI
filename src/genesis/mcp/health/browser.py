@@ -26,6 +26,9 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
+# Prevents concurrent browser init/cleanup races across tool calls.
+_browser_lock = asyncio.Lock()
+
 _PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
@@ -53,9 +56,28 @@ _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 
 
+def _is_page_alive(page) -> bool:
+    """Check if a Playwright page reference is still usable.
+
+    Synchronous fast-path check.  Catches the most common failure modes
+    (closed pages, disposed objects).  Some stale-page scenarios where the
+    browser process died but the page object has cached state may slip
+    through — those are caught by try/except in the tool implementations.
+    """
+    try:
+        if page.is_closed():
+            return False
+        _ = page.url  # raises on disposed objects
+        return True
+    except Exception:
+        return False
+
+
 async def async_cleanup():
     """Shut down browser. Called from MCP lifespan, idle timeout, or manually.
 
+    Safe to call when the browser is already dead — all steps are
+    individually guarded so a crashed Camoufox won't hang cleanup.
     Each cleanup step has a 10s timeout (user-approved) to prevent hanging
     if the Playwright Node.js driver or browser process is stuck. Orphaned
     processes that survive timeout are caught by the process reaper (4h cycle).
@@ -110,37 +132,51 @@ async def _ensure_browser():
     Returns the active page. Raises ImportError if camoufox is not installed.
     In collaborate mode, launches headed on virtual display :99 for VNC sharing.
     Uses anti-detection Firefox by default for all browsing.
+
+    Detects stale pages (e.g. browser killed by a concurrent session) and
+    automatically cleans up + re-initializes.
     """
     global _stealth_cm, _stealth_browser, _stealth_page
 
-    if _stealth_page is not None:
+    async with _browser_lock:
+        if _stealth_page is not None:
+            if _is_page_alive(_stealth_page):
+                return _stealth_page
+            logger.warning("Camoufox page is stale — restarting browser")
+            await async_cleanup()
+
+        from camoufox.async_api import AsyncCamoufox
+
+        _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+        global _original_display
+        headed = _collaborate_mode
+        if headed:
+            _original_display = os.environ.get("DISPLAY")
+            os.environ["DISPLAY"] = _VNC_DISPLAY
+        elif _original_display is not None:
+            os.environ["DISPLAY"] = _original_display
+        elif "DISPLAY" in os.environ:
+            del os.environ["DISPLAY"]
+
+        _stealth_cm = AsyncCamoufox(
+            headless=not headed,
+            persistent_context=True,
+            user_data_dir=str(_PROFILE_DIR),
+            firefox_user_prefs={
+                # Camoufox disables session history (max_entries=0) for
+                # anti-detection.  Re-enable it so back/forward navigation
+                # works in collaborate mode.
+                "browser.sessionhistory.max_entries": 10,
+                "browser.sessionhistory.max_total_viewers": -1,
+            },
+        )
+        _stealth_browser = await _stealth_cm.__aenter__()
+        # With persistent_context, browser IS the context
+        _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+        mode_str = "headed (collaborate)" if headed else "headless"
+        logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
         return _stealth_page
-
-    from camoufox.async_api import AsyncCamoufox
-
-    _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-    global _original_display
-    headed = _collaborate_mode
-    if headed:
-        _original_display = os.environ.get("DISPLAY")
-        os.environ["DISPLAY"] = _VNC_DISPLAY
-    elif _original_display is not None:
-        os.environ["DISPLAY"] = _original_display
-    elif "DISPLAY" in os.environ:
-        del os.environ["DISPLAY"]
-
-    _stealth_cm = AsyncCamoufox(
-        headless=not headed,
-        persistent_context=True,
-        user_data_dir=str(_PROFILE_DIR),
-    )
-    _stealth_browser = await _stealth_cm.__aenter__()
-    # With persistent_context, browser IS the context
-    _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
-    mode_str = "headed (collaborate)" if headed else "headless"
-    logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
-    return _stealth_page
 
 
 async def _ensure_chromium_fallback():
@@ -148,32 +184,38 @@ async def _ensure_chromium_fallback():
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
+
+    Detects stale pages and automatically re-initializes.
     """
     global _playwright, _context, _page
 
-    if _page is not None:
+    async with _browser_lock:
+        if _page is not None:
+            if _is_page_alive(_page):
+                return _page
+            logger.warning("Chromium page is stale — restarting browser")
+            await async_cleanup()
+
+        from playwright.async_api import async_playwright
+
+        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+        headed = _collaborate_mode
+        if headed:
+            os.environ["DISPLAY"] = _VNC_DISPLAY
+
+        _playwright = await async_playwright().start()
+        _context = await _playwright.chromium.launch_persistent_context(
+            user_data_dir=str(_CHROMIUM_PROFILE_DIR),
+            headless=not headed,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
+            + (["--start-maximized"] if headed else []),
+            viewport={"width": 1280, "height": 720} if headed else None,
+        )
+        _page = _context.pages[0] if _context.pages else await _context.new_page()
+        mode_str = "headed (collaborate)" if headed else "headless"
+        logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
         return _page
-
-    from playwright.async_api import async_playwright
-
-    _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-    headed = _collaborate_mode
-    if headed:
-        os.environ["DISPLAY"] = _VNC_DISPLAY
-
-    _playwright = await async_playwright().start()
-    _context = await _playwright.chromium.launch_persistent_context(
-        user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-        headless=not headed,
-        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-        + (["--start-maximized"] if headed else []),
-        viewport={"width": 1280, "height": 720} if headed else None,
-    )
-    _page = _context.pages[0] if _context.pages else await _context.new_page()
-    mode_str = "headed (collaborate)" if headed else "headless"
-    logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
-    return _page
 
 
 def _touch():
@@ -546,7 +588,8 @@ async def browser_collaborate(enable: bool = True) -> dict:
         }
 
     _collaborate_mode = enable
-    await async_cleanup()  # Force browser restart on next tool call
+    async with _browser_lock:
+        await async_cleanup()  # Force browser restart on next tool call
 
     if enable and not Path(f"/tmp/.X{_VNC_DISPLAY[1:]}-lock").exists():
         return {

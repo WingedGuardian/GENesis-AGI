@@ -17,7 +17,7 @@ BRAIN_IMG="$GENESIS_ROOT/docs/images/genesis-brain.png"
 echo "=== Genesis VNC Stack Setup ==="
 
 # ── 1. System packages ────────────────────────────────────
-PKGS=(xvfb x11vnc novnc websockify feh xdotool)
+PKGS=(xvfb x11vnc novnc websockify feh xdotool openbox xclip)
 MISSING=()
 for pkg in "${PKGS[@]}"; do
     if ! dpkg -s "$pkg" &>/dev/null; then
@@ -46,7 +46,7 @@ fi
 # ── 3. Systemd units ─────────────────────────────────────
 mkdir -p "$SYSTEMD_DIR"
 
-# Xvfb — virtual display :99
+# Xvfb — virtual display :99 with openbox window manager
 cat > "$SYSTEMD_DIR/genesis-xvfb.service" << EOF
 [Unit]
 Description=Genesis Virtual Display (Xvfb)
@@ -55,6 +55,7 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac
+ExecStartPost=/bin/bash -c 'sleep 1 && DISPLAY=:99 /usr/bin/openbox --sm-disable &'
 ExecStartPost=/bin/bash -c 'sleep 1 && HOME=%h DISPLAY=:99 /usr/bin/feh --bg-center $BRAIN_IMG'
 Restart=on-failure
 RestartSec=3
@@ -64,6 +65,11 @@ WantedBy=default.target
 EOF
 
 # x11vnc — VNC server on display :99
+# Flags:
+#   -xdamage   — use X DAMAGE extension to only send changed regions (was -noxdamage)
+#   -threads   — multi-threaded encoding for better FPS
+#   -ncache 10 — client-side pixel caching for faster scrolling/tab switching
+#   xclip required for clipboard sync (installed above)
 cat > "$SYSTEMD_DIR/genesis-vnc.service" << EOF
 [Unit]
 Description=Genesis VNC Server (x11vnc)
@@ -73,7 +79,7 @@ Requires=genesis-xvfb.service
 [Service]
 Type=simple
 Environment=DISPLAY=:99
-ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5900 -noxdamage
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5900 -xdamage -threads -ncache 10
 Restart=on-failure
 RestartSec=3
 
