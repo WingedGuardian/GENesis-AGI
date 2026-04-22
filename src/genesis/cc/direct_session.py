@@ -60,19 +60,22 @@ _UNIVERSAL_DISALLOW = [
     "NotebookEdit",
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
+    "mcp__genesis-health__direct_session_run",  # No recursive spawn
     "mcp__genesis-outreach__outreach_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-health__module_call",
 ]
 
-_OBSERVE_EXTRA_DISALLOW = [
-    # No browser interaction
+# Composable building blocks for profile disallow lists
+_NO_BROWSER_INTERACTION = [
     "mcp__genesis-health__browser_click",
     "mcp__genesis-health__browser_fill",
     "mcp__genesis-health__browser_run_js",
     "mcp__genesis-health__browser_clear_domain",
     "mcp__genesis-health__browser_collaborate",
-    # No memory writes
+]
+
+_NO_MEMORY_WRITES = [
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__memory_extract",
@@ -85,59 +88,36 @@ _OBSERVE_EXTRA_DISALLOW = [
     "mcp__genesis-memory__reference_store",
     "mcp__genesis-memory__reference_delete",
     "mcp__genesis-memory__evolution_propose",
-    # No follow-up creation
-    "mcp__genesis-health__follow_up_create",
-    # No outreach engagement
-    "mcp__genesis-outreach__outreach_engagement",
-    "mcp__genesis-outreach__outreach_preferences",
-    "mcp__genesis-outreach__outreach_queue",
-    # No recon writes
-    "mcp__genesis-recon__recon_store_finding",
-    "mcp__genesis-recon__recon_run_model_intelligence",
 ]
 
-_INTERACT_EXTRA_DISALLOW = [
-    # No memory writes (same as observe)
-    "mcp__genesis-memory__memory_store",
-    "mcp__genesis-memory__memory_synthesize",
-    "mcp__genesis-memory__memory_extract",
-    "mcp__genesis-memory__observation_write",
-    "mcp__genesis-memory__observation_resolve",
-    "mcp__genesis-memory__knowledge_ingest",
-    "mcp__genesis-memory__knowledge_ingest_batch",
-    "mcp__genesis-memory__knowledge_ingest_source",
-    "mcp__genesis-memory__procedure_store",
-    "mcp__genesis-memory__reference_store",
-    "mcp__genesis-memory__reference_delete",
-    "mcp__genesis-memory__evolution_propose",
-    # No follow-up creation
+_NO_FOLLOW_UPS = [
     "mcp__genesis-health__follow_up_create",
-    # No outreach engagement
-    "mcp__genesis-outreach__outreach_engagement",
-    "mcp__genesis-outreach__outreach_preferences",
-    "mcp__genesis-outreach__outreach_queue",
-    # No recon writes
-    "mcp__genesis-recon__recon_store_finding",
-    "mcp__genesis-recon__recon_run_model_intelligence",
 ]
 
-_RESEARCH_EXTRA_DISALLOW = [
-    # No browser interaction
-    "mcp__genesis-health__browser_click",
-    "mcp__genesis-health__browser_fill",
-    "mcp__genesis-health__browser_run_js",
-    "mcp__genesis-health__browser_clear_domain",
-    "mcp__genesis-health__browser_collaborate",
-    # No outreach
+_NO_OUTREACH_ENGAGEMENT = [
     "mcp__genesis-outreach__outreach_engagement",
     "mcp__genesis-outreach__outreach_preferences",
     "mcp__genesis-outreach__outreach_queue",
+]
+
+_NO_RECON_WRITES = [
+    "mcp__genesis-recon__recon_store_finding",
+    "mcp__genesis-recon__recon_run_model_intelligence",
 ]
 
 PROFILES: dict[str, list[str]] = {
-    "observe": _UNIVERSAL_DISALLOW + _OBSERVE_EXTRA_DISALLOW,
-    "interact": _UNIVERSAL_DISALLOW + _INTERACT_EXTRA_DISALLOW,
-    "research": _UNIVERSAL_DISALLOW + _RESEARCH_EXTRA_DISALLOW,
+    "observe": (
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+    ),
+    "interact": (
+        _UNIVERSAL_DISALLOW + _NO_MEMORY_WRITES
+        + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+    ),
+    "research": (
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
+        + _NO_OUTREACH_ENGAGEMENT
+    ),
 }
 
 VALID_PROFILES = frozenset(PROFILES.keys())
@@ -253,6 +233,15 @@ class DirectSessionRunner:
     def active_count(self) -> int:
         return len(self._active)
 
+    @staticmethod
+    def _summarize_tools(tools_called: list[dict]) -> dict[str, int]:
+        """Aggregate tool calls into {name: count} dict."""
+        counts: dict[str, int] = {}
+        for t in tools_called[:100]:
+            name = t.get("name", "unknown")
+            counts[name] = counts.get(name, 0) + 1
+        return counts
+
     # -- Internal ----------------------------------------------------------
 
     async def _run_session(
@@ -353,10 +342,11 @@ class DirectSessionRunner:
             raise
 
     def _build_invocation(self, request: DirectSessionRequest) -> CCInvocation:
-        system_prompt = (
-            request.system_prompt
-            or self._config_builder._load_identity_block()
-        )
+        system_prompt = request.system_prompt
+        if system_prompt is None:
+            # Use the surplus config's system prompt (which loads SOUL.md)
+            surplus_config = self._config_builder.build_surplus_config()
+            system_prompt = surplus_config.get("system_prompt", "")
         disallowed = PROFILES.get(request.profile, PROFILES["observe"])
 
         return CCInvocation(
@@ -390,11 +380,7 @@ class DirectSessionRunner:
             with contextlib.suppress(json.JSONDecodeError, TypeError):
                 existing = json.loads(row["metadata"])
 
-        # Summarize tools for compact storage
-        tool_counts: dict[str, int] = {}
-        for t in result.tools_called[:100]:
-            name = t.get("name", "unknown")
-            tool_counts[name] = tool_counts.get(name, 0) + 1
+        tool_counts = self._summarize_tools(result.tools_called)
 
         existing.update({
             "profile": request.profile,
@@ -426,11 +412,7 @@ class DirectSessionRunner:
             logger.debug("Outreach pipeline not available, skipping notification")
             return
 
-        # Summarize tools
-        tool_counts: dict[str, int] = {}
-        for t in result.tools_called[:100]:
-            name = t.get("name", "unknown")
-            tool_counts[name] = tool_counts.get(name, 0) + 1
+        tool_counts = self._summarize_tools(result.tools_called)
         tools_str = ", ".join(
             f"{n} ({c})" for n, c in sorted(
                 tool_counts.items(), key=lambda x: -x[1],
@@ -467,6 +449,7 @@ class DirectSessionRunner:
                 category=OutreachCategory.ALERT,
                 topic=f"direct_session_{'ok' if success else 'fail'}",
                 context=body,
+                salience_score=0.9 if not success else 0.7,
             ))
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)

@@ -52,12 +52,16 @@ async def _impl_direct_session_run(
             f"Must be one of: {', '.join(sorted(VALID_PROFILES))}",
         }
 
-    model_upper = model.upper()
-    if model_upper not in CCModel.__members__:
+    model_lower = model.lower()
+    try:
+        cc_model = CCModel(model_lower)
+    except ValueError:
         return {"error": f"Invalid model '{model}'. Must be one of: sonnet, opus, haiku"}
 
-    effort_upper = effort.upper()
-    if effort_upper not in EffortLevel.__members__:
+    effort_lower = effort.lower()
+    try:
+        cc_effort = EffortLevel(effort_lower)
+    except ValueError:
         return {"error": f"Invalid effort '{effort}'. Must be one of: low, medium, high, max"}
 
     try:
@@ -66,8 +70,8 @@ async def _impl_direct_session_run(
         request = DirectSessionRequest(
             prompt=prompt,
             profile=profile,
-            model=CCModel(model_upper),
-            effort=EffortLevel(effort_upper),
+            model=cc_model,
+            effort=cc_effort,
             timeout_s=min(timeout_minutes * 60, 3600),  # cap at 1 hour
             notify=notify,
             caller_context="mcp_tool",
