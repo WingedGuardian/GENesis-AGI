@@ -15,9 +15,11 @@ of raw DOM or screenshots by default.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import random
+import time
 from pathlib import Path
 
 from genesis.mcp.health import mcp
@@ -41,30 +43,60 @@ _active_page = None  # Tracks whichever page was last navigated (standard or ste
 _collaborate_mode = False
 _original_display: str | None = None  # Saved DISPLAY before collaborate override
 
+# Idle timeout — auto-cleanup browser after 1 hour of no tool calls.
+# User-approved value (2026-04-21). Background asyncio task polls every 60s.
+_last_used: float = 0.0
+_idle_task: asyncio.Task | None = None
+_IDLE_TIMEOUT_S = 3600  # 1 hour
+
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 
 
 async def async_cleanup():
-    """Shut down browser. Called from MCP lifespan or manually."""
+    """Shut down browser. Called from MCP lifespan, idle timeout, or manually.
+
+    Each cleanup step has a 10s timeout (user-approved) to prevent hanging
+    if the Playwright Node.js driver or browser process is stuck. Orphaned
+    processes that survive timeout are caught by the process reaper (4h cycle).
+    """
     global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
+    global _idle_task, _last_used
+
     _active_page = None
+
+    # Cancel idle watcher first — prevent re-entrant cleanup
+    if _idle_task is not None:
+        _idle_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _idle_task
+        _idle_task = None
+    _last_used = 0.0
+
     if _context is not None:
         try:
-            await _context.close()
+            await asyncio.wait_for(_context.close(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Browser context close timed out (10s)")
         except Exception:
             logger.debug("Browser context cleanup failed", exc_info=True)
         _context = None
         _page = None
     if _playwright is not None:
         try:
-            await _playwright.stop()
+            await asyncio.wait_for(_playwright.stop(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
         except Exception:
             logger.debug("Playwright cleanup failed", exc_info=True)
         _playwright = None
     if _stealth_cm is not None:
         try:
-            await _stealth_cm.__aexit__(None, None, None)
+            await asyncio.wait_for(
+                _stealth_cm.__aexit__(None, None, None), timeout=10.0,
+            )
+        except TimeoutError:
+            logger.warning("Camoufox cleanup timed out (10s)")
         except Exception:
             logger.debug("Camoufox cleanup failed", exc_info=True)
         _stealth_cm = None
@@ -144,6 +176,39 @@ async def _ensure_chromium_fallback():
     return _page
 
 
+def _touch():
+    """Record browser activity timestamp for idle timeout tracking."""
+    global _last_used
+    _last_used = time.monotonic()
+
+
+async def _idle_watcher_loop():
+    """Background task: cleanup browser after idle timeout (1 hour).
+
+    Polls every 60s. When the browser has been idle for _IDLE_TIMEOUT_S,
+    calls async_cleanup() and exits. CancelledError is the normal shutdown
+    path (MCP lifespan exit or explicit cleanup).
+    """
+    try:
+        while True:
+            await asyncio.sleep(60)
+            if _last_used > 0 and (time.monotonic() - _last_used) >= _IDLE_TIMEOUT_S:
+                logger.info("Browser idle for %ds — auto-cleaning up", _IDLE_TIMEOUT_S)
+                await async_cleanup()
+                return
+    except asyncio.CancelledError:
+        return
+
+
+def _start_idle_watcher():
+    """Start the idle watcher task if not already running."""
+    global _idle_task
+    if _idle_task is None or _idle_task.done():
+        _idle_task = asyncio.get_running_loop().create_task(
+            _idle_watcher_loop(), name="browser-idle-watcher",
+        )
+
+
 async def _get_page(stealth: bool = False):
     """Get the appropriate browser page based on mode.
 
@@ -156,6 +221,8 @@ async def _get_page(stealth: bool = False):
     """
     global _active_page
     _active_page = await _ensure_chromium_fallback() if stealth else await _ensure_browser()
+    _touch()
+    _start_idle_watcher()
     return _active_page
 
 
@@ -207,6 +274,7 @@ async def _human_delay() -> None:
 
 async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
     """Navigate to a URL and return the page snapshot."""
+    _touch()
     try:
         page = await _get_page(stealth)
     except ImportError as e:
@@ -227,6 +295,7 @@ async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
 
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page."""
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
@@ -240,6 +309,7 @@ async def _impl_browser_click(selector: str) -> dict:
 
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
@@ -267,6 +337,7 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
 
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
@@ -284,6 +355,7 @@ async def _impl_browser_screenshot() -> dict:
 
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
@@ -299,6 +371,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
     Equivalent to Chrome DevTools console. Expressions are logged for audit.
     """
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:

@@ -455,6 +455,48 @@ async def probe_guardian(
         )
 
 
+async def probe_browser_processes() -> ProbeResult:
+    """Check for accumulation of orphaned browser-related processes.
+
+    Counts Camoufox (camoufox-bin), Chromium (ms-playwright chrome), and
+    Playwright driver (node) processes via pgrep. Patterns verified against
+    actual ``/proc/PID/cmdline`` — they match only browser binaries, not the
+    MCP server's Python process.
+
+    Returns HEALTHY (0 processes), DEGRADED (1-3, likely active session),
+    or DOWN (4+, likely orphaned accumulation).
+    """
+    import asyncio
+
+    start = time.monotonic()
+    count = 0
+    for pattern in ["camoufox-bin", "ms-playwright.*chrome", "playwright/driver/node"]:
+        proc = await asyncio.create_subprocess_exec(
+            "pgrep", "-fc", pattern,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+        if proc.returncode == 0:
+            count += int(stdout.strip())
+    latency = (time.monotonic() - start) * 1000
+
+    if count == 0:
+        status, msg = ProbeStatus.HEALTHY, "No browser processes"
+    elif count <= 3:
+        status, msg = ProbeStatus.DEGRADED, f"{count} browser process(es) — likely active session"
+    else:
+        status, msg = ProbeStatus.DOWN, f"{count} browser processes — likely orphaned"
+
+    return ProbeResult(
+        name="browser_processes",
+        status=status,
+        latency_ms=round(latency, 2),
+        message=msg,
+        checked_at=datetime.now(UTC).isoformat(),
+    )
+
+
 async def collect_probe_results(
     db=None,
     *,
@@ -490,6 +532,7 @@ async def collect_probe_results(
         _safe("tmp_usage", probe_tmp()),
         _safe("disk", probe_disk()),
         _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
+        _safe("browser_processes", probe_browser_processes()),
     ]
     if db is not None:
         tasks.append(_safe("db", probe_db(db)))

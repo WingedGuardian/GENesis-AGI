@@ -398,6 +398,24 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         cooldown_s=86400,
         max_attempts=2,
     ),
+    RemediationAction(
+        name="stale_browser_kill",
+        probe_name="browser_processes",
+        condition="4+ browser-related processes detected (likely orphaned)",
+        command=[
+            "bash", "-c",
+            # Patterns verified against /proc/PID/cmdline — match only browser
+            # binaries (camoufox-bin, ms-playwright chrome, playwright driver),
+            # NOT the MCP server's Python process.
+            "pkill -f 'camoufox-bin' || true; "
+            "pkill -f 'ms-playwright.*chrome' || true; "
+            "pkill -f 'playwright/driver/node' || true",
+        ],
+        governance_level=2,
+        reversible=True,
+        cooldown_s=1800,
+        max_attempts=2,
+    ),
 ]
 
 

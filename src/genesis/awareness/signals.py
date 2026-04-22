@@ -286,6 +286,50 @@ class ContainerMemoryCollector:
         )
 
 
+class ProcessHealthCollector:
+    """Reports count of browser-related processes as 0.0–1.0 signal.
+
+    Uses pgrep to detect Camoufox (camoufox-bin), Chromium (ms-playwright chrome),
+    and Playwright driver (node) processes. Non-zero means browser processes exist;
+    high values (6+) indicate orphaned process accumulation.
+
+    Patterns verified against actual ``/proc/PID/cmdline`` entries — they match
+    only browser binaries, not the MCP server's Python process.
+    """
+
+    signal_name = "stale_browser_processes"
+
+    async def collect(self) -> SignalReading:
+        try:
+            count = 0
+            for pattern in [
+                "camoufox-bin",
+                "ms-playwright.*chrome",
+                "playwright/driver/node",
+            ]:
+                proc = await asyncio.create_subprocess_exec(
+                    "pgrep", "-fc", pattern,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await proc.communicate()
+                if proc.returncode == 0:
+                    count += int(stdout.strip())
+            # 0 procs = 0.0, 6+ procs = 1.0
+            value = min(1.0, count / 6.0)
+            return SignalReading(
+                name=self.signal_name, value=value, source="process",
+                collected_at=datetime.now(UTC).isoformat(),
+                warning_threshold=0.3, critical_threshold=0.5,
+            )
+        except Exception:
+            logger.error("ProcessHealthCollector failed", exc_info=True)
+            return SignalReading(
+                name=self.signal_name, value=0.0, source="process",
+                collected_at=datetime.now(UTC).isoformat(), failed=True,
+            )
+
+
 class JobHealthCollector:
     """Reports normalized job health based on consecutive failures.
 
