@@ -14,8 +14,10 @@ of raw DOM or screenshots by default.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
 from pathlib import Path
 
 from genesis.mcp.health import mcp
@@ -166,6 +168,39 @@ async def _snapshot_page(page) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Human-like interaction timing
+# ---------------------------------------------------------------------------
+
+
+def _is_camoufox_active() -> bool:
+    """True when the active browser is Camoufox (anti-detection mode)."""
+    return _stealth_cm is not None and _active_page is _stealth_page
+
+
+async def _human_delay() -> None:
+    """Random delay mimicking human interaction timing.
+
+    Only fires when Camoufox (anti-detection browser) is active.
+    Playwright/Chromium mode skips delays entirely — that's for dev/test.
+
+    Background (default): 1.0–15.0s, log-normal distribution.
+    Stealth priority — nobody watching, look maximally human.
+
+    Collaborate mode (VNC): 0.5–2.0s, uniform.
+    Human watching — keep it responsive but not instant.
+    """
+    if not _is_camoufox_active():
+        return
+    if _collaborate_mode:
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+    else:
+        # Log-normal: mostly 2-5s with occasional longer pauses up to ~15s
+        delay = min(random.lognormvariate(1.2, 0.6), 15.0)
+        delay = max(delay, 1.0)
+        await asyncio.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
 # Tool implementations (testable without FastMCP)
 # ---------------------------------------------------------------------------
 
@@ -195,6 +230,7 @@ async def _impl_browser_click(selector: str) -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
+        await _human_delay()
         await _active_page.click(selector, timeout=10000)
         snapshot = await _snapshot_page(_active_page)
         return {"clicked": selector, "url": _active_page.url, "snapshot": snapshot}
@@ -207,10 +243,26 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     try:
+        await _human_delay()
         await _active_page.fill(selector, value, timeout=10000)
         return {"filled": selector, "url": _active_page.url}
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
+
+
+async def _impl_browser_upload(selector: str, file_path: str) -> dict:
+    """Upload a file to a file input element on the current page."""
+    if _active_page is None:
+        return {"error": "No page open. Call browser_navigate first."}
+    p = Path(file_path)
+    if not p.is_file():
+        return {"error": f"File not found or not a regular file: {file_path}"}
+    try:
+        await _human_delay()
+        await _active_page.set_input_files(selector, str(p), timeout=10000)
+        return {"uploaded": p.name, "selector": selector, "url": _active_page.url}
+    except Exception as e:
+        return {"error": f"Upload failed on '{selector}': {e}"}
 
 
 async def _impl_browser_screenshot() -> dict:
@@ -305,6 +357,10 @@ async def browser_navigate(url: str, stealth: bool = False) -> dict:
     Uses Camoufox (anti-detection Firefox) by default with a persistent profile
     at ~/.genesis/camoufox-profile/ so cookies and logins survive across calls.
 
+    IMPORTANT: When using Camoufox for stealth browsing (the default), load the
+    stealth-browser skill for anti-detection behavioral rules. The skill covers
+    timing, interaction patterns, honeypot avoidance, and per-site guidance.
+
     Set stealth=True to use Chromium fallback for sites incompatible with
     Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
     """
@@ -328,6 +384,18 @@ async def browser_fill(selector: str, value: str) -> dict:
     Examples: browser_fill('#email', 'user@example.com')
     """
     return await _impl_browser_fill(selector, value)
+
+
+@mcp.tool()
+async def browser_upload(selector: str, file_path: str) -> dict:
+    """Upload a file to a file input element on the current page.
+
+    Use for <input type="file"> elements (resume uploads, document attachments).
+    The file must exist at the given path.
+
+    Examples: browser_upload('input[type=file]', '/path/to/resume.pdf')
+    """
+    return await _impl_browser_upload(selector, file_path)
 
 
 @mcp.tool()

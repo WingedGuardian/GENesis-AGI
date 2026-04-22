@@ -33,6 +33,7 @@ _READONLY_DISALLOWED = [
 _MCP_PROFILES: dict[str, list[str]] = {
     "reflection": ["genesis-health", "genesis-memory"],
     "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
+    "interop": ["genesis-health", "genesis-memory"],
 }
 
 

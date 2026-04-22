@@ -74,3 +74,10 @@ config/modules/automaton-supervisor.yaml
 docs/reflections/
 docs/plans/
 docs/content/
+
+# Career-ops interop (private — lives at ~/.genesis/interop/)
+config/interop_system_prompt.md
+scripts/cops_interop.sh
+
+# Stealth browser skill + research (private — lives at ~/.genesis/skills/)
+src/genesis/skills/stealth-browser/
