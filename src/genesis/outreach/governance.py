@@ -40,6 +40,7 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "morning_report": 24,
     "surplus_insight": 24,
     "surplus_opportunity": 24,
+    "content_review": 1,  # Short window — distinct content pieces may share topics
 }
 _DEFAULT_DEDUP_HOURS = 24
 
@@ -117,6 +118,12 @@ class GovernanceGate:
                 passed.append("surplus_quota")
             else:
                 failed.append("surplus_quota: daily surplus already sent")
+
+        if request.category == OutreachCategory.CONTENT:
+            if await self._content_available():
+                passed.append("content_quota")
+            else:
+                failed.append(f"content_quota: daily content limit ({self._config.content_daily}) reached")
 
         # Engagement throttle: reduce outreach if ignore rate is high
         # BLOCKER/ALERT categories always exempt
@@ -222,6 +229,15 @@ class GovernanceGate:
         )
         row = await cursor.fetchone()
         return (row[0] if row else 0) < self._config.surplus_daily
+
+    async def _content_available(self) -> bool:
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM outreach_history "
+            "WHERE category = 'content' AND delivered_at IS NOT NULL "
+            "AND delivered_at >= date('now')",
+        )
+        row = await cursor.fetchone()
+        return (row[0] if row else 0) < self._config.content_daily
 
     async def _engagement_throttle(self, request) -> str | None:
         """Check if low engagement rate should throttle outreach.

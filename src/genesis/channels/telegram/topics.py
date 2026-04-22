@@ -40,6 +40,8 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     # "approve all N pending" batch button.  Bare "approve"/"reject"
     # text messages in this topic resolve the most recent pending request.
     "approvals": "Approvals",
+    # Content pipeline drafts awaiting user review before external publishing.
+    "content_review": "Content Review",
 }
 
 
@@ -224,5 +226,6 @@ class TopicManager:
             # button UX and "approve all N pending" semantics are clearly
             # scoped — they don't mix with general alerts.
             "approval": "approvals",
+            "content": "content_review",
         }
         return mapping.get(outreach_category, "surplus")
