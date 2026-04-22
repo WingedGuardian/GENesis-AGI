@@ -598,7 +598,27 @@ class SentinelDispatcher:
         result.duration_s = duration
 
         # Update state based on result
-        if result.dispatched and result.resolved:
+        resolved = result.dispatched and result.resolved
+        # No-action resolution: CC diagnosed a false positive or confirmed the
+        # issue is no longer active.  Treat as resolved even when the CC didn't
+        # propose actions (previously this fell through to ESCALATED because
+        # resolved was always False per the old prompt instructions).
+        if (
+            not resolved
+            and result.dispatched
+            and not result.proposed_actions
+            and result.diagnosis
+        ):
+            diag_lower = result.diagnosis.lower()
+            if any(phrase in diag_lower for phrase in (
+                "false positive", "no longer active", "already resolved",
+                "no active alerts", "alert cleared", "not an issue",
+            )):
+                resolved = True
+                result.resolved = True
+                logger.info("Sentinel treating dispatch as resolved (no-action diagnosis)")
+
+        if resolved:
             self._state.transition(SentinelState.HEALTHY, reason="resolved after action execution")
             self._state.escalated_count = 0  # Reset oscillation counter
             # Clear backoff attempts for this pattern — the problem is fixed.
@@ -1235,6 +1255,16 @@ class SentinelDispatcher:
         appeared in ≥_ALARM_CONFIRMATION_COUNT of the last _ALARM_RING_SIZE
         ticks. Single-tick flaps never wake the Sentinel.
         """
+        # Auto-reset ESCALATED on every tick (not just on new dispatches).
+        # Without this, the sentinel stays red forever if no new alarms fire.
+        if self._state.should_auto_reset_escalated():
+            self._state.escalated_count += 1
+            self._state.transition(
+                SentinelState.HEALTHY,
+                reason=f"auto-reset from ESCALATED (count={self._state.escalated_count})",
+            )
+            save_state(self._state)
+
         if self._health_data is None:
             return None
 

@@ -90,7 +90,8 @@ will present these to the user for approval and execute them if approved.
 ```
 
 **Important:**
-- `resolved` should be `false` — you are proposing, not executing
+- Set `resolved` to `true` if you confirm the issue is no longer active or was a false positive (e.g., stale alert, already fixed by another process, transient condition that cleared)
+- Set `resolved` to `false` if the issue is still active and you are proposing actions to fix it
 - `proposed_actions` is a list of commands for the dispatcher to execute after approval
 - Each action needs a `description` (human-readable), `command` (exact shell command),
   and `safe`/`reversible` flags

@@ -350,7 +350,8 @@ TABLES = {
             id           TEXT PRIMARY KEY,
             content      TEXT NOT NULL,
             section      TEXT NOT NULL CHECK (section IN (
-                'active_context', 'pending_actions', 'state_flags'
+                'active_context', 'pending_actions', 'state_flags',
+                'resilience_degradation'
             )),
             generated_by TEXT,
             created_at   TEXT NOT NULL,

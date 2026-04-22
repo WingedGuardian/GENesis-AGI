@@ -223,7 +223,7 @@ class ReflectionBasedSurplusExecutor:
                     f"<i>Salience: {output.salience:.2f}"
                     f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
                 )
-                category = "surplus"
+                category = "reflection_micro"
 
             elif isinstance(output, LightOutput):
                 assessment = escape(output.assessment[:2000])
@@ -237,7 +237,7 @@ class ReflectionBasedSurplusExecutor:
                     f"<i>Focus: {escape(output.focus_area)} | "
                     f"Confidence: {output.confidence:.2f}</i>"
                 )
-                category = "surplus"
+                category = "reflection_light"
 
             else:
                 return
