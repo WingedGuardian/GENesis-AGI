@@ -30,6 +30,7 @@ from genesis.runtime.init import (
     awareness,
     cc_relay,
     db,
+    direct_session,
     health_data,
     inbox,
     learning,
@@ -83,6 +84,9 @@ class _InitDelegatesMixin:
 
     async def _init_cc_relay(self) -> None:
         await cc_relay.init(self)
+
+    async def _init_direct_session(self) -> None:
+        await direct_session.init(self)
 
     async def _init_memory(self) -> None:
         await memory.init(self)

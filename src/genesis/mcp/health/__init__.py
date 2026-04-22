@@ -59,6 +59,7 @@ def init_health_mcp(
 from genesis.mcp.health import browser as _browser  # noqa: E402
 from genesis.mcp.health import codebase as _codebase  # noqa: E402
 from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
+from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
@@ -112,13 +113,21 @@ _impl_update_history_recent = _update_history._impl_update_history_recent
 _impl_follow_up_create = _follow_up_tools._impl_follow_up_create
 _impl_follow_up_list = _follow_up_tools._impl_follow_up_list
 
-# Re-export init function for runtime wiring
+# direct_session_tools wired here
+direct_session_tools = _direct_session_tools
+_impl_direct_session_run = _direct_session_tools._impl_direct_session_run
+_impl_direct_session_status = _direct_session_tools._impl_direct_session_status
+_impl_direct_session_list = _direct_session_tools._impl_direct_session_list
+
+# Re-export init functions for runtime wiring
 init_task_tools = _task_tools.init_task_tools
+init_direct_session_tools = _direct_session_tools.init_direct_session_tools
 
 __all__ = [
     "mcp",
     "init_health_mcp",
     "init_task_tools",
+    "init_direct_session_tools",
     "_service",
     "_event_bus",
     "_activity_tracker",
@@ -162,4 +171,8 @@ __all__ = [
     "_follow_up_tools",
     "_impl_follow_up_create",
     "_impl_follow_up_list",
+    "direct_session_tools",
+    "_impl_direct_session_run",
+    "_impl_direct_session_status",
+    "_impl_direct_session_list",
 ]

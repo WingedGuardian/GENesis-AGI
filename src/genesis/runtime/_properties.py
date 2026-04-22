@@ -125,6 +125,10 @@ class _RuntimeProperties:
         return self._stability_monitor
 
     @property
+    def direct_session_runner(self) -> object | None:
+        return self._direct_session_runner
+
+    @property
     def task_executor(self) -> object | None:
         return self._task_executor
 

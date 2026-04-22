@@ -229,6 +229,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_executor: object | None = None
         self._task_dispatcher: object | None = None
         self._task_dispatch_poll: asyncio.Task | None = None
+        self._direct_session_runner: object | None = None
 
         # Global pause state — blocks all background dispatches when True.
         self._paused: bool = False
@@ -330,6 +331,11 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._run_init_step("perception", self._init_perception)
 
         await self._run_init_step_async("cc_relay", self._init_cc_relay)
+
+        if _full:
+            await self._run_init_step_async(
+                "direct_session", self._init_direct_session,
+            )
 
         await self._run_init_step_async("memory", self._init_memory)
 
