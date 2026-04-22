@@ -6201,10 +6201,32 @@
                   <template x-for="field in $store.genesisDashboard.selectedModule.config_fields" :key="field.name">
                     <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.78rem;">
                       <label style="min-width: 140px; color: #ccc;" x-text="field.label" :title="field.description"></label>
-                      <input type="number" step="any"
-                             :value="field.value"
-                             @change="field.value = parseFloat($el.value)"
-                             style="width: 100px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
+                      <!-- Bool: toggle switch -->
+                      <template x-if="field.type === 'bool'">
+                        <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
+                          <input type="checkbox" :checked="field.value" @change="field.value = $el.checked"
+                                 style="opacity: 0; width: 0; height: 0;">
+                          <span :style="'position: absolute; inset: 0; border-radius: 10px; transition: 0.2s; ' +
+                            (field.value ? 'background: #66bb6a;' : 'background: rgba(255,255,255,0.15);')"></span>
+                          <span :style="'position: absolute; top: 2px; width: 16px; height: 16px; border-radius: 50%; transition: 0.2s; background: #fff; ' +
+                            (field.value ? 'left: 18px;' : 'left: 2px;')"></span>
+                        </label>
+                      </template>
+                      <!-- List: comma-separated text input -->
+                      <template x-if="field.type === 'list'">
+                        <input type="text"
+                               :value="Array.isArray(field.value) ? field.value.join(', ') : field.value"
+                               @change="field.value = $el.value.split(',').map(s => s.trim()).filter(s => s)"
+                               style="width: 200px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;"
+                               placeholder="comma-separated values">
+                      </template>
+                      <!-- Number: int/float -->
+                      <template x-if="field.type !== 'bool' && field.type !== 'list'">
+                        <input type="number" step="any"
+                               :value="field.value"
+                               @change="field.value = parseFloat($el.value)"
+                               style="width: 100px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
+                      </template>
                       <span style="font-size: 0.64rem; opacity: 0.5;" x-text="field.description"></span>
                     </div>
                   </template>
