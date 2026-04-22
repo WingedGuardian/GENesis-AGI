@@ -106,6 +106,40 @@ def _bootstrap_health() -> None:
             tracker = ProviderActivityTracker()
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
+
+            # Wire direct session runner for background CC sessions.
+            # Standalone MCP has no outreach pipeline — notifications
+            # degrade gracefully (logged, not sent to Telegram).
+            try:
+                from genesis.cc.direct_session import DirectSessionRunner
+                from genesis.cc.invoker import CCInvoker
+                from genesis.cc.session_config import SessionConfigBuilder
+                from genesis.cc.session_manager import SessionManager
+                from genesis.mcp.health.direct_session_tools import (
+                    init_direct_session_tools,
+                )
+
+                class _StandaloneRuntime:
+                    """Minimal runtime stub for standalone MCP."""
+                    def __init__(self, db):
+                        self._db = db
+                        self._outreach_pipeline = None
+
+                invoker = CCInvoker()
+                session_mgr = SessionManager(db=db, invoker=invoker)
+                runner = DirectSessionRunner(
+                    invoker=invoker,
+                    session_manager=session_mgr,
+                    config_builder=SessionConfigBuilder(),
+                    runtime=_StandaloneRuntime(db),
+                )
+                init_direct_session_tools(runner)
+            except Exception:
+                logger.warning(
+                    "Direct session runner not available in standalone MCP",
+                    exc_info=True,
+                )
+
             clear_mcp_crash("health")
             yield
         finally:
