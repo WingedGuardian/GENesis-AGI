@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -21,6 +22,7 @@ def _reset_browser_state():
     browser._active_page = None
     browser._collaborate_mode = False
     browser._original_display = None
+    browser._browser_lock = asyncio.Lock()
     yield
     browser._stealth_cm = None
     browser._stealth_browser = None
@@ -31,6 +33,7 @@ def _reset_browser_state():
     browser._active_page = None
     browser._collaborate_mode = False
     browser._original_display = None
+    browser._browser_lock = asyncio.Lock()
 
 
 class TestIsPageAlive:

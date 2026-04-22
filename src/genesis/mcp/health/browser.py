@@ -57,11 +57,17 @@ _VNC_DISPLAY = ":99"
 
 
 def _is_page_alive(page) -> bool:
-    """Check if a Playwright page reference is still usable."""
+    """Check if a Playwright page reference is still usable.
+
+    Synchronous fast-path check.  Catches the most common failure modes
+    (closed pages, disposed objects).  Some stale-page scenarios where the
+    browser process died but the page object has cached state may slip
+    through — those are caught by try/except in the tool implementations.
+    """
     try:
         if page.is_closed():
             return False
-        _ = page.url  # raises if connection severed
+        _ = page.url  # raises on disposed objects
         return True
     except Exception:
         return False
@@ -582,7 +588,8 @@ async def browser_collaborate(enable: bool = True) -> dict:
         }
 
     _collaborate_mode = enable
-    await async_cleanup()  # Force browser restart on next tool call
+    async with _browser_lock:
+        await async_cleanup()  # Force browser restart on next tool call
 
     if enable and not Path(f"/tmp/.X{_VNC_DISPLAY[1:]}-lock").exists():
         return {
