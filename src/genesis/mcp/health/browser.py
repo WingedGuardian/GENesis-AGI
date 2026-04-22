@@ -44,7 +44,6 @@ _active_page = None  # Tracks whichever page was last navigated (standard or ste
 # Collaborative mode — when True, browser launches headed on virtual display :99.
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
-_original_display: str | None = None  # Saved DISPLAY before collaborate override
 
 # Idle timeout — auto-cleanup browser after 1 hour of no tool calls.
 # User-approved value (2026-04-21). Background asyncio task polls every 60s.
@@ -149,18 +148,11 @@ async def _ensure_browser():
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        global _original_display
-        headed = _collaborate_mode
-        if headed:
-            _original_display = os.environ.get("DISPLAY")
-            os.environ["DISPLAY"] = _VNC_DISPLAY
-        elif _original_display is not None:
-            os.environ["DISPLAY"] = _original_display
-        elif "DISPLAY" in os.environ:
-            del os.environ["DISPLAY"]
+        # Always headed — Xvfb :99 is always running.
+        os.environ["DISPLAY"] = _VNC_DISPLAY
 
         _stealth_cm = AsyncCamoufox(
-            headless=not headed,
+            headless=False,
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
             firefox_user_prefs={
@@ -174,7 +166,7 @@ async def _ensure_browser():
         _stealth_browser = await _stealth_cm.__aenter__()
         # With persistent_context, browser IS the context
         _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
-        mode_str = "headed (collaborate)" if headed else "headless"
+        mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
         return _stealth_page
 
@@ -200,20 +192,19 @@ async def _ensure_chromium_fallback():
 
         _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
-        headed = _collaborate_mode
-        if headed:
-            os.environ["DISPLAY"] = _VNC_DISPLAY
+        # Always headed — Xvfb :99 is always running.
+        os.environ["DISPLAY"] = _VNC_DISPLAY
 
         _playwright = await async_playwright().start()
         _context = await _playwright.chromium.launch_persistent_context(
             user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-            headless=not headed,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"]
-            + (["--start-maximized"] if headed else []),
-            viewport={"width": 1280, "height": 720} if headed else None,
+            headless=False,
+            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                  "--start-maximized"],
+            viewport={"width": 1280, "height": 720},
         )
         _page = _context.pages[0] if _context.pages else await _context.new_page()
-        mode_str = "headed (collaborate)" if headed else "headless"
+        mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
         return _page
 
@@ -569,20 +560,20 @@ async def browser_clear_domain(domain: str) -> dict:
 
 @mcp.tool()
 async def browser_collaborate(enable: bool = True) -> dict:
-    """Toggle collaborative browser mode (headed + VNC).
+    """Toggle collaborative browser mode (VNC observation).
 
-    When enabled, the browser runs visibly on a virtual display.
-    The user can watch and interact via noVNC in their browser.
-    Useful for tasks requiring human input (captchas, payments, 2FA).
+    The browser always runs headed on the virtual display.
+    Collaborate mode makes it observable and interactive via noVNC,
+    useful for tasks requiring human input (captchas, payments, 2FA).
 
-    When disabled, reverts to headless mode for faster automation.
+    When disabled, the browser still runs headed but without VNC sharing.
     Toggling restarts the browser — existing page state is lost.
     """
     global _collaborate_mode
 
     if _collaborate_mode == enable:
         return {
-            "mode": "collaborate" if enable else "headless",
+            "mode": "collaborate" if enable else "headed",
             "changed": False,
             "vnc_url": _get_vnc_url() if enable else None,
         }
@@ -601,7 +592,7 @@ async def browser_collaborate(enable: bool = True) -> dict:
         }
 
     return {
-        "mode": "collaborate" if enable else "headless",
+        "mode": "collaborate" if enable else "headed",
         "changed": True,
         "vnc_url": _get_vnc_url() if enable else None,
         "note": "Browser will relaunch in new mode on next navigation.",
