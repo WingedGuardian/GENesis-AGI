@@ -2680,8 +2680,11 @@
   <style>
     :root { --color-text-secondary: var(--color-text-muted, #d4d4d4e4); }
 
-    /* Override AZ's body overflow:hidden + position:fixed so dashboard can scroll */
+    /* Override AZ's body overflow:hidden + position:fixed so dashboard can scroll.
+       overscroll-behavior:auto counters index.css body{overscroll-behavior:none}
+       which blocks wheel-event scroll chaining from body→html viewport. */
     html, body { overflow: auto !important; position: static !important; height: auto !important; }
+    body { overscroll-behavior: auto !important; }
 
     /* Error banner */
     .error-banner {
