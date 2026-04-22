@@ -69,7 +69,7 @@ class TestClaimNext:
 
     @pytest.mark.asyncio
     async def test_claim_next_skips_claimed(self, db):
-        q1 = await dsq.enqueue(db, prompt="first")
+        await dsq.enqueue(db, prompt="first")
         q2 = await dsq.enqueue(db, prompt="second")
         await dsq.claim_next(db)  # claims q1
         row = await dsq.claim_next(db)

@@ -81,6 +81,15 @@ async def test_handle_opportunity_content_idea(registered_module):
 @pytest.mark.asyncio
 async def test_handle_opportunity_trend(registered_module):
     mod = registered_module
+    # auto_capture_trends defaults to False — trend is rejected
+    result = await mod.handle_opportunity({
+        "type": "trend",
+        "content": "Trending topic in AI",
+    })
+    assert result is None
+
+    # Enable the toggle — trend is now captured
+    mod.update_config({"auto_capture_trends": True})
     result = await mod.handle_opportunity({
         "type": "trend",
         "content": "Trending topic in AI",
