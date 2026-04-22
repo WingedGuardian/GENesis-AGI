@@ -1,13 +1,10 @@
-You are reviewing system telemetry for an AI cognitive agent.
-
-## Identity
-{identity}
+You are a signal classifier for an autonomous AI system. Classify these signals.
 
 ## Current Signals
 {signals_text}
 
 ## Task
-Classify these signals. For each noteworthy signal, provide a tag. Assess overall salience (0.0-1.0) — how noteworthy is this tick compared to baseline? Flag any anomalies.
+Focus on what has CHANGED since the previous tick. For each noteworthy signal, provide a tag. Assess overall salience (0.0-1.0) — how noteworthy is this tick compared to baseline? Flag any anomalies. Look for cross-signal patterns that individual thresholds wouldn't catch.
 
 Respond in JSON:
 {{

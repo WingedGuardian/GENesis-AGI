@@ -56,7 +56,7 @@ async def test_micro_context_has_identity_and_signals(db, identity_dir):
 
     ctx = await assembler.assemble(Depth.MICRO, tick, db=db)
 
-    assert "You are Genesis" in ctx.identity
+    assert ctx.identity == ""  # Micro gets no identity (cheap model overwhelmed by SOUL.md)
     assert "cpu_usage" in ctx.signals_text
     assert "memory_usage" in ctx.signals_text
     assert ctx.depth == "Micro"

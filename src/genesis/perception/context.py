@@ -114,8 +114,8 @@ class ContextAssembler:
     """Assembles context for prompt rendering based on depth.
 
     Scopes context by relevance, not budget. Never truncates.
-    Micro: identity + signals only.
-    Light: + user profile + cognitive state + user model.
+    Micro: signals only (no identity — cheap model gets task instruction via template).
+    Light: full identity + user profile + cognitive state + user model.
     Deep/Strategic: + calibration feedback.
     """
 
@@ -138,11 +138,9 @@ class ContextAssembler:
         db: aiosqlite.Connection,
         prior_context: str | None = None,
     ) -> PromptContext:
-        # Micro: SOUL.md only. Light+: full identity block (SOUL.md + USER.md + STEERING.md).
-        if depth == Depth.MICRO:
-            identity = self._identity.soul()
-        else:
-            identity = self._identity.identity_block()
+        # Micro: no identity (cheap model overwhelmed by SOUL.md — just task instruction).
+        # Light+: full identity block (SOUL.md + USER.md + STEERING.md).
+        identity = "" if depth == Depth.MICRO else self._identity.identity_block()
         signals_text = self._format_signals(tick)
         tick_number = self._extract_tick_number(tick)
 
