@@ -106,6 +106,13 @@ EOF
 
 echo "Systemd units written to $SYSTEMD_DIR"
 
+# ── 3b. Deploy scaled noVNC viewer ────────────────────────
+# vnc_scaled.html forces scaleViewport=true so the display fits the browser
+# window without clipping. Stock vnc.html defaults to no scaling (off-center
+# logo, bottom-right cut off on displays wider than the browser window).
+cp "$SCRIPT_DIR/vnc_scaled.html" /usr/share/novnc/vnc_scaled.html
+echo "✓ Deployed scripts/vnc_scaled.html → /usr/share/novnc/vnc_scaled.html"
+
 # ── 4. Enable and start ──────────────────────────────────
 # Ensure user session bus is available
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -146,9 +153,9 @@ if $OK; then
     # Try to get Tailscale IP for the access URL
     TS_IP=$(tailscale ip -4 2>/dev/null || echo "")
     if [ -n "$TS_IP" ]; then
-        echo "Access noVNC at: http://$TS_IP:6080/vnc.html"
+        echo "Access noVNC at: http://$TS_IP:6080/vnc_scaled.html"
     else
-        echo "Access noVNC at: http://localhost:6080/vnc.html"
+        echo "Access noVNC at: http://localhost:6080/vnc_scaled.html"
     fi
     echo "VNC password: whatever you set (default: genesis)"
     echo ""

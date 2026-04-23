@@ -801,7 +801,7 @@ def _get_vnc_url() -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             ip = result.stdout.strip().split("\n")[0]
-            return f"http://{ip}:6080/vnc.html"
+            return f"http://{ip}:6080/vnc_scaled.html"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return "http://localhost:6080/vnc.html"
+    return "http://localhost:6080/vnc_scaled.html"
