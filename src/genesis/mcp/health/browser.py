@@ -265,7 +265,12 @@ async def _get_page(stealth: bool = False):
 async def _snapshot_page(page) -> str:
     """Get accessibility tree snapshot of the current page."""
     try:
-        return await page.locator("body").aria_snapshot()
+        return await asyncio.wait_for(
+            page.locator("body").aria_snapshot(), timeout=15.0
+        )
+    except TimeoutError:
+        logger.warning("Snapshot timed out (15s) — page accessibility tree stuck")
+        return "(snapshot timed out after 15s)"
     except Exception as e:
         return f"(snapshot unavailable: {e})"
 
@@ -304,6 +309,41 @@ async def _human_delay() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tool-level timeout (user-approved: career-ops handoff 2026-04-22)
+# ---------------------------------------------------------------------------
+# Playwright's internal timeout= parameter does NOT reliably fire with
+# Camoufox (patched Firefox).  Confirmed: a page.click(timeout=10000) hung
+# for 22 minutes until the browser was killed externally.  This asyncio-level
+# wrapper is the ONLY reliable timeout for Camoufox browser tools.
+_TOOL_TIMEOUT_S: float = 60.0
+
+
+async def _with_tool_timeout(
+    coro, timeout_s: float = _TOOL_TIMEOUT_S, operation: str = "browser"
+) -> dict:
+    """Wrap a browser tool coroutine with a hard asyncio timeout.
+
+    Returns a structured ``{"error": ...}`` dict on timeout instead of
+    raising, so the MCP caller gets a clean error response.
+
+    On timeout, resets ``_active_page`` to None so subsequent tool calls
+    don't operate on a page left in an indeterminate state.
+    """
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except TimeoutError:
+        global _active_page
+        logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
+        _active_page = None
+        return {
+            "error": (
+                f"{operation} timed out after {timeout_s:.0f}s. "
+                "Browser state was reset — call browser_navigate to resume."
+            )
+        }
+
+
+# ---------------------------------------------------------------------------
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
     """Human-like click: hover first, jitter position, realistic event chain.
 
@@ -314,6 +354,37 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
 
     Falls back to plain page.click() when not in stealth mode.
     """
+    # --- Ambiguous text= selector guard ---
+    # Bare text= selectors silently match the first element even when
+    # multiple exist (e.g., "text=No" on a form with several Yes/No radio
+    # groups).  Fail fast with a descriptive error so the caller can use a
+    # more specific selector.
+    if selector.startswith("text="):
+        try:
+            count = await asyncio.wait_for(
+                page.locator(selector).count(), timeout=5.0
+            )
+            if count > 1:
+                summaries: list[str] = []
+                for i in range(min(count, 5)):
+                    nth = page.locator(selector).nth(i)
+                    tag = await nth.evaluate("e => e.tagName.toLowerCase()")
+                    name = await nth.evaluate(
+                        "e => (e.getAttribute('name') || e.parentElement?.getAttribute('name') || '')"
+                    )
+                    summaries.append(f"  {i + 1}. <{tag}> name='{name}'")
+                raise Exception(
+                    f"Ambiguous selector '{selector}' matches {count} elements:\n"
+                    + "\n".join(summaries)
+                    + "\nUse a more specific selector: CSS, [name=...][value=...], or role."
+                )
+        except TimeoutError:
+            logger.warning("Ambiguity check timed out for '%s', proceeding", selector)
+        except Exception as amb_err:
+            if "Ambiguous selector" in str(amb_err):
+                raise  # re-raise our own ambiguity error
+            logger.warning("Ambiguity check failed for '%s': %s", selector, amb_err)
+
     if not _is_camoufox_active():
         await page.click(selector, timeout=timeout)
         return
@@ -341,9 +412,32 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
         await page.mouse.down()
         await asyncio.sleep(random.uniform(0.04, 0.12))
         await page.mouse.up()
-    except Exception:
-        logger.warning("Stealth click fallback for '%s'", selector)
-        await page.click(selector, timeout=timeout)
+    except Exception as stealth_err:
+        logger.warning("Stealth click failed for '%s': %s", selector, stealth_err)
+        try:
+            await page.click(selector, timeout=timeout)
+        except Exception as plain_err:
+            logger.warning("Plain click also failed for '%s': %s", selector, plain_err)
+            # --- Keyboard fallback (last resort) ---
+            # Focus the element and press Space/Enter.  Works for radios,
+            # checkboxes, buttons — anything keyboard-navigable per WCAG.
+            try:
+                el = await page.wait_for_selector(selector, timeout=5000)
+                if el:
+                    await el.focus()
+                    tag = await el.evaluate("e => e.tagName.toLowerCase()")
+                    input_type = await el.evaluate(
+                        "e => (e.getAttribute('type') || '').toLowerCase()"
+                    )
+                    if tag == "input" and input_type in ("radio", "checkbox"):
+                        await page.keyboard.press("Space")
+                    else:
+                        await page.keyboard.press("Enter")
+                    logger.info("Keyboard fallback succeeded for '%s'", selector)
+                    return
+            except Exception as kb_err:
+                logger.warning("Keyboard fallback also failed for '%s': %s", selector, kb_err)
+            raise plain_err
 
 
 async def _human_type(page, selector: str, value: str) -> None:
@@ -651,6 +745,22 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
         return {"error": f"Failed to clear domain '{domain}': {e}"}
 
 
+async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
+    """Press a keyboard key on the current page."""
+    _touch()
+    if _active_page is None:
+        return {"error": "No page open. Call browser_navigate first."}
+    count = max(1, min(count, 50))
+    try:
+        for i in range(count):
+            if i > 0:
+                await asyncio.sleep(random.uniform(0.05, 0.15))
+            await _active_page.keyboard.press(key)
+        return {"pressed": key, "count": count, "url": _active_page.url}
+    except Exception as e:
+        return {"error": f"Key press failed for '{key}': {e}"}
+
+
 # ---------------------------------------------------------------------------
 # MCP tool registrations
 # ---------------------------------------------------------------------------
@@ -683,9 +793,23 @@ async def browser_click(selector: str) -> dict:
     """Click an element on the current page by CSS selector or text.
 
     Examples: '#submit-btn', 'text=Sign In', '[data-testid="login"]'
+
+    For form controls (radios, checkboxes): prefer specific selectors like
+    'input[name="sponsorship"][value="no"]' over ambiguous 'text=No'.
+    If a text= selector matches multiple elements, the click fails with
+    an ambiguity error listing the matches.
+
+    Keyboard fallback: if mouse click fails on a form control, the tool
+    automatically attempts keyboard activation (focus + Space/Enter).
+    For manual keyboard navigation, use browser_press_key with Tab/Space.
+
     Returns the updated page snapshot after clicking.
     """
-    return await _impl_browser_click(selector)
+    return await _with_tool_timeout(
+        _impl_browser_click(selector),
+        _TOOL_TIMEOUT_S,
+        f"browser_click('{selector}')",
+    )
 
 
 @mcp.tool()
@@ -693,8 +817,16 @@ async def browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page.
 
     Examples: browser_fill('#email', 'user@example.com')
+
+    Per-keystroke typing is active for Camoufox — long strings take
+    proportionally longer. The tool timeout scales with string length.
     """
-    return await _impl_browser_fill(selector, value)
+    timeout = min(max(60.0, len(value) * 0.25), 300.0)
+    return await _with_tool_timeout(
+        _impl_browser_fill(selector, value),
+        timeout,
+        f"browser_fill('{selector}')",
+    )
 
 
 @mcp.tool()
@@ -706,7 +838,11 @@ async def browser_upload(selector: str, file_path: str) -> dict:
 
     Examples: browser_upload('input[type=file]', '/path/to/resume.pdf')
     """
-    return await _impl_browser_upload(selector, file_path)
+    return await _with_tool_timeout(
+        _impl_browser_upload(selector, file_path),
+        _TOOL_TIMEOUT_S,
+        f"browser_upload('{selector}')",
+    )
 
 
 @mcp.tool()
@@ -716,7 +852,9 @@ async def browser_screenshot() -> dict:
     Saves to ~/tmp/genesis_browser_screenshot.png and returns the path.
     Use the Read tool to view the image.
     """
-    return await _impl_browser_screenshot()
+    return await _with_tool_timeout(
+        _impl_browser_screenshot(), 30.0, "browser_screenshot"
+    )
 
 
 @mcp.tool()
@@ -726,7 +864,9 @@ async def browser_snapshot() -> dict:
     Token-efficient alternative to screenshots. Returns structured text
     showing all interactive elements, headings, and content.
     """
-    return await _impl_browser_snapshot()
+    return await _with_tool_timeout(
+        _impl_browser_snapshot(), 30.0, "browser_snapshot"
+    )
 
 
 @mcp.tool()
@@ -738,7 +878,9 @@ async def browser_run_js(expression: str) -> dict:
 
     Example: browser_run_js('document.title')
     """
-    return await _impl_browser_run_js(expression)
+    return await _with_tool_timeout(
+        _impl_browser_run_js(expression), _TOOL_TIMEOUT_S, "browser_run_js"
+    )
 
 
 @mcp.tool()
@@ -759,6 +901,27 @@ async def browser_clear_domain(domain: str) -> dict:
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
+
+
+@mcp.tool()
+async def browser_press_key(key: str, count: int = 1) -> dict:
+    """Press a keyboard key on the current page.
+
+    Supports Playwright key names: Tab, Enter, Space, ArrowDown, ArrowUp,
+    ArrowLeft, ArrowRight, Escape, Backspace, Delete, and combinations
+    like Shift+Tab, Control+a.
+
+    Use count > 1 for repeated presses (e.g., Tab 3 times to advance focus).
+    Useful as a fallback when click-based interaction fails on form controls.
+
+    Examples: browser_press_key('Tab', 3), browser_press_key('Space'),
+              browser_press_key('ArrowDown'), browser_press_key('Shift+Tab')
+    """
+    return await _with_tool_timeout(
+        _impl_browser_press_key(key, count),
+        30.0,
+        f"browser_press_key('{key}')",
+    )
 
 
 @mcp.tool()

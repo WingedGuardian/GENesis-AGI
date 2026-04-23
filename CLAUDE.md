@@ -257,6 +257,16 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Check procedures before multi-step tasks**: use `procedure_recall` if relevant.
   Applies when a task involves external services, has failed before, or
   requires multi-step tool use.
+- **Never pipe background Bash commands.** `run_in_background` with piped
+  commands (`| tail`, `| head`, `| grep`) produces empty output files.
+  Run without pipes, or run in the foreground. If you need the last N
+  lines, run the full command first, then read the output file.
+- **Targeted tests during development.** Run ONLY the relevant test
+  file(s) for your changes (`pytest tests/test_mcp/test_browser_tools.py -v`).
+  Full `ruff check . && pytest -v` runs once at pre-commit, not during
+  iterative development. Never loop on a slow full suite �� diagnose and
+  run the specific test. If a verification step takes >60s during
+  development, the scope is wrong.
 - **Plan mode by default.** Enter plan mode for any task with 3+ steps or
   architectural decisions. Plan verification steps, not just build steps. If
   something goes sideways mid-execution — STOP and re-plan immediately. Don't
