@@ -164,7 +164,7 @@ class MorningReportGenerator:
             logger.warning("Morning report: engagement summary unavailable", exc_info=True)
             await self._emit_warning("engagement_summary", "Engagement summary section unavailable")
 
-        # 6. Critical Issues (only if WARNING+ alerts are active)
+        # 7. Critical Issues (only if WARNING+ alerts are active)
         try:
             critical_issues = await self._get_critical_issues()
             if critical_issues:
