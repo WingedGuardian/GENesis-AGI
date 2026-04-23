@@ -145,16 +145,22 @@ async def init(rt: GenesisRuntime) -> None:
             outreach_fn = None
             if hasattr(rt, "_outreach_pipeline") and rt._outreach_pipeline:
                 async def _outreach_submit(severity: str, title: str, body: str) -> None:
+                    # Only CRITICAL health probes reach Telegram (as BLOCKER).
+                    # WARNINGs stay dashboard-only — they are informational,
+                    # not actionable alerts. This matches HealthOutreachBridge
+                    # which also filters to CRITICAL + whitelist only.
+                    if severity != "critical":
+                        logger.debug(
+                            "Remediation outreach suppressed (severity=%s): %s",
+                            severity, title,
+                        )
+                        return
                     from genesis.outreach.pipeline import OutreachCategory, OutreachRequest
-                    cat = {
-                        "critical": OutreachCategory.BLOCKER,
-                        "warning": OutreachCategory.ALERT,
-                    }.get(severity, OutreachCategory.ALERT)
                     await rt._outreach_pipeline.submit(OutreachRequest(
-                        category=cat,
+                        category=OutreachCategory.BLOCKER,
                         topic=title,
                         context=body,
-                        salience_score=0.9 if severity == "critical" else 0.6,
+                        salience_score=0.9,
                         signal_type="health_alert",
                         source_id=f"remediation:{title}",
                     ))

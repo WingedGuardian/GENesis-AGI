@@ -321,13 +321,22 @@ class OutreachScheduler:
 
             for row in rows:
                 try:
-                    # Validate category — fall back to ALERT for unknown categories
+                    # Validate category — map known non-enum values, fall
+                    # back to DIGEST (not ALERT) for truly unknown ones.
+                    _CATEGORY_ALIASES = {
+                        "follow_up": OutreachCategory.DIGEST,
+                        "reminder": OutreachCategory.DIGEST,
+                    }
+                    raw_cat = row["category"]
                     try:
-                        cat = OutreachCategory(row["category"])
+                        cat = OutreachCategory(raw_cat)
                     except ValueError:
-                        logger.warning("Unknown category '%s' in pending outreach %s, using ALERT",
-                                       row["category"], row["id"])
-                        cat = OutreachCategory.ALERT
+                        cat = _CATEGORY_ALIASES.get(raw_cat, OutreachCategory.DIGEST)
+                        if raw_cat not in _CATEGORY_ALIASES:
+                            logger.warning(
+                                "Unknown category '%s' in pending outreach %s, using DIGEST",
+                                raw_cat, row["id"],
+                            )
                     req = OutreachRequest(
                         category=cat,
                         topic=row["message"][:100],

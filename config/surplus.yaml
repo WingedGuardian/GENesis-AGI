@@ -12,7 +12,7 @@ jobs:
   brainstorm_check_hours: 12
   code_audit_hours: 12
   code_index_hours: 4
-  infra_monitor_hours: 3
+  infra_monitor_hours: 2
   recon_gather_hours: 84       # ~3.5 days
   maintenance_hours: 6
   follow_up_dispatch_minutes: 5
