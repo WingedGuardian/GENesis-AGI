@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -410,6 +411,10 @@ def _mock_remote_browser(pages=None, connected=True):
     return mock_browser
 
 
+@pytest.mark.skipif(
+    not importlib.util.find_spec("playwright"),
+    reason="playwright not installed",
+)
 class TestEnsureRemoteCdp:
     """Verify _ensure_remote_cdp connection lifecycle."""
 

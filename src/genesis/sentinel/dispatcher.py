@@ -269,6 +269,41 @@ class SentinelDispatcher:
             return True
         return False
 
+    async def _re_verify_alarms(self, request: SentinelRequest) -> bool:
+        """Check whether the original alarms from a pending request still exist.
+
+        Called before resuming a dispatch after approval is granted.
+        Returns True if at least one original alarm is still active.
+        Returns True on error (fail-open: if we can't verify, proceed).
+        """
+        original_ids = {a.alert_id for a in request.alarms} if request.alarms else set()
+        if not original_ids:
+            return True  # No alarm IDs to check — proceed
+
+        try:
+            from genesis.mcp.health_mcp import _impl_health_alerts
+            alerts = await _impl_health_alerts(active_only=True)
+        except Exception:
+            logger.warning("Re-verification failed — proceeding with dispatch", exc_info=True)
+            return True  # Fail-open
+
+        current_alarms = classify_alerts(alerts or [])
+        current_ids = {a.alert_id for a in current_alarms}
+        overlap = original_ids & current_ids
+
+        if overlap:
+            logger.info(
+                "Re-verification: %d/%d original alarms still active",
+                len(overlap), len(original_ids),
+            )
+            return True
+
+        logger.info(
+            "Re-verification: none of %d original alarms still active (current: %s)",
+            len(original_ids), current_ids or "none",
+        )
+        return False
+
     async def _gated_dispatch(self, request: SentinelRequest) -> SentinelResult:
         """Gate checks and dispatch, protected by asyncio.Lock."""
         # Gate 1: Bootstrap grace
@@ -724,8 +759,25 @@ class SentinelDispatcher:
 
             if policy_id == "sentinel_dispatch":
                 logger.info("Resuming sentinel dispatch after approval %s", request_id)
+                # Re-verify original alarms are still active before dispatching
+                if not await self._re_verify_alarms(request):
+                    self._state.clear_pending()
+                    self._state.transition(
+                        SentinelState.HEALTHY,
+                        reason="alarms cleared during approval wait — dispatch cancelled",
+                    )
+                    save_state(self._state)
+                    logger.info("Sentinel dispatch cancelled — original alarms no longer active")
+                    return SentinelResult(
+                        dispatched=False,
+                        reason="Original alarms cleared during approval wait",
+                    )
                 return await self._phase2_cc_and_actions(request, pattern=pattern)
             if policy_id == "sentinel_action":
+                # No re-verification here — actions are tied to a specific CC
+                # diagnosis, not to alarm state.  The CC session already ran
+                # and proposed actions; even if the original alarm cleared,
+                # the proposed fix may still be needed.
                 logger.info("Resuming sentinel actions after approval %s", request_id)
                 cc_result = _deserialize_result(self._state.pending_cc_result_json)
                 if cc_result is None:

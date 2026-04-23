@@ -164,7 +164,7 @@ class MorningReportGenerator:
             logger.warning("Morning report: engagement summary unavailable", exc_info=True)
             await self._emit_warning("engagement_summary", "Engagement summary section unavailable")
 
-        # 6. Critical Issues (only if WARNING+ alerts are active)
+        # 7. Critical Issues (only if WARNING+ alerts are active)
         try:
             critical_issues = await self._get_critical_issues()
             if critical_issues:
@@ -289,16 +289,17 @@ class MorningReportGenerator:
         cursor = await self._db.execute(
             "SELECT section, content, created_at FROM cognitive_state "
             "WHERE (expires_at IS NULL OR expires_at > datetime('now')) "
-            "AND created_at > datetime('now', '-48 hours') "
+            "AND created_at > datetime('now', '-24 hours') "
             "ORDER BY section, created_at DESC LIMIT 10"
         )
         rows = await cursor.fetchall()
         if not rows:
-            return "No active cognitive state entries."
+            return "No active cognitive state entries (all >24h old — skipped)."
         header = (
-            "Note: These are Genesis's internal state entries. Only surface items\n"
-            "that explicitly require user input or awareness. Items Genesis can\n"
-            "handle autonomously should be noted as 'Genesis will handle.'\n"
+            "Note: These are Genesis's INTERNAL state entries. Do NOT present\n"
+            "them as action items or quote them. At most, summarize in one line:\n"
+            "'Genesis is tracking N internal items.' Skip entirely if nothing\n"
+            "requires user awareness.\n"
         )
         entries = "\n".join(f"- [{r[0]}] {r[1][:300]} (as of {r[2]})" for r in rows)
         return header + "\n" + entries
@@ -368,10 +369,19 @@ class MorningReportGenerator:
             from genesis.mcp.health_mcp import _impl_health_alerts
 
             alerts = await _impl_health_alerts(active_only=True)
-            critical = [
-                a for a in alerts
-                if a.get("severity", "").upper() in ("WARNING", "ERROR", "CRITICAL")
-            ]
+            # Filter to genuinely urgent issues only:
+            # - CRITICAL/ERROR always included (something is actually down)
+            # - WARNING only if NOT a degraded call site (fallback routing
+            #   is normal operation, not worth morning-report space)
+            critical = []
+            for a in alerts:
+                severity = a.get("severity", "").upper()
+                alert_id = a.get("id", "")
+                if (
+                    severity in ("ERROR", "CRITICAL")
+                    or (severity == "WARNING" and not alert_id.startswith("call_site:"))
+                ):
+                    critical.append(a)
             if not critical:
                 return None
             lines = []
@@ -403,23 +413,11 @@ class MorningReportGenerator:
         if not total:
             return "- No outreach in last 7 days."
 
-        engaged = stats["engaged"]
-        ignored = stats["ignored"]
-        ambivalent = stats["ambivalent"]
         pending = stats["pending"]
 
+        # Just total count — no engagement self-analysis per guidelines
         lines = [f"- {total} messages sent in last 7 days."]
-        if engaged:
-            lines.append(f"- {engaged} received a reply ({engaged * 100 // total}% engagement).")
-        if ignored:
-            lines.append(f"- {ignored} went unread ({ignored * 100 // total}% ignore rate).")
-        if ambivalent:
-            lines.append(f"- {ambivalent} had implicit activity (user active but no direct reply).")
         if pending:
             lines.append(f"- {pending} awaiting engagement signal.")
-
-        # Note if throttle is active
-        if total >= 5 and ignored / total > 0.8:
-            lines.append("- **Engagement throttle active**: surplus outreach reduced due to low engagement.")
 
         return "\n".join(lines)
