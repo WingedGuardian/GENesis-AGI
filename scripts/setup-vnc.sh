@@ -68,7 +68,9 @@ EOF
 # Flags:
 #   -xdamage   — use X DAMAGE extension to only send changed regions (was -noxdamage)
 #   -threads   — multi-threaded encoding for better FPS
-#   -ncache 10 — client-side pixel caching for faster scrolling/tab switching
+#   NOTE: -ncache was removed — it creates a hidden pixel cache below the
+#   visible screen that makes the framebuffer ~11x taller, causing noVNC
+#   local scaling to produce a stretched/distorted view.
 #   xclip required for clipboard sync (installed above)
 cat > "$SYSTEMD_DIR/genesis-vnc.service" << EOF
 [Unit]
@@ -79,7 +81,7 @@ Requires=genesis-xvfb.service
 [Service]
 Type=simple
 Environment=DISPLAY=:99
-ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5900 -xdamage -threads -ncache 10
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5900 -xdamage -threads
 Restart=on-failure
 RestartSec=3
 
@@ -110,7 +112,7 @@ echo "Systemd units written to $SYSTEMD_DIR"
 # vnc_scaled.html forces scaleViewport=true so the display fits the browser
 # window without clipping. Stock vnc.html defaults to no scaling (off-center
 # logo, bottom-right cut off on displays wider than the browser window).
-cp "$SCRIPT_DIR/vnc_scaled.html" /usr/share/novnc/vnc_scaled.html
+sudo cp "$SCRIPT_DIR/vnc_scaled.html" /usr/share/novnc/vnc_scaled.html
 echo "✓ Deployed scripts/vnc_scaled.html → /usr/share/novnc/vnc_scaled.html"
 
 # ── 4. Enable and start ──────────────────────────────────
