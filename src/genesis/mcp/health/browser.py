@@ -439,6 +439,16 @@ def _check_remote_health() -> dict | None:
     return None
 
 
+def _update_remote_url() -> None:
+    """Update drift tracking URL after a successful action that may navigate."""
+    global _remote_last_url
+    if _is_remote_active() and _active_page is not None:
+        try:
+            _remote_last_url = _active_page.url
+        except Exception:
+            pass
+
+
 def _check_page_drift(page) -> dict | None:
     """Check if the remote page URL changed since Genesis last touched it.
 
@@ -851,6 +861,7 @@ async def _impl_browser_click(selector: str) -> dict:
     try:
         await _human_delay()
         await _stealth_click(_active_page, selector)
+        _update_remote_url()  # Click may cause navigation (form submit, link)
         snapshot = await _snapshot_page(_active_page)
         return {"clicked": selector, "url": _active_page.url, "snapshot": snapshot}
     except Exception as e:
@@ -875,6 +886,7 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     try:
         await _human_delay()
         await _human_type(_active_page, selector, value)
+        _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": _active_page.url}
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
@@ -949,6 +961,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
     try:
         logger.info("browser_run_js: %s", expression[:200])
         result = await _active_page.evaluate(expression)
+        _update_remote_url()  # JS may cause navigation
         return {"result": result, "url": _active_page.url}
     except Exception as e:
         return {"error": f"JS execution failed: {e}"}

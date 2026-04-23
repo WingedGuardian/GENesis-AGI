@@ -837,3 +837,24 @@ class TestRemoteHelpers:
         assert browser._remote_browser is None
         assert browser._remote_page is None
         assert browser._active_page is None
+
+    def test_update_remote_url_tracks_after_action(self):
+        """_update_remote_url syncs drift tracking after click/fill/js."""
+        page = MagicMock()
+        page.url = "https://new-page-after-submit.com"
+        browser._remote_page = page
+        browser._active_page = page
+        browser._remote_last_url = "https://old-form-page.com"
+
+        browser._update_remote_url()
+
+        assert browser._remote_last_url == "https://new-page-after-submit.com"
+
+    def test_update_remote_url_noop_when_not_remote(self):
+        """_update_remote_url does nothing when not in remote mode."""
+        browser._active_page = MagicMock()
+        browser._remote_last_url = "https://old.com"
+
+        browser._update_remote_url()
+
+        assert browser._remote_last_url == "https://old.com"  # unchanged
