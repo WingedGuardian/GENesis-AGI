@@ -161,6 +161,12 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         if status_val == "disabled":
             continue
 
+        # Skip idle sites — config exists but no invocations recorded.
+        # These are either groundwork sites not yet wired or sites whose
+        # callers haven't fired yet.  Not an outage.
+        if status_val == "idle":
+            continue
+
         if status_val == "down":
             alerts.append({
                 "id": alert_id,
