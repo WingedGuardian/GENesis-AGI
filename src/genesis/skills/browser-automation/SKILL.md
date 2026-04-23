@@ -27,23 +27,25 @@ that can accomplish the task. **Token cost increases with each layer.**
 
 ### Layer 2: Genesis Browser Tools (persistent profile, on-demand)
 - Tools: `browser_navigate`, `browser_click`, `browser_fill`,
-  `browser_screenshot`, `browser_snapshot`, `browser_run_js`,
-  `browser_sessions`, `browser_clear_domain`
+  `browser_upload`, `browser_press_key`, `browser_screenshot`,
+  `browser_snapshot`, `browser_run_js`, `browser_sessions`,
+  `browser_clear_domain`
 - Available via genesis-health MCP (always loaded, ~800 chars token cost)
 - Browser launches lazily on first navigation — zero overhead until used
-- Profile persists at `~/.genesis/browser-profile/` — cookies, localStorage,
-  login sessions survive across MCP restarts
-- **Standard mode**: Chromium (fast, default)
-- **Stealth mode**: `browser_navigate(url, stealth=True)` uses Camoufox
-  (anti-detection Firefox) for sites that block automated browsers.
-  Separate profile at `~/.genesis/camoufox-profile/`.
+- All blocking tools have a hard 60s timeout (configurable per tool) to
+  prevent indefinite hangs. `browser_fill` scales with string length.
+- **Default mode**: Camoufox (anti-detection Firefox). Always runs headed on
+  VNC display :99 — observable via noVNC. Profile at `~/.genesis/camoufox-profile/`.
+  Includes humanized cursor movement, per-keystroke typing with IKI jitter,
+  and stealth click with hover/jitter.
+- **Chromium fallback**: `browser_navigate(url, stealth=True)` uses Chromium
+  for sites incompatible with Camoufox (rare). Profile at `~/.genesis/browser-profile/`.
 - **Agent-owned accounts**: log into accounts created FOR the agent, never the
   user's personal accounts. Treat the agent like a new employee.
-- **Collaborate mode**: `browser_collaborate(enable=True)` switches to headed
-  mode on a virtual display. The user watches and interacts via noVNC in their
-  browser (URL returned by the tool). Use for tasks requiring human input:
-  captchas, payments, 2FA, OAuth flows. Genesis drives automation; user takes
-  VNC control when needed. Toggling mode restarts the browser.
+- **Collaborate mode**: `browser_collaborate(enable=True)` switches to fast
+  timing (0.5-2s delays vs 1-15s stealth). The browser is ALWAYS visible on
+  VNC — no mode switch or restart needed. Use when a human is actively
+  watching to speed up interaction. Disabling restores stealth timing.
 
 ### Layer 3: On-Demand MCP (heavy sessions — activate when needed)
 - Tools: Chrome DevTools MCP (29 tools) or Playwright MCP
@@ -184,8 +186,9 @@ result: <task outcome description>
 ## References
 
 - Genesis browser MCP tools: `browser_navigate`, `browser_click`, `browser_fill`,
-  `browser_screenshot`, `browser_snapshot`, `browser_run_js`, `browser_sessions`,
-  `browser_clear_domain`, `browser_collaborate` (via genesis-health MCP)
+  `browser_upload`, `browser_press_key`, `browser_screenshot`, `browser_snapshot`,
+  `browser_run_js`, `browser_sessions`, `browser_clear_domain`,
+  `browser_collaborate` (via genesis-health MCP)
 - `src/genesis/mcp/health/browser.py` — MCP tool implementations
 - `src/genesis/browser/profile.py` — BrowserProfileManager (cookie DB, sessions)
 - `scripts/browser.py` — Standalone CLI (opens/closes per command, for one-off use)
