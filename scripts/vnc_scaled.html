@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!--
+    noVNC: scaled viewer for Genesis remote display.
+    Based on vnc_lite.html from noVNC 1.3.0.
+    Forces scaleViewport=true with a robust flexbox layout that
+    constrains the container size independently of canvas content.
+
+    Usage:
+        http://HOST:6080/vnc_scaled.html?password=PASS
+        http://HOST:6080/vnc_scaled.html  (will prompt for password)
+    -->
+    <title>Genesis Remote Display</title>
+    <meta charset="utf-8">
+    <style>
+        * { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;          /* prevent body scrollbars */
+            background-color: #1a1a2e;
+        }
+        body {
+            display: flex;
+            flex-direction: column;
+        }
+        #top_bar {
+            background-color: #16213e;
+            color: #e2e2e2;
+            font: bold 12px Helvetica, Arial, sans-serif;
+            padding: 6px 10px 4px 10px;
+            border-bottom: 1px solid #0f3460;
+            flex-shrink: 0;            /* never collapse the bar */
+        }
+        #status {
+            text-align: center;
+        }
+        #sendCtrlAltDelButton {
+            position: fixed;
+            top: 0px;
+            right: 0px;
+            border: 1px outset;
+            padding: 5px 8px 4px 8px;
+            cursor: pointer;
+            background: #0f3460;
+            color: #e2e2e2;
+            font-size: 11px;
+            z-index: 10;
+        }
+        #sendCtrlAltDelButton:hover {
+            background: #533483;
+        }
+        /*
+         * This is the critical layout fix:
+         * - position:absolute fills the remaining space below the top bar
+         *   without depending on height:100% inheritance
+         * - overflow:hidden prevents the canvas from expanding this container
+         * - The container size is determined by the viewport, NOT by its children
+         */
+        #screen {
+            position: absolute;
+            top: 28px;                 /* height of top_bar */
+            left: 0;
+            right: 0;
+            bottom: 0;
+            overflow: hidden;
+        }
+    </style>
+
+    <script type="module" crossorigin="anonymous">
+        import RFB from './core/rfb.js';
+
+        let rfb;
+        let desktopName;
+
+        function connectedToServer(e) {
+            status("Connected to " + desktopName);
+        }
+
+        function disconnectedFromServer(e) {
+            if (e.detail.clean) {
+                status("Disconnected");
+            } else {
+                status("Connection lost");
+            }
+        }
+
+        function credentialsAreRequired(e) {
+            const password = prompt("VNC Password:");
+            rfb.sendCredentials({ password: password });
+        }
+
+        function updateDesktopName(e) {
+            desktopName = e.detail.name;
+        }
+
+        function sendCtrlAltDel() {
+            rfb.sendCtrlAltDel();
+            return false;
+        }
+
+        function status(text) {
+            document.getElementById('status').textContent = text;
+        }
+
+        function readQueryVariable(name, defaultValue) {
+            const re = new RegExp('.*[?&]' + name + '=([^&#]*)'),
+                  match = ''.concat(document.location.href, window.location.hash).match(re);
+            if (match) {
+                return decodeURIComponent(match[1]);
+            }
+            return defaultValue;
+        }
+
+        document.getElementById('sendCtrlAltDelButton')
+            .onclick = sendCtrlAltDel;
+
+        const host = readQueryVariable('host', window.location.hostname);
+        let port = readQueryVariable('port', window.location.port);
+        const password = readQueryVariable('password');
+        const path = readQueryVariable('path', 'websockify');
+
+        status("Connecting");
+
+        let url;
+        if (window.location.protocol === "https:") {
+            url = 'wss';
+        } else {
+            url = 'ws';
+        }
+        url += '://' + host;
+        if (port) {
+            url += ':' + port;
+        }
+        url += '/' + path;
+
+        rfb = new RFB(document.getElementById('screen'), url,
+                      { credentials: { password: password } });
+
+        rfb.addEventListener("connect",  connectedToServer);
+        rfb.addEventListener("disconnect", disconnectedFromServer);
+        rfb.addEventListener("credentialsrequired", credentialsAreRequired);
+        rfb.addEventListener("desktopname", updateDesktopName);
+
+        rfb.viewOnly = readQueryVariable('view_only', false);
+
+        // Force scaling ON -- this is the whole point of this page
+        rfb.scaleViewport = true;
+    </script>
+</head>
+
+<body>
+    <div id="top_bar">
+        <div id="status">Loading</div>
+        <div id="sendCtrlAltDelButton">Send CtrlAltDel</div>
+    </div>
+    <div id="screen">
+        <!-- RFB attaches the canvas here -->
+    </div>
+</body>
+</html>
