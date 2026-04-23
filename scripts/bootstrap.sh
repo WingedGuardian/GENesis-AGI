@@ -481,6 +481,14 @@ if [[ -f "$WATCHGOD_SRC" ]]; then
     systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
         echo "  genesis-tmp-watchgod.service enabled + started" || true
 fi
+
+# --- VNC stack (collaborative browser mode) ---
+echo "--- Setting up VNC stack ---"
+if bash "$GENESIS_ROOT/scripts/setup-vnc.sh" 2>&1 | sed 's/^/  /'; then
+    echo "  VNC stack ready"
+else
+    echo "  VNC setup failed (non-fatal — run scripts/setup-vnc.sh manually)"
+fi
 echo
 
 # --- Memory restore ---
