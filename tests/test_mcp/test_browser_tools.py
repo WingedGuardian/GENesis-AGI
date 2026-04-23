@@ -10,28 +10,31 @@ import pytest
 from genesis.mcp.health import browser
 
 
+def _clear_all_browser_state():
+    """Clear all module-level browser state."""
+    browser._stealth_cm = None
+    browser._stealth_browser = None
+    browser._stealth_page = None
+    browser._playwright = None
+    browser._context = None
+    browser._page = None
+    browser._active_page = None
+    browser._collaborate_mode = False
+    browser._browser_lock = asyncio.Lock()
+    # Remote CDP state
+    browser._remote_pw = None
+    browser._remote_browser = None
+    browser._remote_page = None
+    browser._remote_cdp_url = None
+    browser._remote_last_url = None
+
+
 @pytest.fixture(autouse=True)
 def _reset_browser_state():
     """Reset module-level browser state before and after each test."""
-    browser._stealth_cm = None
-    browser._stealth_browser = None
-    browser._stealth_page = None
-    browser._playwright = None
-    browser._context = None
-    browser._page = None
-    browser._active_page = None
-    browser._collaborate_mode = False
-    browser._browser_lock = asyncio.Lock()
+    _clear_all_browser_state()
     yield
-    browser._stealth_cm = None
-    browser._stealth_browser = None
-    browser._stealth_page = None
-    browser._playwright = None
-    browser._context = None
-    browser._page = None
-    browser._active_page = None
-    browser._collaborate_mode = False
-    browser._browser_lock = asyncio.Lock()
+    _clear_all_browser_state()
 
 
 class TestIsPageAlive:
@@ -386,3 +389,472 @@ class TestPressKey:
         result = await browser._impl_browser_press_key("Foo")
         assert "error" in result
         assert "Foo" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# CDP Remote Browser Tests (Layer 3)
+# ---------------------------------------------------------------------------
+
+
+def _mock_remote_browser(pages=None, connected=True):
+    """Create a mock CDP browser with optional pages."""
+    mock_browser = MagicMock()
+    mock_browser.is_connected.return_value = connected
+    mock_browser.close = AsyncMock()
+    mock_browser.on = MagicMock()
+    ctx = MagicMock()
+    ctx.pages = pages or []
+    ctx.new_page = AsyncMock(return_value=MagicMock())
+    mock_browser.contexts = [ctx]
+    mock_browser.new_context = AsyncMock(return_value=ctx)
+    return mock_browser
+
+
+class TestEnsureRemoteCdp:
+    """Verify _ensure_remote_cdp connection lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_returns_alive_page_without_reconnect(self):
+        """Already-connected, alive page is reused."""
+        page = MagicMock()
+        page.is_closed.return_value = False
+        page.url = "https://example.com"
+        mock_br = _mock_remote_browser(connected=True)
+
+        browser._remote_page = page
+        browser._remote_browser = mock_br
+
+        result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+        assert result is page
+
+    @pytest.mark.asyncio
+    async def test_reconnects_after_disconnect(self):
+        """Stale connection is cleaned up and re-established."""
+        dead_browser = _mock_remote_browser(connected=False)
+        browser._remote_browser = dead_browser
+        browser._remote_page = MagicMock()
+
+        new_page = MagicMock()
+        new_browser = _mock_remote_browser(pages=[new_page])
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
+        mock_pw.stop = AsyncMock()
+
+        with patch("playwright.async_api.async_playwright") as mock_apw:
+            mock_starter = AsyncMock()
+            mock_starter.start = AsyncMock(return_value=mock_pw)
+            mock_apw.return_value = mock_starter
+            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+
+        assert result is new_page
+        assert browser._remote_cdp_url == "http://100.1.2.3:9222"
+
+    @pytest.mark.asyncio
+    async def test_raises_connection_error_no_url(self):
+        """No CDP URL configured — clear error with setup instructions."""
+        with pytest.raises(ConnectionError, match="No CDP URL configured"):
+            await browser._ensure_remote_cdp(None)
+
+    @pytest.mark.asyncio
+    async def test_raises_connection_error_chrome_not_running(self):
+        """Chrome not running — clear error with troubleshooting."""
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(
+            side_effect=Exception("Connection refused")
+        )
+        mock_pw.stop = AsyncMock()
+
+        with patch("playwright.async_api.async_playwright") as mock_apw:
+            mock_starter = AsyncMock()
+            mock_starter.start = AsyncMock(return_value=mock_pw)
+            mock_apw.return_value = mock_starter
+            with pytest.raises(ConnectionError, match="Cannot connect"):
+                await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+
+        # Playwright instance must be cleaned up
+        mock_pw.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_uses_existing_tab(self):
+        """Picks up existing tab (last page) instead of creating new."""
+        existing_page = MagicMock()
+        existing_page.url = "https://already-open.com"
+        new_browser = _mock_remote_browser(pages=[MagicMock(), existing_page])
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
+
+        with patch("playwright.async_api.async_playwright") as mock_apw:
+            mock_starter = AsyncMock()
+            mock_starter.start = AsyncMock(return_value=mock_pw)
+            mock_apw.return_value = mock_starter
+            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+
+        assert result is existing_page  # Last tab, not first
+
+    @pytest.mark.asyncio
+    async def test_creates_new_tab_when_no_pages(self):
+        """Context exists but no pages — creates new tab."""
+        new_browser = _mock_remote_browser(pages=[])
+        created_page = MagicMock()
+        new_browser.contexts[0].new_page = AsyncMock(return_value=created_page)
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
+
+        with patch("playwright.async_api.async_playwright") as mock_apw:
+            mock_starter = AsyncMock()
+            mock_starter.start = AsyncMock(return_value=mock_pw)
+            mock_apw.return_value = mock_starter
+            result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
+
+        assert result is created_page
+        new_browser.contexts[0].new_page.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_resolves_url_from_env(self):
+        """Falls back to GENESIS_CDP_URL env var when no explicit URL."""
+        new_page = MagicMock()
+        new_browser = _mock_remote_browser(pages=[new_page])
+
+        mock_pw = AsyncMock()
+        mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
+
+        with patch("playwright.async_api.async_playwright") as mock_apw, \
+             patch.dict("os.environ", {"GENESIS_CDP_URL": "http://env.url:9222"}):
+            mock_starter = AsyncMock()
+            mock_starter.start = AsyncMock(return_value=mock_pw)
+            mock_apw.return_value = mock_starter
+            await browser._ensure_remote_cdp(None)
+
+        mock_pw.chromium.connect_over_cdp.assert_awaited_once_with("http://env.url:9222")
+
+
+class TestRemotePageDrift:
+    """Verify _check_page_drift detects URL changes."""
+
+    def test_no_drift_when_url_unchanged(self):
+        page = MagicMock()
+        page.url = "https://example.com/form"
+        browser._remote_last_url = "https://example.com/form"
+
+        assert browser._check_page_drift(page) is None
+
+    def test_drift_detected_on_url_change(self):
+        page = MagicMock()
+        page.url = "https://example.com/other"
+        browser._remote_last_url = "https://example.com/form"
+
+        drift = browser._check_page_drift(page)
+        assert drift is not None
+        assert drift["drift"] == "url_changed"
+        assert drift["expected"] == "https://example.com/form"
+        assert drift["actual"] == "https://example.com/other"
+
+    def test_no_drift_when_no_previous_url(self):
+        page = MagicMock()
+        page.url = "https://example.com"
+        browser._remote_last_url = None
+
+        assert browser._check_page_drift(page) is None
+
+    def test_drift_on_inaccessible_page(self):
+        page = MagicMock()
+        type(page).url = property(lambda self: (_ for _ in ()).throw(Exception("tab closed")))
+        browser._remote_last_url = "https://example.com"
+
+        drift = browser._check_page_drift(page)
+        assert drift is not None
+        assert drift["drift"] == "page_inaccessible"
+
+
+class TestRemoteCleanup:
+    """Verify _cleanup_remote_cdp disconnects safely."""
+
+    @pytest.mark.asyncio
+    async def test_cleanup_disconnects_without_closing_chrome(self):
+        """browser.close() on CDP = disconnect, verified via mock."""
+        mock_br = _mock_remote_browser()
+        mock_pw = AsyncMock()
+        mock_pw.stop = AsyncMock()
+
+        browser._remote_browser = mock_br
+        browser._remote_page = MagicMock()
+        browser._remote_pw = mock_pw
+        browser._remote_last_url = "https://example.com"
+
+        await browser._cleanup_remote_cdp()
+
+        mock_br.close.assert_awaited_once()
+        mock_pw.stop.assert_awaited_once()
+        assert browser._remote_browser is None
+        assert browser._remote_page is None
+        assert browser._remote_pw is None
+        assert browser._remote_last_url is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_safe_on_dead_connection(self):
+        """Cleanup doesn't raise when browser.close() fails."""
+        mock_br = _mock_remote_browser()
+        mock_br.close = AsyncMock(side_effect=Exception("already gone"))
+        mock_pw = AsyncMock()
+        mock_pw.stop = AsyncMock()
+
+        browser._remote_browser = mock_br
+        browser._remote_page = MagicMock()
+        browser._remote_pw = mock_pw
+
+        await browser._cleanup_remote_cdp()  # should not raise
+
+        assert browser._remote_browser is None
+        assert browser._remote_pw is None
+
+    @pytest.mark.asyncio
+    async def test_cleanup_resets_all_globals(self):
+        browser._remote_browser = MagicMock()
+        browser._remote_page = MagicMock()
+        browser._remote_pw = AsyncMock()
+        browser._remote_pw.stop = AsyncMock()
+        browser._remote_browser.close = AsyncMock()
+        browser._remote_last_url = "https://test.com"
+
+        await browser._cleanup_remote_cdp()
+
+        assert browser._remote_browser is None
+        assert browser._remote_page is None
+        assert browser._remote_pw is None
+        assert browser._remote_last_url is None
+        # cdp_url preserved for reconnection
+        # (not set in this test, but verify it's not touched)
+
+
+class TestRemoteNavigate:
+    """Verify _impl_browser_navigate with remote=True."""
+
+    @pytest.mark.asyncio
+    async def test_navigate_remote_auto_enables_collaborate(self):
+        page = MagicMock()
+        page.url = "https://example.com"
+        page.title = AsyncMock(return_value="Example")
+        page.goto = AsyncMock()
+        page.is_closed.return_value = False
+        locator = MagicMock()
+        locator.aria_snapshot = AsyncMock(return_value="- heading: Example")
+        page.locator.return_value = locator
+
+        assert browser._collaborate_mode is False
+        # _ensure_remote_cdp normally sets _remote_page; mock must too
+        browser._remote_page = page
+
+        with patch.object(browser, "_ensure_remote_cdp", new_callable=AsyncMock, return_value=page):
+            result = await browser._impl_browser_navigate(
+                "https://example.com", remote=True, cdp_url="http://x:9222"
+            )
+
+        assert browser._collaborate_mode is True
+        assert result.get("layer") == "remote_cdp"
+
+    @pytest.mark.asyncio
+    async def test_navigate_remote_skips_turnstile(self):
+        page = MagicMock()
+        page.url = "https://example.com"
+        page.title = AsyncMock(return_value="Example")
+        page.goto = AsyncMock()
+        page.is_closed.return_value = False
+        locator = MagicMock()
+        locator.aria_snapshot = AsyncMock(return_value="- heading: Example")
+        page.locator.return_value = locator
+        browser._remote_page = page
+
+        with patch.object(browser, "_ensure_remote_cdp", new_callable=AsyncMock, return_value=page), \
+             patch.object(browser, "_wait_for_turnstile") as mock_turnstile:
+            await browser._impl_browser_navigate(
+                "https://example.com", remote=True, cdp_url="http://x:9222"
+            )
+
+        mock_turnstile.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_navigate_remote_connection_error(self):
+        with patch.object(
+            browser, "_ensure_remote_cdp", new_callable=AsyncMock,
+            side_effect=ConnectionError("No CDP URL configured"),
+        ):
+            result = await browser._impl_browser_navigate(
+                "https://example.com", remote=True
+            )
+
+        assert "error" in result
+        assert "No CDP URL" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_navigate_remote_tracks_url_for_drift(self):
+        page = MagicMock()
+        page.url = "https://jobs.ashbyhq.com/apply"
+        page.title = AsyncMock(return_value="Apply")
+        page.goto = AsyncMock()
+        page.is_closed.return_value = False
+        locator = MagicMock()
+        locator.aria_snapshot = AsyncMock(return_value="- heading: Apply")
+        page.locator.return_value = locator
+
+        browser._remote_page = page
+
+        with patch.object(browser, "_ensure_remote_cdp", new_callable=AsyncMock, return_value=page):
+            browser._active_page = page
+            await browser._impl_browser_navigate(
+                "https://jobs.ashbyhq.com/apply", remote=True, cdp_url="http://x:9222"
+            )
+
+        assert browser._remote_last_url == "https://jobs.ashbyhq.com/apply"
+
+
+class TestRemoteInteraction:
+    """Verify interaction tools handle remote CDP state."""
+
+    @pytest.mark.asyncio
+    async def test_click_with_drift_returns_advisory(self):
+        """When user navigated away, click returns advisory instead of acting."""
+        page = MagicMock()
+        page.url = "https://other-page.com"
+        page.is_closed.return_value = False
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://original-page.com"
+
+        result = await browser._impl_browser_click("#submit")
+        assert "advisory" in result
+        assert result["drift"] == "url_changed"
+
+    @pytest.mark.asyncio
+    async def test_click_with_disconnected_remote_returns_error(self):
+        page = MagicMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=False)
+
+        result = await browser._impl_browser_click("#submit")
+        assert "error" in result
+        assert "connection lost" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_human_delay_uses_collaborate_timing_for_remote(self):
+        """Remote CDP always uses fast 0.5-2.0s timing."""
+        page = MagicMock()
+        browser._active_page = page
+        browser._remote_page = page
+
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            await browser._human_delay()
+
+        mock_sleep.assert_awaited_once()
+        delay = mock_sleep.call_args[0][0]
+        assert 0.5 <= delay <= 2.0
+
+    @pytest.mark.asyncio
+    async def test_fill_with_drift_returns_advisory(self):
+        page = MagicMock()
+        page.url = "https://other.com"
+        page.is_closed.return_value = False
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=True)
+        browser._remote_last_url = "https://original.com"
+
+        result = await browser._impl_browser_fill("#email", "test@test.com")
+        assert "advisory" in result
+
+    @pytest.mark.asyncio
+    async def test_press_key_with_disconnected_returns_error(self):
+        page = MagicMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = _mock_remote_browser(connected=False)
+
+        result = await browser._impl_browser_press_key("Tab")
+        assert "error" in result
+        assert "connection lost" in result["error"].lower()
+
+
+class TestRemoteHelpers:
+    """Verify remote state helper functions."""
+
+    def test_is_remote_active_true(self):
+        page = MagicMock()
+        browser._remote_page = page
+        browser._active_page = page
+        assert browser._is_remote_active() is True
+
+    def test_is_remote_active_false_no_remote(self):
+        assert browser._is_remote_active() is False
+
+    def test_is_remote_active_false_different_page(self):
+        browser._remote_page = MagicMock()
+        browser._active_page = MagicMock()  # different object
+        assert browser._is_remote_active() is False
+
+    def test_remote_browser_connected(self):
+        browser._remote_browser = MagicMock()
+        browser._remote_browser.is_connected.return_value = True
+        assert browser._remote_browser_connected() is True
+
+    def test_remote_browser_not_connected(self):
+        browser._remote_browser = MagicMock()
+        browser._remote_browser.is_connected.return_value = False
+        assert browser._remote_browser_connected() is False
+
+    def test_remote_browser_none(self):
+        assert browser._remote_browser_connected() is False
+
+    def test_check_remote_health_ok(self):
+        """Non-remote page — returns None."""
+        browser._active_page = MagicMock()
+        assert browser._check_remote_health() is None
+
+    def test_check_remote_health_disconnected(self):
+        page = MagicMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = MagicMock()
+        browser._remote_browser.is_connected.return_value = False
+
+        result = browser._check_remote_health()
+        assert result is not None
+        assert "error" in result
+        assert browser._active_page is None
+        assert browser._remote_page is None
+
+    def test_on_remote_disconnected_clears_state(self):
+        page = MagicMock()
+        browser._remote_browser = MagicMock()
+        browser._remote_page = page
+        browser._active_page = page
+
+        browser._on_remote_disconnected()
+
+        assert browser._remote_browser is None
+        assert browser._remote_page is None
+        assert browser._active_page is None
+
+    def test_update_remote_url_tracks_after_action(self):
+        """_update_remote_url syncs drift tracking after click/fill/js."""
+        page = MagicMock()
+        page.url = "https://new-page-after-submit.com"
+        browser._remote_page = page
+        browser._active_page = page
+        browser._remote_last_url = "https://old-form-page.com"
+
+        browser._update_remote_url()
+
+        assert browser._remote_last_url == "https://new-page-after-submit.com"
+
+    def test_update_remote_url_noop_when_not_remote(self):
+        """_update_remote_url does nothing when not in remote mode."""
+        browser._active_page = MagicMock()
+        browser._remote_last_url = "https://old.com"
+
+        browser._update_remote_url()
+
+        assert browser._remote_last_url == "https://old.com"  # unchanged

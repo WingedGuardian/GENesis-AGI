@@ -47,12 +47,26 @@ that can accomplish the task. **Token cost increases with each layer.**
   VNC — no mode switch or restart needed. Use when a human is actively
   watching to speed up interaction. Disabling restores stealth timing.
 
-### Layer 3: On-Demand MCP (heavy sessions — activate when needed)
+### Layer 3: Remote CDP (user's real Chrome over Tailscale)
+- Tool: `browser_navigate(url, remote=True)` — built into genesis-health MCP
+- Connects to user's Chrome via `playwright.chromium.connect_over_cdp()`
+- **Real browser, real fingerprint** — nothing to detect. Bulletproof for
+  ATS submissions with reCAPTCHA v3 or aggressive anti-bot detection.
+- Collaborate timing auto-enabled (user watching their own screen)
+- Drift detection: warns if user navigated away since last Genesis action
+- **User setup**: Launch Chrome with `--remote-debugging-port=9222
+  --user-data-dir=%USERPROFILE%\chrome-genesis` (Windows batch file)
+- Set `GENESIS_CDP_URL=http://<tailscale-ip>:9222` in `secrets.env`, or
+  pass `cdp_url=` parameter directly
+- Graceful errors when Chrome is offline — no retry storms
+- Camoufox stays default for non-adversarial browsing
+
+### Layer 3b: On-Demand MCP (network inspection — activate when needed)
 - Tools: Chrome DevTools MCP (29 tools) or Playwright MCP
 - Activate: `/activate-browser` → adds to `.mcp.json` → restart session
 - Deactivate when done to reclaim ~17k tokens of context budget
-- **Remote mode**: `--browserUrl http://127.0.0.1:9222` connects to user's
-  Chrome via CDP-over-SSH tunnel (uses user's logged-in sessions)
+- Use when you need network inspection, Lighthouse, or performance tracing
+  beyond what the built-in Genesis browser tools provide
 
 ### Layer 4: Computer Use (visual fallback — V4)
 - Claude Computer Use API (screenshot-based interaction)
@@ -67,9 +81,10 @@ that can accomplish the task. **Token cost increases with each layer.**
 | Fill a form on agent's account | Genesis Browser | Persistent login |
 | Site blocks automation | Genesis Browser (stealth) | Anti-detection |
 | CAPTCHA / payment / 2FA step | Genesis Browser (collaborate) | User takes VNC control |
+| ATS with reCAPTCHA v3 / Ashby | Remote CDP | Real Chrome fingerprint |
+| Submit on user's logged-in site | Remote CDP | User's sessions |
 | Network inspection / Lighthouse | On-Demand MCP | Chrome DevTools |
-| Check user's Gmail | On-Demand MCP (remote) | CDP-over-SSH |
-| Take action in user's banking app | On-Demand MCP (remote) | MUST confirm |
+| Take action in user's banking app | Remote CDP | MUST confirm |
 
 ## When to Use
 
