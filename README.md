@@ -408,7 +408,6 @@ V3 is the foundation — complete, tested, running in production. What comes nex
 ### Beta — What's landing next
 
 - **Ego loop activation** — the autonomous decision-making loop is built (9-module system with its own cadence, model, and budget). What's coming next: wiring it into the runtime so it runs on its own cadence without per-action approval gates. The mechanism exists; the governance layer that lets it run unsupervised is V4.
-- **Agent framework portability** — OpenClaw and Agent Zero adapters are already built and live. What's coming: Hermes Agent adapter and a standardized pluggable interface for any agent framework runtime.
 - **Voice expansion** — speech-to-text and text-to-speech are live in Telegram. What's coming: voice as a first-class channel across all interaction surfaces.
 
 ### V4 — Autonomous action
