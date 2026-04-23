@@ -893,12 +893,24 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
 
 
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
-    """Upload a file to a file input element on the current page."""
+    """Upload a file to a file input element on the current page.
+
+    For remote CDP: file must exist on the Genesis container (Playwright sends
+    the file contents over the wire to the remote browser).
+    """
+    _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
     health = _check_remote_health()
     if health:
         return health
+    drift = _check_page_drift(_active_page) if _is_remote_active() else None
+    if drift:
+        return {
+            "advisory": "Page state changed since last Genesis action.",
+            **drift,
+            "recommendation": "Call browser_snapshot() to see current page state before acting.",
+        }
     p = Path(file_path)
     if not p.is_file():
         return {"error": f"File not found or not a regular file: {file_path}"}
