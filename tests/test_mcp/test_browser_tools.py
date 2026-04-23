@@ -78,6 +78,7 @@ class TestEnsureBrowserRecovery:
     @pytest.mark.asyncio
     async def test_recovers_from_stale_page(self):
         """If page is dead, _ensure_browser cleans up and re-initializes."""
+        pytest.importorskip("camoufox", reason="camoufox not installed")
         dead_page = MagicMock()
         dead_page.is_closed.return_value = True
         browser._stealth_page = dead_page
@@ -125,6 +126,7 @@ class TestEnsureChromiumRecovery:
 
     @pytest.mark.asyncio
     async def test_recovers_from_stale_chromium(self):
+        pytest.importorskip("playwright", reason="playwright not installed")
         dead_page = MagicMock()
         dead_page.is_closed.return_value = True
         browser._page = dead_page

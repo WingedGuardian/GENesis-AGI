@@ -2132,8 +2132,9 @@
             if (sentinel.current_state === "escalated") {
               return { state: "error", reason: "sentinel escalated — CC diagnosis failed" };
             }
-            if (sentinel.current_state === "investigating" || sentinel.current_state === "remediating") {
-              return { state: "degraded", reason: `sentinel ${sentinel.current_state}` };
+            if (["investigating", "remediating", "awaiting_dispatch_approval", "awaiting_action_approval"].includes(sentinel.current_state)) {
+              const label = sentinel.current_state.startsWith("awaiting") ? "awaiting approval" : sentinel.current_state;
+              return { state: "degraded", reason: `sentinel ${label}` };
             }
           }
           return { state: "healthy", reason: `${svcLabel} and watchdog services are active` };
@@ -3684,7 +3685,7 @@
                             if (!s || !s.enabled) return '#666';
                             if (s.current_state === 'healthy') return '#4caf50';
                             if (s.current_state === 'escalated') return '#d9534f';
-                            if (s.current_state === 'investigating' || s.current_state === 'remediating') return '#f0ad4e';
+                            if (['investigating', 'remediating', 'awaiting_dispatch_approval', 'awaiting_action_approval'].includes(s.current_state)) return '#f0ad4e';
                             return '#666';  // unknown/future state — gray, not yellow
                           })()}`"></span>
                     Sentinel
@@ -3693,6 +3694,7 @@
                             const s = $store.genesisDashboard.health.services?.sentinel;
                             if (!s || !s.enabled) return '';
                             if (s.is_active) return '(running)';
+                            if (s.current_state.startsWith('awaiting')) return '(awaiting approval)';
                             if (s.current_state !== 'healthy') return '(' + s.current_state + ')';
                             return '';
                           })()"></span>
