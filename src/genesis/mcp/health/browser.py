@@ -41,6 +41,13 @@ _stealth_browser = None
 _stealth_page = None
 _active_page = None  # Tracks whichever page was last navigated (standard or stealth)
 
+# Layer 3: CDP remote browser (user's real Chrome over Tailscale)
+_remote_pw = None  # Separate Playwright instance (independent lifecycle from _playwright)
+_remote_browser = None  # CDP Browser connection
+_remote_page = None  # Active page on user's remote Chrome
+_remote_cdp_url: str | None = None  # e.g. "http://100.x.y.z:9222"
+_remote_last_url: str | None = None  # URL at last Genesis action (drift detection)
+
 # Collaborative mode — when True, browser launches headed on virtual display :99.
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
@@ -93,6 +100,9 @@ async def async_cleanup():
             await _idle_task
         _idle_task = None
     _last_used = 0.0
+
+    # Remote CDP: disconnect (does NOT close user's Chrome)
+    await _cleanup_remote_cdp()
 
     if _context is not None:
         try:
@@ -156,6 +166,7 @@ async def _ensure_browser():
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
             humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
+            window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
             firefox_user_prefs={
                 # Camoufox disables session history (max_entries=0) for
                 # anti-detection.  Re-enable it so back/forward navigation
@@ -210,6 +221,112 @@ async def _ensure_chromium_fallback():
         return _page
 
 
+def _on_remote_disconnected() -> None:
+    """Callback when CDP connection drops (Chrome closed, machine asleep)."""
+    global _remote_browser, _remote_page, _active_page
+    logger.warning("Remote CDP disconnected (Chrome closed or network lost)")
+    _remote_browser = None
+    if _active_page is _remote_page:
+        _active_page = None
+    _remote_page = None
+    # Preserve _remote_cdp_url so reconnection works on next call
+
+
+async def _cleanup_remote_cdp() -> None:
+    """Disconnect from remote Chrome. Does NOT close the user's browser.
+
+    Playwright's browser.close() on a CDP connection is a disconnect only —
+    it does NOT terminate the remote Chrome process.
+    """
+    global _remote_pw, _remote_browser, _remote_page, _remote_last_url
+
+    if _remote_browser is not None:
+        try:
+            await asyncio.wait_for(_remote_browser.close(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Remote CDP disconnect timed out (10s)")
+        except Exception:
+            logger.debug("Remote CDP cleanup failed", exc_info=True)
+        _remote_browser = None
+        _remote_page = None
+
+    if _remote_pw is not None:
+        try:
+            await asyncio.wait_for(_remote_pw.stop(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("Remote Playwright stop timed out (10s)")
+        except Exception:
+            logger.debug("Remote Playwright cleanup failed", exc_info=True)
+        _remote_pw = None
+
+    _remote_last_url = None
+
+
+async def _ensure_remote_cdp(cdp_url: str | None = None):
+    """Connect to the user's Chrome via CDP over Tailscale.
+
+    Returns the active remote page. The user must have Chrome running with
+    ``--remote-debugging-port=9222``. Connection is via Tailscale IP.
+
+    Does NOT launch Chrome. Does NOT close the user's existing tabs.
+    On disconnect, clears state — next call gets a clear error.
+    """
+    global _remote_pw, _remote_browser, _remote_page, _remote_cdp_url
+
+    async with _browser_lock:
+        # Already connected and alive — reuse
+        if _remote_page is not None and _remote_browser is not None:
+            if _remote_browser.is_connected() and _is_page_alive(_remote_page):
+                return _remote_page
+            logger.warning("Remote CDP connection stale — cleaning up")
+            await _cleanup_remote_cdp()
+
+        # Resolve CDP URL: explicit > env > stored
+        url = cdp_url or os.environ.get("GENESIS_CDP_URL") or _remote_cdp_url
+        if not url:
+            raise ConnectionError(
+                "No CDP URL configured. Pass cdp_url parameter or set "
+                "GENESIS_CDP_URL in secrets.env.\n\n"
+                "User setup: Launch Chrome on your machine with:\n"
+                "  chrome.exe --remote-debugging-port=9222 "
+                "--user-data-dir=%USERPROFILE%\\chrome-genesis"
+            )
+
+        from playwright.async_api import async_playwright
+
+        _remote_pw = await async_playwright().start()
+        try:
+            _remote_browser = await _remote_pw.chromium.connect_over_cdp(url)
+        except Exception as e:
+            await _remote_pw.stop()
+            _remote_pw = None
+            raise ConnectionError(
+                f"Cannot connect to Chrome at {url}. Error: {e}\n\n"
+                "Check:\n"
+                "  1. Chrome is running with --remote-debugging-port=9222\n"
+                "  2. Tailscale is connected on both machines\n"
+                "  3. Windows firewall allows port 9222 from Tailscale"
+            ) from e
+
+        _remote_cdp_url = url
+        _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
+
+        # Use existing tab or create new one — never close user's tabs
+        contexts = _remote_browser.contexts
+        if contexts and contexts[0].pages:
+            _remote_page = contexts[0].pages[-1]
+            logger.info("CDP remote connected — using existing tab: %s", _remote_page.url)
+        elif contexts:
+            _remote_page = await contexts[0].new_page()
+            logger.info("CDP remote connected — created new tab")
+        else:
+            ctx = await _remote_browser.new_context()
+            _remote_page = await ctx.new_page()
+            logger.info("CDP remote connected — created new context and tab")
+
+        return _remote_page
+
+
 def _touch():
     """Record browser activity timestamp for idle timeout tracking."""
     global _last_used
@@ -245,18 +362,27 @@ def _start_idle_watcher():
         )
 
 
-async def _get_page(stealth: bool = False):
+async def _get_page(
+    stealth: bool = False,
+    remote: bool = False,
+    cdp_url: str | None = None,
+):
     """Get the appropriate browser page based on mode.
 
     Default (stealth=False): Camoufox (anti-detection, primary).
     Fallback (stealth=True): Chromium (for Camoufox-incompatible sites).
-    Note: 'stealth' param is inverted from its old meaning for API compat.
+    Remote (remote=True): User's real Chrome via CDP over Tailscale.
 
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
     use whichever browser was last navigated.
     """
     global _active_page
-    _active_page = await _ensure_chromium_fallback() if stealth else await _ensure_browser()
+    if remote:
+        _active_page = await _ensure_remote_cdp(cdp_url)
+    elif stealth:
+        _active_page = await _ensure_chromium_fallback()
+    else:
+        _active_page = await _ensure_browser()
     _touch()
     _start_idle_watcher()
     return _active_page
@@ -285,18 +411,74 @@ def _is_camoufox_active() -> bool:
     return _stealth_cm is not None and _active_page is _stealth_page
 
 
+def _is_remote_active() -> bool:
+    """True when the active browser is the remote CDP connection."""
+    return _remote_page is not None and _active_page is _remote_page
+
+
+def _remote_browser_connected() -> bool:
+    """Quick check if CDP remote is still connected."""
+    return _remote_browser is not None and _remote_browser.is_connected()
+
+
+def _check_remote_health() -> dict | None:
+    """Returns error dict if remote is active but disconnected. None if OK."""
+    if not _is_remote_active():
+        return None
+    if not _remote_browser_connected():
+        global _active_page, _remote_page
+        _active_page = None
+        _remote_page = None
+        return {
+            "error": (
+                "Remote Chrome connection lost. "
+                "Ask the user to restart Chrome with --remote-debugging-port=9222, "
+                "then call browser_navigate(url, remote=True) to reconnect."
+            )
+        }
+    return None
+
+
+def _check_page_drift(page) -> dict | None:
+    """Check if the remote page URL changed since Genesis last touched it.
+
+    Returns None if no drift, or a dict describing the change.
+    Non-async — uses only the synchronous page.url property.
+    """
+    if _remote_last_url is None:
+        return None
+    try:
+        current_url = page.url
+    except Exception:
+        return {
+            "drift": "page_inaccessible",
+            "detail": "Cannot read page URL — tab may have been closed",
+        }
+    if current_url != _remote_last_url:
+        return {
+            "drift": "url_changed",
+            "expected": _remote_last_url,
+            "actual": current_url,
+            "detail": (
+                f"Page URL changed from {_remote_last_url} to {current_url} "
+                "since last Genesis action"
+            ),
+        }
+    return None
+
+
 async def _human_delay() -> None:
     """Random delay mimicking human interaction timing.
 
-    Only fires when Camoufox (anti-detection browser) is active.
-    Playwright/Chromium mode skips delays entirely — that's for dev/test.
-
-    Background (default): 1.0–15.0s, log-normal distribution.
-    Stealth priority — nobody watching, look maximally human.
-
-    Collaborate mode (VNC): 0.5–2.0s, uniform.
-    Human watching — keep it responsive but not instant.
+    Remote CDP: always collaborate timing (user watching their own screen).
+    Camoufox background: 1.0–15.0s, log-normal distribution.
+    Camoufox collaborate (VNC): 0.5–2.0s, uniform.
+    Chromium: no delay (dev/test).
     """
+    if _is_remote_active():
+        # Remote CDP: user is literally watching their own screen
+        await asyncio.sleep(random.uniform(0.5, 2.0))
+        return
     if not _is_camoufox_active():
         return
     if _collaborate_mode:
@@ -585,27 +767,48 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
+async def _impl_browser_navigate(
+    url: str,
+    stealth: bool = False,
+    remote: bool = False,
+    cdp_url: str | None = None,
+) -> dict:
     """Navigate to a URL and return the page snapshot."""
+    global _collaborate_mode, _remote_last_url
     _touch()
+
+    # Auto-enable collaborate timing for remote CDP (user watching their screen)
+    if remote and not _collaborate_mode:
+        _collaborate_mode = True
+        logger.info("Auto-enabled collaborate timing for remote CDP session")
+
     try:
-        page = await _get_page(stealth)
+        page = await _get_page(stealth, remote=remote, cdp_url=cdp_url)
+    except ConnectionError as e:
+        return {"error": str(e)}
     except ImportError as e:
         return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
 
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Detect and handle Cloudflare Turnstile if present
+        # Turnstile detection only for Camoufox (real Chrome won't trigger it)
         turnstile_result = None
         if _is_camoufox_active():
             turnstile_result = await _wait_for_turnstile(page)
+
+        # Track URL for drift detection on remote sessions
+        if remote:
+            _remote_last_url = page.url
 
         snapshot = await _snapshot_page(page)
         result = {
             "url": page.url,
             "title": await page.title(),
             "snapshot": snapshot,
+            "layer": "remote_cdp" if _is_remote_active() else (
+                "camoufox" if _is_camoufox_active() else "chromium"
+            ),
         }
         if turnstile_result:
             result["turnstile"] = turnstile_result
@@ -616,6 +819,16 @@ async def _impl_browser_navigate(url: str, stealth: bool = False) -> dict:
                 )
         return result
     except Exception as e:
+        if remote and not _remote_browser_connected():
+            return {
+                "error": (
+                    "Remote Chrome disconnected during navigation. "
+                    "The user may have closed Chrome or the machine went to sleep. "
+                    "Ask the user to restart Chrome with --remote-debugging-port=9222, "
+                    "then retry."
+                ),
+                "url": url,
+            }
         logger.error("browser_navigate failed: %s", e, exc_info=True)
         return {"error": str(e), "url": url}
 
@@ -625,6 +838,16 @@ async def _impl_browser_click(selector: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
+    drift = _check_page_drift(_active_page) if _is_remote_active() else None
+    if drift:
+        return {
+            "advisory": "Page state changed since last Genesis action.",
+            **drift,
+            "recommendation": "Call browser_snapshot() to see current page state before acting.",
+        }
     try:
         await _human_delay()
         await _stealth_click(_active_page, selector)
@@ -639,6 +862,16 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
+    drift = _check_page_drift(_active_page) if _is_remote_active() else None
+    if drift:
+        return {
+            "advisory": "Page state changed since last Genesis action.",
+            **drift,
+            "recommendation": "Call browser_snapshot() to see current page state before acting.",
+        }
     try:
         await _human_delay()
         await _human_type(_active_page, selector, value)
@@ -651,6 +884,9 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     """Upload a file to a file input element on the current page."""
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
     p = Path(file_path)
     if not p.is_file():
         return {"error": f"File not found or not a regular file: {file_path}"}
@@ -667,6 +903,9 @@ async def _impl_browser_screenshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
     try:
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         screenshot_path = _SCREENSHOT_DIR / "genesis_browser_screenshot.png"
@@ -685,6 +924,9 @@ async def _impl_browser_snapshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
     try:
         snapshot = await _snapshot_page(_active_page)
         return {"url": _active_page.url, "title": await _active_page.title(), "snapshot": snapshot}
@@ -701,6 +943,9 @@ async def _impl_browser_run_js(expression: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
     try:
         logger.info("browser_run_js: %s", expression[:200])
         result = await _active_page.evaluate(expression)
@@ -750,6 +995,9 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
+    health = _check_remote_health()
+    if health:
+        return health
     count = max(1, min(count, 50))
     try:
         for i in range(count):
@@ -767,7 +1015,12 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
 
 
 @mcp.tool()
-async def browser_navigate(url: str, stealth: bool = False) -> dict:
+async def browser_navigate(
+    url: str,
+    stealth: bool = False,
+    remote: bool = False,
+    cdp_url: str | None = None,
+) -> dict:
     """Navigate to a URL and return an accessibility tree snapshot.
 
     Uses Camoufox (anti-detection Firefox) by default with a persistent profile
@@ -780,12 +1033,19 @@ async def browser_navigate(url: str, stealth: bool = False) -> dict:
     Set stealth=True to use Chromium fallback for sites incompatible with
     Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
 
-    NOTE: If Cloudflare Turnstile is detected, this call may block for up to
-    ~5 minutes while waiting for human resolution via VNC. A Telegram alert
-    is sent automatically. The response will include a 'turnstile' field with
-    the resolution status.
+    Set remote=True to drive the user's real Chrome over CDP/Tailscale.
+    This connects to Chrome running on the user's machine with
+    --remote-debugging-port=9222. Real browser = real fingerprint = no detection.
+    Collaborate timing is auto-enabled. Use for ATS submissions with aggressive
+    anti-bot detection (Ashby, Greenhouse with reCAPTCHA v3).
+
+    cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
+    Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
+
+    NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
+    block for up to ~5 minutes while waiting for human resolution via VNC.
     """
-    return await _impl_browser_navigate(url, stealth)
+    return await _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url)
 
 
 @mcp.tool()
@@ -943,12 +1203,18 @@ async def browser_collaborate(enable: bool = True) -> dict:
     _collaborate_mode = enable
 
     vnc_url = _get_vnc_url()
-    return {
+    result = {
         "mode": "collaborate" if enable else "background",
         "timing": "fast (0.5-2s)" if enable else "stealth (1-15s)",
         "vnc_url": vnc_url,
         "note": "Browser is always headed on VNC. Open the URL above to watch/interact.",
     }
+    if _is_remote_active():
+        result["remote_note"] = (
+            "Remote CDP session active — collaborate timing is always used "
+            "regardless of this setting (user watching their own screen)."
+        )
+    return result
 
 
 def _get_vnc_url() -> str:
