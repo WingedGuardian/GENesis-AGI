@@ -774,6 +774,10 @@ class SentinelDispatcher:
                     )
                 return await self._phase2_cc_and_actions(request, pattern=pattern)
             if policy_id == "sentinel_action":
+                # No re-verification here — actions are tied to a specific CC
+                # diagnosis, not to alarm state.  The CC session already ran
+                # and proposed actions; even if the original alarm cleared,
+                # the proposed fix may still be needed.
                 logger.info("Resuming sentinel actions after approval %s", request_id)
                 cc_result = _deserialize_result(self._state.pending_cc_result_json)
                 if cc_result is None:

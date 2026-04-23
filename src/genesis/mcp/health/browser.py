@@ -443,10 +443,8 @@ def _update_remote_url() -> None:
     """Update drift tracking URL after a successful action that may navigate."""
     global _remote_last_url
     if _is_remote_active() and _active_page is not None:
-        try:
+        with contextlib.suppress(Exception):
             _remote_last_url = _active_page.url
-        except Exception:
-            pass
 
 
 def _check_page_drift(page) -> dict | None:
