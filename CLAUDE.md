@@ -72,6 +72,19 @@ CC WebSearch for general lookups, SearXNG for structured/bulk queries,
 Crawl4AI for JS-rendered pages, ATS APIs for job listings.
 Full decision guide: `.claude/docs/web-tools-guide.md`
 
+## Background Sessions
+
+**When to use a background session vs sub-agent:**
+- Task > 20 min OR needs persistent `memory_store` writes → **background session**
+- Quick research returning results to this conversation → **sub-agent**
+
+Always instruct background sessions to write progress incrementally — never batch at the end.
+
+Profiles: `observe` · `interact` · `research` — use the minimum that covers the task.
+
+**Always read the full guide before dispatching a background session:**
+`.claude/docs/background-sessions.md`
+
 ## Genesis Development Work
 
 When the task involves modifying Genesis itself — fixing bugs, implementing
