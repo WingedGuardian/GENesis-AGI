@@ -15,6 +15,7 @@ jobs:
   infra_monitor_hours: 2
   recon_gather_hours: 84       # ~3.5 days
   maintenance_hours: 6
+  analytical_hours: 24            # gap_clustering, anticipatory_research, prompt_effectiveness
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
 
