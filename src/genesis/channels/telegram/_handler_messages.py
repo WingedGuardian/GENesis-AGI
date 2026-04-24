@@ -697,6 +697,57 @@ async def _try_bare_approval_resolution(
     return True
 
 
+async def _try_ego_correction_store(ctx: HandlerContext, msg) -> bool:
+    """Store non-reply messages in the ego_proposals topic as user corrections.
+
+    These messages are general input to the ego (corrections, context,
+    instructions) rather than proposal approve/reject replies.  Stored
+    in the memory system so the ego can recall them in future cycles.
+    """
+    thread_id = getattr(msg, "message_thread_id", None)
+    if thread_id is None:
+        return False
+
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        pipeline = rt.outreach_pipeline
+        if pipeline is None:
+            return False
+        topic_manager = pipeline.topic_manager
+        if topic_manager is None:
+            return False
+        ego_thread_id = topic_manager.get_thread_id("ego_proposals")
+        if ego_thread_id is None or ego_thread_id != thread_id:
+            return False
+    except Exception:
+        return False
+
+    # This message is in the ego_proposals topic and is not a quote-reply.
+    # Store it as a user correction for the ego.
+    try:
+        store = rt._memory_store
+        if store is not None:
+            await store.store(
+                content=f"User correction (ego): {msg.text}",
+                source="telegram_ego_correction",
+                tags=["user_correction", "ego"],
+                memory_type="episodic",
+                wing="autonomy",
+                room="ego",
+            )
+            log.info("Stored ego user correction (%d chars)", len(msg.text))
+            try:
+                await msg.reply_text("Noted — the ego will see this next cycle.")
+            except Exception:
+                log.debug("Failed to ack ego correction", exc_info=True)
+            return True
+    except Exception:
+        log.warning("Failed to store ego correction in memory", exc_info=True)
+    return False
+
+
 async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not ctx.authorized(user.id):
@@ -720,6 +771,12 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     # the most recent pending autonomous CLI approval without requiring
     # a formal Telegram quote-reply.  No-op for anything else.
     if await _try_bare_approval_resolution(ctx, msg, user):
+        return
+
+    # Messages in the ego_proposals topic (that aren't quote-replies to
+    # proposals — those are handled below by ReplyWaiter) get stored as
+    # user corrections for the ego's next cycle.
+    if not msg.reply_to_message and await _try_ego_correction_store(ctx, msg):
         return
 
     if msg.reply_to_message:
