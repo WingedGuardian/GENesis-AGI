@@ -28,13 +28,11 @@ _TEST_PIPELINE = PipelineDefinition(
         PipelineStep(
             task_type=TaskType.GAP_CLUSTERING,
             compute_tier=ComputeTier.FREE_API,
-            prompt_key="gap_clustering",
             priority=0.4,
         ),
         PipelineStep(
             task_type=TaskType.BRAINSTORM_SELF,
             compute_tier=ComputeTier.FREE_API,
-            prompt_key="brainstorm_self",
             priority=0.5,
         ),
     ),

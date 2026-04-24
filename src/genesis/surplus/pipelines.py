@@ -30,7 +30,6 @@ class PipelineStep:
 
     task_type: TaskType
     compute_tier: ComputeTier
-    prompt_key: str  # Key into the executor's _TASK_PROMPTS or a custom template
     priority: float = 0.5
 
 

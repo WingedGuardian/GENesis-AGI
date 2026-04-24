@@ -237,8 +237,7 @@ class SurplusLLMExecutor:
         # Inject previous pipeline step output into context if present
         if task.payload:
             try:
-                import json as _json
-                payload_data = _json.loads(task.payload)
+                payload_data = json.loads(task.payload)
                 prev = payload_data.get("previous_output")
                 if prev:
                     context = (

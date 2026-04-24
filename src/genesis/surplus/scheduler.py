@@ -239,7 +239,7 @@ class SurplusScheduler:
         self._scheduler.start()
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
-        # Also run infra monitor and recon gather immediately —
+        # Run remaining jobs immediately on startup —
         # otherwise they only fire after their IntervalTrigger elapses.
         if self._enable_code_audits:
             await self.schedule_code_audit()
@@ -683,7 +683,12 @@ class SurplusScheduler:
 
         await self._queue.mark_completed(task.id, staging_id=staging_id)
 
-        # Pipeline chaining — enqueue next step if this was a pipeline task
+        # Pipeline chaining — enqueue next step if this was a pipeline task.
+        # Note: if a step returns NOMINAL (empty content), chaining still
+        # proceeds — the next step gets empty previous_output.  This is
+        # intentional: pipeline steps are deterministic, not conditional.
+        # If a pipeline should skip remaining steps on NOMINAL, that logic
+        # belongs in the pipeline definition, not the generic chainer.
         if result.success and task.payload:
             from genesis.surplus.pipelines import (
                 build_next_step_payload,
