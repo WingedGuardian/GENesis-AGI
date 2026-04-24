@@ -33,13 +33,13 @@
 
 We have the most capable AI models ever created, and we're using them like search bars with better grammar.
 
-Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
+Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step. 
 
-**AGI is here.**
+But now? **Personal AGI is here.**
 
 Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs.
 
-Open source. 100,000 lines. Clone it. Run it. Tell me what's missing.
+Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
 
 ---
 
@@ -63,7 +63,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## What this is
 
-Genesis is a cognitive architecture that makes the AGI claim explicitly — and backs it with 100,000 lines of open-source code you can read, run, and challenge.
+Genesis is a cognitive architecture that makes the AGI claim explicitly — and backs it up with 100,000 lines of open-source code you can read, run, and challenge.
 
 Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
 
@@ -75,7 +75,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-100,000+ lines of Python. 45+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+45+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 <p align="center">
   <img src="docs/images/genesis-architecture.png" alt="Genesis cognitive architecture — three concentric rings" width="820">
@@ -89,7 +89,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
 
 ## Getting started
 
-*v3 alpha — architecturally complete, actively hardening. If you find a rough edge, Genesis can usually diagnose it itself. Report anything it can't.*
+*v3 alpha — architecturally complete, actively hardening. If you find a rough edge, tell Genesis to fix itself.*
 
 ### System requirements
 
@@ -298,7 +298,7 @@ Genesis operates in the real world through always-on channels:
 
 **Email** — Two-layer AI triage: a fast model reads and scores every email, a capable model makes final keep/discard decisions on what survives. Relevant findings get stored as searchable intelligence. Your inbox processed by a paralegal and a judge.
 
-**Inbox** — Drop anything — a markdown file, a URL, a PDF, a voice memo — into a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and sends you a summary via Telegram within minutes. Drop it in the folder. Walk away.
+**Inbox** — Drop anything — a markdown file, a URL, a PDF, a voice memo — into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and sends you a summary via Telegram within minutes. Drop it in your notes. Walk away.
 
 **Telegram** — Proactive notifications, morning digests, and conversational interaction. Genesis reaches out when it has something worth saying. Not a notification firehose — calibrated outreach based on measured engagement. Voice input works too: speech gets transcribed and routed through the same pipeline as text.
 
