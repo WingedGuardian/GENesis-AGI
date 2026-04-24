@@ -34,6 +34,8 @@ async def init(rt: GenesisRuntime) -> None:
         return
 
     try:
+        from genesis.cc.invoker import CCInvoker
+        from genesis.cc.session_config import SessionConfigBuilder
         from genesis.ego.cadence import EgoCadenceManager
         from genesis.ego.compaction import CompactionEngine
         from genesis.ego.config import load_ego_config
@@ -62,8 +64,17 @@ async def init(rt: GenesisRuntime) -> None:
 
         dispatcher = EgoDispatcher(db=rt._db)
 
+        # Dedicated invoker for the ego — prevents _active_proc race
+        # conditions with other concurrent CC invocations (same pattern
+        # as DirectSessionRunner at runtime/init/direct_session.py).
+        ego_invoker = CCInvoker()
+
+        # MCP config: reflection profile (genesis-health + genesis-memory)
+        config_builder = SessionConfigBuilder()
+        mcp_config_path = config_builder.build_mcp_config("reflection")
+
         session = EgoSession(
-            invoker=rt._cc_invoker,
+            invoker=ego_invoker,
             session_manager=rt._session_manager,
             compaction_engine=compaction,
             context_builder=context_builder,
@@ -72,6 +83,7 @@ async def init(rt: GenesisRuntime) -> None:
             config=config,
             db=rt._db,
             event_bus=rt._event_bus,
+            mcp_config_path=mcp_config_path,
         )
 
         # Wire autonomous dispatcher if available (for approval gating)
@@ -91,9 +103,10 @@ async def init(rt: GenesisRuntime) -> None:
 
         await cadence.start()
         logger.info(
-            "Ego initialized (cadence=%dm, model=%s, budget=$%.2f/day)",
+            "Ego initialized (cadence=%dm, model=%s, effort=%s, budget=$%.2f/day)",
             config.cadence_minutes,
             config.model,
+            config.default_effort,
             config.daily_budget_cap_usd,
         )
 

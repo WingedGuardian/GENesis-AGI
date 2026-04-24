@@ -483,8 +483,7 @@ const SITE_META = {
     'contingency_micro': { name: 'CC Fallback (Micro)', category: 'processing' },
     // Groundwork / disabled
     '2_triage': { name: 'Triage', category: 'classification' },
-    '7_ego_cycle': { name: 'Ego Cycle (CC)', category: 'reasoning' },
-    '7_ego_cycle_api': { name: 'Ego Cycle (API)', category: 'reasoning' },
+    '7_ego_cycle': { name: 'Ego Cycle', category: 'reasoning' },
     '7_task_retrospective': { name: 'Task Retro', category: 'processing' },
     '8_ego_compaction': { name: 'Ego Compact', category: 'processing' },
     '10_cognitive_state': { name: 'Cog State', category: 'reasoning' },
@@ -1683,7 +1682,7 @@ const SUBSYSTEM_GROUPS = {
     ego: {
         name: 'Ego', domId: 'sub-ego',
         desc: 'Autonomous decision cycle \u2014 periodic thinking, proposals, adaptive cadence',
-        sites: ['7_ego_cycle', '7_ego_cycle_api', '8_ego_compaction'],
+        sites: ['7_ego_cycle', '8_ego_compaction'],
     },
     reflection: {
         name: 'Reflection', domId: 'sub-reflection',

@@ -142,6 +142,7 @@ def ego_session(
         dispatcher=dispatcher,
         config=config,
         db=db,
+        mcp_config_path=None,
     )
 
 
@@ -240,13 +241,13 @@ class TestEgoSession:
         mock_proposal_workflow.create_batch.assert_not_called()
 
     async def test_invocation_args(self, ego_session, mock_invoker):
-        """Verify CCInvocation has correct model, effort, timeout."""
+        """Verify CCInvocation has correct model, effort, append mode."""
         await ego_session.run_cycle()
 
         invocation = mock_invoker.run.call_args[0][0]
         assert invocation.model.value == "opus"
-        assert invocation.effort.value == "max"
-        assert invocation.timeout_s == 2400
+        assert invocation.effort.value == "high"  # default from EgoConfig
+        assert invocation.append_system_prompt is True
         assert invocation.skip_permissions is True
 
     async def test_compaction_runs_before_cycle(

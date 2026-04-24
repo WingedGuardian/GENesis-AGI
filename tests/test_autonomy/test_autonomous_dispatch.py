@@ -232,7 +232,7 @@ async def test_dispatch_router_whitespace_content_is_not_success(approval_gate):
         action_label="ego cycle",
         messages=[{"role": "user", "content": "hi"}],
         cli_invocation=_invocation(),
-        api_call_site_id="7_ego_cycle_api",
+        api_call_site_id="7_ego_cycle",
     ))
 
     assert decision.mode != "api"
@@ -277,7 +277,7 @@ async def test_dispatch_router_blocks_pending_cli_fallback(approval_gate):
         action_label="ego cycle",
         messages=[{"role": "user", "content": "hi"}],
         cli_invocation=_invocation(),
-        api_call_site_id="7_ego_cycle_api",
+        api_call_site_id="7_ego_cycle",
     ))
 
     assert decision.mode == "blocked"
@@ -336,7 +336,7 @@ async def test_find_site_pending_returns_none_for_no_match(
         policy_id="ego_cycle",
         action_label="ego cycle",
         invocation=_invocation(),
-        api_call_site_id="7_ego_cycle_api",
+        api_call_site_id="7_ego_cycle",
         api_error="api failed",
     )
 
@@ -394,7 +394,7 @@ async def test_get_pending_count_counts_only_cli_fallback(
             model=CCModel.SONNET, effort=EffortLevel.HIGH,
             system_prompt="sys",
         ),
-        api_call_site_id="7_ego_cycle_api", api_error="api down",
+        api_call_site_id="7_ego_cycle", api_error="api down",
     )
 
     assert await approval_gate.get_pending_count() == 2
@@ -470,7 +470,7 @@ async def test_resolve_from_reply_no_longer_auto_batches(
             model=CCModel.SONNET, effort=EffortLevel.HIGH,
             system_prompt="sys",
         ),
-        api_call_site_id="7_ego_cycle_api", api_error="api down",
+        api_call_site_id="7_ego_cycle", api_error="api down",
     )
     assert first_id != second_id
     assert await approval_gate.get_pending_count() == 2
@@ -509,7 +509,7 @@ async def test_resolve_most_recent_pending_resolves_latest(
             model=CCModel.SONNET, effort=EffortLevel.HIGH,
             system_prompt="sys",
         ),
-        api_call_site_id="7_ego_cycle_api", api_error="api down",
+        api_call_site_id="7_ego_cycle", api_error="api down",
     )
 
     resolved = await approval_gate.resolve_most_recent_pending(
@@ -547,7 +547,7 @@ async def test_send_request_builds_batch_button_when_two_pending(
             model=CCModel.SONNET, effort=EffortLevel.HIGH,
             system_prompt="sys",
         ),
-        api_call_site_id="7_ego_cycle_api", api_error="down",
+        api_call_site_id="7_ego_cycle", api_error="down",
     )
 
     assert len(runtime.pipeline.sent) == 2

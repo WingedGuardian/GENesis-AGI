@@ -235,7 +235,7 @@ class AutonomousCliApprovalGate:
         description = (
             f"Approve {action_label}?"
             if action_type.startswith("sentinel_")
-            else f"Approve autonomous Claude Code fallback for {action_label}?"
+            else f"Approve Claude Code session for {action_label}?"
         )
         context = {
             "kind": "autonomous_cli_fallback",
@@ -747,7 +747,7 @@ class AutonomousCliApprovalGate:
             if api_error:
                 lines.extend([
                     "",
-                    "<b>Why CLI fallback is being considered</b>",
+                    "<b>Context</b>",
                     api_error[:500],
                 ])
 

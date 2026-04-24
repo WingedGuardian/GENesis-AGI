@@ -1,7 +1,14 @@
-"""Ego session — runs a single thinking cycle via claude -p.
+"""Ego session — persistent CC session with tool access.
 
-Orchestrates: context assembly → CC invocation → output parsing →
-cycle storage → proposal creation → follow-up recording.
+Orchestrates: context assembly → CC invocation (with --resume for
+continuity) → output parsing → cycle storage → proposal creation →
+follow-up recording.
+
+The ego maintains a persistent CC session via --resume.  Each cycle
+resumes the prior session (conversational continuity) and injects
+fresh operational context via --append-system-prompt.  The ego has
+MCP tool access (genesis-health + genesis-memory) to verify beliefs
+before proposing actions.
 """
 
 from __future__ import annotations
@@ -45,11 +52,12 @@ class BudgetExceededError(Exception):
 
 
 class EgoSession:
-    """Runs a single ego thinking cycle via ``claude -p``.
+    """Persistent CC session for ego thinking cycles.
 
     One instance is created at runtime startup and reused across cycles.
-    Each call to :meth:`run_cycle` is a fresh ``claude -p`` invocation
-    with assembled context (not ``--resume``).
+    The ego maintains a CC session ID across cycles via ``--resume`` for
+    conversational continuity, and receives fresh operational context
+    each cycle via ``--append-system-prompt``.
     """
 
     def __init__(
@@ -64,6 +72,7 @@ class EgoSession:
         config: EgoConfig,
         db: aiosqlite.Connection,
         event_bus: GenesisEventBus | None = None,
+        mcp_config_path: str | None = None,
     ) -> None:
         self._invoker = invoker
         self._session_manager = session_manager
@@ -75,6 +84,7 @@ class EgoSession:
         self._db = db
         self._event_bus = event_bus
         self._autonomous_dispatcher = None
+        self._mcp_config_path = mcp_config_path
         # Cache the static system prompt (read once, not every cycle)
         if _PROMPT_PATH.exists():
             self._static_prompt = _PROMPT_PATH.read_text()
@@ -121,19 +131,41 @@ class EgoSession:
         system_prompt = self._build_system_prompt(dynamic_context)
         user_prompt = self._build_user_prompt(is_morning_report=is_morning_report)
 
-        # 5. Prepare invocation
-        invocation = CCInvocation(
-            prompt=user_prompt,
-            model=CCModel(self._config.model),
-            effort=EffortLevel.MAX,
-            system_prompt=system_prompt,
-            timeout_s=2400,
-            skip_permissions=True,
-            working_dir=background_session_dir(),
+        # 5. Determine effort level from config
+        effort = EffortLevel(
+            self._config.morning_report_effort if is_morning_report
+            else self._config.default_effort
         )
 
+        # 6. Check for stored CC session ID (persistent session)
+        stored_cc_sid = await ego_crud.get_state(self._db, "cc_session_id")
+
+        # 7. Build invocation — resume if we have a prior session
+        if stored_cc_sid:
+            invocation = CCInvocation(
+                prompt=user_prompt,
+                model=CCModel(self._config.model),
+                effort=effort,
+                resume_session_id=stored_cc_sid,
+                append_system_prompt=True,
+                system_prompt=system_prompt,
+                skip_permissions=True,
+                working_dir=background_session_dir(),
+                mcp_config=self._mcp_config_path,
+            )
+        else:
+            invocation = CCInvocation(
+                prompt=user_prompt,
+                model=CCModel(self._config.model),
+                effort=effort,
+                append_system_prompt=True,
+                system_prompt=system_prompt,
+                skip_permissions=True,
+                working_dir=background_session_dir(),
+                mcp_config=self._mcp_config_path,
+            )
+
         output = None
-        used_cli = True
         session_id: str | None = None
         if self._autonomous_dispatcher is not None:
             # Call-site gating pre-check: if an ego_cycle approval is
@@ -169,7 +201,7 @@ class EgoSession:
                         {"role": "user", "content": user_prompt},
                     ],
                     cli_invocation=invocation,
-                    api_call_site_id="7_ego_cycle_api",
+                    dispatch_mode="cli",
                     cli_fallback_allowed=True,
                     approval_required_for_cli=True,
                 ),
@@ -177,16 +209,13 @@ class EgoSession:
             if decision.mode == "blocked":
                 logger.warning("Ego cycle blocked: %s", decision.reason)
                 return None
-            if decision.mode == "api":
-                output = decision.output
-                used_cli = False
 
         if output is None:
             try:
                 sess = await self._session_manager.create_background(
                     session_type=SessionType.BACKGROUND_TASK,
                     model=CCModel(self._config.model),
-                    effort=EffortLevel.MAX,
+                    effort=effort,
                     source_tag="ego_cycle",
                 )
                 session_id = sess["id"]
@@ -198,6 +227,11 @@ class EgoSession:
                 output = await self._invoker.run(invocation)
             except Exception:
                 logger.error("Ego CC invocation failed", exc_info=True)
+                # Resume failure — clear stored session ID so next cycle
+                # starts fresh instead of retrying the broken session.
+                if stored_cc_sid:
+                    await ego_crud.set_state(self._db, key="cc_session_id", value="")
+                    logger.info("Cleared stored cc_session_id after invocation failure")
                 try:
                     await self._session_manager.fail(session_id, reason="CC invocation error")
                 except Exception:
@@ -206,17 +240,27 @@ class EgoSession:
 
         if output.is_error:
             logger.error("Ego CC session returned error: %s", output.error_message)
-            if used_cli and session_id is not None:
+            # Clear stored session ID on error — next cycle starts fresh
+            if stored_cc_sid:
+                await ego_crud.set_state(self._db, key="cc_session_id", value="")
+                logger.info("Cleared stored cc_session_id after CC error")
+            if session_id is not None:
                 try:
                     await self._session_manager.fail(session_id, reason=output.error_message)
                 except Exception:
                     logger.error("Session fail() also errored", exc_info=True)
             return None
 
-        # 7. Parse output
+        # 8. Store CC session ID for next cycle's --resume
+        if output.session_id:
+            await ego_crud.set_state(
+                self._db, key="cc_session_id", value=output.session_id,
+            )
+
+        # 9. Parse output
         parsed = self._parse_output(output.text)
 
-        # 8. Store cycle
+        # 10. Store cycle
         focus = parsed.get("focus_summary", "") if parsed else ""
         proposals_json = json.dumps(parsed.get("proposals", [])) if parsed else "[]"
         cycle = EgoCycle(
@@ -231,7 +275,7 @@ class EgoSession:
         )
         await self._compaction.store_cycle(cycle)
 
-        if used_cli and session_id is not None:
+        if session_id is not None:
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
@@ -239,7 +283,7 @@ class EgoSession:
                 output_tokens=output.output_tokens,
             )
 
-            # 10. Record last run for neural monitor
+            # 11. Record last run for neural monitor
             try:
                 from genesis.observability.call_site_recorder import record_last_run
                 await record_last_run(
@@ -294,8 +338,9 @@ class EgoSession:
         """Short directive prompt sent via stdin."""
         base = (
             "Run your ego cycle. Review the operational context above, "
-            "check your open threads, and decide what Genesis should do. "
-            "Output valid JSON — no preamble, no explanation outside the JSON."
+            "check your open threads, and use your MCP tools to verify "
+            "any beliefs before proposing actions. End with valid JSON "
+            "matching the ego output schema."
         )
         if is_morning_report:
             base += (
