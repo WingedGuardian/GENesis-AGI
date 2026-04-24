@@ -223,6 +223,45 @@ async def _process_light_output(output, *, source: str, now: str, db) -> None:
             except Exception:
                 logger.error("Failed to upsert surplus candidate from CC output", exc_info=True)
 
+        # Update cognitive state from situation focus (Prong 2)
+        context_update = data.get("context_update")
+        focus = data.get("focus_area", "")
+        if context_update and focus == "situation" and len(context_update.strip()) > 20:
+            try:
+                from genesis.db.crud import awareness_ticks, cognitive_state
+
+                # Preserve deep reflection's comprehensive update for 4h
+                _DEEP_PRESERVE_HOURS = 4
+                hours_since_deep = 999.0
+                last_deep = await awareness_ticks.last_at_depth(db, "Deep")
+                if last_deep:
+                    try:
+                        last_deep_dt = datetime.fromisoformat(last_deep["created_at"])
+                        hours_since_deep = (datetime.now(UTC) - last_deep_dt).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        pass  # unparseable — don't suppress (fail-open)
+
+                if hours_since_deep >= _DEEP_PRESERVE_HOURS:
+                    await cognitive_state.replace_section(
+                        db,
+                        section="active_context",
+                        id=str(uuid.uuid4()),
+                        content=context_update.strip(),
+                        generated_by="light_reflection",
+                        created_at=now,
+                    )
+                    logger.info(
+                        "Light reflection updated active_context (%.1fh since deep)",
+                        hours_since_deep,
+                    )
+                else:
+                    logger.debug(
+                        "Skipping light context_update (deep ran %.1fh ago < %dh preserve window)",
+                        hours_since_deep, _DEEP_PRESERVE_HOURS,
+                    )
+            except Exception:
+                logger.warning("Failed to update active_context from light reflection", exc_info=True)
+
     except (json.JSONDecodeError, AttributeError):
         logger.debug("Could not parse JSON from light CC output")
 

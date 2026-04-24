@@ -45,6 +45,7 @@ class LightOutput:
     escalate_to_deep: bool = False
     escalation_reason: str | None = None
     surplus_candidates: list[str] = field(default_factory=list)
+    context_update: str | None = None
 
 
 @dataclass(frozen=True)

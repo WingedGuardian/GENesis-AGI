@@ -63,7 +63,10 @@ LIGHT_FOCUS_INSTRUCTIONS: dict[str, str] = {
         "Assess current system state. Every claim MUST cite a specific signal value.\n"
         "Do NOT produce user_model_updates (set to empty list).\n"
         "Do NOT produce surplus_candidates (set to empty list).\n"
-        "Focus on: assessment, patterns, recommendations, escalation."
+        "Focus on: assessment, patterns, recommendations, escalation.\n\n"
+        "Also include a \"context_update\" field (string): a 2-3 sentence summary of "
+        "current system state and any active work or pending items. This keeps the "
+        "cognitive state fresh between deep reflections. Be factual and specific."
     ),
     "user_impact": (
         "## Focus: User Impact Analysis\n"
