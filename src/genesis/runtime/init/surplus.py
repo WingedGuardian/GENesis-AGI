@@ -73,7 +73,6 @@ async def init(rt: GenesisRuntime) -> None:
             task_expiry_hours=int(dispatch.get("task_expiry_hours", 72)),
             code_audit_hours=int(jobs.get("code_audit_hours", 12)),
             code_index_hours=int(jobs.get("code_index_hours", 4)),
-            infra_monitor_hours=int(jobs.get("infra_monitor_hours", 2)),
             recon_gather_hours=int(jobs.get("recon_gather_hours", 84)),
             maintenance_hours=int(jobs.get("maintenance_hours", 6)),
             analytical_hours=int(jobs.get("analytical_hours", 24)),

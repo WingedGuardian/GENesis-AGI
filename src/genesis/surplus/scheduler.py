@@ -50,7 +50,6 @@ class SurplusScheduler:
         task_expiry_hours: int = 72,
         code_audit_hours: int = 12,
         code_index_hours: int = 4,
-        infra_monitor_hours: int = 2,
         recon_gather_hours: int = 84,
         maintenance_hours: int = 6,
         analytical_hours: int = 24,
@@ -75,7 +74,6 @@ class SurplusScheduler:
         self._task_expiry_hours = task_expiry_hours
         self._code_audit_hours = code_audit_hours
         self._code_index_hours = code_index_hours
-        self._infra_monitor_hours = infra_monitor_hours
         self._recon_gather_hours = recon_gather_hours
         self._maintenance_hours = maintenance_hours
         self._analytical_hours = analytical_hours
@@ -210,13 +208,6 @@ class SurplusScheduler:
             misfire_grace_time=300,
         )
         self._scheduler.add_job(
-            self.schedule_infra_monitor,
-            IntervalTrigger(hours=self._infra_monitor_hours),
-            id="schedule_infra_monitor",
-            max_instances=1,
-            misfire_grace_time=300,
-        )
-        self._scheduler.add_job(
             self.run_recon_gather,
             IntervalTrigger(hours=self._recon_gather_hours),
             id="recon_gather",
@@ -253,7 +244,6 @@ class SurplusScheduler:
         if self._enable_code_audits:
             await self.schedule_code_audit()
         await self.schedule_code_index()
-        await self.schedule_infra_monitor()
         await self.run_recon_gather()
         await self.schedule_maintenance()
         await self.schedule_analytical()
@@ -343,29 +333,6 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_code_index", str(exc))
-            except Exception:
-                pass
-
-    async def schedule_infra_monitor(self) -> None:
-        """Enqueue an infrastructure monitor task if none pending/running."""
-        try:
-            from genesis.surplus.types import ComputeTier, TaskType
-
-            pending = await self._queue.pending_by_type(TaskType.INFRASTRUCTURE_MONITOR)
-            if pending == 0:
-                await self._queue.enqueue(
-                    TaskType.INFRASTRUCTURE_MONITOR, ComputeTier.FREE_API, 0.6, "preservation"
-                )
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_success("schedule_infra_monitor")
-            except Exception:
-                pass
-        except Exception as exc:
-            logger.exception("Infrastructure monitor scheduling failed")
-            try:
-                from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("schedule_infra_monitor", str(exc))
             except Exception:
                 pass
 
