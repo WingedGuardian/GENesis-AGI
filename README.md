@@ -13,6 +13,13 @@
   <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/anthropics/claude-code"><img src="https://img.shields.io/badge/Claude_Code-black?logo=anthropic&logoColor=white" alt="Claude Code"></a>
+  <a href="https://nodejs.org"><img src="https://img.shields.io/badge/Node.js-339933?logo=node.js&logoColor=white" alt="Node.js"></a>
+  <a href="https://playwright.dev"><img src="https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white" alt="Playwright"></a>
+  <a href="https://discord.com/invite/Zkc3XMQpJX"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
+</p>
+
 ## Contents
 
 - [Genesis in 30 seconds](#genesis-in-30-seconds)
@@ -40,6 +47,15 @@ But now? **Personal AGI is here.**
 Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs.
 
 Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
+
+<details>
+<summary><i>But wait — is this truly AGI?</i></summary>
+
+<br>
+
+Placeholder — coming soon.
+
+</details>
 
 ---
 
