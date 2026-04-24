@@ -234,6 +234,20 @@ class SurplusLLMExecutor:
 
         context = await self._gather_context(task)
 
+        # Inject previous pipeline step output into context if present
+        if task.payload:
+            try:
+                import json as _json
+                payload_data = _json.loads(task.payload)
+                prev = payload_data.get("previous_output")
+                if prev:
+                    context = (
+                        f"## Previous Step Output\n{prev}\n\n"
+                        f"## Additional Context\n{context}"
+                    )
+            except (ValueError, TypeError):
+                pass
+
         if task.task_type == TaskType.INFRASTRUCTURE_MONITOR:
             return template.format(signals=context)
         return template.format(context=context)

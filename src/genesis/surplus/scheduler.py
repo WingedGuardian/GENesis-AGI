@@ -379,13 +379,8 @@ class SurplusScheduler:
 
             analytical_tasks = [
                 (TaskType.GAP_CLUSTERING, 0.4, "competence"),
-                # DEACTIVATED: anticipatory_research has no web search — pure
-                # LLM speculation.  Redesign as CC session task with tool access.
-                # (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
-                # DEACTIVATED: prompt_effectiveness_review reviews outputs, not
-                # prompts.  Redesign to actually analyze prompt templates vs
-                # output quality.
-                # (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
+                # anticipatory_research and prompt_effectiveness_review return
+                # as multi-step pipelines — see pipelines.py.
             ]
             for task_type, priority, drive in analytical_tasks:
                 pending = await self._queue.pending_by_type(task_type)
@@ -405,6 +400,38 @@ class SurplusScheduler:
                 GenesisRuntime.instance().record_job_failure("schedule_analytical", str(exc))
             except Exception:
                 pass
+
+    async def schedule_pipeline(self, pipeline_name: str) -> str | None:
+        """Enqueue step 1 of a named pipeline if not already running.
+
+        Returns the task ID of the enqueued step, or None if skipped
+        (pipeline unknown, or step 1 task type already pending).
+        """
+        from genesis.surplus.pipelines import build_initial_payload, get_pipeline
+
+        defn = get_pipeline(pipeline_name)
+        if defn is None:
+            logger.warning("Unknown pipeline: %s", pipeline_name)
+            return None
+
+        step1 = defn.steps[0]
+        # Prevent re-enqueue if step 1's task type is already pending.
+        # This is imprecise (blocks if ANY task of this type is pending,
+        # not just pipeline tasks), but safe — false negatives only mean
+        # the pipeline waits one more cycle.
+        if await self._queue.pending_by_type(step1.task_type) > 0:
+            return None
+
+        payload = build_initial_payload(pipeline_name, len(defn.steps))
+        task_id = await self._queue.enqueue(
+            step1.task_type,
+            step1.compute_tier,
+            step1.priority,
+            defn.drive_alignment,
+            payload=payload,
+        )
+        logger.info("Pipeline %s: enqueued step 1 (task=%s)", pipeline_name, task_id[:8])
+        return task_id
 
     async def dispatch_follow_ups(self) -> None:
         """Run the follow-up dispatcher cycle (always-on, not idle-gated)."""
@@ -655,6 +682,51 @@ class SurplusScheduler:
                 )
 
         await self._queue.mark_completed(task.id, staging_id=staging_id)
+
+        # Pipeline chaining — enqueue next step if this was a pipeline task
+        if result.success and task.payload:
+            from genesis.surplus.pipelines import (
+                build_next_step_payload,
+                get_pipeline,
+                is_pipeline_task,
+                parse_pipeline_payload,
+            )
+            if is_pipeline_task(task.payload):
+                try:
+                    meta = parse_pipeline_payload(task.payload)
+                    step = meta.get("step", 1)
+                    total = meta.get("total_steps", 1)
+                    pipeline_name = meta.get("pipeline", "")
+                    if step < total:
+                        defn = get_pipeline(pipeline_name)
+                        if defn and step < len(defn.steps):
+                            next_step = defn.steps[step]  # 0-indexed, step is 1-based
+                            next_payload = build_next_step_payload(
+                                meta, result.content or "",
+                            )
+                            await self._queue.enqueue(
+                                next_step.task_type,
+                                next_step.compute_tier,
+                                next_step.priority,
+                                defn.drive_alignment,
+                                payload=next_payload,
+                            )
+                            logger.info(
+                                "Pipeline %s: step %d/%d complete, enqueued step %d",
+                                pipeline_name, step, total, step + 1,
+                            )
+                        else:
+                            logger.warning(
+                                "Pipeline %s: step %d references missing definition",
+                                pipeline_name, step + 1,
+                            )
+                    else:
+                        logger.info(
+                            "Pipeline %s: final step %d/%d complete",
+                            pipeline_name, step, total,
+                        )
+                except Exception:
+                    logger.error("Pipeline chaining failed", exc_info=True)
 
         # Bridge code audit findings to recon observations
         if task.task_type == _TT.CODE_AUDIT and result.insights:
