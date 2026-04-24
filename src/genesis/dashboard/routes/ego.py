@@ -40,6 +40,8 @@ async def ego_status():
     return jsonify({
         "enabled": config.enabled,
         "model": config.model,
+        "default_effort": config.default_effort,
+        "morning_report_effort": config.morning_report_effort,
         "cadence_minutes": config.cadence_minutes,
         "daily_budget_cap_usd": config.daily_budget_cap_usd,
         "daily_cost_usd": round(daily_cost, 4),
