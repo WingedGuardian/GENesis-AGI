@@ -1,0 +1,160 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520" font-family="'Segoe UI', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1117"/>
+      <stop offset="100%" style="stop-color:#161b22"/>
+    </linearGradient>
+    <linearGradient id="tickGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#e94560;stop-opacity:0.6"/>
+      <stop offset="100%" style="stop-color:#e94560;stop-opacity:0.1"/>
+    </linearGradient>
+    <linearGradient id="surplusGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#533483;stop-opacity:0.5"/>
+      <stop offset="100%" style="stop-color:#533483;stop-opacity:0.1"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="520" fill="url(#bg)" rx="12"/>
+
+  <!-- Title -->
+  <text x="600" y="42" text-anchor="middle" fill="white" font-size="20" font-weight="bold">What Genesis Does While You Sleep</text>
+  <text x="600" y="64" text-anchor="middle" fill="#8b949e" font-size="13">24 hours of autonomous cognition — no user involvement required</text>
+
+  <!-- Timeline axis -->
+  <line x1="80" y1="420" x2="1140" y2="420" stroke="#30363d" stroke-width="2"/>
+
+  <!-- Hour markers -->
+  <g fill="#8b949e" font-size="11" text-anchor="middle">
+    <text x="80" y="445">12am</text><line x1="80" y1="416" x2="80" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="168" y="445">2am</text><line x1="168" y1="416" x2="168" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="256" y="445">4am</text><line x1="256" y1="416" x2="256" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="344" y="445">6am</text><line x1="344" y1="416" x2="344" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="432" y="445">8am</text><line x1="432" y1="416" x2="432" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="520" y="445">10am</text><line x1="520" y1="416" x2="520" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="608" y="445">12pm</text><line x1="608" y1="416" x2="608" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="696" y="445">2pm</text><line x1="696" y1="416" x2="696" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="784" y="445">4pm</text><line x1="784" y1="416" x2="784" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="872" y="445">6pm</text><line x1="872" y1="416" x2="872" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="960" y="445">8pm</text><line x1="960" y1="416" x2="960" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="1048" y="445">10pm</text><line x1="1048" y1="416" x2="1048" y2="424" stroke="#30363d" stroke-width="1"/>
+    <text x="1140" y="445">12am</text><line x1="1140" y1="416" x2="1140" y2="424" stroke="#30363d" stroke-width="1"/>
+  </g>
+
+  <!-- User active zone (translucent overlay) -->
+  <rect x="432" y="88" width="528" height="330" fill="#1f6feb" opacity="0.04" rx="6"/>
+  <text x="696" y="468" text-anchor="middle" fill="#1f6feb" font-size="10" opacity="0.5">▲ typical user active hours ▲</text>
+
+  <!-- Lane labels -->
+  <g fill="#8b949e" font-size="12" font-weight="600">
+    <text x="76" y="118" text-anchor="end">Awareness</text>
+    <text x="76" y="178" text-anchor="end">Reflection</text>
+    <text x="76" y="238" text-anchor="end">Learning</text>
+    <text x="76" y="298" text-anchor="end">Surplus</text>
+    <text x="76" y="358" text-anchor="end">Outreach</text>
+    <text x="76" y="398" text-anchor="end">Sessions</text>
+  </g>
+
+  <!-- Lane separator lines -->
+  <line x1="80" y1="138" x2="1140" y2="138" stroke="#21262d" stroke-width="1" stroke-dasharray="4,8"/>
+  <line x1="80" y1="198" x2="1140" y2="198" stroke="#21262d" stroke-width="1" stroke-dasharray="4,8"/>
+  <line x1="80" y1="258" x2="1140" y2="258" stroke="#21262d" stroke-width="1" stroke-dasharray="4,8"/>
+  <line x1="80" y1="318" x2="1140" y2="318" stroke="#21262d" stroke-width="1" stroke-dasharray="4,8"/>
+  <line x1="80" y1="378" x2="1140" y2="378" stroke="#21262d" stroke-width="1" stroke-dasharray="4,8"/>
+
+  <!-- AWARENESS LANE: ticks every ~5 min (288/day) — show as dense dot pattern -->
+  <g opacity="0.7">
+    <!-- Continuous tick marks across 24h -->
+    <line x1="80" y1="115" x2="1140" y2="115" stroke="#e94560" stroke-width="3" stroke-dasharray="3,15" opacity="0.5"/>
+    <text x="600" y="130" text-anchor="middle" fill="#e94560" font-size="9" opacity="0.7">~288 ticks/day · zero LLM cost · signal collection + depth classification</text>
+  </g>
+
+  <!-- REFLECTION LANE: scattered events, more during active hours -->
+  <g filter="url(#glow)">
+    <!-- Micro reflections (small dots, frequent during active hours) -->
+    <circle cx="140" cy="175" r="3" fill="#0f3460" opacity="0.6"/>
+    <circle cx="280" cy="175" r="3" fill="#0f3460" opacity="0.6"/>
+    <circle cx="460" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="530" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="590" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="640" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="710" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="770" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="850" cy="175" r="4" fill="#0f3460" opacity="0.8"/>
+    <circle cx="920" cy="175" r="3" fill="#0f3460" opacity="0.6"/>
+    <circle cx="1010" cy="175" r="3" fill="#0f3460" opacity="0.6"/>
+    <!-- Light reflections (medium dots) -->
+    <circle cx="350" cy="175" r="5" fill="#1a5fb4" opacity="0.7"/>
+    <circle cx="680" cy="175" r="5" fill="#1a5fb4" opacity="0.7"/>
+    <circle cx="900" cy="175" r="5" fill="#1a5fb4" opacity="0.7"/>
+    <!-- Deep reflection (large dot, typically overnight) -->
+    <circle cx="200" cy="175" r="7" fill="#3584e4" opacity="0.9"/>
+    <!-- Strategic (rare, large) -->
+    <circle cx="1080" cy="175" r="9" fill="#62a0ea" opacity="0.9"/>
+    <text x="1080" y="165" text-anchor="middle" fill="#62a0ea" font-size="8">Strategic</text>
+  </g>
+  <text x="600" y="193" text-anchor="middle" fill="#3584e4" font-size="9" opacity="0.7">Micro · Light · Deep · Strategic — depth scales with signal complexity</text>
+
+  <!-- LEARNING LANE: extraction after sessions -->
+  <g>
+    <rect x="510" y="225" width="20" height="12" fill="#2ea043" rx="2" opacity="0.7"/>
+    <rect x="620" y="225" width="20" height="12" fill="#2ea043" rx="2" opacity="0.7"/>
+    <rect x="740" y="225" width="20" height="12" fill="#2ea043" rx="2" opacity="0.7"/>
+    <rect x="860" y="225" width="20" height="12" fill="#2ea043" rx="2" opacity="0.7"/>
+    <rect x="950" y="225" width="20" height="12" fill="#2ea043" rx="2" opacity="0.7"/>
+    <text x="600" y="252" text-anchor="middle" fill="#2ea043" font-size="9" opacity="0.7">6-stage extraction after each session · triage → classify → delta → attribute → persist → procedure</text>
+  </g>
+
+  <!-- SURPLUS LANE: background tasks during idle -->
+  <g>
+    <!-- Overnight surplus blocks -->
+    <rect x="80" y="285" width="340" height="16" fill="url(#surplusGrad)" rx="3"/>
+    <text x="250" y="296" text-anchor="middle" fill="#c9b1ff" font-size="9">memory audits · anticipatory research · procedure testing · code analysis</text>
+    <!-- Evening surplus -->
+    <rect x="960" y="285" width="180" height="16" fill="url(#surplusGrad)" rx="3"/>
+    <text x="1050" y="296" text-anchor="middle" fill="#c9b1ff" font-size="9">bookmark enrichment · recon</text>
+    <!-- Brief idle gaps during day -->
+    <rect x="560" y="285" width="40" height="16" fill="#533483" rx="3" opacity="0.3"/>
+    <rect x="780" y="285" width="30" height="16" fill="#533483" rx="3" opacity="0.3"/>
+    <text x="600" y="312" text-anchor="middle" fill="#9b72cf" font-size="9" opacity="0.7">Uses idle compute · free-tier models · fills every gap between active sessions</text>
+  </g>
+
+  <!-- OUTREACH LANE -->
+  <g>
+    <!-- Morning digest -->
+    <rect x="432" y="348" width="24" height="14" fill="#d29922" rx="3" opacity="0.9"/>
+    <text x="444" y="343" text-anchor="middle" fill="#d29922" font-size="9" font-weight="bold">☀ Morning digest</text>
+    <!-- Alert -->
+    <circle cx="750" cy="355" r="5" fill="#da3633" opacity="0.7"/>
+    <text x="750" y="343" text-anchor="middle" fill="#da3633" font-size="8">Alert</text>
+    <!-- Proactive -->
+    <circle cx="870" cy="355" r="4" fill="#d29922" opacity="0.5"/>
+    <text x="600" y="373" text-anchor="middle" fill="#d29922" font-size="9" opacity="0.7">Proactive outreach · calibrated by engagement history · never spams</text>
+  </g>
+
+  <!-- SESSIONS LANE (user-initiated, shown as blocks) -->
+  <g>
+    <rect x="450" y="388" width="80" height="14" fill="#1f6feb" rx="3" opacity="0.6"/>
+    <rect x="580" y="388" width="120" height="14" fill="#1f6feb" rx="3" opacity="0.6"/>
+    <rect x="750" y="388" width="60" height="14" fill="#1f6feb" rx="3" opacity="0.6"/>
+    <rect x="860" y="388" width="90" height="14" fill="#1f6feb" rx="3" opacity="0.6"/>
+    <!-- Background session -->
+    <rect x="160" y="388" width="140" height="14" fill="#8957e5" rx="3" opacity="0.5"/>
+    <text x="230" y="398" text-anchor="middle" fill="white" font-size="8">background session</text>
+  </g>
+
+  <!-- Legend -->
+  <g transform="translate(80, 478)">
+    <circle cx="0" cy="0" r="4" fill="#e94560"/><text x="10" y="4" fill="#8b949e" font-size="10">Awareness tick</text>
+    <circle cx="140" cy="0" r="4" fill="#3584e4"/><text x="150" y="4" fill="#8b949e" font-size="10">Reflection</text>
+    <circle cx="260" cy="0" r="4" fill="#2ea043"/><text x="270" y="4" fill="#8b949e" font-size="10">Learning</text>
+    <circle cx="370" cy="0" r="4" fill="#533483"/><text x="380" y="4" fill="#8b949e" font-size="10">Surplus compute</text>
+    <circle cx="520" cy="0" r="4" fill="#d29922"/><text x="530" y="4" fill="#8b949e" font-size="10">Outreach</text>
+    <circle cx="640" cy="0" r="4" fill="#1f6feb"/><text x="650" y="4" fill="#8b949e" font-size="10">User session</text>
+    <circle cx="770" cy="0" r="4" fill="#8957e5"/><text x="780" y="4" fill="#8b949e" font-size="10">Background session</text>
+  </g>
+</svg>
