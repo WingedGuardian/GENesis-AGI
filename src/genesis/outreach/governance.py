@@ -41,6 +41,7 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_insight": 24,
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
+    "cli_approval": 0,  # Never dedup — every approval request must be delivered
 }
 _DEFAULT_DEDUP_HOURS = 24
 
