@@ -163,8 +163,10 @@ class FollowUpDispatcher:
 
         if "benchmark" in content or "eval" in content:
             return TaskType.MODEL_EVAL, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
+        # DEACTIVATED: anticipatory_research has no web search — route to
+        # brainstorm_self until redesigned as CC session task.
         if "research" in content:
-            return TaskType.ANTICIPATORY_RESEARCH, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
+            return TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
         if "brainstorm" in content:
             return TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
         if "cleanup" in content or "disk" in content:
