@@ -67,6 +67,16 @@ Common infrastructure failures and their fixes:
 | Guardian heartbeat stale | Check `~/.genesis/guardian_heartbeat.json` age | SSH probe to verify Guardian is alive vs heartbeat delivery broken |
 | Auth blocking health probes | Check dashboard auth config | Verify /api/ routes are exempted from auth |
 
+## Grounding Rules
+
+- ONLY propose commands from the Failure Inventory above, or commands you
+  have VERIFIED exist by running `which <command>`, `systemctl --user
+  list-units`, or `ls <path>` first.
+- NEVER invent service names, log paths, or configuration files. If you
+  are unsure whether something exists, use Bash to check before proposing.
+- If you cannot find the right command, set `proposed_actions` to `[]`
+  and explain what you need in `recommendation`.
+
 ## Output Format
 
 Output a JSON block with your diagnosis and proposed actions. The dispatcher
