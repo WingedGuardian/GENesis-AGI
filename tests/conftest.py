@@ -83,7 +83,7 @@ async def db():
     await conn.commit()
     wrapped = SerializedConnection(conn)
     yield wrapped
-    await conn.close()
+    await wrapped.close()
 
 
 @pytest.fixture
@@ -99,4 +99,4 @@ async def empty_db():
     await conn.commit()
     wrapped = SerializedConnection(conn)
     yield wrapped
-    await conn.close()
+    await wrapped.close()

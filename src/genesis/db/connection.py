@@ -26,13 +26,23 @@ class SerializedConnection:
     """Proxy that serializes all DB operations through an asyncio.Lock.
 
     Genesis shares a single aiosqlite.Connection across all subsystems.
-    Without serialization, concurrent coroutines can interleave
-    execute(DML) + commit() calls, causing the connection to get stuck
-    with in_transaction=True permanently (requiring a server restart).
+    Without serialization, concurrent coroutines can simultaneously call
+    execute/commit on the underlying connection, corrupting the aiosqlite
+    thread's transaction state and leaving in_transaction=True permanently
+    (requiring a server restart).
 
-    This proxy wraps every operation in a lock so only one coroutine
-    touches the underlying connection at a time.  SQLite operations are
-    sub-millisecond, so the serialization overhead is negligible.
+    The lock ensures only one coroutine touches the underlying connection
+    at a time.  Each method acquires and releases the lock independently,
+    so two coroutines doing ``execute(); commit()`` may interleave at the
+    method boundary (A.execute → B.execute → A.commit → B.commit).  This
+    is safe: both operations execute serially on aiosqlite's background
+    thread, and commit() flushes all pending work.  The lock prevents the
+    actual failure mode — simultaneous access to the connection.
+
+    Reads are serialized behind the same lock as writes.  SQLite
+    operations are sub-millisecond (~1.8ms for write+commit), so the
+    overhead is negligible.  A read-write lock could be used if read
+    contention becomes measurable.
 
     execute/executemany/execute_fetchall/execute_insert/executescript
     return aiosqlite.context.Result objects (not coroutines) so that
@@ -87,7 +97,7 @@ class SerializedConnection:
     def execute_insert(
         self, sql: str, parameters: Iterable[Any] | None = None,
     ) -> Result:
-        async def _locked() -> int | None:
+        async def _locked() -> tuple | None:
             async with self._lock:
                 return await self._conn.execute_insert(sql, parameters)
         return Result(_locked())
