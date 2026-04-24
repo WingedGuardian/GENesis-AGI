@@ -263,6 +263,14 @@ class _RuntimeProperties:
         return self._contingency_dispatcher
 
     @property
+    def ego_session(self) -> object | None:
+        return self._ego_session
+
+    @property
+    def ego_cadence_manager(self) -> object | None:
+        return self._ego_cadence_manager
+
+    @property
     def bootstrap_manifest(self) -> dict[str, str]:
         return dict(self._bootstrap_manifest)
 

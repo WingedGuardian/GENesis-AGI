@@ -1682,7 +1682,7 @@ async function loadFollowUpsBadge(container) {
 const SUBSYSTEM_GROUPS = {
     ego: {
         name: 'Ego', domId: 'sub-ego',
-        desc: 'Self-model and identity layer \u2014 groundwork for Genesis self-awareness',
+        desc: 'Autonomous decision cycle \u2014 periodic thinking, proposals, adaptive cadence',
         sites: ['7_ego_cycle', '7_ego_cycle_api', '8_ego_compaction'],
     },
     reflection: {
@@ -1866,7 +1866,7 @@ function updateSubsystemGrid(data) {
         let hasEnrichment = false;
 
         if (key === 'ego') {
-            enrichment.appendChild(sectionRow('Status', 'Groundwork', 'color:#c084fc;font-style:italic'));
+            enrichment.appendChild(sectionRow('Status', 'Active', 'color:#c084fc;font-weight:600'));
             hasEnrichment = true;
         }
         if (key === 'reflection') {

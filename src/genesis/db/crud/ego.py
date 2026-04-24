@@ -230,6 +230,27 @@ async def list_pending_proposals(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def list_proposals(
+    db: aiosqlite.Connection,
+    *,
+    status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """All proposals, optionally filtered by status, newest first."""
+    if status:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals WHERE status = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
 async def resolve_proposal(
     db: aiosqlite.Connection,
     id: str,
