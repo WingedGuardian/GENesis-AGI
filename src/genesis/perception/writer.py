@@ -207,6 +207,41 @@ class ResultWriter:
                     )
                     logger.info("Light escalation pending created: %s", esc_reason[:80])
 
+        # Update cognitive state from situation focus (Prong 2)
+        # Mirrors the CC bridge path (cc/reflection_bridge/_output.py).
+        if (
+            output.context_update
+            and output.focus_area == "situation"
+            and len(output.context_update.strip()) > 20
+        ):
+            try:
+                from genesis.db.crud import awareness_ticks, cognitive_state
+
+                _DEEP_PRESERVE_HOURS = 4
+                hours_since_deep = 999.0
+                last_deep = await awareness_ticks.last_at_depth(db, "Deep")
+                if last_deep:
+                    try:
+                        last_deep_dt = datetime.fromisoformat(last_deep["created_at"])
+                        hours_since_deep = (datetime.now(UTC) - last_deep_dt).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        pass
+                if hours_since_deep >= _DEEP_PRESERVE_HOURS:
+                    await cognitive_state.replace_section(
+                        db,
+                        section="active_context",
+                        id=str(uuid.uuid4()),
+                        content=output.context_update.strip(),
+                        generated_by="light_reflection",
+                        created_at=tick.timestamp,
+                    )
+                    logger.info(
+                        "Light reflection updated active_context (%.1fh since deep)",
+                        hours_since_deep,
+                    )
+            except Exception:
+                logger.warning("Failed to update active_context from light reflection", exc_info=True)
+
         if self._memory_store:
             await self._memory_store.store(
                 output.assessment,

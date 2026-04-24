@@ -53,6 +53,7 @@ class SurplusScheduler:
         infra_monitor_hours: int = 2,
         recon_gather_hours: int = 84,
         maintenance_hours: int = 6,
+        analytical_hours: int = 24,
         follow_up_dispatch_minutes: int | None = None,
         memory_extraction_hours: int = 2,
         clock=None,
@@ -77,6 +78,7 @@ class SurplusScheduler:
         self._infra_monitor_hours = infra_monitor_hours
         self._recon_gather_hours = recon_gather_hours
         self._maintenance_hours = maintenance_hours
+        self._analytical_hours = analytical_hours
         self._follow_up_dispatch_minutes = follow_up_dispatch_minutes or dispatch_interval_minutes
         self._memory_extraction_hours = memory_extraction_hours
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -228,6 +230,13 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        self._scheduler.add_job(
+            self.schedule_analytical,
+            IntervalTrigger(hours=self._analytical_hours),
+            id="schedule_analytical",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
@@ -247,6 +256,7 @@ class SurplusScheduler:
         await self.schedule_infra_monitor()
         await self.run_recon_gather()
         await self.schedule_maintenance()
+        await self.schedule_analytical()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
             self._dispatch_interval, self._brainstorm_interval,
@@ -360,21 +370,16 @@ class SurplusScheduler:
                 pass
 
     async def schedule_maintenance(self) -> None:
-        """Enqueue infrastructure maintenance tasks if none pending."""
+        """Enqueue mechanical infrastructure maintenance tasks if none pending."""
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
-            # Each task: check pending, enqueue if zero
-            # Infrastructure maintenance (no LLM needed)
+            # Mechanical tasks only — no LLM needed, run every maintenance_hours
             maintenance_tasks = [
                 (TaskType.DISK_CLEANUP, 0.4, "preservation"),
                 (TaskType.BACKUP_VERIFICATION, 0.7, "preservation"),
                 (TaskType.DEAD_LETTER_REPLAY, 0.5, "cooperation"),
                 (TaskType.DB_MAINTENANCE, 0.3, "competence"),
-                # Tier 1 LLM tasks — observation-only analysis via ReflectionEngine
-                (TaskType.GAP_CLUSTERING, 0.4, "competence"),
-                (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
-                (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
             ]
             for task_type, priority, drive in maintenance_tasks:
                 pending = await self._queue.pending_by_type(task_type)
@@ -392,6 +397,40 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_maintenance", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_analytical(self) -> None:
+        """Enqueue LLM-based analytical tasks if none pending.
+
+        These run on a separate (longer) cadence than mechanical maintenance
+        because their inputs change slowly and their free-tier model output
+        needs time to be consumed by deep reflection.
+        """
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            analytical_tasks = [
+                (TaskType.GAP_CLUSTERING, 0.4, "competence"),
+                (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
+                (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
+            ]
+            for task_type, priority, drive in analytical_tasks:
+                pending = await self._queue.pending_by_type(task_type)
+                if pending == 0:
+                    await self._queue.enqueue(
+                        task_type, ComputeTier.FREE_API, priority, drive,
+                    )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_analytical")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Analytical scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_analytical", str(exc))
             except Exception:
                 pass
 

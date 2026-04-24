@@ -71,11 +71,12 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "You are monitoring infrastructure for an autonomous AI system.\n\n"
         "## Recent Signal Data\n{signals}\n\n"
         "## Task\n"
-        "Assess the current infrastructure state.  Report anything that "
+        "Assess the current infrastructure state.  Report ONLY if something "
         "needs attention — resource pressure, degraded services, anomalous "
-        "patterns.  Focus on actionable findings, not routine status.  "
-        "If everything is healthy, say so briefly.\n\n"
-        "Respond in plain text (2-4 sentences)."
+        "patterns, or trends that could become problems.\n\n"
+        "If everything is operating normally with no concerns, respond with "
+        "exactly the word NOMINAL and nothing else.\n\n"
+        "Respond in plain text (2-4 sentences for concerns, or just NOMINAL)."
     ),
     TaskType.BRAINSTORM_USER: (
         "You are brainstorming ways to create value for your user.\n\n"
@@ -193,6 +194,11 @@ class SurplusLLMExecutor:
             return ExecutorResult(success=False, error=error)
 
         content = result.content.strip()
+
+        # Quality gate: NOMINAL means nothing noteworthy — skip insight + Telegram
+        if content.upper().startswith("NOMINAL") and len(content) < 40:
+            logger.info("Surplus task %s reported NOMINAL — skipping insight", task.task_type)
+            return ExecutorResult(success=True, content="", insights=[])
 
         # Post to Telegram surplus topic
         if self._topic_manager and content:
