@@ -368,20 +368,19 @@ class EgoContextBuilder:
             from genesis.runtime import GenesisRuntime
 
             rt = GenesisRuntime.instance()
-            store = rt._memory_store
-            if store is None:
-                lines.append("*Memory store not available.*\n")
+            retriever = rt._hybrid_retriever
+            if retriever is None:
+                lines.append("*Memory retriever not available.*\n")
                 return "\n".join(lines)
 
-            results = await store.recall(
-                query="user correction ego",
+            results = await retriever.recall(
+                "user correction ego",
                 limit=10,
-                wing="autonomy",
-                room="ego",
             )
+            # Filter for corrections tagged by the ego correction handler
             corrections = [
                 r for r in results
-                if "user_correction" in (r.get("tags") or [])
+                if "user_correction" in (r.payload.get("tags") or [])
             ]
         except Exception:
             logger.debug("Failed to recall user corrections", exc_info=True)
@@ -394,9 +393,9 @@ class EgoContextBuilder:
 
         lines.append(f"**{len(corrections)} corrections** from the user:\n")
         for c in corrections[:10]:
-            content = (c.get("content") or "")[:300]
+            content = (c.content or "")[:300]
             content = content.replace("\n", " ")
-            created = c.get("created_at", "?")
+            created = c.payload.get("created_at", "?")
             lines.append(f"- [{created}] {content}")
 
         lines.append(

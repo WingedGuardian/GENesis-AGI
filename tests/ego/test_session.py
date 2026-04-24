@@ -274,6 +274,50 @@ class TestEgoSession:
         mock_proposal_workflow.create_batch.assert_called_once()
         mock_proposal_workflow.send_digest.assert_called_once()
 
+    async def test_session_id_stored_after_cycle(self, ego_session, db):
+        """CC session ID is stored in ego_state for --resume."""
+        await ego_session.run_cycle()
+        stored = await ego_crud.get_state(db, "cc_session_id")
+        assert stored == "sess123"  # from _cc_output fixture
+
+    async def test_resume_uses_stored_session_id(self, ego_session, mock_invoker, db):
+        """Second cycle resumes from stored cc_session_id."""
+        # First cycle stores session ID
+        await ego_session.run_cycle()
+        mock_invoker.run.reset_mock()
+
+        # Second cycle should use resume_session_id
+        await ego_session.run_cycle()
+        invocation = mock_invoker.run.call_args[0][0]
+        assert invocation.resume_session_id == "sess123"
+
+    async def test_error_clears_session_id(self, ego_session, mock_invoker, db):
+        """CC error clears stored session ID for fresh start."""
+        # First cycle stores session ID
+        await ego_session.run_cycle()
+        stored = await ego_crud.get_state(db, "cc_session_id")
+        assert stored == "sess123"
+
+        # Second cycle fails — session ID should be cleared
+        mock_invoker.run.return_value = _cc_output(is_error=True)
+        result = await ego_session.run_cycle()
+        assert result is None
+
+        stored = await ego_crud.get_state(db, "cc_session_id")
+        assert stored == ""
+
+    async def test_first_cycle_no_resume(self, ego_session, mock_invoker):
+        """First cycle (no stored session) has no resume_session_id."""
+        await ego_session.run_cycle()
+        invocation = mock_invoker.run.call_args[0][0]
+        assert invocation.resume_session_id is None
+
+    async def test_morning_report_uses_low_effort(self, ego_session, mock_invoker):
+        """Morning report uses morning_report_effort from config."""
+        await ego_session.run_cycle(is_morning_report=True)
+        invocation = mock_invoker.run.call_args[0][0]
+        assert invocation.effort.value == "low"
+
 
 # ---------------------------------------------------------------------------
 # Output parsing tests

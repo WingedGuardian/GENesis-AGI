@@ -140,30 +140,21 @@ class EgoSession:
         # 6. Check for stored CC session ID (persistent session)
         stored_cc_sid = await ego_crud.get_state(self._db, "cc_session_id")
 
-        # 7. Build invocation — resume if we have a prior session
-        if stored_cc_sid:
-            invocation = CCInvocation(
-                prompt=user_prompt,
-                model=CCModel(self._config.model),
-                effort=effort,
-                resume_session_id=stored_cc_sid,
-                append_system_prompt=True,
-                system_prompt=system_prompt,
-                skip_permissions=True,
-                working_dir=background_session_dir(),
-                mcp_config=self._mcp_config_path,
-            )
-        else:
-            invocation = CCInvocation(
-                prompt=user_prompt,
-                model=CCModel(self._config.model),
-                effort=effort,
-                append_system_prompt=True,
-                system_prompt=system_prompt,
-                skip_permissions=True,
-                working_dir=background_session_dir(),
-                mcp_config=self._mcp_config_path,
-            )
+        # 7. Build invocation — resume if we have a prior session.
+        # append_system_prompt=True always: preserve CC's tool framework
+        # underneath the ego identity prompt (see feedback_append_system_prompt.md).
+        invocation = CCInvocation(
+            prompt=user_prompt,
+            model=CCModel(self._config.model),
+            effort=effort,
+            resume_session_id=stored_cc_sid or None,
+            append_system_prompt=True,
+            system_prompt=system_prompt,
+            timeout_s=2400,
+            skip_permissions=True,
+            working_dir=background_session_dir(),
+            mcp_config=self._mcp_config_path,
+        )
 
         output = None
         session_id: str | None = None
