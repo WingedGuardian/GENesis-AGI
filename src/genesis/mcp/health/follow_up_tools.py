@@ -1,7 +1,7 @@
 """MCP tools for the follow-up accountability ledger.
 
-Provides follow_up_create and follow_up_list for foreground sessions
-to create and inspect follow-up items.
+Provides follow_up_create, follow_up_list, and follow_up_update for
+foreground sessions to create, inspect, and update follow-up items.
 """
 
 from __future__ import annotations
@@ -106,6 +106,72 @@ async def _impl_follow_up_list(
         return {"error": f"Failed to list follow-ups: {exc}"}
 
 
+async def _impl_follow_up_update(
+    follow_up_id: str,
+    *,
+    status: str | None = None,
+    resolution_notes: str | None = None,
+    blocked_reason: str | None = None,
+    priority: str | None = None,
+) -> dict:
+    """Update an existing follow-up item."""
+    db = _get_db()
+    if db is None:
+        return {"error": "Database not available"}
+
+    valid_statuses = {"pending", "scheduled", "in_progress", "completed", "failed", "blocked"}
+    if status and status not in valid_statuses:
+        return {"error": f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}"}
+
+    valid_priorities = {"low", "medium", "high", "critical"}
+    if priority and priority not in valid_priorities:
+        return {"error": f"Invalid priority '{priority}'. Must be one of: {', '.join(sorted(valid_priorities))}"}
+
+    try:
+        from genesis.db.crud import follow_ups
+
+        existing = await follow_ups.get_by_id(db, follow_up_id)
+        if not existing:
+            return {"error": f"Follow-up '{follow_up_id}' not found"}
+
+        if priority and priority != existing.get("priority"):
+            await db.execute(
+                "UPDATE follow_ups SET priority = ? WHERE id = ?",
+                (priority, follow_up_id),
+            )
+            await db.commit()
+
+        if status:
+            updated = await follow_ups.update_status(
+                db,
+                follow_up_id,
+                status,
+                resolution_notes=resolution_notes,
+                blocked_reason=blocked_reason,
+            )
+            if not updated:
+                return {"error": "Update failed — row not modified"}
+        elif resolution_notes or blocked_reason:
+            await follow_ups.update_status(
+                db,
+                follow_up_id,
+                existing["status"],
+                resolution_notes=resolution_notes,
+                blocked_reason=blocked_reason,
+            )
+
+        refreshed = await follow_ups.get_by_id(db, follow_up_id)
+        return {
+            "id": follow_up_id,
+            "status": refreshed["status"],
+            "priority": refreshed["priority"],
+            "message": "Follow-up updated.",
+        }
+    except Exception as exc:
+        logger.error("follow_up_update failed", exc_info=True)
+        return {"error": f"Failed to update follow-up: {exc}"}
+
+
 # ---------------------------------------------------------------------------
 # MCP tool decorators
 # ---------------------------------------------------------------------------
@@ -140,6 +206,35 @@ async def follow_up_create(
         strategy,
         scheduled_at=scheduled_at or None,
         priority=priority,
+    )
+
+
+@mcp.tool()
+async def follow_up_update(
+    follow_up_id: str,
+    status: str = "",
+    resolution_notes: str = "",
+    blocked_reason: str = "",
+    priority: str = "",
+) -> dict:
+    """Update an existing follow-up item.
+
+    Use this to change status, add resolution notes, mark as blocked, or
+    adjust priority on an existing follow-up.
+
+    Args:
+        follow_up_id: The ID of the follow-up to update
+        status: New status (pending, scheduled, in_progress, completed, failed, blocked). Empty to keep current.
+        resolution_notes: Notes on resolution or progress. Appended context for future sessions.
+        blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
+        priority: New priority (low, medium, high, critical). Empty to keep current.
+    """
+    return await _impl_follow_up_update(
+        follow_up_id,
+        status=status or None,
+        resolution_notes=resolution_notes or None,
+        blocked_reason=blocked_reason or None,
+        priority=priority or None,
     )
 
 

@@ -116,7 +116,6 @@ PROFILES: dict[str, list[str]] = {
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
-        + _NO_OUTREACH_ENGAGEMENT
     ),
 }
 
