@@ -412,8 +412,13 @@ class SurplusScheduler:
 
             analytical_tasks = [
                 (TaskType.GAP_CLUSTERING, 0.4, "competence"),
-                (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
-                (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
+                # DEACTIVATED: anticipatory_research has no web search — pure
+                # LLM speculation.  Redesign as CC session task with tool access.
+                # (TaskType.ANTICIPATORY_RESEARCH, 0.3, "curiosity"),
+                # DEACTIVATED: prompt_effectiveness_review reviews outputs, not
+                # prompts.  Redesign to actually analyze prompt templates vs
+                # output quality.
+                # (TaskType.PROMPT_EFFECTIVENESS_REVIEW, 0.3, "competence"),
             ]
             for task_type, priority, drive in analytical_tasks:
                 pending = await self._queue.pending_by_type(task_type)

@@ -57,6 +57,8 @@ Truthfully, no, this is not "true" AGI. In order to get to something resembling 
 
 But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behaviours and capabilities that AGI would presumably need to exhibit.
 
+If AGI sounds like something you'd like to help build — [**come build with us →**](#get-involved)
+
 </details>
 
 ---
