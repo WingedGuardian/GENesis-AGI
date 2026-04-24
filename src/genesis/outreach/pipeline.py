@@ -159,7 +159,7 @@ class OutreachPipeline:
         # Wrapped in try/except: submit_raw must stay reliable even if DB is down.
         try:
             if await self._governance.is_duplicate(request):
-                logger.info(
+                logger.warning(
                     "submit_raw dedup suppressed: signal=%s topic=%r",
                     request.signal_type, request.topic,
                 )
