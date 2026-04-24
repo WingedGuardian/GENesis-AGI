@@ -242,6 +242,16 @@ class ProposalWorkflow:
         self._reply_waiter = reply_waiter
         self._expiry_minutes = expiry_minutes
 
+    # -- Late-binding setters (wired in standalone.py after Telegram init) --
+
+    def set_topic_manager(self, topic_manager: TopicManager) -> None:
+        """Attach a TopicManager for Telegram proposal delivery."""
+        self._topic_manager = topic_manager
+
+    def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
+        """Attach a ReplyWaiter for detecting user responses to proposals."""
+        self._reply_waiter = waiter
+
     # -- Creation ----------------------------------------------------------
 
     async def create_batch(

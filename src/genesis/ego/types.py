@@ -81,6 +81,8 @@ class EgoConfig:
     max_interval_minutes: int = 240  # backoff cap (4 hours)
     backoff_multiplier: float = 2.0  # interval doubles on idle cycles
     model: str = "opus"  # default model for ego cycles
+    default_effort: str = "high"  # effort for regular cycles
+    morning_report_effort: str = "low"  # effort for morning reports
     proposal_expiry_minutes: int = 240  # 4 hours
     daily_budget_cap_usd: float = 10.0  # max daily ego spend
     morning_report_hour: int = 8  # 24h format, local time

@@ -95,7 +95,7 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
-| `7_ego_cycle_api` | Ego cycle API reasoning | **Keep** — wire when ego sessions go live |
+| `7_ego_cycle` | Ego cycle CLI reasoning | **Active** — persistent session with --resume |
 | `7_task_retrospective` | Task outcome root-cause analysis | **Keep** — wire when executor goes live |
 | `autonomous_executor_reasoning` | Executor non-tooling reasoning | **Keep** — wire when executor goes live |
 

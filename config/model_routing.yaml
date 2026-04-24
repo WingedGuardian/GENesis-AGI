@@ -219,21 +219,15 @@ call_sites:
     - groq-free
     - mistral-large-free
     - gemini-free
-    - openrouter-free
     default_paid: false
     never_pays: true
   5_deep_reflection:
     chain:
     - claude-sonnet
-    - claude-opus
-    - gpt-5.4
-    - glm5
     default_paid: true
     retry_profile: background
-    never_pays: false
     cc_model: Sonnet
     dispatch: cli
-    cc_position: 4
   6_strategic_reflection:
     chain:
     - claude-opus
@@ -241,25 +235,22 @@ call_sites:
     retry_profile: background
     cc_model: Opus
     dispatch: cli
-    cc_position: 1
-  7_ego_cycle_api:
+  7_ego_cycle:
     chain:
-    - claude-sonnet
     - claude-opus
     default_paid: true
     retry_profile: background
-    description: Autonomous ego cycle reasoning via API
+    dispatch: cli
+    cc_model: Opus
   7_task_retrospective:
     chain:
     - openrouter-free
     default_paid: true
   8_ego_compaction:
     chain:
-    - cerebras-qwen
+    - claude-haiku
     - mistral-large-free
-    - groq-free
-    - gemini-free
-    - openrouter-free
+    default_paid: true
   9_fact_extraction:
     chain:
     - mistral-large-free

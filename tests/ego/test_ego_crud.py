@@ -203,6 +203,86 @@ class TestStateCRUD:
         assert ts2 > ts1, f"updated_at should change on upsert: {ts1} -> {ts2}"
 
 
+# ---------------------------------------------------------------------------
+# ego_proposals tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def db_with_proposals():
+    """In-memory DB with ego_proposals table."""
+    async with aiosqlite.connect(":memory:") as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute(TABLES["ego_proposals"])
+        yield conn
+
+
+def _make_proposal_kwargs(id: str, **overrides):
+    base = {
+        "id": id,
+        "action_type": "research",
+        "action_category": "learning",
+        "content": f"proposal {id}",
+        "rationale": "test rationale",
+        "confidence": 0.8,
+        "urgency": "normal",
+        "status": "pending",
+        "created_at": "2026-04-20T10:00:00Z",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestListProposals:
+    async def test_empty_table(self, db_with_proposals):
+        result = await ego_crud.list_proposals(db_with_proposals)
+        assert result == []
+
+    async def test_returns_all_proposals(self, db_with_proposals):
+        for i in range(3):
+            await ego_crud.create_proposal(
+                db_with_proposals,
+                **_make_proposal_kwargs(f"p{i}", created_at=f"2026-04-2{i}T10:00:00Z"),
+            )
+        result = await ego_crud.list_proposals(db_with_proposals)
+        assert len(result) == 3
+
+    async def test_newest_first(self, db_with_proposals):
+        for i, ts in enumerate(["2026-01-01", "2026-01-03", "2026-01-02"]):
+            await ego_crud.create_proposal(
+                db_with_proposals,
+                **_make_proposal_kwargs(f"p{i}", created_at=f"{ts}T00:00:00Z"),
+            )
+        result = await ego_crud.list_proposals(db_with_proposals)
+        assert result[0]["id"] == "p1"  # Jan 3 is newest
+        assert result[-1]["id"] == "p0"  # Jan 1 is oldest
+
+    async def test_filter_by_status(self, db_with_proposals):
+        await ego_crud.create_proposal(
+            db_with_proposals, **_make_proposal_kwargs("p1", status="pending"),
+        )
+        await ego_crud.create_proposal(
+            db_with_proposals, **_make_proposal_kwargs("p2", status="pending"),
+        )
+        await ego_crud.create_proposal(
+            db_with_proposals, **_make_proposal_kwargs("p3", status="approved"),
+        )
+        pending = await ego_crud.list_proposals(db_with_proposals, status="pending")
+        assert len(pending) == 2
+        approved = await ego_crud.list_proposals(db_with_proposals, status="approved")
+        assert len(approved) == 1
+        assert approved[0]["id"] == "p3"
+
+    async def test_limit(self, db_with_proposals):
+        for i in range(5):
+            await ego_crud.create_proposal(
+                db_with_proposals,
+                **_make_proposal_kwargs(f"p{i}", created_at=f"2026-04-2{i}T10:00:00Z"),
+            )
+        result = await ego_crud.list_proposals(db_with_proposals, limit=2)
+        assert len(result) == 2
+
+
 class TestDailyEgoCost:
     async def test_no_cycles_returns_zero(self, db):
         cost = await ego_crud.daily_ego_cost(db)

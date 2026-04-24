@@ -459,6 +459,7 @@ class StandaloneAdapter:
                     "reflection_micro", "reflection_light",
                     "reflection_deep", "reflection_strategic",
                     "surplus", "recon", "approvals",
+                    "ego_proposals",
                 ):
                     await topic_manager.get_or_create_persistent(cat)
 
@@ -471,6 +472,10 @@ class StandaloneAdapter:
                     rt.awareness_loop.set_topic_manager(topic_manager)
                 if rt.surplus_scheduler:
                     rt.surplus_scheduler.set_topic_manager(topic_manager)
+                if rt._ego_proposal_workflow is not None:
+                    rt._ego_proposal_workflow.set_topic_manager(topic_manager)
+                    rt._ego_proposal_workflow.set_reply_waiter(reply_waiter)
+                    logger.info("Ego proposal workflow wired with TopicManager + ReplyWaiter")
 
                 logger.info(
                     "Forum topics enabled (chat_id=%s) — %d categories",

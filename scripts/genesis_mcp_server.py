@@ -275,6 +275,8 @@ def main(argv: list[str] | None = None) -> None:
     _MCP_VARS = {
         # Infrastructure
         "OLLAMA_URL", "QDRANT_URL", "GENESIS_DB_PATH", "GENESIS_CC_PROJECT_ID",
+        # Browser (CDP remote backend)
+        "GENESIS_CDP_URL",
         # Embedding providers (required for memory MCP)
         "API_KEY_DEEPINFRA", "API_KEY_QWEN",
         # LLM providers (used by recon/outreach MCP tools)
