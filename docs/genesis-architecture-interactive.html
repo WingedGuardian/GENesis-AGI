@@ -60,7 +60,7 @@
     position:absolute; left:24px; bottom:20px; display:flex; flex-wrap:wrap; gap:8px 16px;
     font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--ink-dim);
     background:rgba(13,17,23,0.6); border:1px solid var(--line); border-radius:8px; padding:10px 14px;
-    max-width:560px;
+    max-width:380px;
   }
   .legend .sw{display:inline-flex;align-items:center;gap:6px}
   .legend .sw i{width:10px;height:10px;border-radius:2px;display:inline-block}
@@ -162,34 +162,28 @@
       <!-- INNER RING — COGNITIVE LOOP (r=170, nodes r=46) -->
       <!-- Awareness top: (700, 310) -->
       <g class="node layer-loop" data-id="awareness" transform="translate(700 310)">
-        <circle r="46" fill="#17121a" stroke="#e94560" stroke-width="1.5"/>
-        <circle r="46" fill="none" stroke="#e94560" stroke-width="6" opacity="0.12" class="pulse"/>
-        <circle r="34" fill="none" stroke="#e94560" stroke-width="1" opacity="0.35" stroke-dasharray="1 3"/>
-        <circle r="3.5" fill="#e94560"/>
-        <text class="node-title" y="-4" text-anchor="middle" fill="#fff">Awareness</text>
-        <text class="node-sub" y="10" text-anchor="middle">5-min signals</text>
+        <circle r="56" fill="#17121a" stroke="#e94560" stroke-width="1.5"/>
+        <circle r="56" fill="none" stroke="#e94560" stroke-width="6" opacity="0.12" class="pulse"/>
+        <text class="node-title" y="-10" text-anchor="middle" fill="#fff">Awareness</text>
+        <text class="node-sub" y="8" text-anchor="middle">5-min signals</text>
         <text class="node-sub" y="22" text-anchor="middle">zero LLM cost</text>
       </g>
 
       <!-- Reflection bottom-right: 30° from +X, (700+170*0.866, 480+170*0.5) = (847.2, 565) -->
       <g class="node layer-loop" data-id="reflection" transform="translate(847.2 565)">
-        <circle r="46" fill="#0f1722" stroke="#62a0ea" stroke-width="1.5"/>
-        <circle r="46" fill="none" stroke="#62a0ea" stroke-width="6" opacity="0.12" class="pulse" style="animation-delay:-1.2s"/>
-        <circle r="34" fill="none" stroke="#62a0ea" stroke-width="1" opacity="0.35" stroke-dasharray="1 3"/>
-        <circle r="3.5" fill="#62a0ea"/>
-        <text class="node-title" y="-4" text-anchor="middle">Reflection</text>
-        <text class="node-sub" y="10" text-anchor="middle">micro · light</text>
+        <circle r="56" fill="#0f1722" stroke="#62a0ea" stroke-width="1.5"/>
+        <circle r="56" fill="none" stroke="#62a0ea" stroke-width="6" opacity="0.12" class="pulse" style="animation-delay:-1.2s"/>
+        <text class="node-title" y="-10" text-anchor="middle">Reflection</text>
+        <text class="node-sub" y="8" text-anchor="middle">micro · light</text>
         <text class="node-sub" y="22" text-anchor="middle">deep · strategic</text>
       </g>
 
       <!-- Learning bottom-left: 150° from +X, (700-147.2, 480+85) = (552.8, 565) -->
       <g class="node layer-loop" data-id="learning" transform="translate(552.8 565)">
-        <circle r="46" fill="#101a13" stroke="#2ea043" stroke-width="1.5"/>
-        <circle r="46" fill="none" stroke="#2ea043" stroke-width="6" opacity="0.12" class="pulse" style="animation-delay:-2.4s"/>
-        <circle r="34" fill="none" stroke="#2ea043" stroke-width="1" opacity="0.35" stroke-dasharray="1 3"/>
-        <circle r="3.5" fill="#2ea043"/>
-        <text class="node-title" y="-4" text-anchor="middle">Self-Learning</text>
-        <text class="node-sub" y="10" text-anchor="middle">6-stage pipeline</text>
+        <circle r="56" fill="#101a13" stroke="#2ea043" stroke-width="1.5"/>
+        <circle r="56" fill="none" stroke="#2ea043" stroke-width="6" opacity="0.12" class="pulse" style="animation-delay:-2.4s"/>
+        <text class="node-title" y="-10" text-anchor="middle">Self-Learning</text>
+        <text class="node-sub" y="8" text-anchor="middle">6-stage pipeline</text>
         <text class="node-sub" y="22" text-anchor="middle">causal attribution</text>
       </g>
 
@@ -291,67 +285,57 @@
         </g>
       </g>
 
-      <!-- OUTER RING — CHANNELS (7 spokes) at r=400→480, positioned to avoid ring labels at top corners -->
+      <!-- OUTER RING — CHANNELS (7 spokes), EVENLY spaced every 360°/7 ≈ 51.43°, starting at top -->
       <g class="layer-channels" id="channels">
-        <!-- Distribute 7 angles from +X axis in degrees: 260, 310, 340, 20, 50, 100, 150 roughly
-             Actually place them evenly in lower half + avoid top where Telegram was colliding.
-             Spread: -70, -40, -10, 20, 50, 200 (bottom-left), 160 (bottom-right top mirror)
-             Simpler: use angles that dodge top-center: [-75, -40, -10, 25, 70, 195, 225] (deg from east, svg y flipped) -->
 
-        <!-- ch-telegram — NE (angle -75°): cos=0.259, sin=-0.966 -->
-        <!-- start r=258: (700+66.8, 480-249.1)=(766.8, 230.9); end r=420: (700+108.8, 480-405.7)=(808.8, 74.3) -->
+        <!-- ch-telegram · -90° (top) — (700, 222) → (700, 60) -->
         <g class="node" data-id="ch-telegram">
-          <line x1="766.8" y1="230.9" x2="808.8" y2="74.3" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="812" cy="62" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="824" y="60" style="fill:#e6edf3">Telegram</text>
+          <line x1="700" y1="222" x2="700" y2="68" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="700" cy="60" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="700" y="44" text-anchor="middle" style="fill:#e6edf3">Telegram</text>
         </g>
 
-        <!-- ch-email — E-upper (angle -35°): cos=0.819, sin=-0.574 -->
-        <!-- start: (700+211.3, 480-148.1)=(911.3, 331.9); end: (700+344.0, 480-241.1)=(1044.0, 238.9) -->
+        <!-- ch-email · -38.57° — (901.8, 319.3) → (1028.4, 218.3) -->
         <g class="node" data-id="ch-email">
-          <line x1="911.3" y1="331.9" x2="1044" y2="238.9" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="1051" cy="234" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="1063" y="232" style="fill:#e6edf3">Email</text>
+          <line x1="901.8" y1="319.3" x2="1028.4" y2="218.3" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="1035" cy="213" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="1047" y="211" style="fill:#e6edf3">Email</text>
         </g>
 
-        <!-- ch-browser — E (angle 5°): cos=0.996, sin=0.087 -->
-        <!-- start: (700+256.9, 480+22.4)=(956.9, 502.4); end: (700+418.3, 480+36.5)=(1118.3, 516.5) -->
+        <!-- ch-browser · 12.86° — (951.6, 537.5) → (1109.4, 573.6) -->
         <g class="node" data-id="ch-browser">
-          <line x1="956.9" y1="502.4" x2="1118.3" y2="516.5" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="1125" cy="518" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="1137" y="521" style="fill:#e6edf3">Browser</text>
+          <line x1="951.6" y1="537.5" x2="1109.4" y2="573.6" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="1116" cy="575" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="1128" y="578" style="fill:#e6edf3">Browser</text>
         </g>
 
-        <!-- ch-inbox — SE (angle 50°): cos=0.643, sin=0.766 -->
-        <!-- start: (700+165.9, 480+197.6)=(865.9, 677.6); end: (700+270.1, 480+321.7)=(970.1, 801.7) -->
+        <!-- ch-inbox · 64.29° — (811.9, 712.5) → (882.3, 858.4) -->
         <g class="node" data-id="ch-inbox">
-          <line x1="865.9" y1="677.6" x2="970.1" y2="801.7" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="975" cy="807" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="987" y="810" style="fill:#e6edf3">Inbox Watcher</text>
+          <line x1="811.9" y1="712.5" x2="882.3" y2="858.4" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="885" cy="864" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="897" y="867" style="fill:#e6edf3">Obsidian / Notepad Monitor</text>
         </g>
 
-        <!-- ch-task — S (angle 95°): cos=-0.087, sin=0.996 -->
-        <!-- start: (700-22.4, 480+256.9)=(677.6, 736.9); end: (700-36.5, 480+418.3)=(663.5, 898.3) -->
-        <g class="node" data-id="ch-task">
-          <line x1="677.6" y1="736.9" x2="663.5" y2="898.3" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="662" cy="905" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="655" y="925" text-anchor="end" style="fill:#e6edf3">Task Executor</text>
-        </g>
-
-        <!-- ch-bgsessions — SW (angle 140°): cos=-0.766, sin=0.643 -->
-        <!-- start: (700-197.6, 480+165.9)=(502.4, 645.9); end: (700-321.7, 480+270.1)=(378.3, 750.1) -->
+        <!-- ch-bgsessions · 128° (halfway between original 115.71° and adjusted 140°) -->
+        <!-- start r=258: (541, 683.2); dot r=420: (441.3, 810.9) -->
         <g class="node" data-id="ch-bgsessions">
-          <line x1="502.4" y1="645.9" x2="378.3" y2="750.1" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="372" cy="755" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="360" y="758" text-anchor="end" style="fill:#e6edf3">Background Sessions</text>
+          <line x1="541" y1="683.2" x2="441.3" y2="810.9" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="435" cy="815" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="423" y="818" text-anchor="end" style="fill:#e6edf3">Background Sessions</text>
         </g>
 
-        <!-- ch-research — W (angle 185°): cos=-0.996, sin=-0.087 -->
-        <!-- start: (700-256.9, 480-22.4)=(443.1, 457.6); end: (700-418.3, 480-36.5)=(281.7, 443.5) -->
+        <!-- ch-research · 167.14° — (448.4, 537.5) → (290.6, 573.6) -->
         <g class="node" data-id="ch-research">
-          <line x1="443.1" y1="457.6" x2="281.7" y2="443.5" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
-          <circle cx="275" cy="442" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
-          <text class="node-sub" x="263" y="445" text-anchor="end" style="fill:#e6edf3">Research Stack</text>
+          <line x1="448.4" y1="537.5" x2="290.6" y2="573.6" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="284" cy="575" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="272" y="578" text-anchor="end" style="fill:#e6edf3">Research Stack</text>
+        </g>
+
+        <!-- ch-task · 218.57° (upper-left) — (498.2, 319.3) → (371.6, 218.3) -->
+        <g class="node" data-id="ch-task">
+          <line x1="498.2" y1="319.3" x2="371.6" y2="218.3" stroke="#2b394a" stroke-width="1" stroke-dasharray="2 3"/>
+          <circle cx="365" cy="213" r="6" fill="#0d1117" stroke="#e6edf3" stroke-width="1.2"/>
+          <text class="node-sub" x="353" y="211" text-anchor="end" style="fill:#e6edf3">Task Executor</text>
         </g>
       </g>
 
@@ -385,7 +369,6 @@
       <span class="sw"><i style="background:#8b5cf6"></i>surplus / background</span>
       <span class="sw"><i style="background:#d4a73a"></i>4 MCP servers</span>
     </div>
-    <div class="corner-tag">GENesis-AGI · v0</div>
   </div>
 </div>
 
@@ -422,7 +405,7 @@
     "ch-telegram":{kicker:"CHANNEL",dot:"#e6edf3",title:"Telegram",body:"Human-facing conversational surface. Messages land in the inbox watcher and get classified for depth.",tags:["inbound","outbound"]},
     "ch-email":{kicker:"CHANNEL",dot:"#e6edf3",title:"Email",body:"Long-form asynchronous surface. Integrated with Outreach + Mail modules.",tags:["async"]},
     "ch-browser":{kicker:"CHANNEL",dot:"#e6edf3",title:"Browser",body:"Controlled browser surface for research, form-filling, and web-scale observation.",tags:["research","automation"]},
-    "ch-inbox":{kicker:"CHANNEL",dot:"#e6edf3",title:"Inbox Watcher",body:"Polls inbound surfaces on a fast cadence and routes signals into Awareness.",tags:["polling"]},
+    "ch-inbox":{kicker:"CHANNEL",dot:"#e6edf3",title:"Obsidian / Notepad Monitor",body:"Watches local notes (Obsidian vault, notepads) and routes changes into Awareness as signals.",tags:["obsidian","file-watch"]},
     "ch-task":{kicker:"CHANNEL",dot:"#e6edf3",title:"Task Executor",body:"Runs background tasks on behalf of Reflection + Learning. Bounded by Autonomy's trust level.",tags:["executor"]},
     "ch-bgsessions":{kicker:"CHANNEL",dot:"#e6edf3",title:"Background Sessions",body:"Long-running sessions for surplus/idle cognition. Purple-tagged in cost reports.",tags:["idle","surplus"]},
     "ch-research":{kicker:"CHANNEL",dot:"#e6edf3",title:"Research Stack",body:"Dedicated deep-research surface — planning, crawling, synthesis, citation.",tags:["deep-research"]},
