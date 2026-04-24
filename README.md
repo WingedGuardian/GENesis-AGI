@@ -49,11 +49,13 @@ Not the sci-fi version. The real one: a system that remembers everything, learns
 Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
 
 <details>
-<summary><i>But wait — is this truly AGI?</i></summary>
+<summary><i>But wait — is this really AGI?</i></summary>
 
 <br>
 
-Placeholder — coming soon.
+Truthfully, no, this is not "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orcestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are the right archetecture for this task in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even. 
+
+But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behviours and capabilities that AGI would presumably need to exhibit. 
 
 </details>
 
