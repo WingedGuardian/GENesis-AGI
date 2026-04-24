@@ -53,7 +53,7 @@ Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
 
 <br>
 
-Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
+Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are neccessarily the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
 
 But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behaviours and capabilities that AGI would presumably need to exhibit. If AGI sounds like something you'd like to help contribute to, [**come build with us →**](#get-involved)
 
