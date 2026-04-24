@@ -85,6 +85,28 @@ async def test_create_background_no_dispatch_mode(db, manager):
     assert meta["skill_tags"] == ["light-reflection"]
 
 
+async def test_create_background_with_profile(db, manager):
+    """Profile is stored in metadata at creation time."""
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        dispatch_mode="direct",
+        profile="observe",
+    )
+    meta = json.loads(sess["metadata"])
+    assert meta["profile"] == "observe"
+    assert meta["dispatch_mode"] == "direct"
+
+
+async def test_create_background_no_profile(db, manager):
+    """Without profile, metadata omits the key (backward compat)."""
+    sess = await manager.create_background(
+        session_type=SessionType.BACKGROUND_REFLECTION,
+        model=CCModel.SONNET,
+    )
+    assert sess["metadata"] is None
+
+
 async def test_checkpoint(db, manager):
     sess = await manager.get_or_create_foreground(
         user_id="u1", channel=ChannelType.TELEGRAM,
