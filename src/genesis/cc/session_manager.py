@@ -86,6 +86,7 @@ class SessionManager:
         source_tag: str = "background",
         skill_tags: list[str] | None = None,
         dispatch_mode: str | None = None,
+        profile: str | None = None,
     ) -> dict:
         now = datetime.now(UTC).isoformat()
         sess_id = str(uuid.uuid4())
@@ -94,6 +95,8 @@ class SessionManager:
             meta["skill_tags"] = skill_tags
         if dispatch_mode:
             meta["dispatch_mode"] = dispatch_mode
+        if profile:
+            meta["profile"] = profile
         metadata = json.dumps(meta) if meta else None
         await cc_sessions.create(
             self._db,

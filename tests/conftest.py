@@ -72,6 +72,7 @@ def _isolate_circuit_breaker_state(tmp_path, monkeypatch):
 @pytest.fixture
 async def db():
     """In-memory SQLite database with all tables created and seeded."""
+    from genesis.db.connection import SerializedConnection
     from genesis.db.schema import create_all_tables, seed_data
 
     conn = await aiosqlite.connect(":memory:")
@@ -80,13 +81,15 @@ async def db():
     await create_all_tables(conn)
     await seed_data(conn)
     await conn.commit()
-    yield conn
-    await conn.close()
+    wrapped = SerializedConnection(conn)
+    yield wrapped
+    await wrapped.close()
 
 
 @pytest.fixture
 async def empty_db():
     """In-memory SQLite database with tables but no seed data."""
+    from genesis.db.connection import SerializedConnection
     from genesis.db.schema import create_all_tables
 
     conn = await aiosqlite.connect(":memory:")
@@ -94,5 +97,6 @@ async def empty_db():
     await conn.execute("PRAGMA foreign_keys=ON")
     await create_all_tables(conn)
     await conn.commit()
-    yield conn
-    await conn.close()
+    wrapped = SerializedConnection(conn)
+    yield wrapped
+    await wrapped.close()

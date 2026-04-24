@@ -219,6 +219,7 @@ class DirectSessionRunner:
             effort=request.effort,
             source_tag=request.source_tag,
             dispatch_mode="direct",
+            profile=request.profile,
         )
         session_id = session["id"]
 
