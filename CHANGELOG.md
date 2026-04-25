@@ -7,6 +7,60 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a10] - 2026-04-24
+
+31-commit release. Themes: **multi-step surplus pipelines**, **ego
+autonomy**, **browser stealth**, and **reflection quality**.
+
+### Added
+
+- **Surplus pipeline engine** (#147, #149) — deterministic multi-step
+  task chains for analytical work. Each step runs on free-tier models;
+  the pipeline mechanically advances between steps. First pipeline:
+  prompt effectiveness review (catalog call sites, sample outputs,
+  evaluate and recommend improvements).
+- **Autonomous ego cycle** (#142, #143) — persistent thinking sessions
+  with adaptive cadence. Ego proposes actions via Telegram; user approves
+  or rejects. Approval requests exempt from message dedup so they always
+  arrive.
+- **Follow-up management** (#146) — `follow_up_update` MCP tool for
+  modifying tracked follow-up items. Outreach engagement enabled in
+  research profile.
+- **Browser stealth layer 2** (#128) — humanized mouse movements, typing
+  cadence, click randomization, and CAPTCHA escalation for automated
+  browser sessions.
+- **CDP remote backend** (#135) — drive a real Chrome browser over
+  Tailscale instead of running headless locally.
+
+### Changed
+
+- **Reflection quality improvements** (#123, #127, #139) — identity
+  context for API reflection path, surplus decoupled from reflection
+  engine, sentinel recovery wiring, light cognitive state, frequency
+  tuning, and NOMINAL quality gate for infrastructure monitoring.
+- **Browser reliability** (#126, #133, #134) — always-headed mode, hard
+  timeouts, keyboard fallback, ambiguous selector guard, noVNC scaling
+  fix.
+
+### Fixed
+
+- **Database write serialization** (#141) — prevents permanent connection
+  lock when concurrent writes collide on aiosqlite.
+- **Dashboard scroll restoration** (#124) — mouse wheel scrolling works
+  on all pages again.
+- **Sentinel dashboard indicator** (#130) — yellow indicator for approval
+  states plus CI skip markers.
+- **Safety fixes** (#136) — surplus test hardening, morning report idle
+  filter, sentinel re-verify.
+
+### Removed
+
+- **Infrastructure monitor schedule** — removed from surplus cron.
+  Produced noise (459 insights, 1 promotion). Returns as a focused
+  "monitor the monitors" pipeline in a future release.
+
+---
+
 ## [v3.0a9] - 2026-04-22
 
 7-commit release. Themes: **background session spawner**, **content
