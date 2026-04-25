@@ -36,20 +36,38 @@ to Genesis. Produce a structured evaluation with clear recommendations.
 
 ## Output Format
 
-```yaml
-target: <what was evaluated>
-date: <YYYY-MM-DD>
-recommendation: ADOPT | WATCH | IGNORE | ADAPT
-summary: <2-3 sentences>
-capability_gap: <low | medium | high>
-replacement_risk: <low | medium | high>
-integration_cost: <low | medium | high>
-lock_in_risk: <low | medium | high>
-action_items:
-  - <concrete next step if any>
-reasoning: |
-  <detailed reasoning, 3-5 paragraphs>
-```
+When invoked from the inbox, follow the output template in `INBOX_EVALUATE.md`
+(summary-first, then lens-by-lens). When invoked standalone (e.g., `/evaluate`),
+use this structure:
+
+**{target title or URL}** — {recommendation: ADOPT | WATCH | IGNORE | ADAPT}
+
+### Summary
+
+{1-2 paragraphs: what this is, what it means for Genesis, and the key
+architectural implications. Lead with what matters most. This is a TLDR — if
+a scoring axis is unremarkable, skip it here.}
+
+**Scores:** Capability gap: {low|medium|high} · Replacement risk: {low|medium|high} · Integration cost: {low|medium|high} · Lock-in risk: {low|medium|high}
+
+**Action items:**
+- {concrete next step if any}
+
+### How It Helps
+
+{Direct applicability, ready-to-use tools, validated patterns}
+
+### How It Doesn't Help
+
+{Incompatibilities, misalignment, maturity concerns}
+
+### How It COULD Help
+
+{Patterns worth stealing, future version ideas, creative applications}
+
+### What to Learn
+
+{Engineering patterns, competitive positioning, design principles}
 
 ## References
 

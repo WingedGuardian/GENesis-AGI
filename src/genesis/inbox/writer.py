@@ -77,9 +77,6 @@ class ResponseWriter:
             "date": datetime_str,
             "source_files": source_files,
             "batch_id": batch_id,
-            "item_count": item_count,
-            "status": "complete",
-            "tags": ["genesis/inbox", "genesis/evaluation"],
         }
         frontmatter = _dump_frontmatter(frontmatter_data)
 

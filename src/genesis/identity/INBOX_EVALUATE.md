@@ -403,23 +403,56 @@ If any evaluation produces concrete action items:
 **CRITICAL: Your evaluation text must be the absolute last thing you produce.
 Do NOT make any tool calls after writing this text.**
 
+### Cognitive Ordering
+
+You think through all four lenses first, then compose the summary from those
+findings — but you format the output with the summary ABOVE the detailed lens
+breakdown. The reader sees the summary first; you write it last (cognitively).
+
+### Output Format
+
 Produce your response as readable markdown (NOT JSON). Structure it as:
 
 # Inbox Evaluation — {date}
 
-Genesis evaluated {N} items from your inbox.
+Genesis evaluated {N} items from your inbox: "{exact URL or title 1}", "{exact URL or title 2}"
 
-## Item 1: {filename}
+{If any URLs failed to fetch or had issues, note it briefly here — one line per
+issue. Otherwise omit this section entirely.}
 
-**Classification:** [category]
+## {URL or title of item 1}
 
-**Decision:** Research | Note | Question | To-do | Acknowledged
+**Classification:** [category] | **Decision:** Research | Note | Question | To-do
 
-{Evaluation using the appropriate framework}
+{1-2 sentence primer — what this source actually is.}
+
+### Summary
+
+{1-2 paragraphs capturing the most important findings across all lenses. Lead
+with what matters most. If a lens contributed nothing meaningful, don't mention
+it — this is a TLDR, not a formality. The reader should be able to stop here
+and know: what this is, why it matters (or doesn't), and what to do about it.}
+
+### Lens 1: {lens name}
+
+{Full analysis for this lens}
+
+### Lens 2: {lens name}
+
+{Full analysis for this lens}
+
+### Lens 3: {lens name}
+
+{Full analysis for this lens}
+
+### Lens 4: {lens name}
+
+{Full analysis for this lens}
 
 ---
 
-*Evaluated by Genesis using the inbox evaluation framework.*
+{Repeat the pattern above for each additional item: heading, classification,
+primer, summary, then lenses.}
 
 The inbox session cannot write to these files directly (Write tool is disallowed),
 but note the recommended action item in the response so foreground sessions or

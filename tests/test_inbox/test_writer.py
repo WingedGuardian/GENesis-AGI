@@ -70,9 +70,8 @@ async def test_write_valid_frontmatter(writer: ResponseWriter, tmp_path: Path):
     )
     content = path.read_text()
     assert content.startswith("---\n")
-    assert "item_count: 2" in content
-    assert "status: complete" in content
-    assert "genesis/inbox" in content
+    assert "batch_id: batch123" in content
+    assert "links.md" in content
 
 
 @pytest.mark.asyncio

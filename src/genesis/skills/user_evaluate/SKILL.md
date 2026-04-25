@@ -41,17 +41,39 @@ working on. Assume everything matters; find HOW it matters.
 
 ## Output Format
 
-```yaml
-target: <what was evaluated>
-date: <YYYY-MM-DD>
-summary: <2-3 sentences — what it is and why it might matter to the user>
-action_timeline: Now | Soon | Someday
-relevance: Direct | Tangential | Background
-action_items:
-  - <concrete collaborative next step if any>
-reasoning: |
-  <four-lens evaluation, 3-5 paragraphs>
-```
+When invoked from the inbox, follow the output template in `INBOX_EVALUATE.md`
+(summary-first, then lens-by-lens). When invoked standalone (e.g.,
+`/user-evaluate`), use this structure:
+
+**{target title or URL}**
+
+**Timeline:** {Now | Soon | Someday} · **Relevance:** {Direct | Tangential | Background}
+
+### Summary
+
+{1-2 paragraphs: what this is, why it matters to the user, and what to do
+about it. Lead with what matters most. If a lens contributed nothing meaningful,
+don't pad — this is a TLDR, not a formality. The reader should be able to stop
+here and know the key takeaway.}
+
+**Action items:**
+- {concrete collaborative next step if any}
+
+### What This Is
+
+{Content-native analysis — argument, evidence, contribution}
+
+### How This Could Help You
+
+{User-model-informed value extraction}
+
+### What We Could Do With It
+
+{Collaborative actions — Genesis + user}
+
+### What to Watch
+
+{Critical assessment — gaps, biases, counterarguments}
 
 ## Key Rules
 
