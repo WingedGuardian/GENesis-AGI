@@ -6,7 +6,7 @@ Catches all variations of pushing to or merging into the main branch:
 - git push origin main
 - git push -u origin main
 - git merge <branch> (when on main)
-- gh pr merge (without --admin, which requires explicit user action)
+- gh pr merge (without --admin — requires explicit user approval flag)
 
 Stdlib-only. Fail-open on parse errors (don't block legitimate work).
 """
@@ -113,6 +113,18 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
+
+        # ── gh pr merge without --admin ────────────────────────────
+        if "gh pr merge" in cmd and "--admin" not in cmd:
+            print(
+                "BLOCKED: gh pr merge without --admin is not allowed.",
+                file=sys.stderr,
+            )
+            print(
+                "Use: gh pr merge --squash --admin",
+                file=sys.stderr,
+            )
+            return 2
 
     except (json.JSONDecodeError, KeyError):
         pass  # Fail-open on parse errors
