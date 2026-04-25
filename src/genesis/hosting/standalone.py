@@ -82,6 +82,12 @@ class StandaloneAdapter:
         # coroutines via asyncio.run_coroutine_threadsafe().
         self._loop = asyncio.get_running_loop()
 
+        # Expose the runtime loop to Flask threads so _async_route (and any
+        # code using run_coroutine_threadsafe) can bridge sync→async safely.
+        # Must be set unconditionally — OpenClaw init may fail, but every
+        # dashboard route still needs the loop reference.
+        self._app.config["GENESIS_EVENT_LOOP"] = self._loop
+
         # Create shared ConversationLoop for the OpenClaw endpoint.
         # Same pattern as _start_telegram() but without channel-specific
         # wiring (TTS, reply waiter, etc.).
@@ -201,7 +207,6 @@ class StandaloneAdapter:
             )
 
             self._app.config["OPENCLAW_CONVERSATION_LOOP"] = conversation_loop
-            self._app.config["GENESIS_EVENT_LOOP"] = self._loop
             logger.info("OpenClaw ConversationLoop initialized")
         except Exception:
             logger.exception("Failed to initialize OpenClaw ConversationLoop")
