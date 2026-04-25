@@ -7,7 +7,7 @@ dependencies = [
     "aiohttp",
     "apscheduler>=3.11,<4",
     "python-telegram-bot>=21.0",
-    "litellm==1.78.7",  # pinned — 1.82.7/1.82.8 contain malware; CVE-2026-35030/35029 not exploitable
+    "litellm==1.83.7",  # pinned — 1.82.7/1.82.8 contain malware; CVE-2026-35030/35029 not exploitable
                        # (Genesis uses acompletion/completion_cost only, no proxy server or OIDC)
     "qdrant-client",
     "pyyaml",
