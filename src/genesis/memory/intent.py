@@ -355,8 +355,13 @@ async def expand_query(
         if not expansions:
             return query
 
-        # Append expansion terms to original query
-        expanded = query + " " + " ".join(expansions)
+        # Build boolean FTS5 query: original terms AND'd, expansions OR'd
+        # e.g. "configure routing" + expansions [setup, deploy] →
+        #   "(configure AND routing) OR setup OR deploy"
+        # This broadens recall without losing the original intent.
+        original_and = " AND ".join(keywords)
+        parts = [f"({original_and})"] + expansions
+        expanded = " OR ".join(parts)
         logger.debug("Query expanded: %r → %r", query, expanded)
         return expanded
 

@@ -14,9 +14,19 @@ import aiosqlite
 def _escape_fts5(query: str) -> str | None:
     """Escape FTS5 special characters to prevent syntax errors from user input.
 
+    Preserves FTS5 boolean operators (OR, AND) and parentheses when present,
+    allowing callers to pass pre-constructed boolean queries. Plain queries
+    without operators are treated as implicit AND (FTS5 default).
+
     Returns None if the query is empty after escaping (caller should return []).
     """
-    cleaned = re.sub(r'[^\w\s]', " ", query, flags=re.UNICODE).strip()
+    # Check if query contains boolean operators (from expand_query)
+    has_boolean = bool(re.search(r'\bOR\b|\bAND\b', query))
+    if has_boolean:
+        # Preserve OR/AND keywords and parentheses, escape everything else
+        cleaned = re.sub(r'[^\w\s()"]', " ", query, flags=re.UNICODE).strip()
+    else:
+        cleaned = re.sub(r'[^\w\s]', " ", query, flags=re.UNICODE).strip()
     return cleaned or None
 
 
