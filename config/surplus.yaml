@@ -12,7 +12,6 @@ jobs:
   brainstorm_check_hours: 12
   code_audit_hours: 12
   code_index_hours: 4
-  infra_monitor_hours: 2
   recon_gather_hours: 84       # ~3.5 days
   maintenance_hours: 6
   analytical_hours: 24            # gap_clustering, anticipatory_research, prompt_effectiveness

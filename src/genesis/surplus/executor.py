@@ -76,7 +76,10 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "patterns, or trends that could become problems.\n\n"
         "If everything is operating normally with no concerns, respond with "
         "exactly the word NOMINAL and nothing else.\n\n"
-        "Respond in plain text (2-4 sentences for concerns, or just NOMINAL)."
+        "Respond in plain text (2-4 sentences for concerns, or just NOMINAL).\n\n"
+        "Do not reference specific system commands, service names, or file "
+        "paths unless you have verified they exist.  Report what you observe, "
+        "not what you assume the fix would be."
     ),
     TaskType.BRAINSTORM_USER: (
         "You are brainstorming ways to create value for your user.\n\n"
@@ -230,6 +233,19 @@ class SurplusLLMExecutor:
             )
 
         context = await self._gather_context(task)
+
+        # Inject previous pipeline step output into context if present
+        if task.payload:
+            try:
+                payload_data = json.loads(task.payload)
+                prev = payload_data.get("previous_output")
+                if prev:
+                    context = (
+                        f"## Previous Step Output\n{prev}\n\n"
+                        f"## Additional Context\n{context}"
+                    )
+            except (ValueError, TypeError):
+                pass
 
         if task.task_type == TaskType.INFRASTRUCTURE_MONITOR:
             return template.format(signals=context)

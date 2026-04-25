@@ -118,10 +118,10 @@ async def test_start_and_stop(db):
     assert sched._scheduler.get_job("surplus_brainstorm_check") is not None
     assert sched._scheduler.get_job("surplus_dispatch") is not None
     assert sched._scheduler.get_job("schedule_code_audit") is not None
-    # Brainstorm (2) + code audit (1) + code index (1) + infra monitor (1)
-    # + maintenance (4) + analytical (1: gap_clustering) = 10
-    # (anticipatory_research and prompt_effectiveness_review deactivated)
-    assert await sched._queue.pending_count() == 10
+    # Brainstorm (2) + code audit (1) + code index (1)
+    # + maintenance (4) + analytical (1: gap_clustering) = 9
+    # (infra_monitor removed, anticipatory/prompt_effectiveness deactivated)
+    assert await sched._queue.pending_count() == 9
     # Stop should not raise
     await sched.stop()
 
@@ -133,9 +133,9 @@ async def test_start_without_code_audits(db):
     assert sched._scheduler.running is True
     # Code audit job should NOT be registered
     assert sched._scheduler.get_job("schedule_code_audit") is None
-    # Brainstorm (2) + code index (1) + infra monitor (1)
-    # + maintenance (4) + analytical (1: gap_clustering) = 9
-    assert await sched._queue.pending_count() == 9
+    # Brainstorm (2) + code index (1)
+    # + maintenance (4) + analytical (1: gap_clustering) = 8
+    assert await sched._queue.pending_count() == 8
     await sched.stop()
 
 
