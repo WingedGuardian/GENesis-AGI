@@ -9,8 +9,8 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ## [v3.0a10] - 2026-04-24
 
-31-commit release. Themes: **multi-step surplus pipelines**, **ego
-autonomy**, **browser stealth**, and **reflection quality**.
+31-commit release. Themes: **multi-step surplus pipelines**, **browser
+stealth**, and **reflection quality**.
 
 ### Added
 
@@ -19,13 +19,8 @@ autonomy**, **browser stealth**, and **reflection quality**.
   the pipeline mechanically advances between steps. First pipeline:
   prompt effectiveness review (catalog call sites, sample outputs,
   evaluate and recommend improvements).
-- **Autonomous ego cycle** (#142, #143) — persistent thinking sessions
-  with adaptive cadence. Ego proposes actions via Telegram; user approves
-  or rejects. Approval requests exempt from message dedup so they always
-  arrive.
 - **Follow-up management** (#146) — `follow_up_update` MCP tool for
-  modifying tracked follow-up items. Outreach engagement enabled in
-  research profile.
+  modifying tracked follow-up items.
 - **Browser stealth layer 2** (#128) — humanized mouse movements, typing
   cadence, click randomization, and CAPTCHA escalation for automated
   browser sessions.
