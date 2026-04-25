@@ -143,13 +143,6 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         needs_restart=False,
         dedicated_tool="recon_sources",
     ),
-    "ego": SettingsDomain(
-        name="ego",
-        description="Ego session settings (cadence, model, budget, morning report, circuit breaker)",
-        config_filename="ego.yaml",
-        readonly=False,
-        needs_restart=False,
-    ),
     "confidence_gates": SettingsDomain(
         name="confidence_gates",
         description="Confidence gating thresholds for observations, memory, and reflection",
@@ -371,12 +364,6 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
     return errors
 
 
-def _validate_ego(changes: dict) -> list[str]:
-    """Validate ego config changes."""
-    from genesis.ego.config import validate_ego_config
-    return validate_ego_config(changes)
-
-
 def _validate_autonomous_cli_policy(changes: dict) -> list[str]:
     """Validate autonomous CLI policy changes."""
     errors: list[str] = []
@@ -517,7 +504,6 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
     "inbox_monitor": _validate_inbox_monitor,
-    "ego": _validate_ego,
     "autonomous_cli_policy": _validate_autonomous_cli_policy,
     "updates": _validate_updates,
     "surplus": _validate_surplus,

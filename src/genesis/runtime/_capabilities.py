@@ -49,7 +49,6 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "health_data": "Health data service — aggregates subsystem status for dashboard and MCP tools",
     "outreach": "Outreach pipeline + scheduler — morning reports, alerts, proactive Telegram messages",
     "autonomy": "Autonomy manager — task classification, protected paths, action verification, approval gates",
-    "ego": "Autonomous decision-making cycle — periodic thinking, proposals via Telegram, adaptive cadence with budget controls",
     "modules": "Capability module registry — domain-specific add-on modules (prediction markets, crypto ops)",
     "pipeline": "Pipeline orchestrator — signal collection, triage, and module dispatch cycles",
     "memory_extraction": "Periodic cross-session memory extraction — entities, decisions, relationships from conversation transcripts",

@@ -379,9 +379,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         await self._run_init_step_async("autonomy", self._init_autonomy)
 
         if _full:
-            await self._run_init_step_async("ego", self._init_ego)
-
-        if _full:
             await self._run_init_step_async("tasks", self._init_tasks)
         self._run_init_step("guardian", self._probe_guardian_status)
 

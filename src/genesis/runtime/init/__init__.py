@@ -6,7 +6,6 @@ from genesis.runtime.init import (
     cc_relay,
     db,
     direct_session,
-    ego,
     health_data,
     inbox,
     learning,
@@ -46,6 +45,5 @@ __all__ = [
     "health_data",
     "outreach",
     "autonomy",
-    "ego",
     "tasks",
 ]
