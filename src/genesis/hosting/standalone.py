@@ -170,8 +170,7 @@ class StandaloneAdapter:
         """Create a ConversationLoop for the OpenClaw completions endpoint.
 
         Stored in Flask app config so the completions blueprint can access
-        it from request context.  Also stores the asyncio loop reference
-        so Flask threads can submit coroutines to the main loop.
+        it from request context.
         """
         if self._app is None or self._runtime is None:
             return

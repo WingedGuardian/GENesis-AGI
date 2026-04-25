@@ -9,7 +9,7 @@ import re
 import uuid
 from pathlib import Path
 
-from flask import current_app, jsonify, request
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 
@@ -137,33 +137,18 @@ async def knowledge_ingest_upload():
             return jsonify({"error": "Upload not found"}), 404
         return jsonify({"error": f"Upload in '{upload['status']}' state, expected 'uploaded'"}), 409
 
-    # Dispatch ingestion to the main event loop (fire-and-forget)
+    # Fire-and-forget: _async_route already runs us on the main event loop,
+    # so create_task schedules directly without an extra cross-thread hop.
     from genesis.knowledge.ingest_upload import run_ingest
 
-    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
-    if event_loop and event_loop.is_running():
-        asyncio.run_coroutine_threadsafe(
-            run_ingest(
-                upload_id,
-                project_type=project_type,
-                domain=domain,
-                purpose=purpose_list,
-                context=context,
-                mode=mode,
-            ),
-            event_loop,
-        )
-    else:
-        # Fallback: run in current request's event loop (blocks until done)
-        logger.warning("Main event loop unavailable — running ingest synchronously")
-        await run_ingest(
-            upload_id,
-            project_type=project_type,
-            domain=domain,
-            purpose=purpose_list,
-            context=context,
-            mode=mode,
-        )
+    asyncio.create_task(run_ingest(
+        upload_id,
+        project_type=project_type,
+        domain=domain,
+        purpose=purpose_list,
+        context=context,
+        mode=mode,
+    ))
 
     return jsonify({
         "upload_id": upload_id,
