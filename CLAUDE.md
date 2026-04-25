@@ -93,6 +93,12 @@ components — invoke the `genesis-development` skill via the Skill tool
 immediately. Do NOT load it for Genesis-as-tool work (using
 Genesis to research, summarize, write content, or do non-Genesis tasks).
 
+## Vision
+
+- **Philosophical foundation**: `docs/architecture/genesis-v3-vision.md` —
+  Genesis's self-understanding, purpose, and aspirations. Read this when
+  you need your "why."
+
 ## Design Principles
 
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable

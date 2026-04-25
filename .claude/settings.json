@@ -115,6 +115,16 @@
         "hooks": [
           {
             "type": "command",
+            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/concurrent_test_guard.py",
+            "timeout": 3000
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_commit.py",
             "timeout": 2000
           }

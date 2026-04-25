@@ -154,6 +154,15 @@ class WatchdogChecker:
 
         if staleness_s <= self._staleness_threshold:
             logger.debug("Status file fresh (%.0fs old, threshold %ds)", staleness_s, self._staleness_threshold)
+            # Check for zombie schedulers: process alive but scheduler dead.
+            zombie = self._check_scheduler_heartbeats(status)
+            if zombie:
+                logger.warning(
+                    "Zombie scheduler detected: %s — triggering restart",
+                    ", ".join(zombie),
+                )
+                state = self._load_state()
+                return self._restart_if_allowed(state, reason="zombie_scheduler")
             self._reset_state()
             return WatchdogAction.SKIP  # Healthy — no action needed
 
@@ -290,6 +299,34 @@ class WatchdogChecker:
         except (json.JSONDecodeError, OSError):
             logger.error("Failed to read status file at %s", self._status_path, exc_info=True)
             return None
+
+    @staticmethod
+    def _check_scheduler_heartbeats(
+        status: dict,
+        *,
+        threshold_s: int = 900,  # 15 min — surplus dispatches every 5m, awareness ticks every 5m
+    ) -> list[str]:
+        """Check scheduler_heartbeats in status.json for zombie schedulers.
+
+        Returns list of stale scheduler names (empty = healthy).
+        """
+        heartbeats = status.get("scheduler_heartbeats")
+        if not heartbeats:
+            return []  # No heartbeat data yet — don't alarm
+
+        now = datetime.now(UTC)
+        stale: list[str] = []
+        for name, ts_str in heartbeats.items():
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=UTC)
+                age_s = (now - ts).total_seconds()
+                if age_s > threshold_s:
+                    stale.append(f"{name} ({int(age_s)}s stale)")
+            except (ValueError, TypeError):
+                pass
+        return stale
 
     @staticmethod
     def _compute_staleness(status: dict) -> float | None:

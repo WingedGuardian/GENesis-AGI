@@ -476,7 +476,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _evolve_user_model,
-            IntervalTrigger(seconds=172800),
+            CronTrigger(hour=4, minute=30),
             id="user_model_evolution",
             max_instances=1,
             misfire_grace_time=3600,

@@ -60,6 +60,8 @@ class HybridRetriever:
         limit: int = 10,
         min_activation: float = 0.0,
         expand_query_terms: bool = False,
+        wing: str | None = None,
+        room: str | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF."""
         if source not in _SOURCE_TO_COLLECTIONS:
@@ -94,6 +96,8 @@ class HybridRetriever:
                         collection=coll,
                         query_vector=vector,
                         limit=candidate_limit,
+                        wing=wing,
+                        room=room,
                     )
                 for hit in hits:
                     hit["_collection"] = coll
@@ -221,6 +225,22 @@ class HybridRetriever:
 
         # 9. Sort by fused score descending
         candidates.sort(key=lambda m: fused[m], reverse=True)
+
+        # 9b. Filter FTS5-only candidates by wing/room (Qdrant results
+        #     are already filtered at query time; this catches FTS5-only
+        #     candidates that don't match the requested wing/room).
+        if wing or room:
+            filtered: list[str] = []
+            for mid in candidates:
+                qhit = qdrant_by_id.get(mid)
+                if qhit:
+                    # Qdrant already filtered — guaranteed match
+                    filtered.append(mid)
+                else:
+                    # FTS5-only candidate — no wing/room data, exclude
+                    # since we can't verify membership.
+                    pass
+            candidates = filtered
 
         # 10. Take top limit
         top = candidates[:limit]
