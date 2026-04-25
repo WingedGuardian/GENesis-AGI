@@ -48,7 +48,34 @@ class PipelineDefinition:
 # definition — no DB config, no YAML. Adding a pipeline = adding an
 # entry to this dict.
 
-PIPELINES: dict[str, PipelineDefinition] = {}
+PIPELINES: dict[str, PipelineDefinition] = {
+    "prompt_effectiveness": PipelineDefinition(
+        name="prompt_effectiveness",
+        steps=(
+            PipelineStep(
+                task_type=TaskType.PROMPT_REVIEW_CATALOG,
+                compute_tier=ComputeTier.FREE_API,
+                priority=0.4,
+            ),
+            PipelineStep(
+                task_type=TaskType.PROMPT_REVIEW_SAMPLE,
+                compute_tier=ComputeTier.FREE_API,
+                priority=0.4,
+            ),
+            PipelineStep(
+                task_type=TaskType.PROMPT_EFFECTIVENESS_REVIEW,
+                compute_tier=ComputeTier.FREE_API,
+                priority=0.5,
+            ),
+        ),
+        drive_alignment="competence",
+        description=(
+            "Three-step prompt effectiveness review: "
+            "catalog active call sites, sample recent outputs, "
+            "evaluate gaps and recommend improvements"
+        ),
+    ),
+}
 
 
 # ── Payload helpers ──────────────────────────────────────────────────

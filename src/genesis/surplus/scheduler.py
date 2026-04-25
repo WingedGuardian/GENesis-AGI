@@ -379,8 +379,7 @@ class SurplusScheduler:
 
             analytical_tasks = [
                 (TaskType.GAP_CLUSTERING, 0.4, "competence"),
-                # anticipatory_research and prompt_effectiveness_review return
-                # as multi-step pipelines — see pipelines.py.
+                # anticipatory_research returns as a pipeline — see pipelines.py.
             ]
             for task_type, priority, drive in analytical_tasks:
                 pending = await self._queue.pending_by_type(task_type)
@@ -388,6 +387,8 @@ class SurplusScheduler:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
+            # prompt_effectiveness runs as a 3-step pipeline.
+            await self.schedule_pipeline("prompt_effectiveness")
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_success("schedule_analytical")
@@ -415,11 +416,10 @@ class SurplusScheduler:
             return None
 
         step1 = defn.steps[0]
-        # Prevent re-enqueue if step 1's task type is already pending.
-        # This is imprecise (blocks if ANY task of this type is pending,
-        # not just pipeline tasks), but safe — false negatives only mean
-        # the pipeline waits one more cycle.
-        if await self._queue.pending_by_type(step1.task_type) > 0:
+        # Prevent re-enqueue if step 1's task type is already pending or
+        # running.  Checks RUNNING too — otherwise a slow pipeline step
+        # could allow a duplicate enqueue on the next scheduled cycle.
+        if await self._queue.active_by_type(step1.task_type) > 0:
             return None
 
         payload = build_initial_payload(pipeline_name, len(defn.steps))

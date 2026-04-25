@@ -360,3 +360,156 @@ async def test_schedule_pipeline_unknown():
     )
     result = await sched.schedule_pipeline("nonexistent_pipeline")
     assert result is None
+
+
+# ── Prompt effectiveness pipeline tests ───────────────────────────
+
+
+def test_prompt_effectiveness_pipeline_registered():
+    """prompt_effectiveness pipeline is registered in the PIPELINES dict."""
+    defn = get_pipeline("prompt_effectiveness")
+    assert defn is not None
+    assert defn.name == "prompt_effectiveness"
+
+
+def test_prompt_effectiveness_has_three_steps():
+    """prompt_effectiveness pipeline has exactly 3 steps."""
+    defn = get_pipeline("prompt_effectiveness")
+    assert defn is not None
+    assert len(defn.steps) == 3
+
+
+def test_prompt_effectiveness_step_types():
+    """Steps use the correct task types in order."""
+    defn = get_pipeline("prompt_effectiveness")
+    assert defn is not None
+    assert defn.steps[0].task_type == TaskType.PROMPT_REVIEW_CATALOG
+    assert defn.steps[1].task_type == TaskType.PROMPT_REVIEW_SAMPLE
+    assert defn.steps[2].task_type == TaskType.PROMPT_EFFECTIVENESS_REVIEW
+
+
+def test_prompt_effectiveness_all_free_tier():
+    """All steps use FREE_API compute tier."""
+    defn = get_pipeline("prompt_effectiveness")
+    assert defn is not None
+    for step in defn.steps:
+        assert step.compute_tier == ComputeTier.FREE_API
+
+
+async def test_prompt_effectiveness_three_step_chaining(db):
+    """Full 3-step pipeline chains correctly through all steps."""
+    from genesis.surplus.queue import SurplusQueue
+    from genesis.surplus.scheduler import SurplusScheduler
+    from genesis.surplus.types import ExecutorResult
+
+    queue = SurplusQueue(db=db)
+    step_outputs = [
+        "Step 1: Call site catalog — 12_surplus_brainstorm active, 37_infra disabled.",
+        "Step 2: Quality scores — brainstorm=Medium, gap_clustering=Low.",
+        "Step 3: Recommendations — improve gap_clustering prompt specificity.",
+    ]
+    call_count = 0
+
+    async def mock_execute(task):
+        nonlocal call_count
+        output = step_outputs[min(call_count, len(step_outputs) - 1)]
+        call_count += 1
+        return ExecutorResult(
+            success=True,
+            content=output,
+            insights=[{"generating_model": "test", "confidence": 0.5}],
+        )
+
+    mock_executor = AsyncMock()
+    mock_executor.execute = mock_execute
+
+    sched = SurplusScheduler(
+        db=db, queue=queue,
+        idle_detector=AsyncMock(),
+        compute_availability=AsyncMock(),
+        executor=mock_executor,
+    )
+    sched._idle_detector.is_idle = lambda **kwargs: True
+
+    # Enqueue step 1
+    payload = build_initial_payload("prompt_effectiveness", 3)
+    await queue.enqueue(
+        TaskType.PROMPT_REVIEW_CATALOG, ComputeTier.FREE_API,
+        0.4, "competence", payload=payload,
+    )
+
+    # Dispatch step 1 → should chain to step 2
+    with patch.object(sched._compute, "get_available_tiers", new_callable=AsyncMock, return_value=[ComputeTier.FREE_API]):
+        dispatched = await sched.dispatch_once()
+    assert dispatched is True
+
+    # Step 2 should be pending
+    pending = await queue.pending_by_type(TaskType.PROMPT_REVIEW_SAMPLE)
+    assert pending == 1
+
+    # Dispatch step 2 → should chain to step 3
+    with patch.object(sched._compute, "get_available_tiers", new_callable=AsyncMock, return_value=[ComputeTier.FREE_API]):
+        dispatched = await sched.dispatch_once()
+    assert dispatched is True
+
+    # Step 3 should be pending
+    pending = await queue.pending_by_type(TaskType.PROMPT_EFFECTIVENESS_REVIEW)
+    assert pending == 1
+
+    # Dispatch step 3 → final step, no more chaining
+    with patch.object(sched._compute, "get_available_tiers", new_callable=AsyncMock, return_value=[ComputeTier.FREE_API]):
+        dispatched = await sched.dispatch_once()
+    assert dispatched is True
+
+    # No more tasks pending
+    total = await queue.pending_count()
+    assert total == 0
+    assert call_count == 3
+
+
+async def test_active_by_type_includes_running(db):
+    """active_by_type counts both pending and running tasks."""
+    from genesis.surplus.queue import SurplusQueue
+
+    queue = SurplusQueue(db=db)
+
+    # Enqueue a task
+    task_id = await queue.enqueue(
+        TaskType.PROMPT_REVIEW_CATALOG, ComputeTier.FREE_API,
+        0.4, "competence",
+    )
+
+    # Pending: active_by_type should count it
+    assert await queue.active_by_type(TaskType.PROMPT_REVIEW_CATALOG) == 1
+
+    # Mark running: active_by_type should still count it
+    await queue.mark_running(task_id)
+    assert await queue.active_by_type(TaskType.PROMPT_REVIEW_CATALOG) == 1
+    # But pending_by_type should NOT count it
+    assert await queue.pending_by_type(TaskType.PROMPT_REVIEW_CATALOG) == 0
+
+    # Mark completed: active_by_type should NOT count it
+    await queue.mark_completed(task_id)
+    assert await queue.active_by_type(TaskType.PROMPT_REVIEW_CATALOG) == 0
+
+
+async def test_schedule_pipeline_blocks_on_running(db):
+    """schedule_pipeline returns None if step 1 type is running (not just pending)."""
+    from genesis.surplus.queue import SurplusQueue
+    from genesis.surplus.scheduler import SurplusScheduler
+
+    queue = SurplusQueue(db=db)
+    sched = SurplusScheduler(
+        db=db, queue=queue,
+        idle_detector=AsyncMock(),
+        compute_availability=AsyncMock(),
+    )
+
+    # Enqueue step 1 and mark it running
+    task_id = await sched.schedule_pipeline("prompt_effectiveness")
+    assert task_id is not None
+    await queue.mark_running(task_id)
+
+    # Second schedule attempt should still be blocked (task is RUNNING)
+    result = await sched.schedule_pipeline("prompt_effectiveness")
+    assert result is None
