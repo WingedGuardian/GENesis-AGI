@@ -149,14 +149,50 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "research directions.\n\n"
         "Respond in plain text with numbered suggestions."
     ),
-    TaskType.PROMPT_EFFECTIVENESS_REVIEW: (
-        "You are reviewing prompt effectiveness for an autonomous AI.\n\n"
+    TaskType.PROMPT_REVIEW_CATALOG: (
+        "You are cataloging LLM call site activity for an autonomous AI.\n\n"
         "{context}\n\n"
         "## Task\n"
-        "Assess whether recent LLM outputs have been high-quality and "
-        "on-target.  Identify prompts or call sites that consistently "
-        "produce poor results and suggest improvements.\n\n"
-        "Respond in plain text with bullet points."
+        "Review the call site activity data above.  For each active call "
+        "site, summarize: what it does, how often it fires, which model it "
+        "uses, its cost efficiency (tokens in vs out), and success rate.\n\n"
+        "Flag any concerning patterns: silent sites (not firing when they "
+        "should), expensive sites (high token usage for low value), or "
+        "failing sites (low success rate).\n\n"
+        "If no call site data is available, state that no data was found "
+        "and produce no findings.\n\n"
+        "Respond in plain text with a numbered list of call sites and a "
+        "summary section for flagged concerns."
+    ),
+    TaskType.PROMPT_REVIEW_SAMPLE: (
+        "You are sampling and scoring recent LLM outputs for an "
+        "autonomous AI.\n\n"
+        "{context}\n\n"
+        "## Task\n"
+        "Review the recent LLM outputs above.  For each task type or call "
+        "site represented, score the outputs on three dimensions:\n"
+        "- **Relevance**: Does the output address the intended purpose?\n"
+        "- **Actionability**: Are recommendations specific enough to act on?\n"
+        "- **Specificity**: Does it reference real data, or is it generic?\n\n"
+        "Use a simple Low/Medium/High scale.  Identify which task types "
+        "produce consistently good vs poor results.\n\n"
+        "Respond in plain text with a scored summary per task type."
+    ),
+    TaskType.PROMPT_EFFECTIVENESS_REVIEW: (
+        "You are synthesizing a prompt effectiveness review for an "
+        "autonomous AI.\n\n"
+        "{context}\n\n"
+        "## Task\n"
+        "Using the call site activity catalog and output quality scores "
+        "in '## Previous Step Output' above (if present), identify the "
+        "2-3 highest-leverage improvements to LLM prompts or call sites.\n\n"
+        "For each recommendation:\n"
+        "1. Name the call site or task type\n"
+        "2. Describe the failure pattern (low relevance, generic output, etc.)\n"
+        "3. Suggest a concrete prompt improvement\n\n"
+        "If no prior analysis is present, assess general prompt quality "
+        "from the context above.\n\n"
+        "Respond in plain text with numbered recommendations."
     ),
 }
 
@@ -269,6 +305,101 @@ class SurplusLLMExecutor:
             except Exception:
                 parts.append("(Signal data unavailable)")
             return "\n".join(parts) if parts else "(No recent signals)"
+
+        # Pipeline step 1: call site activity + cost aggregation
+        if task.task_type == TaskType.PROMPT_REVIEW_CATALOG:
+            try:
+                cursor = await self._db.execute(
+                    "SELECT call_site_id, last_run_at, provider_used, "
+                    "model_id, input_tokens, output_tokens, success "
+                    "FROM call_site_last_run "
+                    "ORDER BY last_run_at DESC LIMIT 20"
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    parts.append("## Call Site Activity (most recent run per site)")
+                    for r in rows:
+                        cs = r[0] or "?"
+                        last = (r[1] or "?")[:19]
+                        provider = r[2] or "?"
+                        model = r[3] or "?"
+                        in_tok = r[4] or 0
+                        out_tok = r[5] or 0
+                        ok = "OK" if r[6] else "FAIL"
+                        parts.append(
+                            f"- {cs}: {last} | {provider}/{model} | "
+                            f"in={in_tok} out={out_tok} | {ok}"
+                        )
+            except Exception:
+                logger.warning(
+                    "_gather_context failed for %s (call_site_last_run)",
+                    task.task_type, exc_info=True,
+                )
+                parts.append("(Call site activity data unavailable)")
+
+            try:
+                cursor = await self._db.execute(
+                    "SELECT json_extract(metadata, '$.call_site') as call_site, "
+                    "COUNT(*) as cnt, SUM(cost_usd) as total_cost, "
+                    "AVG(input_tokens) as avg_in, AVG(output_tokens) as avg_out "
+                    "FROM cost_events "
+                    "WHERE created_at > datetime('now', '-7 days') "
+                    "AND json_extract(metadata, '$.call_site') IS NOT NULL "
+                    "GROUP BY json_extract(metadata, '$.call_site') "
+                    "ORDER BY cnt DESC LIMIT 15"
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    parts.append("\n## Cost Summary (last 7 days, by call site)")
+                    for r in rows:
+                        cs = r[0] or "?"
+                        cnt = r[1]
+                        cost = r[2] or 0.0
+                        avg_in = int(r[3] or 0)
+                        avg_out = int(r[4] or 0)
+                        parts.append(
+                            f"- {cs}: {cnt} calls, ${cost:.4f}, "
+                            f"avg_in={avg_in}, avg_out={avg_out}"
+                        )
+            except Exception:
+                logger.warning(
+                    "_gather_context failed for %s (cost_events)",
+                    task.task_type, exc_info=True,
+                )
+                parts.append("(Cost data unavailable)")
+
+            return "\n".join(parts) if parts else "(No call site data available)"
+
+        # Pipeline step 2: recent surplus insight samples
+        if task.task_type == TaskType.PROMPT_REVIEW_SAMPLE:
+            try:
+                cursor = await self._db.execute(
+                    "SELECT source_task_type, content, generating_model, "
+                    "confidence, promotion_status, created_at "
+                    "FROM surplus_insights "
+                    "WHERE created_at > datetime('now', '-7 days') "
+                    "ORDER BY created_at DESC LIMIT 15"
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    parts.append("## Recent Surplus Outputs (last 7 days)")
+                    for r in rows:
+                        task_type = r[0] or "?"
+                        content = (r[1] or "")[:300]
+                        model = r[2] or "?"
+                        conf = r[3] or 0.0
+                        status = r[4] or "?"
+                        parts.append(
+                            f"- [{task_type}] model={model} conf={conf:.2f} "
+                            f"status={status}\n  {content}"
+                        )
+            except Exception:
+                logger.warning(
+                    "_gather_context failed for %s (surplus_insights)",
+                    task.task_type, exc_info=True,
+                )
+                parts.append("(Surplus output data unavailable)")
+            # Fall through to also gather standard observations below
 
         # For analytical tasks: recent observations + basic stats
         try:

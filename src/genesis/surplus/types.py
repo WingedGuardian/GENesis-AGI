@@ -18,6 +18,9 @@ class TaskType(StrEnum):
     SELF_UNBLOCK = "self_unblock"
     ANTICIPATORY_RESEARCH = "anticipatory_research"
     PROMPT_EFFECTIVENESS_REVIEW = "prompt_effectiveness_review"
+    # Pipeline intermediate steps (prompt_effectiveness pipeline)
+    PROMPT_REVIEW_CATALOG = "prompt_review_catalog"
+    PROMPT_REVIEW_SAMPLE = "prompt_review_sample"
     CODE_AUDIT = "code_audit"
     INFRASTRUCTURE_MONITOR = "infrastructure_monitor"
     BOOKMARK_ENRICHMENT = "bookmark_enrichment"

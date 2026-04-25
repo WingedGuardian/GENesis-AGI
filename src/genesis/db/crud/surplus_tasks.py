@@ -176,6 +176,17 @@ async def count_pending_by_type(db: aiosqlite.Connection, task_type: str) -> int
     return row[0]
 
 
+async def count_active_by_type(db: aiosqlite.Connection, task_type: str) -> int:
+    """Count tasks that are pending OR running for a given type."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM surplus_tasks "
+        "WHERE status IN ('pending', 'running') AND task_type = ?",
+        (task_type,),
+    )
+    row = await cursor.fetchone()
+    return row[0]
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM surplus_tasks WHERE id = ?", (id,))
     await db.commit()
