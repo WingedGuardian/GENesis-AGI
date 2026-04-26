@@ -308,6 +308,14 @@ class Router:
                 attempts=attempts,
             )
 
+        # Record failure for neural monitor visibility
+        if self.cost_tracker and self.cost_tracker.db:
+            await record_last_run(
+                self.cost_tracker.db, call_site_id,
+                provider="(exhausted)", model_id="",
+                response_text=None, success=False,
+            )
+
         dead_lettered = False
         if self._dead_letter and not suppress_dead_letter:
             try:

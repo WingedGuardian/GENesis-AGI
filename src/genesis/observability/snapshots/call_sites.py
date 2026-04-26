@@ -162,26 +162,24 @@ async def call_sites(
     if db:
         try:
             cursor = await db.execute(
-                "SELECT call_site_id, last_run_at, provider_used, model_id, response_text, input_tokens, output_tokens FROM call_site_last_run"
+                "SELECT call_site_id, last_run_at, provider_used, model_id,"
+                " response_text, input_tokens, output_tokens, success"
+                " FROM call_site_last_run"
             )
             for row in await cursor.fetchall():
                 sid = row[0]
+                run_data = {
+                    "last_run_at": row[1],
+                    "last_run_provider": row[2],
+                    "last_run_model": row[3],
+                    "last_response": row[4],
+                    "last_run_tokens": (row[5] or 0) + (row[6] or 0),
+                    "last_run_success": bool(row[7]) if row[7] is not None else True,
+                }
                 if sid in result:
-                    result[sid]["last_run_at"] = row[1]
-                    result[sid]["last_run_provider"] = row[2]
-                    result[sid]["last_run_model"] = row[3]
-                    result[sid]["last_response"] = row[4]
-                    result[sid]["last_run_tokens"] = (row[5] or 0) + (row[6] or 0)
+                    result[sid].update(run_data)
                 else:
-                    result[sid] = {
-                        "status": "active",
-                        "routing": False,
-                        "last_run_at": row[1],
-                        "last_run_provider": row[2],
-                        "last_run_model": row[3],
-                        "last_response": row[4],
-                        "last_run_tokens": (row[5] or 0) + (row[6] or 0),
-                    }
+                    result[sid] = {"status": "active", "routing": False, **run_data}
         except sqlite3.Error:
             logger.debug("call_site_last_run query failed", exc_info=True)
 
