@@ -9,12 +9,17 @@ from datetime import UTC, datetime
 import aiosqlite
 
 
-def _escape_fts5(query: str) -> str | None:
-    """Escape FTS5 special characters to prevent syntax errors from user input.
+def _prepare_fts5(query: str) -> str | None:
+    """Prepare a query string for FTS5 MATCH.
+
+    Lowercases the query to neutralize accidental FTS5 boolean operators —
+    uppercase OR/AND are interpreted as operators by FTS5, but lowercase
+    or/and are plain search terms. FTS5 content matching is case-insensitive,
+    so lowercasing doesn't affect result quality.
 
     Returns None if the query is empty after escaping (caller should return []).
     """
-    cleaned = re.sub(r'[^\w\s]', " ", query, flags=re.UNICODE).strip()
+    cleaned = re.sub(r'[^\w\s]', " ", query.lower(), flags=re.UNICODE).strip()
     return cleaned or None
 
 
@@ -235,7 +240,7 @@ async def search_fts(
     JOINs back to knowledge_units to include source_pipeline for authority
     boosting in the recall merge step.
     """
-    escaped = _escape_fts5(query)
+    escaped = _prepare_fts5(query)
     if not escaped:
         return []
     sql = (

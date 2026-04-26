@@ -121,11 +121,13 @@ class HybridRetriever:
 
         # 3. FTS5 text search (using expanded query)
         fts_collection = collections[0] if len(collections) == 1 else None
+        fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_results = await memory_crud.search_ranked(
             self._db,
             query=fts_query,
             collection=fts_collection,
             limit=candidate_limit,
+            boolean=fts_is_boolean,
         )
 
         fts_by_id: dict[str, dict] = {}

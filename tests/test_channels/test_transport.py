@@ -264,38 +264,79 @@ class TestDraftStreamer:
 
 # ---- FTS5 Escape Fix ----
 
-class TestFTS5Escape:
+class TestFTS5Prepare:
+    """Tests for _prepare_fts5 — the FTS5 query sanitizer."""
+
     def test_commas_escaped(self):
-        from genesis.db.crud.memory import _escape_fts5
-        result = _escape_fts5("hello, world, test")
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("hello, world, test")
         assert "," not in result
         assert result is not None
 
     def test_natural_language(self):
-        from genesis.db.crud.memory import _escape_fts5
-        result = _escape_fts5("What's the weather like today?")
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("What's the weather like today?")
         assert result is not None
-        # No special chars should remain
         assert "?" not in result
         assert "'" not in result
 
     def test_parentheses_escaped(self):
-        from genesis.db.crud.knowledge import _escape_fts5
-        result = _escape_fts5("function(arg1, arg2)")
+        from genesis.db.crud.knowledge import _prepare_fts5
+        result = _prepare_fts5("function(arg1, arg2)")
         assert "(" not in result
         assert ")" not in result
         assert "," not in result
 
     def test_empty_after_escape_returns_none(self):
-        from genesis.db.crud.memory import _escape_fts5
-        result = _escape_fts5("!!!")
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("!!!")
         assert result is None
 
     def test_unicode_preserved(self):
-        from genesis.db.crud.memory import _escape_fts5
-        result = _escape_fts5("café résumé naïve")
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("café résumé naïve")
         assert result is not None
         assert "café" in result
+
+    def test_uppercase_or_and_neutralized(self):
+        """Uppercase OR/AND in user queries must not become FTS5 operators."""
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("FTS5 boolean OR AND query")
+        assert result is not None
+        # Lowercased — or/and are plain search terms, not FTS5 operators
+        assert "OR" not in result
+        assert "AND" not in result
+        assert "or" in result
+        assert "and" in result
+
+    def test_boolean_mode_preserves_operators(self):
+        """Boolean mode preserves OR/AND/parens for expand_query output."""
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5(
+            "(configure AND routing) OR setup OR deploy", boolean=True,
+        )
+        assert result is not None
+        assert "OR" in result
+        assert "AND" in result
+        assert "(" in result
+        assert ")" in result
+
+    def test_boolean_mode_unbalanced_parens_stripped(self):
+        """Unbalanced parentheses in boolean mode are safely stripped."""
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5("(test AND query", boolean=True)
+        assert result is not None
+        assert "(" not in result  # parens stripped due to imbalance
+        assert ")" not in result
+
+    def test_boolean_mode_strips_special_chars(self):
+        """Boolean mode still strips non-operator special chars."""
+        from genesis.db.crud.memory import _prepare_fts5
+        result = _prepare_fts5(
+            '(test AND "query") OR setup*', boolean=True,
+        )
+        assert '"' not in result
+        assert "*" not in result
 
 
 # ---- Adapter offset persistence debounce ----

@@ -11,22 +11,34 @@ import re
 import aiosqlite
 
 
-def _escape_fts5(query: str) -> str | None:
-    """Escape FTS5 special characters to prevent syntax errors from user input.
+def _prepare_fts5(query: str, *, boolean: bool = False) -> str | None:
+    """Prepare a query string for FTS5 MATCH.
 
-    Preserves FTS5 boolean operators (OR, AND) and parentheses when present,
-    allowing callers to pass pre-constructed boolean queries. Plain queries
-    without operators are treated as implicit AND (FTS5 default).
+    Args:
+        query: Raw query text.
+        boolean: If True, preserve FTS5 boolean operators (OR, AND) and
+            parentheses. Use ONLY for queries constructed by expand_query
+            (controlled vocabulary). Never for raw user input.
+
+    Default path (boolean=False): lowercases the query to neutralize
+    accidental FTS5 boolean operators — uppercase OR/AND are interpreted
+    as operators by FTS5, but lowercase or/and are plain search terms.
+    FTS5 content matching is case-insensitive, so lowercasing doesn't
+    affect result quality.
 
     Returns None if the query is empty after escaping (caller should return []).
     """
-    # Check if query contains boolean operators (from expand_query)
-    has_boolean = bool(re.search(r'\bOR\b|\bAND\b', query))
-    if has_boolean:
-        # Preserve OR/AND keywords and parentheses, escape everything else
-        cleaned = re.sub(r'[^\w\s()"]', " ", query, flags=re.UNICODE).strip()
+    if boolean:
+        # Preserve OR/AND keywords and parentheses for structured queries.
+        # Strip everything else that could cause FTS5 syntax errors.
+        cleaned = re.sub(r'[^\w\s()]', " ", query, flags=re.UNICODE).strip()
+        # Safety: strip unbalanced parentheses rather than crash FTS5
+        if cleaned.count("(") != cleaned.count(")"):
+            cleaned = cleaned.replace("(", " ").replace(")", " ").strip()
     else:
-        cleaned = re.sub(r'[^\w\s]', " ", query, flags=re.UNICODE).strip()
+        # Lowercase neutralizes accidental boolean operators (OR/AND).
+        # Strip all non-alphanumeric to prevent FTS5 syntax errors.
+        cleaned = re.sub(r'[^\w\s]', " ", query.lower(), flags=re.UNICODE).strip()
     return cleaned or None
 
 
@@ -110,7 +122,7 @@ async def search(
     limit: int = 10,
 ) -> list[dict]:
     """Full-text search on memory content. Returns matching rows."""
-    escaped = _escape_fts5(query)
+    escaped = _prepare_fts5(query)
     if not escaped:
         return []
     sql = "SELECT memory_id, content, source_type, collection FROM memory_fts WHERE memory_fts MATCH ?"
@@ -137,9 +149,10 @@ async def search_ranked(
     query: str,
     collection: str | None = None,
     limit: int = 30,
+    boolean: bool = False,
 ) -> list[dict]:
     """FTS5 search returning rank scores for RRF fusion."""
-    escaped = _escape_fts5(query)
+    escaped = _prepare_fts5(query, boolean=boolean)
     if not escaped:
         return []
     sql = (
