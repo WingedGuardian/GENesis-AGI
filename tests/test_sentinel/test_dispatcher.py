@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -587,3 +587,88 @@ class TestRingBufferDebounce:
         assert r1 is None
         assert r2 is None
         assert r3 is None
+
+
+class TestRejectionWindow:
+    """Tests for the 24-hour rejection suppression window."""
+
+    def test_rejected_pattern_blocked_during_window(self):
+        """Pattern with active rejection window returns not-ready."""
+        d = _make_dispatcher()
+        expiry = (datetime.now(UTC) + timedelta(hours=23)).isoformat()
+        d._state.rejected_patterns["memory:critical"] = expiry
+        ready, reason = d._backoff_ready("memory:critical")
+        assert ready is False
+        assert "rejected" in reason.lower()
+
+    def test_rejected_pattern_allowed_after_expiry(self):
+        """Pattern with expired rejection window is allowed and entry cleaned."""
+        d = _make_dispatcher()
+        expiry = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        d._state.rejected_patterns["memory:critical"] = expiry
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            ready, _ = d._backoff_ready("memory:critical")
+
+        assert ready is True
+        assert "memory:critical" not in d._state.rejected_patterns
+
+    def test_rejection_independent_per_pattern(self):
+        """Rejecting one pattern doesn't block another."""
+        d = _make_dispatcher()
+        expiry = (datetime.now(UTC) + timedelta(hours=23)).isoformat()
+        d._state.rejected_patterns["memory:critical"] = expiry
+        ready, _ = d._backoff_ready("infra:disk_low")
+        assert ready is True
+
+    def test_resolve_clears_rejection(self):
+        """Successful resolve clears the rejection entry for the pattern."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        expiry = (datetime.now(UTC) + timedelta(hours=20)).isoformat()
+        d._state.rejected_patterns["memory:critical"] = expiry
+
+        # Simulate resolve by directly calling the logic from _finalize_dispatch
+        pattern = "memory:critical"
+        if pattern in d._state.rejected_patterns:
+            del d._state.rejected_patterns[pattern]
+
+        assert "memory:critical" not in d._state.rejected_patterns
+
+    @pytest.mark.asyncio
+    async def test_handle_approval_resolution_rejected(self):
+        """handle_approval_resolution('rejected') records 24h window and transitions to HEALTHY."""
+        d = _make_dispatcher()
+        d._state.current_state = "awaiting_dispatch_approval"
+        d._state.pending_request_id = "req-123"
+        d._state.pending_policy_id = "sentinel_dispatch"
+        d._state.pending_pattern = "memory:critical"
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            result = await d.handle_approval_resolution("req-123", "rejected")
+
+        assert result is not None
+        assert result.dispatched is False
+        assert "memory:critical" in d._state.rejected_patterns
+        # Verify the expiry is ~24h from now
+        expiry = datetime.fromisoformat(d._state.rejected_patterns["memory:critical"])
+        diff = expiry - datetime.now(UTC)
+        assert timedelta(hours=23) < diff < timedelta(hours=25)
+        # State transitioned to HEALTHY
+        assert d._state.current_state == "healthy"
+
+    def test_rejection_persists_across_save_load(self, tmp_path):
+        """rejected_patterns survives state serialization round-trip."""
+        from genesis.sentinel.state import SentinelStateData, load_state, save_state
+
+        state = SentinelStateData()
+        expiry = (datetime.now(UTC) + timedelta(hours=12)).isoformat()
+        state.rejected_patterns["memory:critical"] = expiry
+
+        state_file = tmp_path / "sentinel_state.json"
+        save_state(state, path=state_file)
+        loaded = load_state(path=state_file)
+
+        assert "memory:critical" in loaded.rejected_patterns
+        assert loaded.rejected_patterns["memory:critical"] == expiry

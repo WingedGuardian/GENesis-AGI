@@ -353,6 +353,12 @@ async def _idle_watcher_loop():
     Polls every 60s. When the browser has been idle for _IDLE_TIMEOUT_S,
     calls async_cleanup() and exits. CancelledError is the normal shutdown
     path (MCP lifespan exit or explicit cleanup).
+
+    Note: does NOT acquire _browser_lock before cleanup. async_cleanup()
+    cancels and awaits _idle_task (this very coroutine), so holding the
+    lock here would self-deadlock. Cleanup is safe without the lock because
+    it sets _active_page = None atomically at entry and is individually
+    guarded throughout.
     """
     try:
         while True:
@@ -933,24 +939,26 @@ async def _impl_browser_navigate(
 async def _impl_browser_click(selector: str) -> dict:
     """Click an element on the current page."""
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
-    drift = _check_page_drift(_active_page) if _is_remote_active() else None
-    if drift:
-        return {
-            "advisory": "Page state changed since last Genesis action.",
-            **drift,
-            "recommendation": "Call browser_snapshot() to see current page state before acting.",
-        }
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        drift = _check_page_drift(_active_page) if _is_remote_active() else None
+        if drift:
+            return {
+                "advisory": "Page state changed since last Genesis action.",
+                **drift,
+                "recommendation": "Call browser_snapshot() to see current page state before acting.",
+            }
+        page = _active_page
     try:
         await _human_delay()
-        await _stealth_click(_active_page, selector)
+        await _stealth_click(page, selector)
         _update_remote_url()  # Click may cause navigation (form submit, link)
-        snapshot = await _snapshot_page(_active_page)
-        return {"clicked": selector, "url": _active_page.url, "snapshot": snapshot}
+        snapshot = await _snapshot_page(page)
+        return {"clicked": selector, "url": page.url, "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Click failed on '{selector}': {e}"}
 
@@ -958,23 +966,25 @@ async def _impl_browser_click(selector: str) -> dict:
 async def _impl_browser_fill(selector: str, value: str) -> dict:
     """Fill a form field on the current page."""
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
-    drift = _check_page_drift(_active_page) if _is_remote_active() else None
-    if drift:
-        return {
-            "advisory": "Page state changed since last Genesis action.",
-            **drift,
-            "recommendation": "Call browser_snapshot() to see current page state before acting.",
-        }
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        drift = _check_page_drift(_active_page) if _is_remote_active() else None
+        if drift:
+            return {
+                "advisory": "Page state changed since last Genesis action.",
+                **drift,
+                "recommendation": "Call browser_snapshot() to see current page state before acting.",
+            }
+        page = _active_page
     try:
         await _human_delay()
-        await _human_type(_active_page, selector, value)
+        await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
-        return {"filled": selector, "url": _active_page.url}
+        return {"filled": selector, "url": page.url}
     except Exception as e:
         return {"error": f"Fill failed on '{selector}': {e}"}
 
@@ -986,25 +996,27 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     the file contents over the wire to the remote browser).
     """
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
-    drift = _check_page_drift(_active_page) if _is_remote_active() else None
-    if drift:
-        return {
-            "advisory": "Page state changed since last Genesis action.",
-            **drift,
-            "recommendation": "Call browser_snapshot() to see current page state before acting.",
-        }
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        drift = _check_page_drift(_active_page) if _is_remote_active() else None
+        if drift:
+            return {
+                "advisory": "Page state changed since last Genesis action.",
+                **drift,
+                "recommendation": "Call browser_snapshot() to see current page state before acting.",
+            }
+        page = _active_page
     p = Path(file_path)
     if not p.is_file():
         return {"error": f"File not found or not a regular file: {file_path}"}
     try:
         await _human_delay()
-        await _active_page.set_input_files(selector, str(p), timeout=10000)
-        return {"uploaded": p.name, "selector": selector, "url": _active_page.url}
+        await page.set_input_files(selector, str(p), timeout=10000)
+        return {"uploaded": p.name, "selector": selector, "url": page.url}
     except Exception as e:
         return {"error": f"Upload failed on '{selector}': {e}"}
 
@@ -1012,19 +1024,21 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        page = _active_page
     try:
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         screenshot_path = _SCREENSHOT_DIR / "genesis_browser_screenshot.png"
-        await _active_page.screenshot(path=str(screenshot_path))
+        await page.screenshot(path=str(screenshot_path))
         return {
             "path": str(screenshot_path),
-            "url": _active_page.url,
-            "title": await _active_page.title(),
+            "url": page.url,
+            "title": await page.title(),
         }
     except Exception as e:
         return {"error": f"Screenshot failed: {e}"}
@@ -1033,14 +1047,16 @@ async def _impl_browser_screenshot() -> dict:
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        page = _active_page
     try:
-        snapshot = await _snapshot_page(_active_page)
-        return {"url": _active_page.url, "title": await _active_page.title(), "snapshot": snapshot}
+        snapshot = await _snapshot_page(page)
+        return {"url": page.url, "title": await page.title(), "snapshot": snapshot}
     except Exception as e:
         return {"error": f"Snapshot failed: {e}"}
 
@@ -1052,16 +1068,18 @@ async def _impl_browser_run_js(expression: str) -> dict:
     Equivalent to Chrome DevTools console. Expressions are logged for audit.
     """
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        page = _active_page
     try:
         logger.info("browser_run_js: %s", expression[:200])
-        result = await _active_page.evaluate(expression)
+        result = await page.evaluate(expression)
         _update_remote_url()  # JS may cause navigation
-        return {"result": result, "url": _active_page.url}
+        return {"result": result, "url": page.url}
     except Exception as e:
         return {"error": f"JS execution failed: {e}"}
 
@@ -1105,18 +1123,20 @@ async def _impl_browser_clear_domain(domain: str) -> dict:
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     """Press a keyboard key on the current page."""
     _touch()
-    if _active_page is None:
-        return {"error": "No page open. Call browser_navigate first."}
-    health = _detach_dead_remote()
-    if health:
-        return health
+    async with _browser_lock:
+        if _active_page is None:
+            return {"error": "No page open. Call browser_navigate first."}
+        health = _detach_dead_remote()
+        if health:
+            return health
+        page = _active_page
     count = max(1, min(count, 50))
     try:
         for i in range(count):
             if i > 0:
                 await asyncio.sleep(random.uniform(0.05, 0.15))
-            await _active_page.keyboard.press(key)
-        return {"pressed": key, "count": count, "url": _active_page.url}
+            await page.keyboard.press(key)
+        return {"pressed": key, "count": count, "url": page.url}
     except Exception as e:
         return {"error": f"Key press failed for '{key}': {e}"}
 
