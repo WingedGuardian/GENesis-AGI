@@ -6,6 +6,7 @@ from genesis.dashboard.routes import (
     activity,
     backup,
     budget,
+    comms,
     config,
     errors,
     events,
@@ -33,12 +34,14 @@ from genesis.dashboard.routes import (
     ui_data,
     updates,
     vitals,
+    work,
 )
 
 __all__ = [
     "activity",
     "backup",
     "budget",
+    "comms",
     "config",
     "errors",
     "events",
@@ -66,4 +69,5 @@ __all__ = [
     "ui_data",
     "updates",
     "vitals",
+    "work",
 ]
