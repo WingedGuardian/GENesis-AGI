@@ -1,6 +1,6 @@
-"""Genesis database schema — split into DDL definitions and runtime migrations.
+"""Genesis database schema — DDL definitions and runtime migrations.
 
-Public API (backward-compatible with the old single-file schema.py):
+Public API:
 - TABLES, INDEXES: DDL definitions
 - create_all_tables(): creates tables, runs migrations, creates indexes
 - seed_data(): inserts initial seed data

@@ -96,7 +96,7 @@ sensitive:
   # Runtime core — changes affect all subsystems
   - pattern: "src/genesis/runtime.py"
     reason: "Runtime bootstrap — changes affect all subsystem initialization"
-  - pattern: "src/genesis/db/schema.py"
+  - pattern: "src/genesis/db/schema/_tables.py"
     reason: "Database schema — migrations must be carefully reviewed"
 
   # Identity files — shape LLM behavior

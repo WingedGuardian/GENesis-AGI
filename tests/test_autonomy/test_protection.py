@@ -31,7 +31,7 @@ def rules() -> list[ProtectedPathRule]:
         ProtectedPathRule("/etc/netplan/**", ProtectionLevel.CRITICAL, "Networking"),
         ProtectedPathRule("src/genesis/runtime.py", ProtectionLevel.SENSITIVE,
                           "Runtime bootstrap"),
-        ProtectedPathRule("src/genesis/db/schema.py", ProtectionLevel.SENSITIVE,
+        ProtectedPathRule("src/genesis/db/schema/_tables.py", ProtectionLevel.SENSITIVE,
                           "Database schema"),
         ProtectedPathRule("src/genesis/identity/*.md", ProtectionLevel.SENSITIVE,
                           "Identity files"),
@@ -82,7 +82,7 @@ class TestClassify:
         assert registry.classify("src/genesis/runtime.py") is ProtectionLevel.SENSITIVE
 
     def test_sensitive_schema(self, registry: ProtectedPathRegistry):
-        assert registry.classify("src/genesis/db/schema.py") is ProtectionLevel.SENSITIVE
+        assert registry.classify("src/genesis/db/schema/_tables.py") is ProtectionLevel.SENSITIVE
 
     def test_sensitive_identity_md(self, registry: ProtectedPathRegistry):
         assert registry.classify("src/genesis/identity/SOUL.md") is ProtectionLevel.SENSITIVE

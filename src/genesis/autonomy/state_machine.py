@@ -327,7 +327,9 @@ class AutonomyManager:
             return
 
         try:
-            import asyncio
+            import contextlib
+
+            from genesis.util.tasks import tracked_task
 
             coro = self._event_bus.emit(
                 Subsystem.AUTONOMY,
@@ -339,16 +341,11 @@ class AutonomyManager:
                 level_after=level_after,
                 corrected_at=corrected_at,
             )
-            # emit() is async; schedule from sync context
-            try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(coro)
-                task.add_done_callback(lambda t: (
-                    logger.error("Autonomy regression event emission failed: %s", t.exception(), exc_info=t.exception())
-                    if not t.cancelled() and t.exception() else None
-                ))
-            except RuntimeError:
-                pass  # No running loop — skip event
+            with contextlib.suppress(RuntimeError):
+                tracked_task(
+                    coro, name="autonomy.regression-emit",
+                    subsystem=Subsystem.AUTONOMY, logger=logger,
+                )
         except Exception:
             logger.error(
                 "Failed to emit autonomy.regression event", exc_info=True
@@ -361,7 +358,9 @@ class AutonomyManager:
         if self._event_bus is None:
             return
         try:
-            import asyncio
+            import contextlib
+
+            from genesis.util.tasks import tracked_task
 
             coro = self._event_bus.emit(
                 Subsystem.AUTONOMY,
@@ -372,15 +371,11 @@ class AutonomyManager:
                 level_before=level_before,
                 level_after=level_after,
             )
-            try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(coro)
-                task.add_done_callback(lambda t: (
-                    logger.error("Autonomy promotion event emission failed: %s", t.exception(), exc_info=t.exception())
-                    if not t.cancelled() and t.exception() else None
-                ))
-            except RuntimeError:
-                pass
+            with contextlib.suppress(RuntimeError):
+                tracked_task(
+                    coro, name="autonomy.promotion-emit",
+                    subsystem=Subsystem.AUTONOMY, logger=logger,
+                )
         except Exception:
             logger.error(
                 "Failed to emit autonomy.promotion event", exc_info=True

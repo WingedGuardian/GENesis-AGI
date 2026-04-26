@@ -847,7 +847,7 @@ drift. Mitigation: null hypothesis = conservative by default. Monitor `capabilit
   approach). A single failed attempt must NOT be classified as a gap — it's an
   incomplete workaround search. — `learning/classification/attribution.py` enforces evidence
 - [x] `workaround_success` stores both the failed primary path AND the working
-  workaround. Future identical tasks use the workaround as primary approach. — `learning/types.py` + `db/schema.py`
+  workaround. Future identical tasks use the workaround as primary approach. — `learning/types.py` + `db/schema/_tables.py`
 - [x] Request-delivery delta assessed for every task with full scope evolution chain:
   original request → discoveries during execution → adjusted scope → delta classification
   → discovery attribution. Critical test cases: — `learning/classification/delta.py` + `db/crud/execution_traces.py`
@@ -2006,7 +2006,7 @@ deferred from V3's "Basic Autonomy" scope. They need wiring before V4.
 | `cross-vendor-review` | `autonomy/disagreement.py` | V4 |
 | `outreach-voice` | `outreach/pipeline.py` | V4 |
 | `observation-feedback-loop` | `db/crud/observations.py` | V4 |
-| `multi-person` | `db/schema.py` (8 tables) | V4+ |
+| `multi-person` | `db/schema/_tables.py` (8 tables) | V4+ |
 | `v4-parallel-dispatch` | `surplus/scheduler.py` | V4 |
 | `v4-surplus-tasks` | `surplus/types.py` | V4 |
 | `v4-rate-tracking` | `surplus/compute_availability.py` | V4 |
