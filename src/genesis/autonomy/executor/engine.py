@@ -18,19 +18,17 @@ import asyncio
 import contextlib
 import json
 import logging
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.executor import dispatch as _dispatch
 from genesis.autonomy.executor import worktree_mgr as _worktree
+from genesis.autonomy.executor.step_dispatcher import StepDispatcher
 from genesis.autonomy.executor.types import (
     ExecutionTrace,
     InvalidTransitionError,
     StepResult,
-    StepType,
     TaskPhase,
     validate_transition,
 )
@@ -65,12 +63,19 @@ class CCSessionExecutor:
         self._invoker = invoker
         self._decomposer = decomposer
         self._reviewer = reviewer
-        self._workaround = workaround_searcher
         self._tracer = tracer
         self._outreach = outreach_pipeline
         self._event_bus = event_bus
         self._runtime = runtime
         self._autonomous_dispatcher = autonomous_dispatcher
+
+        # Step dispatch (extracted to StepDispatcher)
+        self._step_dispatcher = StepDispatcher(
+            db=db,
+            invoker=invoker,
+            autonomous_dispatcher=autonomous_dispatcher,
+            workaround_searcher=workaround_searcher,
+        )
 
         # In-memory state
         self._active_tasks: dict[str, TaskPhase] = {}
@@ -170,8 +175,9 @@ class CCSessionExecutor:
                     await self._transition(task_id, TaskPhase.CANCELLED)
                     return False
 
-                result = await self._execute_step(
+                result = await self._step_dispatcher.execute_step(
                     task_id, step, step_results,
+                    worktree_path=self._worktree_paths.get(task_id),
                 )
                 step_results.append(result)
 
@@ -197,8 +203,9 @@ class CCSessionExecutor:
 
                 # Handle failed step -- try workaround
                 if result.status == "failed":
-                    recovered = await self._try_workaround(
+                    recovered = await self._step_dispatcher.try_workaround(
                         task_id, step, result, step_results,
+                        worktree_path=self._worktree_paths.get(task_id),
                     )
                     if recovered is not None:
                         step_results[-1] = recovered
@@ -244,8 +251,9 @@ class CCSessionExecutor:
                     fixup = _dispatch.create_fixup_step(
                         verify, len(steps) + iteration,
                     )
-                    fixup_result = await self._execute_step(
+                    fixup_result = await self._step_dispatcher.execute_step(
                         task_id, fixup, step_results,
+                        worktree_path=self._worktree_paths.get(task_id),
                     )
                     step_results.append(fixup_result)
                     deliverable = _dispatch.synthesize_deliverable(step_results)
@@ -460,256 +468,6 @@ class CCSessionExecutor:
             )
 
         return True
-
-    # =================================================================
-    # Step dispatch
-    # =================================================================
-
-    async def _execute_step(
-        self,
-        task_id: str,
-        step: dict,
-        prior_results: list[StepResult],
-        *,
-        workaround: str | None = None,
-    ) -> StepResult:
-        """Execute and record a single step via CC session."""
-        from genesis.db.crud import task_steps
-
-        step_idx = step["idx"]
-        started_at = datetime.now(UTC).isoformat()
-
-        await task_steps.update_step(
-            self._db, task_id, step_idx,
-            status="executing",
-            started_at=started_at,
-        )
-
-        start = time.monotonic()
-        try:
-            result = await self._dispatch_step(
-                task_id, step, prior_results, workaround=workaround,
-            )
-        except Exception as exc:
-            duration = time.monotonic() - start
-            logger.error(
-                "Step %d of task %s failed: %s",
-                step_idx, task_id, exc,
-                exc_info=True,
-            )
-            result = StepResult(
-                idx=step_idx,
-                status="failed",
-                result=str(exc),
-                duration_s=duration,
-            )
-
-        completed_at = datetime.now(UTC).isoformat()
-        await task_steps.update_step(
-            self._db, task_id, step_idx,
-            status=result.status,
-            result_json=json.dumps({
-                "result": result.result[:2000],
-                "artifacts": result.artifacts,
-                "blocker": result.blocker_description,
-            }),
-            cost_usd=result.cost_usd,
-            model_used=result.model_used,
-            session_id=result.session_id,
-            completed_at=completed_at,
-        )
-
-        return result
-
-    async def _dispatch_step(
-        self,
-        task_id: str,
-        step: dict,
-        prior_results: list[StepResult],
-        *,
-        workaround: str | None = None,
-    ) -> StepResult:
-        """Dispatch step to a CC session.
-
-        All V3 steps use CC sessions. Multi-model router dispatch
-        for research/analysis steps is deferred to V4.
-        """
-        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
-
-        step_idx = step["idx"]
-        step_type_str = step.get("type", "code")
-        try:
-            step_type = StepType(step_type_str)
-        except ValueError:
-            step_type = StepType.CODE
-
-        prompt = _dispatch.build_step_prompt(step, prior_results, workaround)
-
-        # CODE steps use worktree working directory (Amendment #7)
-        working_dir: str | None = None
-        wt = self._worktree_paths.get(task_id)
-        if wt and step_type == StepType.CODE:
-            working_dir = str(wt)
-
-        # Effort: HIGH for code/verification, MEDIUM otherwise
-        effort = (
-            EffortLevel.HIGH
-            if step_type in (StepType.CODE, StepType.VERIFICATION)
-            else EffortLevel.MEDIUM
-        )
-
-        invocation = CCInvocation(
-            prompt=prompt,
-            model=CCModel.SONNET,
-            effort=effort,
-            timeout_s=step_type.default_timeout_s,
-            skip_permissions=True,
-            working_dir=working_dir,
-        )
-
-        api_call_site_id = None
-        if step_type in (StepType.RESEARCH, StepType.ANALYSIS, StepType.SYNTHESIS):
-            api_call_site_id = "autonomous_executor_reasoning"
-
-        if self._autonomous_dispatcher is not None:
-            # Call-site gating pre-check: if this executor step_type is
-            # already pending approval, return a blocked StepResult
-            # without creating a second approval request.  The checkpoint
-            # system persists the step state and the next resume will
-            # re-check (approved → dispatch, still pending → still blocked).
-            executor_policy_id = f"executor_{step_type.value}"
-            try:
-                pending = await (
-                    self._autonomous_dispatcher.approval_gate.find_site_pending(
-                        subsystem="task_executor",
-                        policy_id=executor_policy_id,
-                    )
-                )
-            except Exception:
-                logger.warning(
-                    "find_site_pending failed for %s; proceeding without pre-check",
-                    executor_policy_id, exc_info=True,
-                )
-                pending = None
-            if pending is not None:
-                blocker = (
-                    f"awaiting approval {pending.get('id')} for "
-                    f"{step_type.value} step"
-                )
-                logger.info(
-                    "Task %s step %d skipped — call site blocked on approval %s",
-                    task_id, step_idx, pending.get("id"),
-                )
-                return StepResult(
-                    idx=step_idx,
-                    status="blocked",
-                    result=blocker,
-                    blocker_description=blocker,
-                )
-
-            decision = await self._autonomous_dispatcher.route(
-                AutonomousDispatchRequest(
-                    subsystem="task_executor",
-                    policy_id=executor_policy_id,
-                    action_label=f"task step {step_idx} ({step_type.value})",
-                    messages=[{"role": "user", "content": prompt}],
-                    cli_invocation=invocation,
-                    api_call_site_id=api_call_site_id,
-                    cli_fallback_allowed=True,
-                    approval_required_for_cli=True,
-                    context={
-                        "task_id": task_id,
-                        "step_idx": step_idx,
-                        "step_type": step_type.value,
-                    },
-                ),
-            )
-            if decision.mode == "blocked":
-                return StepResult(
-                    idx=step_idx,
-                    status="blocked",
-                    result=decision.reason,
-                    blocker_description=decision.reason,
-                )
-            if decision.mode == "api" and decision.output is not None:
-                parsed = _dispatch.parse_step_output(decision.output.text)
-                return StepResult(
-                    idx=step_idx,
-                    status=parsed.get("status", "completed"),
-                    result=parsed.get("result", decision.output.text[:500]),
-                    cost_usd=decision.output.cost_usd,
-                    session_id=decision.output.session_id,
-                    model_used=decision.output.model_used,
-                    duration_s=0.0,
-                    artifacts=parsed.get("artifacts", []),
-                    blocker_description=parsed.get("blocker_description"),
-                )
-
-        start = time.monotonic()
-        output = await self._invoker.run(invocation)
-        duration = time.monotonic() - start
-
-        if output.is_error:
-            return StepResult(
-                idx=step_idx,
-                status="failed",
-                result=output.error_message or output.text[:500],
-                cost_usd=output.cost_usd,
-                session_id=output.session_id,
-                model_used=output.model_used,
-                duration_s=duration,
-            )
-
-        # Parse structured output from CC response
-        parsed = _dispatch.parse_step_output(output.text)
-
-        return StepResult(
-            idx=step_idx,
-            status=parsed.get("status", "completed"),
-            result=parsed.get("result", output.text[:500]),
-            cost_usd=output.cost_usd,
-            session_id=output.session_id,
-            model_used=output.model_used,
-            duration_s=duration,
-            artifacts=parsed.get("artifacts", []),
-            blocker_description=parsed.get("blocker_description"),
-        )
-
-    # =================================================================
-    # Workaround recovery
-    # =================================================================
-
-    async def _try_workaround(
-        self,
-        task_id: str,
-        step: dict,
-        failed_result: StepResult,
-        step_results: list[StepResult],
-    ) -> StepResult | None:
-        """Attempt workaround for a failed step. Returns new result or None."""
-        if not self._workaround:
-            return None
-
-        try:
-            wa_result = await self._workaround.search(
-                step, failed_result.result, [],
-            )
-        except Exception:
-            logger.error(
-                "Workaround search failed for step %d",
-                step["idx"], exc_info=True,
-            )
-            return None
-
-        if wa_result is None or not wa_result.found or not wa_result.approach:
-            return None
-
-        # Retry with workaround context
-        retry = await self._execute_step(
-            task_id, step, step_results,
-            workaround=wa_result.approach,
-        )
-        return retry if retry.status == "completed" else None
 
     # =================================================================
     # Worktree management (Amendment #7)

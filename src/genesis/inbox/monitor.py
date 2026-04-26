@@ -188,15 +188,15 @@ class InboxMonitor:
             return await self._check_once_inner()
 
     async def _check_once_inner(self) -> CheckResult:
-        """Core check logic, called under _check_lock."""
-        from genesis.cc.types import (
-            CCInvocation,
-            CCModel,
-            EffortLevel,
-            SessionType,
-            background_session_dir,
-        )
-        from genesis.db.crud import inbox_items, message_queue
+        """Core check logic, called under _check_lock.
+
+        Decomposed into phase methods for readability:
+        1. _phase_resume — process approval-parked items
+        2. _phase_detect_changes — scan for new/modified files
+        3. _phase_create_records — create DB rows for changed files
+        4. _phase_dispatch_batches — build batches, route, invoke CC
+        """
+        from genesis.db.crud import inbox_items
 
         errors: list[str] = []
         watch = self._config.watch_path
@@ -204,53 +204,78 @@ class InboxMonitor:
         if not watch.is_dir():
             return CheckResult(errors=[f"Watch path does not exist: {watch}"])
 
-        # Expire stuck processing items before loading known set.
-        # Rows carrying an ``awaiting_approval:*`` marker are deliberately
-        # skipped by expire_stuck_processing — see the CRUD function for
-        # rationale.
         await inbox_items.expire_stuck_processing(self._db)
 
         now = self._clock()
         now_iso = now.isoformat()
 
-        # 1. Resume rows that are parked waiting for user approval.
-        # Rows stay in 'processing' state with an
-        # ``awaiting_approval:<request_id>`` marker in error_message.
-        #
-        # The resume pass ONLY dispatches on the pending→approved state
-        # transition.  Prior iterations of this code re-dispatched on
-        # every scan and relied on the approval gate's stable key to
-        # dedup.  That worked but generated wasted dispatch cycles
-        # while pending.  With the per-call-site gating in T10, we now:
-        #
-        #   1. Parse approval_request_id from the marker
-        #   2. Look up approval status via approval_manager.get_by_id
-        #   3. Route by status:
-        #      - approved  → validate content + queue for dispatch
-        #      - rejected  → mark row failed with rejection message
-        #      - pending   → leave row alone (no dispatch, no Telegram)
-        #      - expired / cancelled / NULL → mark row failed with the
-        #        APPROVAL_INVALIDATED_PREFIX marker so the next scan
-        #        treats the file as new and starts fresh
-        #
-        # Hash validation still happens FIRST so a file that vanished
-        # or was edited while pending is invalidated immediately —
-        # regardless of whether the approval ever resolved.
-        #
-        # Invariant: resume items are ALWAYS dispatched as singleton
-        # batches (one item per dispatch call), regardless of
-        # self._config.batch_size.  This preserves the original
-        # content-stable approval key.
+        # Phase 1: Resume approval-parked items
+        resume_items, resumed_ids, resumed_paths = await self._phase_resume(
+            now, now_iso,
+        )
+
+        # Phase 2: Detect new/modified files
+        new_files, modified_files = await self._phase_detect_changes(
+            watch, resumed_paths,
+        )
+
+        if not (new_files + modified_files) and not resume_items:
+            return CheckResult(
+                items_found=len(scan_folder(
+                    watch, self._config.response_dir,
+                    recursive=self._config.recursive,
+                )),
+            )
+
+        # Phase 3: Create/update DB records for changed files
+        pending_items = await self._phase_create_records(
+            new_files, modified_files, now, now_iso,
+        )
+
+        # Phase 4: Batch and dispatch
+        batches_dispatched = await self._phase_dispatch_batches(
+            resume_items, pending_items, resumed_ids, now_iso, errors,
+        )
+
+        return CheckResult(
+            items_found=len(scan_folder(
+                watch, self._config.response_dir,
+                recursive=self._config.recursive,
+            )),
+            items_new=len(new_files),
+            items_modified=len(modified_files),
+            batches_dispatched=batches_dispatched,
+            errors=errors,
+        )
+
+    # =================================================================
+    # Phase 1: Resume approval-parked items
+    # =================================================================
+
+    async def _phase_resume(
+        self,
+        now: datetime,
+        now_iso: str,
+    ) -> tuple[list[InboxItem], set[str], set[str]]:
+        """Resume rows parked waiting for user approval.
+
+        Returns ``(resume_items, resumed_ids, resumed_paths)``.
+
+        Rows stay in 'processing' state with an
+        ``awaiting_approval:<request_id>`` marker in error_message.
+        The resume pass ONLY dispatches on the pending→approved state
+        transition.  Hash validation happens FIRST so a file that
+        vanished or was edited while pending is invalidated immediately.
+
+        Invariant: resume items are ALWAYS dispatched as singleton
+        batches to preserve the original content-stable approval key.
+        """
+        from genesis.db.crud import inbox_items
+
         resume_items: list[InboxItem] = []
         awaiting_rows = await inbox_items.get_awaiting_approval(self._db)
 
-        # Reach the ApprovalManager via public accessors so wrappers /
-        # test doubles that only mirror public API still work.  Silent
-        # fall-through here would cause the resume pass to regress to
-        # "re-dispatch every scan" behaviour without anyone noticing —
-        # that's the exact wasted-work pattern T11 was meant to eliminate.
-        # If we find the dispatcher but cannot walk the chain, log an
-        # ERROR so the wiring bug is visible in observability immediately.
+        # Walk the dispatcher → approval_gate → approval_manager chain.
         approval_manager = None
         if self._autonomous_dispatcher is not None:
             gate = getattr(
@@ -306,10 +331,7 @@ class InboxMonitor:
                 )
                 continue
 
-            # Query approval status.  If we can't reach the approval
-            # manager at all (dispatcher not yet wired, startup ordering),
-            # fall back to the old "queue for dispatch" behavior so the
-            # gate can re-verify state — this is strictly additive safety.
+            # Query approval status.
             approval_status: str | None = None
             if approval_manager is not None and request_id:
                 try:
@@ -327,12 +349,6 @@ class InboxMonitor:
                     )
 
             if approval_status == "rejected":
-                # Single atomic UPDATE: mark failed AND set retry_count
-                # to max_retries so the scanner treats the file as
-                # permanently-blocked immediately.  Using the retry_count
-                # override on update_status avoids the double-commit
-                # race where a concurrent reader could see 'failed'
-                # with retry_count still below max_retries.
                 await inbox_items.update_status(
                     self._db, row_id, status="failed",
                     error_message=(
@@ -354,9 +370,6 @@ class InboxMonitor:
                 and request_id
                 and approval_status is None
             ):
-                # Approval row gone or terminal non-approved state —
-                # invalidate the inbox row and let the next scan
-                # re-detect the file as new.
                 await inbox_items.update_status(
                     self._db, row_id, status="failed",
                     error_message=(
@@ -372,18 +385,13 @@ class InboxMonitor:
                 continue
 
             if approval_status == "pending":
-                # Still waiting — do nothing.  No dispatch, no Telegram,
-                # no work.  The row stays in processing with its marker.
                 logger.debug(
                     "Inbox row %s still awaiting approval %s",
                     row_id, request_id,
                 )
                 continue
 
-            # approval_status == "approved" (or approval_manager is None,
-            # fall-through "legacy" case): load content and queue for
-            # dispatch.  The dispatcher will hit ensure_approval, find
-            # the approved row, return cli_approved, and run CC.
+            # approved or legacy fall-through: load content for dispatch
             try:
                 content = read_content(p)
             except (FileNotFoundError, PermissionError):
@@ -404,24 +412,27 @@ class InboxMonitor:
                 detected_at=str(row["created_at"]),
             ))
 
-        # Track resumed item IDs so the dispatch loop can skip the
-        # pre-dispatch update_status(processing) for them.  That call
-        # wipes error_message, which would clear the awaiting_approval
-        # marker — if the process dies between the wipe and the blocked
-        # branch re-setting the marker, the row would become invisible to
-        # the resume pass AND stale enough to be evicted by
-        # expire_stuck_processing.  Resumed items are already in
-        # processing state with the correct marker; leave them alone.
         resumed_ids: set[str] = {item.id for item in resume_items}
         resumed_paths: set[str] = {item.file_path for item in resume_items}
+        return resume_items, resumed_ids, resumed_paths
 
-        # Call-site gating pre-check: if an inbox_evaluation approval is
-        # already pending, skip detection of new/modified files entirely.
-        # No new inbox_items rows are created, no new approval requests
-        # fire, and the next scan re-checks once the pending approval
-        # resolves.  Resume items (already-pending rows) are still
-        # dispatched below to handle state transitions.
-        creation_blocked = False
+    # =================================================================
+    # Phase 2: Detect new/modified files
+    # =================================================================
+
+    async def _phase_detect_changes(
+        self,
+        watch: Path,
+        resumed_paths: set[str],
+    ) -> tuple[list[Path], list[Path]]:
+        """Detect new and modified files in the inbox folder.
+
+        Returns ``(new_files, modified_files)``.  Skips detection
+        entirely if a call-site approval is pending.
+        """
+        from genesis.db.crud import inbox_items
+
+        # Call-site gating pre-check: skip detection if approval pending.
         if self._autonomous_dispatcher is not None:
             try:
                 pending = await (
@@ -442,53 +453,44 @@ class InboxMonitor:
                     "call site blocked on approval %s",
                     pending.get("id"),
                 )
-                creation_blocked = True
+                return [], []
 
-        # 2. Load known items from DB (skipped when creation is blocked:
-        # detect_changes and the creation loops would just be no-ops).
-        if creation_blocked:
-            new_files: list[Path] = []
-            modified_files: list[Path] = []
-        else:
-            known = await inbox_items.get_all_known(
-                self._db, max_retries=self._config.max_retries,
-            )
+        known = await inbox_items.get_all_known(
+            self._db, max_retries=self._config.max_retries,
+        )
 
-            # 3. Detect changes
-            new_files, modified_files = detect_changes(
-                watch, known, self._config.response_dir,
-                recursive=self._config.recursive,
-            )
+        new_files, modified_files = detect_changes(
+            watch, known, self._config.response_dir,
+            recursive=self._config.recursive,
+        )
 
-        # Dedup resumed paths out of new/modified lists.  This closes a
-        # narrow TOCTOU window: the resume pass computes compute_hash(p)
-        # and matches it to the stored hash, then detect_changes computes
-        # compute_hash(p) again.  If the file is edited between the two
-        # calls, detect_changes may classify it as modified even though
-        # the resume pass already queued it for dispatch.  Giving the
-        # resume path priority avoids doubling up on the same file in a
-        # single scan.
+        # Dedup resumed paths out of new/modified lists (TOCTOU guard).
         if resumed_paths:
             new_files = [f for f in new_files if str(f) not in resumed_paths]
             modified_files = [
                 f for f in modified_files if str(f) not in resumed_paths
             ]
-        all_changed = new_files + modified_files
 
-        if not all_changed and not resume_items:
-            return CheckResult(
-                items_found=len(scan_folder(
-                    watch, self._config.response_dir,
-                    recursive=self._config.recursive,
-                )),
-            )
+        return new_files, modified_files
 
-        # 4. Create/update DB records for changed files.
-        # NOTE: resume_items are kept in a SEPARATE list — they are
-        # dispatched as forced singleton batches to preserve their
-        # original content-stable approval key.  Only new/modified
-        # items flow into pending_items for configured-batch-size
-        # dispatch.
+    # =================================================================
+    # Phase 3: Create DB records for changed files
+    # =================================================================
+
+    async def _phase_create_records(
+        self,
+        new_files: list[Path],
+        modified_files: list[Path],
+        now: datetime,
+        now_iso: str,
+    ) -> list[InboxItem]:
+        """Create/update DB rows for new and modified files.
+
+        Returns ``pending_items`` — items queued for dispatch.
+        Resume items are NOT included (they're dispatched separately).
+        """
+        from genesis.db.crud import inbox_items
+
         pending_items: list[InboxItem] = []
 
         for f in new_files:
@@ -510,8 +512,6 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            # Retry storm prevention: stop re-evaluating files that
-            # persistently fail URL fetches (e.g. permanent SSL issues).
             url_fail_count = await inbox_items.count_url_failures(
                 self._db, str(f), since_hours=48,
             )
@@ -545,7 +545,6 @@ class InboxMonitor:
         cooldown = timedelta(seconds=self._config.evaluation_cooldown_seconds)
 
         for f in modified_files:
-            # Update existing record: create new entry with updated hash
             item_id = str(uuid.uuid4())
             try:
                 content = read_content(f)
@@ -564,7 +563,6 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
-            # Cooldown: skip if successfully evaluated recently
             last_at = await inbox_items.get_last_completed_at(
                 self._db, str(f),
             )
@@ -587,7 +585,6 @@ class InboxMonitor:
                         continue
                 except (ValueError, TypeError):
                     pass  # Unparseable timestamp — proceed with evaluation
-            # Look up previous evaluation for delta-only processing
             existing = await inbox_items.get_by_file_path(self._db, str(f))
             if existing and existing["status"] == "pending":
                 await inbox_items.update_status(
@@ -595,7 +592,6 @@ class InboxMonitor:
                     status="failed",
                     error_message="superseded_by_modification",
                 )
-            # Compute delta: only send content not previously evaluated
             prev_content = await inbox_items.get_evaluated_content(
                 self._db, str(f),
             )
@@ -630,19 +626,39 @@ class InboxMonitor:
                 content_hash=h, detected_at=now_iso,
             ))
 
-        # 4. Batch and dispatch
+        return pending_items
+
+    # =================================================================
+    # Phase 4: Batch and dispatch
+    # =================================================================
+
+    async def _phase_dispatch_batches(
+        self,
+        resume_items: list[InboxItem],
+        pending_items: list[InboxItem],
+        resumed_ids: set[str],
+        now_iso: str,
+        errors: list[str],
+    ) -> int:
+        """Build batches and dispatch to CC sessions.
+
+        Returns the number of batches successfully dispatched.
+        Appends errors to the ``errors`` list in-place.
+        """
+        from genesis.cc.types import (
+            CCInvocation,
+            CCModel,
+            EffortLevel,
+            SessionType,
+            background_session_dir,
+        )
+        from genesis.db.crud import inbox_items, message_queue
+
         batches_dispatched = 0
         batch_size = self._config.batch_size
-        # Reflection MCP profile gives inbox sessions memory access
-        # (genesis-health + genesis-memory) so evaluations can query
-        # and store user signals via memory_recall / memory_store.
         mcp_path = SessionConfigBuilder().build_mcp_config("reflection")
 
-        # Build the dispatch schedule: resume items ALWAYS go as singleton
-        # batches (one item per dispatch call), new/modified items use the
-        # configured batch_size.  Resume items are dispatched first so the
-        # user sees pending-approval items resolved before new inbox work
-        # queues behind them.
+        # Resume items as singletons first, then new/modified in batches.
         scheduled_batches: list[list[InboxItem]] = [
             [item] for item in resume_items
         ]
@@ -652,12 +668,6 @@ class InboxMonitor:
         for batch in scheduled_batches:
             batch_id = str(uuid.uuid4())
 
-            # Update DB with batch_id and status=processing.
-            # For resumed items, do NOT overwrite status/error_message —
-            # they're already in processing with the awaiting_approval
-            # marker, and clearing the marker here would leave a narrow
-            # window where the row is invisible to the resume pass if the
-            # process dies before the blocked branch rewrites it.
             for item in batch:
                 await inbox_items.set_batch(self._db, item.id, batch_id=batch_id)
                 if item.id not in resumed_ids:
@@ -665,7 +675,6 @@ class InboxMonitor:
                         self._db, item.id, status="processing",
                     )
 
-            # Build prompt with all items
             prompt = self._build_prompt(batch)
             system_prompt = self._load_system_prompt()
 
@@ -678,11 +687,6 @@ class InboxMonitor:
                 effort = EffortLevel(self._config.effort)
             except ValueError:
                 effort = EffortLevel.MEDIUM
-
-            # No allowed_tools restriction: --dangerously-skip-permissions
-            # overrides --allowedTools (empirically verified 2026-03-17).
-            # The PreToolUse hook in .claude/settings.json blocks dangerous
-            # tool usage (e.g. WebFetch on YouTube URLs → redirects to yt-dlp).
 
             invocation = CCInvocation(
                 prompt=prompt,
@@ -710,60 +714,20 @@ class InboxMonitor:
                             {"role": "user", "content": prompt},
                         ],
                         cli_invocation=invocation,
-                        # Inbox deliberately routes through the autonomous
-                        # dispatcher for the approval gate only, never for
-                        # API fallback.  Free-tier SLMs are not acceptable
-                        # for user-facing inbox evaluation (quality > cost),
-                        # but the manual-approval gate before firing a real
-                        # CC session is the load-bearing piece of the April
-                        # 4 autonomous-CLI hardening we want to preserve.
-                        # Passing api_call_site_id=None makes route() skip
-                        # the API attempt and go straight to the approval
-                        # gate + CLI path.
                         api_call_site_id=None,
                         cli_fallback_allowed=True,
                         approval_required_for_cli=True,
-                        # Do NOT include batch_id or item_count here.  The
-                        # approval key is computed from this context, and
-                        # batch_id is a fresh UUID per scan — including it
-                        # would break dedup across scans and trigger a
-                        # fresh Telegram prompt every 30 minutes for the
-                        # same pending item.  The invocation.prompt
-                        # already contains the full item content and is
-                        # hashed into the approval key, so content-level
-                        # uniqueness is preserved without the UUID noise.
                         context=None,
                     ),
                 )
                 if decision.mode == "blocked":
                     err = f"CLI fallback blocked: {decision.reason}"
-                    # Distinguish "awaiting user approval" from other blocks
-                    # (policy disabled, rejection).  If the user simply hasn't
-                    # replied yet, keep the row alive in processing state with
-                    # a marker so the next scan can resume it — no new row,
-                    # no DB churn, no duplicate Telegram (the approval_key is
-                    # stable now, so ensure_approval will find the existing
-                    # pending request and skip the Telegram resend until the
-                    # re-ask interval elapses).
-                    #
-                    # Detection logic: if the dispatcher returned an
-                    # approval_request_id AND the reason does not indicate
-                    # rejection, the approval is still pending.  The
-                    # dispatcher emits "approval requested", "approval
-                    # pending", or "approval pending; reminder sent" for
-                    # pending cases and "existing rejection found" for
-                    # rejection — we match on the rejection keyword because
-                    # the pending phrases don't share a single substring.
                     reason_lower = decision.reason.lower()
                     is_pending_approval = (
                         decision.approval_request_id is not None
                         and "reject" not in reason_lower
                     )
                     if is_pending_approval:
-                        # Not an error — this is the expected state while
-                        # waiting for the user to approve in Telegram.  Log
-                        # at INFO so parked items don't spam the dashboard
-                        # with WARNING noise every 30 minutes.
                         logger.info(
                             "Inbox batch %s parked awaiting approval %s",
                             batch_id[:8], decision.approval_request_id,
@@ -777,12 +741,7 @@ class InboxMonitor:
                                 self._db, item.id, status="processing",
                                 error_message=marker, processed_at=now_iso,
                             )
-                        # Don't append parked items to errors list — they're
-                        # waiting, not failing.
                     else:
-                        # Rejection, policy disabled, or other terminal block —
-                        # mark failed so the standard retry/permanent-failure
-                        # logic takes over.
                         errors.append(err)
                         logger.warning(err)
                         for item in batch:
@@ -844,15 +803,6 @@ class InboxMonitor:
                     )
                 continue
 
-            # Empty-output tripwire.  Even with api_call_site_id=None and
-            # the AutonomousDispatchRouter empty-content fix upstream, a
-            # CC session could theoretically return empty text (e.g.
-            # upstream model timeout returning 200, transient edge cases).
-            # Without this guard, the response writer concatenates
-            # frontmatter + "" and produces a frontmatter-only file that
-            # silently marks the item completed — the exact failure mode
-            # that produced Genesis-4.genesis.md and
-            # "My todos & musings.genesis.md" on 2026-04-06 and 2026-04-10.
             if not output.text or not output.text.strip():
                 err = "CC invocation returned empty evaluation text"
                 errors.append(err)
@@ -879,12 +829,6 @@ class InboxMonitor:
                     )
                 continue
 
-            # Check if LLM classified as Acknowledged (context absorbed,
-            # no response file needed).  Still store evaluated_content so
-            # future delta computation works correctly.
-            # Guard: only apply for single-item batches.  With batch_size>1
-            # the response may contain both Acknowledged and non-Acknowledged
-            # items — _is_acknowledged would false-positive for the whole batch.
             if len(batch) == 1 and _is_acknowledged(output.text):
                 logger.info(
                     "Item(s) classified as Acknowledged — no response file "
@@ -936,8 +880,6 @@ class InboxMonitor:
                         batch_id=batch_id, items=len(batch),
                     )
 
-                # Intentionally skip triage pipeline for Acknowledged items:
-                # they are context/metadata, not findings worth triaging.
                 batches_dispatched += 1
                 continue
 
@@ -956,9 +898,6 @@ class InboxMonitor:
                     errors.append(err)
                     logger.error(err)
 
-            # Check for unresolved URL failures before marking complete.
-            # If URLs failed, don't store evaluated_content (prevents delta
-            # from masking failed URLs on future evaluations).
             batch_content = "\n".join(item.content for item in batch)
             url_failures = _has_url_failures(output.text, batch_content)
             if url_failures:
@@ -971,21 +910,16 @@ class InboxMonitor:
             completed_at = self._clock().isoformat()
             for item in batch:
                 if url_failures:
-                    # URL failures: preserve response but mark failed so
-                    # the file is re-detected on the next cycle and
-                    # evaluated with full content (no delta masking).
                     await inbox_items.mark_url_failure(
                         self._db, item.id,
                         response_path=str(response_path) if response_path else None,
                         processed_at=completed_at,
                     )
                 else:
-                    # Success: store full file content for future delta computation
                     try:
                         full_content = read_content(Path(item.file_path))
                     except (FileNotFoundError, PermissionError):
                         full_content = item.content
-                    # Fallback: file may be transiently empty during Obsidian save
                     if not full_content.strip():
                         full_content = item.content
                     if response_path:
@@ -1002,11 +936,9 @@ class InboxMonitor:
                             evaluated_content=full_content,
                         )
 
-            # Complete CC session
             if used_cli and session_id is not None:
                 await self._session_manager.complete(session_id)
 
-            # Write message_queue entry for foreground context
             try:
                 source_names = ", ".join(
                     Path(item.file_path).name for item in batch
@@ -1028,7 +960,6 @@ class InboxMonitor:
             except Exception:
                 logger.exception("Failed to write message_queue entry")
 
-            # Fire triage pipeline — same path as foreground conversations
             if self._triage_pipeline is not None:
                 from genesis.observability.types import Subsystem
                 from genesis.util.tasks import tracked_task
@@ -1052,16 +983,7 @@ class InboxMonitor:
                     batch_id=batch_id, items=len(batch),
                 )
 
-        return CheckResult(
-            items_found=len(scan_folder(
-                watch, self._config.response_dir,
-                recursive=self._config.recursive,
-            )),
-            items_new=len(new_files),
-            items_modified=len(modified_files),
-            batches_dispatched=batches_dispatched,
-            errors=errors,
-        )
+        return batches_dispatched
 
     def _build_prompt(self, items: list[InboxItem]) -> str:
         """Build the evaluation prompt from a batch of items.
