@@ -9,19 +9,20 @@
 
 Specialized for reasoning, systems architecture, and deep technical logic.
 
-### GLM-5 (Thinking)
+### GLM 5.1
 
-- **API ID:** `z-ai/glm-5` (OpenRouter) / `glm-5` (Z.AI direct)
-- **Role:** Complex Planning & Systems Engineering
+- **API ID:** `z-ai/glm-5.1` (OpenRouter) / `glm-5.1` (Z.AI direct)
+- **Role:** Autonomous Workflow & Agentic Coding
 - **Context:** 200k tokens
-- **Intelligence Tier:** S (Chain-of-Thought reasoning)
-- **Cost:** $0.80/$2.56 per MTok (input/output via OpenRouter) — ~$1.24 blended via DeepInfra
+- **Intelligence Tier:** S (Elite, Agent-focused)
+- **SWE-Bench:** 77.8%
+- **Cost:** $1.40/$4.40 per MTok (input/output)
 - **Free Tier:** Z.AI/BigModel — 20M free tokens for new users (api.z.ai); also on Nvidia NIM (5,000 credits, 40 RPM)
 
 **Best At:**
-1. Multi-step Architecture: Planning microservices and system diagrams.
-2. Root Cause Analysis: Tracing intermittent bugs across distributed systems.
-3. Technical Planning: Deep-thinking logic at competitive pricing.
+1. Agentic Coding: Built specifically for planning multi-step changes across multiple files.
+2. Autonomous Workflow: Best model for agents that need to plan and execute independently.
+3. Root Cause Analysis: Tracing intermittent bugs across distributed systems.
 
 **Worst For:**
 - Response Speed: High latency due to internal "thinking" cycles.
@@ -31,20 +32,21 @@ Specialized for reasoning, systems architecture, and deep technical logic.
 ### DeepSeek V4
 
 - **API ID:** `deepseek/deepseek-v4` (OpenRouter)
-- **Role:** Coding & Codebase Building
-- **Context:** 10M tokens
-- **Intelligence Tier:** S (Logic Efficiency)
-- **Cost:** ~$0.30/$1.20 per MTok (input/output)
+- **Role:** Hardcore Dev / Math
+- **Context:** 128K - 512K tokens
+- **Intelligence Tier:** S (State-of-the-Art Logic)
+- **SWE-Bench:** ~75%+
+- **Cost:** $0.27 (cache) / $2.00 (input) / $4.50 (output) per MTok
 - **Free Tier:** DeepSeek V3.2 available on Nvidia NIM (5,000 credits, 40 RPM)
 
 **Best At:**
-1. Repository Scaffolding: Generating entire app structures (Next.js/Rust) in one go.
-2. Math & Logic: Top-tier algorithmic density for a low price.
+1. Raw IQ: Highest raw intelligence and best one-shot coding logic.
+2. Math & Algorithms: Top-tier algorithmic density; wins on pure syntax accuracy.
 3. Multi-file Reasoning: Handling logic that spans dozens of files simultaneously.
 
 **Worst For:**
+- Formatting Stubbornness: Can be stubborn with specific formatting instructions.
 - Natural Prose: Writing can feel slightly robotic or "translated."
-- Formatting Nuance: Occasionally ignores specific "soft" styling instructions.
 - Censorship: Heavily filtered on sensitive political or cultural topics.
 
 ### GPT-5.3 Codex
@@ -110,43 +112,45 @@ The daily drivers for professional productivity and general intelligence.
 - Speed: Slower than "Flash" models for simple, repetitive chat tasks.
 - Risk Aversion: Often refuses tasks that require "playing devil's advocate."
 
-### MiniMax M2.5
+### MiniMax 2.7
 
-- **API ID:** `minimax/minimax-m2.5` (OpenRouter)
-- **Role:** Small Context Generalist
-- **Context:** 205k tokens
-- **Intelligence Tier:** A (Office Logic)
-- **Cost:** $0.30/$1.20 per MTok (Standard) or $0.30/$2.40 (Lightning, 2x speed)
+- **API ID:** `minimax/minimax-m2.7` (OpenRouter)
+- **Role:** Fast Agents / Chatbots / Scale & Speed
+- **Context:** 200k tokens
+- **Intelligence Tier:** A (GPT-4o class)
+- **SWE-Bench:** ~55-60%
+- **Cost:** $0.30/$1.20 per MTok (input/output)
 - **Free Tier:** None
 
 **Best At:**
-1. Office Deliverables: Perfect output for Word, PPT, and Excel financial models.
-2. Roleplay: Surprisingly high EQ and adaptability to specific personas.
-3. Value: Very cheap for its capability level.
+1. Economics: 70-80% cheaper than alternatives while maintaining 90% of the intelligence.
+2. Speed: Noticeably fastest TTFT (Time to First Token), making UIs feel snappier.
+3. Value: Exceptional capability-to-cost ratio for high-volume automation.
 
 **Worst For:**
 - Obscure Facts: High hallucination rate on niche historical or legal details.
 - Coding Security: Often generates working code that contains security vulnerabilities.
 - Conversation Length: Tends to lose focus after 20+ turns of dialogue.
 
-### Kimi K2.5
+### Kimi 2.6
 
-- **API ID:** `moonshotai/kimi-k2.5` (OpenRouter)
-- **Role:** Agent Swarms & Project Management
-- **Context:** 2M tokens
-- **Intelligence Tier:** A (S if agentic use case) (Multimodal Agentic)
-- **Cost:** $0.60/$3.00 per MTok (Moonshot direct) — $0.45/$2.25 via DeepInfra
+- **API ID:** `moonshotai/kimi-2.6` (OpenRouter)
+- **Role:** Research / Long Docs
+- **Context:** 1M+ tokens (Turbo)
+- **Intelligence Tier:** A/S (Thoughtful reasoning)
+- **SWE-Bench:** ~62%
+- **Cost:** $1.00/$4.00 per MTok (input/output)
 - **Free Tier:** Available on Nvidia NIM (5,000 credits, 40 RPM)
 
 **Best At:**
-1. Parallel Research: Spawning sub-agents to research multiple topics at once.
-2. Multi-File Handling: Native support for handling large .zip or .tar uploads.
-3. Long-Context Summarization: Synthesizing massive amounts of raw research.
+1. Needle in a Haystack: Specialized architecture for searching its own memory — king of long-context retrieval.
+2. Research Synthesis: Synthesizing massive amounts of raw research from 500+ page documents.
+3. Human-like Reasoning: More "human-like" and conversational; better for creative writing and nuanced feedback.
 
 **Worst For:**
 - Single-Thread Speed: Slower than Gemini Flash for simple, direct Q&A.
 - Mathematical Precision: Weaker than DeepSeek on pure arithmetic calculation.
-- Reliability: Beta "swarm" features can occasionally crash or loop.
+- Hallucination: Other models hallucinate significantly past 100K tokens; Kimi handles it better but isn't immune.
 
 ### Mistral Large 3
 
@@ -394,8 +398,11 @@ Optimized for specific tasks: speed, video reasoning, and massive memory ingesti
 
 Loose guidance — not prescriptive. Use your judgment based on the task requirements.
 
-- **The Architect:** GLM-5 / Opus
+- **The Architect:** GLM 5.1 / Opus
 - **The Programmer:** DeepSeek V4 / Codex
+- **The Autonomous Agent:** GLM 5.1
+- **The Economist:** MiniMax 2.7
+- **The Librarian:** Kimi 2.6
 - **The Researcher:** Gemini 3 Flash / Llama 4 Scout
 
 ---
@@ -639,6 +646,9 @@ High for adversarial review (#20) — without changing application code.
 ---
 
 ## Last Reviewed
+2026-04-26 — updated GLM-5→5.1 (77.8% SWE, agent-focused), MiniMax M2.5→2.7
+(GPT-4o class, best economics), Kimi K2.5→2.6 (1M+ context, retrieval king),
+DeepSeek V4 specs (128K-512K context, corrected from 10M; updated pricing).
 2026-04-14 — added free tier benchmark comparison table; added Cerebras, GitHub
 Models, SambaNova free tier terms; updated OpenRouter with $10 balance info;
 added Pending Evaluation section; added Qwen3-Coder 480B, Gemma 4, Trinity Large.
