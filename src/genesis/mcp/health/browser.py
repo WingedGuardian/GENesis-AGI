@@ -422,13 +422,14 @@ def _remote_browser_connected() -> bool:
 
 
 def _check_remote_health() -> dict | None:
-    """Returns error dict if remote is active but disconnected. None if OK."""
+    """Returns error dict if remote is active but disconnected. None if OK.
+
+    Read-only — does NOT modify global state. Use _detach_dead_remote()
+    when you need to clear globals on disconnection.
+    """
     if not _is_remote_active():
         return None
     if not _remote_browser_connected():
-        global _active_page, _remote_page
-        _active_page = None
-        _remote_page = None
         return {
             "error": (
                 "Remote Chrome connection lost. "
@@ -437,6 +438,20 @@ def _check_remote_health() -> dict | None:
             )
         }
     return None
+
+
+def _detach_dead_remote() -> dict | None:
+    """Check remote health and clear globals if disconnected.
+
+    Returns error dict if remote was disconnected (globals cleared),
+    None if OK or not in remote mode.
+    """
+    err = _check_remote_health()
+    if err is not None:
+        global _active_page, _remote_page
+        _active_page = None
+        _remote_page = None
+    return err
 
 
 def _update_remote_url() -> None:
@@ -906,7 +921,7 @@ async def _impl_browser_click(selector: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -931,7 +946,7 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -959,7 +974,7 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -985,7 +1000,7 @@ async def _impl_browser_screenshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1006,7 +1021,7 @@ async def _impl_browser_snapshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1025,7 +1040,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1078,7 +1093,7 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     count = max(1, min(count, 50))
