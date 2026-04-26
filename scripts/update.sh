@@ -721,12 +721,39 @@ print(cfg.get('host_user', 'ubuntu'))
     SSH_KEY="$HOME/.ssh/genesis_guardian_ed25519"
 
     if [ -n "$HOST_IP" ] && [ -f "$SSH_KEY" ]; then
-        echo "--- Updating Guardian on host VM ---"
-        if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
-               "${HOST_USER}@${HOST_IP}" update 2>&1; then
-            echo "  Guardian updated"
+        # Check if Guardian-relevant paths changed in this update
+        GUARDIAN_PATHS="src/genesis/guardian src/genesis/util src/genesis/env.py src/genesis/observability src/genesis/db config/guardian-claude.md pyproject.toml scripts/install_guardian.sh scripts/guardian-gateway.sh"
+        DEPLOY_HASH=$(git -C "$GENESIS_ROOT" rev-parse --short HEAD)
+
+        if ! git -C "$GENESIS_ROOT" diff --quiet "$OLD_COMMIT" HEAD -- $GUARDIAN_PATHS 2>/dev/null; then
+            echo "--- Guardian-relevant paths changed — redeploying to host ---"
+            # Try push-based redeploy (new gateway verb)
+            if git -C "$GENESIS_ROOT" archive HEAD -- src/ config/ scripts/ pyproject.toml | \
+               ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                   "${HOST_USER}@${HOST_IP}" "redeploy $DEPLOY_HASH" 2>/dev/null; then
+                echo "  Guardian redeployed ($DEPLOY_HASH)"
+            else
+                # Fallback: old gateway doesn't know 'redeploy' — use 'update'
+                # to install new gateway, then retry redeploy
+                echo "  Redeploy not available — falling back to update + retry"
+                if ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=10 \
+                       "${HOST_USER}@${HOST_IP}" update 2>&1; then
+                    echo "  Guardian updated via git pull — retrying redeploy..."
+                    # Gateway is a static file invoked fresh per SSH connection.
+                    # After update writes the new version, next ssh uses it.
+                    if git -C "$GENESIS_ROOT" archive HEAD -- src/ config/ scripts/ pyproject.toml | \
+                       ssh -i "$SSH_KEY" -o BatchMode=yes -o ConnectTimeout=30 \
+                           "${HOST_USER}@${HOST_IP}" "redeploy $DEPLOY_HASH" 2>/dev/null; then
+                        echo "  Guardian redeployed on retry ($DEPLOY_HASH)"
+                    else
+                        echo "  Guardian redeploy retry failed (non-fatal)"
+                    fi
+                else
+                    echo "  Guardian update failed (non-fatal)"
+                fi
+            fi
         else
-            echo "  Guardian update failed (non-fatal)"
+            echo "--- No Guardian-relevant changes — skipping host redeploy ---"
         fi
         echo ""
     fi

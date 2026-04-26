@@ -9,11 +9,12 @@
 #   reset-state    — reset stuck state machine to healthy
 #   version        — report CC, code, and Node versions
 #   update         — pull latest code + self-update gateway script
+#   redeploy <hash> — receive tar archive on stdin, deploy to install dir
 #
 # SSH authorized_keys entry (replace CONTAINER_IP with your container's IP):
 #   command="~/.local/bin/guardian-gateway.sh",from="CONTAINER_IP" ssh-ed25519 ...
 #
-# This gives Genesis exactly 7 operations on the host. Nothing else.
+# This gives Genesis exactly 8 operations on the host. Nothing else.
 
 set -euo pipefail
 
@@ -78,8 +79,9 @@ PYEOF
         NODE_VER=$(node --version 2>/dev/null || echo "unavailable")
         CODE_VER=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         CODE_DATE=$(cd "$INSTALL_DIR" && git log -1 --format=%ci 2>/dev/null || echo "unknown")
-        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s"}\n' \
-            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE"
+        DEPLOYED=$(python3 -c "import json; print(json.load(open('$STATE_DIR/state.json')).get('deployed_commit','unknown'))" 2>/dev/null || echo "unknown")
+        printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s"}\n' \
+            "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED"
         ;;
     update)
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
@@ -148,6 +150,81 @@ PYEOF
             echo '{"ok": false, "action": "update", "error": "not a git repo"}' >&2
             exit 1
         fi
+        ;;
+    redeploy\ *)
+        # Push-based redeploy: container sends tar archive on stdin.
+        # Usage: tar ... | ssh host "redeploy <commit_hash>"
+        # The container is the source of truth — no git pull needed.
+        COMMIT_HASH="${SSH_ORIGINAL_COMMAND#redeploy }"
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        BACKUP_DIR="${STATE_DIR}/deploy-backup"
+
+        # Backup current installation for rollback
+        rm -rf "$BACKUP_DIR"
+        if [ -d "$INSTALL_DIR/src" ]; then
+            cp -a "$INSTALL_DIR" "$BACKUP_DIR"
+        fi
+
+        # Extract archive from stdin into install dir
+        mkdir -p "$INSTALL_DIR"
+        if ! tar -xf - -C "$INSTALL_DIR" 2>/dev/null; then
+            # Rollback on extraction failure
+            if [ -d "$BACKUP_DIR" ]; then
+                rm -rf "$INSTALL_DIR"
+                mv "$BACKUP_DIR" "$INSTALL_DIR"
+            fi
+            echo '{"ok": false, "action": "redeploy", "error": "tar extraction failed"}' >&2
+            exit 1
+        fi
+
+        # Self-update gateway script (atomic rename — safe mid-execution)
+        if [ -f "$INSTALL_DIR/scripts/guardian-gateway.sh" ]; then
+            cp "$INSTALL_DIR/scripts/guardian-gateway.sh" "$HOME/.local/bin/guardian-gateway.sh.new"
+            chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
+            mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
+        fi
+
+        # Regenerate CLAUDE.md from template (never use repo version on host)
+        if [ -f "$INSTALL_DIR/config/guardian-claude.md" ]; then
+            cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
+            _cfg="$INSTALL_DIR/config/guardian.yaml"
+            if [ -f "$_cfg" ]; then
+                _cname=$(grep 'container_name:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
+                _cip=$(grep 'container_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
+                _hip=$(grep 'host_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
+                {
+                    echo ""
+                    echo "## Network"
+                    echo ""
+                    echo "- **Container**: ${_cname} at ${_cip}"
+                    echo "- **Host VM**: ${_hip} (this machine)"
+                    echo "- **Dashboard**: http://${_cip}:5000"
+                } >> "$INSTALL_DIR/CLAUDE.md"
+            fi
+        fi
+
+        # Record deployed commit in state
+        python3 << PYEOF
+import json
+from datetime import datetime, timezone
+sf = "$STATE_DIR/state.json"
+try:
+    with open(sf) as f:
+        d = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError, ValueError):
+    d = {}
+d["deployed_commit"] = "$COMMIT_HASH"
+d["deployed_at"] = datetime.now(timezone.utc).isoformat()
+with open(sf, "w") as f:
+    json.dump(d, f, indent=2)
+print(json.dumps({"ok": True, "action": "redeploy", "commit": "$COMMIT_HASH"}))
+PYEOF
+
+        # Restart timer so new code takes effect immediately
+        systemctl --user restart genesis-guardian.timer 2>/dev/null || true
+
+        # Clean up backup on success
+        rm -rf "$BACKUP_DIR"
         ;;
     ping)
         echo '{"ok": true, "action": "ping"}'

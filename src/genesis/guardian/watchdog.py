@@ -6,13 +6,18 @@ triggers SSH recovery if stale, and escalates via Telegram if recovery fails.
 When Guardian is stuck in confirmed_dead (state machine won't auto-reset and
 timer restarts don't help), escalates to reset-state via SSH.
 
+Also performs code drift detection: compares container's Guardian-relevant
+commit hash with the host's deployed version, alerting if they diverge.
+
 # GROUNDWORK(guardian-bidirectional): Container-side monitoring of host Guardian
 """
 
 from __future__ import annotations
 
 import logging
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +39,15 @@ class GuardianWatchdog:
     STUCK_THRESHOLD = 2         # Consecutive ticks seeing confirmed_dead before reset
     RESET_COOLDOWN_S = 1800     # 30 min between reset attempts (conservative)
 
+    # Paths that constitute "Guardian-relevant code" for drift detection.
+    _GUARDIAN_PATHS = [
+        "src/genesis/guardian", "src/genesis/util", "src/genesis/env.py",
+        "src/genesis/observability", "src/genesis/db",
+        "config/guardian-claude.md", "pyproject.toml",
+        "scripts/install_guardian.sh", "scripts/guardian-gateway.sh",
+    ]
+    DRIFT_ALERT_THRESHOLD = 3   # Consecutive drifted ticks before alerting
+
     def __init__(
         self,
         remote,  # GuardianRemote — import avoided for loose coupling
@@ -47,6 +61,7 @@ class GuardianWatchdog:
         self._last_recovery_at: datetime | None = None
         self._last_reset_at: datetime | None = None
         self._consecutive_stuck: int = 0
+        self._drift_count: int = 0
 
     def _in_cooldown(self) -> bool:
         if self._last_recovery_at is None:
@@ -125,6 +140,9 @@ class GuardianWatchdog:
         # Step 2: Check if Guardian is stuck in confirmed_dead
         await self._check_stuck_state()
 
+        # Step 3: Check for code version drift between container and host
+        await self._check_code_drift()
+
     async def _check_stuck_state(self) -> None:
         """Detect and recover from Guardian stuck in confirmed_dead.
 
@@ -189,3 +207,72 @@ class GuardianWatchdog:
                         )
         else:
             self._consecutive_stuck = 0
+
+    async def _check_code_drift(self) -> None:
+        """Detect Guardian code version drift between container and host.
+
+        Compares the container's latest commit for Guardian-relevant paths
+        against the host's deployed_commit (set by the redeploy verb).
+        Alerts after DRIFT_ALERT_THRESHOLD consecutive drifted ticks.
+
+        Best-effort: any failure silently skips. Drift detection must never
+        interfere with the primary health monitoring flow.
+        """
+        import contextlib
+        with contextlib.suppress(Exception):
+            await self._check_code_drift_inner()
+
+    async def _check_code_drift_inner(self) -> None:
+        """Inner implementation of drift detection (may raise)."""
+        # Get container's hash for Guardian-relevant paths
+        result = subprocess.run(
+            ["git", "-C", str(Path.home() / "genesis"),
+             "log", "-1", "--format=%h", "--"] + self._GUARDIAN_PATHS,
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return
+        container_hash = result.stdout.strip()
+        if not container_hash:
+            return
+
+        # Get host's deployed hash via SSH version command
+        version_info = await self._remote.version()
+        if not isinstance(version_info, dict):
+            return
+        host_hash = version_info.get("deployed_commit", "unknown")
+
+        if not isinstance(host_hash, str) or host_hash == "unknown":
+            return  # Host hasn't been redeployed yet (pre-feature) — skip
+
+        # Compare (short hashes — prefix match)
+        if container_hash.startswith(host_hash) or host_hash.startswith(container_hash):
+            if self._drift_count > 0:
+                logger.info("Guardian code drift resolved (container=%s host=%s)",
+                            container_hash, host_hash)
+            self._drift_count = 0
+            return
+
+        # Drift detected
+        self._drift_count += 1
+        if self._drift_count == self.DRIFT_ALERT_THRESHOLD:
+            logger.error(
+                "Guardian code drift detected for %d ticks: container=%s host=%s",
+                self._drift_count, container_hash, host_hash,
+            )
+            if self._event_bus:
+                from genesis.observability.types import Severity, Subsystem
+                await self._event_bus.emit(
+                    Subsystem.GUARDIAN, Severity.ERROR,
+                    "guardian.code_drift",
+                    f"Guardian code version mismatch — container={container_hash} "
+                    f"host={host_hash} (drifted {self._drift_count} ticks)",
+                )
+            if self._outreach_queue:
+                await self._outreach_queue.enqueue(
+                    f"⚠️ Guardian code drift: container={container_hash} "
+                    f"host={host_hash}. Auto-redeploy may have failed. "
+                    "Check update logs or run install_guardian.sh --non-interactive on host.",
+                    priority="high",
+                    source="guardian_watchdog",
+                )
