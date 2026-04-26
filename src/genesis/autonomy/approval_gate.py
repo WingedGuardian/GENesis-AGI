@@ -381,8 +381,11 @@ class AutonomousCliApprovalGate:
                 context.get("kind") == "autonomous_cli_fallback"
                 and context.get("approval_key") == approval_key
             ):
-                # Don't reuse consumed approvals — each dispatch needs its own.
-                if str(row.get("status") or "") == "approved" and row.get("consumed_at"):
+                # Each approval/rejection is instance-only — skip resolved rows.
+                status_str = str(row.get("status") or "")
+                if status_str == "rejected":
+                    continue
+                if status_str == "approved" and row.get("consumed_at"):
                     continue
                 return row
         # Pass 2: race-safety fallback — pending rows for the same site.
