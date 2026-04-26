@@ -340,13 +340,12 @@ class AutonomyManager:
                 corrected_at=corrected_at,
             )
             # emit() is async; schedule from sync context
+            from genesis.util.tasks import tracked_task
             try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(coro)
-                task.add_done_callback(lambda t: (
-                    logger.error("Autonomy regression event emission failed: %s", t.exception(), exc_info=t.exception())
-                    if not t.cancelled() and t.exception() else None
-                ))
+                tracked_task(
+                    coro, name="autonomy.regression-emit",
+                    subsystem=Subsystem.AUTONOMY, logger=logger,
+                )
             except RuntimeError:
                 pass  # No running loop — skip event
         except Exception:
@@ -372,15 +371,14 @@ class AutonomyManager:
                 level_before=level_before,
                 level_after=level_after,
             )
+            from genesis.util.tasks import tracked_task
             try:
-                loop = asyncio.get_running_loop()
-                task = loop.create_task(coro)
-                task.add_done_callback(lambda t: (
-                    logger.error("Autonomy promotion event emission failed: %s", t.exception(), exc_info=t.exception())
-                    if not t.cancelled() and t.exception() else None
-                ))
+                tracked_task(
+                    coro, name="autonomy.promotion-emit",
+                    subsystem=Subsystem.AUTONOMY, logger=logger,
+                )
             except RuntimeError:
-                pass
+                pass  # No running loop — skip event
         except Exception:
             logger.error(
                 "Failed to emit autonomy.promotion event", exc_info=True

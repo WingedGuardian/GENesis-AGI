@@ -16,6 +16,7 @@ import json
 import logging
 
 from genesis.dashboard.terminal_session import TerminalSession
+from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ async def terminal_ws_endpoint(websocket) -> None:  # noqa: C901
         finally:
             closed.set()
 
-    reader_task = asyncio.create_task(_pty_reader())
+    reader_task = tracked_task(_pty_reader(), name="pty-reader", logger=logger)
 
     try:
         while not closed.is_set():

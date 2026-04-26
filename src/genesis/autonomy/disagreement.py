@@ -98,13 +98,12 @@ class DisagreementGate:
                     secondary=secondary,
                 )
                 # emit() is async; schedule from sync context
+                from genesis.util.tasks import tracked_task
                 try:
-                    loop = asyncio.get_running_loop()
-                    task = loop.create_task(coro)
-                    task.add_done_callback(lambda t: (
-                        logger.error("Disagreement event emission failed: %s", t.exception(), exc_info=t.exception())
-                        if not t.cancelled() and t.exception() else None
-                    ))
+                    tracked_task(
+                        coro, name="autonomy.disagreement-emit",
+                        subsystem=Subsystem.AUTONOMY, logger=logger,
+                    )
                 except RuntimeError:
                     pass  # No running loop — skip event
             except Exception:
