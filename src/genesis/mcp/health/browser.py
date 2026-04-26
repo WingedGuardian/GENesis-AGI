@@ -627,7 +627,66 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
                     return
             except Exception as kb_err:
                 logger.warning("Keyboard fallback also failed for '%s': %s", selector, kb_err)
+            # --- Shadow DOM fallback ---
+            # Element may be inside an open shadow root that Playwright's
+            # selector engine can't pierce (common with Lit/Reddit-style
+            # web components).  Walk all shadow roots via JS and click the
+            # first match.  Only fires when ALL other strategies failed.
+            if await _click_in_shadow_dom(page, selector):
+                logger.info("Shadow DOM fallback succeeded for '%s'", selector)
+                return
             raise plain_err
+
+
+async def _click_in_shadow_dom(page, selector: str) -> bool:
+    """Walk open shadow roots via JS and click the first matching element.
+
+    Returns True if an element was found and clicked, False otherwise.
+    Only handles ``text=`` selectors (by text content) and bare CSS
+    selectors (via ``querySelector``).  Closed shadow roots are
+    inaccessible from JS — this only covers open shadow DOM.
+    """
+    is_text = selector.startswith("text=")
+    search_value = selector[len("text="):] if is_text else selector
+
+    js = """
+    ([searchValue, isText]) => {
+        function walk(root) {
+            if (isText) {
+                const candidates = root.querySelectorAll(
+                    'button, a, [role="button"], input[type="submit"], '
+                    + 'input[type="button"], [tabindex]'
+                );
+                for (const el of candidates) {
+                    const txt = (el.textContent || el.value || '').trim();
+                    if (txt === searchValue) return el;
+                }
+            } else {
+                try {
+                    const el = root.querySelector(searchValue);
+                    if (el) return el;
+                } catch (_) { /* invalid selector — skip */ }
+            }
+            for (const child of root.querySelectorAll('*')) {
+                if (child.shadowRoot) {
+                    const found = walk(child.shadowRoot);
+                    if (found) return found;
+                }
+            }
+            return null;
+        }
+        const el = walk(document);
+        if (!el) return false;
+        el.scrollIntoView({block: 'center'});
+        el.click();
+        return true;
+    }
+    """
+    try:
+        return await page.evaluate(js, [search_value, is_text])
+    except Exception as exc:
+        logger.debug("Shadow DOM traversal failed for '%s': %s", selector, exc)
+        return False
 
 
 async def _human_type(page, selector: str, value: str) -> None:
