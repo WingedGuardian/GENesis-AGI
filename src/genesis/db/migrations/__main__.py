@@ -28,9 +28,11 @@ async def _run(args: argparse.Namespace) -> int:
         print(f"Database not found: {db_path}", file=sys.stderr)
         return 1
 
+    from genesis.db.connection import BUSY_TIMEOUT_MS
+
     async with aiosqlite.connect(str(db_path)) as db:
         await db.execute("PRAGMA journal_mode=WAL")
-        await db.execute("PRAGMA busy_timeout=5000")  # Match connection.BUSY_TIMEOUT_MS
+        await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         runner = MigrationRunner(db)
 
         if args.status:
