@@ -135,7 +135,7 @@ def _stream_response(conversation_loop, event_loop, user_message, session_key, c
         # Block until CC finishes (buffered response)
         response_text = future.result(timeout=300)
     except TimeoutError:
-        logger.error("OpenClaw CC invocation timed out for session %s", session_key[:16])
+        logger.error("OpenClaw CC invocation timed out for session %s", session_key[:16], exc_info=True)
         response_text = None
     except Exception:
         logger.exception(

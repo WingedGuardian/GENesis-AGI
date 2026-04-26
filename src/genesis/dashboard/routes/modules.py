@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import sqlite3
 
@@ -70,8 +69,10 @@ async def modules_list():
 
         tracker = getattr(mod, "_tracker", None)
         if tracker is not None and hasattr(tracker, "stats"):
-            with contextlib.suppress(Exception):
+            try:
                 entry["stats"] = tracker.stats()
+            except Exception:
+                logger.warning("Failed to get stats for module %s", name, exc_info=True)
         if hasattr(mod, "configurable_fields") and callable(getattr(mod, "configurable_fields", None)):
             try:
                 fields = mod.configurable_fields()
