@@ -49,8 +49,26 @@ def settings() -> dict:
 
 @pytest.fixture(scope="session")
 def bash_hook_command(settings: dict) -> str:
-    """The raw bash -c command string for the Bash PreToolUse hook."""
+    """The inline bash -c command string for the Bash PreToolUse hook."""
     return _find_hook_command(settings, "Bash")
+
+
+@pytest.fixture(scope="session")
+def rm_rf_hook_command() -> str:
+    """Command to run the destructive_command_guard.py script directly.
+
+    The rm-rf guard is a separate Python script (not the inline bash hook).
+    This fixture resolves the script path and returns a shell command that
+    invokes it via the venv Python, matching how genesis-hook runs it.
+    """
+    here = Path(__file__).resolve()
+    for ancestor in here.parents:
+        script = ancestor / "scripts" / "hooks" / "destructive_command_guard.py"
+        if script.exists():
+            venv_python = ancestor / ".venv" / "bin" / "python"
+            python = str(venv_python) if venv_python.exists() else "python3"
+            return f"{python} {script}"
+    raise FileNotFoundError("Could not find destructive_command_guard.py")
 
 
 @pytest.fixture(scope="session")

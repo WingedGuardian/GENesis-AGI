@@ -2,13 +2,13 @@
 """PreToolUse hook (Bash): block rm -rf on broad paths.
 
 Catches rm with recursive+force flags targeting shallow paths that
-could wipe important directories. A path must be at least 3 components
-deep (e.g., /home/ubuntu/genesis/some_dir) to pass.
+could wipe important directories. A path must be at least 4 components
+deep (e.g., /home/user/project/some_dir) to pass.
 
-Blocks:  rm -rf /  |  rm -rf ~  |  rm -rf .  |  rm -rf ~/genesis
-Allows:  rm -rf /home/ubuntu/genesis/.claude/worktrees/old-branch
+Blocks:  rm -rf /  |  rm -rf ~  |  rm -rf .  |  rm -rf ~/project
+Allows:  rm -rf /home/user/project/.claude/worktrees/old-branch
 
-Depth threshold is 4 components (e.g., /home/ubuntu/genesis/subdir).
+Depth threshold is 4 components (e.g., /home/user/project/subdir).
 
 Stdlib-only. Fail-open on parse errors.
 """
