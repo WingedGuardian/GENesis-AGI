@@ -25,7 +25,6 @@ def _valid_output(
     focus: str = "investigating backlog growth",
     follow_ups: list | None = None,
     morning_report: str | None = None,
-    communication_decision: str = "send_digest",
 ) -> str:
     """Build a valid ego JSON output string."""
     default_proposals = [
@@ -43,7 +42,6 @@ def _valid_output(
         "proposals": proposals if proposals is not None else default_proposals,
         "focus_summary": focus,
         "follow_ups": follow_ups if follow_ups is not None else ["check backlog tomorrow"],
-        "communication_decision": communication_decision,
     }
     if morning_report is not None:
         data["morning_report"] = morning_report
@@ -125,7 +123,7 @@ def dispatcher(db):
 
 @pytest.fixture
 def config():
-    return EgoConfig(ego_thinking_budget_usd=10.0, ego_dispatch_budget_usd=5.0)
+    return EgoConfig(daily_budget_cap_usd=10.0)
 
 
 @pytest.fixture
@@ -204,7 +202,7 @@ class TestEgoSession:
         # Insert a costly cycle to exhaust budget
         await ego_crud.create_cycle(
             db, id="expensive", output_text="x",
-            cost_usd=config.ego_thinking_budget_usd + 1.0,
+            cost_usd=config.daily_budget_cap_usd + 1.0,
         )
         with pytest.raises(BudgetExceededError):
             await ego_session.run_cycle()
@@ -322,166 +320,6 @@ class TestEgoSession:
         await ego_session.run_cycle()
         invocation = mock_invoker.run.call_args[0][0]
         assert "Test operational context" in invocation.prompt
-
-
-# ---------------------------------------------------------------------------
-# Execution brief tests
-# ---------------------------------------------------------------------------
-
-
-class TestProcessExecutionBriefs:
-    """Tests for _process_execution_briefs — the ego-as-executor path."""
-
-    @pytest.fixture
-    def mock_direct_runner(self):
-        runner = AsyncMock()
-        runner.spawn.return_value = "dispatched_sess_1"
-        return runner
-
-    @pytest.fixture
-    def ego_with_runner(
-        self, mock_invoker, mock_session_manager, mock_compaction,
-        mock_context_builder, mock_proposal_workflow, dispatcher,
-        config, db, mock_direct_runner,
-    ):
-        return EgoSession(
-            invoker=mock_invoker,
-            session_manager=mock_session_manager,
-            compaction_engine=mock_compaction,
-            context_builder=mock_context_builder,
-            proposal_workflow=mock_proposal_workflow,
-            dispatcher=dispatcher,
-            config=config,
-            db=db,
-            mcp_config_path=None,
-            direct_session_runner=mock_direct_runner,
-        )
-
-    async def _insert_proposal(self, db, proposal_id, status="approved"):
-        """Insert a proposal into the DB for testing."""
-        await db.execute(
-            "INSERT INTO ego_proposals "
-            "(id, action_type, action_category, content, rationale, "
-            "confidence, urgency, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            (proposal_id, "investigate", "test", "test content",
-             "test rationale", 0.8, "normal", status),
-        )
-        await db.commit()
-
-    async def test_happy_path(self, ego_with_runner, mock_direct_runner, db):
-        """Approved proposal dispatches via DirectSessionRunner."""
-        await self._insert_proposal(db, "prop_001")
-
-        briefs = [{"proposal_id": "prop_001", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_called_once()
-        req = mock_direct_runner.spawn.call_args[0][0]
-        assert req.prompt == "Do the thing"
-        assert req.source_tag == "ego_dispatch"
-        assert req.caller_context == "ego_proposal:prop_001"
-
-        # Proposal should be transitioned to executed
-        prop = await ego_crud.get_proposal(db, "prop_001")
-        assert prop["status"] == "executed"
-
-    async def test_pending_proposal_skipped(self, ego_with_runner, mock_direct_runner, db):
-        """Non-approved proposal in execution brief is skipped."""
-        await self._insert_proposal(db, "prop_002", status="pending")
-
-        briefs = [{"proposal_id": "prop_002", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
-        # Proposal stays pending
-        prop = await ego_crud.get_proposal(db, "prop_002")
-        assert prop["status"] == "pending"
-
-    async def test_rejected_proposal_skipped(self, ego_with_runner, mock_direct_runner, db):
-        """Rejected proposal in execution brief is skipped."""
-        await self._insert_proposal(db, "prop_003", status="rejected")
-
-        briefs = [{"proposal_id": "prop_003", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
-
-    async def test_nonexistent_proposal_skipped(self, ego_with_runner, mock_direct_runner, db):
-        """Execution brief for unknown proposal ID is skipped."""
-        briefs = [{"proposal_id": "does_not_exist", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
-
-    async def test_spawn_failure_marks_failed(self, ego_with_runner, mock_direct_runner, db):
-        """DirectSessionRunner failure transitions proposal to failed."""
-        await self._insert_proposal(db, "prop_004")
-        mock_direct_runner.spawn.side_effect = RuntimeError("spawn failed")
-
-        briefs = [{"proposal_id": "prop_004", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        prop = await ego_crud.get_proposal(db, "prop_004")
-        assert prop["status"] == "failed"
-
-    async def test_no_runner_returns_early(self, ego_session, db):
-        """No DirectSessionRunner → log warning and return."""
-        await self._insert_proposal(db, "prop_005")
-
-        briefs = [{"proposal_id": "prop_005", "prompt": "Do the thing"}]
-        await ego_session._process_execution_briefs(briefs)
-
-        # Proposal unchanged (no runner to dispatch)
-        prop = await ego_crud.get_proposal(db, "prop_005")
-        assert prop["status"] == "approved"
-
-    async def test_dispatch_budget_exceeded(self, ego_with_runner, mock_direct_runner, db, config):
-        """Dispatch budget exhausted → no spawns."""
-        config.ego_dispatch_budget_usd = 0.0  # Exhausted
-        await self._insert_proposal(db, "prop_006")
-
-        briefs = [{"proposal_id": "prop_006", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
-        # Proposal unchanged
-        prop = await ego_crud.get_proposal(db, "prop_006")
-        assert prop["status"] == "approved"
-
-    async def test_profile_mapping(self, ego_with_runner, mock_direct_runner, db):
-        """Profile and model from brief are passed to the request."""
-        await self._insert_proposal(db, "prop_007")
-
-        briefs = [{"proposal_id": "prop_007", "prompt": "Research this",
-                    "profile": "research", "model": "haiku"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        req = mock_direct_runner.spawn.call_args[0][0]
-        assert req.profile == "research"
-        assert req.model.value == "haiku"
-
-    async def test_invalid_profile_defaults_observe(self, ego_with_runner, mock_direct_runner, db):
-        """Invalid profile falls back to observe."""
-        await self._insert_proposal(db, "prop_008")
-
-        briefs = [{"proposal_id": "prop_008", "prompt": "Do it",
-                    "profile": "admin"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        req = mock_direct_runner.spawn.call_args[0][0]
-        assert req.profile == "observe"
-
-    async def test_empty_brief_skipped(self, ego_with_runner, mock_direct_runner, db):
-        """Brief missing proposal_id or prompt is silently skipped."""
-        briefs = [
-            {"proposal_id": "", "prompt": "Do it"},     # empty ID
-            {"proposal_id": "x", "prompt": ""},          # empty prompt
-            {"not_a_real": "brief"},                      # wrong keys
-        ]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

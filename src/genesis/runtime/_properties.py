@@ -281,6 +281,10 @@ class _RuntimeProperties:
         return self._genesis_ego_cadence_manager
 
     @property
+    def ego_proposal_executor(self) -> object | None:
+        return self._ego_proposal_executor
+
+    @property
     def bootstrap_manifest(self) -> dict[str, str]:
         return dict(self._bootstrap_manifest)
 

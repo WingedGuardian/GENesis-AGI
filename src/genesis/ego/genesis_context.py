@@ -56,8 +56,6 @@ class GenesisEgoContextBuilder:
         sections.append(await self._observations_section())
         sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
-        sections.append(await self._proposal_board_section())
-        sections.append(await self._execution_outcomes_section())
         sections.append(self._output_contract_section())
 
         return "\n".join(sections)
@@ -293,87 +291,6 @@ class GenesisEgoContextBuilder:
             lines.append(f"- **Ego spend today**: ${ego_spend:.4f}")
         except Exception:
             pass
-
-        lines.append("")
-        return "\n".join(lines)
-
-    async def _proposal_board_section(self) -> str:
-        """Current board state + approved proposals ready for execution."""
-        from genesis.db.crud import ego as ego_crud
-
-        lines = ["## Proposal Board\n"]
-
-        try:
-            board = await ego_crud.get_board(self._db, board_size=10)
-        except Exception:
-            logger.error("Failed to query proposal board", exc_info=True)
-            lines.append("*Could not query proposal board.*\n")
-            return "\n".join(lines)
-
-        if not board:
-            lines.append("*Board is empty — no pending proposals.*\n")
-        else:
-            lines.append(f"**{len(board)} pending proposals** (your active board):\n")
-            for p in board:
-                rank = p.get("rank")
-                rank_str = f"#{rank}" if rank else "unranked"
-                content = (p.get("content") or "")[:150]
-                content = content.replace("\n", " ")
-                lines.append(
-                    f"- [{rank_str}] **{p.get('action_type', '?')}** "
-                    f"(id:{p['id']}): {content}"
-                )
-
-        # Approved proposals ready for execution
-        try:
-            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5)
-        except Exception:
-            approved = []
-
-        if approved:
-            lines.append(f"\n**{len(approved)} approved proposals** (ready for execution):\n")
-            for p in approved:
-                content = (p.get("content") or "")[:150]
-                content = content.replace("\n", " ")
-                lines.append(
-                    f"- **{p.get('action_type', '?')}** (id:{p['id']}): {content}"
-                )
-            lines.append(
-                "\nYou can execute these by outputting execution_briefs "
-                "with the proposal_id and dispatch instructions.\n"
-            )
-        else:
-            lines.append("\n*No approved proposals awaiting execution.*\n")
-
-        lines.append("")
-        return "\n".join(lines)
-
-    async def _execution_outcomes_section(self) -> str:
-        """Recent outcomes from ego-dispatched background sessions."""
-        lines = ["## Recent Execution Outcomes (48h)\n"]
-
-        try:
-            cursor = await self._db.execute(
-                "SELECT content, priority, created_at FROM observations "
-                "WHERE type = 'execution_outcome' AND source = 'ego_dispatch' "
-                "AND created_at >= datetime('now', '-48 hours') "
-                "ORDER BY created_at DESC LIMIT 10"
-            )
-            rows = await cursor.fetchall()
-        except Exception:
-            logger.error("Failed to query execution outcomes", exc_info=True)
-            lines.append("*Could not query execution outcomes.*\n")
-            return "\n".join(lines)
-
-        if not rows:
-            lines.append("*No ego dispatch outcomes in last 48h.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"**{len(rows)} outcomes**:\n")
-        for content, priority, created_at in rows:
-            short = (content or "")[:200].replace("\n", " ")
-            ts = (created_at or "?")[:16]
-            lines.append(f"- [{ts}] [{priority}] {short}")
 
         lines.append("")
         return "\n".join(lines)

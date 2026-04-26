@@ -36,8 +36,6 @@ class ProposalStatus(StrEnum):
     EXPIRED = "expired"
     EXECUTED = "executed"
     FAILED = "failed"
-    TABLED = "tabled"
-    WITHDRAWN = "withdrawn"
 
 
 class ProposalUrgency(StrEnum):
@@ -105,9 +103,8 @@ class EgoConfig:
     default_effort: str = "high"  # effort for regular cycles
     morning_report_effort: str = "low"  # effort for morning reports
     morning_report_enabled: bool = True  # set False for Genesis ego
-    board_size: int = 3  # max active proposals on the board
-    ego_thinking_budget_usd: float = 4.0  # daily cap for ego cycle costs
-    ego_dispatch_budget_usd: float = 2.50  # daily cap for dispatched sessions
+    proposal_expiry_minutes: int = 240  # 4 hours
+    daily_budget_cap_usd: float = 10.0  # max daily ego spend
     morning_report_hour: int = 8  # 24h format, local time
     morning_report_minute: int = 0
     morning_report_timezone: str = "UTC"
@@ -140,63 +137,8 @@ EGO_OUTPUT_SCHEMA = {
                     "urgency": {"type": "string",
                                 "enum": ["low", "normal", "high", "critical"]},
                     "alternatives": {"type": "string"},
-                    "execution_plan": {
-                        "type": "string",
-                        "description": "Brief dispatch plan (e.g., 'background CC session, ~$0.50, ~15 min')",
-                    },
-                    "rank": {
-                        "type": "integer",
-                        "description": "Board priority rank (1 = highest)",
-                    },
-                    "recurring": {
-                        "type": "boolean",
-                        "description": "True if this implies ongoing/recurring work",
-                    },
                 },
             },
-        },
-        "tabled": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Proposal IDs to table (move off active board, keep in DB)",
-        },
-        "withdrawn": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Proposal IDs to withdraw (superseded or no longer relevant)",
-        },
-        "execution_briefs": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["proposal_id", "prompt"],
-                "properties": {
-                    "proposal_id": {
-                        "type": "string",
-                        "description": "ID of an approved proposal to execute",
-                    },
-                    "prompt": {
-                        "type": "string",
-                        "description": "Dispatch instructions for the background session",
-                    },
-                    "profile": {
-                        "type": "string",
-                        "enum": ["observe", "research"],
-                        "description": "Session profile (default: observe)",
-                    },
-                    "model": {
-                        "type": "string",
-                        "enum": ["sonnet", "haiku"],
-                        "description": "Model for dispatch (default: sonnet)",
-                    },
-                },
-            },
-            "description": "Approved proposals to dispatch as background sessions",
-        },
-        "communication_decision": {
-            "type": "string",
-            "enum": ["send_digest", "urgent_notify", "stay_quiet"],
-            "description": "Whether to send proposals to user (default: send_digest)",
         },
         "focus_summary": {
             "type": "string",

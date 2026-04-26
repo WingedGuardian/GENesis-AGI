@@ -84,10 +84,7 @@ async def db():
                 batch_id        TEXT,
                 created_at      TEXT NOT NULL,
                 resolved_at     TEXT,
-                expires_at      TEXT,
-                rank            INTEGER,
-                execution_plan  TEXT,
-                recurring       INTEGER DEFAULT 0
+                expires_at      TEXT
             )
         """)
         await conn.execute("""

@@ -87,8 +87,7 @@ class TestEgoInitWiring:
             mock_config.enabled = True
             mock_config.cadence_minutes = 60
             mock_config.model = "opus"
-            mock_config.ego_thinking_budget_usd = 4.0
-            mock_config.ego_dispatch_budget_usd = 2.5
+            mock_config.daily_budget_cap_usd = 10.0
             mock_load.return_value = mock_config
 
             mock_cadence = AsyncMock()
@@ -122,8 +121,7 @@ class TestEgoInitWiring:
             mock_config.enabled = True
             mock_config.cadence_minutes = 60
             mock_config.model = "opus"
-            mock_config.ego_thinking_budget_usd = 4.0
-            mock_config.ego_dispatch_budget_usd = 2.5
+            mock_config.daily_budget_cap_usd = 10.0
             mock_load.return_value = mock_config
 
             mock_cadence = AsyncMock()
@@ -154,8 +152,7 @@ class TestEgoInitWiring:
             mock_config.enabled = True
             mock_config.cadence_minutes = 60
             mock_config.model = "opus"
-            mock_config.ego_thinking_budget_usd = 4.0
-            mock_config.ego_dispatch_budget_usd = 2.5
+            mock_config.daily_budget_cap_usd = 10.0
             mock_load.return_value = mock_config
 
             mock_cadence = AsyncMock()
@@ -185,8 +182,7 @@ class TestEgoInitWiring:
             mock_config.enabled = True
             mock_config.cadence_minutes = 60
             mock_config.model = "opus"
-            mock_config.ego_thinking_budget_usd = 4.0
-            mock_config.ego_dispatch_budget_usd = 2.5
+            mock_config.daily_budget_cap_usd = 10.0
             mock_load.return_value = mock_config
 
             mock_cadence = AsyncMock()

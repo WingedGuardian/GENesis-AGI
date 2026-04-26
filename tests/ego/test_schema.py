@@ -49,10 +49,6 @@ class TestEgoSchema:
             assert "cycle_id" in cols
             assert "batch_id" in cols
             assert "expires_at" in cols
-            # Phase B board columns
-            assert "rank" in cols
-            assert "execution_plan" in cols
-            assert "recurring" in cols
 
     @pytest.mark.asyncio
     async def test_ego_state_table_creation(self):
@@ -81,30 +77,6 @@ class TestEgoSchema:
                 )
 
     @pytest.mark.asyncio
-    async def test_ego_proposals_tabled_status_valid(self):
-        async with aiosqlite.connect(":memory:") as db:
-            await db.execute(TABLES["ego_proposals"])
-            await db.execute(
-                "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
-                "VALUES ('p1', 'test', 'test', 'tabled', '2026-04-26')"
-            )
-            cursor = await db.execute("SELECT status FROM ego_proposals WHERE id='p1'")
-            row = await cursor.fetchone()
-            assert row[0] == "tabled"
-
-    @pytest.mark.asyncio
-    async def test_ego_proposals_withdrawn_status_valid(self):
-        async with aiosqlite.connect(":memory:") as db:
-            await db.execute(TABLES["ego_proposals"])
-            await db.execute(
-                "INSERT INTO ego_proposals (id, action_type, content, status, created_at) "
-                "VALUES ('p1', 'test', 'test', 'withdrawn', '2026-04-26')"
-            )
-            cursor = await db.execute("SELECT status FROM ego_proposals WHERE id='p1'")
-            row = await cursor.fetchone()
-            assert row[0] == "withdrawn"
-
-    @pytest.mark.asyncio
     async def test_ego_proposals_urgency_constraint(self):
         async with aiosqlite.connect(":memory:") as db:
             await db.execute(TABLES["ego_proposals"])
@@ -120,7 +92,7 @@ class TestEgoSchema:
 
     def test_ego_indexes_present(self):
         idx_names = [idx for idx in INDEXES if "ego_" in idx]
-        assert len(idx_names) >= 9  # 8 original + rank index
+        assert len(idx_names) >= 8  # We added 8 ego indexes
         # Check specific critical indexes exist
         idx_text = "\n".join(INDEXES)
         assert "idx_ego_cycles_created" in idx_text
@@ -128,4 +100,3 @@ class TestEgoSchema:
         assert "idx_ego_proposals_category" in idx_text
         assert "idx_ego_proposals_expires" in idx_text
         assert "idx_ego_proposals_batch" in idx_text
-        assert "idx_ego_proposals_rank" in idx_text
