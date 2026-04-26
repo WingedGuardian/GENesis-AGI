@@ -108,6 +108,18 @@ class Router:
         else:
             logger.info("Routing config reloaded: %d call sites", len(new_sites))
 
+        # Validate hardcoded call site IDs used by the route() wrapper
+        for label, site_id in [
+            ("_FREE_TIER_SITE", self._FREE_TIER_SITE),
+            *((f"_PURPOSE_SITES[{k!r}]", v) for k, v in self._PURPOSE_SITES.items()),
+        ]:
+            if site_id not in new_config.call_sites:
+                logger.error(
+                    "route() wrapper references call site %r (%s) "
+                    "which is missing from routing config",
+                    site_id, label,
+                )
+
     async def scan_dlq_orphans_after_reload(self) -> int:
         """Proactively expire DLQ items whose target_provider was removed.
 
@@ -402,14 +414,14 @@ class Router:
         Used by modules (crypto_ops, prediction_markets, generalization),
         pipeline triage, and bookmark enrichment.
 
-        Currently only tier="free" is supported. Other tiers log a warning
-        and fall through to the free-tier site.
+        Currently only tier="free" is supported. Raises ValueError for
+        other tiers.
         """
         if purpose and purpose in self._PURPOSE_SITES:
             call_site_id = self._PURPOSE_SITES[purpose]
         else:
             if tier != "free":
-                logger.warning("route() called with tier=%r but only 'free' is supported; using free-tier site", tier)
+                raise ValueError(f"route() only supports tier='free', got {tier!r}")
             call_site_id = self._FREE_TIER_SITE
 
         result = await self.route_call(
