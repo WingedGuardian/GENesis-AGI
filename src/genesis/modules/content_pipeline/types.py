@@ -54,6 +54,8 @@ class Script:
     voice_calibrated: bool = False
     anti_slop_passed: bool = False
     created_at: str = ""
+    status: str = "drafted"
+    register: str | None = None
 
 
 @dataclass

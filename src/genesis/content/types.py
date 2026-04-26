@@ -11,6 +11,7 @@ class FormatTarget(StrEnum):
     EMAIL = "email"
     LINKEDIN = "linkedin"
     TWITTER = "twitter"
+    MEDIUM = "medium"
     TERMINAL = "terminal"
     GENERIC = "generic"
 
@@ -38,6 +39,7 @@ class DraftRequest:
     context: str = ""
     target: FormatTarget = FormatTarget.GENERIC
     tone: str = "professional"
+    register: str = "professional_peers"
     max_length: int | None = None
     system_prompt: str | None = None
 
