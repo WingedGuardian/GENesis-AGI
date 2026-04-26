@@ -327,7 +327,9 @@ class AutonomyManager:
             return
 
         try:
-            import asyncio
+            import contextlib
+
+            from genesis.util.tasks import tracked_task
 
             coro = self._event_bus.emit(
                 Subsystem.AUTONOMY,
@@ -339,15 +341,11 @@ class AutonomyManager:
                 level_after=level_after,
                 corrected_at=corrected_at,
             )
-            # emit() is async; schedule from sync context
-            from genesis.util.tasks import tracked_task
-            try:
+            with contextlib.suppress(RuntimeError):
                 tracked_task(
                     coro, name="autonomy.regression-emit",
                     subsystem=Subsystem.AUTONOMY, logger=logger,
                 )
-            except RuntimeError:
-                pass  # No running loop — skip event
         except Exception:
             logger.error(
                 "Failed to emit autonomy.regression event", exc_info=True
@@ -360,7 +358,9 @@ class AutonomyManager:
         if self._event_bus is None:
             return
         try:
-            import asyncio
+            import contextlib
+
+            from genesis.util.tasks import tracked_task
 
             coro = self._event_bus.emit(
                 Subsystem.AUTONOMY,
@@ -371,14 +371,11 @@ class AutonomyManager:
                 level_before=level_before,
                 level_after=level_after,
             )
-            from genesis.util.tasks import tracked_task
-            try:
+            with contextlib.suppress(RuntimeError):
                 tracked_task(
                     coro, name="autonomy.promotion-emit",
                     subsystem=Subsystem.AUTONOMY, logger=logger,
                 )
-            except RuntimeError:
-                pass  # No running loop — skip event
         except Exception:
             logger.error(
                 "Failed to emit autonomy.promotion event", exc_info=True

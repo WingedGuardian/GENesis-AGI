@@ -728,16 +728,17 @@ async def _send_turnstile_alert(page_url: str) -> None:
     must not crash the browser submission.
     """
     try:
+        from genesis.env import secrets_path as _secrets_path
         from genesis.guardian.alert.base import Alert, AlertSeverity
         from genesis.guardian.alert.telegram import TelegramAlertChannel
 
-        secrets_path = Path.home() / "genesis" / "secrets.env"
-        if not secrets_path.exists():
+        sec_path = _secrets_path()
+        if not sec_path.exists():
             logger.warning("secrets.env not found — cannot send CAPTCHA alert")
             return
 
         secrets: dict[str, str] = {}
-        for line in secrets_path.read_text(encoding="utf-8").splitlines():
+        for line in sec_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if line and "=" in line and not line.startswith("#"):
                 k, v = line.split("=", 1)

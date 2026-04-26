@@ -86,7 +86,9 @@ class DisagreementGate:
 
         if self._event_bus is not None:
             try:
-                import asyncio
+                import contextlib
+
+                from genesis.util.tasks import tracked_task
 
                 coro = self._event_bus.emit(
                     Subsystem.AUTONOMY,
@@ -97,15 +99,11 @@ class DisagreementGate:
                     primary=primary,
                     secondary=secondary,
                 )
-                # emit() is async; schedule from sync context
-                from genesis.util.tasks import tracked_task
-                try:
+                with contextlib.suppress(RuntimeError):
                     tracked_task(
                         coro, name="autonomy.disagreement-emit",
                         subsystem=Subsystem.AUTONOMY, logger=logger,
                     )
-                except RuntimeError:
-                    pass  # No running loop — skip event
             except Exception:
                 logger.error(
                     "Failed to emit disagreement event for domain=%s",
