@@ -379,6 +379,77 @@ class JobHealthCollector:
         )
 
 
+class SchedulerLivenessCollector:
+    """Detects zombie APScheduler instances (running=True but no jobs executing).
+
+    Checks last job timestamps for the surplus scheduler.  If the surplus
+    scheduler's most recent job is older than ``stale_threshold_s`` seconds,
+    the signal fires (value > 0).  The awareness loop's own scheduler cannot
+    be self-monitored — that's handled by the status.json heartbeat +
+    external watchdog.
+    """
+
+    signal_name = "scheduler_liveness"
+
+    def __init__(
+        self,
+        *,
+        runtime=None,
+        stale_threshold_s: int = 900,  # 15 min (surplus dispatch runs every 5m)
+    ) -> None:
+        self._runtime = runtime
+        self._stale_threshold_s = stale_threshold_s
+
+    async def collect(self) -> SignalReading:
+        if self._runtime is None:
+            return _bootstrap_placeholder_reading(self.signal_name, "runtime")
+
+        now = datetime.now(UTC)
+        stale_schedulers: list[str] = []
+
+        # Check surplus scheduler liveness via job_health timestamps
+        surplus_sched = getattr(self._runtime, "_surplus_scheduler", None)
+        if surplus_sched is not None:
+            # Look at surplus-specific jobs in job_health
+            jh = self._runtime.job_health
+            surplus_jobs = [
+                "surplus_dispatch", "surplus_brainstorm",
+                "schedule_code_audit", "schedule_code_index",
+            ]
+            latest_run: datetime | None = None
+            for job_name in surplus_jobs:
+                entry = jh.get(job_name, {})
+                last_run_str = entry.get("last_run")
+                if last_run_str:
+                    try:
+                        lr = datetime.fromisoformat(last_run_str)
+                        if latest_run is None or lr > latest_run:
+                            latest_run = lr
+                    except (ValueError, TypeError):
+                        pass
+
+            if latest_run is not None:
+                age_s = (now - latest_run).total_seconds()
+                if age_s > self._stale_threshold_s:
+                    stale_schedulers.append(
+                        f"surplus (last job {int(age_s)}s ago)"
+                    )
+
+        if not stale_schedulers:
+            return SignalReading(
+                name=self.signal_name, value=0.0, source="runtime",
+                collected_at=now.isoformat(),
+            )
+
+        return SignalReading(
+            name=self.signal_name,
+            value=min(1.0, len(stale_schedulers) * 0.5),
+            source="runtime",
+            collected_at=now.isoformat(),
+            metadata={"stale": stale_schedulers},
+        )
+
+
 async def collect_all(collectors: list) -> list[SignalReading]:
     """Run all collectors concurrently. Failures return 0.0, never propagate."""
 

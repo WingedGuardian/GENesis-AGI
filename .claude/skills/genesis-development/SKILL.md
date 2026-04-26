@@ -87,6 +87,11 @@ with evidence, you're not done.
   at bootstrap, not dynamic. New capabilities need registration in
   `_CAPABILITY_DESCRIPTIONS` in `src/genesis/runtime/_capabilities.py`
   AND a bootstrap init step.
+- **APScheduler IntervalTrigger resets on restart.** `IntervalTrigger`
+  counts from server startup, not from last successful run. If the
+  server restarts more frequently than the interval, the job never
+  fires. Use `CronTrigger` for anything longer than a few hours.
+  Bit us with `user_model_evolution` (48h interval, daily restarts).
 
 ## Adaptive Review Protocol
 

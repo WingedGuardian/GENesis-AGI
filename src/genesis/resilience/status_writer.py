@@ -95,6 +95,26 @@ class StatusFileWriter:
         except Exception:
             pass
 
+        # Scheduler liveness heartbeats — enables the external watchdog to
+        # detect zombie schedulers (process alive, scheduler dead).
+        scheduler_heartbeats = {}
+        try:
+            rt_inst = self._runtime
+            if rt_inst is not None:
+                jh = rt_inst.job_health
+                # Awareness: use the awareness_tick job timestamp
+                at_entry = jh.get("awareness_tick", {})
+                if at_entry.get("last_run"):
+                    scheduler_heartbeats["awareness"] = at_entry["last_run"]
+                # Surplus: use surplus_dispatch job timestamp
+                sd_entry = jh.get("surplus_dispatch", {})
+                if sd_entry.get("last_run"):
+                    scheduler_heartbeats["surplus"] = sd_entry["last_run"]
+        except Exception:
+            pass
+        if scheduler_heartbeats:
+            data["scheduler_heartbeats"] = scheduler_heartbeats
+
         # Merge bridge/adapter health if provided
         if self._extra_data:
             data.update(self._extra_data)

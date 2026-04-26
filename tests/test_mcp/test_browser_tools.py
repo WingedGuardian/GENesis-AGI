@@ -314,7 +314,7 @@ class TestKeyboardFallback:
 
     @pytest.mark.asyncio
     async def test_raises_when_all_methods_fail(self):
-        """When stealth, plain, AND keyboard all fail, raises the plain error."""
+        """When stealth, plain, keyboard, AND shadow DOM all fail, raises the plain error."""
         page = MagicMock()
         locator = MagicMock()
         locator.count = AsyncMock(return_value=1)
@@ -329,9 +329,82 @@ class TestKeyboardFallback:
         page.click = AsyncMock(side_effect=Exception("plain failed"))
         page.keyboard = MagicMock()
         page.keyboard.press = AsyncMock(side_effect=Exception("kb failed"))
+        # Shadow DOM fallback also fails (returns False = not found)
+        page.evaluate = AsyncMock(return_value=False)
 
         with pytest.raises(Exception, match="plain failed"):
             await browser._stealth_click(page, "text=No")
+
+
+class TestShadowDomClick:
+    """Verify _click_in_shadow_dom and its integration in _stealth_click."""
+
+    @pytest.mark.asyncio
+    async def test_shadow_dom_fallback_succeeds(self):
+        """Shadow DOM JS traversal finds and clicks element after all else fails."""
+        page = MagicMock()
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=1)
+        page.locator.return_value = locator
+
+        browser._stealth_cm = MagicMock()
+        browser._stealth_page = page
+        browser._active_page = page
+
+        # Stealth, plain, and keyboard all fail
+        page.wait_for_selector = AsyncMock(side_effect=Exception("nope"))
+        page.click = AsyncMock(side_effect=Exception("plain failed"))
+        page.keyboard = MagicMock()
+        page.keyboard.press = AsyncMock(side_effect=Exception("kb failed"))
+        # Shadow DOM fallback succeeds (JS found and clicked the element)
+        page.evaluate = AsyncMock(return_value=True)
+
+        # Should NOT raise — shadow DOM fallback saves it
+        await browser._stealth_click(page, "text=Submit")
+
+        # Verify page.evaluate was called with the shadow DOM JS
+        page.evaluate.assert_awaited_once()
+        args = page.evaluate.call_args
+        assert args[0][1] == ["Submit", True]  # [search_value, is_text]
+
+    @pytest.mark.asyncio
+    async def test_shadow_dom_not_triggered_on_normal_success(self):
+        """Shadow DOM fallback should not run when normal click succeeds."""
+        page = MagicMock()
+        locator = MagicMock()
+        locator.count = AsyncMock(return_value=1)
+        page.locator.return_value = locator
+
+        # Non-Camoufox mode — plain click succeeds
+        page.click = AsyncMock()
+        page.evaluate = AsyncMock()
+
+        await browser._stealth_click(page, "text=Submit")
+
+        # Plain click worked, evaluate should NOT be called
+        page.evaluate.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shadow_dom_css_selector(self):
+        """CSS selectors are passed to querySelector inside shadow roots."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(return_value=True)
+
+        result = await browser._click_in_shadow_dom(page, "button.submit-btn")
+
+        assert result is True
+        args = page.evaluate.call_args
+        assert args[0][1] == ["button.submit-btn", False]  # [value, is_text=False]
+
+    @pytest.mark.asyncio
+    async def test_shadow_dom_evaluate_exception(self):
+        """JS evaluation errors return False, not raise."""
+        page = MagicMock()
+        page.evaluate = AsyncMock(side_effect=Exception("page crashed"))
+
+        result = await browser._click_in_shadow_dom(page, "text=Click")
+
+        assert result is False
 
 
 class TestPressKey:

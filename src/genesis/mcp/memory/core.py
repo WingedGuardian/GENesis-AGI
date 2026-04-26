@@ -44,19 +44,10 @@ async def memory_recall(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
-    # Over-fetch when filtering to compensate for post-retrieval filtering
-    fetch_limit = limit * 3 if (wing or room) else limit
     results = await memory_mod._retriever.recall(
-        query, source=source, limit=fetch_limit, min_activation=min_activation
+        query, source=source, limit=limit, min_activation=min_activation,
+        wing=wing, room=room,
     )
-
-    # Apply wing/room filters (post-retrieval — Qdrant doesn't support combined
-    # vector search + payload filter in a single recall path)
-    if wing:
-        results = [r for r in results if (r.payload.get("wing") or "") == wing]
-    if room:
-        results = [r for r in results if (r.payload.get("room") or "") == room]
-    results = results[:limit]
 
     if compact:
         return [

@@ -75,15 +75,27 @@ def search(
     query_vector: list[float],
     limit: int = 10,
     source_type: str | None = None,
+    wing: str | None = None,
+    room: str | None = None,
 ) -> list[dict]:
-    """Search by vector similarity. Optionally filter by source_type."""
-    query_filter = None
-    if source_type:
+    """Search by vector similarity with optional payload filters."""
+    conditions: list = []
+    if source_type or wing or room:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-        query_filter = Filter(
-            must=[FieldCondition(key="source_type", match=MatchValue(value=source_type))]
-        )
+        if source_type:
+            conditions.append(
+                FieldCondition(key="source_type", match=MatchValue(value=source_type))
+            )
+        if wing:
+            conditions.append(
+                FieldCondition(key="wing", match=MatchValue(value=wing))
+            )
+        if room:
+            conditions.append(
+                FieldCondition(key="room", match=MatchValue(value=room))
+            )
+    query_filter = Filter(must=conditions) if conditions else None
     results = client.query_points(
         collection_name=collection,
         query=query_vector,
