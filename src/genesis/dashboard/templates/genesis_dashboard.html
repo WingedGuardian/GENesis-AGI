@@ -6049,7 +6049,7 @@
           <div>
             <!-- Tab bar -->
             <div style="display: flex; gap: 0; border-bottom: 1px solid var(--color-border); margin-bottom: 1rem;">
-              <template x-for="t in [{id:'overview',label:'Overview'},{id:'proposals',label:'Proposals'},{id:'cycles',label:'Cycles'},{id:'followups',label:'Follow-ups'}]" :key="t.id">
+              <template x-for="t in [{id:'overview',label:'Overview'},{id:'cycles',label:'Cycles'}]" :key="t.id">
                 <button style="padding: 0.4rem 1rem; font-size: 0.78rem; border: none; background: none; cursor: pointer; border-bottom: 2px solid transparent; color: var(--color-text-secondary);"
                         :style="$store.genesisDashboard.egoModal.tab === t.id ? 'border-bottom-color: #c084fc; color: #c084fc; font-weight: 600;' : ''"
                         @click="$store.genesisDashboard.egoModal.tab = t.id"
@@ -6139,9 +6139,16 @@
                   </div>
                 </div>
               </template>
+              <!-- Quick navigation links -->
+              <div style="margin-top:1rem; display:flex; gap:0.5rem;">
+                <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(192,132,252,0.1); color:#c084fc; border:1px solid rgba(192,132,252,0.2);"
+                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'">View Proposals</button>
+                <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(156,39,176,0.1); color:#ce93d8; border:1px solid rgba(156,39,176,0.2);"
+                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'work'; $store.genesisDashboard.workTypeFilter = 'follow_up'">View Follow-ups</button>
+              </div>
             </div>
 
-            <!-- ═══ Tab: Proposals ═══ -->
+            <!-- ═══ Tab: Proposals (deprecated — now in Chat tab) ═══ -->
             <div x-show="$store.genesisDashboard.egoModal.tab === 'proposals'">
               <!-- Filter pills -->
               <div style="display: flex; gap: 0.4rem; margin-bottom: 0.8rem; flex-wrap: wrap;">
