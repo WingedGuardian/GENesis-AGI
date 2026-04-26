@@ -138,81 +138,79 @@ class TestBashHookWorktreeForceRemove:
 class TestBashHookRmRf:
     """Block rm -rf on broad/dangerous paths.
 
-    The hook uses glob patterns like *"rm -rf /"* which means ANY command
-    containing the literal substring 'rm -rf /' is blocked, including
-    specific absolute paths like /tmp/foo. This is intentionally aggressive.
+    The rm-rf guard is a separate Python script (destructive_command_guard.py)
+    that uses depth-based path analysis. Paths must be at least 4 components
+    deep to be allowed. Special targets (., .., /) are always blocked.
     """
 
-    def test_rm_rf_root_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf / -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "rm -rf /"})
+    def test_rm_rf_root_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf / -> BLOCKED (always-block target)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /"})
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_rm_rf_home_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf ~ -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "rm -rf ~"})
+    def test_rm_rf_home_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf ~ -> BLOCKED (depth 2 < 4)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf ~"})
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
 
-    def test_rm_rf_dot_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf . -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "rm -rf ."})
+    def test_rm_rf_dot_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf . -> BLOCKED (always-block target)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf ."})
         assert result.returncode == 2
 
-    def test_rm_rf_dotdot_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf .. -> BLOCKED."""
-        result = run_hook(bash_hook_command, {"command": "rm -rf .."})
+    def test_rm_rf_dotdot_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf .. -> BLOCKED (always-block target)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf .."})
         assert result.returncode == 2
 
-    def test_rm_rf_absolute_path_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf /tmp/foo -> BLOCKED (substring 'rm -rf /' matches).
-
-        The hook pattern *"rm -rf /"* catches ALL absolute-path rm -rf.
-        This is intentionally aggressive — the hook errs on the side of
-        safety. Use 'rm -r' (no -f) or ask the user for specific paths.
-        """
-        result = run_hook(bash_hook_command, {"command": "rm -rf /tmp/foo"})
+    def test_rm_rf_absolute_path_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf /tmp/foo -> BLOCKED (depth 2 < 4)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /tmp/foo"})
         assert result.returncode == 2
 
-    def test_rm_rf_relative_subpath_blocked(
-        self, bash_hook_command: str
+    def test_rm_rf_shallow_relative_blocked(
+        self, rm_rf_hook_command: str
     ) -> None:
-        """rm -rf ./some/specific/deep/path -> BLOCKED.
+        """rm -rf ./src -> BLOCKED (depth 1 < 4)."""
+        result = run_hook(
+            rm_rf_hook_command,
+            {"command": "rm -rf ./src"},
+        )
+        assert result.returncode == 2
 
-        The pattern *"rm -rf ."* matches because the command contains
-        the substring 'rm -rf .'. All ./relative rm -rf is caught.
+    def test_rm_rf_home_subpath_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf ~/Downloads -> BLOCKED (depth 3 < 4)."""
+        result = run_hook(
+            rm_rf_hook_command, {"command": "rm -rf ~/Downloads"}
+        )
+        assert result.returncode == 2
+
+    def test_rm_rf_bare_dirname_blocked(self, rm_rf_hook_command: str) -> None:
+        """rm -rf somedir -> BLOCKED (depth 1 < 4)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf somedir"})
+        assert result.returncode == 2
+
+    def test_rm_rf_deep_path_allowed(self, rm_rf_hook_command: str) -> None:
+        """rm -rf ./some/specific/deep/path -> allowed (depth 4 >= 4).
+
+        Paths with 4+ components are considered specific enough to allow.
         """
         result = run_hook(
-            bash_hook_command,
+            rm_rf_hook_command,
             {"command": "rm -rf ./some/specific/deep/path"},
         )
-        assert result.returncode == 2
-
-    def test_rm_rf_home_subpath_blocked(self, bash_hook_command: str) -> None:
-        """rm -rf ~/Downloads -> BLOCKED (substring 'rm -rf ~' matches)."""
-        result = run_hook(
-            bash_hook_command, {"command": "rm -rf ~/Downloads"}
-        )
-        assert result.returncode == 2
-
-    def test_rm_rf_bare_dirname_allowed(self, bash_hook_command: str) -> None:
-        """rm -rf somedir -> allowed.
-
-        Bare directory names (no leading /, ~, or .) are not caught by
-        the hook patterns. This is the escape hatch for specific cleanup.
-        """
-        result = run_hook(bash_hook_command, {"command": "rm -rf somedir"})
         assert result.returncode == 0
 
-    def test_rm_r_no_force_allowed(self, bash_hook_command: str) -> None:
-        """rm -r / -> allowed (no -f flag, pattern requires 'rm -rf')."""
-        result = run_hook(bash_hook_command, {"command": "rm -r /"})
+    def test_rm_r_no_force_allowed(self, rm_rf_hook_command: str) -> None:
+        """rm -r / -> allowed (no -f flag, pattern requires both -r and -f)."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -r /"})
         assert result.returncode == 0
 
-    def test_rm_single_file_allowed(self, bash_hook_command: str) -> None:
+    def test_rm_single_file_allowed(self, rm_rf_hook_command: str) -> None:
         """rm foo.txt -> allowed (no -rf)."""
-        result = run_hook(bash_hook_command, {"command": "rm foo.txt"})
+        result = run_hook(rm_rf_hook_command, {"command": "rm foo.txt"})
         assert result.returncode == 0
 
 
@@ -487,10 +485,11 @@ class TestBashHookErrorMessages:
         assert result.returncode == 2
         assert "user" in result.stderr.lower()
 
-    def test_rm_rf_suggests_specific(self, bash_hook_command: str) -> None:
-        result = run_hook(bash_hook_command, {"command": "rm -rf /"})
+    def test_rm_rf_suggests_confirm(self, rm_rf_hook_command: str) -> None:
+        """rm -rf on shallow path suggests asking the user to confirm."""
+        result = run_hook(rm_rf_hook_command, {"command": "rm -rf /tmp"})
         assert result.returncode == 2
-        assert "specific" in result.stderr.lower() or "user" in result.stderr.lower()
+        assert "user" in result.stderr.lower() or "confirm" in result.stderr.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -509,9 +508,19 @@ class TestBashHookEdgeCases:
     def test_multiline_command_with_blocked(
         self, bash_hook_command: str
     ) -> None:
-        """Multiline command containing rm -rf / -> BLOCKED."""
+        """Multiline command containing git reset --hard -> BLOCKED."""
         result = run_hook(
             bash_hook_command,
+            {"command": "echo hello\ngit reset --hard\necho done"},
+        )
+        assert result.returncode == 2
+
+    def test_multiline_command_with_rm_rf_blocked(
+        self, rm_rf_hook_command: str
+    ) -> None:
+        """Multiline command containing rm -rf / -> BLOCKED."""
+        result = run_hook(
+            rm_rf_hook_command,
             {"command": "echo hello\nrm -rf /\necho done"},
         )
         assert result.returncode == 2
@@ -846,24 +855,38 @@ class TestSettingsStructure:
                 assert len(inline) >= 1, "No inline WebFetch hook found"
 
     def test_bash_hook_checks_all_expected_patterns(
-        self, bash_hook_command: str
+        self, settings: dict
     ) -> None:
-        """Bash hook script contains checks for all expected danger patterns."""
+        """Bash hooks collectively cover all expected danger patterns.
+
+        The inline bash hook handles git/pip patterns. The rm-rf guard is
+        a separate Python script referenced via destructive_command_guard.
+        """
         from pathlib import Path
 
-        # The command may be an external script path or inline bash -c.
-        # Read the script file to check patterns.
-        if bash_hook_command.startswith("bash -c"):
-            content = bash_hook_command
-        else:
-            content = Path(bash_hook_command).read_text()
-        assert "pip install" in content
-        assert "worktree" in content
-        assert "rm -rf" in content
-        assert "git push" in content
-        assert "--force" in content
-        assert "git reset --hard" in content
-        assert "git clean" in content
+        # Collect all Bash hook commands and any scripts they reference
+        combined = ""
+        for entry in settings["hooks"]["PreToolUse"]:
+            if entry.get("matcher") == "Bash":
+                for hook in entry.get("hooks", []):
+                    cmd = hook.get("command", "")
+                    combined += cmd + "\n"
+                    # If it references an external script, read that too
+                    if "destructive_command_guard" in cmd:
+                        here = Path(__file__).resolve()
+                        for ancestor in here.parents:
+                            script = ancestor / "scripts" / "hooks" / "destructive_command_guard.py"
+                            if script.exists():
+                                combined += script.read_text()
+                                break
+
+        assert "pip install" in combined
+        assert "worktree" in combined
+        assert "rm" in combined and "rf" in combined  # rm -rf in Python script
+        assert "git push" in combined
+        assert "--force" in combined or "force" in combined
+        assert "git reset --hard" in combined
+        assert "git clean" in combined
 
     def test_webfetch_hook_checks_youtube(
         self, webfetch_hook_command: str
