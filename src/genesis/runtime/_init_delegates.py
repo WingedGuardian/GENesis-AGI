@@ -31,6 +31,7 @@ from genesis.runtime.init import (
     cc_relay,
     db,
     direct_session,
+    ego,
     health_data,
     inbox,
     learning,
@@ -120,6 +121,9 @@ class _InitDelegatesMixin:
 
     async def _init_autonomy(self) -> None:
         await autonomy.init(self)
+
+    async def _init_ego(self) -> None:
+        await ego.init(self)
 
     async def _init_tasks(self) -> None:
         await tasks.init(self)

@@ -231,9 +231,12 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._task_dispatch_poll: asyncio.Task | None = None
         self._direct_session_runner: object | None = None
         self._direct_session_poll: asyncio.Task | None = None
-        self._ego_session: object | None = None
-        self._ego_cadence_manager: object | None = None
+        self._ego_session: object | None = None  # User ego (primary)
+        self._ego_cadence_manager: object | None = None  # User ego cadence
         self._ego_proposal_workflow: object | None = None
+        self._genesis_ego_session: object | None = None  # Genesis ego (COO)
+        self._genesis_ego_cadence_manager: object | None = None
+        self._ego_proposal_executor: object | None = None
 
         # Global pause state — blocks all background dispatches when True.
         self._paused: bool = False
@@ -379,6 +382,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         await self._run_init_step_async("autonomy", self._init_autonomy)
 
         if _full:
+            await self._run_init_step_async("ego", self._init_ego)
+
+        if _full:
             await self._run_init_step_async("tasks", self._init_tasks)
         self._run_init_step("guardian", self._probe_guardian_status)
 
@@ -433,7 +439,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             logger.info("Stopped status writer loop")
 
         for name, component in [
-            ("ego_cadence_manager", self._ego_cadence_manager),
+            ("user_ego_cadence", self._ego_cadence_manager),
+            ("genesis_ego_cadence", self._genesis_ego_cadence_manager),
+            ("ego_proposal_executor", self._ego_proposal_executor),
             ("outreach_scheduler", self._outreach_scheduler),
             ("reflection_scheduler", self._reflection_scheduler),
             ("inbox_monitor", self._inbox_monitor),

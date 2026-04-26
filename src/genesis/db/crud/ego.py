@@ -271,6 +271,31 @@ async def resolve_proposal(
     return cursor.rowcount > 0
 
 
+async def execute_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    status: str,
+    user_response: str | None = None,
+) -> bool:
+    """Transition an approved proposal to executed or failed.
+
+    Only operates on proposals with status='approved'. Companion to
+    resolve_proposal (which operates on 'pending').
+    """
+    if status not in ("executed", "failed"):
+        raise ValueError(
+            f"execute_proposal status must be 'executed' or 'failed', got {status!r}"
+        )
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
+        "WHERE id = ? AND status = 'approved'",
+        (status, user_response, datetime.now(UTC).isoformat(), id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def expire_proposals(db: aiosqlite.Connection, *, now: str) -> int:
     """Bulk-expire pending proposals past their expires_at. Returns count."""
     cursor = await db.execute(
