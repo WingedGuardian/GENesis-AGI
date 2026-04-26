@@ -143,6 +143,9 @@ class ScriptEngine:
                     exc_info=True,
                 )
 
+        # NOTE: register is stored on the Script for CC session dispatch
+        # but has no effect on in-process Router drafting — voice calibration
+        # requires the voice-master skill loaded in a CC session.
         voice_calibrated = False
 
         script = Script(
@@ -156,24 +159,7 @@ class ScriptEngine:
             status="drafted",
             register=register,
         )
-        await self._db.execute(
-            """INSERT INTO content_scripts
-               (id, idea_id, content, platform, voice_calibrated,
-                anti_slop_passed, created_at, status, register)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                script.id,
-                script.idea_id,
-                script.content,
-                script.platform,
-                int(script.voice_calibrated),
-                int(script.anti_slop_passed),
-                script.created_at,
-                script.status,
-                script.register,
-            ),
-        )
-        await self._db.commit()
+        await self._persist_script(script)
         logger.debug("Drafted script %s for idea %s", script.id, idea.id)
         return script
 
@@ -195,24 +181,7 @@ class ScriptEngine:
             status="pending_draft",
             register=register,
         )
-        await self._db.execute(
-            """INSERT INTO content_scripts
-               (id, idea_id, content, platform, voice_calibrated,
-                anti_slop_passed, created_at, status, register)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                script.id,
-                script.idea_id,
-                script.content,
-                script.platform,
-                int(script.voice_calibrated),
-                int(script.anti_slop_passed),
-                script.created_at,
-                script.status,
-                script.register,
-            ),
-        )
-        await self._db.commit()
+        await self._persist_script(script)
         logger.debug(
             "Recorded pending draft %s for idea %s (dispatch mode)",
             script.id,
@@ -266,26 +235,30 @@ class ScriptEngine:
             status="refined",
             register=original.register,
         )
+        await self._persist_script(refined)
+        logger.debug("Refined script %s -> %s", script_id, refined.id)
+        return refined
+
+    async def _persist_script(self, script: Script) -> None:
+        """Insert a Script into the content_scripts table."""
         await self._db.execute(
             """INSERT INTO content_scripts
                (id, idea_id, content, platform, voice_calibrated,
                 anti_slop_passed, created_at, status, register)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                refined.id,
-                refined.idea_id,
-                refined.content,
-                refined.platform,
-                int(refined.voice_calibrated),
-                int(refined.anti_slop_passed),
-                refined.created_at,
-                refined.status,
-                refined.register,
+                script.id,
+                script.idea_id,
+                script.content,
+                script.platform,
+                int(script.voice_calibrated),
+                int(script.anti_slop_passed),
+                script.created_at,
+                script.status,
+                script.register,
             ),
         )
         await self._db.commit()
-        logger.debug("Refined script %s -> %s", script_id, refined.id)
-        return refined
 
 
 def _resolve_format_target(platform: str):
