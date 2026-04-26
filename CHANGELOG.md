@@ -7,6 +7,57 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
+## [v3.0a11] - 2026-04-26
+
+Code review remediation + Guardian auto-sync. Themes: **observability**,
+**concurrency safety**, and **host VM self-maintenance**.
+
+### Added
+
+- **Guardian auto-sync** (#168, #169, #170, #171) — host VM Guardian now
+  stays automatically in sync with container updates. When you update
+  Genesis, changed Guardian-relevant code is pushed to the host via SSH.
+  Drift detection alerts within 15 minutes if sync fails silently.
+  No more manual SSH to update Guardian code.
+- **Sentinel rejection test coverage** (#166) — 6 tests verifying the
+  24-hour dispatch suppression window after user rejection.
+
+### Changed
+
+- **Browser concurrency safety** (#166) — all 7 interaction tools (click,
+  fill, upload, screenshot, snapshot, run_js, press_key) now acquire a
+  lock before accessing shared page state. Prevents races when concurrent
+  sessions use the browser simultaneously.
+
+### Fixed
+
+- **Observability gaps** (#165) — `exc_info=True` on 3 timeout-path log
+  calls; replaced 4 `contextlib.suppress(Exception)` in data-returning
+  code paths with logged warnings.
+- **Update subprocess logging** (#165) — direct update and CC tier spawning
+  now log to `~/.genesis/` instead of /dev/null; merge conflict status
+  recorded in update history.
+
+### Upgrade notes
+
+**Existing users with Guardian on a host VM:** One-time bootstrap required
+to enable auto-sync. Run on your **host VM** (not the container):
+
+```bash
+cd ~/.local/share/genesis-guardian
+incus exec genesis -- tar -cf - -C /home/ubuntu/genesis \
+    src/ scripts/ pyproject.toml config/guardian-claude.md | tar -xf -
+cp scripts/guardian-gateway.sh ~/.local/bin/guardian-gateway.sh
+chmod +x ~/.local/bin/guardian-gateway.sh
+systemctl --user restart genesis-guardian.timer
+```
+
+Or: `bash scripts/install_guardian.sh --non-interactive`
+
+After this one-time step, all future updates are automatic.
+
+---
+
 ## [v3.0a10] - 2026-04-24
 
 31-commit release. Themes: **multi-step surplus pipelines**, **browser
