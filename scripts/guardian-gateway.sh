@@ -189,16 +189,17 @@ PYEOF
             cp "$INSTALL_DIR/config/guardian-claude.md" "$INSTALL_DIR/CLAUDE.md"
             _cfg="$INSTALL_DIR/config/guardian.yaml"
             if [ -f "$_cfg" ]; then
-                _cname=$(grep 'container_name:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
-                _cip=$(grep 'container_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
-                _hip=$(grep 'host_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"')
+                # || true: guardian.yaml is host-specific; some fields may be absent
+                _cname=$(grep 'container_name:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+                _cip=$(grep 'container_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
+                _hip=$(grep 'host_ip:' "$_cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' || true)
                 {
                     echo ""
                     echo "## Network"
                     echo ""
-                    echo "- **Container**: ${_cname} at ${_cip}"
-                    echo "- **Host VM**: ${_hip} (this machine)"
-                    echo "- **Dashboard**: http://${_cip}:5000"
+                    [ -n "$_cname" ] && echo "- **Container**: ${_cname} at ${_cip}"
+                    [ -n "$_hip" ] && echo "- **Host VM**: ${_hip} (this machine)"
+                    [ -n "$_cip" ] && echo "- **Dashboard**: http://${_cip}:5000"
                 } >> "$INSTALL_DIR/CLAUDE.md"
             fi
         fi
