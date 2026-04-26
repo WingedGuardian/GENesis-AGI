@@ -245,7 +245,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _harvest_and_store,
-            IntervalTrigger(hours=6),
+            CronTrigger(hour="*/6", minute=15),
             id="auto_memory_harvest",
             max_instances=1,
             misfire_grace_time=3600,
@@ -267,7 +267,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _observation_expiry_sweep,
-            IntervalTrigger(hours=24),
+            CronTrigger(hour=2, minute=0),
             id="observation_expiry_sweep",
             max_instances=1,
             misfire_grace_time=3600,
@@ -330,7 +330,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _expire_dead_letters,
-            IntervalTrigger(hours=24),
+            CronTrigger(hour=1, minute=30),
             id="dead_letter_expiry",
             max_instances=1,
             misfire_grace_time=3600,
@@ -352,7 +352,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _expire_stale_messages,
-            IntervalTrigger(hours=24),
+            CronTrigger(hour=2, minute=30),
             id="message_queue_expiry",
             max_instances=1,
             misfire_grace_time=3600,
@@ -385,7 +385,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _redispatch_dead_letters,
-            IntervalTrigger(hours=6),
+            CronTrigger(hour="0,6,12,18", minute=45),
             id="dead_letter_redispatch",
             max_instances=1,
             misfire_grace_time=3600,
@@ -499,7 +499,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _reap_stale_sessions,
-            IntervalTrigger(hours=6),
+            CronTrigger(hour="1,7,13,19", minute=30),
             id="session_reaper",
             max_instances=1,
             misfire_grace_time=3600,
@@ -519,7 +519,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _reap_activity_log,
-            IntervalTrigger(hours=6),
+            CronTrigger(hour="2,8,14,20", minute=0),
             id="activity_log_reaper",
             max_instances=1,
             misfire_grace_time=3600,
