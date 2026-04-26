@@ -79,7 +79,7 @@ cannot be completed due to degraded state.
 
 ### 4.1 Schema
 
-See `src/genesis/db/schema.py` for DDL. Key fields:
+See `src/genesis/db/schema/_tables.py` for DDL. Key fields:
 - `work_type`: categorizes the work (e.g., `reflection`, `outreach_draft`, `morning_report`)
 - `priority`: integer 10–100, lower = higher priority
 - `staleness_policy`: one of `drain`, `refresh`, `discard`, `ttl`
@@ -116,7 +116,7 @@ embedding is written to `pending_embeddings` rather than dropped.
 
 ### 5.1 Schema
 
-See `src/genesis/db/schema.py`. Each row captures the raw content, memory type,
+See `src/genesis/db/schema/_tables.py`. Each row captures the raw content, memory type,
 target collection, and tags needed to embed and upsert on recovery.
 
 ### 5.2 Recovery Worker
@@ -230,7 +230,7 @@ deferred work can be queued — this is a last-resort scenario.
 
 | File | Change |
 |------|--------|
-| `src/genesis/db/schema.py` | Add `deferred_work_queue` and `pending_embeddings` tables + indexes |
+| `src/genesis/db/schema/_tables.py` | Add `deferred_work_queue` and `pending_embeddings` tables + indexes |
 | `src/genesis/observability/types.py` | Add `RESILIENCE` to `Subsystem` enum (if needed) |
 
 ### 10.3 Existing Infrastructure

@@ -610,7 +610,7 @@ class TestConfigCompleteness:
         patterns = _load_critical_patterns()
         sensitive_examples = [
             "src/genesis/runtime.py",
-            "src/genesis/db/schema.py",
+            "src/genesis/db/schema/_tables.py",
             "src/genesis/identity/*.md",
             "config/model_routing.yaml",
             "config/resilience.yaml",
