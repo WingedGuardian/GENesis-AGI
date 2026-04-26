@@ -162,7 +162,7 @@ async def _write_guardian_heartbeat(config: GuardianConfig) -> None:
                 stderr_bytes.decode("utf-8", errors="replace"),
             )
     except TimeoutError:
-        logger.error("Guardian heartbeat write timed out")
+        logger.error("Guardian heartbeat write timed out", exc_info=True)
     except OSError as exc:
         logger.error("Guardian heartbeat write failed: %s", exc)
 

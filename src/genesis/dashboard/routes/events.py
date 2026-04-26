@@ -9,7 +9,7 @@ from pathlib import Path
 import aiosqlite
 from flask import jsonify, request, send_from_directory
 
-from genesis.dashboard._blueprint import _async_route, blueprint
+from genesis.dashboard._blueprint import _async_route, blueprint, logger
 
 TEMPLATE_DIR = Path(__file__).parent.parent / "templates"
 
@@ -80,12 +80,15 @@ async def events_paginated():
             **filter_kwargs,
         )
     except Exception:
+        logger.warning("Failed to query paginated events", exc_info=True)
         return jsonify({"events": [], "has_more": False, "total_matching": 0, "next_cursor": None})
 
     total = 0
     if not cursor_ts:
-        with contextlib.suppress(Exception):
+        try:
             total = await events_crud.count_filtered(rt.db, **filter_kwargs)
+        except Exception:
+            logger.warning("Failed to count filtered events", exc_info=True)
 
     next_cursor = None
     if has_more and events:

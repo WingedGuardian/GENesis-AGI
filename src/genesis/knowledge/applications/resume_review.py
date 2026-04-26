@@ -194,12 +194,12 @@ class ResumeReviewer:
 
             # Also do FTS search for specific terms
             fts_results = []
-            import contextlib
-
-            with contextlib.suppress(Exception):
+            try:
                 fts_results = await memory_mod.knowledge.search_fts(
                     memory_mod._db, resume_text[:200], limit=10
                 )
+            except Exception:
+                logger.warning("Failed to FTS search for resume context", exc_info=True)
 
             # Combine and deduplicate
             seen: set[str] = set()

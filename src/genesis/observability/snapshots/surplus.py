@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -36,8 +35,10 @@ async def surplus_status(
             logger.warning("Failed to determine surplus status", exc_info=True)
             status = "unknown"
 
-        with contextlib.suppress(Exception):
+        try:
             queue_depth = await surplus._queue.pending_count()
+        except Exception:
+            logger.warning("Failed to query surplus queue depth", exc_info=True)
 
     if db:
         try:

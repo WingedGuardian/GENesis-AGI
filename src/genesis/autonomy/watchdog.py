@@ -511,7 +511,7 @@ def restart_bridge(service: str = "genesis-bridge.service") -> int:
             logger.error("%s restart failed: %s", service, result.stderr)
         return result.returncode
     except subprocess.TimeoutExpired:
-        logger.error("%s restart command timed out", service)
+        logger.error("%s restart command timed out", service, exc_info=True)
         return -1
     except FileNotFoundError:
         logger.error("systemctl not found — cannot restart bridge")

@@ -484,6 +484,8 @@ CEOF
 
         echo "  System is running on pre-update code."
         echo "  A CC session will resolve conflicts in a worktree."
+        _record_update_history "conflicts_pending" \
+            "merge conflicts in: $(echo "$CONFLICTED_FILES" | tr '\n' ', ' | sed 's/, $//')" ""
         trap - ERR
         exit 2
     else
