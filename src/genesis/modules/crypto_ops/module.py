@@ -168,11 +168,14 @@ class CryptoOpsModule:
         mon = self._position_monitor
         return [
             {"name": "volume_drop_threshold", "label": "Volume Drop Threshold", "type": "float",
-             "value": mon._volume_drop_threshold, "description": "Volume drop % that triggers exit signal"},
+             "value": mon._volume_drop_threshold, "description": "Volume drop % that triggers exit signal",
+             "default": 0.7, "min": 0.0, "max": 1.0},
             {"name": "liquidity_drop_threshold", "label": "Liquidity Drop Threshold", "type": "float",
-             "value": mon._liquidity_drop_threshold, "description": "Liquidity drop % that triggers exit signal"},
+             "value": mon._liquidity_drop_threshold, "description": "Liquidity drop % that triggers exit signal",
+             "default": 0.5, "min": 0.0, "max": 1.0},
             {"name": "momentum_exit_threshold", "label": "Momentum Exit Threshold", "type": "float",
-             "value": mon._momentum_exit_threshold, "description": "Narrative momentum below this triggers exit"},
+             "value": mon._momentum_exit_threshold, "description": "Narrative momentum below this triggers exit",
+             "default": 0.2, "min": 0.0, "max": 1.0},
         ]
 
     def update_config(self, updates: dict) -> dict:

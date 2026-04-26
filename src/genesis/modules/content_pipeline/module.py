@@ -233,19 +233,19 @@ class ContentPipelineModule:
         """Return user-editable configuration fields for the dashboard."""
         return [
             {"name": "auto_capture_recon", "label": "Auto-Capture Recon", "type": "bool",
-             "value": self._auto_capture_recon,
+             "value": self._auto_capture_recon, "default": False,
              "description": "Automatically capture recon findings as content ideas"},
             {"name": "auto_capture_trends", "label": "Auto-Capture Trends", "type": "bool",
-             "value": self._auto_capture_trends,
+             "value": self._auto_capture_trends, "default": False,
              "description": "Automatically capture trend signals as content ideas"},
             {"name": "autonomous_drafting", "label": "Autonomous Drafting", "type": "bool",
-             "value": self._autonomous_drafting,
+             "value": self._autonomous_drafting, "default": False,
              "description": "Auto-draft scripts from ideas without explicit request"},
             {"name": "platform_targets", "label": "Platform Targets", "type": "list",
-             "value": self._platform_targets,
+             "value": self._platform_targets, "default": ["telegram", "medium", "linkedin"],
              "description": "Platforms to generate content for (telegram, linkedin, reddit, etc.)"},
             {"name": "engagement_threshold", "label": "Engagement Threshold", "type": "int",
-             "value": self._engagement_threshold,
+             "value": self._engagement_threshold, "default": 50, "min": 0,
              "description": "Minimum engagement score to extract lessons from outcomes"},
         ]
 

@@ -1,4 +1,5 @@
 name: crypto_ops
+display_name: "Crypto Token Operations"
 type: native
 class: genesis.modules.crypto_ops.module.CryptoOpsModule
 description: >
@@ -6,4 +7,11 @@ description: >
   chains (Solana, Base). Monitors position health (price, volume,
   holders), tracks launch outcomes, and extracts generalizable lessons
   for core memory.
+category: trading
+tags:
+  - crypto
+  - solana
+  - defi
+version: "1.0.0"
 enabled: false
+research_profile: null
