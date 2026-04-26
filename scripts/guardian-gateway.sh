@@ -79,7 +79,7 @@ PYEOF
         NODE_VER=$(node --version 2>/dev/null || echo "unavailable")
         CODE_VER=$(cd "$INSTALL_DIR" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
         CODE_DATE=$(cd "$INSTALL_DIR" && git log -1 --format=%ci 2>/dev/null || echo "unknown")
-        DEPLOYED=$(python3 -c "import json; print(json.load(open('$STATE_DIR/state.json')).get('deployed_commit','unknown'))" 2>/dev/null || echo "unknown")
+        DEPLOYED=$(python3 -c "import json; print(json.load(open('$STATE_DIR/deploy_state.json')).get('deployed_commit','unknown'))" 2>/dev/null || echo "unknown")
         printf '{"cc_version": "%s", "node_version": "%s", "code_version": "%s", "code_date": "%s", "deployed_commit": "%s"}\n' \
             "$CC_VER" "$NODE_VER" "$CODE_VER" "$CODE_DATE" "$DEPLOYED"
         ;;
@@ -215,18 +215,13 @@ PYEOF
             fi
         fi
 
-        # Record deployed commit in state
+        # Record deployed commit (separate file — state.json is overwritten by Guardian ticks)
+        mkdir -p "$STATE_DIR"
         python3 << PYEOF
 import json
 from datetime import datetime, timezone
-sf = "$STATE_DIR/state.json"
-try:
-    with open(sf) as f:
-        d = json.load(f)
-except (FileNotFoundError, json.JSONDecodeError, ValueError):
-    d = {}
-d["deployed_commit"] = "$COMMIT_HASH"
-d["deployed_at"] = datetime.now(timezone.utc).isoformat()
+sf = "$STATE_DIR/deploy_state.json"
+d = {"deployed_commit": "$COMMIT_HASH", "deployed_at": datetime.now(timezone.utc).isoformat()}
 with open(sf, "w") as f:
     json.dump(d, f, indent=2)
 print(json.dumps({"ok": True, "action": "redeploy", "commit": "$COMMIT_HASH"}))
