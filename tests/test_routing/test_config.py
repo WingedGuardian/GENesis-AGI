@@ -131,7 +131,7 @@ def test_load_full_yaml(monkeypatch):
     assert "openrouter-deepseek-r1" not in cfg.providers
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
-    assert len(cfg.call_sites) == 41
+    assert len(cfg.call_sites) == 42
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True

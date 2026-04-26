@@ -356,9 +356,10 @@ class AutonomousCliApprovalGate:
     ) -> dict[str, Any] | None:
         """Find an existing approval request that matches this call.
 
-        Primary match: content-stable ``approval_key`` (hits any status,
-        preserves "previously rejected" behaviour so a rejected row blocks
-        the dispatch instead of creating a duplicate).
+        Primary match: content-stable ``approval_key``. Skips resolved
+        rows (rejected and consumed-approved) so each approval/rejection
+        is instance-only — only pending or unconsumed-approved rows are
+        reused for dedup.
 
         Race-safety fallback: if no approval_key match and the caller
         provided ``subsystem``/``policy_id``, also match any *pending* row

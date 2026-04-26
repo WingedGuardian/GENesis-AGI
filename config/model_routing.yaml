@@ -463,6 +463,14 @@ call_sites:
     never_pays: true
     description: "Email triage \u2014 Gemini-primary light filter for weekly email\
       \ batch"
+  contribution_gate:
+    chain:
+    - claude-haiku
+    - groq-free
+    - gemini-free
+    default_paid: true
+    description: "Contribution pipeline \u2014 evaluates whether a code change is\
+      \ already fixed upstream"
 retry:
   default:
     max_retries: 3
