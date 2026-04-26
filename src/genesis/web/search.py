@@ -15,7 +15,7 @@ from genesis.web.types import SearchBackend, SearchResponse, SearchResult
 logger = logging.getLogger(__name__)
 
 _SEARXNG_URL = os.environ.get("SEARXNG_URL", "http://localhost:55510/search")
-_BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
+_BRAVE_URL = os.environ.get("BRAVE_API_URL", "https://api.search.brave.com/res/v1/web/search")
 _SANITIZER = ContentSanitizer()
 
 
