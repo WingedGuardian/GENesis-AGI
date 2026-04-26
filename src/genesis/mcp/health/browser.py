@@ -377,14 +377,14 @@ def _start_idle_watcher():
 
 
 async def _get_page(
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ):
     """Get the appropriate browser page based on mode.
 
-    Default (stealth=False): Camoufox (anti-detection, primary).
-    Fallback (stealth=True): Chromium (for Camoufox-incompatible sites).
+    Default (stealth=True): Camoufox (anti-detection, primary).
+    Plain (stealth=False): Chromium fallback for Camoufox-incompatible sites.
     Remote (remote=True): User's real Chrome via CDP over Tailscale.
 
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
@@ -394,9 +394,9 @@ async def _get_page(
     if remote:
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
-        _active_page = await _ensure_chromium_fallback()
-    else:
         _active_page = await _ensure_browser()
+    else:
+        _active_page = await _ensure_chromium_fallback()
     _touch()
     _start_idle_watcher()
     return _active_page
@@ -436,13 +436,14 @@ def _remote_browser_connected() -> bool:
 
 
 def _check_remote_health() -> dict | None:
-    """Returns error dict if remote is active but disconnected. None if OK."""
+    """Returns error dict if remote is active but disconnected. None if OK.
+
+    Read-only — does NOT modify global state. Use _detach_dead_remote()
+    when you need to clear globals on disconnection.
+    """
     if not _is_remote_active():
         return None
     if not _remote_browser_connected():
-        global _active_page, _remote_page
-        _active_page = None
-        _remote_page = None
         return {
             "error": (
                 "Remote Chrome connection lost. "
@@ -451,6 +452,20 @@ def _check_remote_health() -> dict | None:
             )
         }
     return None
+
+
+def _detach_dead_remote() -> dict | None:
+    """Check remote health and clear globals if disconnected.
+
+    Returns error dict if remote was disconnected (globals cleared),
+    None if OK or not in remote mode.
+    """
+    err = _check_remote_health()
+    if err is not None:
+        global _active_page, _remote_page
+        _active_page = None
+        _remote_page = None
+    return err
 
 
 def _update_remote_url() -> None:
@@ -851,7 +866,7 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
 
 async def _impl_browser_navigate(
     url: str,
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ) -> dict:
@@ -920,7 +935,7 @@ async def _impl_browser_click(selector: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -945,7 +960,7 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -973,7 +988,7 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     drift = _check_page_drift(_active_page) if _is_remote_active() else None
@@ -999,7 +1014,7 @@ async def _impl_browser_screenshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1020,7 +1035,7 @@ async def _impl_browser_snapshot() -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1039,7 +1054,7 @@ async def _impl_browser_run_js(expression: str) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     try:
@@ -1092,7 +1107,7 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     _touch()
     if _active_page is None:
         return {"error": "No page open. Call browser_navigate first."}
-    health = _check_remote_health()
+    health = _detach_dead_remote()
     if health:
         return health
     count = max(1, min(count, 50))
@@ -1114,7 +1129,7 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
 @mcp.tool()
 async def browser_navigate(
     url: str,
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ) -> dict:
@@ -1127,7 +1142,7 @@ async def browser_navigate(
     stealth-browser skill for anti-detection behavioral rules. The skill covers
     timing, interaction patterns, honeypot avoidance, and per-site guidance.
 
-    Set stealth=True to use Chromium fallback for sites incompatible with
+    Set stealth=False to use Chromium fallback for sites incompatible with
     Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
 
     Set remote=True to drive the user's real Chrome over CDP/Tailscale.

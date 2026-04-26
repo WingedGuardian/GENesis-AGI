@@ -16,10 +16,10 @@ The model scored 10/10 at all thresholds 60-90. We ship with a
 threshold of 75 as a safety margin against future prompt-change
 hedging.
 
-Model: Claude Haiku 4.5 preferred when ANTHROPIC_API_KEY is available,
-`groq/llama-3.3-70b-versatile` as the validated fallback. Chosen via
-the Genesis router when runtime is available, direct
-`litellm.acompletion()` otherwise (e.g. from hook contexts).
+Model: Reads from ``contribution_gate`` call site in model_routing.yaml.
+Falls back to hardcoded chain (Claude Haiku 4.5 → Groq Llama → Gemini
+Flash) if config is unavailable. Calls litellm directly (not through the
+router) but records results to the neural monitor for visibility.
 """
 from __future__ import annotations
 
@@ -39,13 +39,15 @@ logger = logging.getLogger(__name__)
 # spike. Lower = more cancellations; higher = more duplicate PRs.
 CONFIDENCE_THRESHOLD = 75
 
-# Preferred model chain (first available wins). Production can override
-# by passing `model=...` to `check_version_gate()`.
-_PREFERRED_MODELS = [
+# Fallback model chain when routing config is unavailable.
+# Production can override by passing `model=...` to `check_version_gate()`.
+_FALLBACK_MODELS = [
     ("anthropic/claude-haiku-4-5", "ANTHROPIC_API_KEY"),
     ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
     ("gemini/gemini-2.0-flash", "GEMINI_API_KEY"),
 ]
+
+_CALL_SITE_ID = "contribution_gate"
 
 # Copied VERBATIM from scripts/spike_version_gate_calibrate.py after
 # 10/10 validation. Do NOT re-engineer without re-running the spike.
@@ -281,10 +283,50 @@ def parse_llm_response(text: str) -> tuple[bool, dict]:
     return True, obj
 
 
+def _load_models_from_config() -> list[tuple[str, str]]:
+    """Try to load the contribution_gate chain from model_routing.yaml.
+
+    Returns list of (litellm_model_string, required_env_var) tuples,
+    or empty list if config is unavailable.
+    """
+    try:
+        from genesis.routing.config import load_config
+
+        cfg_path = Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+        config = load_config(cfg_path)
+        site = config.call_sites.get(_CALL_SITE_ID)
+        if site is None:
+            return []
+        # Map provider type to litellm prefix
+        _PREFIX = {"anthropic": "anthropic", "groq": "groq", "google": "gemini"}
+        # Map provider type to conventional env var for API key
+        _ENV = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "groq": "GROQ_API_KEY",
+            "google": "GEMINI_API_KEY",
+        }
+        result = []
+        for pname in site.chain:
+            pcfg = config.providers.get(pname)
+            if pcfg is None or not pcfg.enabled:
+                continue
+            ptype = pcfg.provider_type
+            prefix = _PREFIX.get(ptype, ptype)
+            model_str = f"{prefix}/{pcfg.model_id}" if prefix else pcfg.model_id
+            env_var = _ENV.get(ptype, f"{ptype.upper()}_API_KEY")
+            result.append((model_str, env_var))
+        return result
+    except Exception:
+        logger.debug("Could not load routing config for contribution_gate", exc_info=True)
+        return []
+
+
 def _select_model(override: str | None) -> str | None:
     if override:
         return override
-    for model, env_var in _PREFERRED_MODELS:
+    # Try routing config first, fall back to hardcoded defaults
+    models = _load_models_from_config() or _FALLBACK_MODELS
+    for model, env_var in models:
         if os.environ.get(env_var):
             return model
     return None
@@ -300,6 +342,29 @@ async def _call_llm(prompt: str, model: str) -> str:
         max_tokens=500,
     )
     return response.choices[0].message.content or ""
+
+
+async def _record_to_monitor(model: str, response_text: str | None, *, success: bool) -> None:
+    """Best-effort recording to neural monitor. Never raises."""
+    try:
+        import aiosqlite
+
+        from genesis.env import genesis_db_path
+        from genesis.observability.call_site_recorder import record_last_run
+
+        # Extract provider prefix from litellm model string (e.g. "anthropic/..." → "anthropic")
+        provider = model.split("/", 1)[0] if "/" in model else model
+        model_id = model.split("/", 1)[1] if "/" in model else model
+
+        async with aiosqlite.connect(str(genesis_db_path())) as db:
+            await record_last_run(
+                db, _CALL_SITE_ID,
+                provider=provider, model_id=model_id,
+                response_text=(response_text or "")[:200],
+                success=success,
+            )
+    except Exception:
+        logger.debug("Failed to record contribution_gate to neural monitor", exc_info=True)
 
 
 async def check_version_gate(
@@ -364,6 +429,7 @@ async def check_version_gate(
         raw = await _call_llm(prompt, chosen_model)
     except Exception as e:  # noqa: BLE001 — fail-open on any litellm error
         logger.error("version_gate: LLM call failed: %s", e, exc_info=True)
+        await _record_to_monitor(chosen_model, None, success=False)
         return VersionGateResult(
             already_fixed=False,
             confidence=0,
@@ -372,6 +438,8 @@ async def check_version_gate(
             parse_ok=False,
             llm_error=str(e),
         )
+
+    await _record_to_monitor(chosen_model, raw[:200], success=True)
 
     ok, parsed = parse_llm_response(raw)
     if not ok:

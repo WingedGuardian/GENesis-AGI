@@ -896,6 +896,7 @@ class TestRemoteHelpers:
         assert browser._check_remote_health() is None
 
     def test_check_remote_health_disconnected(self):
+        """Read-only check — returns error but does NOT clear globals."""
         page = MagicMock()
         browser._active_page = page
         browser._remote_page = page
@@ -903,6 +904,21 @@ class TestRemoteHelpers:
         browser._remote_browser.is_connected.return_value = False
 
         result = browser._check_remote_health()
+        assert result is not None
+        assert "error" in result
+        # Read-only: globals NOT cleared
+        assert browser._active_page is page
+        assert browser._remote_page is page
+
+    def test_detach_dead_remote_clears_globals(self):
+        """Mutating variant — returns error AND clears globals."""
+        page = MagicMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._remote_browser = MagicMock()
+        browser._remote_browser.is_connected.return_value = False
+
+        result = browser._detach_dead_remote()
         assert result is not None
         assert "error" in result
         assert browser._active_page is None

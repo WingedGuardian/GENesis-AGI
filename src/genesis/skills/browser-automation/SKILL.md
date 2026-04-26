@@ -38,7 +38,7 @@ that can accomplish the task. **Token cost increases with each layer.**
   VNC display :99 — observable via noVNC. Profile at `~/.genesis/camoufox-profile/`.
   Includes humanized cursor movement, per-keystroke typing with IKI jitter,
   and stealth click with hover/jitter.
-- **Chromium fallback**: `browser_navigate(url, stealth=True)` uses Chromium
+- **Chromium fallback**: `browser_navigate(url, stealth=False)` uses Chromium
   for sites incompatible with Camoufox (rare). Profile at `~/.genesis/browser-profile/`.
 - **Agent-owned accounts**: log into accounts created FOR the agent, never the
   user's personal accounts. Treat the agent like a new employee.
