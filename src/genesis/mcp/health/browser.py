@@ -311,18 +311,32 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
         _remote_cdp_url = url
         _remote_browser.on("disconnected", lambda: _on_remote_disconnected())
 
-        # Use existing tab or create new one — never close user's tabs
-        contexts = _remote_browser.contexts
-        if contexts and contexts[0].pages:
-            _remote_page = contexts[0].pages[-1]
-            logger.info("CDP remote connected — using existing tab: %s", _remote_page.url)
-        elif contexts:
-            _remote_page = await contexts[0].new_page()
-            logger.info("CDP remote connected — created new tab")
-        else:
-            ctx = await _remote_browser.new_context()
-            _remote_page = await ctx.new_page()
-            logger.info("CDP remote connected — created new context and tab")
+        # Find user's existing visible tab — never create phantom windows.
+        # connect_over_cdp() may create its own default context whose pages
+        # render in an invisible off-screen window.  Scan ALL contexts for a
+        # real Chrome page (chrome://newtab, about:blank, or any http(s) URL)
+        # and prefer that over Playwright's auto-created context.
+        _remote_page = None
+        for ctx in _remote_browser.contexts:
+            for pg in ctx.pages:
+                page_url = pg.url
+                if page_url.startswith(("chrome://", "about:", "http://", "https://")):
+                    _remote_page = pg
+                    logger.info("CDP remote connected — using existing tab: %s", page_url)
+                    break
+            if _remote_page is not None:
+                break
+
+        if _remote_page is None:
+            # No existing tab found — create in first available context
+            contexts = _remote_browser.contexts
+            if contexts:
+                _remote_page = await contexts[0].new_page()
+                logger.info("CDP remote connected — created new tab")
+            else:
+                ctx = await _remote_browser.new_context()
+                _remote_page = await ctx.new_page()
+                logger.info("CDP remote connected — created new context and tab")
 
         return _remote_page
 

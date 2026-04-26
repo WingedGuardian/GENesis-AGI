@@ -22,6 +22,12 @@ PLATFORM_LIMITS: dict[FormatTarget, PlatformLimits] = {
         supports_html=False,
         supports_code_blocks=False,
     ),
+    FormatTarget.MEDIUM: PlatformLimits(
+        max_length=100_000,
+        supports_markdown=True,
+        supports_html=True,
+        supports_code_blocks=True,
+    ),
     FormatTarget.EMAIL: PlatformLimits(
         max_length=50_000,
         supports_markdown=True,

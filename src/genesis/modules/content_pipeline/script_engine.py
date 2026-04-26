@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 
 async def ensure_table(db: aiosqlite.Connection) -> None:
-    """Create the content_scripts table if it doesn't exist."""
+    """Create the content_scripts table if it doesn't exist, then migrate."""
     await db.execute("""
         CREATE TABLE IF NOT EXISTS content_scripts (
             id TEXT PRIMARY KEY,
@@ -27,14 +27,44 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             platform TEXT NOT NULL,
             voice_calibrated INTEGER NOT NULL DEFAULT 0,
             anti_slop_passed INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'drafted',
+            register TEXT
         )
     """)
+    # Migrate existing tables that lack the new columns.
+    cursor = await db.execute("PRAGMA table_info(content_scripts)")
+    existing_cols = {row[1] for row in await cursor.fetchall()}
+    if "status" not in existing_cols:
+        await db.execute(
+            "ALTER TABLE content_scripts ADD COLUMN status TEXT NOT NULL DEFAULT 'drafted'"
+        )
+    if "register" not in existing_cols:
+        await db.execute(
+            "ALTER TABLE content_scripts ADD COLUMN register TEXT"
+        )
     await db.commit()
 
 
-def _row_to_script(row: aiosqlite.Row) -> Script:
-    """Convert a database row to a Script."""
+def _row_to_script(row: aiosqlite.Row, col_names: list[str] | None = None) -> Script:
+    """Convert a database row to a Script.
+
+    Supports both positional (legacy) and named-column access.
+    """
+    if col_names is not None:
+        d = dict(zip(col_names, row, strict=False))
+        return Script(
+            id=d["id"],
+            idea_id=d["idea_id"],
+            content=d["content"],
+            platform=d["platform"],
+            voice_calibrated=bool(d.get("voice_calibrated", 0)),
+            anti_slop_passed=bool(d.get("anti_slop_passed", 0)),
+            created_at=d.get("created_at", ""),
+            status=d.get("status", "drafted"),
+            register=d.get("register"),
+        )
+    # Positional fallback for callers that don't pass col_names.
     return Script(
         id=row[0],
         idea_id=row[1],
@@ -43,19 +73,31 @@ def _row_to_script(row: aiosqlite.Row) -> Script:
         voice_calibrated=bool(row[4]),
         anti_slop_passed=bool(row[5]),
         created_at=row[6],
+        status=row[7] if len(row) > 7 else "drafted",
+        register=row[8] if len(row) > 8 else None,
     )
 
 
 class ScriptEngine:
-    """Drafts and refines content scripts using LLM."""
+    """Drafts and refines content scripts using LLM.
+
+    When ``dispatch_mode`` is True, ``draft_script()`` records the idea
+    with ``status='pending_draft'`` and returns immediately — the actual
+    drafting is deferred to a CC session with the appropriate voice and
+    platform skills loaded.  When False (the default), the engine drafts
+    in-process via the Router as before.
+    """
 
     def __init__(
         self,
         db: aiosqlite.Connection,
         drafter: ContentDrafter | None = None,
+        *,
+        dispatch_mode: bool = False,
     ) -> None:
         self._db = db
         self._drafter = drafter
+        self.dispatch_mode = dispatch_mode
 
     async def draft_script(
         self,
@@ -65,9 +107,18 @@ class ScriptEngine:
     ) -> Script:
         """Draft a script for a content idea.
 
-        Uses ContentDrafter for LLM generation when available,
-        otherwise falls back to the idea content directly.
+        In dispatch mode, records the idea with status ``pending_draft``
+        and returns immediately — the actual drafting is deferred to a
+        CC session with voice-master + platform skills.
+
+        Otherwise, uses ContentDrafter for LLM generation when available,
+        falling back to the idea content directly.
         """
+        register = config.get("register") if config else None
+
+        if self.dispatch_mode:
+            return await self._record_pending(idea, platform, register)
+
         content = idea.content
 
         if self._drafter is not None:
@@ -80,6 +131,7 @@ class ScriptEngine:
                     context=f"Tags: {', '.join(idea.tags)}" if idea.tags else "",
                     target=target,
                     tone=config.get("tone", "professional") if config else "professional",
+                    register=register or "professional_peers",
                     max_length=config.get("max_length") if config else None,
                 )
                 result = await self._drafter.draft(request)
@@ -91,10 +143,9 @@ class ScriptEngine:
                     exc_info=True,
                 )
 
-        # Check for voice-master skill availability.
-        # NOTE: This flag indicates the skill is *available*, not that the
-        # content was actually voice-calibrated. Voice calibration happens at
-        # the CC session level when the skill is loaded as a playbook.
+        # NOTE: register is stored on the Script for CC session dispatch
+        # but has no effect on in-process Router drafting — voice calibration
+        # requires the voice-master skill loaded in a CC session.
         voice_calibrated = False
 
         script = Script(
@@ -105,23 +156,37 @@ class ScriptEngine:
             voice_calibrated=voice_calibrated,
             anti_slop_passed=False,
             created_at=datetime.now(UTC).isoformat(),
+            status="drafted",
+            register=register,
         )
-        await self._db.execute(
-            """INSERT INTO content_scripts
-               (id, idea_id, content, platform, voice_calibrated, anti_slop_passed, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                script.id,
-                script.idea_id,
-                script.content,
-                script.platform,
-                int(script.voice_calibrated),
-                int(script.anti_slop_passed),
-                script.created_at,
-            ),
-        )
-        await self._db.commit()
+        await self._persist_script(script)
         logger.debug("Drafted script %s for idea %s", script.id, idea.id)
+        return script
+
+    async def _record_pending(
+        self,
+        idea: ContentIdea,
+        platform: str,
+        register: str | None,
+    ) -> Script:
+        """Record a pending-draft script for later CC session processing."""
+        script = Script(
+            id=str(uuid.uuid4()),
+            idea_id=idea.id,
+            content=idea.content,
+            platform=platform,
+            voice_calibrated=False,
+            anti_slop_passed=False,
+            created_at=datetime.now(UTC).isoformat(),
+            status="pending_draft",
+            register=register,
+        )
+        await self._persist_script(script)
+        logger.debug(
+            "Recorded pending draft %s for idea %s (dispatch mode)",
+            script.id,
+            idea.id,
+        )
         return script
 
     async def refine_script(self, script_id: str, feedback: str) -> Script:
@@ -137,7 +202,8 @@ class ScriptEngine:
             msg = f"Script {script_id} not found"
             raise ValueError(msg)
 
-        original = _row_to_script(row)
+        col_names = [desc[0] for desc in cursor.description]
+        original = _row_to_script(row, col_names=col_names)
         refined_content = original.content
 
         if self._drafter is not None:
@@ -166,24 +232,33 @@ class ScriptEngine:
             voice_calibrated=original.voice_calibrated,
             anti_slop_passed=False,
             created_at=datetime.now(UTC).isoformat(),
+            status="refined",
+            register=original.register,
         )
+        await self._persist_script(refined)
+        logger.debug("Refined script %s -> %s", script_id, refined.id)
+        return refined
+
+    async def _persist_script(self, script: Script) -> None:
+        """Insert a Script into the content_scripts table."""
         await self._db.execute(
             """INSERT INTO content_scripts
-               (id, idea_id, content, platform, voice_calibrated, anti_slop_passed, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               (id, idea_id, content, platform, voice_calibrated,
+                anti_slop_passed, created_at, status, register)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                refined.id,
-                refined.idea_id,
-                refined.content,
-                refined.platform,
-                int(refined.voice_calibrated),
-                int(refined.anti_slop_passed),
-                refined.created_at,
+                script.id,
+                script.idea_id,
+                script.content,
+                script.platform,
+                int(script.voice_calibrated),
+                int(script.anti_slop_passed),
+                script.created_at,
+                script.status,
+                script.register,
             ),
         )
         await self._db.commit()
-        logger.debug("Refined script %s -> %s", script_id, refined.id)
-        return refined
 
 
 def _resolve_format_target(platform: str):
@@ -195,6 +270,7 @@ def _resolve_format_target(platform: str):
         "email": FormatTarget.EMAIL,
         "linkedin": FormatTarget.LINKEDIN,
         "twitter": FormatTarget.TWITTER,
+        "medium": FormatTarget.MEDIUM,
         "terminal": FormatTarget.TERMINAL,
     }
     return mapping.get(platform.lower(), FormatTarget.GENERIC)

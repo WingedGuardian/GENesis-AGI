@@ -4,4 +4,4 @@ class: genesis.modules.content_pipeline.module.ContentPipelineModule
 description: >
   Content Pipeline — idea capture, weekly planning, voice-calibrated
   script drafting, multi-platform publishing, and analytics feedback loop.
-enabled: false
+enabled: true
