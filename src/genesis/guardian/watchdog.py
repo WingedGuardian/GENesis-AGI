@@ -91,6 +91,10 @@ class GuardianWatchdog:
         """
         from genesis.observability.health import ProbeStatus, probe_guardian
 
+        # Drift detection runs regardless of health status — its purpose is
+        # to catch stale host code even when Guardian appears healthy.
+        await self._check_code_drift()
+
         result = await probe_guardian(guardian_remote=self._remote)
 
         if result.status != ProbeStatus.DOWN:
@@ -139,9 +143,6 @@ class GuardianWatchdog:
 
         # Step 2: Check if Guardian is stuck in confirmed_dead
         await self._check_stuck_state()
-
-        # Step 3: Check for code version drift between container and host
-        await self._check_code_drift()
 
     async def _check_stuck_state(self) -> None:
         """Detect and recover from Guardian stuck in confirmed_dead.
@@ -224,8 +225,11 @@ class GuardianWatchdog:
 
     async def _check_code_drift_inner(self) -> None:
         """Inner implementation of drift detection (may raise)."""
-        # Get container's hash for Guardian-relevant paths
-        result = subprocess.run(
+        import asyncio
+
+        # Get container's hash for Guardian-relevant paths (non-blocking)
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["git", "-C", str(Path.home() / "genesis"),
              "log", "-1", "--format=%h", "--"] + self._GUARDIAN_PATHS,
             capture_output=True, text=True, timeout=5,
@@ -233,6 +237,16 @@ class GuardianWatchdog:
         if result.returncode != 0:
             return
         container_hash = result.stdout.strip()
+
+        # Skip drift detection when not on main (feature branch = expected divergence)
+        branch_result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "-C", str(Path.home() / "genesis"),
+             "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if branch_result.returncode == 0 and branch_result.stdout.strip() not in ("main",):
+            return
         if not container_hash:
             return
 
@@ -255,7 +269,8 @@ class GuardianWatchdog:
 
         # Drift detected
         self._drift_count += 1
-        if self._drift_count == self.DRIFT_ALERT_THRESHOLD:
+        if self._drift_count >= self.DRIFT_ALERT_THRESHOLD and \
+                self._drift_count % self.DRIFT_ALERT_THRESHOLD == 0:
             logger.error(
                 "Guardian code drift detected for %d ticks: container=%s host=%s",
                 self._drift_count, container_hash, host_hash,

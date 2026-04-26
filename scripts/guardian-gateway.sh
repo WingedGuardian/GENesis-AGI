@@ -113,9 +113,9 @@ PYEOF
                     # Append per-machine network identity from guardian.yaml
                     _cfg="$INSTALL_DIR/config/guardian.yaml"
                     if [ -f "$_cfg" ]; then
-                        _cname=$(grep 'container_name:' "$_cfg" | awk '{print $2}' | tr -d '"')
-                        _cip=$(grep 'container_ip:' "$_cfg" | awk '{print $2}' | tr -d '"')
-                        _hip=$(grep 'host_ip:' "$_cfg" | awk '{print $2}' | tr -d '"')
+                        _cname=$(grep 'container_name:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
+                        _cip=$(grep 'container_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
+                        _hip=$(grep 'host_ip:' "$_cfg" | awk '{print $2}' | tr -d '"' || true)
                         _hv6=$(ip -6 addr show scope global 2>/dev/null | grep -oP 'inet6 \K[^ /]+' | head -1 || echo '')
                         {
                             echo ""
@@ -159,6 +159,15 @@ PYEOF
         INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
         BACKUP_DIR="${STATE_DIR}/deploy-backup"
 
+        # Validate commit hash (must be 7-40 hex chars — defense in depth)
+        if ! echo "$COMMIT_HASH" | grep -qE '^[0-9a-f]{7,40}$'; then
+            echo '{"ok": false, "action": "redeploy", "error": "invalid commit hash"}' >&2
+            exit 1
+        fi
+
+        # Stop timer during extraction to prevent running on partial state
+        systemctl --user stop genesis-guardian.timer 2>/dev/null || true
+
         # Backup current installation for rollback
         rm -rf "$BACKUP_DIR"
         if [ -d "$INSTALL_DIR/src" ]; then
@@ -173,6 +182,8 @@ PYEOF
                 rm -rf "$INSTALL_DIR"
                 mv "$BACKUP_DIR" "$INSTALL_DIR"
             fi
+            # Restart timer with old code
+            systemctl --user start genesis-guardian.timer 2>/dev/null || true
             echo '{"ok": false, "action": "redeploy", "error": "tar extraction failed"}' >&2
             exit 1
         fi
