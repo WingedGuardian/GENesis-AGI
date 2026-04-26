@@ -256,12 +256,16 @@ def update_apply():
 def _apply_direct(pid_file: Path) -> tuple:
     """Run update.sh directly (no CC supervision)."""
     try:
+        log_path = _HOME / ".genesis" / "update_direct.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "w")  # noqa: SIM115
         proc = subprocess.Popen(
             ["bash", str(_UPDATE_SCRIPT)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        log_fh.close()  # child inherited the fd; parent can close its copy
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(proc.pid))
         logger.info("Direct update triggered (pid %d)", proc.pid)
@@ -494,13 +498,18 @@ def _apply_supervised(pid_file: Path) -> tuple:
 
 def _spawn_detached_cc(prompt: str, model: str) -> subprocess.Popen:
     """Spawn a detached CC session. Returns the Popen object (caller waits)."""
-    return subprocess.Popen(
+    log_path = _HOME / ".genesis" / f"cc_session_{model.replace('/', '_')}.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_fh = open(log_path, "w")  # noqa: SIM115
+    proc = subprocess.Popen(
         ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
         cwd=str(_GENESIS_ROOT),
     )
+    log_fh.close()  # child inherited the fd
+    return proc
 
 
 # Template for the orchestrator subprocess. Baked-in paths avoid genesis imports.
@@ -539,7 +548,6 @@ def spawn_cc(prompt, model):
     try:
         proc = subprocess.Popen(
             ["claude", "-p", prompt, "--model", model, "--dangerously-skip-permissions"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True, cwd=str(GENESIS_ROOT),
         )
         PID_FILE.write_text(str(proc.pid))
