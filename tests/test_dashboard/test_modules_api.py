@@ -43,6 +43,12 @@ class TestModulesEndpoint:
         mock_mod.name = "prediction_markets"
         mock_mod.enabled = True
         mock_mod.get_research_profile_name.return_value = "prediction-markets"
+        # Explicit non-MagicMock values so _get_identity_fields() serializes correctly
+        mock_mod._display_name = None
+        mock_mod._category = ""
+        mock_mod._tags = []
+        mock_mod._version = ""
+        mock_mod._description = ""
         mock_mod._tracker.stats.return_value = {
             "total_records": 5,
             "brier_score": 0.25,

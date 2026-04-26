@@ -201,6 +201,10 @@ class ModuleBase:
             elif f.type == "float":
                 value = float(value)
             elif f.type == "bool":
-                value = bool(value)
+                # bool("false") == True, so normalize string representations
+                if isinstance(value, str):
+                    value = value.lower() in ("true", "1", "yes", "on")
+                else:
+                    value = bool(value)
             setattr(self, f"_{key}", value)
         return {d["name"]: d["value"] for d in self.configurable_fields()}

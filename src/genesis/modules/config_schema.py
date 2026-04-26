@@ -15,6 +15,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+# Sentinel: distinguishes "no value provided" from value=None in to_dict()
+_MISSING = object()
+
 FieldType = Literal["str", "int", "float", "bool", "enum", "secret", "list"]
 
 
@@ -92,12 +95,13 @@ class ConfigField:
             options=options,
         )
 
-    def to_dict(self, value: Any = None) -> dict:
+    def to_dict(self, value: Any = _MISSING) -> dict:
         """Serialize to the format expected by the dashboard API.
 
         Args:
-            value: Live current value. When provided, included as 'value' key.
-                   Omit for static schema export (no live value available).
+            value: Live current value. When provided (including 0, False, ""),
+                   included as 'value' key. Omit entirely for static schema
+                   export (no live value available).
         """
         result: dict[str, Any] = {
             "name": self.name,
@@ -114,7 +118,7 @@ class ConfigField:
             result["max"] = self.max
         if self.options:
             result["options"] = [o.to_dict() for o in self.options]
-        if value is not None:
+        if value is not _MISSING:
             result["value"] = value
         return result
 

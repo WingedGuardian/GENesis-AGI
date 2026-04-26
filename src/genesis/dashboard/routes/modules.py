@@ -127,7 +127,14 @@ async def modules_list():
             try:
                 fields = mod.configurable_fields()
                 if isinstance(fields, list):
-                    entry["config_fields"] = fields
+                    # Mask value/default for secret and sensitive fields — never
+                    # expose credentials in the API response even in read-only form.
+                    masked = []
+                    for f in fields:
+                        if f.get("type") == "secret" or f.get("sensitive"):
+                            f = {**f, "value": None, "default": None}
+                        masked.append(f)
+                    entry["config_fields"] = masked
             except Exception:
                 pass
 
@@ -349,7 +356,7 @@ async def module_config(name: str):
 
     try:
         new_config = mod.update_config(data)
-        logger.info("Module '%s' config updated via dashboard: %s", name, data)
+        logger.info("Module '%s' config updated via dashboard: fields=%s", name, list(data.keys()))
 
         if rt.db is not None:
             await save_module_state(rt.db, name, config_json=json.dumps(new_config))
