@@ -513,6 +513,7 @@ class TestEnsureRemoteCdp:
         browser._remote_page = MagicMock()
 
         new_page = MagicMock()
+        new_page.url = "chrome://newtab/"
         new_browser = _mock_remote_browser(pages=[new_page])
 
         mock_pw = AsyncMock()
@@ -555,10 +556,12 @@ class TestEnsureRemoteCdp:
 
     @pytest.mark.asyncio
     async def test_uses_existing_tab(self):
-        """Picks up existing tab (last page) instead of creating new."""
-        existing_page = MagicMock()
-        existing_page.url = "https://already-open.com"
-        new_browser = _mock_remote_browser(pages=[MagicMock(), existing_page])
+        """Picks first tab with a real URL (chrome://, http://, etc)."""
+        visible_page = MagicMock()
+        visible_page.url = "chrome://newtab/"
+        other_page = MagicMock()
+        other_page.url = "https://already-open.com"
+        new_browser = _mock_remote_browser(pages=[visible_page, other_page])
 
         mock_pw = AsyncMock()
         mock_pw.chromium.connect_over_cdp = AsyncMock(return_value=new_browser)
@@ -569,7 +572,7 @@ class TestEnsureRemoteCdp:
             mock_apw.return_value = mock_starter
             result = await browser._ensure_remote_cdp("http://100.1.2.3:9222")
 
-        assert result is existing_page  # Last tab, not first
+        assert result is visible_page  # First tab with real URL
 
     @pytest.mark.asyncio
     async def test_creates_new_tab_when_no_pages(self):
@@ -594,6 +597,7 @@ class TestEnsureRemoteCdp:
     async def test_resolves_url_from_env(self):
         """Falls back to GENESIS_CDP_URL env var when no explicit URL."""
         new_page = MagicMock()
+        new_page.url = "chrome://newtab/"
         new_browser = _mock_remote_browser(pages=[new_page])
 
         mock_pw = AsyncMock()
