@@ -363,14 +363,14 @@ def _start_idle_watcher():
 
 
 async def _get_page(
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ):
     """Get the appropriate browser page based on mode.
 
-    Default (stealth=False): Camoufox (anti-detection, primary).
-    Fallback (stealth=True): Chromium (for Camoufox-incompatible sites).
+    Default (stealth=True): Camoufox (anti-detection, primary).
+    Plain (stealth=False): Chromium fallback for Camoufox-incompatible sites.
     Remote (remote=True): User's real Chrome via CDP over Tailscale.
 
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
@@ -380,9 +380,9 @@ async def _get_page(
     if remote:
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
-        _active_page = await _ensure_chromium_fallback()
-    else:
         _active_page = await _ensure_browser()
+    else:
+        _active_page = await _ensure_chromium_fallback()
     _touch()
     _start_idle_watcher()
     return _active_page
@@ -837,7 +837,7 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
 
 async def _impl_browser_navigate(
     url: str,
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ) -> dict:
@@ -1100,7 +1100,7 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
 @mcp.tool()
 async def browser_navigate(
     url: str,
-    stealth: bool = False,
+    stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
 ) -> dict:
@@ -1113,7 +1113,7 @@ async def browser_navigate(
     stealth-browser skill for anti-detection behavioral rules. The skill covers
     timing, interaction patterns, honeypot avoidance, and per-site guidance.
 
-    Set stealth=True to use Chromium fallback for sites incompatible with
+    Set stealth=False to use Chromium fallback for sites incompatible with
     Camoufox (rare). Chromium uses a separate profile at ~/.genesis/browser-profile/.
 
     Set remote=True to drive the user's real Chrome over CDP/Tailscale.
