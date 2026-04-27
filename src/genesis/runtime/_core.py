@@ -236,7 +236,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._ego_proposal_workflow: object | None = None
         self._genesis_ego_session: object | None = None  # Genesis ego (COO)
         self._genesis_ego_cadence_manager: object | None = None
-        self._ego_proposal_executor: object | None = None
 
         # Global pause state — blocks all background dispatches when True.
         self._paused: bool = False
@@ -441,7 +440,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         for name, component in [
             ("user_ego_cadence", self._ego_cadence_manager),
             ("genesis_ego_cadence", self._genesis_ego_cadence_manager),
-            ("ego_proposal_executor", self._ego_proposal_executor),
             ("outreach_scheduler", self._outreach_scheduler),
             ("reflection_scheduler", self._reflection_scheduler),
             ("inbox_monitor", self._inbox_monitor),

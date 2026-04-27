@@ -67,7 +67,10 @@ async def init(rt: GenesisRuntime) -> None:
         # -- Shared components --
         # ProposalWorkflow is shared — both egos create proposals that go
         # through the same Telegram approval pipeline.
-        proposal_workflow = ProposalWorkflow(db=rt._db)
+        proposal_workflow = ProposalWorkflow(
+            db=rt._db,
+            memory_store=rt._memory_store,
+        )
         rt._ego_proposal_workflow = proposal_workflow
 
         dispatcher = EgoDispatcher(db=rt._db)
@@ -101,6 +104,7 @@ async def init(rt: GenesisRuntime) -> None:
             config=config,  # Uses base config (Opus, HIGH effort)
             db=rt._db,
             event_bus=rt._event_bus,
+            direct_session_runner=rt._direct_session_runner,
             mcp_config_path=mcp_config_path,
             prompt_path=_IDENTITY_DIR / "USER_EGO_SESSION.md",
             call_site="7_user_ego_cycle",
@@ -141,7 +145,8 @@ async def init(rt: GenesisRuntime) -> None:
             default_effort="high",
             cadence_minutes=max(config.cadence_minutes, 60),
             morning_report_enabled=False,
-            daily_budget_cap_usd=5.0,
+            ego_thinking_budget_usd=2.0,
+            ego_dispatch_budget_usd=1.0,
         )
 
         genesis_ego_compaction = CompactionEngine(
@@ -170,6 +175,7 @@ async def init(rt: GenesisRuntime) -> None:
             config=genesis_ego_config,
             db=rt._db,
             event_bus=rt._event_bus,
+            direct_session_runner=rt._direct_session_runner,
             mcp_config_path=mcp_config_path,
             prompt_path=_IDENTITY_DIR / "GENESIS_EGO_SESSION.md",
             call_site="7_genesis_ego_cycle",
@@ -201,20 +207,54 @@ async def init(rt: GenesisRuntime) -> None:
         )
 
         # ================================================================
-        # PROPOSAL EXECUTOR — dispatches approved proposals
+        # OUTCOME TRACKING — on_end hook for ego-dispatched sessions
         # ================================================================
-        from genesis.ego.executor import EgoProposalExecutor
+        if rt._session_manager is not None:
+            from genesis.cc.session_manager import cc_sessions
+            from genesis.db.crud import observations as obs_crud
 
-        executor = EgoProposalExecutor(
-            db=rt._db,
-            direct_session_runner=rt._direct_session_runner,
-            surplus_queue=rt._surplus_queue,
-            outreach_pipeline=rt._outreach_pipeline,
-        )
-        rt._ego_proposal_executor = executor
+            async def _ego_dispatch_on_end(session_id: str) -> None:
+                """Create an observation when an ego-dispatched session ends."""
+                try:
+                    session = await cc_sessions.get_by_id(rt._db, session_id)
+                    if not session:
+                        return
+                    if session.get("source_tag") != "ego_dispatch":
+                        return
 
-        await executor.start()
-        logger.info("Ego proposal executor initialized")
+                    import uuid
+                    from datetime import UTC, datetime
+
+                    status = session.get("status", "unknown")
+                    cost = session.get("cost_usd", 0.0)
+                    caller_ctx = session.get("caller_context", "")
+
+                    await obs_crud.create(
+                        rt._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_dispatch",
+                        type="execution_outcome",
+                        content=(
+                            f"Ego dispatch session {session_id[:8]} "
+                            f"completed: status={status}, cost=${cost:.4f}. "
+                            f"Context: {caller_ctx}"
+                        ),
+                        priority="medium",
+                        category="ego_dispatch",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                    logger.info(
+                        "Recorded ego dispatch outcome for session %s",
+                        session_id[:8],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record ego dispatch outcome",
+                        exc_info=True,
+                    )
+
+            rt._session_manager.add_on_end(_ego_dispatch_on_end)
+            logger.info("Ego dispatch outcome hook registered")
 
     except ImportError:
         logger.warning("genesis.ego not available")

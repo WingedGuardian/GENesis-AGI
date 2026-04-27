@@ -25,18 +25,19 @@ class TestLoadEgoConfig:
         assert config.enabled is True
         assert config.cadence_minutes == 60
         assert config.model == "opus"
-        assert config.daily_budget_cap_usd == 10.0
+        assert config.ego_thinking_budget_usd == 4.0
+        assert config.ego_dispatch_budget_usd == 2.50
 
     def test_loads_from_yaml(self, tmp_config):
         tmp_config.write_text(yaml.dump({
             "cadence_minutes": 30,
             "model": "sonnet",
-            "daily_budget_cap_usd": 5.0,
+            "ego_thinking_budget_usd": 5.0,
         }))
         config = load_ego_config(tmp_config)
         assert config.cadence_minutes == 30
         assert config.model == "sonnet"
-        assert config.daily_budget_cap_usd == 5.0
+        assert config.ego_thinking_budget_usd == 5.0
         # Unspecified fields keep defaults
         assert config.enabled is True
         assert config.activity_threshold_minutes == 30
@@ -62,14 +63,14 @@ class TestSaveEgoConfig:
         original = EgoConfig(
             cadence_minutes=45,
             model="sonnet",
-            daily_budget_cap_usd=5.0,
+            ego_thinking_budget_usd=5.0,
         )
         save_ego_config(original, tmp_config)
 
         loaded = load_ego_config(tmp_config)
         assert loaded.cadence_minutes == 45
         assert loaded.model == "sonnet"
-        assert loaded.daily_budget_cap_usd == 5.0
+        assert loaded.ego_thinking_budget_usd == 5.0
 
     def test_creates_file(self, tmp_config):
         assert not tmp_config.exists()
@@ -87,7 +88,7 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({
             "cadence_minutes": 30,
             "model": "sonnet",
-            "daily_budget_cap_usd": 5.0,
+            "ego_thinking_budget_usd": 5.0,
         })
         assert errors == []
 
@@ -102,18 +103,32 @@ class TestValidateEgoConfig:
         assert "model" in errors[0]
 
     def test_invalid_budget(self):
-        errors = validate_ego_config({"daily_budget_cap_usd": -1})
+        errors = validate_ego_config({"ego_thinking_budget_usd": -1})
         assert len(errors) == 1
 
     def test_invalid_morning_hour(self):
         errors = validate_ego_config({"morning_report_hour": 25})
         assert len(errors) == 1
 
+    def test_invalid_board_size(self):
+        errors = validate_ego_config({"board_size": 0})
+        assert len(errors) == 1
+        assert "board_size" in errors[0]
+
+    def test_valid_board_size(self):
+        errors = validate_ego_config({"board_size": 5})
+        assert errors == []
+
+    def test_no_proposal_expiry_validation(self):
+        """proposal_expiry_minutes was removed — should not validate."""
+        errors = validate_ego_config({"proposal_expiry_minutes": 240})
+        assert errors == []  # unknown key, ignored
+
     def test_multiple_errors(self):
         errors = validate_ego_config({
             "cadence_minutes": -1,
             "model": "invalid",
-            "daily_budget_cap_usd": -5,
+            "ego_thinking_budget_usd": -5,
         })
         assert len(errors) == 3
 
