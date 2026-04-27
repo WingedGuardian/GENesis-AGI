@@ -197,10 +197,6 @@ def _format_digest(
             lines.append(f"<i>Alternatives:</i> {_ESC(alts)}")
         lines.append("")
 
-    lines.append("<i>Reply to this message to approve/reject. Examples:</i>")
-    lines.append("<code>approve all</code>")
-    lines.append("<code>approve 1,3</code>")
-    lines.append("<code>reject 2 \u2014 not worth it</code>")
 
     return "\n".join(lines)
 
