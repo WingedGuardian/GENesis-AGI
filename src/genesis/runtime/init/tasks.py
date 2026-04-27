@@ -36,7 +36,10 @@ async def init(rt: GenesisRuntime) -> None:
 
         # Build components
         decomposer = TaskDecomposer(router=rt._router)
-        reviewer = TaskReviewer(router=rt._router)
+        reviewer = TaskReviewer(
+            router=rt._router,
+            invoker=rt._cc_invoker,
+        )
         workaround = WorkaroundSearcherImpl(db=rt._db)
         tracer = ExecutionTracer(
             db=rt._db,

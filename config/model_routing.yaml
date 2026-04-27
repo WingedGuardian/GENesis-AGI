@@ -93,6 +93,20 @@ providers:
     enabled: false
     rpm_limit: 20
     open_duration_s: 120
+  openrouter-deepseek-v4:
+    type: openrouter
+    model: deepseek/deepseek-v4-pro
+    profile: deepseek-v4-pro
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-gpt55:
+    type: openrouter
+    model: openai/gpt-5.5
+    profile: gpt-5.5
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
   openrouter-mimo:
     type: openrouter
     model: xiaomi/mimo-v2-pro
@@ -144,15 +158,15 @@ providers:
     open_duration_s: 120
   glm5:
     type: zenmux
-    model: z-ai/glm-5-turbo
-    profile: glm-5
+    model: z-ai/glm-5.1-turbo
+    profile: glm-5.1
     base_url: https://zenmux.ai/api/v1
     free: false
     open_duration_s: 120
   minimax-m25:
     type: minimax
-    model: MiniMax-M2.5
-    profile: minimax-m2.5
+    model: MiniMax-M2.7
+    profile: minimax-m2.7
     base_url: https://api.minimaxi.com/v1
     free: false
     open_duration_s: 120
@@ -171,8 +185,8 @@ providers:
     open_duration_s: 120
   kimi-k2.5:
     type: openrouter
-    model: moonshotai/kimi-k2.5
-    profile: kimi-k2.5
+    model: moonshotai/kimi-k2.6
+    profile: kimi-k2.6
     free: false
     rpm_limit: 20
     open_duration_s: 120
@@ -294,8 +308,8 @@ call_sites:
     default_paid: true
   17_fresh_eyes_review:
     chain:
-    - openrouter-free
-    - claude-sonnet
+    - openrouter-deepseek-v4
+    - openrouter-qwen36plus
     default_paid: true
   18_meta_prompting:
     chain:
@@ -303,8 +317,9 @@ call_sites:
     default_paid: true
   20_adversarial_counterargument:
     chain:
-    - openrouter-free
-    - claude-sonnet
+    - openrouter-gpt55
+    - openrouter-deepseek-v4
+    - openrouter-qwen36plus
     default_paid: true
   21_session_observer:
     chain:

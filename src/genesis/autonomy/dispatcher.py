@@ -137,16 +137,56 @@ class TaskDispatcher:
         return task_id
 
     async def dispatch_cycle(self) -> int:
-        """Poll for task_detected observations and dispatch new tasks.
+        """Poll for pending tasks and task_detected observations.
 
-        Secondary path: picks up tasks from conversation_intent observations
-        that haven't been dispatched yet. Resolves observations after dispatch
-        to prevent duplicates (Amendment #11).
+        Two pickup paths:
+        1. DB scan for PENDING tasks not yet dispatched (picks up tasks
+           created by MCP tool's DB-direct fallback path).
+        2. Observation scan for task_detected observations with plan_path
+           metadata (Amendment #11).
 
         Returns the count of newly dispatched tasks.
         """
         from genesis.db.crud import observations, task_states
+        from genesis.util.tasks import tracked_task
 
+        dispatched = 0
+
+        # Fetch active tasks once — reused by both paths
+        try:
+            active = await task_states.list_active(self._db)
+        except Exception:
+            logger.error("Failed to list active tasks", exc_info=True)
+            active = []
+
+        # --- Path 1: Pick up PENDING tasks from DB (MCP-submitted) ---
+        for task in active:
+            task_id = task["task_id"]
+            phase = task.get("current_phase", "")
+            if phase != TaskPhase.PENDING.value:
+                continue
+            if task_id in self._dispatched:
+                continue
+
+            plan_path = task.get("outputs") or ""
+            if not plan_path:
+                logger.warning(
+                    "Pending task %s has no plan path, skipping", task_id,
+                )
+                continue
+
+            logger.info(
+                "Picking up pending task %s from DB (source=mcp_fallback)",
+                task_id,
+            )
+            self._dispatched.add(task_id)
+            tracked_task(
+                self._executor.execute(task_id),
+                name=f"task-{task_id}",
+            )
+            dispatched += 1
+
+        # --- Path 2: Observation-based task pickup ---
         try:
             pending_obs = await observations.query(
                 self._db,
@@ -156,16 +196,9 @@ class TaskDispatcher:
             )
         except Exception:
             logger.error("Failed to query task observations", exc_info=True)
-            return 0
+            return dispatched
 
-        dispatched = 0
-        # Fetch active tasks once, not per-observation
-        try:
-            existing = await task_states.list_active(self._db)
-        except Exception:
-            logger.error("Failed to list active tasks for dedup", exc_info=True)
-            existing = []
-        active_descriptions = {t.get("description", "") for t in existing}
+        active_descriptions = {t.get("description", "") for t in active}
 
         for obs in pending_obs:
             obs_id = obs["id"]

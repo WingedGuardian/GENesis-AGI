@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -24,10 +25,45 @@ def _reset_task_tools():
 
 @pytest.mark.asyncio
 class TestTaskSubmit:
-    async def test_not_initialized(self) -> None:
+    async def test_mcp_fallback_invalid_path(self) -> None:
+        """Without dispatcher, MCP fallback validates plan path."""
         result = await task_tools._impl_task_submit("/path", "desc")
         assert "error" in result
-        assert "not initialized" in result["error"]
+        assert "outside allowed" in result["error"]
+
+    async def test_mcp_fallback_missing_file(self) -> None:
+        """Without dispatcher, MCP fallback checks file existence."""
+        allowed_dir = Path.home() / ".claude" / "plans"
+        result = await task_tools._impl_task_submit(
+            str(allowed_dir / "nonexistent.md"), "desc",
+        )
+        assert "error" in result
+        assert "not found" in result["error"]
+
+    async def test_mcp_fallback_creates_db_row(self, tmp_path: Path) -> None:
+        """Without dispatcher, MCP fallback creates DB row directly."""
+        plan = tmp_path / "test-plan.md"
+        plan.write_text("# Test Plan\n")
+
+        # Temporarily allow the tmp dir
+        original_dirs = task_tools._ALLOWED_PLAN_DIRS[:]
+        task_tools._ALLOWED_PLAN_DIRS.append(tmp_path)
+
+        mock_db = AsyncMock()
+        mock_db.close = AsyncMock()
+        mock_db.commit = AsyncMock()
+
+        with (
+            patch.object(task_tools, "_get_db", new_callable=AsyncMock, return_value=mock_db),
+            patch("genesis.db.crud.task_states.create", new_callable=AsyncMock),
+        ):
+            result = await task_tools._impl_task_submit(str(plan), "Test task")
+
+        task_tools._ALLOWED_PLAN_DIRS[:] = original_dirs
+
+        assert "task_id" in result
+        assert result["status"] == "pending"
+        assert "dispatch cycle" in result.get("note", "")
 
     async def test_empty_plan_path(self) -> None:
         task_tools._dispatcher = AsyncMock()
@@ -56,9 +92,37 @@ class TestTaskSubmit:
 
 @pytest.mark.asyncio
 class TestTaskList:
-    async def test_not_initialized(self) -> None:
-        result = await task_tools._impl_task_list()
+    async def test_db_fallback_on_connection_error(self) -> None:
+        """Without wired _db, tries _get_db() fallback."""
+        with patch.object(
+            task_tools, "_get_db",
+            new_callable=AsyncMock,
+            side_effect=Exception("no DB"),
+        ):
+            result = await task_tools._impl_task_list()
         assert "error" in result
+        assert "unavailable" in result["error"].lower()
+
+    async def test_db_fallback_lists_tasks(self) -> None:
+        """Without wired _db, opens own connection and lists."""
+        mock_db = AsyncMock()
+        mock_db.close = AsyncMock()
+
+        with (
+            patch.object(task_tools, "_get_db", new_callable=AsyncMock, return_value=mock_db),
+            patch(
+                "genesis.db.crud.task_states.list_active",
+                new_callable=AsyncMock,
+                return_value=[
+                    {"task_id": "t-001", "description": "Task 1", "current_phase": "executing", "created_at": "now"},
+                ],
+            ),
+        ):
+            result = await task_tools._impl_task_list()
+
+        assert result["count"] == 1
+        assert result["tasks"][0]["task_id"] == "t-001"
+        mock_db.close.assert_awaited_once()
 
     async def test_lists_active_tasks(self) -> None:
         task_tools._dispatcher = AsyncMock()
@@ -92,13 +156,44 @@ class TestTaskDetail:
         assert "error" in result
         assert "not found" in result["error"]
 
+    async def test_db_fallback_detail(self) -> None:
+        """Without wired _db, opens own connection for detail."""
+        mock_db = AsyncMock()
+        mock_db.close = AsyncMock()
+
+        with (
+            patch.object(task_tools, "_get_db", new_callable=AsyncMock, return_value=mock_db),
+            patch(
+                "genesis.db.crud.task_states.get_by_id",
+                new_callable=AsyncMock,
+                return_value={
+                    "task_id": "t-002",
+                    "description": "Test",
+                    "current_phase": "pending",
+                    "created_at": "now",
+                    "updated_at": "now",
+                    "blockers": None,
+                    "outputs": None,
+                },
+            ),
+            patch(
+                "genesis.db.crud.task_steps.get_steps_for_task",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+        ):
+            result = await task_tools._impl_task_detail("t-002")
+
+        assert result["task_id"] == "t-002"
+        mock_db.close.assert_awaited_once()
+
 
 @pytest.mark.asyncio
 class TestTaskControl:
     async def test_not_initialized(self) -> None:
         result = await task_tools._impl_task_control("t-001", "pause")
         assert "error" in result
-        assert "not initialized" in result["error"]
+        assert "main Genesis server" in result["error"]
 
     async def test_invalid_action(self) -> None:
         task_tools._executor = AsyncMock()
