@@ -177,19 +177,51 @@ class StepDispatcher:
                 )
                 pending = None
             if pending is not None:
-                blocker = (
-                    f"awaiting approval {pending.get('id')} for "
-                    f"{step_type.value} step"
-                )
+                # Check whether this pending request has already been
+                # approved but not yet consumed.  Without this, the
+                # pre-check blocks indefinitely even after the user
+                # grants approval — route() never gets the chance to
+                # consume the approved request.
+                try:
+                    approved = await (
+                        self._autonomous_dispatcher
+                        .approval_gate
+                        .find_recently_approved(
+                            subsystem="task_executor",
+                            policy_id=executor_policy_id,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "find_recently_approved failed for %s; "
+                        "treating as still pending",
+                        executor_policy_id, exc_info=True,
+                    )
+                    approved = None
+
+                if approved is None:
+                    # Genuinely pending — no approval yet.
+                    blocker = (
+                        f"awaiting approval {pending.get('id')} for "
+                        f"{step_type.value} step"
+                    )
+                    logger.info(
+                        "Task %s step %d skipped — call site blocked "
+                        "on approval %s",
+                        task_id, step_idx, pending.get("id"),
+                    )
+                    return StepResult(
+                        idx=step_idx,
+                        status="blocked",
+                        result=blocker,
+                        blocker_description=blocker,
+                    )
+                # Approved but unconsumed — fall through to route()
+                # which will consume it atomically.
                 logger.info(
-                    "Task %s step %d skipped — call site blocked on approval %s",
-                    task_id, step_idx, pending.get("id"),
-                )
-                return StepResult(
-                    idx=step_idx,
-                    status="blocked",
-                    result=blocker,
-                    blocker_description=blocker,
+                    "Task %s step %d has approved request %s — "
+                    "proceeding to route()",
+                    task_id, step_idx, approved.get("id"),
                 )
 
             decision = await self._autonomous_dispatcher.route(
