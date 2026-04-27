@@ -4,13 +4,31 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from genesis.autonomy.executor.review import (
     TaskReviewer,
 )
+from genesis.cc.types import CCOutput
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_codex(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent real codex exec from running in tests.
+
+    Tests that specifically test the codex path patch this themselves.
+    """
+    monkeypatch.setattr(
+        "genesis.autonomy.executor.review.shutil.which",
+        lambda name: None,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -287,3 +305,223 @@ class TestFeedbackAssessment:
             json.dumps({"verdict": "pass"}),
             json.dumps({"verdict": "fail"}),
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# Tool-capable verification chain tests
+# ---------------------------------------------------------------------------
+
+
+def _codex_jsonl_output(text: str) -> bytes:
+    """Build fake codex --json JSONL output containing an agent_message."""
+    item = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": text},
+    }
+    return (json.dumps(item) + "\n").encode("utf-8")
+
+
+def _make_fake_cc_output(
+    text: str = "", is_error: bool = False, error_message: str | None = None,
+) -> CCOutput:
+    return CCOutput(
+        session_id="test-session",
+        text=text,
+        model_used="claude-sonnet-4-6",
+        cost_usd=0.01,
+        input_tokens=100,
+        output_tokens=50,
+        duration_ms=1000,
+        exit_code=0 if not is_error else 1,
+        is_error=is_error,
+        error_message=error_message,
+    )
+
+
+@pytest.mark.asyncio
+class TestVerifyViaCodex:
+    async def test_codex_not_installed_returns_none(self) -> None:
+        """When codex is not on PATH, _verify_via_codex returns None."""
+        # _no_codex fixture already patches shutil.which -> None
+        reviewer = TaskReviewer(router=AsyncMock())
+        result = await reviewer._verify_via_codex("deliverable", "requirements")
+        assert result is None
+
+    async def test_codex_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When codex returns a verdict, parse the JSONL output."""
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+        verdict_text = json.dumps({
+            "verdict": "pass",
+            "checks": [{"criterion": "file exists", "verified": True}],
+        })
+
+        fake_proc = AsyncMock()
+        fake_proc.communicate = AsyncMock(
+            return_value=(_codex_jsonl_output(verdict_text), b""),
+        )
+        fake_proc.returncode = 0
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            return_value=fake_proc,
+        ):
+            reviewer = TaskReviewer(router=AsyncMock())
+            result = await reviewer._verify_via_codex("deliverable", "reqs")
+
+        assert result is not None
+        assert "pass" in result
+
+    async def test_codex_nonzero_exit_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+
+        fake_proc = AsyncMock()
+        fake_proc.communicate = AsyncMock(return_value=(b"", b"error"))
+        fake_proc.returncode = 1
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            return_value=fake_proc,
+        ):
+            reviewer = TaskReviewer(router=AsyncMock())
+            result = await reviewer._verify_via_codex("deliverable", "reqs")
+
+        assert result is None
+
+    async def test_codex_empty_output_returns_none(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+
+        fake_proc = AsyncMock()
+        fake_proc.communicate = AsyncMock(return_value=(b"{}\n", b""))
+        fake_proc.returncode = 0
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            return_value=fake_proc,
+        ):
+            reviewer = TaskReviewer(router=AsyncMock())
+            result = await reviewer._verify_via_codex("deliverable", "reqs")
+
+        assert result is None
+
+
+@pytest.mark.asyncio
+class TestVerifyViaInvoker:
+    async def test_invoker_none_returns_none(self) -> None:
+        reviewer = TaskReviewer(router=AsyncMock(), invoker=None)
+        result = await reviewer._verify_via_invoker("deliverable", "reqs")
+        assert result is None
+
+    async def test_invoker_pass(self) -> None:
+        invoker = AsyncMock()
+        invoker.run = AsyncMock(
+            return_value=_make_fake_cc_output(
+                text=json.dumps({"verdict": "pass"}),
+            ),
+        )
+        reviewer = TaskReviewer(router=AsyncMock(), invoker=invoker)
+        result = await reviewer._verify_via_invoker("deliverable", "reqs")
+
+        assert result is not None
+        assert "pass" in result
+
+    async def test_invoker_error_returns_none(self) -> None:
+        invoker = AsyncMock()
+        invoker.run = AsyncMock(
+            return_value=_make_fake_cc_output(
+                is_error=True, error_message="session failed",
+            ),
+        )
+        reviewer = TaskReviewer(router=AsyncMock(), invoker=invoker)
+        result = await reviewer._verify_via_invoker("deliverable", "reqs")
+        assert result is None
+
+    async def test_invoker_exception_returns_none(self) -> None:
+        invoker = AsyncMock()
+        invoker.run = AsyncMock(side_effect=RuntimeError("crash"))
+        reviewer = TaskReviewer(router=AsyncMock(), invoker=invoker)
+        result = await reviewer._verify_via_invoker("deliverable", "reqs")
+        assert result is None
+
+
+@pytest.mark.asyncio
+class TestToolCapableReviewChain:
+    async def test_codex_success_skips_invoker(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When codex succeeds, invoker and API are not called."""
+        monkeypatch.setattr(
+            "genesis.autonomy.executor.review.shutil.which",
+            lambda name: "/usr/bin/codex",
+        )
+        verdict = json.dumps({"verdict": "pass"})
+
+        fake_proc = AsyncMock()
+        fake_proc.communicate = AsyncMock(
+            return_value=(_codex_jsonl_output(verdict), b""),
+        )
+        fake_proc.returncode = 0
+
+        invoker = AsyncMock()
+        router = AsyncMock()
+
+        with patch(
+            "genesis.autonomy.executor.review.asyncio.create_subprocess_exec",
+            return_value=fake_proc,
+        ):
+            reviewer = TaskReviewer(router=router, invoker=invoker)
+            result = await reviewer._tool_capable_review("deliverable", "reqs")
+
+        assert result is not None
+        # Invoker should NOT have been called
+        invoker.run.assert_not_called()
+        # Router (API fallback) should NOT have been called for adversarial
+        for call in router.route_call.call_args_list:
+            assert "20_adversarial" not in call[0][0]
+
+    async def test_codex_fail_falls_to_invoker(self) -> None:
+        """When codex is not installed, invoker is tried next."""
+        # _no_codex fixture: shutil.which -> None
+        invoker = AsyncMock()
+        invoker.run = AsyncMock(
+            return_value=_make_fake_cc_output(
+                text=json.dumps({"verdict": "pass"}),
+            ),
+        )
+        reviewer = TaskReviewer(router=AsyncMock(), invoker=invoker)
+        result = await reviewer._tool_capable_review("deliverable", "reqs")
+
+        assert result is not None
+        invoker.run.assert_called_once()
+
+    async def test_all_fail_falls_to_api(self) -> None:
+        """When codex and invoker both fail, API call site 20 is used."""
+        # codex not installed (_no_codex fixture), invoker=None
+        pass_json = json.dumps({"verdict": "pass"})
+        router = _make_router(pass_json)
+        reviewer = TaskReviewer(router=router, invoker=None)
+        result = await reviewer._tool_capable_review("deliverable", "reqs")
+
+        assert result is not None
+        # Verify the router was called with adversarial call site
+        router.route_call.assert_called()
+
+    async def test_chain_total_failure(self) -> None:
+        """When all three links fail, returns None."""
+        # codex not installed, invoker=None, router returns failure
+        router = _make_router(None, success=False)
+        reviewer = TaskReviewer(router=router, invoker=None)
+        result = await reviewer._tool_capable_review("deliverable", "reqs")
+        assert result is None

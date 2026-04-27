@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from genesis.autonomy.executor.dispatch import (
+    _read_artifact,
     build_step_prompt,
     create_fixup_step,
     dominant_step_type,
@@ -63,6 +65,36 @@ class TestParseStepOutput:
         assert "Just plain text" in result["result"]
 
 
+class TestReadArtifact:
+    def test_reads_existing_file(self, tmp_path: Path) -> None:
+        f = tmp_path / "output.txt"
+        f.write_text("hello world", encoding="utf-8")
+        result = _read_artifact(str(f))
+        assert "hello world" in result
+        assert "```" in result
+
+    def test_missing_file(self) -> None:
+        result = _read_artifact("/nonexistent/file.txt")
+        assert "does not exist" in result
+
+    def test_directory_skipped(self, tmp_path: Path) -> None:
+        result = _read_artifact(str(tmp_path))
+        assert "not a regular file" in result
+
+    def test_binary_file(self, tmp_path: Path) -> None:
+        f = tmp_path / "binary.bin"
+        f.write_bytes(b"\x00\x01\x02\xff" * 100)
+        result = _read_artifact(str(f))
+        assert "binary or unreadable" in result
+
+    def test_large_file_truncated(self, tmp_path: Path) -> None:
+        f = tmp_path / "large.txt"
+        f.write_text("x" * 100_000, encoding="utf-8")
+        result = _read_artifact(str(f))
+        assert "Truncated" in result
+        assert "100,000" in result
+
+
 class TestSynthesizeDeliverable:
     def test_combines_completed_steps(self) -> None:
         results = [
@@ -77,6 +109,39 @@ class TestSynthesizeDeliverable:
 
     def test_empty_results(self) -> None:
         assert synthesize_deliverable([]) == ""
+
+    def test_includes_artifacts(self, tmp_path: Path) -> None:
+        f = tmp_path / "result.txt"
+        f.write_text("file content here", encoding="utf-8")
+        results = [
+            StepResult(
+                idx=0, status="completed", result="Built output",
+                artifacts=[str(f)],
+            ),
+        ]
+        text = synthesize_deliverable(results)
+        assert "Built output" in text
+        assert "file content here" in text
+        assert "Artifact:" in text
+
+    def test_missing_artifact_included(self) -> None:
+        results = [
+            StepResult(
+                idx=0, status="completed", result="Done",
+                artifacts=["/nonexistent/path.txt"],
+            ),
+        ]
+        text = synthesize_deliverable(results)
+        assert "Done" in text
+        assert "does not exist" in text
+
+    def test_no_artifacts(self) -> None:
+        results = [
+            StepResult(idx=0, status="completed", result="No files"),
+        ]
+        text = synthesize_deliverable(results)
+        assert "No files" in text
+        assert "Artifact" not in text
 
 
 class TestDominantStepType:

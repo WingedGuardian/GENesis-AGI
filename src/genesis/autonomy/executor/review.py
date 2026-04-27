@@ -2,8 +2,8 @@
 
 Implements the quality gate from the design doc:
 1. Programmatic checks (basic validation)
-2. Fresh-eyes review (call site 17, cross-vendor)
-3. Adversarial counterargument (call site 20, cross-vendor)
+2. Fresh-eyes review (call site 17, cross-vendor API)
+3. Adversarial verification (tool-capable chain: Codex -> CC invoker -> API)
 
 If programmatic checks fail, LLM review is skipped entirely.
 If cross-vendor routing fails after retries, review is skipped with
@@ -12,10 +12,12 @@ a warning (Amendment #5).
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import re
+import shutil
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -146,7 +148,7 @@ class TaskReviewer:
             prompt=prompt,
             model=CCModel.OPUS,
             effort=EffortLevel.HIGH,
-            timeout_s=300,
+            timeout_s=600,
             skip_permissions=True,
         )
         output = await self._invoker.run(invocation)
@@ -168,11 +170,12 @@ class TaskReviewer:
         task_type: str = "code",
         iteration: int = 0,
     ) -> VerifyResult:
-        """Post-execution dual-gate verification.
+        """Post-execution verification with tool-capable adversarial gate.
 
         Gate 1: Programmatic checks (basic validation).
-        Gate 2: Fresh-eyes review (call site 17, cross-vendor).
-        Gate 3: Adversarial review (call site 20, cross-vendor).
+        Gate 2: Fresh-eyes review (call site 17, cross-vendor API).
+        Gate 3: Adversarial verification via tool-capable chain:
+                Codex (GPT, cross-vendor) -> CC invoker (Sonnet) -> API fallback.
 
         If programmatic checks fail, LLM gates are skipped.
         If both LLM routes fail, delivers with a warning (Amendment #5).
@@ -186,15 +189,13 @@ class TaskReviewer:
                 iteration=iteration,
             )
 
-        # Gate 2 -- fresh-eyes review
+        # Gate 2 -- fresh-eyes review (API, enriched deliverable)
         fresh_eyes = await self._llm_review(
             _CALL_SITE_FRESH, deliverable, requirements,
         )
 
-        # Gate 3 -- adversarial review
-        adversarial = await self._llm_review(
-            _CALL_SITE_ADVERSARIAL, deliverable, requirements,
-        )
+        # Gate 3 -- adversarial verification (tool-capable chain)
+        adversarial = await self._tool_capable_review(deliverable, requirements)
 
         # Amendment #5: both routing fail -> deliver with warning
         if fresh_eyes is None and adversarial is None:
@@ -218,6 +219,152 @@ class TaskReviewer:
             adversarial_feedback=adversarial,
             iteration=iteration,
         )
+
+    # --- Tool-capable verification chain --------------------------------
+
+    async def _tool_capable_review(
+        self,
+        deliverable: str,
+        requirements: str,
+    ) -> str | None:
+        """Run the tool-capable adversarial verification chain.
+
+        First-success semantics (same pattern as contribution/review.py):
+        1. Codex (GPT, cross-vendor, full tools) -- ``shutil.which`` guard
+        2. CC invoker (Sonnet, same-vendor fallback, full tools)
+        3. API call site 20 (last resort, text-only)
+
+        Returns verdict text or ``None`` on total chain failure.
+
+        # GROUNDWORK(per-step-verify): This method is extracted so future
+        # per-step verification can reuse the same chain.  The follow-up
+        # PR will call it from the step execution loop for steps where
+        # ``StepType.verify_step`` is True.
+        """
+        # Link 1: Codex (cross-vendor, tool-capable)
+        verdict = await self._verify_via_codex(deliverable, requirements)
+        if verdict is not None:
+            return verdict
+
+        # Link 2: CC invoker (Sonnet, tool-capable fallback)
+        verdict = await self._verify_via_invoker(deliverable, requirements)
+        if verdict is not None:
+            return verdict
+
+        # Link 3: API call site 20 (text-only last resort)
+        return await self._llm_review(
+            _CALL_SITE_ADVERSARIAL, deliverable, requirements,
+        )
+
+    async def _verify_via_codex(
+        self,
+        deliverable: str,
+        requirements: str,
+    ) -> str | None:
+        """Run adversarial verification via ``codex exec`` subprocess.
+
+        Returns verdict text or ``None`` if Codex is not installed or fails.
+        Uses ``asyncio.create_subprocess_exec`` since review.py is async.
+        """
+        if shutil.which("codex") is None:
+            logger.info("review: codex not on PATH -- skipping codex link")
+            return None
+
+        prompt = self._build_active_verify_prompt(deliverable, requirements)
+
+        try:
+            # Sandbox bypass required: bubblewrap namespace creation
+            # fails inside containers (bwrap: Creating new namespace
+            # failed: Permission denied).  --full-auto also fails.
+            # Verification is read-only in intent; the bypass only
+            # affects the sandbox layer, not the prompt instructions.
+            proc = await asyncio.create_subprocess_exec(
+                "codex", "exec", "-",
+                "-c", 'model_reasoning_effort="medium"',
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate(
+                input=prompt.encode("utf-8"),
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            logger.warning("review: codex exec OS error", exc_info=True)
+            return None
+
+        if proc.returncode != 0:
+            logger.warning(
+                "review: codex exec rc=%s, stderr=%r",
+                proc.returncode,
+                (stderr_bytes.decode(errors="replace") or "")[:200],
+            )
+            return None
+
+        # Parse JSONL output -- same pattern as contribution/review.py
+        stdout = stdout_bytes.decode(errors="replace")
+        pieces: list[str] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "item.completed":
+                item = obj.get("item", {})
+                if item.get("type") == "agent_message" and item.get("text"):
+                    pieces.append(item["text"])
+
+        output = "\n".join(pieces).strip()
+        if not output:
+            logger.warning("review: codex output was empty after JSONL parse")
+            return None
+
+        logger.info("review: codex adversarial verification completed")
+        return output
+
+    async def _verify_via_invoker(
+        self,
+        deliverable: str,
+        requirements: str,
+    ) -> str | None:
+        """Run adversarial verification via CC invoker (Sonnet).
+
+        Returns verdict text or ``None`` if invoker is unavailable or fails.
+        """
+        if self._invoker is None:
+            return None
+
+        prompt = self._build_active_verify_prompt(deliverable, requirements)
+
+        try:
+            from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+
+            invocation = CCInvocation(
+                prompt=prompt,
+                model=CCModel.SONNET,
+                effort=EffortLevel.HIGH,
+                skip_permissions=True,
+            )
+            output = await self._invoker.run(invocation)
+            if output.is_error:
+                logger.warning(
+                    "CC invoker adversarial review returned error: %s",
+                    output.error_message or output.text[:200],
+                )
+                return None
+            return output.text
+        except Exception:
+            logger.warning(
+                "CC invoker adversarial review failed",
+                exc_info=True,
+            )
+            return None
 
     # --- Programmatic checks --------------------------------------------
 
@@ -405,6 +552,38 @@ class TaskReviewer:
             '{"verdict": "pass" or "fail", '
             '"issues": ["list of specific issues"], '
             '"feedback": "overall assessment"}'
+        )
+
+    @staticmethod
+    def _build_active_verify_prompt(
+        deliverable: str,
+        requirements: str,
+    ) -> str:
+        """Build prompt for tool-capable adversarial verification.
+
+        Unlike ``_build_verify_prompt`` (text-only API models), this
+        prompt instructs the reviewer to USE TOOLS to verify claims.
+        """
+        return (
+            "You are an adversarial verifier. Your job is to ACTIVELY CHECK "
+            "whether the deliverable meets the requirements. Do not just read "
+            "the summary -- use your tools to verify:\n\n"
+            "- If a file should exist, READ the file and check its contents\n"
+            "- If a URL should be live, FETCH the URL\n"
+            "- If tests should pass, RUN the tests\n"
+            "- If code was written, READ and REVIEW the actual code\n\n"
+            "## Requirements\n"
+            f"{requirements}\n\n"
+            "## Reported Deliverable\n"
+            f"{deliverable}\n\n"
+            "## Instructions\n"
+            "Verify each success criterion by checking the actual state. Be "
+            "thorough and skeptical. Report what you found.\n\n"
+            "Respond with JSON:\n"
+            '{"verdict": "pass" or "fail",\n'
+            ' "checks": [{"criterion": "...", "verified": true/false, '
+            '"evidence": "..."}],\n'
+            ' "issues": ["list of genuine failures"]}'
         )
 
     def _parse_plan_review(self, content: str) -> ReviewResult:
