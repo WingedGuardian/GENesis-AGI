@@ -36,6 +36,9 @@ more.
 
 **Gather these (as needed):**
 - Desired outcome --- what does "done" look like?
+- Success criteria --- specific, testable conditions (the plan review gate
+  evaluates these heavily)
+- Risks --- what could go wrong? How should the executor handle it?
 - Constraints --- timeline, budget, technology preferences, things to avoid
 - Access/credentials --- does the executor need anything the user must provide?
 - Deliverable format --- code (branch + PR), document, summary, external action?
@@ -66,6 +69,11 @@ What the user receives (branch + PR, document, summary, etc).
 
 ## Quality Checks
 What verification is appropriate (tests, lint, review, manual check).
+
+## Risks and Failure Modes
+What could go wrong and how the executor should handle it.
+Be specific: "API may be rate-limited — retry with backoff" is useful.
+"Something might fail" is not.
 
 ## Constraints
 Budget, timeline, technology, things to avoid.
