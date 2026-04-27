@@ -38,7 +38,7 @@ class TaskPhase(StrEnum):
 # ---------------------------------------------------------------------------
 
 VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
-    TaskPhase.PENDING: {TaskPhase.REVIEWING, TaskPhase.CANCELLED},
+    TaskPhase.PENDING: {TaskPhase.REVIEWING, TaskPhase.FAILED, TaskPhase.CANCELLED},
     TaskPhase.REVIEWING: {
         TaskPhase.PLANNING,
         TaskPhase.BLOCKED,  # plan has gaps, need user input
