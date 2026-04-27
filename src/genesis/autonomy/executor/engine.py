@@ -255,6 +255,10 @@ class CCSessionExecutor:
                 remaining_steps = steps
 
             # --- EXECUTING ---
+            # When recovering from VERIFYING/BLOCKED, remaining_steps
+            # is typically empty (all steps completed in prior run).
+            # The loop below is a no-op, and we fall through directly
+            # to the VERIFYING phase with the recovered step_results.
             await self._transition(task_id, TaskPhase.EXECUTING)
 
             for step in remaining_steps:

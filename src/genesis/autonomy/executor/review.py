@@ -148,7 +148,7 @@ class TaskReviewer:
             prompt=prompt,
             model=CCModel.OPUS,
             effort=EffortLevel.HIGH,
-            timeout_s=300,
+            timeout_s=600,
             skip_permissions=True,
         )
         output = await self._invoker.run(invocation)
@@ -273,9 +273,13 @@ class TaskReviewer:
         prompt = self._build_active_verify_prompt(deliverable, requirements)
 
         try:
+            # Sandbox bypass required: bubblewrap namespace creation
+            # fails inside containers (bwrap: Creating new namespace
+            # failed: Permission denied).  --full-auto also fails.
+            # Verification is read-only in intent; the bypass only
+            # affects the sandbox layer, not the prompt instructions.
             proc = await asyncio.create_subprocess_exec(
                 "codex", "exec", "-",
-                "-s", "read-only",
                 "-c", 'model_reasoning_effort="medium"',
                 "--json",
                 "--dangerously-bypass-approvals-and-sandbox",

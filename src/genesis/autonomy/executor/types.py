@@ -144,13 +144,16 @@ class StepType(StrEnum):
         return self in (StepType.CODE, StepType.VERIFICATION)
 
 
+# Generous timeouts — executor runs in the background, nobody is waiting.
+# A code step may write code + run the full test suite (11+ min observed).
+# Prefer letting work finish over killing productive sessions.
 _STEP_TIMEOUTS: dict[StepType, int] = {
-    StepType.RESEARCH: 300,
-    StepType.CODE: 600,
-    StepType.ANALYSIS: 180,
-    StepType.SYNTHESIS: 180,
-    StepType.VERIFICATION: 300,
-    StepType.EXTERNAL: 600,
+    StepType.RESEARCH: 1800,      # 30 min — network-dependent, multiple sources
+    StepType.CODE: 3600,          # 60 min — write + test + iterate
+    StepType.ANALYSIS: 900,       # 15 min — may read many files
+    StepType.SYNTHESIS: 900,      # 15 min — reading + writing
+    StepType.VERIFICATION: 1800,  # 30 min — may run full test suite
+    StepType.EXTERNAL: 3600,      # 60 min — unknown external work
 }
 
 
