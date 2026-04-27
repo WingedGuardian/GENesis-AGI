@@ -148,11 +148,11 @@ class StepType(StrEnum):
 # A code step may write code + run the full test suite (11+ min observed).
 # Prefer letting work finish over killing productive sessions.
 _STEP_TIMEOUTS: dict[StepType, int] = {
-    StepType.RESEARCH: 1800,      # 30 min — network-dependent, multiple sources
+    StepType.RESEARCH: 3600,      # 60 min — network-dependent, multiple sources
     StepType.CODE: 3600,          # 60 min — write + test + iterate
-    StepType.ANALYSIS: 900,       # 15 min — may read many files
-    StepType.SYNTHESIS: 900,      # 15 min — reading + writing
-    StepType.VERIFICATION: 1800,  # 30 min — may run full test suite
+    StepType.ANALYSIS: 1800,      # 30 min — may read many files
+    StepType.SYNTHESIS: 1800,     # 30 min — reading + writing
+    StepType.VERIFICATION: 3600,  # 60 min — may run full test suite
     StepType.EXTERNAL: 3600,      # 60 min — unknown external work
 }
 

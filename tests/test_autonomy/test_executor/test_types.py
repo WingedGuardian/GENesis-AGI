@@ -61,10 +61,10 @@ class TestValidateTransition:
 class TestStepType:
     def test_default_timeouts(self) -> None:
         assert StepType.CODE.default_timeout_s == 3600
-        assert StepType.RESEARCH.default_timeout_s == 1800
-        assert StepType.ANALYSIS.default_timeout_s == 900
-        assert StepType.SYNTHESIS.default_timeout_s == 900
-        assert StepType.VERIFICATION.default_timeout_s == 1800
+        assert StepType.RESEARCH.default_timeout_s == 3600
+        assert StepType.ANALYSIS.default_timeout_s == 1800
+        assert StepType.SYNTHESIS.default_timeout_s == 1800
+        assert StepType.VERIFICATION.default_timeout_s == 3600
         assert StepType.EXTERNAL.default_timeout_s == 3600
 
     def test_all_types_have_timeouts(self) -> None:
