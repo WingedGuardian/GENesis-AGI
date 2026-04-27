@@ -316,7 +316,8 @@ class TestProposalWorkflow:
         assert "<b>1.</b>" in digest
         assert "<b>2.</b>" in digest
         assert "[investigate]" in digest
-        assert "approve all" in digest
+        # Footer removed — bidirectional comms replaces reply-to-approve
+        assert "approve all" not in digest
 
     async def test_format_digest_escapes_html(self, workflow):
         bad = [{"action_type": "<script>", "content": "a<b>c", "confidence": 0.5}]
