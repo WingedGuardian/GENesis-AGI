@@ -10,6 +10,7 @@ Implements:
 - Amendment #7:  Worktree management for CODE steps
 - Amendment #10: Formal state transitions via validate_transition()
 - Amendment #13: Global pause check at each checkpoint
+- Recovery:      Phase resume — skip REVIEWING/PLANNING on recovery
 """
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ class CCSessionExecutor:
 
         Returns ``True`` on successful completion, ``False`` on
         blocker/failure/cancellation.
+
+        Supports recovery resume: if the task was previously blocked in
+        EXECUTING, VERIFYING, or BLOCKED phase, existing step results
+        are loaded from the DB and REVIEWING/PLANNING are skipped.
         """
         from genesis.db.crud import task_states, task_steps
 
@@ -101,7 +106,17 @@ class CCSessionExecutor:
             logger.error("Task %s not found in DB", task_id)
             return False
 
-        plan_path = task.get("outputs") or ""
+        # Resolve plan path from outputs (may be plain string or JSON)
+        raw_outputs = task.get("outputs") or ""
+        plan_path = raw_outputs
+        if raw_outputs:
+            try:
+                parsed = json.loads(raw_outputs)
+                if isinstance(parsed, dict):
+                    plan_path = parsed.get("plan_path", raw_outputs)
+            except (json.JSONDecodeError, ValueError):
+                pass  # plain string, use as-is
+
         if not plan_path:
             logger.error("Task %s has no plan path in outputs column", task_id)
             await self._fail_task(task_id, "No plan path specified")
@@ -116,8 +131,21 @@ class CCSessionExecutor:
 
         description = task.get("description", "")
 
-        # Register task
-        self._active_tasks[task_id] = TaskPhase.PENDING
+        # Determine recovery phase from DB
+        db_phase_str = task.get("current_phase", "pending")
+        _RESUMABLE_PHASES = {"executing", "verifying", "blocked"}
+        resuming = db_phase_str in _RESUMABLE_PHASES
+
+        # Register task at current phase (recovery) or PENDING (fresh)
+        if resuming:
+            self._active_tasks[task_id] = TaskPhase(db_phase_str)
+            logger.info(
+                "Task %s: resuming from %s phase (skipping review/plan)",
+                task_id, db_phase_str,
+            )
+        else:
+            self._active_tasks[task_id] = TaskPhase.PENDING
+
         cancel_event = asyncio.Event()
         self._cancel_events[task_id] = cancel_event
 
@@ -127,49 +155,109 @@ class CCSessionExecutor:
             trace = self._tracer.start_trace(task_id, "user", description)
 
         try:
-            # --- REVIEWING ---
-            await self._transition(task_id, TaskPhase.REVIEWING)
-            review = await self._reviewer.review_plan(plan_content, description)
+            if resuming:
+                # Recovery path: load existing steps from DB
+                existing_rows = await task_steps.get_steps_for_task(
+                    self._db, task_id,
+                )
+                steps = [
+                    {
+                        "idx": row["step_idx"],
+                        "type": row.get("step_type", "code"),
+                        "description": row.get("description", ""),
+                        "complexity": "medium",
+                    }
+                    for row in existing_rows
+                ]
 
-            if not review.passed:
-                gap_text = "; ".join(review.gaps) if review.gaps else "unspecified"
-                await self._persist_blocker(
+                # Reconstruct completed StepResults from persisted data
+                step_results: list[StepResult] = []
+                completed_indices: set[int] = set()
+                for row in existing_rows:
+                    if row.get("status") == "completed" and row.get("result_json"):
+                        try:
+                            rj = json.loads(row["result_json"])
+                        except (json.JSONDecodeError, ValueError):
+                            rj = {}
+                        sr = StepResult(
+                            idx=row["step_idx"],
+                            status="completed",
+                            result=rj.get("result", ""),
+                            cost_usd=row.get("cost_usd", 0.0) or 0.0,
+                            session_id=row.get("session_id"),
+                            model_used=row.get("model_used", ""),
+                            artifacts=rj.get("artifacts", []),
+                        )
+                        step_results.append(sr)
+                        completed_indices.add(row["step_idx"])
+
+                # Create worktree if needed
+                has_code = any(s.get("type") == "code" for s in steps)
+                if has_code:
+                    await self._create_worktree(task_id)
+
+                # Filter to only pending/failed steps
+                remaining_steps = [
+                    s for s in steps if s["idx"] not in completed_indices
+                ]
+
+                logger.info(
+                    "Task %s: recovered %d completed steps, %d remaining",
+                    task_id, len(completed_indices), len(remaining_steps),
+                )
+            else:
+                # Fresh path: REVIEWING -> PLANNING
+                # --- REVIEWING ---
+                await self._transition(task_id, TaskPhase.REVIEWING)
+                review = await self._reviewer.review_plan(
+                    plan_content, description,
+                )
+
+                if not review.passed:
+                    gap_text = (
+                        "; ".join(review.gaps) if review.gaps else "unspecified"
+                    )
+                    await self._persist_blocker(
+                        task_id,
+                        f"Plan review found gaps: {gap_text}",
+                        TaskPhase.REVIEWING,
+                    )
+                    return False
+
+                # --- PLANNING ---
+                await self._transition(task_id, TaskPhase.PLANNING)
+                steps = await self._decomposer.decompose(
+                    plan_content, description,
+                )
+
+                for step in steps:
+                    await task_steps.create_step(
+                        self._db,
+                        task_id=task_id,
+                        step_idx=step["idx"],
+                        step_type=step.get("type", "code"),
+                        description=step.get("description", ""),
+                    )
+
+                # Create worktree if any step is CODE (Amendment #7)
+                has_code = any(s.get("type") == "code" for s in steps)
+                if has_code:
+                    await self._create_worktree(task_id)
+
+                await self._notify(
                     task_id,
-                    f"Plan review found gaps: {gap_text}",
-                    TaskPhase.REVIEWING,
-                )
-                return False
-
-            # --- PLANNING ---
-            await self._transition(task_id, TaskPhase.PLANNING)
-            steps = await self._decomposer.decompose(plan_content, description)
-
-            for step in steps:
-                await task_steps.create_step(
-                    self._db,
-                    task_id=task_id,
-                    step_idx=step["idx"],
-                    step_type=step.get("type", "code"),
-                    description=step.get("description", ""),
+                    f"Proceeding with task: {description} "
+                    f"({len(steps)} steps)",
+                    "alert",
                 )
 
-            # Create worktree if any step is CODE (Amendment #7)
-            has_code = any(s.get("type") == "code" for s in steps)
-            if has_code:
-                await self._create_worktree(task_id)
-
-            await self._notify(
-                task_id,
-                f"Proceeding with task: {description} "
-                f"({len(steps)} steps)",
-                "alert",
-            )
+                step_results = []
+                remaining_steps = steps
 
             # --- EXECUTING ---
             await self._transition(task_id, TaskPhase.EXECUTING)
-            step_results: list[StepResult] = []
 
-            for step in steps:
+            for step in remaining_steps:
                 # Check cancel before each step
                 if cancel_event.is_set():
                     await self._transition(task_id, TaskPhase.CANCELLED)

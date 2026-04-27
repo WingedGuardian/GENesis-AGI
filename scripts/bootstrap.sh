@@ -270,6 +270,35 @@ if _node_version_ok; then
 else
     echo "  Node: $(node --version 2>/dev/null || echo 'not available') (needs >= 20)"
 fi
+
+# bubblewrap (sandbox for codex exec — optional)
+if ! command -v bwrap &>/dev/null; then
+    echo "  bubblewrap not found — installing..."
+    install_pkg bubblewrap || echo "  WARNING: Could not install bubblewrap. Codex sandbox will use bypass mode."
+fi
+
+# Codex CLI (optional — cross-vendor adversarial verification)
+if _node_version_ok; then
+    if ! command -v codex &>/dev/null; then
+        echo "  Codex CLI not found — installing (optional)..."
+        npm install -g @openai/codex 2>/dev/null || echo "  WARNING: Could not install Codex CLI. Adversarial verification will use CC invoker fallback."
+    fi
+    if command -v codex &>/dev/null; then
+        echo "  Codex: $(codex --version 2>/dev/null || echo 'installed')"
+        # Create default config if not present
+        CODEX_CONFIG_DIR="$HOME/.codex"
+        CODEX_CONFIG="$CODEX_CONFIG_DIR/config.toml"
+        if [[ ! -f "$CODEX_CONFIG" ]]; then
+            mkdir -p "$CODEX_CONFIG_DIR"
+            cat > "$CODEX_CONFIG" <<'CODEXCFG'
+model = "gpt-5.4"
+model_reasoning_effort = "medium"
+CODEXCFG
+            echo "  Created default Codex config at $CODEX_CONFIG"
+        fi
+        echo "  NOTE: Run 'codex auth login' to enable cross-vendor adversarial verification"
+    fi
+fi
 echo
 
 # --- Python venv ---

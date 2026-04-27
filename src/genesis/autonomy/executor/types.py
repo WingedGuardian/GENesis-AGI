@@ -86,6 +86,7 @@ VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
     TaskPhase.BLOCKED: {
         TaskPhase.REVIEWING,  # user responded to review-phase blocker
         TaskPhase.EXECUTING,  # user responded to mid-task blocker
+        TaskPhase.VERIFYING,  # recovery resume after verify-phase blocker
         TaskPhase.CANCELLED,
     },
     # Terminal states --- no transitions out
@@ -128,6 +129,19 @@ class StepType(StrEnum):
     def default_timeout_s(self) -> int:
         """Default timeout in seconds for this step type."""
         return _STEP_TIMEOUTS.get(self, 600)
+
+    @property
+    def verify_step(self) -> bool:
+        """Whether this step type warrants per-step verification.
+
+        # GROUNDWORK(per-step-verify): flag for future per-step
+        # verification gates.  CODE and VERIFICATION steps produce
+        # verifiable artifacts; others (research, analysis, synthesis,
+        # external) are informational and don't need active checking.
+        # The follow-up PR will call ``_tool_capable_review()`` after
+        # each step where ``verify_step`` is True.
+        """
+        return self in (StepType.CODE, StepType.VERIFICATION)
 
 
 _STEP_TIMEOUTS: dict[StepType, int] = {

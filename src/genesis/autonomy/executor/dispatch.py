@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 # CC output JSON extraction (same pattern as perception/parser.py)
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 
+_MAX_ARTIFACT_BYTES = 50_000  # 50 KB per artifact for deliverable enrichment
+
 _TASK_STEP_PROMPT_PATH = (
     Path(__file__).resolve().parent.parent.parent / "identity" / "TASK_STEP.md"
 )
@@ -102,12 +104,47 @@ def parse_step_output(text: str) -> dict:
     return {"status": "completed", "result": text[:500]}
 
 
+def _read_artifact(path_str: str) -> str:
+    """Best-effort file read for deliverable enrichment. Never raises."""
+    path = Path(path_str).expanduser()
+    header = f"### Artifact: `{path_str}`"
+    if not path.exists():
+        return f"{header}\n**ERROR: File does not exist**"
+    if not path.is_file():
+        return f"{header}\n**Skipped: not a regular file**"
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return f"{header}\n**Skipped: cannot stat file**"
+    if size > _MAX_ARTIFACT_BYTES:
+        try:
+            raw = path.read_bytes()[:_MAX_ARTIFACT_BYTES]
+            content = raw.decode("utf-8", errors="replace")
+        except OSError:
+            return f"{header}\n**Skipped: read error**"
+        return (
+            f"{header}\n**Truncated** ({size:,} bytes)\n```\n"
+            f"{content}\n```"
+        )
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return f"{header}\n**Skipped: binary or unreadable**"
+    return f"{header}\n```\n{content}\n```"
+
+
 def synthesize_deliverable(step_results: list[StepResult]) -> str:
-    """Combine completed step results into a deliverable string."""
+    """Combine completed step results into a deliverable string.
+
+    Includes artifact file contents (best-effort) so reviewers can
+    evaluate actual output, not just narrative text.
+    """
     parts = []
     for r in step_results:
         if r.status == "completed":
             parts.append(f"## Step {r.idx}\n{r.result}")
+            for path_str in r.artifacts:
+                parts.append(_read_artifact(path_str))
     return "\n\n".join(parts) if parts else ""
 
 
