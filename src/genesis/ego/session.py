@@ -32,6 +32,7 @@ from genesis.ego.types import CYCLE_TYPE_DEFAULTS, CycleType, EgoConfig, EgoCycl
 if TYPE_CHECKING:
     import aiosqlite
 
+    from genesis.cc.direct_session import DirectSessionRunner
     from genesis.cc.protocol import AgentProvider
     from genesis.cc.session_manager import SessionManager
     from genesis.ego.compaction import CompactionEngine
@@ -76,6 +77,7 @@ class EgoSession:
         config: EgoConfig,
         db: aiosqlite.Connection,
         event_bus: GenesisEventBus | None = None,
+        direct_session_runner: DirectSessionRunner | None = None,
         mcp_config_path: str | None = None,
         prompt_path: Path | None = None,
         call_site: str | None = None,
@@ -93,6 +95,7 @@ class EgoSession:
         self._config = config
         self._db = db
         self._event_bus = event_bus
+        self._direct_session_runner = direct_session_runner
         self._autonomous_dispatcher = None
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
@@ -152,7 +155,8 @@ class EgoSession:
         # 1. Budget check — raises BudgetExceededError (not a failure)
         if not await self._check_budget():
             raise BudgetExceededError(
-                f"Daily ego spend exceeds cap ${self._config.daily_budget_cap_usd}"
+                f"Daily ego thinking spend exceeds cap "
+                f"${self._config.ego_thinking_budget_usd}"
             )
 
         # 2. Assemble operational context (previous focus + fresh context)
@@ -280,8 +284,33 @@ class EgoSession:
         # 9. Process proposals
         if parsed:
             proposals = parsed.get("proposals", [])
+            comm_decision = parsed.get("communication_decision", "stay_quiet")
             if proposals:
-                await self._process_proposals(proposals, cycle.id)
+                await self._process_proposals(
+                    proposals, cycle.id, communication_decision=comm_decision,
+                )
+
+            # 9b. Process tabled/withdrawn proposal IDs
+            tabled_ids = parsed.get("tabled", [])
+            if isinstance(tabled_ids, list):
+                for pid in tabled_ids:
+                    if isinstance(pid, str) and pid:
+                        ok = await ego_crud.table_proposal(self._db, pid)
+                        if ok:
+                            logger.info("Proposal %s tabled by ego", pid)
+
+            withdrawn_ids = parsed.get("withdrawn", [])
+            if isinstance(withdrawn_ids, list):
+                for pid in withdrawn_ids:
+                    if isinstance(pid, str) and pid:
+                        ok = await ego_crud.withdraw_proposal(self._db, pid)
+                        if ok:
+                            logger.info("Proposal %s withdrawn by ego", pid)
+
+            # 9c. Process execution briefs (ego-as-executor)
+            execution_briefs = parsed.get("execution_briefs", [])
+            if isinstance(execution_briefs, list) and execution_briefs:
+                await self._process_execution_briefs(execution_briefs)
 
             # 10. Record follow_ups (deduped against existing pending)
             follow_ups = parsed.get("follow_ups", [])
@@ -406,8 +435,15 @@ class EgoSession:
         self,
         proposals: list[dict],
         cycle_id: str,
+        *,
+        communication_decision: str = "send_digest",
     ) -> None:
-        """Create proposal batch and send digest to Telegram."""
+        """Create proposal batch, optionally send to Telegram.
+
+        The ego's ``communication_decision`` gates delivery:
+        - ``send_digest`` / ``urgent_notify``: create batch + send
+        - ``stay_quiet``: create batch only (proposals stored, not sent)
+        """
         try:
             batch_id, ids = await self._proposals.create_batch(
                 proposals, cycle_id=cycle_id,
@@ -416,11 +452,101 @@ class EgoSession:
                 "Created proposal batch %s with %d proposals",
                 batch_id, len(ids),
             )
-            delivery = await self._proposals.send_digest(batch_id)
-            if delivery:
-                logger.info("Ego digest sent (delivery_id=%s)", delivery)
+            if communication_decision in ("send_digest", "urgent_notify"):
+                delivery = await self._proposals.send_digest(batch_id)
+                if delivery:
+                    logger.info("Ego digest sent (delivery_id=%s)", delivery)
+            else:
+                logger.info(
+                    "Ego decided stay_quiet — batch %s stored only", batch_id,
+                )
         except Exception:
             logger.error("Failed to process ego proposals", exc_info=True)
+
+    async def _process_execution_briefs(
+        self,
+        briefs: list[dict],
+    ) -> None:
+        """Dispatch approved proposals via DirectSessionRunner.
+
+        The ego outputs execution_briefs referencing approved proposal IDs.
+        For each brief, we verify the proposal is actually approved, then
+        spawn a background session. On success the proposal transitions to
+        'executed'; on failure it transitions to 'failed'.
+        """
+        if self._direct_session_runner is None:
+            logger.warning("No DirectSessionRunner — cannot dispatch execution briefs")
+            return
+
+        # Check dispatch budget before spawning any sessions
+        if not await self._check_dispatch_budget():
+            logger.warning("Dispatch budget exceeded — skipping execution briefs")
+            return
+
+        from genesis.cc.direct_session import DirectSessionRequest
+        from genesis.cc.types import CCModel, EffortLevel
+
+        for brief in briefs:
+            if not isinstance(brief, dict):
+                continue
+            proposal_id = brief.get("proposal_id", "")
+            prompt = brief.get("prompt", "")
+            if not proposal_id or not prompt:
+                continue
+
+            # Verify the proposal is actually approved
+            proposal = await ego_crud.get_proposal(self._db, proposal_id)
+            if not proposal or proposal["status"] != "approved":
+                logger.warning(
+                    "Execution brief for proposal %s skipped (status=%s)",
+                    proposal_id,
+                    proposal["status"] if proposal else "not found",
+                )
+                continue
+
+            # Map profile and model from brief
+            profile = brief.get("profile", "observe")
+            if profile not in ("observe", "research"):
+                profile = "observe"
+            model_str = brief.get("model", "sonnet")
+            model = CCModel.SONNET if model_str != "haiku" else CCModel.HAIKU
+
+            try:
+                request = DirectSessionRequest(
+                    prompt=prompt,
+                    profile=profile,
+                    model=model,
+                    effort=EffortLevel.HIGH,
+                    notify=True,
+                    source_tag="ego_dispatch",
+                    caller_context=f"ego_proposal:{proposal_id}",
+                )
+                session_id = await self._direct_session_runner.spawn(request)
+                await ego_crud.execute_proposal(
+                    self._db, proposal_id,
+                    status="executed",
+                    user_response=f"session:{session_id}",
+                )
+                logger.info(
+                    "Dispatched proposal %s → session %s",
+                    proposal_id, session_id,
+                )
+            except Exception:
+                logger.error(
+                    "Failed to dispatch proposal %s", proposal_id,
+                    exc_info=True,
+                )
+                try:
+                    await ego_crud.execute_proposal(
+                        self._db, proposal_id,
+                        status="failed",
+                        user_response="dispatch failed",
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to mark proposal %s as failed",
+                        proposal_id, exc_info=True,
+                    )
 
     async def _process_escalations(
         self,
@@ -472,17 +598,31 @@ class EgoSession:
             )
 
     async def _check_budget(self) -> bool:
-        """True if daily ego spend is under the budget cap."""
+        """True if daily ego thinking spend is under the budget cap."""
         try:
             daily = await ego_crud.daily_ego_cost(self._db)
-            if daily >= self._config.daily_budget_cap_usd:
+            if daily >= self._config.ego_thinking_budget_usd:
                 logger.warning(
-                    "Ego daily spend $%.2f exceeds cap $%.2f",
-                    daily, self._config.daily_budget_cap_usd,
+                    "Ego thinking spend $%.2f exceeds cap $%.2f",
+                    daily, self._config.ego_thinking_budget_usd,
                 )
                 return False
         except Exception:
             logger.warning("Budget check failed — allowing cycle", exc_info=True)
+        return True
+
+    async def _check_dispatch_budget(self) -> bool:
+        """True if daily ego dispatch spend is under the budget cap."""
+        try:
+            daily = await ego_crud.daily_dispatch_cost(self._db)
+            if daily >= self._config.ego_dispatch_budget_usd:
+                logger.warning(
+                    "Ego dispatch spend $%.2f exceeds cap $%.2f",
+                    daily, self._config.ego_dispatch_budget_usd,
+                )
+                return False
+        except Exception:
+            logger.warning("Dispatch budget check failed — allowing", exc_info=True)
         return True
 
 

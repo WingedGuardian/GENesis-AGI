@@ -18,11 +18,12 @@ default_effort: high         # effort for regular cycles (low/medium/high/max)
 morning_report_effort: low   # effort for morning reports
 
 # Proposals
-proposal_expiry_minutes: 240 # 4 hours before proposals expire
+board_size: 3                # max active proposals on the bulletin board
 batch_digest: true           # send proposals as batch (vs individual)
 
 # Budget
-daily_budget_cap_usd: 10.0   # max daily ego spend
+ego_thinking_budget_usd: 4.0  # daily cap for ego cycle (thinking) costs
+ego_dispatch_budget_usd: 2.50 # daily cap for dispatched background sessions
 
 # Morning report
 morning_report_hour: 8       # 24h format, local time

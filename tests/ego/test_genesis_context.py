@@ -78,6 +78,28 @@ async def db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE ego_proposals (
+                id              TEXT PRIMARY KEY,
+                action_type     TEXT NOT NULL,
+                action_category TEXT NOT NULL DEFAULT '',
+                content         TEXT NOT NULL,
+                rationale       TEXT NOT NULL DEFAULT '',
+                confidence      REAL NOT NULL DEFAULT 0.0,
+                urgency         TEXT NOT NULL DEFAULT 'normal',
+                alternatives    TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'pending',
+                user_response   TEXT,
+                cycle_id        TEXT,
+                batch_id        TEXT,
+                created_at      TEXT NOT NULL,
+                resolved_at     TEXT,
+                expires_at      TEXT,
+                rank            INTEGER,
+                execution_plan  TEXT,
+                recurring       INTEGER DEFAULT 0
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE follow_ups (
                 id               TEXT PRIMARY KEY,
                 source           TEXT NOT NULL,

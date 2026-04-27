@@ -745,13 +745,16 @@ TABLES = {
             confidence      REAL NOT NULL DEFAULT 0.0, -- 0.0-1.0
             urgency         TEXT NOT NULL DEFAULT 'normal' CHECK (urgency IN ('low', 'normal', 'high', 'critical')),
             alternatives    TEXT NOT NULL DEFAULT '',  -- what else was considered
-            status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'executed', 'failed')),
+            status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'executed', 'failed', 'tabled', 'withdrawn')),
             user_response   TEXT,                     -- rejection reason, approval notes
             cycle_id        TEXT,                     -- FK to ego_cycles.id
             batch_id        TEXT,                     -- groups proposals into digest batches
             created_at      TEXT NOT NULL,
             resolved_at     TEXT,
-            expires_at      TEXT                      -- auto-expiry timestamp
+            expires_at      TEXT,                     -- auto-expiry timestamp
+            rank            INTEGER,                  -- board position (lower = higher priority)
+            execution_plan  TEXT,                     -- dispatch instructions for approved proposals
+            recurring       INTEGER DEFAULT 0         -- 1 if ongoing/recurring commitment
         )
     """,
     "ego_state": """
@@ -1051,6 +1054,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_category ON ego_proposals(action_category, status)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
     # behavioral immune system (BIS)
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_theme ON behavioral_corrections(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_created ON behavioral_corrections(created_at)",

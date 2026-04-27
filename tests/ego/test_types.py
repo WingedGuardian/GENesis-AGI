@@ -68,8 +68,9 @@ class TestEgoConfig:
         assert cfg.activity_threshold_minutes == 30
         assert cfg.max_interval_minutes == 240
         assert cfg.model == "opus"
-        assert cfg.proposal_expiry_minutes == 240
-        assert cfg.daily_budget_cap_usd == 10.0
+        assert cfg.board_size == 3
+        assert cfg.ego_thinking_budget_usd == 4.0
+        assert cfg.ego_dispatch_budget_usd == 2.50
         assert cfg.consecutive_failure_limit == 3
         assert cfg.batch_digest is True
         assert cfg.shadow_morning_report is True
@@ -78,6 +79,14 @@ class TestEgoConfig:
         cfg = EgoConfig(cadence_minutes=120, model="sonnet")
         assert cfg.cadence_minutes == 120
         assert cfg.model == "sonnet"
+
+    def test_board_size_default(self):
+        cfg = EgoConfig()
+        assert cfg.board_size == 3
+
+    def test_no_proposal_expiry(self):
+        """proposal_expiry_minutes was removed in Phase B."""
+        assert not hasattr(EgoConfig(), "proposal_expiry_minutes")
 
 
 class TestOutputSchema:
@@ -95,6 +104,16 @@ class TestOutputSchema:
         assert "confidence" in item["properties"]
         assert "action_category" in item["properties"]
 
+    def test_proposal_item_has_board_fields(self):
+        item = EGO_OUTPUT_SCHEMA["properties"]["proposals"]["items"]
+        assert "execution_plan" in item["properties"]
+        assert "rank" in item["properties"]
+        assert "recurring" in item["properties"]
+
+    def test_schema_has_tabled_withdrawn(self):
+        assert "tabled" in EGO_OUTPUT_SCHEMA["properties"]
+        assert "withdrawn" in EGO_OUTPUT_SCHEMA["properties"]
+
 
 class TestProposalStatus:
     def test_all_states(self):
@@ -104,3 +123,5 @@ class TestProposalStatus:
         assert ProposalStatus.EXPIRED == "expired"
         assert ProposalStatus.EXECUTED == "executed"
         assert ProposalStatus.FAILED == "failed"
+        assert ProposalStatus.TABLED == "tabled"
+        assert ProposalStatus.WITHDRAWN == "withdrawn"

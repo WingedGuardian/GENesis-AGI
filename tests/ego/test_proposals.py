@@ -46,12 +46,20 @@ def mock_reply_waiter():
 
 
 @pytest.fixture
-def workflow(db, mock_topic_manager, mock_reply_waiter):
+def mock_memory_store():
+    """MemoryStore mock for correction storage tests."""
+    ms = AsyncMock()
+    ms.store.return_value = "mem_123"
+    return ms
+
+
+@pytest.fixture
+def workflow(db, mock_topic_manager, mock_reply_waiter, mock_memory_store):
     return ProposalWorkflow(
         db=db,
         topic_manager=mock_topic_manager,
         reply_waiter=mock_reply_waiter,
-        expiry_minutes=240,
+        memory_store=mock_memory_store,
     )
 
 
@@ -160,29 +168,6 @@ class TestProposalCRUD:
         await ego_crud.resolve_proposal(db, "p1", status="approved")
         ok = await ego_crud.resolve_proposal(db, "p1", status="rejected")
         assert ok is False
-
-    async def test_expire_proposals(self, db):
-        await ego_crud.create_proposal(
-            db, id="p1", action_type="t", content="c",
-            expires_at="2026-01-01T00:00:00",
-        )
-        await ego_crud.create_proposal(
-            db, id="p2", action_type="t", content="c",
-            expires_at="2026-12-31T00:00:00",
-        )
-        count = await ego_crud.expire_proposals(db, now="2026-06-01T00:00:00")
-        assert count == 1
-        assert (await ego_crud.get_proposal(db, "p1"))["status"] == "expired"
-        assert (await ego_crud.get_proposal(db, "p2"))["status"] == "pending"
-
-    async def test_expire_skips_resolved(self, db):
-        await ego_crud.create_proposal(
-            db, id="p1", action_type="t", content="c",
-            expires_at="2026-01-01T00:00:00",
-        )
-        await ego_crud.resolve_proposal(db, "p1", status="approved")
-        count = await ego_crud.expire_proposals(db, now="2026-06-01T00:00:00")
-        assert count == 0
 
     async def test_batch_delivery_mapping(self, db):
         await ego_crud.set_state(
@@ -305,20 +290,24 @@ class TestProposalWorkflow:
         rows = await ego_crud.list_proposals_by_batch(db, batch_id)
         assert len(rows) == 3
         assert all(r["cycle_id"] == "cycle1" for r in rows)
-        assert all(r["expires_at"] is not None for r in rows)
         assert all(r["batch_id"] == batch_id for r in rows)
 
-    async def test_create_batch_sets_expiry(self, workflow, db):
-        batch_id, _ = await workflow.create_batch(
-            _sample_proposals(1), expiry_minutes=60,
-        )
+    async def test_create_batch_with_new_fields(self, workflow, db):
+        props = [{
+            "action_type": "investigate",
+            "action_category": "system_health",
+            "content": "Check backlog",
+            "rationale": "Growing",
+            "confidence": 0.85,
+            "rank": 1,
+            "execution_plan": "background CC, ~$0.30",
+            "recurring": True,
+        }]
+        batch_id, ids = await workflow.create_batch(props)
         row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
-        # expires_at should be ~60min from created_at
-        from datetime import datetime as dt
-        created = dt.fromisoformat(row["created_at"])
-        expires = dt.fromisoformat(row["expires_at"])
-        delta = (expires - created).total_seconds()
-        assert 3500 < delta < 3700  # ~3600 seconds = 60 min
+        assert row["rank"] == 1
+        assert row["execution_plan"] == "background CC, ~$0.30"
+        assert row["recurring"] == 1
 
     async def test_format_digest_html(self, workflow):
         digest = workflow.format_digest(_sample_proposals(2), "batch123")
@@ -418,16 +407,63 @@ class TestProposalWorkflow:
         for pid in ids:
             assert (await ego_crud.get_proposal(db, pid))["status"] == "pending"
 
-    async def test_expire_stale(self, workflow, db):
-        await ego_crud.create_proposal(
-            db, id="old", action_type="t", content="c",
-            expires_at="2020-01-01T00:00:00",
+    async def test_correction_stored_on_reject_with_reason(
+        self, workflow, db, mock_memory_store,
+    ):
+        batch_id, ids = await workflow.create_batch(_sample_proposals(2))
+        await workflow.send_digest(batch_id)
+        mock_memory_store.reset_mock()
+
+        # Reject proposal 1 with a reason
+        results = await workflow.resolve_proposals(
+            batch_id, {1: ("rejected", "waste of time")},
         )
-        await ego_crud.create_proposal(
-            db, id="fresh", action_type="t", content="c",
-            expires_at="2099-01-01T00:00:00",
+        assert results[ids[0]] == "rejected"
+
+        # Verify correction was stored
+        mock_memory_store.store.assert_called_once()
+        call_kwargs = mock_memory_store.store.call_args[1]
+        assert "waste of time" in call_kwargs["content"]
+        assert call_kwargs["wing"] == "autonomy"
+        assert call_kwargs["room"] == "ego_corrections"
+        assert "ego_correction" in call_kwargs["tags"]
+
+    async def test_no_correction_on_reject_without_reason(
+        self, workflow, db, mock_memory_store,
+    ):
+        batch_id, ids = await workflow.create_batch(_sample_proposals(1))
+        mock_memory_store.reset_mock()
+
+        await workflow.resolve_proposals(
+            batch_id, {1: ("rejected", None)},
         )
-        count = await workflow.expire_stale()
-        assert count == 1
-        assert (await ego_crud.get_proposal(db, "old"))["status"] == "expired"
-        assert (await ego_crud.get_proposal(db, "fresh"))["status"] == "pending"
+        mock_memory_store.store.assert_not_called()
+
+    async def test_no_correction_on_approve(
+        self, workflow, db, mock_memory_store,
+    ):
+        batch_id, ids = await workflow.create_batch(_sample_proposals(1))
+        mock_memory_store.reset_mock()
+
+        await workflow.resolve_proposals(
+            batch_id, {1: ("approved", None)},
+        )
+        mock_memory_store.store.assert_not_called()
+
+    async def test_correction_failure_does_not_block(self, db, mock_topic_manager, mock_reply_waiter):
+        """If memory_store.store raises, proposal still gets resolved."""
+        bad_store = AsyncMock()
+        bad_store.store.side_effect = RuntimeError("Qdrant down")
+        wf = ProposalWorkflow(
+            db=db,
+            topic_manager=mock_topic_manager,
+            reply_waiter=mock_reply_waiter,
+            memory_store=bad_store,
+        )
+        batch_id, ids = await wf.create_batch(_sample_proposals(1))
+        results = await wf.resolve_proposals(
+            batch_id, {1: ("rejected", "bad idea")},
+        )
+        assert results[ids[0]] == "rejected"
+        row = await ego_crud.get_proposal(db, ids[0])
+        assert row["status"] == "rejected"

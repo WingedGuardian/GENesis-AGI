@@ -98,14 +98,18 @@ def validate_ego_config(changes: dict) -> list[str]:
         valid_models = {"opus", "sonnet", "haiku"}
         if changes["model"] not in valid_models:
             errors.append(f"model must be one of {valid_models}")
-    if "daily_budget_cap_usd" in changes:
-        v = changes["daily_budget_cap_usd"]
+    if "ego_thinking_budget_usd" in changes:
+        v = changes["ego_thinking_budget_usd"]
         if not isinstance(v, (int, float)) or v < 0:
-            errors.append("daily_budget_cap_usd must be >= 0")
-    if "proposal_expiry_minutes" in changes:
-        v = changes["proposal_expiry_minutes"]
-        if not isinstance(v, (int, float)) or v < 1:
-            errors.append("proposal_expiry_minutes must be >= 1")
+            errors.append("ego_thinking_budget_usd must be >= 0")
+    if "ego_dispatch_budget_usd" in changes:
+        v = changes["ego_dispatch_budget_usd"]
+        if not isinstance(v, (int, float)) or v < 0:
+            errors.append("ego_dispatch_budget_usd must be >= 0")
+    if "board_size" in changes:
+        v = changes["board_size"]
+        if not isinstance(v, int) or v < 1:
+            errors.append("board_size must be integer >= 1")
     if "consecutive_failure_limit" in changes:
         v = changes["consecutive_failure_limit"]
         if not isinstance(v, int) or v < 1:

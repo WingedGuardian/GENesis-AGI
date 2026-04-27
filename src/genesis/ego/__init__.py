@@ -21,7 +21,6 @@ from genesis.ego.cadence import EgoCadenceManager
 from genesis.ego.compaction import CompactionEngine
 from genesis.ego.context import EgoContextBuilder
 from genesis.ego.dispatch import EgoDispatcher
-from genesis.ego.executor import EgoProposalExecutor
 from genesis.ego.genesis_context import GenesisEgoContextBuilder
 from genesis.ego.proposals import ProposalWorkflow
 from genesis.ego.session import EgoSession
@@ -41,7 +40,6 @@ __all__ = [
     "EgoCycle",
     "EgoDispatcher",
     "EgoProposal",
-    "EgoProposalExecutor",
     "EgoSession",
     "GenesisEgoContextBuilder",
     "ProposalStatus",

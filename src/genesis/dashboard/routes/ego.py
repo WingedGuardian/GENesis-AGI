@@ -37,22 +37,40 @@ async def ego_status():
             "model_used": c["model_used"],
         }
 
+    # Dispatch cost from cc_sessions
+    import contextlib
+    dispatch_cost = 0.0
+    with contextlib.suppress(Exception):
+        dispatch_cost = await ego_crud.daily_dispatch_cost(rt._db)
+
     return jsonify({
         "enabled": config.enabled,
         "model": config.model,
         "default_effort": config.default_effort,
         "morning_report_effort": config.morning_report_effort,
         "cadence_minutes": config.cadence_minutes,
-        "daily_budget_cap_usd": config.daily_budget_cap_usd,
+        "ego_thinking_budget_usd": config.ego_thinking_budget_usd,
+        "ego_dispatch_budget_usd": config.ego_dispatch_budget_usd,
         "daily_cost_usd": round(daily_cost, 4),
+        "daily_dispatch_cost_usd": round(dispatch_cost, 4),
+        "thinking_budget_remaining_usd": round(
+            max(0, config.ego_thinking_budget_usd - daily_cost), 4,
+        ),
+        "dispatch_budget_remaining_usd": round(
+            max(0, config.ego_dispatch_budget_usd - dispatch_cost), 4,
+        ),
+        # Backwards compat: total budget view
+        "daily_budget_cap_usd": config.ego_thinking_budget_usd + config.ego_dispatch_budget_usd,
         "budget_remaining_usd": round(
-            max(0, config.daily_budget_cap_usd - daily_cost), 4,
+            max(0, (config.ego_thinking_budget_usd - daily_cost)
+                + (config.ego_dispatch_budget_usd - dispatch_cost)), 4,
         ),
         "focus_summary": focus,
         "last_cycle": last_cycle,
         "pending_proposals": len(pending),
         "uncompacted_cycles": uncompacted,
         "shadow_morning_report": config.shadow_morning_report,
+        "board_size": config.board_size,
     })
 
 
@@ -107,6 +125,9 @@ async def ego_proposals():
             "status": p["status"],
             "created_at": p["created_at"],
             "expires_at": p["expires_at"],
+            "rank": p.get("rank"),
+            "execution_plan": p.get("execution_plan"),
+            "recurring": bool(p.get("recurring", 0)),
         }
         for p in pending
     ])
@@ -167,6 +188,9 @@ async def ego_proposals_all():
             "created_at": p["created_at"],
             "resolved_at": p["resolved_at"],
             "expires_at": p["expires_at"],
+            "rank": p.get("rank"),
+            "execution_plan": p.get("execution_plan"),
+            "recurring": bool(p.get("recurring", 0)),
         }
         for p in proposals
     ])
