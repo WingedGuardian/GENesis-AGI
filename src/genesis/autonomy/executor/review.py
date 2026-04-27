@@ -17,7 +17,10 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from genesis.cc.invoker import CCInvoker
 
 logger = logging.getLogger(__name__)
 
@@ -74,13 +77,20 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
 class TaskReviewer:
     """Adversarial quality gate using cross-vendor LLM review.
 
-    Plan review uses call site 27.  Post-execution verification uses
+    Plan review uses CC invoker (Opus) when available, falling back to
+    call site 27 via route_call.  Post-execution verification uses
     call sites 17 (fresh eyes) and 20 (adversarial counterargument),
     which are configured for cross-vendor routing.
     """
 
-    def __init__(self, *, router: _Router) -> None:
+    def __init__(
+        self,
+        *,
+        router: _Router,
+        invoker: CCInvoker | None = None,
+    ) -> None:
         self._router = router
+        self._invoker = invoker
 
     # --- Plan review (pre-execution) ------------------------------------
 
@@ -89,14 +99,28 @@ class TaskReviewer:
         plan_content: str,
         task_description: str,
     ) -> ReviewResult:
-        """Pre-execution plan review (call site 27).
+        """Pre-execution plan review via CC invoker (Opus) or call site 27.
 
-        On routing failure, passes the plan through rather than
-        blocking execution on infrastructure problems.
+        Prefers CC invoker for Opus-quality review. Falls back to
+        route_call if invoker unavailable or fails. On total failure,
+        passes the plan through rather than blocking execution.
         """
         prompt = self._build_plan_review_prompt(plan_content, task_description)
-        messages = [{"role": "user", "content": prompt}]
 
+        # Primary path: CC invoker with Opus
+        if self._invoker is not None:
+            try:
+                content = await self._review_plan_via_invoker(prompt)
+                if content is not None:
+                    return self._parse_plan_review(content)
+            except Exception:
+                logger.warning(
+                    "CC invoker plan review failed, falling back to route_call",
+                    exc_info=True,
+                )
+
+        # Fallback: route_call to call site 27
+        messages = [{"role": "user", "content": prompt}]
         try:
             result = await self._router.route_call(_CALL_SITE_PLAN, messages)
         except Exception:
@@ -113,6 +137,26 @@ class TaskReviewer:
             return ReviewResult(passed=True)
 
         return self._parse_plan_review(result.content)
+
+    async def _review_plan_via_invoker(self, prompt: str) -> str | None:
+        """Run plan review via CC invoker (Opus). Returns text or None."""
+        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+
+        invocation = CCInvocation(
+            prompt=prompt,
+            model=CCModel.OPUS,
+            effort=EffortLevel.HIGH,
+            timeout_s=300,
+            skip_permissions=True,
+        )
+        output = await self._invoker.run(invocation)
+        if output.is_error:
+            logger.warning(
+                "CC invoker plan review returned error: %s",
+                output.error_message or output.text[:200],
+            )
+            return None
+        return output.text
 
     # --- Deliverable verification (post-execution) ----------------------
 

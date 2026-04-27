@@ -190,10 +190,13 @@ _CALL_SITE_META: dict[str, dict] = {
     },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
-        "description": "Sanity-checks proposed task execution plans before committing resources. Triggers from autonomous executor.",
+        "description": "Sanity-checks proposed task execution plans before committing resources. Opus via CC invoker, route_call fallback.",
         "category": "reasoning",
         "frequency": "Per task",
-        "model_tier": "frontier",
+        "model_tier": "cc",
+        "dispatch": "cli",
+        "cc_model": "Opus",
+        "wired": True,
     },
     "33_skill_refiner": {
         "description": "Proposes improvements to Genesis's learned skills based on recent outcomes. Part of the learning pipeline.",
@@ -253,11 +256,11 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "17_fresh_eyes_review": {
-        "description": "Cross-vendor quality review of executor deliverables (Gate 2). Wired into executor pipeline. Activates when executor goes live.",
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2). DeepSeek V4 Pro primary, Qwen 3.6+ fallback via OpenRouter.",
         "category": "assessment",
-        "frequency": "Per major decision",
+        "frequency": "Per task verification",
         "model_tier": "frontier",
-        "wired": False,
+        "wired": True,
     },
     "18_meta_prompting": {
         "description": "Disabled. Pre-reflection prompt engineering. Planned for V4 adaptive prompting.",
@@ -267,11 +270,11 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "20_adversarial_counterargument": {
-        "description": "Devil's advocate review of executor deliverables (Gate 3). Wired into executor pipeline. Activates when executor goes live.",
+        "description": "Devil's advocate review of executor deliverables (Gate 3). GPT 5.5 primary, DeepSeek V4 Pro + Qwen 3.6+ fallback via OpenRouter.",
         "category": "assessment",
-        "frequency": "Per major decision",
+        "frequency": "Per task verification",
         "model_tier": "frontier",
-        "wired": False,
+        "wired": True,
     },
     "22_tagging": {
         "description": "Disabled. Entity extraction and metadata tagging. Planned for V4 knowledge graph.",
@@ -301,10 +304,10 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
     },
     "autonomous_executor_reasoning": {
-        "description": "Non-tooling reasoning for autonomous executor steps. Wired into executor engine. Activates when executor goes live.",
+        "description": "Non-tooling reasoning for autonomous executor steps (research/analysis/synthesis). API-first via AutonomousDispatchRouter.",
         "category": "reasoning",
         "frequency": "Per executor step",
         "model_tier": "frontier",
-        "wired": False,
+        "wired": True,
     },
 }
