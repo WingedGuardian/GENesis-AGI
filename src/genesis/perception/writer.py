@@ -54,9 +54,11 @@ class ResultWriter:
         tick: TickResult,
         *,
         db: aiosqlite.Connection,
-    ) -> None:
+    ) -> bool:
+        """Write reflection output.  Returns True if stored, False if gated."""
+        stored = True
         if isinstance(output, MicroOutput):
-            await self._write_micro(output, tick, db)
+            stored = await self._write_micro(output, tick, db)
         elif isinstance(output, LightOutput):
             await self._write_light(output, tick, db)
 
@@ -69,17 +71,19 @@ class ResultWriter:
                 depth=depth.value,
                 tick_id=tick.tick_id,
             )
+        return stored
 
     async def _write_micro(
         self,
         output: MicroOutput,
         tick: TickResult,
         db: aiosqlite.Connection,
-    ) -> None:
+    ) -> bool:
+        """Returns True if stored, False if gated."""
         # Salience gate: skip low-salience non-anomaly observations
         if output.salience < 0.45 and not output.anomaly:
             logger.debug("Micro observation below salience threshold (%.2f), skipping", output.salience)
-            return
+            return False
 
         content = json.dumps({
             "tags": output.tags,
@@ -93,7 +97,7 @@ class ResultWriter:
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):
             logger.debug("Micro observation dedup: skipping duplicate (hash=%s)", chash[:12])
-            return
+            return False
 
         await observations.create(
             db,
@@ -116,6 +120,7 @@ class ResultWriter:
                 confidence=output.salience,
                 source_pipeline="reflection",
             )
+        return True
 
     async def _write_light(
         self,

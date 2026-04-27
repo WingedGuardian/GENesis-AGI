@@ -7,6 +7,7 @@ batch-approve, and re-ask cadence.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -95,6 +96,7 @@ class AutonomousCliApprovalGate:
         self._approval_manager = approval_manager
         self._policy_loader = policy_loader
         self._delivery_to_request: dict[str, str] = {}
+        self._approval_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def hydrate_delivery_map(self, db) -> int:
         """Rebuild _delivery_to_request from pending approvals in DB.
@@ -161,6 +163,33 @@ class AutonomousCliApprovalGate:
         if not policy.manual_approval_required:
             return ("approved", None, "manual approval disabled by config")
 
+        # Serialize check-then-create per (subsystem, policy_id) to prevent
+        # duplicate approval requests from concurrent callers.
+        lock_key = (subsystem, policy_id)
+        if lock_key not in self._approval_locks:
+            self._approval_locks[lock_key] = asyncio.Lock()
+        async with self._approval_locks[lock_key]:
+            return await self._ensure_approval_locked(
+                subsystem=subsystem, policy_id=policy_id,
+                action_label=action_label, invocation=invocation,
+                api_call_site_id=api_call_site_id, api_error=api_error,
+                extra_context=extra_context, action_type=action_type,
+            )
+
+    async def _ensure_approval_locked(
+        self,
+        *,
+        subsystem: str,
+        policy_id: str,
+        action_label: str,
+        invocation: CCInvocation | None = None,
+        api_call_site_id: str | None = None,
+        api_error: str | None = None,
+        extra_context: dict[str, Any] | None = None,
+        action_type: str = "autonomous_cli_fallback",
+    ) -> tuple[str, str | None, str]:
+        """Inner approval logic, called under per-site lock."""
+        policy = self._policy()
         approval_key = _approval_key(
             subsystem=subsystem,
             policy_id=policy_id,

@@ -1120,7 +1120,7 @@ DEPTH_THRESHOLDS_SEED = [
     # Thresholds tuned 2026-03-21: originals (0.5/0.8/0.55) were too conservative,
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
-    ("Micro", 0.30, 1800, 2, 3600),         # floor 30min, max 2/hr
+    ("Micro", 0.50, 1800, 2, 3600),         # floor 30min, max 2/hr
     ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
     ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk

@@ -117,7 +117,7 @@ class ReflectionEngine:
                 reason="max_retries_exceeded",
             )
 
-        # 5. Write results
-        await self._writer.write(parsed.output, depth, tick, db=db)
+        # 5. Write results (returns False if gated by salience/dedup)
+        stored = await self._writer.write(parsed.output, depth, tick, db=db)
 
-        return ReflectionResult(success=True, output=parsed.output)
+        return ReflectionResult(success=True, output=parsed.output if stored else None)
