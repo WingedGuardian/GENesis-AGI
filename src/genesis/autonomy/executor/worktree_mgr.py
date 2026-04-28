@@ -83,6 +83,13 @@ async def create_worktree(
     if wt_path.exists():
         logger.info("Stale worktree dir %s exists, cleaning up", wt_path)
         await cleanup_worktree(wt_path, repo_root)
+        # If cleanup failed (logged as warning), force-remove the directory
+        # so git worktree add doesn't fail on an existing path.
+        if wt_path.exists():
+            import shutil
+
+            shutil.rmtree(wt_path, ignore_errors=True)
+            logger.warning("Force-removed stale worktree dir at %s", wt_path)
     else:
         # No dir but branch might linger from a prior crash
         await _prune_worktrees(repo_root)
