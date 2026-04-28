@@ -1,8 +1,8 @@
 """Task decomposer --- breaks a plan document into executable steps.
 
-Uses call site 27 (pre_execution_assessment) with the router to decompose
-a task plan into a structured list of steps. Follows the OutcomeClassifier
-pattern: build prompt, route call, parse response, validate output.
+Uses CC invoker (Sonnet) as primary path for decomposition, falling back
+to call site 27 (pre_execution_assessment) via the router. Follows the
+same pattern as TaskReviewer: CC invoker primary, route_call fallback.
 
 Falls back to a single-step plan if the LLM response is unparseable.
 """
@@ -13,7 +13,10 @@ import contextlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from genesis.cc.invoker import CCInvoker
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +42,14 @@ class _Router(Protocol):
 class TaskDecomposer:
     """Decompose a task plan into executable steps via LLM."""
 
-    def __init__(self, *, router: _Router) -> None:
+    def __init__(
+        self,
+        *,
+        router: _Router,
+        invoker: CCInvoker | None = None,
+    ) -> None:
         self._router = router
+        self._invoker = invoker
 
     async def decompose(
         self,
@@ -52,12 +61,40 @@ class TaskDecomposer:
         Returns a list of validated step dicts, each with keys:
         idx, type, description, required_tools, complexity, dependencies.
 
-        Falls back to a single verification step on any parse failure.
+        Prefers CC invoker (Sonnet) for reliable auth. Falls back to
+        route_call if invoker unavailable or fails, then to a single
+        verification step on total failure.
         """
         prompt = self._build_prompt(plan_content, task_description)
-        messages = [{"role": "user", "content": prompt}]
 
-        result = await self._router.route_call(_CALL_SITE, messages)
+        # Primary path: CC invoker (Sonnet)
+        if self._invoker is not None:
+            try:
+                content = await self._decompose_via_invoker(prompt)
+                if content is not None:
+                    steps = self._parse_response(content)
+                    if steps:
+                        return self._validate_steps(steps)
+                    logger.warning(
+                        "CC invoker decomposition returned unparseable response, "
+                        "falling back to route_call",
+                    )
+            except Exception:
+                logger.warning(
+                    "CC invoker decomposition failed, falling back to route_call",
+                    exc_info=True,
+                )
+
+        # Fallback: route_call via call site 27
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            result = await self._router.route_call(_CALL_SITE, messages)
+        except Exception:
+            logger.warning(
+                "Decomposer route_call raised, falling back to single step",
+                exc_info=True,
+            )
+            return self._single_step_fallback(task_description)
 
         if not result.success or not result.content:
             logger.warning(
@@ -72,6 +109,26 @@ class TaskDecomposer:
             return self._single_step_fallback(task_description)
 
         return self._validate_steps(steps)
+
+    async def _decompose_via_invoker(self, prompt: str) -> str | None:
+        """Run decomposition via CC invoker (Sonnet). Returns text or None."""
+        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+
+        invocation = CCInvocation(
+            prompt=prompt,
+            model=CCModel.SONNET,
+            effort=EffortLevel.HIGH,
+            timeout_s=300,
+            skip_permissions=True,
+        )
+        output = await self._invoker.run(invocation)
+        if output.is_error:
+            logger.warning(
+                "CC invoker decomposition returned error: %s",
+                output.error_message or output.text[:200],
+            )
+            return None
+        return output.text
 
     def _build_prompt(self, plan_content: str, task_description: str) -> str:
         """Build the decomposition prompt from the identity template + plan."""

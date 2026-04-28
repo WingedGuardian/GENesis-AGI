@@ -165,20 +165,25 @@ class TaskDispatcher:
             phase = task.get("current_phase", "")
             if phase != TaskPhase.PENDING.value:
                 continue
-            if task_id in self._dispatched:
-                continue
 
             plan_path = task.get("outputs") or ""
             if not plan_path:
-                logger.warning(
-                    "Pending task %s has no plan path, skipping", task_id,
-                )
+                if task_id not in self._dispatched:
+                    logger.warning(
+                        "Pending task %s has no plan path, skipping", task_id,
+                    )
                 continue
 
-            logger.info(
-                "Picking up pending task %s from DB (source=mcp_fallback)",
-                task_id,
-            )
+            # Allow re-dispatch of PENDING tasks that were previously
+            # dispatched and then reset. A PENDING task in the DB cannot
+            # be concurrently executing — the executor transitions out
+            # of PENDING within the first few lines of execute().
+            if task_id in self._dispatched:
+                logger.info(
+                    "Re-dispatching reset task %s (was in _dispatched)",
+                    task_id,
+                )
+
             self._dispatched.add(task_id)
             tracked_task(
                 self._executor.execute(task_id),
@@ -191,8 +196,6 @@ class TaskDispatcher:
             task_id = task["task_id"]
             phase = task.get("current_phase", "")
             if phase != TaskPhase.BLOCKED.value:
-                continue
-            if task_id in self._dispatched:
                 continue
 
             # Check if there's an approved-but-unconsumed approval for this task
