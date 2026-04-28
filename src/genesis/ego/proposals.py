@@ -1,14 +1,13 @@
 """Ego proposal workflow — lifecycle from creation to Telegram approval.
 
 Handles: proposal creation, batch digest formatting, Telegram delivery
-via TopicManager, reply parsing, and status resolution.
+via TopicManager, and status resolution.
 """
 
 from __future__ import annotations
 
 import html
 import logging
-import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -21,140 +20,10 @@ if TYPE_CHECKING:
 
     from genesis.channels.telegram.topics import TopicManager
     from genesis.memory.store import MemoryStore
-    from genesis.outreach.reply_waiter import ReplyWaiter
 
 logger = logging.getLogger(__name__)
 
 TOPIC_CATEGORY = "ego_proposals"
-
-# ---------------------------------------------------------------------------
-# Reply parsing
-# ---------------------------------------------------------------------------
-
-_APPROVE_WORDS = frozenset({
-    "approve", "approved", "ok", "lgtm", "yes", "go", "ship",
-})
-_REJECT_WORDS = frozenset({
-    "reject", "rejected", "no", "nope", "deny", "denied",
-})
-_ALL_WORDS = frozenset({"all", "everything"})
-_NUM_RE = re.compile(r"\d+")
-_REASON_RE = re.compile(r"[\u2014\-:]\s*")  # em-dash, hyphen, colon
-
-
-def _extract_reason(text: str) -> str | None:
-    """Extract rejection reason after separator (—, -, :)."""
-    parts = _REASON_RE.split(text, maxsplit=1)
-    if len(parts) > 1:
-        reason = parts[1].strip()
-        return reason if reason else None
-    return None
-
-
-def _parse_line(
-    line: str,
-    count: int,
-    out: dict[int, tuple[str, str | None]],
-) -> None:
-    """Parse one line/clause for approve/reject + numbers."""
-    lower = line.strip().lower()
-    if not lower:
-        return
-
-    # Determine verb
-    words = lower.split()
-    verb = words[0] if words else ""
-    status: str | None = None
-    if verb in _APPROVE_WORDS:
-        status = ProposalStatus.APPROVED
-    elif verb in _REJECT_WORDS:
-        status = ProposalStatus.REJECTED
-    else:
-        return  # not a recognized command line
-
-    rest = line.strip()[len(verb):].strip()
-
-    # Check for "all"
-    rest_words = rest.lower().split()
-    if not rest_words or (rest_words[0] in _ALL_WORDS):
-        reason = _extract_reason(rest) if status == ProposalStatus.REJECTED else None
-        for i in range(1, count + 1):
-            out[i] = (status, reason)
-        return
-
-    # Extract numbers from text BEFORE the reason separator only.
-    # Without this, "reject 2 — first one is low-priority" would match "1"
-    # from the reason text.
-    reason: str | None = None
-    num_text = rest
-    if status == ProposalStatus.REJECTED:
-        parts = _REASON_RE.split(rest, maxsplit=1)
-        num_text = parts[0]
-        reason = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
-
-    nums = [int(n) for n in _NUM_RE.findall(num_text) if 1 <= int(n) <= count]
-    for n in nums:
-        out[n] = (status, reason)
-
-
-def parse_reply(
-    reply_text: str,
-    proposal_count: int,
-) -> dict[int, tuple[str, str | None]]:
-    """Parse user reply into {1-based index: (status, reason|None)}.
-
-    Supports:
-    - ``"approve all"`` / ``"ok"`` / ``"lgtm"`` / ``"yes"``
-    - ``"reject all"`` / ``"reject all — bad idea"``
-    - ``"approve 1,3"``
-    - ``"reject 2 — not worth it"``
-    - ``"approve 1,3 reject 2"``  (mixed on one line)
-    - ``"1,3"``  (bare numbers → approve)
-    - Empty / unparseable → empty dict (safe default)
-    """
-    text = reply_text.strip()
-    if not text:
-        return {}
-
-    lower = text.lower()
-    words = lower.split()
-    first = words[0] if words else ""
-    result: dict[int, tuple[str, str | None]] = {}
-
-    # Global approve shortcuts
-    if first in _APPROVE_WORDS:
-        rest = lower[len(first):].strip()
-        rest_words = rest.split()
-        if not rest_words or rest_words[0] in _ALL_WORDS:
-            return {i: (ProposalStatus.APPROVED, None) for i in range(1, proposal_count + 1)}
-
-    # Global reject shortcuts
-    if first in _REJECT_WORDS:
-        rest = text[len(first):].strip()
-        rest_lower = rest.lower().split()
-        if not rest_lower or rest_lower[0] in _ALL_WORDS:
-            reason = _extract_reason(rest)
-            return {i: (ProposalStatus.REJECTED, reason) for i in range(1, proposal_count + 1)}
-
-    # Split on newlines and semicolons, also split "approve X reject Y" on keyword boundaries
-    chunks = re.split(r"[\n;]+", text)
-    expanded: list[str] = []
-    for chunk in chunks:
-        # Split "approve 1,3 reject 2" into two lines
-        parts = re.split(r"\b(?=(?:approve|reject|deny)\b)", chunk, flags=re.IGNORECASE)
-        expanded.extend(parts)
-
-    for line in expanded:
-        _parse_line(line, proposal_count, result)
-
-    # Bare numbers with no verb → approve
-    if not result:
-        nums = [int(n) for n in _NUM_RE.findall(text) if 1 <= int(n) <= proposal_count]
-        for n in nums:
-            result[n] = (ProposalStatus.APPROVED, None)
-
-    return result
-
 
 # ---------------------------------------------------------------------------
 # Digest formatting
@@ -216,9 +85,6 @@ class ProposalWorkflow:
     topic_manager:
         TopicManager for sending to Telegram supergroup topics.
         None if Telegram is not available (proposals created but not sent).
-    reply_waiter:
-        ReplyWaiter for detecting quote-replies to proposal digests.
-        None if reply detection is not available.
     memory_store:
         MemoryStore for storing corrections on proposal rejection.
         None if memory is not available (corrections silently skipped).
@@ -229,12 +95,10 @@ class ProposalWorkflow:
         *,
         db: aiosqlite.Connection,
         topic_manager: TopicManager | None = None,
-        reply_waiter: ReplyWaiter | None = None,
         memory_store: MemoryStore | None = None,
     ) -> None:
         self._db = db
         self._topic_manager = topic_manager
-        self._reply_waiter = reply_waiter
         self._memory_store = memory_store
 
     # -- Late-binding setters (wired in standalone.py after Telegram init) --
@@ -242,10 +106,6 @@ class ProposalWorkflow:
     def set_topic_manager(self, topic_manager: TopicManager) -> None:
         """Attach a TopicManager for Telegram proposal delivery."""
         self._topic_manager = topic_manager
-
-    def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
-        """Attach a ReplyWaiter for detecting user responses to proposals."""
-        self._reply_waiter = waiter
 
     # -- Creation ----------------------------------------------------------
 
@@ -349,46 +209,6 @@ class ProposalWorkflow:
         return str(delivery_id)
 
     # -- Approval processing -----------------------------------------------
-
-    async def wait_and_process_reply(
-        self,
-        batch_id: str,
-        delivery_id: str,
-        *,
-        timeout_s: float | None = None,
-    ) -> dict[str, str]:
-        """Wait for user reply and process it.
-
-        Returns ``{proposal_id: new_status}`` for resolved proposals.
-        Empty dict if timeout or no reply waiter.
-        """
-        if self._reply_waiter is None:
-            logger.warning("No reply_waiter — cannot await approval")
-            return {}
-
-        # Default 24h wait — proposals no longer expire on a timer
-        if timeout_s is None:
-            timeout_s = 86400.0
-
-        reply_text = await self._reply_waiter.wait_for_reply(
-            delivery_id, timeout_s=timeout_s,
-        )
-
-        if reply_text is None:
-            logger.info("No reply for batch %s (timed out)", batch_id)
-            return {}
-
-        proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
-        decisions = parse_reply(reply_text, len(proposals))
-
-        if not decisions:
-            logger.warning(
-                "Could not parse reply for batch %s: %r",
-                batch_id, reply_text[:200],
-            )
-            return {}
-
-        return await self.resolve_proposals(batch_id, decisions)
 
     async def resolve_proposals(
         self,
