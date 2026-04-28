@@ -520,3 +520,37 @@ def test_content_hash_truncates_at_200():
 
 def test_content_hash_different_inputs():
     assert content_hash("alpha") != content_hash("beta")
+
+
+@pytest.mark.asyncio
+async def test_dedup_window_zero_skips_check(db):
+    """Signal types with window_hours=0 (e.g. cli_approval) must never
+    be deduped, even when an identical message was just delivered."""
+    cfg = _cfg_no_quiet()
+    gate = GovernanceGate(cfg, db)
+    now = datetime.now(UTC).isoformat()
+
+    # Deliver a cli_approval message
+    await outreach_crud.create(
+        db,
+        id="approval-1",
+        signal_type="cli_approval",
+        topic="Approval: ego cycle",
+        category="approval",
+        salience_score=1.0,
+        channel="telegram",
+        message_content="Approve ego cycle?",
+        created_at=now,
+    )
+    await outreach_crud.record_delivery(db, "approval-1", delivered_at=now)
+
+    # Identical signal_type + topic — window=0 means never dedup
+    req = OutreachRequest(
+        category=OutreachCategory.APPROVAL,
+        topic="Approval: ego cycle",
+        context="Approve ego cycle?",
+        salience_score=1.0,
+        signal_type="cli_approval",
+    )
+    is_dup = await gate.is_duplicate(req)
+    assert is_dup is False
