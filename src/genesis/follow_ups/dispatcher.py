@@ -219,12 +219,27 @@ class FollowUpDispatcher:
                     )
             else:
                 verification_notes = "no staging_id on completed task"
-            await follow_up_crud.update_status(
-                self._db, fu["id"], "completed",
-                resolution_notes=f"Surplus task {task_id[:8]} completed successfully",
-                verified_at=verified_at,
-                verification_notes=verification_notes,
-            )
+
+            # Pinned follow-ups: record verification but don't auto-complete.
+            # The user must close them manually.
+            if fu.get("pinned"):
+                await follow_up_crud.update_status(
+                    self._db, fu["id"], fu["status"],
+                    resolution_notes=f"Surplus task {task_id[:8]} completed (pinned — awaiting user review)",
+                    verified_at=verified_at,
+                    verification_notes=verification_notes,
+                )
+                logger.info(
+                    "Follow-up %s: surplus task completed but follow-up is pinned — not auto-closing",
+                    fu["id"][:8],
+                )
+            else:
+                await follow_up_crud.update_status(
+                    self._db, fu["id"], "completed",
+                    resolution_notes=f"Surplus task {task_id[:8]} completed successfully",
+                    verified_at=verified_at,
+                    verification_notes=verification_notes,
+                )
             summary["completions_tracked"] += 1
             logger.info("Follow-up %s completed via surplus task %s", fu["id"][:8], task_id[:8])
         elif status == "failed":

@@ -108,15 +108,16 @@ def _scan_tier(tier_dir: Path, tier_num: int, repo_root: Path | None) -> list[di
 def generate_catalog() -> dict:
     """Scan skill directories and build the catalog."""
     tier1 = _scan_tier(TIER1_DIR, 1, REPO_ROOT)
-    tier1_names = {s["name"] for s in tier1}
+    seen_names = {s["name"].lower() for s in tier1}
 
     tier2: list[dict] = []
     for t2_dir in TIER2_DIRS:
         for skill in _scan_tier(t2_dir, 2, REPO_ROOT):
-            # Deduplicate: if a skill name exists in Tier 1, skip
-            if skill["name"] not in tier1_names:
+            # Deduplicate (case-insensitive): skip if name exists in Tier 1
+            # or was already added from another Tier 2 directory
+            if skill["name"].lower() not in seen_names:
                 tier2.append(skill)
-                tier1_names.add(skill["name"])  # also dedup across Tier 2 dirs
+                seen_names.add(skill["name"].lower())
 
     return {
         "tier1": tier1,

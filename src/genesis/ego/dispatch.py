@@ -129,7 +129,16 @@ class EgoDispatcher:
         return all_actionable
 
     async def clear_follow_up(self, follow_up_id: str) -> None:
-        """Mark a follow-up as completed by the ego."""
+        """Mark a follow-up as completed by the ego.
+
+        Respects pinned status — pinned follow-ups cannot be cleared by ego.
+        """
+        existing = await follow_up_crud.get_by_id(self._db, follow_up_id)
+        if existing and existing.get("pinned"):
+            logger.info(
+                "Follow-up %s is pinned — ego cannot clear", follow_up_id[:8],
+            )
+            return
         await follow_up_crud.update_status(
             self._db, follow_up_id, "completed",
             resolution_notes="Resolved by ego cycle",
