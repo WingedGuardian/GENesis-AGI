@@ -167,7 +167,7 @@ class SkillApplicator:
                 call_site_id="33_skill_refiner",
                 messages=[{"role": "user", "content": prompt}],
             )
-            data = json.loads(result.text)
+            data = json.loads(result.content)
             return bool(data.get("approved", False))
         except Exception:
             logger.warning(

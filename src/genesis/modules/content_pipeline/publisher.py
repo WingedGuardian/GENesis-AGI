@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 async def ensure_table(db: aiosqlite.Connection) -> None:
-    """Create the content_publishes table if it doesn't exist."""
+    """Create the content_publishes table if it doesn't exist, then migrate."""
     await db.execute("""
         CREATE TABLE IF NOT EXISTS content_publishes (
             id TEXT PRIMARY KEY,
@@ -24,14 +24,50 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             platform TEXT NOT NULL,
             content_text TEXT NOT NULL,
             published_at TEXT,
-            status TEXT NOT NULL DEFAULT 'draft'
+            status TEXT NOT NULL DEFAULT 'draft',
+            platform_post_id TEXT,
+            post_url TEXT,
+            error_message TEXT,
+            distributed_at TEXT
         )
     """)
+    # Migrate existing tables that lack the new columns.
+    cursor = await db.execute("PRAGMA table_info(content_publishes)")
+    existing_cols = {row[1] for row in await cursor.fetchall()}
+    for col, defn in [
+        ("platform_post_id", "TEXT"),
+        ("post_url", "TEXT"),
+        ("error_message", "TEXT"),
+        ("distributed_at", "TEXT"),
+    ]:
+        if col not in existing_cols:
+            await db.execute(f"ALTER TABLE content_publishes ADD COLUMN {col} {defn}")
     await db.commit()
 
 
-def _row_to_publish(row: aiosqlite.Row) -> PublishResult:
-    """Convert a database row to a PublishResult."""
+def _row_to_publish(
+    row: aiosqlite.Row,
+    col_names: list[str] | None = None,
+) -> PublishResult:
+    """Convert a database row to a PublishResult.
+
+    Supports both positional (legacy) and named-column access.
+    """
+    if col_names is not None:
+        d = dict(zip(col_names, row, strict=False))
+        return PublishResult(
+            id=d["id"],
+            idea_id=d["idea_id"],
+            platform=d["platform"],
+            content_text=d["content_text"],
+            published_at=d.get("published_at"),
+            status=d.get("status", "draft"),
+            platform_post_id=d.get("platform_post_id"),
+            post_url=d.get("post_url"),
+            error_message=d.get("error_message"),
+            distributed_at=d.get("distributed_at"),
+        )
+    # Positional fallback for callers that don't pass col_names.
     return PublishResult(
         id=row[0],
         idea_id=row[1],
@@ -39,6 +75,10 @@ def _row_to_publish(row: aiosqlite.Row) -> PublishResult:
         content_text=row[3],
         published_at=row[4],
         status=row[5],
+        platform_post_id=row[6] if len(row) > 6 else None,
+        post_url=row[7] if len(row) > 7 else None,
+        error_message=row[8] if len(row) > 8 else None,
+        distributed_at=row[9] if len(row) > 9 else None,
     )
 
 
@@ -111,7 +151,8 @@ class PublishManager:
 
         cursor = await self._db.execute(query, params)
         rows = await cursor.fetchall()
-        return [_row_to_publish(row) for row in rows]
+        col_names = [desc[0] for desc in cursor.description] if cursor.description else None
+        return [_row_to_publish(row, col_names=col_names) for row in rows]
 
     async def update_publish_status(
         self, publish_id: str, status: str,

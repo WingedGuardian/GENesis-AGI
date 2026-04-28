@@ -264,11 +264,21 @@ class _RuntimeProperties:
 
     @property
     def ego_session(self) -> object | None:
+        """User ego session (primary, backwards-compatible)."""
         return self._ego_session
 
     @property
     def ego_cadence_manager(self) -> object | None:
+        """User ego cadence manager (primary, backwards-compatible)."""
         return self._ego_cadence_manager
+
+    @property
+    def genesis_ego_session(self) -> object | None:
+        return self._genesis_ego_session
+
+    @property
+    def genesis_ego_cadence_manager(self) -> object | None:
+        return self._genesis_ego_cadence_manager
 
     @property
     def bootstrap_manifest(self) -> dict[str, str]:

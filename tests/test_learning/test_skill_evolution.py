@@ -382,7 +382,7 @@ class TestRefiner:
         )
 
         mock_result = MagicMock()
-        mock_result.text = json.dumps({
+        mock_result.content = json.dumps({
             "proposed_content": "improved",
             "rationale": "fixed issues",
             "change_size": "minor",
@@ -493,7 +493,7 @@ class TestApplicator:
         )
 
         mock_result = MagicMock()
-        mock_result.text = json.dumps({"approved": True, "reason": "looks good"})
+        mock_result.content = json.dumps({"approved": True, "reason": "looks good"})
         router = MagicMock()
         router.route_call = AsyncMock(return_value=mock_result)
 
@@ -541,7 +541,7 @@ class TestApplicator:
     @pytest.mark.asyncio
     async def test_validate_approved(self):
         mock_result = MagicMock()
-        mock_result.text = json.dumps({"approved": True, "reason": "ok"})
+        mock_result.content = json.dumps({"approved": True, "reason": "ok"})
         router = MagicMock()
         router.route_call = AsyncMock(return_value=mock_result)
 
@@ -555,7 +555,7 @@ class TestApplicator:
     @pytest.mark.asyncio
     async def test_validate_rejected(self):
         mock_result = MagicMock()
-        mock_result.text = json.dumps({"approved": False, "reason": "bad"})
+        mock_result.content = json.dumps({"approved": False, "reason": "bad"})
         router = MagicMock()
         router.route_call = AsyncMock(return_value=mock_result)
 

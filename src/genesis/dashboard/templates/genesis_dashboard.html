@@ -274,8 +274,8 @@
 
         // Tab management
         _TAB_INTERVALS: {
-          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval", "_approvalsInterval"],
-          chat:      ["_commsInterval"],
+          overview:  ["_cognitiveInterval", "_ekInterval", "_modulesInterval"],
+          chat:      ["_commsInterval", "_approvalsInterval"],
           internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
@@ -314,11 +314,10 @@
           this._tabInitialized[tab] = true;
           switch (tab) {
             case "overview":
-              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); this.fetchApprovals(); }
+              if (first) { this.fetchCognitive(); this.fetchEssentialKnowledge(); this.fetchModules(); this.fetchProvidersDetail(); }
               this._cognitiveInterval = setInterval(() => this.fetchCognitive(), 60000);
               this._ekInterval = setInterval(() => this.fetchEssentialKnowledge(), 120000);
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
-              this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
             case "internals":
               if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); this.fetchActivity(); this.fetchSessions(); }
@@ -334,8 +333,9 @@
             case "chat":
               // Re-fit terminal on tab re-entry
               if (!first && this._xterm && this._fitAddon) { this._fitAddon.fit(); }
-              if (first) { this.fetchComms(); }
+              if (first) { this.fetchComms(); this.fetchApprovals(); }
               this._commsInterval = setInterval(() => this.fetchComms(), 15000);
+              this._approvalsInterval = setInterval(() => this.fetchApprovals(), 15000);
               break;
             case "files":
               if (first) { this.fetchFiles(); }
@@ -378,13 +378,14 @@
           // Check auth status (non-blocking, best-effort)
           this.checkAuth();
 
-          // Always fetch: health, errors, pause, update status (needed on all tabs)
+          // Always fetch: health, errors, pause, update status, approvals (needed on all tabs)
           await Promise.all([
             this.fetchHealth(),
             this.fetchErrorSummary(),
             this.fetchPauseState(),
             this.fetchUpdateStatus(),
             this.fetchEgoStatus(),
+            this.fetchApprovals(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -1270,8 +1271,9 @@
           enabled: 'Enabled', cadence_minutes: 'Cadence (minutes)',
           activity_threshold_minutes: 'Activity Threshold (min)',
           max_interval_minutes: 'Max Interval (min)', backoff_multiplier: 'Backoff Multiplier',
-          proposal_expiry_minutes: 'Proposal Expiry (min)', batch_digest: 'Batch Digest',
-          daily_budget_cap_usd: 'Daily Budget ($)',
+          board_size: 'Board Size', batch_digest: 'Batch Digest',
+          ego_thinking_budget_usd: 'Thinking Budget ($)',
+          ego_dispatch_budget_usd: 'Dispatch Budget ($)',
           morning_report_hour: 'Morning Report Hour', morning_report_minute: 'Morning Report Minute',
           morning_report_timezone: 'Morning Report Timezone',
           shadow_morning_report: 'Shadow Morning Report',
@@ -1313,9 +1315,10 @@
           activity_threshold_minutes: 'Min time since last user activity before running',
           max_interval_minutes: 'Maximum backoff cap (prevents indefinite delays)',
           backoff_multiplier: 'How much to increase interval on idle cycles',
-          proposal_expiry_minutes: 'How long ego proposals remain valid before auto-expiring',
+          board_size: 'Max active proposals on the bulletin board (ego tables excess)',
           batch_digest: 'Bundle ego proposals into periodic digests instead of individual messages',
-          daily_budget_cap_usd: 'Hard cap on daily ego session spending',
+          ego_thinking_budget_usd: 'Daily cap for ego cycle (thinking) costs',
+          ego_dispatch_budget_usd: 'Daily cap for dispatched background sessions',
           morning_report_hour: 'Hour (0\u201323) to send the daily morning report',
           morning_report_minute: 'Minute (0\u201359) for morning report delivery',
           morning_report_timezone: 'Timezone for morning report scheduling',
@@ -2639,7 +2642,7 @@
             items.push({ level: "warning", title: `${this.fallbackCallSiteCount} call site${this.fallbackCallSiteCount === 1 ? "" : "s"} on fallback`, detail: names, href: "#routing-health", tab: "internals", anchor: "routing-health" });
           }
           if (this.pendingApprovalCount > 0) {
-            items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#approval-queue", tab: "overview", anchor: "approval-queue" });
+            items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#chat", tab: "chat", onClick: () => { this.commsTab = 'approvals'; this.fetchApprovals(); } });
           }
           if (this.badApiKeyCount > 0) {
             items.push({ level: "critical", title: `${this.badApiKeyCount} provider key issue${this.badApiKeyCount === 1 ? "" : "s"}`, detail: "missing or failed provider credentials detected", href: null });
@@ -3382,18 +3385,18 @@
               @click="location.hash = 'overview'">Overview</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'chat' }"
               @click="location.hash = 'chat'">Chat</button>
-      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'internals' }"
-              @click="location.hash = 'internals'">Internals</button>
-      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'config' }"
-              @click="location.hash = 'config'">Configuration</button>
-      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'files' }"
-              @click="location.hash = 'files'">Files</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
               @click="location.hash = 'work'">Work</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
               @click="location.hash = 'memory'">Memory</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
               @click="location.hash = 'knowledge'">Knowledge</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'files' }"
+              @click="location.hash = 'files'">Files</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'config' }"
+              @click="location.hash = 'config'">Configuration</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'internals' }"
+              @click="location.hash = 'internals'">Internals</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'backup' }"
               @click="location.hash = 'backup'">Backup & Updates</button>
     </nav>
@@ -4256,79 +4259,7 @@
       </div>
     </div>
 
-    <!-- Panel: Approval Queue (Collapsible) [Tab: overview] -->
-    <div class="panel" id="approval-queue" x-data="{ approvalsOpen: $store.genesisDashboard.pendingApprovalCount > 0 }" x-show="$store.genesisDashboard.activeTab === 'overview'">
-      <div class="panel-header" style="cursor: pointer;" @click="approvalsOpen = !approvalsOpen">
-        <span class="material-symbols-outlined" :style="approvalsOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
-        <span class="material-symbols-outlined">approval</span>
-        Approval Queue
-        <span class="panel-status">
-          <template x-if="$store.genesisDashboard.pendingApprovalCount > 0">
-            <span style="font-size: 0.68rem; opacity: 0.7;"
-                  x-text="$store.genesisDashboard.pendingApprovalCount + ' pending'"></span>
-          </template>
-          <span class="status-dot" :style="`background:${$store.genesisDashboard.panelStateColor('approvals')}`"></span>
-          <span x-text="$store.genesisDashboard.panelStateLabel('approvals')"></span>
-        </span>
-      </div>
-      <div class="panel-body" x-show="approvalsOpen" x-transition>
-        <template x-if="$store.genesisDashboard.panelStatusDetail('approvals')">
-          <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('approvals')"></div>
-        </template>
-        <template x-if="$store.genesisDashboard.approvals.length === 0">
-          <div class="empty-state">No pending approvals.</div>
-        </template>
-        <template x-if="$store.genesisDashboard.approvals.length > 0">
-          <div style="display:grid; gap:0.6rem;">
-            <template x-for="req in $store.genesisDashboard.approvals" :key="req.id">
-              <div style="padding:0.65rem 0.75rem; border-radius:6px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03);">
-                <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.6rem; margin-bottom:0.35rem;">
-                  <div>
-                    <div style="font-size:0.8rem; font-weight:600;" x-text="$store.genesisDashboard.approvalActionLabel(req)"></div>
-                    <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-top:0.15rem;"
-                         x-text="(req.context_data?.subsystem || 'unknown subsystem') + ' · ' + $store.genesisDashboard.relativeTime(req.created_at)"></div>
-                  </div>
-                  <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
-                </div>
-                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
-                    <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Reason</div>
-                    <div x-text="$store.genesisDashboard.approvalReasonLabel(req)"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">API Route</div>
-                    <div x-text="req.context_data?.api_call_site_id || 'none'"></div>
-                  </div>
-                  <div>
-                    <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Channel</div>
-                    <div x-text="req.context_data?.channel || 'dashboard-only'"></div>
-                  </div>
-                </div>
-                <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">
-                  <button type="button"
-                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(76,175,80,0.28); color:#4caf50; background:transparent; cursor:pointer;"
-                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
-                          @click="$store.genesisDashboard.resolveApproval(req.id, 'approved')"
-                          x-text="$store.genesisDashboard.approvalActionState(req.id).saving ? 'Saving...' : 'Approve'"></button>
-                  <button type="button"
-                          style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.28); color:#d9534f; background:transparent; cursor:pointer;"
-                          :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
-                          @click="$store.genesisDashboard.resolveApproval(req.id, 'rejected')">Reject</button>
-                </div>
-                <template x-if="$store.genesisDashboard.approvalActionState(req.id).error">
-                  <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;"
-                       x-text="$store.genesisDashboard.approvalActionState(req.id).error"></div>
-                </template>
-              </div>
-            </template>
-          </div>
-        </template>
-      </div>
-    </div>
+    <!-- Approval Queue moved to Chat tab → Approvals sub-tab -->
 
     <!-- Panel: Awareness Signals (Collapsible) [Tab: internals] -->
     <div class="panel" x-data="{ sigOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
@@ -6920,6 +6851,15 @@
                     x-text="$store.genesisDashboard.commsCounts.proposals_pending"></span>
             </template>
           </button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
+                  :style="$store.genesisDashboard.commsTab === 'approvals' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.commsTab = 'approvals'; $store.genesisDashboard.fetchApprovals()">
+            Approvals
+            <template x-if="$store.genesisDashboard.pendingApprovalCount > 0">
+              <span style="background:#4caf50; color:#000; font-size:0.6rem; padding:0.05rem 0.25rem; border-radius:8px; margin-left:0.25rem;"
+                    x-text="$store.genesisDashboard.pendingApprovalCount"></span>
+            </template>
+          </button>
         </div>
 
         <!-- View toggle -->
@@ -7103,6 +7043,62 @@
             </div>
           </template>
         </div>
+
+        <!-- ── Approvals ────────────────────────────────── -->
+        <div x-show="$store.genesisDashboard.commsTab === 'approvals'">
+          <template x-if="$store.genesisDashboard.approvals.length === 0">
+            <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No pending approvals.</div>
+          </template>
+          <template x-if="$store.genesisDashboard.approvals.length > 0">
+            <div style="display:grid; gap:0.6rem;">
+              <template x-for="req in $store.genesisDashboard.approvals" :key="req.id">
+                <div style="padding:0.65rem 0.75rem; border-radius:6px; border:1px solid var(--color-border); background:rgba(255,255,255,0.03);">
+                  <div style="display:flex; align-items:flex-start; justify-content:space-between; gap:0.6rem; margin-bottom:0.35rem;">
+                    <div>
+                      <div style="font-size:0.8rem; font-weight:600;" x-text="$store.genesisDashboard.approvalActionLabel(req)"></div>
+                      <div style="font-size:0.68rem; color:var(--color-text-secondary); margin-top:0.15rem;"
+                           x-text="(req.context_data?.subsystem || 'unknown subsystem') + ' · ' + $store.genesisDashboard.relativeTime(req.created_at)"></div>
+                    </div>
+                    <div style="font-size:0.66rem; font-family:monospace; color:var(--color-text-secondary);" x-text="req.id"></div>
+                  </div>
+                  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:0.45rem; font-size:0.72rem;">
+                    <div>
+                      <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Fallback</div>
+                      <div x-text="$store.genesisDashboard.approvalFallbackLabel(req)"></div>
+                    </div>
+                    <div>
+                      <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Reason</div>
+                      <div x-text="$store.genesisDashboard.approvalReasonLabel(req)"></div>
+                    </div>
+                    <div>
+                      <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">API Route</div>
+                      <div x-text="req.context_data?.api_call_site_id || 'none'"></div>
+                    </div>
+                    <div>
+                      <div style="opacity:0.6; text-transform:uppercase; letter-spacing:0.04em; font-size:0.62rem;">Channel</div>
+                      <div x-text="req.context_data?.channel || 'dashboard-only'"></div>
+                    </div>
+                  </div>
+                  <div style="display:flex; gap:0.45rem; flex-wrap:wrap; margin-top:0.6rem;">
+                    <button type="button"
+                            style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(76,175,80,0.28); color:#4caf50; background:transparent; cursor:pointer;"
+                            :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                            @click="$store.genesisDashboard.resolveApproval(req.id, 'approved')"
+                            x-text="$store.genesisDashboard.approvalActionState(req.id).saving ? 'Saving...' : 'Approve'"></button>
+                    <button type="button"
+                            style="font-size:0.68rem; padding:0.24rem 0.5rem; border-radius:4px; border:1px solid rgba(217,83,79,0.28); color:#d9534f; background:transparent; cursor:pointer;"
+                            :disabled="$store.genesisDashboard.approvalActionState(req.id).saving"
+                            @click="$store.genesisDashboard.resolveApproval(req.id, 'rejected')">Reject</button>
+                  </div>
+                  <template x-if="$store.genesisDashboard.approvalActionState(req.id).error">
+                    <div style="font-size:0.68rem; color:#d9534f; margin-top:0.35rem;"
+                         x-text="$store.genesisDashboard.approvalActionState(req.id).error"></div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
       </div>
     </div>
 
@@ -7223,11 +7219,146 @@
          Panel: Work [Tab: work] — Tasks + Follow-ups + Background Sessions
          ═══════════════════════════════════════════════════════════════ -->
 
+    <!-- Work: Autonomous Executions (step-by-step background plans) -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">task_alt</span>
+        Autonomous Executions
+        <span style="font-size:0.62rem; opacity:0.5; font-weight:400; margin-left:0.3rem;">background plans with step-by-step progress</span>
+        <span class="panel-status" x-show="Object.keys($store.genesisDashboard.taskActive).length > 0">
+          <span class="status-dot" style="background:#66bb6a;"></span>
+          <span x-text="Object.keys($store.genesisDashboard.taskActive).length + ' active'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Task list -->
+        <template x-if="$store.genesisDashboard.taskList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No tasks found. Submit tasks via the <code>task_submit</code> MCP tool.
+          </div>
+        </template>
+        <div class="activity-feed">
+          <template x-for="task in $store.genesisDashboard.taskList" :key="task.task_id">
+            <div>
+              <div class="activity-row"
+                   @click="$store.genesisDashboard.fetchTaskDetail(task.task_id)"
+                   style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;">
+                <!-- Phase badge -->
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                        'paused':    'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                      }[task.current_phase?.toLowerCase()] || 'background:rgba(33,150,243,0.15); color:#2196F3;'"
+                      x-text="task.current_phase || 'unknown'"></span>
+                <!-- Description -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
+                      x-text="task.description || task.task_id"></span>
+                <!-- Task ID -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; font-family:monospace; flex-shrink:0;"
+                      x-text="task.task_id?.substring(0,10)"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime(task.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.taskExpanded === task.task_id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.taskExpanded === task.task_id && $store.genesisDashboard.taskDetail">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
+                  <!-- Actions bar -->
+                  <div style="display:flex; gap:0.3rem; margin-bottom:0.5rem;">
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'pause')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(255,167,38,0.1); color:#ffa726; border:1px solid rgba(255,167,38,0.2);">Pause</button>
+                    </template>
+                    <template x-if="task.current_phase?.toLowerCase() === 'paused'">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'resume')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">Resume</button>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
+                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'cancel')"
+                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
+                                     background:rgba(239,154,154,0.1); color:#ef9a9a; border:1px solid rgba(239,154,154,0.2);">Cancel</button>
+                    </template>
+                  </div>
+                  <!-- Steps -->
+                  <div style="margin-top:0.3rem;">
+                    <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
+                    <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
+                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                        <!-- Status icon -->
+                        <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
+                              :style="{
+                                'completed': 'color:#66bb6a',
+                                'executing': 'color:#2196F3',
+                                'failed':    'color:#ef9a9a',
+                                'pending':   'color:#9e9e9e',
+                                'blocked':   'color:#ffa726',
+                              }[step.status] || 'color:#9e9e9e'"
+                              x-text="{
+                                'completed': 'check_circle',
+                                'executing': 'sync',
+                                'failed':    'error',
+                                'pending':   'radio_button_unchecked',
+                                'blocked':   'block',
+                              }[step.status] || 'radio_button_unchecked'"></span>
+                        <div style="flex:1; min-width:0;">
+                          <div style="display:flex; justify-content:space-between; gap:0.5rem;">
+                            <span x-text="step.description || `Step ${step.step_idx}`" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
+                            <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                                  x-text="step.step_type"></span>
+                          </div>
+                          <div style="display:flex; gap:0.5rem; color:var(--color-text-secondary); font-size:0.65rem; margin-top:0.1rem;">
+                            <span x-show="step.model_used" x-text="step.model_used"></span>
+                            <span x-show="step.cost_usd" x-text="'$' + step.cost_usd?.toFixed(4)"></span>
+                            <span x-show="step.started_at && step.completed_at"
+                                  x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
+                          </div>
+                          <!-- Result preview -->
+                          <template x-if="step.result_json && step.result_json.result">
+                            <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
+                                        font-family:monospace; font-size:0.65rem; max-height:80px; overflow:hidden; color:var(--color-text-secondary);"
+                                 x-text="(typeof step.result_json.result === 'string' ? step.result_json.result : JSON.stringify(step.result_json.result)).substring(0, 500)">
+                            </div>
+                          </template>
+                        </div>
+                      </div>
+                    </template>
+                    <template x-if="$store.genesisDashboard.taskDetailSteps.length === 0">
+                      <div style="color:var(--color-text-secondary); font-size:0.7rem; padding:0.3rem 0;">No steps recorded yet.</div>
+                    </template>
+                  </div>
+                  <!-- Blockers -->
+                  <template x-if="$store.genesisDashboard.taskDetail.blockers">
+                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15);">
+                      <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
+                      <div style="font-size:0.7rem; color:var(--color-text-secondary);"
+                           x-text="JSON.stringify($store.genesisDashboard.taskDetail.blockers)"></div>
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
     <!-- Work: Unified view -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
       <div class="panel-header">
         <span class="material-symbols-outlined">work</span>
         Work
+        <span style="font-size:0.62rem; opacity:0.5; font-weight:400; margin-left:0.3rem;">tasks, follow-ups & sessions</span>
         <span class="panel-status">
           <span style="font-size:0.72rem; opacity:0.7;"
                 x-text="(() => {
@@ -7353,139 +7484,6 @@
                     <span x-show="item.cost_usd != null" x-text="'Cost: $' + (item.cost_usd || 0).toFixed(4)"></span>
                     <span x-text="'Started: ' + $store.genesisDashboard.formatTime(item.created_at)"></span>
                   </div>
-                </div>
-              </template>
-            </div>
-          </template>
-        </div>
-      </div>
-    </div>
-
-    <!-- Work: Task Execution Detail (preserved from original) -->
-    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
-      <div class="panel-header">
-        <span class="material-symbols-outlined">task_alt</span>
-        Task Execution
-        <span class="panel-status" x-show="Object.keys($store.genesisDashboard.taskActive).length > 0">
-          <span class="status-dot" style="background:#66bb6a;"></span>
-          <span x-text="Object.keys($store.genesisDashboard.taskActive).length + ' active'"></span>
-        </span>
-      </div>
-      <div class="panel-body">
-        <!-- Task list -->
-        <template x-if="$store.genesisDashboard.taskList.length === 0">
-          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
-            No tasks found. Submit tasks via the <code>task_submit</code> MCP tool.
-          </div>
-        </template>
-        <div class="activity-feed">
-          <template x-for="task in $store.genesisDashboard.taskList" :key="task.task_id">
-            <div>
-              <div class="activity-row"
-                   @click="$store.genesisDashboard.fetchTaskDetail(task.task_id)"
-                   style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;">
-                <!-- Phase badge -->
-                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
-                      :style="{
-                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
-                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
-                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
-                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                        'paused':    'background:rgba(255,167,38,0.15); color:#ffa726;',
-                        'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
-                        'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                      }[task.current_phase?.toLowerCase()] || 'background:rgba(33,150,243,0.15); color:#2196F3;'"
-                      x-text="task.current_phase || 'unknown'"></span>
-                <!-- Description -->
-                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
-                      x-text="task.description || task.task_id"></span>
-                <!-- Task ID -->
-                <span style="color:var(--color-text-secondary); font-size:0.65rem; font-family:monospace; flex-shrink:0;"
-                      x-text="task.task_id?.substring(0,10)"></span>
-                <!-- Timestamp -->
-                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
-                      x-text="$store.genesisDashboard.formatTime(task.created_at)"></span>
-                <!-- Expand arrow -->
-                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
-                      :style="$store.genesisDashboard.taskExpanded === task.task_id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
-              </div>
-
-              <!-- Expanded detail -->
-              <template x-if="$store.genesisDashboard.taskExpanded === task.task_id && $store.genesisDashboard.taskDetail">
-                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
-                  <!-- Actions bar -->
-                  <div style="display:flex; gap:0.3rem; margin-bottom:0.5rem;">
-                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
-                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'pause')"
-                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
-                                     background:rgba(255,167,38,0.1); color:#ffa726; border:1px solid rgba(255,167,38,0.2);">Pause</button>
-                    </template>
-                    <template x-if="task.current_phase?.toLowerCase() === 'paused'">
-                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'resume')"
-                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
-                                     background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">Resume</button>
-                    </template>
-                    <template x-if="$store.genesisDashboard.taskActive[task.task_id]">
-                      <button @click.stop="$store.genesisDashboard.taskAction(task.task_id, 'cancel')"
-                              style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;
-                                     background:rgba(239,154,154,0.1); color:#ef9a9a; border:1px solid rgba(239,154,154,0.2);">Cancel</button>
-                    </template>
-                  </div>
-                  <!-- Steps -->
-                  <div style="margin-top:0.3rem;">
-                    <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
-                    <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
-                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-                        <!-- Status icon -->
-                        <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
-                              :style="{
-                                'completed': 'color:#66bb6a',
-                                'executing': 'color:#2196F3',
-                                'failed':    'color:#ef9a9a',
-                                'pending':   'color:#9e9e9e',
-                                'blocked':   'color:#ffa726',
-                              }[step.status] || 'color:#9e9e9e'"
-                              x-text="{
-                                'completed': 'check_circle',
-                                'executing': 'sync',
-                                'failed':    'error',
-                                'pending':   'radio_button_unchecked',
-                                'blocked':   'block',
-                              }[step.status] || 'radio_button_unchecked'"></span>
-                        <div style="flex:1; min-width:0;">
-                          <div style="display:flex; justify-content:space-between; gap:0.5rem;">
-                            <span x-text="step.description || `Step ${step.step_idx}`" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></span>
-                            <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
-                                  x-text="step.step_type"></span>
-                          </div>
-                          <div style="display:flex; gap:0.5rem; color:var(--color-text-secondary); font-size:0.65rem; margin-top:0.1rem;">
-                            <span x-show="step.model_used" x-text="step.model_used"></span>
-                            <span x-show="step.cost_usd" x-text="'$' + step.cost_usd?.toFixed(4)"></span>
-                            <span x-show="step.started_at && step.completed_at"
-                                  x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
-                          </div>
-                          <!-- Result preview -->
-                          <template x-if="step.result_json && step.result_json.result">
-                            <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
-                                        font-family:monospace; font-size:0.65rem; max-height:80px; overflow:hidden; color:var(--color-text-secondary);"
-                                 x-text="(typeof step.result_json.result === 'string' ? step.result_json.result : JSON.stringify(step.result_json.result)).substring(0, 500)">
-                            </div>
-                          </template>
-                        </div>
-                      </div>
-                    </template>
-                    <template x-if="$store.genesisDashboard.taskDetailSteps.length === 0">
-                      <div style="color:var(--color-text-secondary); font-size:0.7rem; padding:0.3rem 0;">No steps recorded yet.</div>
-                    </template>
-                  </div>
-                  <!-- Blockers -->
-                  <template x-if="$store.genesisDashboard.taskDetail.blockers">
-                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15);">
-                      <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
-                      <div style="font-size:0.7rem; color:var(--color-text-secondary);"
-                           x-text="JSON.stringify($store.genesisDashboard.taskDetail.blockers)"></div>
-                    </div>
-                  </template>
                 </div>
               </template>
             </div>

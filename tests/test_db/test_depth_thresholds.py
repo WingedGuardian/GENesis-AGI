@@ -6,7 +6,7 @@ from genesis.db.crud import depth_thresholds
 async def test_get_existing(db):
     row = await depth_thresholds.get(db, "Micro")
     assert row is not None
-    assert row["threshold"] == 0.30
+    assert row["threshold"] == 0.50
     assert row["floor_seconds"] == 1800
 
 

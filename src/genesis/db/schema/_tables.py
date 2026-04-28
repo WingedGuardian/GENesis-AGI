@@ -745,13 +745,16 @@ TABLES = {
             confidence      REAL NOT NULL DEFAULT 0.0, -- 0.0-1.0
             urgency         TEXT NOT NULL DEFAULT 'normal' CHECK (urgency IN ('low', 'normal', 'high', 'critical')),
             alternatives    TEXT NOT NULL DEFAULT '',  -- what else was considered
-            status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'executed', 'failed')),
+            status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected', 'expired', 'executed', 'failed', 'tabled', 'withdrawn')),
             user_response   TEXT,                     -- rejection reason, approval notes
             cycle_id        TEXT,                     -- FK to ego_cycles.id
             batch_id        TEXT,                     -- groups proposals into digest batches
             created_at      TEXT NOT NULL,
             resolved_at     TEXT,
-            expires_at      TEXT                      -- auto-expiry timestamp
+            expires_at      TEXT,                     -- auto-expiry timestamp
+            rank            INTEGER,                  -- board position (lower = higher priority)
+            execution_plan  TEXT,                     -- dispatch instructions for approved proposals
+            recurring       INTEGER DEFAULT 0         -- 1 if ongoing/recurring commitment
         )
     """,
     "ego_state": """
@@ -1051,6 +1054,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_category ON ego_proposals(action_category, status)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
     # behavioral immune system (BIS)
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_theme ON behavioral_corrections(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_created ON behavioral_corrections(created_at)",
@@ -1116,7 +1120,7 @@ DEPTH_THRESHOLDS_SEED = [
     # Thresholds tuned 2026-03-21: originals (0.5/0.8/0.55) were too conservative,
     # producing only ~12 reflections across 6800 ticks.  Deep lowered to 0.45 to
     # encourage more frequent consolidation (design doc says 48-72h floor).
-    ("Micro", 0.30, 1800, 2, 3600),         # floor 30min, max 2/hr
+    ("Micro", 0.50, 1800, 2, 3600),         # floor 30min, max 2/hr
     ("Light", 0.60, 10800, 1, 3600),         # floor 3h, max 1/hr
     ("Deep", 0.45, 172800, 1, 86400),        # floor 48h, max 1/day
     ("Strategic", 0.40, 604800, 1, 604800),  # floor 7d, max 1/wk

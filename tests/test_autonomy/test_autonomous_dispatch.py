@@ -412,40 +412,144 @@ async def test_get_pending_count_counts_only_cli_fallback(
 
 
 @pytest.mark.asyncio
-async def test_find_existing_race_safety_fallback(
-    approval_gate, approval_manager,
+async def test_each_cli_tick_creates_new_approval_row(
+    runtime, approval_gate, approval_manager,
 ):
-    """_find_existing should also match pending rows by
-    (subsystem, policy_id) when the approval_key doesn't match.  Race
-    safety: two concurrent schedulers with slightly different content
-    hashes for the same call site should both find the first pending
-    row instead of creating duplicates."""
-    # First caller creates a pending approval with one prompt
+    """For autonomous_cli_fallback, each tick with different content
+    creates its own pending row + Telegram message.  Pass 2 (race-safety
+    dedup by subsystem/policy_id) is intentionally skipped so the user
+    sees every approval request."""
     _, first_id, _ = await approval_gate.ensure_approval(
-        subsystem="inbox", policy_id="inbox_evaluation",
-        action_label="inbox evaluation",
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
         invocation=_invocation(),
-        api_call_site_id=None, api_error=None,
+        api_call_site_id="7_ego_cycle", api_error=None,
     )
 
-    # Second caller has a slightly different invocation (different
-    # prompt → different approval_key) but the same (subsystem, policy_id).
-    # Without the race-safety fallback, this would create a new
-    # approval request.  With it, _find_existing returns the first row.
+    # Second call — different prompt (different approval_key), same site.
     different_invocation = CCInvocation(
-        prompt="race-safety: slightly different prompt content",
+        prompt="tick 2: different context, different prompt",
         model=CCModel.SONNET, effort=EffortLevel.HIGH,
         system_prompt="System",
     )
     status, second_id, reason = await approval_gate.ensure_approval(
-        subsystem="inbox", policy_id="inbox_evaluation",
-        action_label="inbox evaluation",
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
         invocation=different_invocation,
-        api_call_site_id=None, api_error=None,
+        api_call_site_id="7_ego_cycle", api_error=None,
     )
-    # The race-safety fallback returned the existing pending row
+    # Each tick creates its own row — NOT deduplicated
+    assert status == "pending"
+    assert second_id != first_id
+    assert "requested" in reason
+    # Two separate Telegram messages sent
+    assert len(runtime.pipeline.sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_sentinel_still_deduplicates_via_pass2(
+    runtime, approval_gate, approval_manager,
+):
+    """Sentinel action types retain Pass 2 dedup — alarm-based triggers
+    should NOT spam the user with duplicate messages for the same alarm."""
+    _, first_id, _ = await approval_gate.ensure_approval(
+        subsystem="sentinel", policy_id="sentinel_dispatch",
+        action_label="Sentinel dispatch: container OOM",
+        action_type="sentinel_dispatch",
+        invocation=None,
+        extra_context={
+            "tier_label": "Tier 2",
+            "trigger_source": "guardian",
+            "trigger_reason": "container OOM",
+            "alarm_count": 1,
+        },
+    )
+
+    # Second call — different extra_context (different approval_key)
+    # but same (subsystem, policy_id) and sentinel action_type.
+    status, second_id, reason = await approval_gate.ensure_approval(
+        subsystem="sentinel", policy_id="sentinel_dispatch",
+        action_label="Sentinel dispatch: container OOM again",
+        action_type="sentinel_dispatch",
+        invocation=None,
+        extra_context={
+            "tier_label": "Tier 2",
+            "trigger_source": "guardian",
+            "trigger_reason": "container OOM — second alarm",
+            "alarm_count": 2,
+        },
+    )
+    # Sentinel DOES deduplicate — Pass 2 still active
     assert status == "pending"
     assert second_id == first_id
+    # Only one Telegram message sent (first call)
+    assert len(runtime.pipeline.sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_approve_then_consume_one_per_tick(
+    runtime, approval_gate, approval_manager,
+):
+    """After batch-approve resolves multiple rows, ensure_approval finds
+    one approved row per call via Pass 3 (resume fallback), and
+    mark_consumed prevents double-dispatch."""
+    # Create 3 pending approvals with different prompts
+    ids = []
+    for i in range(3):
+        _, req_id, _ = await approval_gate.ensure_approval(
+            subsystem="ego", policy_id="ego_cycle",
+            action_label="ego cycle",
+            invocation=CCInvocation(
+                prompt=f"ego tick {i}",
+                model=CCModel.SONNET, effort=EffortLevel.HIGH,
+                system_prompt="sys",
+            ),
+            api_call_site_id="7_ego_cycle", api_error=None,
+        )
+        ids.append(req_id)
+
+    assert len(set(ids)) == 3  # all different
+
+    # Batch-approve all
+    count = await approval_gate.approve_all_pending(resolved_by="test:batch")
+    assert count == 3
+
+    # First tick after batch-approve — finds first unconsumed approved
+    status1, found_id1, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="post-approve tick 1",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle", api_error=None,
+    )
+    assert status1 == "approved"
+    assert found_id1 in ids
+
+    # Consume it atomically
+    consumed = await approval_gate.mark_consumed(found_id1)
+    assert consumed is True
+
+    # Second consume attempt fails (idempotent guard)
+    consumed_again = await approval_gate.mark_consumed(found_id1)
+    assert consumed_again is False
+
+    # Next tick — finds NEXT unconsumed approved row
+    status2, found_id2, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=CCInvocation(
+            prompt="post-approve tick 2",
+            model=CCModel.SONNET, effort=EffortLevel.HIGH,
+            system_prompt="sys",
+        ),
+        api_call_site_id="7_ego_cycle", api_error=None,
+    )
+    assert status2 == "approved"
+    assert found_id2 != found_id1
+    assert found_id2 in ids
 
 
 @pytest.mark.asyncio

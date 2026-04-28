@@ -1,0 +1,36 @@
+# Ego session configuration
+# The ego is Genesis's autonomous decision-making cycle.
+# All settings are tunable via settings_update("ego", {...})
+
+enabled: true
+
+# Scheduling
+cadence_minutes: 60          # base interval between cycles
+activity_threshold_minutes: 30  # min time since last user message
+max_interval_minutes: 240    # backoff cap (4 hours)
+backoff_multiplier: 2.0      # interval doubles on idle cycles
+
+# Model
+model: opus                  # default model for ego cycles
+
+# Effort
+default_effort: high         # effort for regular cycles (low/medium/high/max)
+morning_report_effort: low   # effort for morning reports
+
+# Proposals
+board_size: 3                # max active proposals on the bulletin board
+batch_digest: true           # send proposals as batch (vs individual)
+
+# Budget
+ego_thinking_budget_usd: 4.0  # daily cap for ego cycle (thinking) costs
+ego_dispatch_budget_usd: 2.50 # daily cap for dispatched background sessions
+
+# Morning report
+morning_report_hour: 8       # 24h format, local time
+morning_report_minute: 0
+morning_report_timezone: "UTC"
+shadow_morning_report: true  # shadow mode: separate topic for 2 weeks
+
+# Circuit breaker
+consecutive_failure_limit: 3
+failure_backoff_minutes: 60  # pause after N consecutive failures

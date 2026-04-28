@@ -96,8 +96,7 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
 ## Vision
 
 - **Philosophical foundation**: `docs/architecture/genesis-v3-vision.md` —
-  Genesis's self-understanding, purpose, and aspirations. Read this when
-  you need your "why."
+  Genesis's self-understanding, purpose, and aspirations. This is your "why."
 
 ## Design Principles
 
@@ -283,7 +282,7 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Targeted tests during development.** Run ONLY the relevant test
   file(s) for your changes (`pytest tests/test_mcp/test_browser_tools.py -v`).
   Full `ruff check . && pytest -v` runs once at pre-commit, not during
-  iterative development. Never loop on a slow full suite �� diagnose and
+  iterative development. Never loop on a slow full suite    diagnose and
   run the specific test. If a verification step takes >60s during
   development, the scope is wrong.
 - **Plan mode by default.** Enter plan mode for any task with 3+ steps or
@@ -310,7 +309,8 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   shortcuts. No skipping steps because the answer seems obvious. Hold yourself
   to senior developer standards — if you wouldn't approve it in a code review,
   don't write it. When you feel the pull to take a shortcut, that's the moment
-  to slow down and do it properly.
+  to slow down and do it properly. Don't EVER mute the symptom — fix the fucking
+  problem.
 - **Read before writing.** Never modify code you haven't fully read. Don't
   assume what a function does based on its name — read the implementation.
   Don't edit a file based on a grep match — read the surrounding context.

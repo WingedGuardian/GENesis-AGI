@@ -265,32 +265,10 @@ class CCReflectionBridge:
         session_id = f"api:{depth.value.lower()}"
         if self._autonomous_dispatcher is not None:
             reflection_policy_id = f"reflection_{depth.value.lower()}"
-            if not skip_approval:
-                # Call-site gating pre-check: if a reflection of this depth
-                # is already pending approval, skip scheduling a new one.
-                # Skipped when skip_approval=True (resume path — already approved).
-                try:
-                    pending = await (
-                        self._autonomous_dispatcher.approval_gate.find_site_pending(
-                            subsystem="reflection",
-                            policy_id=reflection_policy_id,
-                        )
-                    )
-                except Exception:
-                    logger.warning(
-                        "find_site_pending failed for %s; proceeding without pre-check",
-                        reflection_policy_id, exc_info=True,
-                    )
-                    pending = None
-                if pending is not None:
-                    logger.info(
-                        "%s reflection skipped — call site blocked on approval %s",
-                        depth.value.title(), pending.get("id"),
-                    )
-                    return ReflectionResult(
-                        success=False,
-                        reason=f"awaiting approval {pending.get('id')} for {depth.value} reflection",
-                    )
+            # Each reflection tick creates its own approval row + Telegram
+            # message. No find_site_pending pre-check — the approval gate
+            # handles dedup via Pass 1 (identical content) and resume via
+            # Pass 3 (approved-but-unconsumed rows).
 
             decision = await self._autonomous_dispatcher.route(
                 request=AutonomousDispatchRequest(

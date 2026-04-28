@@ -171,6 +171,8 @@ class GovernanceGate:
         window_hours = _DEDUP_WINDOWS.get(
             request.signal_type, _DEFAULT_DEDUP_HOURS
         )
+        if window_hours == 0:
+            return False
         window_spec = f"-{window_hours} hours"
 
         # Primary key: (signal_type, topic, category) within the window

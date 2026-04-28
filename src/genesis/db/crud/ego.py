@@ -182,6 +182,9 @@ async def create_proposal(
     batch_id: str | None = None,
     created_at: str | None = None,
     expires_at: str | None = None,
+    rank: int | None = None,
+    execution_plan: str | None = None,
+    recurring: bool = False,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -190,11 +193,13 @@ async def create_proposal(
         """INSERT INTO ego_proposals
            (id, action_type, action_category, content, rationale,
             confidence, urgency, alternatives, status, cycle_id,
-            batch_id, created_at, expires_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            batch_id, created_at, expires_at, rank, execution_plan,
+            recurring)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, action_type, action_category, content, rationale,
          confidence, urgency, alternatives, status, cycle_id,
-         batch_id, created_at, expires_at),
+         batch_id, created_at, expires_at, rank, execution_plan,
+         1 if recurring else 0),
     )
     await db.commit()
     return id
@@ -271,15 +276,85 @@ async def resolve_proposal(
     return cursor.rowcount > 0
 
 
-async def expire_proposals(db: aiosqlite.Connection, *, now: str) -> int:
-    """Bulk-expire pending proposals past their expires_at. Returns count."""
+async def execute_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    status: str,
+    user_response: str | None = None,
+) -> bool:
+    """Transition an approved proposal to executed or failed.
+
+    Only operates on proposals with status='approved'. Companion to
+    resolve_proposal (which operates on 'pending').
+    """
+    if status not in ("executed", "failed"):
+        raise ValueError(
+            f"execute_proposal status must be 'executed' or 'failed', got {status!r}"
+        )
     cursor = await db.execute(
-        "UPDATE ego_proposals SET status = 'expired', resolved_at = ? "
-        "WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?",
-        (now, now),
+        "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
+        "WHERE id = ? AND status = 'approved'",
+        (status, user_response, datetime.now(UTC).isoformat(), id),
     )
     await db.commit()
-    return cursor.rowcount
+    return cursor.rowcount > 0
+
+
+async def table_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+) -> bool:
+    """Move a pending proposal to 'tabled' status. Returns True if updated."""
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
+        "resolved_at = ? WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def withdraw_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+) -> bool:
+    """Move a pending proposal to 'withdrawn' status. Returns True if updated."""
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'withdrawn', rank = NULL, "
+        "resolved_at = ? WHERE id = ? AND status = 'pending'",
+        (datetime.now(UTC).isoformat(), id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_board(
+    db: aiosqlite.Connection,
+    *,
+    board_size: int = 3,
+) -> list[dict]:
+    """Active proposal board — pending proposals ordered by rank, capped.
+
+    Returns at most ``board_size`` pending proposals, ordered by rank
+    (NULLS LAST) then by creation time (newest first for unranked).
+    """
+    cursor = await db.execute(
+        "SELECT * FROM ego_proposals WHERE status = 'pending' "
+        "ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, rank ASC, "
+        "created_at DESC LIMIT ?",
+        (board_size,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
+    """All tabled proposals, newest first."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_proposals WHERE status = 'tabled' "
+        "ORDER BY resolved_at DESC",
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 async def get_batch_for_delivery(
@@ -323,3 +398,30 @@ async def daily_ego_cost(
     ) as cur:
         row = await cur.fetchone()
         return float(row[0]) if row else 0.0
+
+
+async def daily_dispatch_cost(
+    db: aiosqlite.Connection,
+    *,
+    date: str | None = None,
+) -> float:
+    """Sum cost_usd for ego-dispatched sessions created on the given date.
+
+    Queries cc_sessions WHERE source_tag='ego_dispatch'. Returns 0.0 if
+    no dispatched sessions found or if the cc_sessions table doesn't exist.
+    """
+    if date is None:
+        date = datetime.now(UTC).strftime("%Y-%m-%d")
+    try:
+        async with db.execute(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cc_sessions "
+            "WHERE source_tag = 'ego_dispatch' "
+            "AND started_at >= ? || 'T00:00:00' "
+            "AND started_at < ? || 'T00:00:00'",
+            (date, _next_date(date)),
+        ) as cur:
+            row = await cur.fetchone()
+            return float(row[0]) if row else 0.0
+    except Exception:
+        logger.warning("daily_dispatch_cost query failed", exc_info=True)
+        return 0.0

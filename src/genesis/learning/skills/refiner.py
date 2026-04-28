@@ -49,7 +49,7 @@ class SkillRefiner:
             logger.exception("Skill refiner LLM call failed")
             return None
 
-        return self._parse_response(report.skill_name, result.text)
+        return self._parse_response(report.skill_name, result.content)
 
     def _build_prompt(self, report: SkillReport, current_content: str) -> str:
         lines = len(current_content.splitlines())

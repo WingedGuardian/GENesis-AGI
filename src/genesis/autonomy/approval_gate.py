@@ -7,6 +7,7 @@ batch-approve, and re-ask cadence.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -95,6 +96,7 @@ class AutonomousCliApprovalGate:
         self._approval_manager = approval_manager
         self._policy_loader = policy_loader
         self._delivery_to_request: dict[str, str] = {}
+        self._approval_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     async def hydrate_delivery_map(self, db) -> int:
         """Rebuild _delivery_to_request from pending approvals in DB.
@@ -161,6 +163,34 @@ class AutonomousCliApprovalGate:
         if not policy.manual_approval_required:
             return ("approved", None, "manual approval disabled by config")
 
+        # Serialize per (subsystem, policy_id) — prevents duplicate rows
+        # from truly concurrent callers and ensures deterministic ordering
+        # for sequential Pass 3 consumption after batch-approve.
+        lock_key = (subsystem, policy_id)
+        if lock_key not in self._approval_locks:
+            self._approval_locks[lock_key] = asyncio.Lock()
+        async with self._approval_locks[lock_key]:
+            return await self._ensure_approval_locked(
+                subsystem=subsystem, policy_id=policy_id,
+                action_label=action_label, invocation=invocation,
+                api_call_site_id=api_call_site_id, api_error=api_error,
+                extra_context=extra_context, action_type=action_type,
+            )
+
+    async def _ensure_approval_locked(
+        self,
+        *,
+        subsystem: str,
+        policy_id: str,
+        action_label: str,
+        invocation: CCInvocation | None = None,
+        api_call_site_id: str | None = None,
+        api_error: str | None = None,
+        extra_context: dict[str, Any] | None = None,
+        action_type: str = "autonomous_cli_fallback",
+    ) -> tuple[str, str | None, str]:
+        """Inner approval logic, called under per-site lock."""
+        policy = self._policy()
         approval_key = _approval_key(
             subsystem=subsystem,
             policy_id=policy_id,
@@ -171,6 +201,7 @@ class AutonomousCliApprovalGate:
 
         existing = await self._find_existing(
             approval_key, subsystem=subsystem, policy_id=policy_id,
+            action_type=action_type,
         )
         if existing is not None:
             status = str(existing.get("status") or "pending")
@@ -353,6 +384,7 @@ class AutonomousCliApprovalGate:
         *,
         subsystem: str | None = None,
         policy_id: str | None = None,
+        action_type: str = "autonomous_cli_fallback",
     ) -> dict[str, Any] | None:
         """Find an existing approval request that matches this call.
 
@@ -361,12 +393,12 @@ class AutonomousCliApprovalGate:
         is instance-only — only pending or unconsumed-approved rows are
         reused for dedup.
 
-        Race-safety fallback: if no approval_key match and the caller
-        provided ``subsystem``/``policy_id``, also match any *pending* row
-        whose context has the same (subsystem, policy_id).  This catches
-        the case where two concurrent schedulers build slightly different
-        content hashes for the same call site and would otherwise each
-        create their own approval.
+        Race-safety fallback (sentinel only): if no approval_key match
+        and the caller provided ``subsystem``/``policy_id``, match any
+        *pending* row for the same site.  Skipped for
+        ``autonomous_cli_fallback`` — periodic ticks (ego, reflection)
+        intentionally create one approval row + Telegram message per tick
+        so the user sees every request.
 
         Resume fallback: match any *approved* row for the same site.
         This handles the approval-resume path: the user approved a
@@ -390,18 +422,26 @@ class AutonomousCliApprovalGate:
                     continue
                 return row
         # Pass 2: race-safety fallback — pending rows for the same site.
+        # Skipped for autonomous_cli_fallback: periodic ticks (ego,
+        # reflection) each create their own row + Telegram notification.
+        # Sentinel retains Pass 2 because alarm-based triggers should dedup.
+        if (
+            subsystem is not None
+            and policy_id is not None
+            and action_type != "autonomous_cli_fallback"
+        ):
+            for row in recent:
+                if str(row.get("status") or "") != "pending":
+                    continue
+                context = _json_loads(row.get("context"))
+                if (
+                    context.get("kind") == "autonomous_cli_fallback"
+                    and context.get("subsystem") == subsystem
+                    and context.get("policy_id") == policy_id
+                ):
+                    return row
         if subsystem is None or policy_id is None:
             return None
-        for row in recent:
-            if str(row.get("status") or "") != "pending":
-                continue
-            context = _json_loads(row.get("context"))
-            if (
-                context.get("kind") == "autonomous_cli_fallback"
-                and context.get("subsystem") == subsystem
-                and context.get("policy_id") == policy_id
-            ):
-                return row
         # Pass 3: resume fallback — unconsumed approved rows for the same site.
         for row in recent:
             if str(row.get("status") or "") != "approved":
