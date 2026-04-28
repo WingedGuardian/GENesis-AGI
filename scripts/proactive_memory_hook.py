@@ -96,6 +96,148 @@ _STOP_WORDS = frozenset({
 })
 
 
+# ---------------------------------------------------------------------------
+# Session intent trail — pivot detection + injection
+# ---------------------------------------------------------------------------
+
+_TRAIL_DIR = Path.home() / ".genesis" / "sessions"
+_PIVOT_SIMILARITY_THRESHOLD = 0.3
+_PIVOT_DEBOUNCE_MSGS = 3
+_MAX_TRAIL_DISPLAY = 8  # Show at most this many pivots in injected line
+
+
+def _trail_path(session_id: str) -> Path:
+    """Path to the intent trail file for a session."""
+    return _TRAIL_DIR / session_id / "intent_trail.json"
+
+
+def _load_trail(session_id: str) -> dict:
+    """Load intent trail from disk. Returns empty structure if missing."""
+    path = _trail_path(session_id)
+    try:
+        if path.exists():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {"session_id": session_id, "pivots": [], "last_keywords": [], "msg_count": 0}
+
+
+def _save_trail(session_id: str, trail: dict) -> None:
+    """Atomic write of intent trail to disk."""
+    path = _trail_path(session_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+        try:
+            os.write(fd, json.dumps(trail).encode())
+        finally:
+            os.close(fd)
+        os.replace(tmp, str(path))
+    except Exception:
+        pass  # Never block
+
+
+def _jaccard_similarity(a: list[str], b: list[str]) -> float:
+    """Jaccard similarity between two keyword lists."""
+    set_a, set_b = set(a), set(b)
+    if not set_a or not set_b:
+        return 0.0
+    intersection = set_a & set_b
+    union = set_a | set_b
+    return len(intersection) / len(union)
+
+
+def _detect_pivot(current_kw: list[str], trail: dict) -> bool:
+    """Detect whether the current message represents a topic pivot."""
+    if not current_kw:
+        return False
+    last_kw = trail.get("last_keywords", [])
+    if not last_kw:
+        # First message with keywords — always a pivot (initial topic)
+        return True
+    # Debounce: require minimum messages between pivots
+    msg_count = trail.get("msg_count", 0)
+    pivots = trail.get("pivots", [])
+    if pivots:
+        last_pivot_msg = pivots[-1].get("at_msg", 0)
+        if msg_count - last_pivot_msg < _PIVOT_DEBOUNCE_MSGS:
+            return False
+    similarity = _jaccard_similarity(current_kw, last_kw)
+    return similarity < _PIVOT_SIMILARITY_THRESHOLD
+
+
+def _record_pivot_observation(
+    db_path: Path, session_id: str, label: str, trigger: str,
+) -> None:
+    """Write a conversation_pivot observation to the DB."""
+    try:
+        import uuid as _uuid
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.execute(
+                "INSERT INTO observations (id, source, type, content, priority, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _uuid.uuid4().hex,
+                    f"session:{session_id}",
+                    "conversation_pivot",
+                    f"Conversation pivot: {label}. Trigger: {trigger[:80]}",
+                    "low",
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Never block
+
+
+def _update_and_format_trail(
+    session_id: str, keywords: list[str], prompt: str,
+) -> str | None:
+    """Update intent trail and return formatted line for injection.
+
+    Returns None if trail has fewer than 2 pivots (not useful yet).
+    """
+    if not session_id:
+        return None
+
+    trail = _load_trail(session_id)
+    trail["msg_count"] = trail.get("msg_count", 0) + 1
+
+    # Only consider prompt-derived keywords (not file keywords) for pivots
+    prompt_keywords = _extract_keywords(prompt)
+
+    if _detect_pivot(prompt_keywords, trail):
+        label = " ".join(prompt_keywords[:4])
+        pivot = {
+            "idx": len(trail["pivots"]),
+            "label": label,
+            "ts": datetime.now(UTC).isoformat(),
+            "trigger": prompt[:80],
+            "at_msg": trail["msg_count"],
+        }
+        trail["pivots"].append(pivot)
+        _record_pivot_observation(_DB_PATH, session_id, label, prompt)
+
+    if prompt_keywords:
+        trail["last_keywords"] = prompt_keywords
+
+    _save_trail(session_id, trail)
+
+    # Format output — only show if 2+ pivots
+    pivots = trail.get("pivots", [])
+    if len(pivots) < 2:
+        return None
+
+    # Show last N pivots to keep the line compact
+    display = pivots[-_MAX_TRAIL_DISPLAY:]
+    labels = [p["label"] for p in display]
+    prefix = "… → " if len(pivots) > _MAX_TRAIL_DISPLAY else ""
+    return f"[Session trail] {prefix}{' → '.join(labels)}"
+
+
 def _is_garbage(content: str) -> bool:
     """Filter out content that should never surface as proactive memory."""
     if "<external-content" in content:
@@ -767,6 +909,15 @@ async def _run(prompt: str, session_id: str = "") -> None:
     heartbeat_ms += _heartbeat_read_and_inject(_DB_PATH, session_id)
 
     keywords = _extract_keywords(prompt)
+
+    # ── Session intent trail (runs on every message, even short ones) ─
+    try:
+        trail_line = _update_and_format_trail(session_id, keywords, prompt)
+        if trail_line:
+            print(trail_line)
+            sys.stdout.flush()
+    except Exception:
+        pass  # Intent trail must never block the hook
 
     # Augment keywords with file-context from PostToolUse tracking
     recent_files = _load_recent_files(session_id)
