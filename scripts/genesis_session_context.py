@@ -329,7 +329,11 @@ def main() -> None:
                 "health_status/health_errors/health_alerts, "
                 "session_set_model/session_set_effort, "
                 "outreach_queue/outreach_digest, recon tools, "
-                "bookmark_shelve/bookmark_unshelve."
+                "bookmark_shelve/bookmark_unshelve.\n\n"
+                "**Skill Library:** Browse `src/genesis/skills/` or "
+                "`~/.genesis/skill-library/` for specialized skills "
+                "(research, outreach, browser automation, etc.). "
+                "The skill injection hook nudges you when one matches."
             )
             _emit("\n".join(lines))
         except Exception:

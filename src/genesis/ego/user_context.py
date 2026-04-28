@@ -359,11 +359,12 @@ class UserEgoContextBuilder:
             lines.append("*No follow-ups requiring attention.*\n")
             return "\n".join(lines)
 
-        # Filter to user-relevant follow-ups
+        # Filter to user-relevant follow-ups (pinned items always shown)
         user_relevant = [
             fu for fu in actionable
             if fu.get("strategy") in ("ego_judgment", "user_input_needed")
             or fu.get("priority") in ("high", "critical")
+            or fu.get("pinned")
         ]
 
         if not user_relevant:
@@ -383,7 +384,8 @@ class UserEgoContextBuilder:
             strategy = fu.get("strategy", "?")
             blocked = fu.get("blocked_reason", "")
 
-            line = f"- [id:{fid}] [{priority}/{status}] **{strategy}**: {content}"
+            pin_tag = " [pinned]" if fu.get("pinned") else ""
+            line = f"- [id:{fid}] [{priority}/{status}]{pin_tag} **{strategy}**: {content}"
             if blocked:
                 line += f" — BLOCKED: {blocked[:100]}"
             lines.append(line)

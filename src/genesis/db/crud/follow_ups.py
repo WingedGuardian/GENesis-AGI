@@ -35,6 +35,7 @@ async def create(
     source_session: str | None = None,
     scheduled_at: str | None = None,
     priority: str = "medium",
+    pinned: bool = False,
     id: str | None = None,
 ) -> str:
     """Create a follow-up and return its ID."""
@@ -42,10 +43,11 @@ async def create(
     await db.execute(
         """INSERT INTO follow_ups
            (id, source, source_session, content, reason, strategy,
-            scheduled_at, status, priority, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+            scheduled_at, status, priority, pinned, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
         (fid, source, source_session, content, reason, strategy,
-         _normalize_scheduled_at(scheduled_at), priority, _now_iso()),
+         _normalize_scheduled_at(scheduled_at), priority, int(pinned),
+         _now_iso()),
     )
     await db.commit()
     return fid
@@ -187,6 +189,20 @@ async def escalate(
     cursor = await db.execute(
         "UPDATE follow_ups SET escalated_to = ? WHERE id = ?",
         (target, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def set_pinned(
+    db: aiosqlite.Connection,
+    id: str,
+    pinned: bool,
+) -> bool:
+    """Pin or unpin a follow-up."""
+    cursor = await db.execute(
+        "UPDATE follow_ups SET pinned = ? WHERE id = ?",
+        (int(pinned), id),
     )
     await db.commit()
     return cursor.rowcount > 0

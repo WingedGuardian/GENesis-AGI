@@ -91,6 +91,16 @@ class EgoDispatcher:
             resolution = item.get("resolution", "Resolved by ego")
             if not fid:
                 continue
+            # Pinned follow-ups cannot be auto-resolved by ego — only the
+            # user can close them.  Ego can still report on them but the
+            # status transition is blocked here.
+            existing = await follow_up_crud.get_by_id(self._db, fid)
+            if existing and existing.get("pinned"):
+                logger.info(
+                    "Follow-up %s is pinned — ego cannot auto-resolve (cycle %s)",
+                    fid, cycle_id,
+                )
+                continue
             ok = await follow_up_crud.update_status(
                 self._db,
                 fid,

@@ -257,7 +257,8 @@ class GenesisEgoContextBuilder:
             content = content.replace("\n", " ")
             strategy = fu.get("strategy", "?")
 
-            lines.append(f"- [id:{fid}] [{priority}/{status}] **{strategy}**: {content}")
+            pin_tag = " [pinned]" if fu.get("pinned") else ""
+            lines.append(f"- [id:{fid}] [{priority}/{status}]{pin_tag} **{strategy}**: {content}")
 
         lines.append("")
         return "\n".join(lines)

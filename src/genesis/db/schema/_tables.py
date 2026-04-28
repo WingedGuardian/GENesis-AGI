@@ -874,7 +874,8 @@ TABLES = {
             blocked_reason   TEXT,
             escalated_to     TEXT,
             verified_at      TEXT,
-            verification_notes TEXT
+            verification_notes TEXT,
+            pinned           INTEGER NOT NULL DEFAULT 0
         )
     """,
     "file_modifications": """
