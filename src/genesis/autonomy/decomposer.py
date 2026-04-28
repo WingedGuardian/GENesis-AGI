@@ -47,9 +47,15 @@ class TaskDecomposer:
         *,
         router: _Router,
         invoker: CCInvoker | None = None,
+        db: Any | None = None,
+        memory_store: Any | None = None,
+        retriever: Any | None = None,
     ) -> None:
         self._router = router
         self._invoker = invoker
+        self._db = db
+        self._memory_store = memory_store
+        self._retriever = retriever
 
     async def decompose(
         self,
@@ -65,7 +71,25 @@ class TaskDecomposer:
         route_call if invoker unavailable or fails, then to a single
         verification step on total failure.
         """
-        prompt = self._build_prompt(plan_content, task_description)
+        # Gather resource inventory for the decomposer
+        resource_appendix = ""
+        if self._db is not None or self._retriever is not None:
+            try:
+                from genesis.autonomy.executor.resources import (
+                    gather_resource_inventory,
+                )
+
+                resource_appendix = await gather_resource_inventory(
+                    self._db, self._memory_store, self._retriever,
+                    task_description,
+                )
+            except Exception:
+                logger.debug(
+                    "Resource inventory gathering failed, proceeding without",
+                    exc_info=True,
+                )
+
+        prompt = self._build_prompt(plan_content, task_description, resource_appendix)
 
         # Primary path: CC invoker (Sonnet)
         if self._invoker is not None:
@@ -130,7 +154,12 @@ class TaskDecomposer:
             return None
         return output.text
 
-    def _build_prompt(self, plan_content: str, task_description: str) -> str:
+    def _build_prompt(
+        self,
+        plan_content: str,
+        task_description: str,
+        resource_appendix: str = "",
+    ) -> str:
         """Build the decomposition prompt from the identity template + plan."""
         template = ""
         try:
@@ -154,8 +183,16 @@ class TaskDecomposer:
             "## Plan Document",
             plan_content,
             "",
-            "Respond with ONLY the JSON array of steps. No other text.",
         ])
+
+        if resource_appendix:
+            parts.extend([
+                "## Available Resources",
+                resource_appendix,
+                "",
+            ])
+
+        parts.append("Respond with ONLY the JSON array of steps. No other text.")
         return "\n".join(parts)
 
     def _parse_response(self, content: str) -> list[dict] | None:
@@ -218,6 +255,21 @@ class TaskDecomposer:
                 ),
                 "complexity": complexity,
                 "dependencies": deps,
+                "skills": (
+                    step.get("skills")
+                    if isinstance(step.get("skills"), list)
+                    else []
+                ),
+                "procedures": (
+                    step.get("procedures")
+                    if isinstance(step.get("procedures"), list)
+                    else []
+                ),
+                "mcp_guidance": (
+                    step.get("mcp_guidance")
+                    if isinstance(step.get("mcp_guidance"), list)
+                    else []
+                ),
             })
 
         # Ensure last step is verification (append if not)

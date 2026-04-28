@@ -44,6 +44,13 @@ If blocked:
 }
 ```
 
+## Resources
+
+If a "Resources for This Step" section appears below, it contains skills,
+procedures, and guidance specifically assigned to this step during planning.
+Use them --- they represent Genesis's accumulated experience with this kind
+of work.
+
 ## Constraints by Step Type
 
 - **research**: Do not modify files. Read, search, fetch only.

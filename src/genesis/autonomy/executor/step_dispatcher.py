@@ -131,7 +131,18 @@ class StepDispatcher:
         except ValueError:
             step_type = StepType.CODE
 
-        prompt = _dispatch.build_step_prompt(step, prior_results, workaround)
+        # Load assigned resources (skills, procedures) for this step
+        resources: str | None = None
+        try:
+            from genesis.autonomy.executor.resources import load_step_resources
+
+            resources = await load_step_resources(self._db, step)
+        except Exception:
+            logger.debug("Step resource loading failed", exc_info=True)
+
+        prompt = _dispatch.build_step_prompt(
+            step, prior_results, workaround, resources=resources,
+        )
 
         # CODE steps use worktree working directory (Amendment #7)
         working_dir: str | None = None

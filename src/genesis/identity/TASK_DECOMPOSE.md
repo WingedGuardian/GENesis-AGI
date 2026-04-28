@@ -15,10 +15,26 @@ Respond with a JSON array of steps. Each step has these fields:
     "description": "What this step accomplishes",
     "required_tools": ["list", "of", "tool", "names"],
     "complexity": "low|medium|high",
-    "dependencies": []
+    "dependencies": [],
+    "skills": ["skill-name"],
+    "procedures": ["procedure-task-type"],
+    "mcp_guidance": ["category"]
   }
 ]
 ```
+
+### Resource Assignment Fields (optional)
+
+If an "Available Resources" section is provided below, you may assign
+resources to steps that would genuinely benefit from them:
+
+- **skills**: skill names from the catalog to inject as step guidance
+- **procedures**: procedure task-types to inject as learned patterns
+- **mcp_guidance**: MCP tool categories relevant to the step
+
+Most steps need zero resources. Only assign what is genuinely useful ---
+don't assign everything to everything. Omit these fields entirely if
+a step needs no special resources.
 
 ## Step Types
 

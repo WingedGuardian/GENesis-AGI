@@ -383,6 +383,13 @@ call_sites:
     - mistral-large-free
     - gemini-free
     description: Extract reusable procedures from interaction outcomes
+  43_task_retrospective:
+    chain:
+    - openrouter-deepseek-v4
+    - mistral-large-free
+    - gemini-free
+    default_paid: true
+    description: Post-execution retrospective learning extraction
   35_content_draft:
     chain:
     - gemini-free

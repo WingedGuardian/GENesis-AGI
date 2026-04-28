@@ -35,7 +35,13 @@ async def init(rt: GenesisRuntime) -> None:
             return
 
         # Build components
-        decomposer = TaskDecomposer(router=rt._router, invoker=rt._cc_invoker)
+        decomposer = TaskDecomposer(
+            router=rt._router,
+            invoker=rt._cc_invoker,
+            db=rt._db,
+            memory_store=getattr(rt, "_memory_store", None),
+            retriever=getattr(rt, "_hybrid_retriever", None),
+        )
         reviewer = TaskReviewer(
             router=rt._router,
             invoker=rt._cc_invoker,
@@ -44,6 +50,7 @@ async def init(rt: GenesisRuntime) -> None:
         tracer = ExecutionTracer(
             db=rt._db,
             memory_store=getattr(rt, "_memory_store", None),
+            router=rt._router,
         )
 
         executor = CCSessionExecutor(
