@@ -68,6 +68,10 @@ class PublishResult:
     content_text: str
     published_at: str | None = None
     status: str = "draft"  # draft | scheduled | published | failed
+    platform_post_id: str | None = None
+    post_url: str | None = None
+    error_message: str | None = None
+    distributed_at: str | None = None
 
 
 @dataclass

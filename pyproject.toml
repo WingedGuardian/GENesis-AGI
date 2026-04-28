@@ -37,6 +37,9 @@ browser = [
     "playwright>=1.40",
     "camoufox>=0.4",
 ]
+distribution = [
+    "composio-client>=1.33.0",
+]
 release = []  # detect-secrets is now a core dep (see dependencies above)
 
 [build-system]

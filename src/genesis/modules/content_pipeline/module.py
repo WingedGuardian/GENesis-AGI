@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from genesis.distribution.config import load_distribution_config
+from genesis.distribution.manager import DistributionManager
 from genesis.modules.content_pipeline.analytics import AnalyticsTracker
 from genesis.modules.content_pipeline.idea_bank import IdeaBank
 from genesis.modules.content_pipeline.planner import ContentPlanner
@@ -34,6 +36,7 @@ class ContentPipelineModule:
         self.script_engine: ScriptEngine | None = None
         self.publisher: PublishManager | None = None
         self.analytics: AnalyticsTracker | None = None
+        self.distribution: DistributionManager | None = None
 
         # Sub-feature toggles (all off by default)
         self._auto_capture_recon: bool = False
@@ -104,6 +107,10 @@ class ContentPipelineModule:
         self.publisher = PublishManager(db)
         self.analytics = AnalyticsTracker(db)
 
+        # Initialize distribution — gracefully degrades if COMPOSIO_API_KEY
+        # is missing or config isn't set up yet.
+        self.distribution = self._init_distribution(db)
+
         logger.info("Content pipeline module registered")
 
     async def deregister(self) -> None:
@@ -114,7 +121,36 @@ class ContentPipelineModule:
         self.script_engine = None
         self.publisher = None
         self.analytics = None
+        self.distribution = None
         logger.info("Content pipeline module deregistered")
+
+    def _init_distribution(self, db: Any) -> DistributionManager:
+        """Initialize the distribution manager with available platform adapters.
+
+        Gracefully degrades — if Composio isn't configured, LinkedIn
+        distribution is simply unavailable. The module still works for
+        everything else (idea capture, drafting, analytics).
+        """
+        config = load_distribution_config()
+        manager = DistributionManager(db=db)
+
+        try:
+            from genesis.distribution.linkedin import LinkedInDistributor
+
+            linkedin = LinkedInDistributor(config=config.linkedin)
+            if linkedin.available:
+                manager.register(linkedin)
+            else:
+                logger.info("LinkedIn distributor not available (missing credentials or config)")
+        except Exception:
+            logger.info("LinkedIn distribution not available", exc_info=True)
+
+        if manager.available_platforms:
+            logger.info("Distribution available for: %s", ", ".join(manager.available_platforms))
+        else:
+            logger.info("No distribution platforms configured — distribution disabled")
+
+        return manager
 
     def get_research_profile_name(self) -> str | None:
         return "content-pipeline"
