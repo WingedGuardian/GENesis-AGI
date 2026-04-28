@@ -73,6 +73,27 @@ changes: verify the notification actually arrives. Ask: "If the system
 restarts right now, will this actually work?" If you can't answer yes
 with evidence, you're not done.
 
+### Use GitNexus for Structural Code Intelligence
+
+GitNexus provides graph-based code intelligence that Grep/Serena cannot:
+multi-hop call chains, blast radius, execution flows, coupling analysis.
+
+**Before editing:** `gitnexus impact <symbol>` — check blast radius.
+Use full UID if ambiguous (e.g., `Method:path/file.py:Class.method#N`).
+
+**Before committing:** `gitnexus detect-changes` — verify you haven't
+missed dependent symbols.
+
+**Understanding unfamiliar code:** `gitnexus context <symbol>` for 360°
+view, or browse processes via `gitnexus://repo/GENesis-AGI/processes`.
+
+**Custom questions:** `gitnexus cypher` for raw graph queries. Note:
+LadybugDB uses `CodeRelation` with a `type` property for edges, not
+Neo4j-style named edge labels.
+
+Full syntax, Cypher examples, and decision matrix:
+`.claude/docs/code-intelligence-guide.md`
+
 ### Common Traps
 
 - **Ego sessions are inert.** `src/genesis/ego/` exists but has zero
