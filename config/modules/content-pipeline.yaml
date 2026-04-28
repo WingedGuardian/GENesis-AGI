@@ -1,7 +1,15 @@
 name: content_pipeline
+display_name: "Content Pipeline"
 type: native
 class: genesis.modules.content_pipeline.module.ContentPipelineModule
 description: >
   Content Pipeline — idea capture, weekly planning, voice-calibrated
   script drafting, multi-platform publishing, and analytics feedback loop.
+category: content
+tags:
+  - content
+  - publishing
+  - drafting
+version: "1.0.0"
 enabled: true
+research_profile: null

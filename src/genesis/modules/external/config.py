@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from genesis.modules.config_schema import ConfigField, infer_field_type
+
 
 @dataclass
 class HealthCheckConfig:
@@ -45,16 +47,34 @@ class LifecycleConfig:
 class ProgramConfig:
     """Full configuration for an external program module.
 
-    Loaded from YAML files in config/external-modules/.
+    Loaded from YAML files in config/modules/.
+
+    Config field schema is stored in ``config_fields`` (list of ConfigField).
+    Live/mutable values are stored in ``configurable`` (dict) which is
+    initialized from field defaults and updated by ``update_config()``.
+
+    Legacy YAML with ``configurable: {key: value}`` is auto-converted to
+    a ``config_fields`` list with inferred types.
+
+    New YAML with ``config_fields: [...]`` uses the full typed schema.
     """
 
     name: str
     description: str = ""
+    # Identity / display fields (shown in dashboard)
+    display_name: str = ""
+    category: str = ""
+    tags: list[str] = field(default_factory=list)
+    version: str = ""
+    # Connectivity
     ipc: IPCConfig = field(default_factory=IPCConfig)
     health_check: HealthCheckConfig | None = None
     lifecycle: LifecycleConfig | None = None
     research_profile: str | None = None
     enabled: bool = False
+    # Typed field schema (source of truth for field metadata)
+    config_fields: list[ConfigField] = field(default_factory=list)
+    # Live mutable values (keyed by field name, initialized from defaults)
     configurable: dict[str, Any] = field(default_factory=dict)
     operations: dict[str, dict] = field(default_factory=dict)
 
@@ -92,14 +112,42 @@ class ProgramConfig:
                 logs_cmd=lc_data.get("logs_cmd"),
             )
 
+        # Config fields: prefer new typed schema, fall back to legacy configurable dict
+        raw_config_fields = data.get("config_fields", [])
+        legacy_configurable = data.get("configurable", {})
+
+        if raw_config_fields:
+            config_fields = [ConfigField.from_dict(f) for f in raw_config_fields]
+        elif legacy_configurable:
+            # Auto-convert legacy {key: default_value} to ConfigField list
+            config_fields = [
+                ConfigField(
+                    name=k,
+                    type=infer_field_type(v),
+                    label=k.replace("_", " ").title(),
+                    default=v,
+                )
+                for k, v in legacy_configurable.items()
+            ]
+        else:
+            config_fields = []
+
+        # Initialize live values from field defaults
+        configurable = {f.name: f.default for f in config_fields}
+
         return cls(
             name=data["name"],
             description=data.get("description", ""),
+            display_name=data.get("display_name", ""),
+            category=data.get("category", ""),
+            tags=data.get("tags", []),
+            version=data.get("version", ""),
             ipc=ipc,
             health_check=health_check,
             lifecycle=lifecycle,
             research_profile=data.get("research_profile"),
             enabled=data.get("enabled", False),
-            configurable=data.get("configurable", {}),
+            config_fields=config_fields,
+            configurable=configurable,
             operations=data.get("operations", {}),
         )

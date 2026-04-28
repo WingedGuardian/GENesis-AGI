@@ -17,6 +17,37 @@ _MODULE_CALL_SITES: dict[str, list[str]] = {
     # prediction_markets and crypto_ops: add call sites when enabled and routed
 }
 
+def _validate_config_update(fields: list[dict], updates: dict) -> list[str]:
+    """Pre-validate config updates against the field schema.
+
+    Checks required, numeric min/max, and type coercibility.
+    Returns a list of error strings (empty = no errors).
+    Modules still own cross-field validation in update_config().
+    """
+    schema = {f["name"]: f for f in fields}
+    errors = []
+    for field_name, value in updates.items():
+        f = schema.get(field_name)
+        if f is None:
+            continue  # Unknown fields pass through — module decides
+        if f.get("required") and (value is None or value == ""):
+            errors.append(f"{field_name} is required")
+            continue
+        field_type = f.get("type")
+        if field_type in ("int", "float") and value is not None:
+            try:
+                v = float(value)
+                mn = f.get("min")
+                mx = f.get("max")
+                if mn is not None and v < mn:
+                    errors.append(f"{field_name} must be >= {mn}")
+                if mx is not None and v > mx:
+                    errors.append(f"{field_name} must be <= {mx}")
+            except (ValueError, TypeError):
+                errors.append(f"{field_name} must be a number")
+    return errors
+
+
 def _get_module_description(mod) -> str:
     """Get description from module — YAML-sourced for both native and external."""
     from genesis.modules.external.adapter import ExternalProgramAdapter
@@ -27,6 +58,25 @@ def _get_module_description(mod) -> str:
     if isinstance(desc, str) and desc:
         return desc
     return ""
+
+
+def _get_identity_fields(mod) -> dict:
+    """Extract display_name, category, tags, version from a module instance."""
+    from genesis.modules.external.adapter import ExternalProgramAdapter
+    if isinstance(mod, ExternalProgramAdapter):
+        cfg = mod.config
+        return {
+            "display_name": cfg.display_name or mod.name,
+            "category": cfg.category,
+            "tags": cfg.tags,
+            "version": cfg.version,
+        }
+    return {
+        "display_name": getattr(mod, "_display_name", None) or mod.name,
+        "category": getattr(mod, "_category", ""),
+        "tags": getattr(mod, "_tags", []),
+        "version": getattr(mod, "_version", ""),
+    }
 
 
 @blueprint.route("/api/genesis/modules")
@@ -52,6 +102,7 @@ async def modules_list():
             "description": _get_module_description(mod),
             "research_profile": mod.get_research_profile_name(),
             "type": "native",
+            **_get_identity_fields(mod),
         }
 
         # Enrich external modules with adapter-specific data
@@ -77,7 +128,14 @@ async def modules_list():
             try:
                 fields = mod.configurable_fields()
                 if isinstance(fields, list):
-                    entry["config_fields"] = fields
+                    # Mask value/default for secret and sensitive fields — never
+                    # expose credentials in the API response even in read-only form.
+                    masked = []
+                    for f in fields:
+                        if f.get("type") == "secret" or f.get("sensitive"):
+                            f = {**f, "value": None, "default": None}
+                        masked.append(f)
+                    entry["config_fields"] = masked
             except Exception:
                 pass
 
@@ -286,9 +344,20 @@ async def module_config(name: str):
         return jsonify({"status": "error", "message": f"module '{name}' has no configurable fields"}), 400
 
     data = request.get_json(silent=True) or {}
+
+    # Framework pre-validation: enforce min/max/required from the field schema
+    # before delegating to the module. Modules still handle cross-field logic.
+    if hasattr(mod, "configurable_fields") and callable(mod.configurable_fields):
+        try:
+            schema_errors = _validate_config_update(mod.configurable_fields(), data)
+            if schema_errors:
+                return jsonify({"status": "error", "message": "; ".join(schema_errors)}), 400
+        except Exception:
+            logger.debug("Config schema pre-validation failed for %s", name, exc_info=True)
+
     try:
         new_config = mod.update_config(data)
-        logger.info("Module '%s' config updated via dashboard: %s", name, data)
+        logger.info("Module '%s' config updated via dashboard: fields=%s", name, list(data.keys()))
 
         if rt.db is not None:
             await save_module_state(rt.db, name, config_json=json.dumps(new_config))

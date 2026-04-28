@@ -1,4 +1,5 @@
 name: prediction_markets
+display_name: "Prediction Markets"
 type: native
 class: genesis.modules.prediction_markets.module.PredictionMarketsModule
 description: >
@@ -6,4 +7,11 @@ description: >
   Tetlock/GJP superforecasting methodology. Scans markets (Polymarket,
   Metaculus, Kalshi), estimates probabilities, sizes positions via
   fractional Kelly criterion, tracks outcomes with Brier scores.
+category: analytics
+tags:
+  - prediction-markets
+  - forecasting
+  - kelly
+version: "1.0.0"
 enabled: false
+research_profile: null

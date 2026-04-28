@@ -132,17 +132,12 @@ class ExternalProgramAdapter:
         return None
 
     def configurable_fields(self) -> list[dict[str, Any]]:
-        """Return user-editable fields from config."""
-        fields = []
-        for key, value in self._config.configurable.items():
-            fields.append({
-                "name": key,
-                "label": key.replace("_", " ").title(),
-                "type": type(value).__name__,
-                "value": value,
-                "description": "",
-            })
-        return fields
+        """Return user-editable fields from config, with live values."""
+        result = []
+        for f in self._config.config_fields:
+            live_value = self._config.configurable.get(f.name, f.default)
+            result.append(f.to_dict(value=live_value))
+        return result
 
     def update_config(self, updates: dict[str, Any]) -> dict[str, Any]:
         """Update configurable fields."""

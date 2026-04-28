@@ -227,13 +227,17 @@ class PredictionMarketsModule:
         """Return user-editable configuration fields."""
         return [
             {"name": "bankroll", "label": "Bankroll ($)", "type": "float",
-             "value": self._sizer.bankroll, "description": "Total bankroll for position sizing"},
+             "value": self._sizer.bankroll, "default": 1000.0, "min": 0.01,
+             "description": "Total bankroll for position sizing"},
             {"name": "kelly_fraction", "label": "Kelly Fraction", "type": "float",
-             "value": self._sizer._kelly_fraction, "description": "Fraction of Kelly criterion (0-1)"},
+             "value": self._sizer._kelly_fraction, "default": 0.25, "min": 0.01, "max": 1.0,
+             "description": "Fraction of Kelly criterion (0-1)"},
             {"name": "max_position_pct", "label": "Max Position %", "type": "float",
-             "value": self._sizer._max_position_pct, "description": "Max % of bankroll per position"},
+             "value": self._sizer._max_position_pct, "default": 0.10, "min": 0.01, "max": 1.0,
+             "description": "Max % of bankroll per position"},
             {"name": "min_edge", "label": "Min Edge", "type": "float",
-             "value": self._sizer._min_edge, "description": "Minimum edge to recommend a bet"},
+             "value": self._sizer._min_edge, "default": 0.05, "min": 0.0, "max": 1.0,
+             "description": "Minimum edge to recommend a bet"},
         ]
 
     def update_config(self, updates: dict) -> dict:

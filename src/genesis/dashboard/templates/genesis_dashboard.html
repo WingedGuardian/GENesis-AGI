@@ -6702,10 +6702,14 @@
             <template x-if="($store.genesisDashboard.selectedModule.config_fields || []).length > 0">
               <div style="margin-bottom: 0.75rem;">
                 <div style="font-weight: 600; font-size: 0.78rem; color: #aaa; margin-bottom: 0.4rem;">Configuration</div>
-                <div style="display: grid; gap: 0.4rem;" x-data="{ saving: false, saved: false }">
+                <div style="display: grid; gap: 0.4rem;" x-data="{ saving: false, saved: false, saveError: '' }">
                   <template x-for="field in $store.genesisDashboard.selectedModule.config_fields" :key="field.name">
                     <div style="display: flex; align-items: center; gap: 0.5rem; font-size: 0.78rem;">
-                      <label style="min-width: 140px; color: #ccc;" x-text="field.label" :title="field.description"></label>
+                      <!-- Label — asterisk for required fields -->
+                      <label style="min-width: 140px; color: #ccc;" :title="field.description">
+                        <span x-text="field.label"></span>
+                        <template x-if="field.required"><span style="color: #ef9a9a; margin-left: 2px;">*</span></template>
+                      </label>
                       <!-- Bool: toggle switch -->
                       <template x-if="field.type === 'bool'">
                         <label style="position: relative; display: inline-block; width: 36px; height: 20px; cursor: pointer;">
@@ -6725,27 +6729,89 @@
                                style="width: 200px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;"
                                placeholder="comma-separated values">
                       </template>
-                      <!-- Number: int/float -->
-                      <template x-if="field.type !== 'bool' && field.type !== 'list'">
+                      <!-- Str: plain text input -->
+                      <template x-if="field.type === 'str'">
+                        <input type="text"
+                               :value="field.value"
+                               @change="field.value = $el.value"
+                               :placeholder="field.default !== undefined && field.default !== null ? String(field.default) : ''"
+                               style="width: 200px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
+                      </template>
+                      <!-- Secret: masked input, never pre-populated -->
+                      <template x-if="field.type === 'secret'">
+                        <input type="password"
+                               placeholder="••••••••"
+                               @change="field.value = $el.value"
+                               autocomplete="new-password"
+                               style="width: 200px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
+                      </template>
+                      <!-- Enum: select dropdown -->
+                      <template x-if="field.type === 'enum'">
+                        <select :value="field.value" @change="field.value = $el.value"
+                                style="width: 200px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(30,30,30,0.9); color: #e0e0e0; font-size: 0.78rem;">
+                          <template x-for="opt in (field.options || [])" :key="opt.value">
+                            <option :value="opt.value" :selected="opt.value == field.value" x-text="opt.label"></option>
+                          </template>
+                        </select>
+                      </template>
+                      <!-- Int: integer number input -->
+                      <template x-if="field.type === 'int'">
+                        <input type="number" step="1"
+                               :value="field.value"
+                               :min="field.min !== undefined && field.min !== null ? field.min : undefined"
+                               :max="field.max !== undefined && field.max !== null ? field.max : undefined"
+                               :placeholder="field.default !== undefined && field.default !== null ? String(field.default) : ''"
+                               @change="field.value = parseInt($el.value, 10)"
+                               style="width: 100px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
+                      </template>
+                      <!-- Float: decimal number input -->
+                      <template x-if="field.type === 'float'">
                         <input type="number" step="any"
                                :value="field.value"
+                               :min="field.min !== undefined && field.min !== null ? field.min : undefined"
+                               :max="field.max !== undefined && field.max !== null ? field.max : undefined"
+                               :placeholder="field.default !== undefined && field.default !== null ? String(field.default) : ''"
                                @change="field.value = parseFloat($el.value)"
                                style="width: 100px; padding: 0.25rem 0.4rem; border-radius: 4px; border: 1px solid var(--color-border); background: rgba(255,255,255,0.06); color: #e0e0e0; font-size: 0.78rem;">
                       </template>
                       <span style="font-size: 0.64rem; opacity: 0.5;" x-text="field.description"></span>
                     </div>
                   </template>
+                  <!-- Save error message -->
+                  <template x-if="saveError">
+                    <div style="font-size: 0.72rem; color: #ef9a9a; padding: 0.2rem 0;" x-text="saveError"></div>
+                  </template>
                   <button @click="
+                    saveError = '';
+                    // Frontend pre-validation
+                    const fields = $store.genesisDashboard.selectedModule.config_fields;
+                    const errs = [];
+                    fields.forEach(f => {
+                      if (f.required && (f.value === null || f.value === undefined || f.value === '')) {
+                        errs.push(f.label + ' is required');
+                      }
+                      if ((f.type === 'int' || f.type === 'float') && f.value !== null && f.value !== undefined && f.value !== '') {
+                        const v = parseFloat(f.value);
+                        if (f.min !== undefined && f.min !== null && v < f.min) errs.push(f.label + ' must be >= ' + f.min);
+                        if (f.max !== undefined && f.max !== null && v > f.max) errs.push(f.label + ' must be <= ' + f.max);
+                      }
+                    });
+                    if (errs.length > 0) { saveError = errs.join('; '); return; }
                     saving = true; saved = false;
                     const updates = {};
-                    $store.genesisDashboard.selectedModule.config_fields.forEach(f => updates[f.name] = f.value);
+                    fields.forEach(f => {
+                      // Secret fields: only include if user typed a value
+                      if (f.type === 'secret') { if (f.value) updates[f.name] = f.value; }
+                      else updates[f.name] = f.value;
+                    });
                     fetch('/api/genesis/modules/' + $store.genesisDashboard.selectedModule.name + '/config', {
                       method: 'PATCH', headers: {'Content-Type': 'application/json'},
                       body: JSON.stringify(updates)
                     }).then(r => r.json()).then(d => {
-                      saving = false; saved = true;
-                      setTimeout(() => saved = false, 2000);
-                    }).catch(() => { saving = false; });
+                      saving = false;
+                      if (d.status === 'ok') { saved = true; setTimeout(() => saved = false, 2000); }
+                      else { saveError = d.message || 'Save failed'; }
+                    }).catch(() => { saving = false; saveError = 'Network error'; });
                   " style="width: fit-content; font-size: 0.74rem; padding: 0.3rem 0.7rem; border-radius: 4px; cursor: pointer; background: rgba(33,150,243,0.15); color: #90caf9; border: 1px solid rgba(33,150,243,0.3);"
                   x-text="saving ? 'Saving...' : saved ? 'Saved!' : 'Save Config'"></button>
                 </div>

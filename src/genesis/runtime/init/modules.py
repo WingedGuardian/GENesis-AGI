@@ -1,8 +1,15 @@
-"""Init function: _init_modules — unified YAML-based module loader."""
+"""Init function: _init_modules — unified YAML-based module loader.
+
+Module loading has two phases:
+1. YAML scan: load all modules declared in config/modules/*.yaml (or local overlay).
+2. Auto-discovery: scan genesis/modules/*/module.py for classes with __module_meta__
+   that were NOT already loaded from YAML. YAML always takes precedence.
+"""
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -31,8 +38,11 @@ async def init(rt: GenesisRuntime) -> None:
         rt._module_registry = ModuleRegistry()
         rt._module_registry.set_runtime(rt)
 
-        # Load all modules from YAML configs (native + external, same directory)
+        # Phase 1: Load all modules from YAML configs (native + external)
         await _load_modules_from_yaml(rt)
+
+        # Phase 2: Auto-discover native modules with __module_meta__ not covered by YAML
+        await _load_discovered_modules(rt)
 
         # Restore persisted state from DB
         await _restore_module_states(rt)
@@ -96,6 +106,83 @@ async def _load_modules_from_yaml(rt: GenesisRuntime) -> None:
             logger.warning("Failed to load module from %s", yaml_path.name, exc_info=True)
 
 
+def _discover_native_modules(already_loaded: set[str]) -> list[dict]:
+    """Scan genesis/modules/*/module.py for classes with __module_meta__.
+
+    Only returns classes that:
+    - Have a ``__module_meta__`` dict attribute with a ``"name"`` key
+    - Were defined in the scanned module file (not imported into it)
+    - Are not already registered (YAML takes precedence)
+
+    Returns a list of synthetic config dicts suitable for _load_native_module().
+    """
+    spec = importlib.util.find_spec("genesis.modules")
+    if spec is None or not spec.submodule_search_locations:
+        logger.debug("Auto-discovery: genesis.modules package not found")
+        return []
+
+    modules_dir = Path(list(spec.submodule_search_locations)[0])
+    discovered = []
+
+    for module_file in sorted(modules_dir.glob("*/module.py")):
+        pkg_name = module_file.parent.name
+        dotted = f"genesis.modules.{pkg_name}.module"
+        try:
+            py_mod = importlib.import_module(dotted)
+        except Exception:
+            logger.warning("Auto-discovery: failed to import %s", dotted, exc_info=True)
+            continue
+
+        for attr_name in dir(py_mod):
+            cls = getattr(py_mod, attr_name, None)
+            if not isinstance(cls, type):
+                continue
+            if not hasattr(cls, "__module_meta__"):
+                continue
+            # Only consider classes defined in THIS file, not imported into it
+            if getattr(cls, "__module__", None) != dotted:
+                continue
+
+            meta = cls.__module_meta__
+            if not isinstance(meta, dict) or "name" not in meta:
+                continue
+
+            mod_name = meta["name"]
+            if mod_name in already_loaded:
+                logger.debug("Auto-discovery: '%s' already loaded from YAML, skipping", mod_name)
+                continue
+
+            discovered.append({
+                "name": mod_name,
+                "type": "native",
+                "class": f"{dotted}.{attr_name}",
+                "display_name": meta.get("display_name", ""),
+                "description": meta.get("description", ""),
+                "category": meta.get("category", ""),
+                "tags": meta.get("tags", []),
+                "version": meta.get("version", ""),
+                "enabled": meta.get("enabled", False),
+                "research_profile": meta.get("research_profile"),
+            })
+            logger.info("Auto-discovery: found module '%s' in %s", mod_name, dotted)
+
+    return discovered
+
+
+async def _load_discovered_modules(rt: GenesisRuntime) -> None:
+    """Load auto-discovered native modules not already present from YAML."""
+    already_loaded = set(rt._module_registry.list_modules())
+    for config in _discover_native_modules(already_loaded):
+        try:
+            module = _load_native_module(config, "<auto-discovered>")
+            if module is not None:
+                await rt._module_registry.load_module(module)
+        except Exception:
+            logger.warning(
+                "Auto-discovery: failed to load '%s'", config.get("name"), exc_info=True,
+            )
+
+
 def _load_native_module(data: dict, filename: str):
     """Load a native Python module from its class path."""
     class_path = data.get("class")
@@ -106,9 +193,10 @@ def _load_native_module(data: dict, filename: str):
     cls = _import_class(class_path)
     module = cls()
 
-    # Apply description from YAML if the module doesn't have one
-    if data.get("description") and hasattr(module, "_description"):
-        module._description = data["description"]
+    # Apply identity fields from YAML/meta to module instance attributes (if present)
+    for attr in ("description", "display_name", "category", "tags", "version"):
+        if data.get(attr) and hasattr(module, f"_{attr}"):
+            setattr(module, f"_{attr}", data[attr])
 
     logger.info("Native module '%s' loaded from %s", data["name"], filename)
     return module
