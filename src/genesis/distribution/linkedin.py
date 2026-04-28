@@ -6,7 +6,7 @@ import logging
 import os
 from typing import Any
 
-from genesis.distribution.base import PlatformDistributor, PostResult
+from genesis.distribution.base import PostResult
 from genesis.distribution.config import LinkedInConfig
 
 logger = logging.getLogger(__name__)
