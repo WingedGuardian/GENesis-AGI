@@ -29,6 +29,7 @@ _RETROSPECTIVE_PROMPT_PATH = (
 
 # Caps to prevent runaway storage from verbose LLM responses
 _MAX_NEW_PROCEDURES = 3
+_MAX_PROCEDURE_UPDATES = 5
 _MAX_SKILL_OBSERVATIONS = 3
 
 
@@ -306,7 +307,7 @@ class ExecutionTracer:
         # 2. Procedure updates
         updates = data.get("procedure_updates", [])
         if isinstance(updates, list):
-            for update in updates:
+            for update in updates[:_MAX_PROCEDURE_UPDATES]:
                 if not isinstance(update, dict):
                     continue
                 try:

@@ -275,8 +275,9 @@ def _find_skill_path(name: str) -> Path | None:
             path_str = skill.get("path", "")
             if path_str:
                 # Paths in catalog are relative to repo root
-                full = _REPO_ROOT / path_str
-                if full.is_dir():
+                full = (_REPO_ROOT / path_str).resolve()
+                # Guard against path traversal via poisoned catalog
+                if full.is_relative_to(_REPO_ROOT.resolve()) and full.is_dir():
                     return full
     return None
 
