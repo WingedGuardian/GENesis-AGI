@@ -938,6 +938,18 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE knowledge_uploads ADD COLUMN chunks_done INTEGER DEFAULT 0",
         "knowledge_uploads.chunks_done")
 
+    # Ego proposals: rank, execution_plan, recurring columns added to
+    # schema definition but missing migrations for existing tables.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN rank INTEGER",
+        "ego_proposals.rank")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN execution_plan TEXT",
+        "ego_proposals.execution_plan")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN recurring INTEGER DEFAULT 0",
+        "ego_proposals.recurring")
+
     # Approval resume tracking — atomic consumed_at column
     await _try_alter(db,
         "ALTER TABLE approval_requests ADD COLUMN consumed_at TEXT",
