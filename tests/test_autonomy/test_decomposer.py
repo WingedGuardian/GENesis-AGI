@@ -160,6 +160,59 @@ class TestDecompose:
         assert steps[1]["dependencies"] == [0]
 
 
+    async def test_resource_fields_preserved(self) -> None:
+        """New optional resource fields are preserved during validation."""
+        steps_with_resources = json.dumps([
+            {
+                "idx": 0,
+                "type": "research",
+                "description": "Research with skill",
+                "required_tools": ["WebSearch"],
+                "skills": ["research"],
+                "procedures": ["web-search-pattern"],
+                "mcp_guidance": ["memory"],
+            },
+            {
+                "idx": 1,
+                "type": "code",
+                "description": "Code step",
+                "required_tools": ["Write"],
+            },
+        ])
+        router = _make_router(steps_with_resources)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task with resources")
+
+        # Step 0 has resources
+        assert steps[0]["skills"] == ["research"]
+        assert steps[0]["procedures"] == ["web-search-pattern"]
+        assert steps[0]["mcp_guidance"] == ["memory"]
+
+        # Step 1 has empty defaults
+        assert steps[1]["skills"] == []
+        assert steps[1]["procedures"] == []
+        assert steps[1]["mcp_guidance"] == []
+
+    async def test_resource_fields_invalid_types_default_empty(self) -> None:
+        """Non-list resource fields default to empty lists."""
+        steps_bad = json.dumps([
+            {
+                "idx": 0,
+                "type": "code",
+                "description": "Step",
+                "skills": "not-a-list",
+                "procedures": 42,
+            },
+        ])
+        router = _make_router(steps_bad)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task")
+
+        assert steps[0]["skills"] == []
+        assert steps[0]["procedures"] == []
+        assert steps[0]["mcp_guidance"] == []
+
+
 @pytest.mark.asyncio
 class TestDecomposeDB:
     """Tests for task_steps and task_states CRUD additions."""
