@@ -74,13 +74,13 @@ async def extract_procedure(
         return None
 
     try:
-        text = result.text.strip()
+        text = result.content.strip()
         # Strip markdown fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         data = json.loads(text)
     except (json.JSONDecodeError, AttributeError, IndexError):
-        logger.error("Procedure extraction: failed to parse LLM response: %s", result.text[:200])
+        logger.error("Procedure extraction: failed to parse LLM response: %s", result.content[:200])
         return None
 
     # Validate required fields

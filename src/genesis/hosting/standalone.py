@@ -478,8 +478,7 @@ class StandaloneAdapter:
                     rt.surplus_scheduler.set_topic_manager(topic_manager)
                 if rt._ego_proposal_workflow is not None:
                     rt._ego_proposal_workflow.set_topic_manager(topic_manager)
-                    rt._ego_proposal_workflow.set_reply_waiter(reply_waiter)
-                    logger.info("Ego proposal workflow wired with TopicManager + ReplyWaiter")
+                    logger.info("Ego proposal workflow wired with TopicManager")
 
                 logger.info(
                     "Forum topics enabled (chat_id=%s) — %d categories",
