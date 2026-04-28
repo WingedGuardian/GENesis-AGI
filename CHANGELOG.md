@@ -7,10 +7,11 @@ Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
 
 ---
 
-## [v3.0a11] - 2026-04-26
+## [v3.0a11] - 2026-04-28
 
-Code review remediation + Guardian auto-sync. Themes: **observability**,
-**concurrency safety**, and **host VM self-maintenance**.
+Guardian auto-sync, task executor maturity, ego module. Themes:
+**autonomous execution**, **adversarial verification**, **cognitive
+architecture**, and **host VM self-maintenance**.
 
 ### Added
 
@@ -19,24 +20,52 @@ Code review remediation + Guardian auto-sync. Themes: **observability**,
   Genesis, changed Guardian-relevant code is pushed to the host via SSH.
   Drift detection alerts within 15 minutes if sync fails silently.
   No more manual SSH to update Guardian code.
+- **Ego module** (#182) — autonomous decision-making cycle with cadence
+  management, proposal board, context assembly (user + Genesis + system),
+  and session dispatch. Dashboard route for ego status.
+- **LinkedIn distribution** (#182) — content delivery via Composio SDK
+  with OAuth2. Graceful degradation when unconfigured. Optional
+  `[distribution]` dependency.
+- **Typed module config schema** (#167) — `ConfigField` dataclass with
+  type/min/max/required/sensitive metadata. `ModuleBase` mixin for
+  zero-boilerplate config. Auto-discovery for new modules without YAML.
+  Dashboard widget fix: correct input types for all field kinds.
+- **Session intent trail** (#179) — detects topic pivots via keyword
+  similarity, injects `[Session trail] topic → topic → ...` into every
+  prompt so conversation flow survives compaction.
+- **Task executor pipeline** (#177) — tool-capable adversarial
+  verification with Codex, recovery resume for interrupted tasks.
 - **Sentinel rejection test coverage** (#166) — 6 tests verifying the
   24-hour dispatch suppression window after user rejection.
 
 ### Changed
 
-- **Browser concurrency safety** (#166) — all 7 interaction tools (click,
-  fill, upload, screenshot, snapshot, run_js, press_key) now acquire a
-  lock before accessing shared page state. Prevents races when concurrent
-  sessions use the browser simultaneously.
+- **Decomposer uses CC invoker** (#181) — task decomposition now uses
+  CC invoker (Sonnet) instead of route_call. Falls back to route_call
+  if invoker unavailable.
+- **Adversarial review runs in worktree** (#183) — Codex and CC invoker
+  verification now execute in the task's worktree directory, not the
+  repo root. Fixup steps receive the original plan content and longer
+  feedback (2000 chars, up from 500).
+- **Browser concurrency safety** (#166) — all 7 interaction tools now
+  acquire a lock before accessing shared page state.
 
 ### Fixed
 
-- **Observability gaps** (#165) — `exc_info=True` on 3 timeout-path log
-  calls; replaced 4 `contextlib.suppress(Exception)` in data-returning
-  code paths with logged warnings.
-- **Update subprocess logging** (#165) — direct update and CC tier spawning
-  now log to `~/.genesis/` instead of /dev/null; merge conflict status
-  recorded in update history.
+- **Blocked tasks resume on approval** (#178) — dispatcher polls for
+  approved-but-unconsumed approvals on blocked tasks, re-dispatching
+  without requiring a server restart.
+- **Dispatcher dedup guard** (#181) — tasks reset to PENDING are
+  re-dispatchable without server restart.
+- **Plan path tilde expansion** (#178) — `expanduser()` on plan paths.
+- **PENDING→FAILED transition** (#178) — tasks that fail before REVIEWING
+  no longer get stuck in PENDING forever.
+- **Concurrent session contamination** (#173) — raw user messages from
+  other sessions no longer appear in concurrent session tags.
+- **Observability gaps** (#165) — `exc_info=True` on timeout-path log
+  calls; replaced `contextlib.suppress(Exception)` with logged warnings.
+- **Update subprocess logging** (#165) — direct update and CC tier
+  spawning now log to `~/.genesis/` instead of /dev/null.
 
 ### Upgrade notes
 
