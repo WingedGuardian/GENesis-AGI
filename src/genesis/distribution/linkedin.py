@@ -33,9 +33,9 @@ class LinkedInDistributor:
             logger.warning("COMPOSIO_API_KEY not set — LinkedIn distribution unavailable")
             return
         try:
-            from composio_client import Composio
+            from composio_client import AsyncComposio
 
-            self._client = Composio(api_key=api_key)
+            self._client = AsyncComposio(api_key=api_key)
             logger.info("LinkedIn distributor initialized (account %s)", self._config.connected_account_id)
         except ImportError:
             logger.warning(
@@ -82,7 +82,7 @@ class LinkedInDistributor:
             )
 
         try:
-            result = self._client.tools.execute(
+            result = await self._client.tools.execute(
                 "LINKEDIN_CREATE_LINKED_IN_POST",
                 arguments={
                     "author": self._config.author_urn,
@@ -93,9 +93,9 @@ class LinkedInDistributor:
                 user_id=self._config.user_id,
             )
 
-            data = result.model_dump() if hasattr(result, "model_dump") else {}
-            successful = data.get("successful", False)
-            response = data.get("data", {}).get("response_dict", {})
+            successful = result.successful if hasattr(result, "successful") else False
+            data = result.data if hasattr(result, "data") else {}
+            response = data.get("response_dict", {}) if isinstance(data, dict) else {}
 
             if successful:
                 post_id = response.get("id", response.get("share_id"))
@@ -107,7 +107,7 @@ class LinkedInDistributor:
                     status="published",
                 )
             else:
-                error_msg = data.get("error") or str(response)
+                error_msg = (result.error if hasattr(result, "error") else None) or str(response)
                 logger.warning("LinkedIn publish failed: %s", error_msg)
                 return PostResult(
                     post_id=None,
@@ -132,14 +132,13 @@ class LinkedInDistributor:
             return False
 
         try:
-            result = self._client.tools.execute(
+            result = await self._client.tools.execute(
                 "LINKEDIN_DELETE_LINKED_IN_POST",
                 arguments={"share_id": post_id},
                 connected_account_id=self._config.connected_account_id,
                 user_id=self._config.user_id,
             )
-            data = result.model_dump() if hasattr(result, "model_dump") else {}
-            return bool(data.get("successful"))
+            return bool(result.successful) if hasattr(result, "successful") else False
         except Exception:
             logger.error("LinkedIn delete failed for %s", post_id, exc_info=True)
             return False
