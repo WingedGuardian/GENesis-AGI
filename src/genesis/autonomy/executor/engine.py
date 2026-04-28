@@ -322,6 +322,7 @@ class CCSessionExecutor:
                     plan_content,
                     task_type=_dispatch.dominant_step_type(steps),
                     iteration=iteration,
+                    worktree_path=self._worktree_paths.get(task_id),
                 )
                 last_verify = verify
 
@@ -342,6 +343,7 @@ class CCSessionExecutor:
                     await self._transition(task_id, TaskPhase.EXECUTING)
                     fixup = _dispatch.create_fixup_step(
                         verify, len(steps) + iteration,
+                        plan_content=plan_content,
                     )
                     fixup_result = await self._step_dispatcher.execute_step(
                         task_id, fixup, step_results,

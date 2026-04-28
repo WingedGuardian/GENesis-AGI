@@ -156,29 +156,49 @@ def dominant_step_type(steps: list[dict]) -> str:
     return max(set(types), key=types.count)
 
 
-def create_fixup_step(verify, idx: int) -> dict:
-    """Create a fixup step from review feedback."""
+def create_fixup_step(
+    verify,
+    idx: int,
+    plan_content: str = "",
+) -> dict:
+    """Create a fixup step from review feedback.
+
+    *plan_content*: the original task plan, included so the fixup CC
+    session can reference the success criteria and requirements.
+    """
+    _FEEDBACK_LIMIT = 2000
+
     feedback_parts = []
     if verify.fresh_eyes_feedback:
         feedback_parts.append(
-            f"Fresh-eyes feedback: {verify.fresh_eyes_feedback[:500]}"
+            f"Fresh-eyes feedback:\n{verify.fresh_eyes_feedback[:_FEEDBACK_LIMIT]}"
         )
     if verify.adversarial_feedback:
         feedback_parts.append(
-            f"Adversarial feedback: {verify.adversarial_feedback[:500]}"
+            f"Adversarial feedback:\n{verify.adversarial_feedback[:_FEEDBACK_LIMIT]}"
         )
     if verify.programmatic_issues:
         feedback_parts.append(
             "Programmatic issues: " + "; ".join(verify.programmatic_issues)
         )
 
+    description_parts = [
+        "Address review feedback and fix identified issues:",
+        "",
+        *feedback_parts,
+    ]
+
+    if plan_content:
+        description_parts.extend([
+            "",
+            "## Original Plan (for reference — especially success criteria)",
+            plan_content[:4000],
+        ])
+
     return {
         "idx": idx,
         "type": "code",
-        "description": (
-            "Address review feedback and fix identified issues:\n"
-            + "\n".join(feedback_parts)
-        ),
+        "description": "\n".join(description_parts),
         "required_tools": [],
         "complexity": "medium",
         "dependencies": [],
