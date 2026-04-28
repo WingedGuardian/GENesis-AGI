@@ -1,8 +1,14 @@
 #!/bin/bash
-# Genesis pre-push hook — block force pushes to main
+# Genesis pre-push hook — block force pushes to main on origin (public repo)
+# Private/fork remotes are unrestricted — users own their forks.
 # Portable copy: lives in scripts/hooks/, symlinked by scripts/install.sh
 
 remote="$1"
+
+# Only protect the public repo (origin). Private forks can force push freely.
+if [ "$remote" != "origin" ]; then
+    exit 0
+fi
 
 while read local_ref local_oid remote_ref remote_oid; do
     if echo "$remote_ref" | grep -qE 'refs/heads/(main|master)$'; then
@@ -10,7 +16,7 @@ while read local_ref local_oid remote_ref remote_oid; do
         if [ "$remote_oid" != "0000000000000000000000000000000000000000" ]; then
             merge_base=$(git merge-base "$remote_oid" "$local_oid" 2>/dev/null)
             if [ "$merge_base" != "$remote_oid" ]; then
-                echo "BLOCKED: Force push to $remote_ref is not allowed."
+                echo "BLOCKED: Force push to $remote_ref on origin is not allowed."
                 echo "Use a feature branch and PR instead."
                 exit 1
             fi
