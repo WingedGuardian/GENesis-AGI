@@ -186,6 +186,46 @@ class TaskDispatcher:
             )
             dispatched += 1
 
+        # --- Path 1b: Resume BLOCKED tasks with approved approvals ---
+        for task in active:
+            task_id = task["task_id"]
+            phase = task.get("current_phase", "")
+            if phase != TaskPhase.BLOCKED.value:
+                continue
+            if task_id in self._dispatched:
+                continue
+
+            # Check if there's an approved-but-unconsumed approval for this task
+            try:
+                cursor = await self._db.execute(
+                    """SELECT id FROM approval_requests
+                       WHERE status = 'approved' AND consumed_at IS NULL
+                         AND context LIKE ?
+                       LIMIT 1""",
+                    (f'%"task_id": "{task_id}"%',),
+                )
+                row = await cursor.fetchone()
+            except Exception:
+                logger.error(
+                    "Failed to check approvals for blocked task %s",
+                    task_id, exc_info=True,
+                )
+                continue
+
+            if row is None:
+                continue
+
+            logger.info(
+                "Resuming blocked task %s (approved approval found)",
+                task_id,
+            )
+            self._dispatched.add(task_id)
+            tracked_task(
+                self._executor.execute(task_id),
+                name=f"task-{task_id}-resume",
+            )
+            dispatched += 1
+
         # --- Path 2: Observation-based task pickup ---
         try:
             pending_obs = await observations.query(
@@ -271,12 +311,40 @@ class TaskDispatcher:
                 continue
 
             if phase == TaskPhase.BLOCKED.value:
-                # Re-send notification for blocked tasks
-                logger.info("Found blocked task %s, re-notifying", task_id)
-                # The executor will handle notification when it resumes
-                # For now, just mark as known
-                self._dispatched.add(task_id)
-                recovered += 1
+                # Check if there's an approved-but-unconsumed approval
+                try:
+                    cursor = await self._db.execute(
+                        """SELECT id FROM approval_requests
+                           WHERE status = 'approved' AND consumed_at IS NULL
+                             AND context LIKE ?
+                           LIMIT 1""",
+                        (f'%"task_id": "{task_id}"%',),
+                    )
+                    approved_row = await cursor.fetchone()
+                except Exception:
+                    logger.error(
+                        "Failed to check approvals for blocked task %s",
+                        task_id, exc_info=True,
+                    )
+                    approved_row = None
+
+                if approved_row:
+                    # Approval granted — re-dispatch for execution
+                    logger.info(
+                        "Resuming blocked task %s (approved approval found)",
+                        task_id,
+                    )
+                    self._dispatched.add(task_id)
+                    tracked_task(
+                        self._executor.execute(task_id),
+                        name=f"task-resume-{task_id}",
+                    )
+                    recovered += 1
+                else:
+                    # Still blocked, just mark as known
+                    logger.info("Found blocked task %s, re-notifying", task_id)
+                    self._dispatched.add(task_id)
+                    recovered += 1
                 continue
 
             # Re-dispatch executing/reviewing/planning/etc tasks

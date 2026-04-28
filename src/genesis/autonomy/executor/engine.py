@@ -123,7 +123,7 @@ class CCSessionExecutor:
             return False
 
         try:
-            plan_content = Path(plan_path).read_text(encoding="utf-8")
+            plan_content = Path(plan_path).expanduser().read_text(encoding="utf-8")
         except OSError:
             logger.error("Cannot read plan at %s", plan_path, exc_info=True)
             await self._fail_task(task_id, f"Cannot read plan: {plan_path}")
