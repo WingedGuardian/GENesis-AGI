@@ -71,6 +71,8 @@ async def create_worktree(
 
     Cleans up stale state from previous runs before creating.
     Returns the worktree path on success.
+    Handles the case where the task branch already exists (e.g., resume
+    after restart) by checking it out instead of creating a new branch.
     Raises RuntimeError if worktree creation fails.
     """
     short_id = task_id[:8]
@@ -92,14 +94,46 @@ async def create_worktree(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await proc.communicate()
+    _, stderr = await proc.communicate()
     if proc.returncode != 0:
         err = stderr.decode(errors="replace")
-        logger.error("Failed to create worktree: %s", err)
-        raise RuntimeError(f"Worktree creation failed: {err}")
+        if "already exists" in err:
+            # Branch exists from previous run — check it out
+            proc = await asyncio.create_subprocess_exec(
+                "git", "worktree", "add", str(wt_path), branch,
+                cwd=str(repo_root),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                err2 = stderr.decode(errors="replace")
+                logger.error("Failed to create worktree: %s", err2)
+                raise RuntimeError(f"Worktree creation failed: {err2}")
+            logger.info(
+                "Created worktree at %s (existing branch %s)", wt_path, branch,
+            )
+        else:
+            logger.error("Failed to create worktree: %s", err)
+            raise RuntimeError(f"Worktree creation failed: {err}")
+    else:
+        logger.info("Created worktree at %s (branch %s)", wt_path, branch)
 
-    logger.info("Created worktree at %s (branch %s)", wt_path, branch)
     return wt_path
+
+
+async def verify_worktree(wt_path: Path) -> bool:
+    """Check if a path is a valid git worktree."""
+    if not wt_path.exists():
+        return False
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--git-dir",
+        cwd=str(wt_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
 
 
 async def cleanup_worktree(
