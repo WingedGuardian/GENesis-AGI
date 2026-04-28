@@ -6912,10 +6912,10 @@
                       x-text="cat ? cat.charAt(0).toUpperCase() + cat.slice(1) : 'All'"></button>
             </template>
           </div>
-          <template x-if="$store.genesisDashboard.commsOutreach.length === 0">
+          <template x-if="$store.genesisDashboard.commsOutreach.filter(m => m.signal_type !== 'cli_approval').length === 0">
             <div style="color:var(--color-text-secondary); text-align:center; padding:2rem; font-size:0.75rem;">No outreach messages found.</div>
           </template>
-          <template x-for="msg in $store.genesisDashboard.commsOutreach.filter(m => !$store.genesisDashboard.commsCategoryFilter || m.category === $store.genesisDashboard.commsCategoryFilter)" :key="msg.id">
+          <template x-for="msg in $store.genesisDashboard.commsOutreach.filter(m => m.signal_type !== 'cli_approval').filter(m => !$store.genesisDashboard.commsCategoryFilter || m.category === $store.genesisDashboard.commsCategoryFilter)" :key="msg.id">
             <div style="border:1px solid var(--color-border); border-radius:6px; padding:0.75rem; margin-bottom:0.5rem;">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.3rem;">
                 <div>
@@ -6966,7 +6966,7 @@
         <div x-show="$store.genesisDashboard.commsTab === 'proposals'">
           <!-- Status filter pills -->
           <div style="display:flex; gap:0.4rem; margin-bottom:0.75rem; flex-wrap:wrap;">
-            <template x-for="[val, label] in [[null, 'All'], ['pending', 'Pending'], ['approved', 'Approved'], ['rejected', 'Rejected'], ['expired', 'Expired']]" :key="val || 'all'">
+            <template x-for="[val, label] in [[null, 'All'], ['pending', 'Pending'], ['approved', 'Approved'], ['executed', 'Executed'], ['rejected', 'Rejected'], ['expired', 'Expired']]" :key="val || 'all'">
               <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
                       :style="$store.genesisDashboard.commsProposalFilter === val ? 'background:#ffffff15; border:1px solid #888; color:#fff;' : 'background:transparent; border:1px solid #555; color:#888;'"
                       @click="$store.genesisDashboard.commsProposalFilter = val"
@@ -7014,7 +7014,36 @@
               <template x-if="p.rationale">
                 <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-bottom:0.3rem;" x-text="'Rationale: ' + p.rationale"></div>
               </template>
-              <template x-if="p.user_response">
+              <!-- Execution outcome for executed proposals -->
+              <template x-if="p.session_outcome">
+                <div style="margin-top:0.4rem; padding:0.5rem; border-radius:4px; font-size:0.72rem;"
+                     :style="p.session_outcome.status === 'completed' ? 'background:rgba(102,187,106,0.08); border:1px solid rgba(102,187,106,0.2);' : 'background:rgba(239,154,154,0.08); border:1px solid rgba(239,154,154,0.2);'">
+                  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.25rem;">
+                    <div style="display:flex; gap:0.4rem; align-items:center;">
+                      <span style="font-weight:600;"
+                            :style="p.session_outcome.status === 'completed' ? 'color:#66bb6a;' : 'color:#ef9a9a;'"
+                            x-text="p.session_outcome.status === 'completed' ? 'Completed' : p.session_outcome.status === 'failed' ? 'Failed' : p.session_outcome.status"></span>
+                      <span x-show="p.session_outcome.profile" style="font-size:0.65rem; padding:0.08rem 0.3rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
+                            x-text="p.session_outcome.profile"></span>
+                    </div>
+                    <div style="display:flex; gap:0.5rem; align-items:center; color:var(--color-text-secondary); font-size:0.65rem;">
+                      <span x-show="p.session_outcome.cost_usd != null" x-text="'$' + Number(p.session_outcome.cost_usd || 0).toFixed(2)"></span>
+                      <span x-show="p.session_outcome.completed_at" x-text="$store.genesisDashboard.formatDateTime(p.session_outcome.completed_at)"></span>
+                    </div>
+                  </div>
+                  <template x-if="p.session_outcome.error">
+                    <div style="font-size:0.7rem; color:#ef9a9a; white-space:pre-wrap; max-height:80px; overflow-y:auto;" x-text="p.session_outcome.error"></div>
+                  </template>
+                  <template x-if="p.session_outcome.output_summary && !p.session_outcome.error">
+                    <div style="font-size:0.7rem; color:var(--color-text-secondary); white-space:pre-wrap; max-height:80px; overflow-y:auto;" x-text="p.session_outcome.output_summary"></div>
+                  </template>
+                  <template x-if="!p.session_outcome.output_summary && !p.session_outcome.error">
+                    <div style="font-size:0.68rem; color:var(--color-text-secondary); font-style:italic;">No output captured</div>
+                  </template>
+                </div>
+              </template>
+              <!-- Response for non-executed proposals -->
+              <template x-if="p.user_response && !p.session_outcome">
                 <div style="font-size:0.7rem; color:var(--color-text-secondary); margin-top:0.2rem;">
                   <strong>Response:</strong> <span x-text="p.user_response"></span>
                 </div>

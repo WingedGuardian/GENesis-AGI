@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 
 from flask import jsonify, request
@@ -9,6 +11,55 @@ from flask import jsonify, request
 from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
+
+
+async def _enrich_proposals_with_outcomes(
+    db: object, proposals: list[dict],
+) -> list[dict]:
+    """For executed proposals, join session outcome from cc_sessions."""
+    session_ids: list[tuple[int, str]] = []
+    for i, p in enumerate(proposals):
+        ur = p.get("user_response") or ""
+        if p.get("status") == "executed" and ur.startswith("session:"):
+            session_ids.append((i, ur[8:]))
+
+    if not session_ids:
+        return proposals
+
+    # Batch fetch session outcomes
+    placeholders = ",".join("?" for _ in session_ids)
+    ids = [sid for _, sid in session_ids]
+    try:
+        cursor = await db.execute(
+            f"SELECT id, status, cost_usd, completed_at, metadata "
+            f"FROM cc_sessions WHERE id IN ({placeholders})",
+            ids,
+        )
+        rows = {r[0]: r for r in await cursor.fetchall()}
+    except Exception:
+        logger.debug("Failed to fetch session outcomes for proposals", exc_info=True)
+        return proposals
+
+    for idx, sid in session_ids:
+        row = rows.get(sid)
+        if not row:
+            continue
+        meta = {}
+        if row[4]:
+            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                meta = json.loads(row[4])
+        output_text = meta.get("output_text", "")
+        error = meta.get("error", "")
+        proposals[idx]["session_outcome"] = {
+            "session_id": sid,
+            "status": row[1],
+            "cost_usd": row[2],
+            "completed_at": row[3],
+            "output_summary": (output_text[:300] + "...") if len(output_text) > 300 else output_text,
+            "error": (error[:200] + "...") if len(error) > 200 else error,
+            "profile": meta.get("profile", ""),
+        }
+    return proposals
 
 
 @blueprint.route("/api/genesis/comms")
@@ -64,6 +115,9 @@ async def unified_comms():
             proposals = await ego.list_pending_proposals(rt.db)
         else:
             proposals = await ego.list_proposals(rt.db, limit=limit)
+
+        # Enrich executed proposals with session outcome data
+        proposals = await _enrich_proposals_with_outcomes(rt.db, proposals)
 
         pending_count_cursor = await rt.db.execute(
             "SELECT COUNT(*) FROM ego_proposals WHERE status = 'pending'"

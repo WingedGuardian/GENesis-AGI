@@ -194,8 +194,8 @@ class EgoSession:
             decision = await self._autonomous_dispatcher.route(
                 AutonomousDispatchRequest(
                     subsystem="ego",
-                    policy_id="ego_cycle",
-                    action_label="ego cycle",
+                    policy_id=self._source_tag,
+                    action_label=self._source_tag.replace("_", " "),
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
