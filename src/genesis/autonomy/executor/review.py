@@ -19,6 +19,7 @@ import logging
 import re
 import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -169,6 +170,7 @@ class TaskReviewer:
         *,
         task_type: str = "code",
         iteration: int = 0,
+        worktree_path: Path | None = None,
     ) -> VerifyResult:
         """Post-execution verification with tool-capable adversarial gate.
 
@@ -179,6 +181,10 @@ class TaskReviewer:
 
         If programmatic checks fail, LLM gates are skipped.
         If both LLM routes fail, delivers with a warning (Amendment #5).
+
+        *worktree_path*: When the task executed in a git worktree, pass the
+        path so tool-capable reviewers (Codex, CC invoker) can inspect the
+        actual changed files rather than the repo root / main branch.
         """
         # Gate 1 -- programmatic checks
         issues = self._programmatic_checks(deliverable, task_type)
@@ -195,7 +201,9 @@ class TaskReviewer:
         )
 
         # Gate 3 -- adversarial verification (tool-capable chain)
-        adversarial = await self._tool_capable_review(deliverable, requirements)
+        adversarial = await self._tool_capable_review(
+            deliverable, requirements, worktree_path=worktree_path,
+        )
 
         # Amendment #5: both routing fail -> deliver with warning
         if fresh_eyes is None and adversarial is None:
@@ -226,6 +234,8 @@ class TaskReviewer:
         self,
         deliverable: str,
         requirements: str,
+        *,
+        worktree_path: Path | None = None,
     ) -> str | None:
         """Run the tool-capable adversarial verification chain.
 
@@ -236,18 +246,25 @@ class TaskReviewer:
 
         Returns verdict text or ``None`` on total chain failure.
 
+        *worktree_path*: passed to Codex (as ``cwd``) and CC invoker
+        (as ``working_dir``) so they inspect the worktree, not repo root.
+
         # GROUNDWORK(per-step-verify): This method is extracted so future
         # per-step verification can reuse the same chain.  The follow-up
         # PR will call it from the step execution loop for steps where
         # ``StepType.verify_step`` is True.
         """
         # Link 1: Codex (cross-vendor, tool-capable)
-        verdict = await self._verify_via_codex(deliverable, requirements)
+        verdict = await self._verify_via_codex(
+            deliverable, requirements, worktree_path=worktree_path,
+        )
         if verdict is not None:
             return verdict
 
         # Link 2: CC invoker (Sonnet, tool-capable fallback)
-        verdict = await self._verify_via_invoker(deliverable, requirements)
+        verdict = await self._verify_via_invoker(
+            deliverable, requirements, worktree_path=worktree_path,
+        )
         if verdict is not None:
             return verdict
 
@@ -260,17 +277,25 @@ class TaskReviewer:
         self,
         deliverable: str,
         requirements: str,
+        *,
+        worktree_path: Path | None = None,
     ) -> str | None:
         """Run adversarial verification via ``codex exec`` subprocess.
 
         Returns verdict text or ``None`` if Codex is not installed or fails.
         Uses ``asyncio.create_subprocess_exec`` since review.py is async.
+
+        *worktree_path*: when set, Codex runs with ``cwd`` pointing to the
+        worktree so it can read the actual changed files rather than main.
         """
         if shutil.which("codex") is None:
             logger.info("review: codex not on PATH -- skipping codex link")
             return None
 
         prompt = self._build_active_verify_prompt(deliverable, requirements)
+
+        # Resolve cwd: prefer worktree so Codex sees the changed files
+        cwd = str(worktree_path) if worktree_path else None
 
         try:
             # Sandbox bypass required: bubblewrap namespace creation
@@ -286,6 +311,7 @@ class TaskReviewer:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
             )
             stdout_bytes, stderr_bytes = await proc.communicate(
                 input=prompt.encode("utf-8"),
@@ -332,10 +358,15 @@ class TaskReviewer:
         self,
         deliverable: str,
         requirements: str,
+        *,
+        worktree_path: Path | None = None,
     ) -> str | None:
         """Run adversarial verification via CC invoker (Sonnet).
 
         Returns verdict text or ``None`` if invoker is unavailable or fails.
+
+        *worktree_path*: when set, the CC session runs in the worktree
+        directory so it can inspect the actual changed files.
         """
         if self._invoker is None:
             return None
@@ -350,6 +381,7 @@ class TaskReviewer:
                 model=CCModel.SONNET,
                 effort=EffortLevel.HIGH,
                 skip_permissions=True,
+                working_dir=str(worktree_path) if worktree_path else None,
             )
             output = await self._invoker.run(invocation)
             if output.is_error:
