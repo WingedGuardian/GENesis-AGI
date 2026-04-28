@@ -73,7 +73,7 @@ class TaskDecomposer:
         """
         # Gather resource inventory for the decomposer
         resource_appendix = ""
-        if self._db is not None or self._retriever is not None:
+        if any([self._db, self._retriever, self._memory_store]):
             try:
                 from genesis.autonomy.executor.resources import (
                     gather_resource_inventory,
@@ -285,6 +285,9 @@ class TaskDecomposer:
                 "required_tools": [],
                 "complexity": "medium",
                 "dependencies": [len(validated) - 1],
+                "skills": [],
+                "procedures": [],
+                "mcp_guidance": [],
             })
 
         return validated

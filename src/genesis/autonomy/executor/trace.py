@@ -184,8 +184,17 @@ class ExecutionTracer:
             )
             return
 
+        # Skip retrospective for trivial traces (single-step fallbacks, all failed)
+        completed = sum(1 for s in trace.step_results if s.status == "completed")
+        if completed == 0:
+            logger.info(
+                "Retrospective skipped for task %s: no completed steps",
+                trace.task_id,
+            )
+            return
+
         try:
-            prompt = self._build_retrospective_prompt(trace, summary)
+            prompt = await self._build_retrospective_prompt(trace, summary)
             result = await self._router.route_call(
                 _CALL_SITE,
                 [{"role": "user", "content": prompt}],
@@ -218,7 +227,7 @@ class ExecutionTracer:
                 trace.task_id, f"Exception: {exc}",
             )
 
-    def _build_retrospective_prompt(
+    async def _build_retrospective_prompt(
         self,
         trace: ExecutionTrace,
         summary: str,
@@ -233,35 +242,56 @@ class ExecutionTracer:
                 _RETROSPECTIVE_PROMPT_PATH,
                 exc_info=True,
             )
+            # Fallback: minimal prompt without template
+            template = (
+                "Analyze this task execution trace and extract learnings.\n\n"
+                "## Execution Trace\n{{trace_summary}}\n\n"
+                "## Existing Procedures\n{{existing_procedures}}\n\n"
+                "Return JSON: {\"new_procedures\": [], "
+                "\"procedure_updates\": [], \"skill_observations\": []}"
+            )
 
         # Replace placeholders
         prompt = template.replace("{{trace_summary}}", summary)
 
-        # Include existing procedures so LLM can recommend updates
-        existing_procs = "No existing procedures loaded."
-        # Populated in _build_existing_procedures_context if DB available
-        if self._db is not None:
-            with contextlib.suppress(Exception):
-                existing_procs = self._format_existing_procedures_sync()
-
+        # Load existing procedures so LLM can recommend updates
+        existing_procs = await self._load_existing_procedures(trace)
         prompt = prompt.replace("{{existing_procedures}}", existing_procs)
 
         return prompt
 
-    def _format_existing_procedures_sync(self) -> str:
-        """Format existing procedures for prompt context.
+    async def _load_existing_procedures(self, trace: ExecutionTrace) -> str:
+        """Load relevant procedures for the retrospective prompt context."""
+        if self._db is None:
+            return "No procedures database available."
 
-        Called synchronously — uses cached DB data. For the async path,
-        the caller should pre-fetch and pass procedure data.
-        """
-        # This is a prompt-building step — we'll let the LLM work with
-        # whatever it has. The async procedure search happens in resources.py
-        # during decomposition. Here we just note that procedures exist.
-        return (
-            "Existing procedures are managed by the procedural learning system. "
-            "If you recognize a pattern matching an existing procedure type, "
-            "include it in procedure_updates with the appropriate outcome."
-        )
+        try:
+            from genesis.learning.procedural.matcher import find_relevant
+
+            # Extract keywords from user request for procedure matching
+            words = [
+                w for w in trace.user_request.lower().split()
+                if len(w) > 3
+            ][:10]
+
+            if not words:
+                return "No relevant procedures found."
+
+            matches = await find_relevant(
+                self._db, words, min_confidence=0.1, limit=10,
+            )
+            if not matches:
+                return "No relevant procedures found."
+
+            lines = []
+            for m in matches:
+                lines.append(
+                    f"- **{m.task_type}** ({m.confidence:.0%}): {m.principle}"
+                )
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("Failed to load existing procedures", exc_info=True)
+            return "Failed to load existing procedures."
 
     def _parse_retrospective_response(self, content: str) -> dict | None:
         """Parse JSON from retrospective LLM response."""
@@ -382,12 +412,17 @@ class ExecutionTracer:
         if not task_type or not outcome:
             return
 
-        from genesis.learning.procedural.matcher import find_best_match
+        # Use find_relevant with task_type as a context tag — find_best_match
+        # with empty tags always returns None (Jaccard overlap = 0).
+        from genesis.learning.procedural.matcher import find_relevant
 
-        match = await find_best_match(self._db, task_type, [])
-        if match is None:
+        matches = await find_relevant(
+            self._db, [task_type], min_confidence=0.0, limit=1,
+        )
+        if not matches:
             logger.debug("No existing procedure found for type '%s'", task_type)
             return
+        match = matches[0]
 
         from genesis.learning.procedural.operations import (
             record_failure,

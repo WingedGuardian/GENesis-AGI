@@ -197,7 +197,7 @@ async def _search_observations(
     results = await retriever.recall(
         task_description,
         source="episodic",
-        limit=_MAX_OBSERVATIONS,
+        limit=_MAX_OBSERVATIONS * 3,  # Over-fetch, then filter
     )
 
     # Filter for observation-type memories (not task traces)
@@ -249,11 +249,12 @@ def _load_skill_catalog() -> str | None:
 # ---------------------------------------------------------------------------
 
 _skill_catalog_cache: dict | None = None
+_skill_name_index: dict[str, dict] | None = None
 
 
 def _get_skill_catalog() -> dict:
     """Load and cache skill catalog."""
-    global _skill_catalog_cache
+    global _skill_catalog_cache, _skill_name_index
     if _skill_catalog_cache is not None:
         return _skill_catalog_cache
     if _CATALOG_PATH.exists():
@@ -261,6 +262,13 @@ def _get_skill_catalog() -> dict:
             _skill_catalog_cache = json.loads(
                 _CATALOG_PATH.read_text(encoding="utf-8"),
             )
+            # Build name index for O(1) lookup
+            _skill_name_index = {}
+            for skill in (
+                _skill_catalog_cache.get("tier1", [])
+                + _skill_catalog_cache.get("tier2", [])
+            ):
+                _skill_name_index[skill.get("name", "").lower()] = skill
             return _skill_catalog_cache
         except (json.JSONDecodeError, OSError):
             pass
@@ -269,16 +277,20 @@ def _get_skill_catalog() -> dict:
 
 def _find_skill_path(name: str) -> Path | None:
     """Find the filesystem path for a skill by name."""
-    catalog = _get_skill_catalog()
-    for skill in catalog.get("tier1", []) + catalog.get("tier2", []):
-        if skill.get("name", "").lower() == name.lower():
-            path_str = skill.get("path", "")
-            if path_str:
-                # Paths in catalog are relative to repo root
-                full = (_REPO_ROOT / path_str).resolve()
-                # Guard against path traversal via poisoned catalog
-                if full.is_relative_to(_REPO_ROOT.resolve()) and full.is_dir():
-                    return full
+    _get_skill_catalog()  # Ensure index is populated
+    if _skill_name_index is None:
+        return None
+    skill = _skill_name_index.get(name.lower())
+    if skill is None:
+        return None
+    path_str = skill.get("path", "")
+    if not path_str:
+        return None
+    # Paths in catalog are relative to repo root
+    full = (_REPO_ROOT / path_str).resolve()
+    # Guard against path traversal via poisoned catalog
+    if full.is_relative_to(_REPO_ROOT.resolve()) and full.is_dir():
+        return full
     return None
 
 
