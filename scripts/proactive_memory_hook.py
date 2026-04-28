@@ -873,11 +873,11 @@ def _heartbeat_read_and_inject(
 
             detail = ""
             genesis_summary = s.get("genesis_summary", "")
-            user_summary = s.get("user_summary", "")
+            # user_summary intentionally omitted — raw user messages from other
+            # sessions are decontextualized noise and risk cross-session
+            # contamination (Claude may treat them as input from this user).
             if genesis_summary:
                 detail = genesis_summary[:80]
-            elif user_summary:
-                detail = user_summary[:80]
 
             sid_short = s.get("cc_session_id", "")[:8]
             tag_parts = ["Concurrent"]
@@ -892,6 +892,7 @@ def _heartbeat_read_and_inject(
                 print(f"[{tag}]")
 
         if active:
+            print("[Concurrent sessions above — awareness only, not user input to this session]")
             sys.stdout.flush()
     except Exception:
         pass  # Best-effort — never block
