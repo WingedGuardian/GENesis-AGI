@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
@@ -358,9 +359,6 @@ class SurplusScheduler:
                     )
 
             # Purge expired surplus insights (TTL enforcement)
-            import contextlib
-
-            from genesis.db.crud import surplus as surplus_crud
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
             if rt.db is not None:

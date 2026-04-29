@@ -118,7 +118,7 @@ async def purge_expired(db: aiosqlite.Connection) -> int:
     cursor = await db.execute(
         "UPDATE surplus_insights SET promotion_status = 'discarded' "
         "WHERE promotion_status = 'pending' "
-        "AND ttl != '' AND ttl < datetime('now')",
+        "AND ttl != '' AND datetime(REPLACE(ttl, 'T', ' ')) < datetime('now')",
     )
     await db.commit()
     return cursor.rowcount
