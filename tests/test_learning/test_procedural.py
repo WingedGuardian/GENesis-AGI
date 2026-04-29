@@ -13,6 +13,7 @@ from genesis.learning.procedural.operations import (
     record_success,
     record_workaround,
     store_procedure,
+    store_procedure_checked,
     update_confidence,
 )
 from genesis.learning.types import MaturityStage
@@ -357,3 +358,162 @@ async def test_find_relevant_still_hides_speculative_extractor_writes(db):
     )
     matches = await find_relevant(db, ["extracted", "hypothesis"], limit=3)
     assert all(m.task_type != "auto-extracted-task" for m in matches)
+
+
+# ─── Conflict Detection ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_store_checked_exact_match_upserts(db):
+    """Same task_type → update existing, preserve counts, bump version."""
+    proc_id = await store_procedure(
+        db, task_type="deploy-safety", principle="original",
+        steps=["step-a"], tools_used=["Bash"], context_tags=["deploy"],
+        speculative=0, success_count=3, confidence=0.8,
+    )
+    result = await store_procedure_checked(
+        db, task_type="deploy-safety", principle="updated principle",
+        steps=["step-b", "step-c"], tools_used=["Bash"],
+        context_tags=["deploy", "safety"],
+    )
+    assert result.action == "updated"
+    assert result.procedure_id == proc_id
+    # Read back and verify
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    assert row["principle"] == "updated principle"
+    assert json.loads(row["steps"]) == ["step-b", "step-c"]
+    assert row["version"] == 2  # bumped
+    assert row["success_count"] == 3  # preserved
+    assert row["confidence"] == 0.8  # preserved
+
+
+@pytest.mark.asyncio
+async def test_store_checked_auto_skips_explicit(db):
+    """Auto-extracted should not overwrite explicit-teach."""
+    proc_id = await store_procedure(
+        db, task_type="manual-task", principle="human taught",
+        steps=["do-this"], tools_used=["Bash"], context_tags=["manual"],
+        speculative=0, success_count=1, confidence=2 / 3,
+    )
+    result = await store_procedure_checked(
+        db, task_type="manual-task", principle="auto extracted",
+        steps=["maybe-this"], tools_used=["Bash"],
+        context_tags=["manual"], speculative=1, confidence=0.0,
+    )
+    assert result.action == "skipped"
+    assert proc_id in result.conflicting_ids
+    # Original unchanged
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    assert row["principle"] == "human taught"
+
+
+@pytest.mark.asyncio
+async def test_store_checked_context_overlap_warns(db):
+    """High Jaccard overlap with different task_type → warn but create."""
+    await store_procedure(
+        db, task_type="youtube-fetch", principle="fetch youtube",
+        steps=["s1"], tools_used=["WebFetch"],
+        context_tags=["youtube", "video", "transcript"],
+        speculative=0, success_count=1, confidence=2 / 3,
+    )
+    # Jaccard: 3/4 = 0.75 >= 0.7 threshold
+    result = await store_procedure_checked(
+        db, task_type="youtube-download", principle="download youtube",
+        steps=["s2"], tools_used=["Bash"],
+        context_tags=["youtube", "video", "transcript", "download"],
+    )
+    assert result.action == "created"
+    assert len(result.warnings) > 0
+    assert "youtube-fetch" in result.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_store_checked_clean_insert(db):
+    """No conflicts → clean create, no warnings."""
+    result = await store_procedure_checked(
+        db, task_type="unique-task", principle="unique",
+        steps=["s1"], tools_used=["Grep"],
+        context_tags=["unique", "new"],
+    )
+    assert result.action == "created"
+    assert result.warnings == []
+    assert result.conflicting_ids == []
+
+
+# ─── Provenance Tracking ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_source_persisted(db):
+    """Source provenance round-trips through store/read."""
+    proc_id = await store_procedure(
+        db, task_type="sourced-task", principle="test",
+        steps=["s1"], tools_used=["Bash"], context_tags=["test"],
+        source={"type": "explicit_teach"},
+    )
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    source = json.loads(row["source"])
+    assert source["type"] == "explicit_teach"
+
+
+@pytest.mark.asyncio
+async def test_auto_extracted_source_persisted(db):
+    """Auto-extracted procedures record triage outcome in source."""
+    proc_id = await store_procedure(
+        db, task_type="extracted-task", principle="test",
+        steps=["s1"], tools_used=["Bash"], context_tags=["test"],
+        source={"type": "auto_extracted", "triage_outcome": "approach_failure"},
+    )
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    source = json.loads(row["source"])
+    assert source["type"] == "auto_extracted"
+    assert source["triage_outcome"] == "approach_failure"
+
+
+@pytest.mark.asyncio
+async def test_null_provenance_backward_compat(db):
+    """Old rows with NULL source/promotion_history still work."""
+    # Insert row without new columns (simulating pre-migration data)
+    await db.execute(
+        "INSERT INTO procedural_memory "
+        "(id, task_type, principle, steps, tools_used, context_tags, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("old-row", "old-task", "p", "[]", "[]", '["old"]', "2026-01-01"),
+    )
+    await db.commit()
+
+    # All existing operations should work
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, "old-row")
+    assert row["source"] is None
+    assert row["promotion_history"] is None
+
+    # record_success should work on rows without provenance
+    result = await record_success(db, "old-row")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_promoter_records_promotion_history(db):
+    """Promotion appends to promotion_history JSON."""
+    from genesis.learning.procedural.promoter import promote_and_demote
+
+    proc_id = await store_procedure(
+        db, task_type="promotable", principle="test",
+        steps=["s1"], tools_used=["Bash"], context_tags=["test"],
+        speculative=0, success_count=5, confidence=0.78,
+        activation_tier="L4",
+    )
+    result = await promote_and_demote(db)
+    assert result["promotions"] >= 1
+
+    from genesis.db.crud.procedural import get_by_id
+    row = await get_by_id(db, proc_id)
+    history = json.loads(row["promotion_history"])
+    assert len(history) >= 1
+    assert history[0]["from_tier"] == "L4"
+    assert history[0]["reason"] == "metrics_promotion"

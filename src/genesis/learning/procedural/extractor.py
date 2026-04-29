@@ -89,6 +89,20 @@ async def extract_procedure(
         logger.warning("Procedure extraction: missing required fields in %s", list(data.keys()))
         return None
 
+    # Skip if an explicit-teach procedure already covers this task_type
+    try:
+        from genesis.db.crud.procedural import find_by_task_type
+
+        existing = await find_by_task_type(db, data["task_type"])
+        if existing and existing.get("speculative") == 0:
+            logger.info(
+                "Skipped extraction for %s: explicit-teach %s exists",
+                data["task_type"], existing["id"],
+            )
+            return None
+    except Exception:
+        pass  # Non-critical guard — continue with extraction if check fails
+
     try:
         proc_id = await store_procedure(
             db,
@@ -100,6 +114,7 @@ async def extract_procedure(
             tool_trigger=data.get("tool_trigger"),
             activation_tier="L4",
             speculative=1,
+            source={"type": "auto_extracted", "triage_outcome": outcome},
         )
         logger.info("Extracted procedure %s: %s", proc_id, data["task_type"])
         return proc_id

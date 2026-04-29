@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -95,6 +96,14 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
 
         # Quarantine check
         if row["confidence"] < 0.3 and row["success_count"] + row["failure_count"] >= 3:
+            history = json.loads(row.get("promotion_history") or "[]")
+            history.append({
+                "from_tier": current_tier,
+                "to_tier": "quarantined",
+                "at": datetime.now(UTC).isoformat(),
+                "reason": "low_confidence_quarantine",
+            })
+            await procedural.update(db, proc_id, promotion_history=json.dumps(history))
             await procedural.quarantine(db, proc_id)
             quarantined += 1
             logger.info("Quarantined procedure %s (conf=%.2f)", row["task_type"], row["confidence"])
@@ -110,9 +119,23 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
                 target_tier = _RANK_TIER[current_rank - 1]
 
         if target_tier != current_tier:
-            await procedural.update(db, proc_id, activation_tier=target_tier)
             target_rank = _TIER_RANK.get(target_tier, 1)
             current_rank = _TIER_RANK.get(current_tier, 1)
+            reason = "metrics_promotion" if target_rank > current_rank else "failure_demotion"
+
+            history = json.loads(row.get("promotion_history") or "[]")
+            history.append({
+                "from_tier": current_tier,
+                "to_tier": target_tier,
+                "at": datetime.now(UTC).isoformat(),
+                "reason": reason,
+            })
+            await procedural.update(
+                db, proc_id,
+                activation_tier=target_tier,
+                promotion_history=json.dumps(history),
+            )
+
             if target_rank > current_rank:
                 promotions += 1
                 logger.info("Promoted %s: %s → %s", row["task_type"], current_tier, target_tier)
