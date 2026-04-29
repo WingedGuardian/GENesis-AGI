@@ -2,6 +2,13 @@
 
 Genesis v3 is an autonomous AI agent system.
 
+## Architecture
+
+Channels (Telegram, Dashboard, OpenClaw) → Cognitive Core (CCInvoker, triage,
+reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
+(SQLite WAL, Qdrant, ~/.genesis/) → Observability (event bus, health).
+64 packages, 94K LOC. Use `codebase_navigate` MCP to explore.
+
 ## Environment
 
 - **Python**: 3.12 (venv at `~/genesis/.venv`)
@@ -20,6 +27,7 @@ Genesis v3 is an autonomous AI agent system.
   secrets). Restore via `scripts/restore.sh` or `python -m genesis restore`.
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
+- **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
 
 ## Process Management
 
@@ -38,12 +46,6 @@ Other units: `genesis-bridge.service` (Telegram relay, on-demand),
 `genesis-tmp-watchgod.service` (/tmp protection), `genesis-watchdog.timer`
 (health check). MCP servers are CC child processes (not systemd) — code
 changes take effect on next CC session start.
-
-## New Machine Setup
-
-```bash
-./scripts/bootstrap.sh                            # Full setup — venv, config, services, memory
-```
 
 ## Common Commands
 
@@ -270,6 +272,12 @@ Full pipeline details are in the `genesis-development` skill's
 ## Scheduling Reminders
 
 To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreach_send` with `preferred_timing` set to an ISO timestamp. This persists in the DB and fires via the Genesis outreach pipeline. Do NOT use the `/schedule` skill — that routes to Claude Code's remote cloud scheduler, not Genesis.
+
+## Traps
+
+- **Ego** (`src/genesis/ego/`) — INERT. Zero production callers. Don't wire.
+- **GROUNDWORK tags** — `# GROUNDWORK(id): why` is intentional. Never delete.
+- **IntervalTrigger** — Resets on restart. Use `CronTrigger` for intervals >1h.
 
 ## Rules
 
