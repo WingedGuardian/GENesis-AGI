@@ -93,7 +93,7 @@ async def _impl_task_submit(plan_path: str, description: str) -> dict:
 
     # MCP fallback: validate + create DB row, server picks up via dispatch_cycle
     try:
-        resolved = Path(plan_path).resolve()
+        resolved = Path(plan_path).expanduser().resolve()
         if not any(resolved.is_relative_to(d) for d in _ALLOWED_PLAN_DIRS):
             return {
                 "error": f"Plan path outside allowed directories: {plan_path}. "
