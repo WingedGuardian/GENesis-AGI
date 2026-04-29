@@ -500,6 +500,8 @@ async def test_null_provenance_backward_compat(db):
 @pytest.mark.asyncio
 async def test_promoter_records_promotion_history(db):
     """Promotion appends to promotion_history JSON."""
+    from unittest.mock import AsyncMock, patch
+
     from genesis.learning.procedural.promoter import promote_and_demote
 
     proc_id = await store_procedure(
@@ -508,7 +510,9 @@ async def test_promoter_records_promotion_history(db):
         speculative=0, success_count=5, confidence=0.78,
         activation_tier="L4",
     )
-    result = await promote_and_demote(db)
+    # Mock regenerate to avoid clobbering the filesystem trigger cache
+    with patch("genesis.learning.procedural.promoter.regenerate", new_callable=AsyncMock):
+        result = await promote_and_demote(db)
     assert result["promotions"] >= 1
 
     from genesis.db.crud.procedural import get_by_id
