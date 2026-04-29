@@ -111,3 +111,14 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM surplus_insights WHERE id = ?", (id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def purge_expired(db: aiosqlite.Connection) -> int:
+    """Discard pending insights past their TTL. Returns count discarded."""
+    cursor = await db.execute(
+        "UPDATE surplus_insights SET promotion_status = 'discarded' "
+        "WHERE promotion_status = 'pending' "
+        "AND ttl != '' AND ttl < datetime('now')",
+    )
+    await db.commit()
+    return cursor.rowcount
