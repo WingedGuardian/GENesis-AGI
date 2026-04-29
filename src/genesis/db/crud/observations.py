@@ -79,6 +79,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "finding": timedelta(days=30),
     "bugfix_committed": timedelta(days=30),
     "sentinel_escalated": timedelta(days=30),
+    "escalation_to_user_ego": timedelta(days=14),
     "user_signal": timedelta(days=30),
     "user_model_gap": timedelta(days=30),
     "reference_pointer": timedelta(days=30),

@@ -11,18 +11,18 @@ from enum import StrEnum
 class CycleType(StrEnum):
     """Types of ego thinking cycles."""
 
-    PROACTIVE = "proactive"        # Regular brainstorming (Opus, High)
-    MORNING_REPORT = "morning_report"  # Daily briefing (Sonnet, Low)
-    REACTIVE = "reactive"          # User message response (Opus, High)
-    ESCALATION = "escalation"      # Health/escalation eval (Sonnet, Medium)
+    PROACTIVE = "proactive"        # Regular brainstorming (uses config model/effort)
+    MORNING_REPORT = "morning_report"  # Daily briefing (always Sonnet, Low)
+    REACTIVE = "reactive"          # User message response (uses config model/effort)
+    ESCALATION = "escalation"      # Health/escalation eval (always Sonnet, Medium)
 
 
-# Model and effort per cycle type. Ephemeral sessions make this trivial —
-# each cycle independently picks model and effort.
+# Per-cycle-type model/effort OVERRIDES.  Only cycle types listed here
+# bypass the ego's config.model / config.default_effort.  PROACTIVE and
+# REACTIVE are intentionally absent — they respect the per-ego config so
+# genesis ego can run Sonnet while user ego runs Opus.
 CYCLE_TYPE_DEFAULTS: dict[CycleType, tuple[str, str]] = {
-    CycleType.PROACTIVE: ("opus", "high"),
     CycleType.MORNING_REPORT: ("sonnet", "low"),
-    CycleType.REACTIVE: ("opus", "high"),
     CycleType.ESCALATION: ("sonnet", "medium"),
 }
 

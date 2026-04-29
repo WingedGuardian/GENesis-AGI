@@ -145,12 +145,11 @@ class EgoSession:
             )
         is_morning_report = cycle_type == CycleType.MORNING_REPORT
 
-        # Select model + effort per cycle type
-        default_model, default_effort = CYCLE_TYPE_DEFAULTS.get(
-            cycle_type, ("opus", "high"),
-        )
-        model = CCModel(default_model)
-        effort = EffortLevel(default_effort)
+        # Select model + effort: config is the base, cycle type overrides
+        # only for specific types (morning report → sonnet/low, etc.)
+        cycle_model, cycle_effort = CYCLE_TYPE_DEFAULTS.get(cycle_type, (None, None))
+        model = CCModel(cycle_model or self._config.model)
+        effort = EffortLevel(cycle_effort or self._config.default_effort)
 
         # 1. Budget check — raises BudgetExceededError (not a failure)
         if not await self._check_budget():
@@ -252,7 +251,7 @@ class EgoSession:
             output_text=output.text,
             proposals_json=proposals_json,
             focus_summary=focus,
-            model_used=output.model_used or default_model,
+            model_used=output.model_used or model.value,
             cost_usd=output.cost_usd,
             input_tokens=output.input_tokens,
             output_tokens=output.output_tokens,
@@ -273,7 +272,7 @@ class EgoSession:
                 from genesis.observability.call_site_recorder import record_last_run
                 await record_last_run(
                     self._db, self._call_site,
-                    provider="cc", model_id=output.model_used or default_model,
+                    provider="cc", model_id=output.model_used or model.value,
                     response_text=output.text[:500] if output.text else "",
                     input_tokens=output.input_tokens,
                     output_tokens=output.output_tokens,
