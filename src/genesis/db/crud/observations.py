@@ -74,6 +74,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quality_calibration": timedelta(days=14),
     "user_model_delta": timedelta(days=14),
     "capability_improvement": timedelta(days=14),
+    "escalation_to_user_ego": timedelta(days=14),
     "strategic_analysis": timedelta(days=14),
     # ── 30-day (intake signals, need processing time) ──────────────────
     "finding": timedelta(days=30),

@@ -69,7 +69,7 @@ class TestEgoConfig:
         assert cfg.max_interval_minutes == 240
         assert cfg.model == "opus"
         assert cfg.board_size == 3
-        assert cfg.ego_thinking_budget_usd == 4.0
+        assert cfg.ego_thinking_budget_usd == 10.0
         assert cfg.ego_dispatch_budget_usd == 2.50
         assert cfg.consecutive_failure_limit == 3
         assert cfg.batch_digest is True

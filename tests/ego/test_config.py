@@ -25,7 +25,7 @@ class TestLoadEgoConfig:
         assert config.enabled is True
         assert config.cadence_minutes == 60
         assert config.model == "opus"
-        assert config.ego_thinking_budget_usd == 4.0
+        assert config.ego_thinking_budget_usd == 10.0
         assert config.ego_dispatch_budget_usd == 2.50
 
     def test_loads_from_yaml(self, tmp_config):

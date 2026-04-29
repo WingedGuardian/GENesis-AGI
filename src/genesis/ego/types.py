@@ -11,18 +11,18 @@ from enum import StrEnum
 class CycleType(StrEnum):
     """Types of ego thinking cycles."""
 
-    PROACTIVE = "proactive"        # Regular brainstorming (Opus, High)
-    MORNING_REPORT = "morning_report"  # Daily briefing (Sonnet, Low)
-    REACTIVE = "reactive"          # User message response (Opus, High)
-    ESCALATION = "escalation"      # Health/escalation eval (Sonnet, Medium)
+    PROACTIVE = "proactive"        # Regular brainstorming (uses config model/effort)
+    MORNING_REPORT = "morning_report"  # Daily briefing (always Sonnet, Low)
+    REACTIVE = "reactive"          # User message response (uses config model/effort)
+    ESCALATION = "escalation"      # Health/escalation eval (always Sonnet, Medium)
 
 
-# Model and effort per cycle type. Ephemeral sessions make this trivial —
-# each cycle independently picks model and effort.
+# Per-cycle-type model/effort OVERRIDES.  Only cycle types listed here
+# bypass the ego's config.model / config.default_effort.  PROACTIVE and
+# REACTIVE are intentionally absent — they respect the per-ego config so
+# genesis ego can run Sonnet while user ego runs Opus.
 CYCLE_TYPE_DEFAULTS: dict[CycleType, tuple[str, str]] = {
-    CycleType.PROACTIVE: ("opus", "high"),
     CycleType.MORNING_REPORT: ("sonnet", "low"),
-    CycleType.REACTIVE: ("opus", "high"),
     CycleType.ESCALATION: ("sonnet", "medium"),
 }
 
@@ -106,7 +106,7 @@ class EgoConfig:
     morning_report_effort: str = "low"  # effort for morning reports
     morning_report_enabled: bool = True  # set False for Genesis ego
     board_size: int = 3  # max active proposals on the board
-    ego_thinking_budget_usd: float = 4.0  # daily cap for ego cycle costs
+    ego_thinking_budget_usd: float = 10.0  # daily cap for ego cycle costs (shadow API pricing)
     ego_dispatch_budget_usd: float = 2.50  # daily cap for dispatched sessions
     morning_report_hour: int = 8  # 24h format, local time
     morning_report_minute: int = 0

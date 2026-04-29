@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
@@ -221,13 +222,14 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
-        self._scheduler.add_job(
-            self.schedule_analytical,
-            IntervalTrigger(hours=self._analytical_hours),
-            id="schedule_analytical",
-            max_instances=1,
-            misfire_grace_time=300,
-        )
+        if self._analytical_hours > 0:
+            self._scheduler.add_job(
+                self.schedule_analytical,
+                IntervalTrigger(hours=self._analytical_hours),
+                id="schedule_analytical",
+                max_instances=1,
+                misfire_grace_time=300,
+            )
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
@@ -246,7 +248,8 @@ class SurplusScheduler:
         await self.schedule_code_index()
         await self.run_recon_gather()
         await self.schedule_maintenance()
-        await self.schedule_analytical()
+        if self._analytical_hours > 0:
+            await self.schedule_analytical()
         logger.info(
             "Surplus scheduler started (dispatch=%dm, brainstorm=%dh)",
             self._dispatch_interval, self._brainstorm_interval,
@@ -354,11 +357,17 @@ class SurplusScheduler:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
-            try:
-                from genesis.runtime import GenesisRuntime
+
+            # Purge expired surplus insights (TTL enforcement)
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.db is not None:
+                purged = await surplus_crud.purge_expired(rt.db)
+                if purged:
+                    logger.info("Purged %d expired surplus insights", purged)
+
+            with contextlib.suppress(Exception):
                 GenesisRuntime.instance().record_job_success("schedule_maintenance")
-            except Exception:
-                pass
         except Exception as exc:
             logger.exception("Maintenance scheduling failed")
             try:

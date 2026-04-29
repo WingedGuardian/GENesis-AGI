@@ -18,7 +18,7 @@ async def db():
         await conn.execute("""
             CREATE TABLE awareness_ticks (
                 id INTEGER PRIMARY KEY,
-                signal_data TEXT,
+                signals_json TEXT,
                 classified_depth TEXT,
                 created_at TEXT
             )
@@ -162,14 +162,14 @@ class TestEgoContextBuilder:
 
     @pytest.mark.asyncio
     async def test_signals_section_with_data(self, db, mock_health_data, capabilities):
-        signal_data = json.dumps({
+        signals_json = json.dumps({
             "software_error_spike": {"value": 0.0, "source": "observations"},
             "budget_pct_consumed": {"value": 0.25, "source": "cost_events"},
         })
         await db.execute(
-            "INSERT INTO awareness_ticks (signal_data, classified_depth, created_at) "
+            "INSERT INTO awareness_ticks (signals_json, classified_depth, created_at) "
             "VALUES (?, ?, ?)",
-            (signal_data, "Micro", "2026-03-28T17:55:00+00:00"),
+            (signals_json, "Micro", "2026-03-28T17:55:00+00:00"),
         )
         builder = EgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,

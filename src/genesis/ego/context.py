@@ -167,7 +167,7 @@ class EgoContextBuilder:
 
         try:
             cursor = await self._db.execute(
-                "SELECT signal_data, classified_depth, created_at "
+                "SELECT signals_json, classified_depth, created_at "
                 "FROM awareness_ticks "
                 "ORDER BY created_at DESC LIMIT 1"
             )
@@ -181,11 +181,11 @@ class EgoContextBuilder:
             lines.append("*No awareness ticks recorded.*\n")
             return "\n".join(lines)
 
-        signal_data, depth, created_at = row
+        signals_json, depth, created_at = row
         lines.append(f"**Last tick**: {created_at} (depth: {depth})\n")
 
         try:
-            signals = json.loads(signal_data) if signal_data else {}
+            signals = json.loads(signals_json) if signals_json else {}
         except (json.JSONDecodeError, TypeError):
             signals = {}
 

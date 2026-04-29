@@ -222,7 +222,7 @@ class TestGenesisEgoContextBuilder:
             "INSERT INTO awareness_ticks "
             "(id, source, signals_json, scores_json, signal_data, classified_depth, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("t1", "scheduled", "{}", "{}", signal_data, "Micro", "2026-04-24T09:55:00+00:00"),
+            ("t1", "scheduled", signal_data, "{}", "{}", "Micro", "2026-04-24T09:55:00+00:00"),
         )
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
