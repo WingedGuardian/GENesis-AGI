@@ -171,6 +171,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=True,
     ),
+    "ego": SettingsDomain(
+        name="ego",
+        description="Ego cycle settings (model, cadence, budget, effort)",
+        config_filename="ego.yaml",
+        readonly=False,
+        needs_restart=True,
+    ),
 }
 
 
@@ -500,6 +507,11 @@ def _validate_surplus(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_ego(changes: dict) -> list[str]:
+    from genesis.ego.config import validate_ego_config
+    return validate_ego_config(changes)
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
@@ -507,6 +519,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "autonomous_cli_policy": _validate_autonomous_cli_policy,
     "updates": _validate_updates,
     "surplus": _validate_surplus,
+    "ego": _validate_ego,
 }
 
 

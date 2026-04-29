@@ -106,7 +106,7 @@ class EgoConfig:
     morning_report_effort: str = "low"  # effort for morning reports
     morning_report_enabled: bool = True  # set False for Genesis ego
     board_size: int = 3  # max active proposals on the board
-    ego_thinking_budget_usd: float = 4.0  # daily cap for ego cycle costs
+    ego_thinking_budget_usd: float = 10.0  # daily cap for ego cycle costs (shadow API pricing)
     ego_dispatch_budget_usd: float = 2.50  # daily cap for dispatched sessions
     morning_report_hour: int = 8  # 24h format, local time
     morning_report_minute: int = 0
