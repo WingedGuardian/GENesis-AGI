@@ -7,7 +7,20 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from genesis.autonomy.dispatcher import TaskDispatcher, _validate_plan_path
+from genesis.autonomy.dispatcher import (
+    TaskDispatcher,
+    _validate_plan_content,
+    _validate_plan_path,
+)
+
+# Minimal plan content satisfying REQUIRED_PLAN_SECTIONS validation
+VALID_PLAN = (
+    "# Plan\n"
+    "## Requirements\nBuild it\n"
+    "## Steps\n1. Do thing\n"
+    "## Success Criteria\nIt works\n"
+    "## Risks and Failure Modes\nNone significant\n"
+)
 
 # ---------------------------------------------------------------------------
 # Path validation tests
@@ -42,6 +55,32 @@ class TestPathValidation:
             _validate_plan_path(str(Path.home() / "nonexistent_plan_xyz.md"))
 
 
+class TestPlanContentValidation:
+    def test_rejects_missing_sections(self, tmp_path: Path) -> None:
+        plan = tmp_path / "bad-plan.md"
+        plan.write_text("# Plan\n## Steps\n1. Do thing\n")
+        with pytest.raises(ValueError, match="missing required sections"):
+            _validate_plan_content(plan)
+
+    def test_lists_all_missing_sections(self, tmp_path: Path) -> None:
+        plan = tmp_path / "minimal.md"
+        plan.write_text("# Plan\nJust a title\n")
+        with pytest.raises(ValueError, match="Requirements") as exc_info:
+            _validate_plan_content(plan)
+        msg = str(exc_info.value)
+        assert "## Requirements" in msg
+        assert "## Steps" in msg
+        assert "## Success Criteria" in msg
+        assert "## Risks and Failure Modes" in msg
+
+    def test_accepts_complete_plan(self, tmp_path: Path) -> None:
+        plan = tmp_path / "good-plan.md"
+        plan.write_text(VALID_PLAN)
+        # Should not raise
+        _validate_plan_content(plan)
+
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -74,7 +113,7 @@ class TestSubmit:
         self, dispatcher: TaskDispatcher, tmp_path: Path,
     ) -> None:
         plan = tmp_path / "plan.md"
-        plan.write_text("# Plan\n## Steps\n1. Do thing")
+        plan.write_text(VALID_PLAN)
 
         with (
             patch("genesis.autonomy.dispatcher._ALLOWED_PLAN_DIRS", [tmp_path]),
@@ -102,6 +141,19 @@ class TestSubmit:
                 str(tmp_path / "gone.md"), "Missing plan",
             )
 
+    async def test_submit_rejects_incomplete_plan(
+        self, dispatcher: TaskDispatcher, tmp_path: Path,
+    ) -> None:
+        """Content validation fires through submit() for in-server path."""
+        plan = tmp_path / "incomplete.md"
+        plan.write_text("# Plan\n## Steps\n1. Do thing\n")
+
+        with (
+            patch("genesis.autonomy.dispatcher._ALLOWED_PLAN_DIRS", [tmp_path]),
+            pytest.raises(ValueError, match="missing required sections"),
+        ):
+            await dispatcher.submit(str(plan), "Bad task")
+
     async def test_submit_with_event_bus(
         self, mock_executor: AsyncMock, tmp_path: Path,
     ) -> None:
@@ -110,7 +162,7 @@ class TestSubmit:
         d = TaskDispatcher(db=AsyncMock(), executor=mock_executor, event_bus=event_bus)
 
         plan = tmp_path / "plan.md"
-        plan.write_text("# Plan")
+        plan.write_text(VALID_PLAN)
 
         with (
             patch("genesis.autonomy.dispatcher._ALLOWED_PLAN_DIRS", [tmp_path]),
@@ -133,7 +185,7 @@ class TestDispatchCycle:
         self, dispatcher: TaskDispatcher, tmp_path: Path,
     ) -> None:
         plan = tmp_path / "plan.md"
-        plan.write_text("# Plan")
+        plan.write_text(VALID_PLAN)
 
         obs = {
             "id": "obs-1",
@@ -157,6 +209,8 @@ class TestDispatchCycle:
     async def test_dedup_skips_active_tasks(
         self, dispatcher: TaskDispatcher,
     ) -> None:
+        # content-match dedup fires before path/content validation —
+        # this path never reaches submit()
         obs = {
             "id": "obs-2",
             "content": "Already running",
