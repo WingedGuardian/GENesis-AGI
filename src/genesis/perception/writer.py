@@ -99,12 +99,11 @@ class ResultWriter:
 
         # Cooldown gate: skip if a micro_reflection was created within the last
         # 20 minutes. Anomalies bypass — same pattern as light reflections (30 min).
-        if not output.anomaly:
-            if await observations.exists_recent_by_type(
-                db, source="reflection", type="micro_reflection", window_minutes=20,
-            ):
-                logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
-                return False
+        if not output.anomaly and await observations.exists_recent_by_type(
+            db, source="reflection", type="micro_reflection", window_minutes=20,
+        ):
+            logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
+            return False
 
         content = json.dumps({
             "tags": output.tags,
