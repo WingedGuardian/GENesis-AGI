@@ -61,7 +61,7 @@ async def test_write_micro_anomaly_tags_observation(db):
 
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 1
-    assert obs[0]["category"] == "anomaly"
+    assert obs[0]["category"] == "anomaly:genesis"
 
 
 async def test_write_light_creates_observation(db):

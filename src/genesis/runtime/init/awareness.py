@@ -33,6 +33,8 @@ async def init(rt: GenesisRuntime) -> None:
             StrategicTimerCollector,
             SurplusActivityCollector,
             TaskQualityCollector,
+            UserGoalStalenessCollector,
+            UserSessionPatternCollector,
         )
 
         collectors = [
@@ -53,6 +55,8 @@ async def init(rt: GenesisRuntime) -> None:
             SurplusActivityCollector(),
             AutonomyActivityCollector(),
             ProcessHealthCollector(),
+            UserGoalStalenessCollector(),
+            UserSessionPatternCollector(),
         ]
 
         rt._awareness_loop = AwarenessLoop(

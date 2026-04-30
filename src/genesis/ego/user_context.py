@@ -186,13 +186,16 @@ class UserEgoContextBuilder:
         lines = ["## User-World Signals (last 7 days, max 15)\n"]
 
         try:
-            # Build category filter
+            # Build category filter — match exact user-world categories
+            # plus composite relevance tags ending in :user or :both
             placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
                 f"SELECT source, type, category, content, priority, created_at "
                 f"FROM observations "
                 f"WHERE resolved = 0 "
-                f"AND category IN ({placeholders}) "
+                f"AND (category IN ({placeholders}) "
+                f"     OR category LIKE '%:user' "
+                f"     OR category LIKE '%:both') "
                 f"AND created_at >= datetime('now', '-7 days') "
                 f"ORDER BY "
                 f"  CASE priority "

@@ -1116,6 +1116,9 @@ SIGNAL_WEIGHTS_SEED = [
     ("autonomy_activity", "autonomy", 0.60, 0.60, 0.0, 1.0, '["Micro"]'),
     # 2026-04-17: ghost signal activation — collector already exists, just needs weight
     ("stale_pending_items", "cognitive_state", 0.35, 0.35, 0.0, 1.0, '["Micro"]'),
+    # 2026-04-30: user-facing signals for reflection rebalancing (Phase 2.5b)
+    ("user_goal_staleness", "follow_ups+user_model", 0.40, 0.40, 0.0, 1.0, '["Micro","Light"]'),
+    ("user_session_pattern", "cc_sessions", 0.35, 0.35, 0.0, 1.0, '["Micro","Light"]'),
 ]
 
 DEPTH_THRESHOLDS_SEED = [

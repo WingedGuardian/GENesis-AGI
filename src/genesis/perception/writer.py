@@ -25,6 +25,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Signals that track user activity/outcomes (vs Genesis infrastructure).
+# Used to determine relevance tagging on micro reflections.
+_USER_FACING_SIGNALS = frozenset({
+    "conversations_since_reflection",
+    "task_completion_quality",
+    "recon_findings_pending",
+    "stale_pending_items",
+    "user_goal_staleness",
+    "user_session_pattern",
+})
+
+# Light reflection focus_area → relevance mapping
+_LIGHT_FOCUS_RELEVANCE: dict[str, str] = {
+    "user_impact": "user",
+    "situation": "both",
+    "anomaly": "genesis",
+}
+
 
 class ResultWriter:
     """Stores reflection outputs to the database and emits events.
@@ -47,6 +65,17 @@ class ResultWriter:
     def _content_hash(content: str) -> str:
         """SHA-256 hash for observation dedup."""
         return hashlib.sha256(content.encode()).hexdigest()
+
+    @staticmethod
+    def _relevance_from_signals(tick: TickResult) -> str:
+        """Determine relevance tag from tick signals: 'user', 'genesis', or 'both'."""
+        has_user = any(s.name in _USER_FACING_SIGNALS for s in tick.signals)
+        has_genesis = any(s.name not in _USER_FACING_SIGNALS for s in tick.signals)
+        if has_user and has_genesis:
+            return "both"
+        if has_user:
+            return "user"
+        return "genesis"
 
     @staticmethod
     def _normalize_for_dedup(summary: str) -> str:
@@ -112,7 +141,9 @@ class ResultWriter:
             "summary": output.summary,
             "signals_examined": output.signals_examined,
         }, sort_keys=True)
-        category = "anomaly" if output.anomaly else "routine"
+        base_category = "anomaly" if output.anomaly else "routine"
+        relevance = self._relevance_from_signals(tick)
+        category = f"{base_category}:{relevance}"
 
         # Normalized hash: strips numeric variation from the summary so
         # "memory at 78% is fine" and "memory at 79% is fine" dedup correctly.
@@ -182,12 +213,16 @@ class ResultWriter:
         }, sort_keys=True)
         chash = self._content_hash(content)
 
+        light_relevance = _LIGHT_FOCUS_RELEVANCE.get(output.focus_area, "both")
+        light_category = f"{output.focus_area}:{light_relevance}"
+
         if not await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):
             await observations.create(
                 db,
                 id=str(uuid.uuid4()),
                 source="reflection",
                 type="light_reflection",
+                category=light_category,
                 content=content,
                 priority="medium",
                 created_at=tick.timestamp,
@@ -336,6 +371,7 @@ class ResultWriter:
                 id=str(uuid.uuid4()),
                 source="reflection",
                 type="user_model_delta",
+                category="user_model_delta",
                 content=delta_content,
                 priority="medium",
                 created_at=tick.timestamp,

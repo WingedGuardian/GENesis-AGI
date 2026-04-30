@@ -9,6 +9,17 @@ description: >
   or any output the user hasn't asked to be written in their voice.
 ---
 
+## Companion Files
+
+This is the **project-level** skill (workflow + AI-tell audit rules). The
+**user-level** companion at `~/.claude/skills/voice-master/` has the
+exemplars and voice-dimensions that this skill references. Always load
+both locations when using this skill:
+
+- **Exemplars:** `~/.claude/skills/voice-master/exemplars/` (index.md,
+  social.md, professional.md, longform.md)
+- **Voice dimensions:** `~/.claude/skills/voice-master/voice-dimensions.md`
+
 ## Overview
 
 Generates content that sounds like the user — not an AI impression of the
@@ -66,6 +77,9 @@ Before delivering, scan the output and eliminate any of the following:
 
 **Banned words and phrases:**
 - delve, leverage, utilize, ensure, robust, seamless, streamline
+- clean (as filler/intensifier, e.g. "clean architecture" — OK for
+  literal cleanliness), smoking gun, landscape, ecosystem (when not
+  literal), holistic, synergy, empower, elevate, harness, foster
 - it's worth noting, it is important to note, it's important to
 - in conclusion, in summary, to summarize
 - cutting-edge, game-changing, transformative, revolutionary
@@ -77,6 +91,15 @@ Before delivering, scan the output and eliminate any of the following:
 - Three-part lists that follow the exact same grammatical structure
 - Passive voice overuse ("it was determined," "it should be noted")
 - Rhetorical questions that aren't genuinely rhetorical
+- Em-dash overuse and wrong format. Two rules, both hard:
+  1. **Format:** `--` with NO spaces on either side. Not `--` with spaces.
+     Not the Unicode `—`. Not ` — `. Just `--` butted up against the words.
+     Wrong: `the memory, the learning loop, the reflection cycles -- Get those`
+     Right: `the memory, the learning loop, the reflection cycles--Get those`
+     Actually: don't write that at all. Use a period instead.
+  2. **Frequency:** Reach for a comma, period, colon, or semicolon first.
+     Every time. Em-dashes are for emphasis or asides where nothing else fits.
+     Max 1-2 per page, not per paragraph. Stacking them is an AI fingerprint.
 - Hedging openers ("It's worth considering that...")
 - Sycophantic acknowledgments before answering
 

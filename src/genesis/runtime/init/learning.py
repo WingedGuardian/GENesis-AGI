@@ -66,6 +66,12 @@ async def init(rt: GenesisRuntime) -> None:
                 SurplusActivityCollector,
             )
             from genesis.learning.signals.task_quality import TaskQualityCollector
+            from genesis.learning.signals.user_goal_staleness import (
+                UserGoalStalenessCollector,
+            )
+            from genesis.learning.signals.user_session_pattern import (
+                UserSessionPatternCollector,
+            )
             from genesis.observability.health import (
                 probe_db,
                 probe_ollama,
@@ -108,6 +114,8 @@ async def init(rt: GenesisRuntime) -> None:
                     pipeline_getter=lambda: rt._outreach_pipeline,
                 ),
                 ProcessHealthCollector(),
+                UserGoalStalenessCollector(rt._db),
+                UserSessionPatternCollector(rt._db),
             ]
             rt._awareness_loop.replace_collectors(collectors)
             logger.info("Installed %d signal collectors", len(collectors))
