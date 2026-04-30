@@ -920,6 +920,15 @@ async def _run(prompt: str, session_id: str = "") -> None:
     except Exception:
         pass  # Intent trail must never block the hook
 
+    # ── Recent tool activity (self-awareness for post-compaction context) ─
+    try:
+        activity = _extract_genesis_summary(session_id)
+        if activity:
+            print(f"[Recent activity] {activity}")
+            sys.stdout.flush()
+    except Exception:
+        pass  # Never block
+
     # Augment keywords with file-context from PostToolUse tracking
     recent_files = _load_recent_files(session_id)
     if recent_files:
