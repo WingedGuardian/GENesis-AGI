@@ -21,7 +21,7 @@ things, and what trips developers up repeatedly.
 | `outreach/` | Governance gate, draft/deliver pipeline, engagement tracker, scheduler | ACTIVE |
 | `autonomy/` | Levels L1-L4, action classifier, approval flow, task verifier | ACTIVE |
 | `skills/` | 20+ internal skills (evaluate, research, osint, forecasting, etc.) | ACTIVE |
-| `ego/` | Ego sessions, adaptive backoff, circuit breaker | **INERT** |
+| `ego/` | Ego sessions (user ego + genesis ego), adaptive cadence, proposals, dispatch | **ACTIVE** |
 | `providers/` | Provider registry (web search, STT, TTS, embeddings, health) | ACTIVE |
 | `research/` | Web search + URL fetch via SearXNG+Brave, Gemini YouTube routing | ACTIVE |
 | `mail/` | Gmail monitor (weekly poll), two-layer triage (Gemini + CC) | ACTIVE |
