@@ -35,12 +35,13 @@ class UserEgoContextBuilder:
 
     Data sources (ordered by signal value):
     1. User model — who the user is, what they care about
-    2. Recent conversations — what the user is working on
-    3. User-world observations — email, inbox, findings
-    4. Genesis ego escalations — things Genesis can't resolve alone
-    5. Capabilities — what Genesis CAN do but ISN'T doing
-    6. Minimal system status — one-line health summary
-    7. Open threads — pending follow-ups
+    2. User activity pulse — user-facing awareness signals
+    3. Recent conversations — what the user is working on
+    4. User-world observations — email, inbox, findings
+    5. Genesis ego escalations — things Genesis can't resolve alone
+    6. Capabilities — what Genesis CAN do but ISN'T doing
+    7. Minimal system status — one-line health summary
+    8. Open threads — pending follow-ups
     """
 
     def __init__(
@@ -65,6 +66,7 @@ class UserEgoContextBuilder:
         )
 
         sections.append(await self._user_model_section())
+        sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
         sections.append(await self._user_world_observations_section())
         sections.append(await self._genesis_escalations_section())
@@ -104,6 +106,27 @@ class UserEgoContextBuilder:
             f"last synthesized {synthesized_at[:10]}*\n"
         )
 
+        # 3d: Model freshness warning — flag when model is stale
+        # relative to recent conversation activity.
+        try:
+            synth_dt = datetime.fromisoformat(synthesized_at)
+            age_days = (datetime.now(UTC) - synth_dt).days
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM cc_sessions "
+                "WHERE source_tag = 'foreground' "
+                "AND started_at > ?",
+                (synthesized_at,),
+            )
+            freshness_row = await cursor.fetchone()
+            sessions_since = freshness_row[0] if freshness_row else 0
+            if age_days >= 3 and sessions_since >= 3:
+                lines.append(
+                    f"**Warning: Model may be stale**: {age_days}d old, "
+                    f"{sessions_since} conversations since last synthesis\n"
+                )
+        except Exception:
+            pass  # Non-critical enrichment
+
         try:
             model = json.loads(model_json) if model_json else {}
         except (json.JSONDecodeError, TypeError):
@@ -140,6 +163,115 @@ class UserEgoContextBuilder:
             lines.append(
                 f"\n*{remaining} more fields available via memory_recall.*"
             )
+
+        lines.append("")
+        return "\n".join(lines)
+
+    # Signals that track user activity — used to filter awareness tick
+    # signals for the user ego's activity pulse section.
+    _USER_FACING_SIGNALS = frozenset({
+        "conversations_since_reflection",
+        "task_completion_quality",
+        "recon_findings_pending",
+        "stale_pending_items",
+        "user_goal_staleness",
+        "user_session_pattern",
+    })
+
+    # Human-readable interpretations for user-facing signal ranges.
+    _SIGNAL_INTERPRETATIONS: dict[str, list[tuple[float, str]]] = {
+        "user_goal_staleness": [
+            (0.7, "oldest pending goal is significantly stale (14+ days)"),
+            (0.3, "oldest pending goal is moderately stale (7-14 days)"),
+            (0.0, "pending goals are relatively fresh"),
+        ],
+        "user_session_pattern": [
+            (0.7, "user activity is significantly below their baseline"),
+            (0.3, "user activity is somewhat below their baseline"),
+            (0.0, "user activity is near their normal pattern"),
+        ],
+        "stale_pending_items": [
+            (0.7, "several pending items are aging (3+ days)"),
+            (0.3, "some pending items are aging"),
+            (0.0, "pending items are fresh"),
+        ],
+    }
+
+    @classmethod
+    def _interpret_signal(cls, name: str, value: float) -> str | None:
+        """Return a human-readable interpretation, or None to skip."""
+        thresholds = cls._SIGNAL_INTERPRETATIONS.get(name)
+        if thresholds:
+            for threshold, text in thresholds:
+                if value >= threshold:
+                    return text
+            return None
+        # Default: just show the raw value for known user-facing signals
+        if isinstance(value, float):
+            return f"{value:.2f}"
+        return str(value)
+
+    async def _user_activity_pulse_section(self) -> str:
+        """User activity signals — interpreted for ego decision-making.
+
+        Queries the latest awareness tick and surfaces user-facing signal
+        values as prose. Signals at 0.0 are skipped (nothing noteworthy).
+        """
+        lines = ["## User Activity Pulse\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT signals_json, created_at "
+                "FROM awareness_ticks "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            logger.error("Failed to query awareness_ticks", exc_info=True)
+            lines.append("*No awareness data available.*\n")
+            return "\n".join(lines)
+
+        if not row:
+            lines.append("*No awareness ticks recorded.*\n")
+            return "\n".join(lines)
+
+        signals_json, created_at = row
+
+        try:
+            signals = json.loads(signals_json) if signals_json else {}
+        except (json.JSONDecodeError, TypeError):
+            signals = {}
+
+        # Normalize list format to dict (same as genesis_context.py)
+        if isinstance(signals, list):
+            signals = {
+                s["name"]: s
+                for s in signals
+                if isinstance(s, dict) and "name" in s
+            }
+
+        # Filter to user-facing signals with non-zero values
+        pulse_items: list[str] = []
+        for sig_name in sorted(self._USER_FACING_SIGNALS):
+            sig_info = signals.get(sig_name)
+            if not sig_info:
+                continue
+            value = sig_info.get("value", 0.0) if isinstance(sig_info, dict) else sig_info
+            if not isinstance(value, (int, float)) or value == 0.0:
+                continue
+            interpretation = self._interpret_signal(sig_name, float(value))
+            if interpretation:
+                label = sig_name.replace("_", " ").title()
+                pulse_items.append(
+                    f"- **{label}**: {interpretation} (signal: {value:.2f})"
+                )
+
+        if not pulse_items:
+            lines.append("*All user activity signals nominal.*\n")
+        else:
+            ts = created_at[:16] if created_at else "?"
+            lines.append(f"*From latest awareness tick ({ts}):*\n")
+            lines.extend(pulse_items)
 
         lines.append("")
         return "\n".join(lines)

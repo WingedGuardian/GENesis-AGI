@@ -1,6 +1,7 @@
 """Tests for genesis.ego.user_context — UserEgoContextBuilder."""
 
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock
 
 import aiosqlite
@@ -104,6 +105,16 @@ async def db():
                 cost_usd         REAL NOT NULL DEFAULT 0.0,
                 metadata         TEXT,
                 created_at       TEXT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE awareness_ticks (
+                id              TEXT PRIMARY KEY,
+                signals_json    TEXT,
+                scores_json     TEXT,
+                classified_depth TEXT,
+                trigger_reason  TEXT,
+                created_at      TEXT NOT NULL
             )
         """)
         await conn.execute("""
@@ -469,6 +480,7 @@ class TestUserEgoContextBuilder:
         result = await builder.build()
         expected_sections = [
             "## User Profile",
+            "## User Activity Pulse",
             "## Recent Conversations",
             "## User-World Signals",
             "## Genesis Ego Escalations",
@@ -522,3 +534,156 @@ class TestUserEgoContextBuilder:
         crit_pos = result.index("CRITICAL_ITEM")
         low_pos = result.index("LOW_ITEM")
         assert crit_pos < low_pos, "Critical items should appear before low-priority items"
+
+    # ── User Activity Pulse (3a) ───────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_with_signals(self, db, mock_health_data, capabilities):
+        """Non-zero user-facing signals are surfaced as prose."""
+        signals = json.dumps([
+            {"name": "user_goal_staleness", "value": 0.5, "source": "follow_ups+user_model"},
+            {"name": "user_session_pattern", "value": 0.8, "source": "cc_sessions"},
+            {"name": "conversations_since_reflection", "value": 3.0, "source": "cc_sessions"},
+            {"name": "software_error_spike", "value": 0.1, "source": "circuit_breakers"},
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, signals_json, classified_depth, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            ("tick1", signals, "Micro", ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "## User Activity Pulse" in result
+        # User-facing signals present
+        assert "User Goal Staleness" in result
+        assert "moderately stale" in result
+        assert "User Session Pattern" in result
+        assert "significantly below" in result
+        assert "Conversations Since Reflection" in result
+        # Genesis-internal signal excluded
+        assert "Software Error Spike" not in result
+        assert "circuit_breakers" not in result
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_all_zero(self, db, mock_health_data, capabilities):
+        """All user-facing signals at 0.0 → nominal message."""
+        signals = json.dumps([
+            {"name": "user_goal_staleness", "value": 0.0, "source": "follow_ups"},
+            {"name": "user_session_pattern", "value": 0.0, "source": "cc_sessions"},
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, signals_json, classified_depth, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            ("tick2", signals, "Micro", ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "All user activity signals nominal" in result
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_no_ticks(self, db, mock_health_data, capabilities):
+        """No awareness ticks recorded → graceful fallback."""
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "No awareness ticks recorded" in result
+
+    @pytest.mark.asyncio
+    async def test_activity_pulse_dict_format(self, db, mock_health_data, capabilities):
+        """signals_json stored as dict (legacy format) still works."""
+        signals = json.dumps({
+            "user_goal_staleness": {"name": "user_goal_staleness", "value": 0.9, "source": "follow_ups"},
+        })
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, signals_json, classified_depth, created_at) "
+            "VALUES (?, ?, ?, datetime('now'))",
+            ("tick3", signals, "Micro", ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "User Goal Staleness" in result
+        assert "significantly stale" in result
+
+    # ── Model Freshness Warning (3d) ───────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_model_freshness_warning_shown(self, db, mock_health_data, capabilities):
+        """Stale model + recent activity → warning shown."""
+        # Model synthesized 5 days ago
+        old_date = (datetime.now(UTC) - timedelta(days=5)).isoformat()
+        model_data = json.dumps({"active_projects": ["Genesis v3"]})
+        await db.execute(
+            "INSERT INTO user_model_cache "
+            "(id, model_json, version, synthesized_at, synthesized_by, evidence_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("current", model_data, 3, old_date, "reflection", 42),
+        )
+        # 5 foreground sessions since synthesis
+        for i in range(5):
+            await db.execute(
+                "INSERT INTO cc_sessions "
+                "(id, session_type, model, started_at, last_activity_at, source_tag, topic) "
+                "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?)",
+                (f"s{i}", "foreground", "opus-4", "foreground", f"Session {i}"),
+            )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "Model may be stale" in result
+        assert "5d old" in result
+        assert "5 conversations since" in result
+
+    @pytest.mark.asyncio
+    async def test_model_freshness_no_warning_when_fresh(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Recent model → no warning."""
+        model_data = json.dumps({"active_projects": ["Genesis v3"]})
+        await db.execute(
+            "INSERT INTO user_model_cache "
+            "(id, model_json, version, synthesized_at, synthesized_by, evidence_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("current", model_data, 3, datetime.now(UTC).isoformat(), "reflection", 42),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "Model may be stale" not in result
+
+    @pytest.mark.asyncio
+    async def test_model_freshness_no_warning_few_sessions(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Old model but few sessions since → no warning (not enough signal)."""
+        old_date = (datetime.now(UTC) - timedelta(days=10)).isoformat()
+        model_data = json.dumps({"active_projects": ["Genesis v3"]})
+        await db.execute(
+            "INSERT INTO user_model_cache "
+            "(id, model_json, version, synthesized_at, synthesized_by, evidence_count) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("current", model_data, 3, old_date, "reflection", 42),
+        )
+        # Only 1 session since (below threshold of 3)
+        await db.execute(
+            "INSERT INTO cc_sessions "
+            "(id, session_type, model, started_at, last_activity_at, source_tag, topic) "
+            "VALUES (?, ?, ?, datetime('now'), datetime('now'), ?, ?)",
+            ("s1", "foreground", "opus-4", "foreground", "One session"),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "Model may be stale" not in result
