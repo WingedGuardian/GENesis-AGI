@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Staleness decay ────────────────────────────────────────────────────────
 _DECAY_BASE = 0.5   # halve contribution each unchanged tick
-_DECAY_FLOOR = 0.25  # never decay below 25% (was 5%, too aggressive — nullified PR #65 scoring overhaul)
+_DECAY_FLOOR = 0.10  # never decay below 10% (was 25%, stuck signals triggered micro every ~30min; was 5%, too aggressive)
 _EPSILON = 0.001     # float comparison tolerance for 0-1 normalized signals
 
 # Module-level state: consecutive-unchanged count per signal.
