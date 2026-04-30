@@ -94,11 +94,25 @@ class TaskDispatcher:
         self._dispatched: set[str] = set()  # in-memory dedup guard
 
     async def _guarded_execute(self, task_id: str) -> bool:
-        """Execute a task, serialized through the semaphore if present."""
-        if self._exec_semaphore:
-            async with self._exec_semaphore:
-                return await self._executor.execute(task_id)
-        return await self._executor.execute(task_id)
+        """Execute a task, serialized through the semaphore if present.
+
+        Uses explicit acquire/release instead of ``async with`` because
+        the engine may release the semaphore during a pause (to let
+        another task run).  On cancel-during-pause the engine signals
+        via ``_semaphore_released`` that it already released, so we
+        must NOT release again here.
+        """
+        if self._exec_semaphore is None:
+            return await self._executor.execute(task_id)
+        await self._exec_semaphore.acquire()
+        try:
+            return await self._executor.execute(task_id)
+        finally:
+            # Only release if engine didn't already release during pause
+            if task_id not in self._executor._semaphore_released:
+                self._exec_semaphore.release()
+            else:
+                self._executor._semaphore_released.discard(task_id)
 
     async def submit(
         self,
