@@ -487,69 +487,61 @@ async def test_sentinel_still_deduplicates_via_pass2(
 
 
 @pytest.mark.asyncio
-async def test_batch_approve_then_consume_one_per_tick(
+async def test_stable_key_one_approval_one_dispatch(
     runtime, approval_gate, approval_manager,
 ):
-    """After batch-approve resolves multiple rows, ensure_approval finds
-    one approved row per call via Pass 3 (resume fallback), and
-    mark_consumed prevents double-dispatch."""
-    # Create 3 pending approvals with different prompts
-    ids = []
-    for i in range(3):
-        _, req_id, _ = await approval_gate.ensure_approval(
-            subsystem="ego", policy_id="ego_cycle",
-            action_label="ego cycle",
-            invocation=CCInvocation(
-                prompt=f"ego tick {i}",
-                model=CCModel.SONNET, effort=EffortLevel.HIGH,
-                system_prompt="sys",
-            ),
-            api_call_site_id="7_ego_cycle", api_error=None,
-        )
-        ids.append(req_id)
-
-    assert len(set(ids)) == 3  # all different
-
-    # Batch-approve all
-    count = await approval_gate.approve_all_pending(resolved_by="test:batch")
-    assert count == 3
-
-    # First tick after batch-approve — finds first unconsumed approved
-    status1, found_id1, _ = await approval_gate.ensure_approval(
+    """With a stable approval key (no invocation in key), one pending
+    request is shared across ticks. Approving it authorizes exactly
+    one dispatch; after consumption, a new pending request is created."""
+    # Tick 1: create pending request (stable key = no invocation)
+    status1, req_id1, _ = await approval_gate.ensure_approval(
         subsystem="ego", policy_id="ego_cycle",
         action_label="ego cycle",
-        invocation=CCInvocation(
-            prompt="post-approve tick 1",
-            model=CCModel.SONNET, effort=EffortLevel.HIGH,
-            system_prompt="sys",
-        ),
+        invocation=None,  # stable key
         api_call_site_id="7_ego_cycle", api_error=None,
     )
-    assert status1 == "approved"
-    assert found_id1 in ids
+    assert status1 == "pending"
 
-    # Consume it atomically
-    consumed = await approval_gate.mark_consumed(found_id1)
+    # Tick 2: same stable key — finds existing pending row, not a new one
+    status2, req_id2, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=None,
+        api_call_site_id="7_ego_cycle", api_error=None,
+    )
+    assert status2 == "pending"
+    assert req_id2 == req_id1  # same row reused
+
+    # Approve it
+    count = await approval_gate.approve_all_pending(resolved_by="test:batch")
+    assert count == 1
+
+    # Tick 3: finds approved-unconsumed row
+    status3, req_id3, _ = await approval_gate.ensure_approval(
+        subsystem="ego", policy_id="ego_cycle",
+        action_label="ego cycle",
+        invocation=None,
+        api_call_site_id="7_ego_cycle", api_error=None,
+    )
+    assert status3 == "approved"
+    assert req_id3 == req_id1
+
+    # Consume it
+    consumed = await approval_gate.mark_consumed(req_id3)
     assert consumed is True
 
-    # Second consume attempt fails (idempotent guard)
-    consumed_again = await approval_gate.mark_consumed(found_id1)
-    assert consumed_again is False
+    # Double-consume fails
+    assert await approval_gate.mark_consumed(req_id3) is False
 
-    # Next tick — finds NEXT unconsumed approved row
-    status2, found_id2, _ = await approval_gate.ensure_approval(
+    # Tick 4: consumed row skipped, NEW pending request created
+    status4, req_id4, _ = await approval_gate.ensure_approval(
         subsystem="ego", policy_id="ego_cycle",
         action_label="ego cycle",
-        invocation=CCInvocation(
-            prompt="post-approve tick 2",
-            model=CCModel.SONNET, effort=EffortLevel.HIGH,
-            system_prompt="sys",
-        ),
+        invocation=None,
         api_call_site_id="7_ego_cycle", api_error=None,
     )
-    assert status2 == "approved"
-    assert found_id2 != found_id1
-    assert found_id2 in ids
+    assert status4 == "pending"
+    assert req_id4 != req_id1  # brand new row
 
 
 @pytest.mark.asyncio

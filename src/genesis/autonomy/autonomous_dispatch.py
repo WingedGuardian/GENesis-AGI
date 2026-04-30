@@ -35,6 +35,16 @@ class AutonomousDispatchRequest:
     cli_fallback_allowed: bool = True
     approval_required_for_cli: bool = True
     context: dict[str, Any] | None = None
+    # When True, the approval key is computed WITHOUT the invocation
+    # content (prompt, model, etc.), making it stable across ticks.
+    # Use for recurring dispatches (ego cycles, inbox, reflections)
+    # where the action is the same but the prompt changes each time.
+    # One pending request per (subsystem, policy_id, action_label);
+    # approving it authorizes exactly one dispatch.
+    # NOTE: ``context`` still enters the key. If you set this True,
+    # ensure ``context`` is constant or None — a varying context dict
+    # will silently break key stability.
+    approval_key_stable: bool = False
     # Optional per-call override of the call site's runtime dispatch
     # mode.  When ``None`` (default), ``AutonomousDispatchRouter.route``
     # looks up ``CallSiteConfig.dispatch`` from the routing config for
