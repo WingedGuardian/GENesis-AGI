@@ -194,10 +194,12 @@ class CCSessionExecutor:
                         step_results.append(sr)
                         completed_indices.add(row["step_idx"])
 
-                # Create worktree if needed
+                # Recover or create worktree for code tasks
                 has_code = any(s.get("type") == "code" for s in steps)
                 if has_code:
-                    await self._create_worktree(task_id)
+                    recovered = await self._recover_worktree(task_id, task)
+                    if not recovered:
+                        await self._create_worktree(task_id)
 
                 # Filter to only pending/failed steps
                 remaining_steps = [
@@ -589,7 +591,57 @@ class CCSessionExecutor:
             task_id, _REPO_ROOT, _WORKTREE_BASE,
         )
         self._worktree_paths[task_id] = wt_path
+        await self._set_output(task_id, "worktree_path", str(wt_path))
         return wt_path
+
+    async def _recover_worktree(
+        self, task_id: str, task: dict,
+    ) -> bool:
+        """Recover a worktree from persisted state.
+
+        Returns True if a valid worktree was found or recreated.
+        Falls back to False so the caller can create a fresh one.
+        """
+        raw_outputs = task.get("outputs") or ""
+        try:
+            parsed = json.loads(raw_outputs)
+            wt_path_str = (
+                parsed.get("worktree_path")
+                if isinstance(parsed, dict)
+                else None
+            )
+        except (json.JSONDecodeError, ValueError):
+            wt_path_str = None
+
+        if not wt_path_str:
+            return False
+
+        wt_path = Path(wt_path_str)
+        if await _worktree.verify_worktree(wt_path):
+            self._worktree_paths[task_id] = wt_path
+            logger.info(
+                "Recovered existing worktree at %s for task %s",
+                wt_path, task_id,
+            )
+            return True
+
+        # Worktree gone but branch might still exist — recreate
+        try:
+            wt_path = await _worktree.create_worktree(
+                task_id, _REPO_ROOT, _WORKTREE_BASE,
+            )
+            self._worktree_paths[task_id] = wt_path
+            await self._set_output(task_id, "worktree_path", str(wt_path))
+            logger.info(
+                "Recreated worktree at %s for task %s (branch recovered)",
+                wt_path, task_id,
+            )
+            return True
+        except RuntimeError:
+            logger.warning(
+                "Worktree recovery failed for task %s", task_id,
+            )
+            return False
 
     async def _cleanup_worktree(self, task_id: str) -> None:
         """Remove worktree if one was created for this task."""
@@ -597,6 +649,8 @@ class CCSessionExecutor:
         if wt_path is None:
             return
         await _worktree.cleanup_worktree(wt_path, _REPO_ROOT)
+        with contextlib.suppress(Exception):
+            await self._set_output(task_id, "worktree_path", "")
 
     # =================================================================
     # Notification
