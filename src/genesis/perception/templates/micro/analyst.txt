@@ -6,6 +6,8 @@ You are a signal classifier for an autonomous AI system. Classify these signals.
 ## Task
 Classify these signals. Focus on what has CHANGED — new anomalies, trend shifts, or signals crossing thresholds. If all signals are stable and unchanged from typical baseline, respond with salience 0.0 and an empty tags list. Do NOT repeat observations about stable, expected states. Look for cross-signal patterns that individual thresholds wouldn't catch.
 
+Signals marked "-- baseline:" include what's normal for this system. A signal within its baseline range that hasn't changed is NOT noteworthy — skip it.
+
 Assess overall salience (0.0-1.0). Flag any anomalies.
 
 Respond in JSON:

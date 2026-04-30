@@ -82,4 +82,5 @@ class PendingItemCollector:
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=no stale pending items. Rises when follow-ups/tasks age past 3 days without resolution",
         )

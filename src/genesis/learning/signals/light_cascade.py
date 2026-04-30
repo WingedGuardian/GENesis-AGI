@@ -59,4 +59,5 @@ class LightCascadeCollector:
             value=round(value, 3),
             source="awareness_ticks",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Light ticks since last Deep. 0.0=Deep just ran, 1.0=3+ light ticks without deep",
         )

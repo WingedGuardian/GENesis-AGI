@@ -74,4 +74,5 @@ class AutonomyActivityCollector:
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=stable autonomy (normal). 0.3=corrections accumulating, 0.7=near regression, 1.0=active regression",
         )

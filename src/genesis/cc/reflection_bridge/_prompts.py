@@ -38,6 +38,8 @@ def _format_signal(s: SignalReading, *, unchanged_ticks: int = 0) -> str:
             else "normal"
         )
         base += f" [{status}]"
+    if s.baseline_note:
+        base += f" -- baseline: {s.baseline_note}"
     if unchanged_ticks >= 2:
         hours = unchanged_ticks * _TICK_INTERVAL_MINUTES / 60
         base += f" (persistent ~{hours:.1f}h)"

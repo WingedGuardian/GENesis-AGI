@@ -173,13 +173,13 @@ def test_update_staleness_new_signal():
 
 
 def test_update_staleness_decay_floor():
-    """Decay should not go below the floor (0.25)."""
+    """Decay should not go below the floor (0.10)."""
     _signal_unchanged_counts.clear()
     _signal_unchanged_counts["sig_a"] = 10  # very stale
     current = {"sig_a": 1.0}
     prev = {"sig_a": 1.0}
     factors = _update_staleness(current, prev)
-    assert factors["sig_a"] == 0.25  # floored at 25%
+    assert factors["sig_a"] == 0.10  # floored at 10%
 
 
 def test_get_staleness_context_returns_copy():

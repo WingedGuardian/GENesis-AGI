@@ -93,6 +93,7 @@ class CCVersionCollector:
                 value=1.0,
                 source="cc_version",
                 collected_at=now,
+                baseline_note="1.0=CC version just changed (event signal, resets to 0.0 next tick)",
             )
 
         # No local change — check if a newer version is available on npm.
@@ -106,6 +107,7 @@ class CCVersionCollector:
             value=0.0,
             source="cc_version",
             collected_at=now,
+            baseline_note="0.0=no version change (normal). 1.0=CC just updated",
         )
 
     async def _get_cc_version(self) -> str:
