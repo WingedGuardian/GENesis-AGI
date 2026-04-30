@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 
 
@@ -135,14 +138,11 @@ async def list_all_recent(
 
 
 async def create_intake_token(db: aiosqlite.Connection) -> str:
-    """Generate an intake token for testing or internal use.
+    """Generate an intake token for task submission.
 
     Inserts a valid token into intake_tokens and returns it.
     The token expires in 2 hours.
     """
-    import uuid
-    from datetime import UTC, datetime, timedelta
-
     token = uuid.uuid4().hex
     now = datetime.now(UTC).isoformat()
     expires = (datetime.now(UTC) + timedelta(hours=2)).isoformat()

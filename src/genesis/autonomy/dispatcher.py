@@ -145,6 +145,13 @@ class TaskDispatcher:
         task_id = f"t-{uuid.uuid4().hex[:12]}"
         now = datetime.now(UTC).isoformat()
 
+        # User submissions require a token from the /task intake process
+        if intake_token is None and source == "user":
+            raise ValueError(
+                "intake_token required for user-submitted tasks. "
+                "Use /task skill to complete guided intake first."
+            )
+
         # Internal sources (observation dispatch, recovery) self-generate tokens
         if intake_token is None and source != "user":
             intake_token = await self._generate_intake_token()

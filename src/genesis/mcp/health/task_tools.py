@@ -80,7 +80,7 @@ async def _get_db() -> aiosqlite.Connection:
 # ---------------------------------------------------------------------------
 
 
-async def _impl_intake_complete(session_description: str) -> dict:
+async def _impl_intake_complete() -> dict:
     """Generate a one-time intake token after /task guided intake.
 
     Returns {"token": "..."} — pass to task_submit as intake_token.
@@ -348,14 +348,14 @@ async def _impl_task_control(task_id: str, action: str) -> dict:
 
 
 @mcp.tool()
-async def intake_complete(session_description: str) -> dict:
+async def intake_complete() -> dict:
     """Generate a one-time intake token after completing /task guided intake.
 
     Call this AFTER the plan is written and approved, BEFORE task_submit.
     Returns a token that must be passed to task_submit as intake_token.
     Tokens expire after 2 hours and can only be used once.
     """
-    return await _impl_intake_complete(session_description)
+    return await _impl_intake_complete()
 
 
 @mcp.tool()

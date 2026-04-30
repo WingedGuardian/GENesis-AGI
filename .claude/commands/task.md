@@ -35,8 +35,7 @@ format (`src/genesis/identity/TASK_INTAKE.md`).
    - `## Quality Checks` (achievable in the executor's environment)
    - `## Constraints`
 6. After user approves the plan:
-   a. Call `intake_complete(session_description=<brief description>)` MCP tool
-      to generate a one-time intake token
+   a. Call `intake_complete()` MCP tool to generate a one-time intake token
    b. Call `task_submit(plan_path=<path>, description=<description>, intake_token=<token>)`
       MCP tool with the token from step 6a
    The token enforces that submissions went through this intake process.

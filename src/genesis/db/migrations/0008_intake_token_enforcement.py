@@ -41,6 +41,7 @@ async def up(db: aiosqlite.Connection) -> None:
             raise
 
     # BEFORE INSERT trigger: validate token exists, is unconsumed, not expired
+    # datetime() wrapper normalizes ISO/SQLite format differences
     await db.execute("""
         CREATE TRIGGER IF NOT EXISTS enforce_intake_token
         BEFORE INSERT ON task_states
@@ -48,7 +49,7 @@ async def up(db: aiosqlite.Connection) -> None:
             SELECT 1 FROM intake_tokens
             WHERE token = NEW.intake_token
               AND consumed_at IS NULL
-              AND expires_at > datetime('now')
+              AND datetime(expires_at) > datetime('now')
         )
         BEGIN
             SELECT RAISE(ABORT, 'Task requires valid intake token. Use /task skill.');

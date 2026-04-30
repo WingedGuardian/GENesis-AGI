@@ -166,6 +166,51 @@ class TestTaskStates:
         result = await task_states.update(db, "task-1")
         assert result is False
 
+    async def test_create_without_token_rejected(self, db):
+        """Trigger rejects INSERT without intake_token."""
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(db, task_id="t-bad", description="no token")
+
+    async def test_create_with_consumed_token_rejected(self, db):
+        """Trigger rejects INSERT with already-consumed token."""
+        token = await create_intake_token(db)
+        await task_states.create(
+            db, task_id="t-first", description="ok", intake_token=token
+        )
+        # Same token again should fail (consumed by AFTER INSERT trigger)
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(
+                db, task_id="t-reuse", description="reuse", intake_token=token
+            )
+
+    async def test_create_with_expired_token_rejected(self, db):
+        """Trigger rejects INSERT with expired token."""
+        # Insert a token that is already expired
+        await db.execute(
+            "INSERT INTO intake_tokens (token, created_at, expires_at) VALUES (?,?,?)",
+            ("expired-tok", "2020-01-01T00:00:00", "2020-01-01T02:00:00"),
+        )
+        await db.commit()
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(
+                db, task_id="t-expired", description="expired", intake_token="expired-tok"
+            )
+
+    async def test_token_consumed_after_insert(self, db):
+        """AFTER INSERT trigger atomically consumes the token."""
+        token = await create_intake_token(db)
+        await task_states.create(
+            db, task_id="t-consume", description="test", intake_token=token
+        )
+        cursor = await db.execute(
+            "SELECT consumed_at, task_id FROM intake_tokens WHERE token = ?",
+            (token,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["consumed_at"] is not None
+        assert row["task_id"] == "t-consume"
+
 
 # ---------------------------------------------------------------------------
 # cc_sessions — thread_id support
