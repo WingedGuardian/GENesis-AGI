@@ -232,6 +232,45 @@ class TestGenesisEgoContextBuilder:
         assert "software_error_spike" in result
         assert "budget_pct_consumed" in result
         assert "Micro" in result
+        # Single tick → all trends should be stable (→)
+        assert "Trend" in result
+        assert "\u2192" in result  # → symbol
+
+    @pytest.mark.asyncio
+    async def test_signals_trend_arrows(self, db, mock_health_data, capabilities):
+        """Signal trends show up/down/stable arrows based on previous tick."""
+        # Previous tick: error_spike=0.0, budget=0.50
+        prev_data = json.dumps([
+            {"name": "software_error_spike", "value": 0.0, "source": "circuit_breakers"},
+            {"name": "budget_pct_consumed", "value": 0.50, "source": "cost_events"},
+            {"name": "container_memory_pct", "value": 0.60, "source": "cgroup"},
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, source, signals_json, scores_json, signal_data, classified_depth, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("t_prev", "scheduled", prev_data, "{}", "{}", "Micro", "2026-04-24T09:50:00+00:00"),
+        )
+        # Current tick: error_spike=0.3 (↑), budget=0.25 (↓), memory=0.60 (→)
+        curr_data = json.dumps([
+            {"name": "software_error_spike", "value": 0.3, "source": "circuit_breakers"},
+            {"name": "budget_pct_consumed", "value": 0.25, "source": "cost_events"},
+            {"name": "container_memory_pct", "value": 0.60, "source": "cgroup"},
+        ])
+        await db.execute(
+            "INSERT INTO awareness_ticks "
+            "(id, source, signals_json, scores_json, signal_data, classified_depth, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("t_curr", "scheduled", curr_data, "{}", "{}", "Micro", "2026-04-24T09:55:00+00:00"),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        # Check that all three trend arrows appear
+        assert "\u2191" in result  # ↑ for error_spike going up
+        assert "\u2193" in result  # ↓ for budget going down
+        assert "\u2192" in result  # → for memory staying the same
 
     @pytest.mark.asyncio
     async def test_signals_section_no_data(self, db, mock_health_data, capabilities):
