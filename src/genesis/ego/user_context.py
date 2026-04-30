@@ -112,6 +112,8 @@ class UserEgoContextBuilder:
         # relative to recent conversation activity.
         try:
             synth_dt = datetime.fromisoformat(synthesized_at)
+            if synth_dt.tzinfo is None:
+                synth_dt = synth_dt.replace(tzinfo=UTC)
             age_days = (datetime.now(UTC) - synth_dt).days
             cursor = await self._db.execute(
                 "SELECT COUNT(*) FROM cc_sessions "
@@ -427,6 +429,8 @@ class UserEgoContextBuilder:
             return None
         try:
             dt = datetime.fromisoformat(iso_timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
             days = (datetime.now(UTC) - dt).days
             if days == 0:
                 return "today"
@@ -608,7 +612,7 @@ class UserEgoContextBuilder:
 
         try:
             cursor = await self._db.execute(
-                "SELECT action_type, action_category, content, status, "
+                "SELECT action_type, content, status, "
                 "user_response, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
@@ -624,9 +628,18 @@ class UserEgoContextBuilder:
             lines.append("*No proposals in last 7 days.*\n")
             return "\n".join(lines)
 
+        # Summary line for quick calibration
+        from collections import Counter
+        status_counts = Counter(r[2] for r in rows)
+        parts = [f"{status_counts[s]} {s}" for s in
+                 ("approved", "rejected", "executed", "pending", "failed",
+                  "expired", "tabled", "withdrawn")
+                 if status_counts.get(s)]
+        lines.append(f"**{len(rows)} proposals**: {', '.join(parts)}\n")
+
         lines.append("| Action | Content | Status | Response |")
         lines.append("|--------|---------|--------|----------|")
-        for action_type, _category, content, status, response, _created in rows:
+        for action_type, content, status, response, _created in rows:
             short = content[:80] + "..." if len(content) > 80 else content
             short = short.replace("\n", " ").replace("|", "/")
             resp = (response or "\u2014")[:50]
