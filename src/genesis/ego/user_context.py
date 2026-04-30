@@ -69,6 +69,7 @@ class UserEgoContextBuilder:
         sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
         sections.append(await self._user_world_observations_section())
+        sections.append(await self._backlog_summary_section())
         sections.append(await self._genesis_escalations_section())
         sections.append(await self._capabilities_section())
         sections.append(await self._system_status_section())
@@ -362,6 +363,78 @@ class UserEgoContextBuilder:
 
         lines.append("")
         return "\n".join(lines)
+
+    async def _backlog_summary_section(self) -> str:
+        """Inbox, recon, and pending item backlogs."""
+        lines = ["## Backlogs\n"]
+
+        counts: list[tuple[str, int, str | None]] = []  # (label, count, oldest)
+
+        # Inbox: pending/processing items
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM inbox_items "
+                "WHERE status NOT IN ('completed', 'failed')"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Inbox", row[0], age))
+        except Exception:
+            pass  # Table may not exist
+
+        # Recon findings: unresolved
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM observations "
+                "WHERE type = 'finding' AND resolved = 0"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Recon findings", row[0], age))
+        except Exception:
+            pass
+
+        # Follow-ups awaiting user input
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM follow_ups "
+                "WHERE status = 'pending' "
+                "AND strategy = 'user_input_needed'"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Awaiting user input", row[0], age))
+        except Exception:
+            pass
+
+        if not counts:
+            lines.append("*All backlogs clear.*\n")
+        else:
+            for label, count, oldest in counts:
+                age_str = f" (oldest: {oldest})" if oldest else ""
+                lines.append(f"- **{label}**: {count} pending{age_str}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _days_ago(iso_timestamp: str | None) -> str | None:
+        """Convert ISO timestamp to 'Xd ago' string."""
+        if not iso_timestamp:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_timestamp)
+            days = (datetime.now(UTC) - dt).days
+            if days == 0:
+                return "today"
+            if days == 1:
+                return "1d ago"
+            return f"{days}d ago"
+        except (ValueError, TypeError):
+            return None
 
     async def _genesis_escalations_section(self) -> str:
         """Escalations from the Genesis ego that need user ego attention."""

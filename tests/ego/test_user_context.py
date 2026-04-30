@@ -108,6 +108,21 @@ async def db():
             )
         """)
         await conn.execute("""
+            CREATE TABLE inbox_items (
+                id             TEXT PRIMARY KEY,
+                file_path      TEXT NOT NULL,
+                content_hash   TEXT NOT NULL,
+                status         TEXT NOT NULL DEFAULT 'pending',
+                batch_id       TEXT,
+                response_path  TEXT,
+                created_at     TEXT NOT NULL,
+                processed_at   TEXT,
+                error_message  TEXT,
+                retry_count    INTEGER NOT NULL DEFAULT 0,
+                evaluated_content TEXT
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE awareness_ticks (
                 id              TEXT PRIMARY KEY,
                 signals_json    TEXT,
@@ -483,6 +498,7 @@ class TestUserEgoContextBuilder:
             "## User Activity Pulse",
             "## Recent Conversations",
             "## User-World Signals",
+            "## Backlogs",
             "## Genesis Ego Escalations",
             "## Genesis Capabilities",
             "## System Status",
@@ -688,3 +704,67 @@ class TestUserEgoContextBuilder:
         )
         result = await builder.build()
         assert "Model may be stale" not in result
+
+    # ── Backlog Summary (3c) ──────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_backlog_with_items(self, db, mock_health_data, capabilities):
+        """Backlogs section shows counts and oldest ages."""
+        old_date = (datetime.now(UTC) - timedelta(days=6)).isoformat()
+        await db.execute(
+            "INSERT INTO inbox_items "
+            "(id, file_path, content_hash, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("i1", "/inbox/test.md", "abc", "pending", old_date),
+        )
+        await db.execute(
+            "INSERT INTO inbox_items "
+            "(id, file_path, content_hash, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("i2", "/inbox/test2.md", "def", "processing", datetime.now(UTC).isoformat()),
+        )
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("f1", "recon", "finding", "finding", "Interesting article", "medium", 0, old_date),
+        )
+        await db.execute(
+            "INSERT INTO follow_ups "
+            "(id, source, content, strategy, status, priority, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("fu1", "ego", "Review draft", "user_input_needed", "pending", "high", old_date),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "## Backlogs" in result
+        assert "**Inbox**: 2 pending" in result
+        assert "6d ago" in result
+        assert "**Recon findings**: 1 pending" in result
+        assert "**Awaiting user input**: 1 pending" in result
+
+    @pytest.mark.asyncio
+    async def test_backlog_all_clear(self, db, mock_health_data, capabilities):
+        """Empty backlogs show 'all clear' message."""
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "All backlogs clear" in result
+
+    @pytest.mark.asyncio
+    async def test_backlog_excludes_completed(self, db, mock_health_data, capabilities):
+        """Completed inbox items don't count."""
+        await db.execute(
+            "INSERT INTO inbox_items "
+            "(id, file_path, content_hash, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("i3", "/inbox/done.md", "ghi", "completed", datetime.now(UTC).isoformat()),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "All backlogs clear" in result
