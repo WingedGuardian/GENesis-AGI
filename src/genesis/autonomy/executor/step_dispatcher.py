@@ -233,7 +233,7 @@ class StepDispatcher:
                     cli_invocation=invocation,
                     api_call_site_id=api_call_site_id,
                     cli_fallback_allowed=True,
-                    approval_required_for_cli=True,
+                    approval_required_for_cli=False,  # task submission = approval
                     context={
                         "task_id": task_id,
                         "step_idx": step_idx,

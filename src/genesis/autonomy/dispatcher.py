@@ -12,6 +12,7 @@ Implements:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -84,11 +85,20 @@ class TaskDispatcher:
         db: Any,
         executor: Any,
         event_bus: Any | None = None,
+        exec_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._db = db
         self._executor = executor
         self._event_bus = event_bus
+        self._exec_semaphore = exec_semaphore
         self._dispatched: set[str] = set()  # in-memory dedup guard
+
+    async def _guarded_execute(self, task_id: str) -> bool:
+        """Execute a task, serialized through the semaphore if present."""
+        if self._exec_semaphore:
+            async with self._exec_semaphore:
+                return await self._executor.execute(task_id)
+        return await self._executor.execute(task_id)
 
     async def submit(
         self,
@@ -131,7 +141,7 @@ class TaskDispatcher:
 
         # Dispatch immediately via tracked_task (Amendment #2)
         tracked_task(
-            self._executor.execute(task_id),
+            self._guarded_execute(task_id),
             name=f"task-{task_id}",
         )
 
@@ -209,7 +219,7 @@ class TaskDispatcher:
 
             self._dispatched.add(task_id)
             tracked_task(
-                self._executor.execute(task_id),
+                self._guarded_execute(task_id),
                 name=f"task-{task_id}",
             )
             dispatched += 1
@@ -247,7 +257,7 @@ class TaskDispatcher:
             )
             self._dispatched.add(task_id)
             tracked_task(
-                self._executor.execute(task_id),
+                self._guarded_execute(task_id),
                 name=f"task-{task_id}-resume",
             )
             dispatched += 1
@@ -336,6 +346,19 @@ class TaskDispatcher:
             if task_id in self._dispatched:
                 continue
 
+            if phase == TaskPhase.PAUSED.value:
+                # Recover as paused — pre-set pause flag so checkpoint
+                # pauses immediately after first step
+                logger.info("Recovering paused task %s", task_id)
+                self._executor._paused_tasks.add(task_id)
+                self._dispatched.add(task_id)
+                tracked_task(
+                    self._guarded_execute(task_id),
+                    name=f"task-paused-{task_id}",
+                )
+                recovered += 1
+                continue
+
             if phase == TaskPhase.BLOCKED.value:
                 # Check if there's an approved-but-unconsumed approval
                 try:
@@ -362,7 +385,7 @@ class TaskDispatcher:
                     )
                     self._dispatched.add(task_id)
                     tracked_task(
-                        self._executor.execute(task_id),
+                        self._guarded_execute(task_id),
                         name=f"task-resume-{task_id}",
                     )
                     recovered += 1
@@ -379,7 +402,7 @@ class TaskDispatcher:
             )
             self._dispatched.add(task_id)
             tracked_task(
-                self._executor.execute(task_id),
+                self._guarded_execute(task_id),
                 name=f"task-recover-{task_id}",
             )
             recovered += 1

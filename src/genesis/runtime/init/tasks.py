@@ -46,6 +46,11 @@ async def init(rt: GenesisRuntime) -> None:
             memory_store=getattr(rt, "_memory_store", None),
         )
 
+        # Single-task execution: semaphore ensures only one task runs
+        # at a time.  Shared between executor (pause releases it) and
+        # dispatcher (guarded_execute acquires it).
+        exec_semaphore = asyncio.Semaphore(1)
+
         executor = CCSessionExecutor(
             db=rt._db,
             invoker=rt._cc_invoker,
@@ -57,12 +62,14 @@ async def init(rt: GenesisRuntime) -> None:
             event_bus=rt._event_bus,
             runtime=rt,
             autonomous_dispatcher=getattr(rt, "_autonomous_dispatcher", None),
+            exec_semaphore=exec_semaphore,
         )
 
         dispatcher = TaskDispatcher(
             db=rt._db,
             executor=executor,
             event_bus=rt._event_bus,
+            exec_semaphore=exec_semaphore,
         )
 
         rt._task_executor = executor
