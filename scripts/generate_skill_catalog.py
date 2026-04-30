@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Generate a compact skill catalog from skill directories.
 
-Scans Tier 1 (.claude/skills/) and Tier 2 (.genesis/skill-library/) directories
-for SKILL.md or skill definition files. Extracts name + one-line description.
-Writes to ~/.genesis/skill_catalog.json.
+Scans Tier 1 (.claude/skills/) and Tier 2 directories for SKILL.md or skill
+definition files.  Extracts name + one-line description.  Writes to
+~/.genesis/skill_catalog.json.
+
+Tier 2 sources (skill library):
+  - src/genesis/skills/  — repo-versioned domain skills
+  - ~/.genesis/skill-library/ — user-added ad-hoc skills
 """
 from __future__ import annotations
 
@@ -14,7 +18,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TIER1_DIR = REPO_ROOT / ".claude" / "skills"
-TIER2_DIR = Path.home() / ".genesis" / "skill-library"
+TIER2_DIRS = [
+    REPO_ROOT / "src" / "genesis" / "skills",
+    Path.home() / ".genesis" / "skill-library",
+]
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 
 
@@ -100,9 +107,21 @@ def _scan_tier(tier_dir: Path, tier_num: int, repo_root: Path | None) -> list[di
 
 def generate_catalog() -> dict:
     """Scan skill directories and build the catalog."""
+    tier1 = _scan_tier(TIER1_DIR, 1, REPO_ROOT)
+    seen_names = {s["name"].lower() for s in tier1}
+
+    tier2: list[dict] = []
+    for t2_dir in TIER2_DIRS:
+        for skill in _scan_tier(t2_dir, 2, REPO_ROOT):
+            # Deduplicate (case-insensitive): skip if name exists in Tier 1
+            # or was already added from another Tier 2 directory
+            if skill["name"].lower() not in seen_names:
+                tier2.append(skill)
+                seen_names.add(skill["name"].lower())
+
     return {
-        "tier1": _scan_tier(TIER1_DIR, 1, REPO_ROOT),
-        "tier2": _scan_tier(TIER2_DIR, 2, None),
+        "tier1": tier1,
+        "tier2": tier2,
         "generated_at": datetime.now(UTC).isoformat(),
     }
 

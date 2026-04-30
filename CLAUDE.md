@@ -66,6 +66,14 @@ Use for symbol references, definitions, type hierarchies, and safe refactoring.
 Use Grep instead for non-Python (config, YAML, shell, SQL, mocks).
 Full decision guide: `.claude/docs/serena-guide.md`
 
+## Skill Library
+
+Tier 1 skills (`.claude/skills/`) are always indexed. Additional specialized
+skills live in `src/genesis/skills/` and `~/.genesis/skill-library/` — browse
+these when a task would benefit from a structured approach (research, outreach,
+browser automation, content, etc.). The skill injection hook nudges you when
+one matches.
+
 ## Web Tools
 
 CC WebSearch for general lookups, SearXNG for structured/bulk queries,
@@ -198,6 +206,12 @@ Memories are tagged with a `wing` (top-level domain) and optional `room`
 (specific topic). When searching, you can filter by wing for domain-specific
 recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy.
+
+## MCP Tool Selection
+
+When multiple Genesis MCP tools could handle a task, see
+`.claude/docs/mcp-tools-guide.md` for decision trees (storage taxonomy,
+recall taxonomy, health debugging escalation).
 
 ## Reference Capture
 

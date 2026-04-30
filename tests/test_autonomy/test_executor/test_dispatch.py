@@ -40,6 +40,24 @@ class TestBuildStepPrompt:
         assert "Workaround Context" in prompt
         assert "Try approach B" in prompt
 
+    def test_includes_resources(self) -> None:
+        step = {"idx": 0, "type": "code"}
+        prompt = build_step_prompt(
+            step, [], resources="### Skill: research\nDo deep research.",
+        )
+
+        assert "Resources for This Step" in prompt
+        assert "research" in prompt
+        assert "Do deep research" in prompt
+
+    def test_no_dynamic_resources_when_none(self) -> None:
+        step = {"idx": 0, "type": "code"}
+        prompt = build_step_prompt(step, [], resources=None)
+
+        # The template mentions "Resources for This Step" in guidance text,
+        # but the dynamic section header "## Resources for This Step" should not appear
+        assert "## Resources for This Step" not in prompt
+
 
 class TestParseStepOutput:
     def test_backtick_json(self) -> None:

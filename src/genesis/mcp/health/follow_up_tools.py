@@ -35,6 +35,7 @@ async def _impl_follow_up_create(
     *,
     scheduled_at: str | None = None,
     priority: str = "medium",
+    pinned: bool = False,
     source_session: str | None = None,
 ) -> dict:
     """Create a follow-up item in the accountability ledger."""
@@ -65,12 +66,15 @@ async def _impl_follow_up_create(
             strategy=strategy,
             scheduled_at=scheduled_at,
             priority=priority,
+            pinned=pinned,
         )
         return {
             "id": fid,
             "status": "pending",
             "strategy": strategy,
-            "message": f"Follow-up created. Strategy: {strategy}.",
+            "pinned": pinned,
+            "message": f"Follow-up created. Strategy: {strategy}."
+            + (" (pinned — ego cannot auto-resolve)" if pinned else ""),
         }
     except Exception as exc:
         logger.error("follow_up_create failed", exc_info=True)
@@ -113,6 +117,7 @@ async def _impl_follow_up_update(
     resolution_notes: str | None = None,
     blocked_reason: str | None = None,
     priority: str | None = None,
+    pinned: bool | None = None,
 ) -> dict:
     """Update an existing follow-up item."""
     db = _get_db()
@@ -141,6 +146,9 @@ async def _impl_follow_up_update(
             )
             await db.commit()
 
+        if pinned is not None:
+            await follow_ups.set_pinned(db, follow_up_id, pinned)
+
         if status:
             updated = await follow_ups.update_status(
                 db,
@@ -165,6 +173,7 @@ async def _impl_follow_up_update(
             "id": follow_up_id,
             "status": refreshed["status"],
             "priority": refreshed["priority"],
+            "pinned": bool(refreshed.get("pinned", 0)),
             "message": "Follow-up updated.",
         }
     except Exception as exc:
@@ -184,6 +193,7 @@ async def follow_up_create(
     strategy: str,
     scheduled_at: str = "",
     priority: str = "medium",
+    pinned: bool = False,
 ) -> dict:
     """Create a follow-up item for Genesis to track and execute.
 
@@ -199,6 +209,9 @@ async def follow_up_create(
             - user_input_needed: Requires user decision, surfaced in morning report
         scheduled_at: ISO datetime for scheduled_task strategy (required if strategy is scheduled_task)
         priority: low | medium | high | critical
+        pinned: If true, ego can see this follow-up but cannot auto-resolve it.
+            Only the user can close a pinned follow-up. Use for items you want
+            to track personally.
     """
     return await _impl_follow_up_create(
         content,
@@ -206,6 +219,7 @@ async def follow_up_create(
         strategy,
         scheduled_at=scheduled_at or None,
         priority=priority,
+        pinned=pinned,
     )
 
 
@@ -216,11 +230,12 @@ async def follow_up_update(
     resolution_notes: str = "",
     blocked_reason: str = "",
     priority: str = "",
+    pinned: str = "",
 ) -> dict:
     """Update an existing follow-up item.
 
-    Use this to change status, add resolution notes, mark as blocked, or
-    adjust priority on an existing follow-up.
+    Use this to change status, add resolution notes, mark as blocked,
+    adjust priority, or pin/unpin on an existing follow-up.
 
     Args:
         follow_up_id: The ID of the follow-up to update
@@ -228,13 +243,21 @@ async def follow_up_update(
         resolution_notes: Notes on resolution or progress. Appended context for future sessions.
         blocked_reason: Why this follow-up is blocked (sets status to blocked if status not provided).
         priority: New priority (low, medium, high, critical). Empty to keep current.
+        pinned: Set to "true" to pin (ego cannot auto-resolve) or "false" to unpin. Empty to keep current.
     """
+    pinned_bool: bool | None = None
+    if pinned.lower() in ("true", "1", "yes"):
+        pinned_bool = True
+    elif pinned.lower() in ("false", "0", "no"):
+        pinned_bool = False
+
     return await _impl_follow_up_update(
         follow_up_id,
         status=status or None,
         resolution_notes=resolution_notes or None,
         blocked_reason=blocked_reason or None,
         priority=priority or None,
+        pinned=pinned_bool,
     )
 
 

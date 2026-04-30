@@ -276,7 +276,8 @@ class EgoContextBuilder:
             strategy = fu.get("strategy", "?")
             blocked = fu.get("blocked_reason", "")
 
-            line = f"- [{priority}/{status}] ({source}) **{strategy}**: {content}"
+            pin_tag = " [pinned]" if fu.get("pinned") else ""
+            line = f"- [{priority}/{status}]{pin_tag} ({source}) **{strategy}**: {content}"
             if blocked:
                 line += f" — BLOCKED: {blocked[:100]}"
             lines.append(line)

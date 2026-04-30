@@ -31,6 +31,7 @@ def build_step_prompt(
     step: dict,
     prior_results: list[StepResult],
     workaround: str | None = None,
+    resources: str | None = None,
 ) -> str:
     """Build the step prompt from TASK_STEP.md template."""
     template = ""
@@ -68,6 +69,13 @@ def build_step_prompt(
             "A previous attempt at this step failed. "
             "Use the following approach instead:",
             workaround,
+            "",
+        ])
+
+    if resources:
+        parts.extend([
+            "## Resources for This Step",
+            resources,
             "",
         ])
 
