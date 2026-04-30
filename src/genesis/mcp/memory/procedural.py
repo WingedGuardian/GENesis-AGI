@@ -41,9 +41,9 @@ async def procedure_store(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
-    from genesis.learning.procedural.operations import store_procedure
+    from genesis.learning.procedural.operations import store_procedure_checked
 
-    return await store_procedure(
+    result = await store_procedure_checked(
         memory_mod._db,
         task_type=task_type,
         principle=principle,
@@ -55,7 +55,17 @@ async def procedure_store(
         speculative=0,
         success_count=1,
         confidence=2 / 3,
+        source={"type": "explicit_teach"},
     )
+
+    response = result.procedure_id
+    if result.action == "updated":
+        response = f"Updated existing procedure {result.procedure_id} (version bumped)"
+    elif result.action == "skipped":
+        response = f"Skipped: procedure {result.conflicting_ids[0]} already covers this task_type"
+    if result.warnings:
+        response += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in result.warnings)
+    return response
 
 
 @mcp.tool()

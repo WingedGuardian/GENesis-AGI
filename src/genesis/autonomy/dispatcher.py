@@ -28,6 +28,14 @@ _ALLOWED_PLAN_DIRS = [
     Path.home() / ".claude" / "plans",
 ]
 
+# Required sections in plan files (must match TASK_INTAKE.md plan format)
+REQUIRED_PLAN_SECTIONS = [
+    "## Requirements",
+    "## Steps",
+    "## Success Criteria",
+    "## Risks and Failure Modes",
+]
+
 # Terminal phases that should not be re-dispatched
 _TERMINAL_PHASES = frozenset({
     TaskPhase.COMPLETED.value,
@@ -51,6 +59,20 @@ def _validate_plan_path(path_str: str) -> Path:
     if not resolved.exists():
         raise FileNotFoundError(f"Plan file not found: {path_str}")
     return resolved
+
+
+def _validate_plan_content(path: Path) -> None:
+    """Check plan file contains required TASK_INTAKE.md sections.
+
+    Raises ValueError listing any missing sections.
+    """
+    lines = set(path.read_text().splitlines())
+    missing = [s for s in REQUIRED_PLAN_SECTIONS if s not in lines]
+    if missing:
+        raise ValueError(
+            f"Plan file missing required sections: {', '.join(missing)}. "
+            "See TASK_INTAKE.md format. Use /task for guided intake."
+        )
 
 
 class TaskDispatcher:
@@ -88,6 +110,7 @@ class TaskDispatcher:
 
         # Amendment #9: path validation
         resolved_path = _validate_plan_path(plan_path)
+        _validate_plan_content(resolved_path)
 
         task_id = f"t-{uuid.uuid4().hex[:12]}"
         now = datetime.now(UTC).isoformat()

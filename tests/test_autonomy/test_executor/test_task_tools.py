@@ -9,6 +9,15 @@ import pytest
 
 from genesis.mcp.health import task_tools
 
+# Minimal plan content satisfying REQUIRED_PLAN_SECTIONS validation
+VALID_PLAN = (
+    "# Test Plan\n"
+    "## Requirements\nBuild it\n"
+    "## Steps\n1. Do thing\n"
+    "## Success Criteria\nIt works\n"
+    "## Risks and Failure Modes\nNone significant\n"
+)
+
 
 @pytest.fixture(autouse=True)
 def _reset_task_tools():
@@ -43,7 +52,7 @@ class TestTaskSubmit:
     async def test_mcp_fallback_creates_db_row(self, tmp_path: Path) -> None:
         """Without dispatcher, MCP fallback creates DB row directly."""
         plan = tmp_path / "test-plan.md"
-        plan.write_text("# Test Plan\n")
+        plan.write_text(VALID_PLAN)
 
         # Temporarily allow the tmp dir
         original_dirs = task_tools._ALLOWED_PLAN_DIRS[:]
@@ -87,7 +96,46 @@ class TestTaskSubmit:
 
         result = await task_tools._impl_task_submit("/bad/path", "task")
         assert "error" in result
-        assert "Invalid" in result["error"]
+        assert "bad path" in result["error"]
+
+    async def test_mcp_fallback_rejects_missing_sections(self, tmp_path: Path) -> None:
+        """MCP fallback validates plan content after path checks pass."""
+        plan = tmp_path / "incomplete.md"
+        plan.write_text("# Plan\n## Steps\n1. Do thing\n")
+
+        original_dirs = task_tools._ALLOWED_PLAN_DIRS[:]
+        task_tools._ALLOWED_PLAN_DIRS.append(tmp_path)
+
+        result = await task_tools._impl_task_submit(str(plan), "Bad task")
+
+        task_tools._ALLOWED_PLAN_DIRS[:] = original_dirs
+
+        assert "error" in result
+        assert "missing required sections" in result["error"]
+        assert "## Requirements" in result["error"]
+        assert "## Success Criteria" in result["error"]
+
+    async def test_mcp_fallback_accepts_valid_plan(self, tmp_path: Path) -> None:
+        """MCP fallback passes content validation for well-formed plans."""
+        plan = tmp_path / "good.md"
+        plan.write_text(VALID_PLAN)
+
+        original_dirs = task_tools._ALLOWED_PLAN_DIRS[:]
+        task_tools._ALLOWED_PLAN_DIRS.append(tmp_path)
+
+        mock_db = AsyncMock()
+        mock_db.close = AsyncMock()
+
+        with (
+            patch.object(task_tools, "_get_db", new_callable=AsyncMock, return_value=mock_db),
+            patch("genesis.db.crud.task_states.create", new_callable=AsyncMock),
+        ):
+            result = await task_tools._impl_task_submit(str(plan), "Good task")
+
+        task_tools._ALLOWED_PLAN_DIRS[:] = original_dirs
+
+        assert "task_id" in result
+        assert result["status"] == "pending"
 
 
 @pytest.mark.asyncio

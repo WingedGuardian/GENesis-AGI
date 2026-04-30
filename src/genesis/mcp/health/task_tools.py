@@ -40,6 +40,23 @@ _ALLOWED_PLAN_DIRS = [
     Path.home() / ".claude" / "plans",
 ]
 
+# Required sections in plan files (must match dispatcher.py)
+REQUIRED_PLAN_SECTIONS = [
+    "## Requirements",
+    "## Steps",
+    "## Success Criteria",
+    "## Risks and Failure Modes",
+]
+
+
+def _validate_plan_content(path: Path) -> list[str]:
+    """Check plan file contains required TASK_INTAKE.md sections.
+
+    Returns list of missing section headers (empty if valid).
+    """
+    lines = set(path.read_text().splitlines())
+    return [s for s in REQUIRED_PLAN_SECTIONS if s not in lines]
+
 
 def init_task_tools(dispatcher, executor, *, db=None) -> None:
     """Wire dispatcher and executor references. Called from runtime init."""
@@ -84,7 +101,7 @@ async def _impl_task_submit(plan_path: str, description: str) -> dict:
             task_id = await _dispatcher.submit(plan_path, description)
             return {"task_id": task_id, "status": "dispatched"}
         except ValueError as exc:
-            return {"error": f"Invalid plan path: {exc}"}
+            return {"error": str(exc)}
         except FileNotFoundError as exc:
             return {"error": f"Plan file not found: {exc}"}
         except Exception as exc:
@@ -103,6 +120,14 @@ async def _impl_task_submit(plan_path: str, description: str) -> dict:
             return {"error": f"Plan file not found: {plan_path}"}
     except Exception as exc:
         return {"error": f"Invalid plan path: {exc}"}
+
+    # Content validation: check required sections
+    missing = _validate_plan_content(resolved)
+    if missing:
+        return {
+            "error": f"Plan file missing required sections: {', '.join(missing)}. "
+            "See TASK_INTAKE.md format. Use /task for guided intake.",
+        }
 
     task_id = f"t-{uuid.uuid4().hex[:12]}"
     now = datetime.now(UTC).isoformat()

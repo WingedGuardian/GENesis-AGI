@@ -25,19 +25,22 @@ async def create(
     tool_trigger: list[str] | None = None,
     success_count: int = 0,
     confidence: float = 0.0,
+    source: str | None = None,
+    promotion_history: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             speculative, attempted_workarounds, version, created_at,
-            activation_tier, tool_trigger, success_count, confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            activation_tier, tool_trigger, success_count, confidence,
+            source, promotion_history)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
-         success_count, confidence),
+         success_count, confidence, source, promotion_history),
     )
     await db.commit()
     return id
@@ -61,6 +64,8 @@ async def upsert(
     tool_trigger: list[str] | None = None,
     success_count: int = 0,
     confidence: float = 0.0,
+    source: str | None = None,
+    promotion_history: str | None = None,
 ) -> str:
     """Idempotent write: insert or update on conflict.
 
@@ -74,8 +79,9 @@ async def upsert(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             speculative, attempted_workarounds, version, created_at,
-            activation_tier, tool_trigger, success_count, confidence)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            activation_tier, tool_trigger, success_count, confidence,
+            source, promotion_history)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(id) DO UPDATE SET
              person_id = excluded.person_id,
              task_type = excluded.task_type, principle = excluded.principle,
@@ -86,13 +92,15 @@ async def upsert(
              activation_tier = excluded.activation_tier,
              tool_trigger = excluded.tool_trigger,
              success_count = excluded.success_count,
-             confidence = excluded.confidence""",
+             confidence = excluded.confidence,
+             source = COALESCE(procedural_memory.source, excluded.source),
+             promotion_history = COALESCE(procedural_memory.promotion_history, excluded.promotion_history)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
-         success_count, confidence),
+         success_count, confidence, source, promotion_history),
     )
     await db.commit()
     return id
@@ -104,6 +112,59 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
     if row is None:
         return None
     return dict(row)
+
+
+async def find_by_task_type(
+    db: aiosqlite.Connection,
+    task_type: str,
+) -> dict | None:
+    """Find the best active procedure with an exact task_type match.
+
+    Returns the highest-confidence non-deprecated, non-quarantined row,
+    or None. Used by conflict detection before store.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM procedural_memory
+           WHERE task_type = ? AND deprecated = 0 AND quarantined = 0
+           ORDER BY confidence DESC LIMIT 1""",
+        (task_type,),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
+async def find_by_context_overlap(
+    db: aiosqlite.Connection,
+    context_tags: list[str],
+    *,
+    jaccard_threshold: float = 0.7,
+    exclude_id: str | None = None,
+    limit: int = 5,
+) -> list[dict]:
+    """Find active procedures with high context_tag Jaccard overlap.
+
+    Loads active procedures and filters in Python (SQLite lacks native
+    JSON set operations). Returns rows with overlap >= threshold.
+    """
+    query_tags = set(context_tags)
+    if not query_tags:
+        return []
+
+    rows = await list_active(db, limit=200)
+    scored = []
+    for row in rows:
+        if exclude_id and row["id"] == exclude_id:
+            continue
+        raw = row.get("context_tags", "[]")
+        row_tags = set(json.loads(raw) if isinstance(raw, str) else raw)
+        union = query_tags | row_tags
+        if not union:
+            continue
+        jaccard = len(query_tags & row_tags) / len(union)
+        if jaccard >= jaccard_threshold:
+            scored.append((jaccard, row))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [row for _, row in scored[:limit]]
 
 
 async def list_by_task_type(
@@ -162,9 +223,11 @@ async def update(db: aiosqlite.Connection, id: str, **fields) -> bool:
         return False
     # Serialize JSON fields
     for key in ("steps", "tools_used", "context_tags", "failure_modes",
-                 "attempted_workarounds", "tool_trigger"):
+                 "attempted_workarounds", "tool_trigger", "promotion_history"):
         if key in fields and isinstance(fields[key], list):
             fields[key] = json.dumps(fields[key])
+    if "source" in fields and isinstance(fields["source"], dict):
+        fields["source"] = json.dumps(fields["source"])
     set_clause = ", ".join(f"{k} = ?" for k in fields)
     values = list(fields.values()) + [id]
     cursor = await db.execute(

@@ -951,6 +951,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE follow_ups ADD COLUMN verification_notes TEXT",
         "follow_ups.verification_notes")
 
+    # Procedure provenance tracking
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN source TEXT",
+        "procedural_memory.source")
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN promotion_history TEXT",
+        "procedural_memory.promotion_history")
+
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
     await _migrate_cognitive_state_check(db)

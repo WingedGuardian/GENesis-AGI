@@ -31,7 +31,9 @@ TABLES = {
             version           INTEGER NOT NULL DEFAULT 1,
             created_at        TEXT NOT NULL,
             activation_tier   TEXT NOT NULL DEFAULT 'L4',  -- L1/L2/L3/L4 promotion tier
-            tool_trigger      TEXT                         -- JSON array of tool names for L1 matching
+            tool_trigger      TEXT,                        -- JSON array of tool names for L1 matching
+            source            TEXT,                        -- JSON: {type, session_id?, observation_id?, triage_outcome?}
+            promotion_history TEXT                         -- JSON array: [{from_tier, to_tier, at, reason}]
         )
     """,
     "observations": """
