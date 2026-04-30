@@ -51,6 +51,7 @@ class ConversationCollector:
             value=round(value, 3),
             source="cc_sessions",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=no conversations since last reflection (normal off-hours). 0.3-0.5=typical active period",
         )
 
     def _count_jsonl_turns(self, cutoff: str) -> int:

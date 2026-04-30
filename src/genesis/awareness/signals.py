@@ -254,6 +254,7 @@ class StrategicTimerCollector:
             value=round(value, 3),
             source="clock",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Time since last strategic reflection. 0.0=recent, 1.0=15+ days overdue",
         )
 
 
@@ -283,6 +284,7 @@ class ContainerMemoryCollector:
             normal_max=0.80,
             warning_threshold=0.85,
             critical_threshold=0.90,
+            baseline_note="Includes page cache; 70-80% is normal for containerized workloads",
         )
 
 
@@ -319,6 +321,7 @@ class ProcessHealthCollector:
                 name=self.signal_name, value=value, source="process",
                 collected_at=datetime.now(UTC).isoformat(),
                 warning_threshold=0.3, critical_threshold=0.5,
+                baseline_note="0=no browsers (normal idle). 1-2 during active browsing is expected",
             )
         except Exception:
             logger.error("ProcessHealthCollector failed", exc_info=True)
@@ -376,6 +379,7 @@ class JobHealthCollector:
             value=round(value, 3),
             source="runtime",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=all jobs healthy. Brief spikes normal after restart",
         )
 
 
@@ -439,6 +443,7 @@ class SchedulerLivenessCollector:
             return SignalReading(
                 name=self.signal_name, value=0.0, source="runtime",
                 collected_at=now.isoformat(),
+                baseline_note="0.0=scheduler active. Rises if surplus jobs stop running",
             )
 
         return SignalReading(

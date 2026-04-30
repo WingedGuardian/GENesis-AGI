@@ -73,4 +73,5 @@ class GuardianActivityCollector:
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=heartbeat fresh <5min (healthy). 0.5=stale 5-30min, 1.0=very stale >30min",
         )

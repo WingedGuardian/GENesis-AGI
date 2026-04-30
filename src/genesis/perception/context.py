@@ -422,6 +422,8 @@ class ContextAssembler:
                     f" [{status}; normal<={s.normal_max},"
                     f" warn>={s.warning_threshold}, crit>={s.critical_threshold}]"
                 )
+            if s.baseline_note:
+                line += f" -- baseline: {s.baseline_note}"
             unchanged = staleness.get(s.name, 0)
             if unchanged >= 2:
                 hours = unchanged * tick_interval_min / 60

@@ -164,6 +164,7 @@ class GenesisVersionCollector:
             return SignalReading(
                 name=self.signal_name, value=1.0,
                 source="genesis_version", collected_at=now_iso,
+                baseline_note="1.0=Genesis version just changed or upstream update available",
             )
 
         # ── Self-throttled remote check ──────────────────────────────
@@ -187,6 +188,7 @@ class GenesisVersionCollector:
                     return SignalReading(
                         name=self.signal_name, value=1.0,
                         source="genesis_version", collected_at=now_iso,
+                        baseline_note="1.0=upstream update available",
                     )
             except Exception:
                 logger.error("Upstream check failed", exc_info=True)
@@ -195,6 +197,7 @@ class GenesisVersionCollector:
         return SignalReading(
             name=self.signal_name, value=0.0,
             source="genesis_version", collected_at=now_iso,
+            baseline_note="0.0=up to date (normal). 1.0=update available or just applied",
         )
 
     # ── Git operations ────────────────────────────────────────────────

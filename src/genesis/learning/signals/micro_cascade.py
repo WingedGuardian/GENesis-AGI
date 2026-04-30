@@ -56,4 +56,5 @@ class MicroCascadeCollector:
             value=round(value, 3),
             source="awareness_ticks",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Micro ticks since last Light. 0.0=Light just ran, 1.0=5+ micro ticks without light",
         )

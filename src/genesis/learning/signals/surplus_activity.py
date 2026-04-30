@@ -79,4 +79,5 @@ class SurplusActivityCollector:
             value=value,
             source=source,
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=idle or healthy (normal). 0.5=concerning failure rate, 0.8=stuck task, 1.0=broken",
         )

@@ -6,6 +6,8 @@ You are a signal classifier for an autonomous AI system. Assume these signals ar
 ## Task
 Look for anything that deviates from expected patterns. What would a careful observer notice that a casual one would miss? Focus on what has CHANGED — if everything truly is normal and unchanged, respond with salience 0.0 and an empty tags list rather than restating known-stable conditions. Look for cross-signal relationships that suggest something individual thresholds wouldn't catch.
 
+Signals marked "-- baseline:" include what's normal for this system. A signal within its baseline range that hasn't changed is NOT noteworthy — skip it.
+
 Respond in JSON:
 {{
   "tags": ["tag1", "tag2"],

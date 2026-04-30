@@ -48,4 +48,5 @@ class SentinelActivityCollector:
             value=value,
             source="sentinel_state",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=healthy (normal). 0.3=investigating, 0.7=remediating, 1.0=escalated",
         )

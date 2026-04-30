@@ -34,4 +34,5 @@ class BudgetCollector:
             value=value,
             source="cost_events",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Daily budget consumption fraction. 0.0-0.5 normal for first half of day",
         )

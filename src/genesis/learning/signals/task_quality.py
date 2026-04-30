@@ -41,4 +41,5 @@ class TaskQualityCollector:
             value=value,
             source="execution_traces",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=no failures in last 24h (or no tasks ran). Failure rate of recent task executions",
         )

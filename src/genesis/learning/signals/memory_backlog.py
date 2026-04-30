@@ -33,4 +33,5 @@ class MemoryBacklogCollector:
             value=value,
             source="observations",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Unprocessed observations from last 7 days. Low values normal; rises if retrieval pipeline stalls",
         )

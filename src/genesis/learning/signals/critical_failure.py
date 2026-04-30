@@ -42,4 +42,5 @@ class CriticalFailureCollector:
             value=value,
             source="health_probes",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="0.0=all providers reachable (healthy). 0.5=degraded, 1.0=provider down",
         )

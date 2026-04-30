@@ -31,4 +31,5 @@ class ReconFindingsCollector:
             value=value,
             source="observations",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note="Unresolved recon findings. 0.0=none pending (normal). Normalized against ceiling of 10",
         )

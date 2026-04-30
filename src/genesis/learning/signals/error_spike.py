@@ -56,4 +56,5 @@ class ErrorSpikeCollector:
             value=value,
             source="observations",
             collected_at=now.isoformat(),
+            baseline_note="0.0=no error spike (normal). Fires when hourly errors exceed 3x daily baseline",
         )

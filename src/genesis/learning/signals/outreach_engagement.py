@@ -25,12 +25,14 @@ class OutreachEngagementCollector:
             "GROUP BY engagement_outcome"
         )
         rows = await cursor.fetchall()
+        note = "Engagement ratio from last 7 days of outreach. 0.0=no outreach or no engagement"
         if not rows:
             return SignalReading(
                 name=self.signal_name,
                 value=0.0,
                 source="outreach_history",
                 collected_at=datetime.now(UTC).isoformat(),
+                baseline_note=note,
             )
         total = sum(r[1] for r in rows)
         engaged = sum(r[1] for r in rows if r[0] == "engaged")
@@ -40,4 +42,5 @@ class OutreachEngagementCollector:
             value=value,
             source="outreach_history",
             collected_at=datetime.now(UTC).isoformat(),
+            baseline_note=note,
         )
