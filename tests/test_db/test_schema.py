@@ -96,9 +96,9 @@ async def test_no_unexpected_tables(db):
 async def test_signal_weights_seeded(db):
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
     count = (await cursor.fetchone())[0]
-    # 10 → 16 on 2026-04-17: +6 new signals (light_cascade, sentinel,
-    # guardian, surplus, autonomy activity, stale_pending_items).
-    assert count == 16
+    # 16 → 18 on 2026-04-30: +2 user-facing signals (user_goal_staleness,
+    # user_session_pattern) for reflection rebalancing Phase 2.5b.
+    assert count == 18
 
 
 async def test_signal_weights_values(db):
@@ -301,8 +301,8 @@ async def test_seed_is_idempotent(db):
     await seed_data(db)
     await db.commit()
     cursor = await db.execute("SELECT COUNT(*) FROM signal_weights")
-    # 10 → 16 on 2026-04-17: +6 new signals (awareness scoring overhaul).
-    assert (await cursor.fetchone())[0] == 16
+    # 16 → 18 on 2026-04-30: +2 user-facing signals (Phase 2.5b).
+    assert (await cursor.fetchone())[0] == 18
     cursor = await db.execute("SELECT COUNT(*) FROM drive_weights")
     assert (await cursor.fetchone())[0] == 4
 

@@ -5,8 +5,8 @@ from genesis.db.crud import signal_weights
 
 async def test_list_all(db):
     rows = await signal_weights.list_all(db)
-    # 10 → 16 on 2026-04-17: +6 new signals (awareness scoring overhaul).
-    assert len(rows) == 16
+    # 16 → 18 on 2026-04-30: +2 user-facing signals (Phase 2.5b).
+    assert len(rows) == 18
 
 
 async def test_get_existing(db):

@@ -174,7 +174,9 @@ class GenesisEgoContextBuilder:
         lines = ["## Unresolved Observations (last 48h, max 20)\n"]
 
         try:
-            # Exclude user-world categories (imported from user_context)
+            # Exclude user-world categories and user-only relevance tags.
+            # Genesis ego sees: NULL category, :genesis, :both, and anything
+            # not in _USER_WORLD_CATEGORIES that isn't :user tagged.
             exclude_placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
             cursor = await self._db.execute(
                 f"SELECT source, type, category, content, priority, created_at "
@@ -182,7 +184,8 @@ class GenesisEgoContextBuilder:
                 f"WHERE resolved = 0 "
                 f"AND created_at >= datetime('now', '-48 hours') "
                 f"AND (category IS NULL "
-                f"     OR category NOT IN ({exclude_placeholders})) "
+                f"     OR (category NOT IN ({exclude_placeholders}) "
+                f"         AND category NOT LIKE '%:user')) "
                 f"AND type != 'escalation_to_user_ego' "
                 f"ORDER BY "
                 f"  CASE priority "

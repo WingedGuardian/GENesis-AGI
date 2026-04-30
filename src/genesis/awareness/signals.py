@@ -174,6 +174,24 @@ class AutonomyActivityCollector:
         return _bootstrap_placeholder_reading(self.signal_name, "autonomy")
 
 
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.user_goal_staleness.UserGoalStalenessCollector.
+class UserGoalStalenessCollector:
+    signal_name = "user_goal_staleness"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "follow_ups+user_model")
+
+
+# GROUNDWORK(signal-bootstrap): pre-swap placeholder. Replaced at runtime
+# by genesis.learning.signals.user_session_pattern.UserSessionPatternCollector.
+class UserSessionPatternCollector:
+    signal_name = "user_session_pattern"
+
+    async def collect(self) -> SignalReading:
+        return _bootstrap_placeholder_reading(self.signal_name, "cc_sessions")
+
+
 class ErrorSpikeCollector:
     signal_name = "software_error_spike"
 
