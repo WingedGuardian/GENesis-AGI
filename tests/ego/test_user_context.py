@@ -487,6 +487,7 @@ class TestUserEgoContextBuilder:
             "## Genesis Capabilities",
             "## System Status",
             "## Open Threads",
+            "## Recent Proposals",
             "## Output Contract",
         ]
         for section in expected_sections:

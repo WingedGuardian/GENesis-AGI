@@ -443,6 +443,7 @@ class TestGenesisEgoContextBuilder:
             "## Unresolved Observations",
             "## Maintenance Follow-ups",
             "## Cost Status",
+            "## Recent Proposals",
             "## Output Contract",
         ]
         for section in expected_sections:
@@ -467,3 +468,80 @@ class TestGenesisEgoContextBuilder:
         assert "Content for interest" not in result
         assert "Content for interests" not in result
         assert "Content for finding" not in result
+
+    # ── Proposal History (3b) ──────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_proposal_history_section(self, db, mock_health_data, capabilities):
+        """Proposal history displays recent proposals in a table."""
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, action_category, content, status, "
+            "user_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("p1", "outreach", "linkedin", "Post update on LinkedIn", "approved", None),
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, action_category, content, status, "
+            "user_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("p2", "investigate", "recon", "Check competitor repos", "rejected", "not now"),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "Recent Proposals" in result
+        assert "outreach" in result
+        assert "Post update on LinkedIn" in result
+        assert "approved" in result
+        assert "rejected" in result
+        assert "not now" in result
+
+    @pytest.mark.asyncio
+    async def test_proposal_history_empty(self, db, mock_health_data, capabilities):
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "No proposals in last 7 days" in result
+
+    @pytest.mark.asyncio
+    async def test_proposal_history_truncates_long_content(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Long content in proposal history table is truncated to 80 chars."""
+        long_content = "Z" * 200
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, action_category, content, status, "
+            "user_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("p3", "investigate", "recon", long_content, "pending", None),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        proposals_section = result.split("## Recent Proposals")[1].split("##")[0]
+        assert "..." in proposals_section
+        assert "Z" * 200 not in proposals_section
+
+    @pytest.mark.asyncio
+    async def test_proposal_history_pipes_escaped(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Pipe chars in content are escaped to not break markdown table."""
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, action_category, content, status, "
+            "user_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("p4", "investigate", "recon", "repo|branch|status", "pending", None),
+        )
+        builder = GenesisEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "repo/branch/status" in result

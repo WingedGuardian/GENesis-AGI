@@ -56,6 +56,7 @@ class GenesisEgoContextBuilder:
         sections.append(await self._observations_section())
         sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
+        sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
         sections.append(self._output_contract_section())
@@ -306,6 +307,41 @@ class GenesisEgoContextBuilder:
             lines.append(f"- **Ego spend today**: ${ego_spend:.4f}")
         except Exception:
             pass
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _proposal_history_section(self) -> str:
+        """Recent proposal outcomes for self-calibration."""
+        lines = ["## Recent Proposals (last 7 days)\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT action_type, action_category, content, status, "
+                "user_response, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "ORDER BY created_at DESC "
+                "LIMIT 15"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            lines.append("*No proposal history available.*\n")
+            return "\n".join(lines)
+
+        if not rows:
+            lines.append("*No proposals in last 7 days.*\n")
+            return "\n".join(lines)
+
+        lines.append("| Action | Content | Status | Response |")
+        lines.append("|--------|---------|--------|----------|")
+        for action_type, _category, content, status, response, _created in rows:
+            short = content[:80] + "..." if len(content) > 80 else content
+            short = short.replace("\n", " ").replace("|", "/")
+            resp = (response or "\u2014")[:50]
+            lines.append(
+                f"| {action_type} | {short} | {status} | {resp} |"
+            )
 
         lines.append("")
         return "\n".join(lines)
