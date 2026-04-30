@@ -731,6 +731,20 @@ else
     fi
 fi
 
+# ── Codebase visualization port forwarding ────────────────────────
+# Forward host:9749 → container:9749 for the codebase-memory-mcp 3D graph UI.
+# Only active when a Claude Code session is running (MCP server serves the UI).
+if incus config device get "$CONTAINER_NAME" codebase-viz-proxy listen &>/dev/null; then
+    echo "  + Codebase viz proxy already configured"
+else
+    if incus config device add "$CONTAINER_NAME" codebase-viz-proxy proxy \
+        listen=tcp:0.0.0.0:9749 connect=tcp:127.0.0.1:9749 2>/dev/null; then
+        echo "  + Codebase viz proxy: host:9749 → container:9749"
+    else
+        echo "  WARN: Could not set up codebase viz proxy — graph UI only reachable via container IP"
+    fi
+fi
+
 # ── Tailscale (remote dashboard access) ──────────────────────────────────────
 # Most Genesis installs are headless VMs. Tailscale gives immediate remote access
 # to the dashboard from any device without port-forwarding or firewall changes.

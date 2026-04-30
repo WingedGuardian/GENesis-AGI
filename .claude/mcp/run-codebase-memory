@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Launcher for codebase-memory-mcp MCP server.
+# Resolves the binary installed by the codebase-memory-mcp install script.
+#
+# Install the tool first:
+#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
+
+BINARY="${HOME}/.local/bin/codebase-memory-mcp"
+
+if [[ ! -x "$BINARY" ]]; then
+    printf 'codebase-memory-mcp not installed.\n' >&2
+    printf 'Install: curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui\n' >&2
+    exit 1
+fi
+
+exec "$BINARY" "$@"

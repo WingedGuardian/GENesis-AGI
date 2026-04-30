@@ -30,6 +30,23 @@ if [[ -z "$COMMIT_SHA" || -z "$COMMIT_SUBJECT" ]]; then
     exit 0
 fi
 
+# ─── Code intelligence reindex (every commit, fire-and-forget) ────────────
+# Keeps codebase-memory-mcp and GitNexus indexes fresh after each commit.
+# Fail-open: errors logged, never block the commit.
+_REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+if [[ -n "$_REPO_ROOT" ]]; then
+    _CI_LOG="$GENESIS_HOME/code-intelligence-hook.log"
+    if command -v codebase-memory-mcp &>/dev/null; then
+        ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$_REPO_ROOT\"}" \
+            >> "$_CI_LOG" 2>&1 ) &
+        disown 2>/dev/null || true
+    fi
+    if command -v npx &>/dev/null; then
+        ( cd "$_REPO_ROOT" && npx gitnexus analyze --quiet >> "$_CI_LOG" 2>&1 ) &
+        disown 2>/dev/null || true
+    fi
+fi
+
 # ─── Stale-branch cleanup on public releases ──────────────────────────────
 # When a commit with subject matching `Genesis v...public release` lands,
 # most feature branches whose work was squash-merged become orphaned. Run
