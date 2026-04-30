@@ -91,14 +91,17 @@ class LinkedInDistributor:
                 },
                 connected_account_id=self._config.connected_account_id,
                 user_id=self._config.user_id,
+                version="20260424_00",
             )
 
             successful = result.successful if hasattr(result, "successful") else False
             data = result.data if hasattr(result, "data") else {}
-            response = data.get("response_dict", {}) if isinstance(data, dict) else {}
+            data = data if isinstance(data, dict) else {}
 
             if successful:
-                post_id = response.get("id", response.get("share_id"))
+                # Response shape: {"x_restli_id": "urn:li:share:..."}
+                # Fallback: check legacy response_dict for older Composio versions
+                post_id = data.get("x_restli_id") or data.get("response_dict", {}).get("id")
                 logger.info("Published to LinkedIn: %s", post_id)
                 return PostResult(
                     post_id=str(post_id) if post_id else None,
@@ -107,7 +110,7 @@ class LinkedInDistributor:
                     status="published",
                 )
             else:
-                error_msg = (result.error if hasattr(result, "error") else None) or str(response)
+                error_msg = (result.error if hasattr(result, "error") else None) or str(data)
                 logger.warning("LinkedIn publish failed: %s", error_msg)
                 return PostResult(
                     post_id=None,
@@ -137,6 +140,7 @@ class LinkedInDistributor:
                 arguments={"share_id": post_id},
                 connected_account_id=self._config.connected_account_id,
                 user_id=self._config.user_id,
+                version="20260424_00",
             )
             return bool(result.successful) if hasattr(result, "successful") else False
         except Exception:
