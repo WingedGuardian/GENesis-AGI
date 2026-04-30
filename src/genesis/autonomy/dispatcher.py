@@ -51,7 +51,7 @@ def _validate_plan_path(path_str: str) -> Path:
     Raises ValueError for paths outside allowed directories.
     Raises FileNotFoundError if the plan file does not exist.
     """
-    resolved = Path(path_str).resolve()
+    resolved = Path(path_str).expanduser().resolve()
     if not any(resolved.is_relative_to(d) for d in _ALLOWED_PLAN_DIRS):
         raise ValueError(
             f"Plan path outside allowed directories: {path_str}. "
