@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.autonomy.decomposer import TaskDecomposer
+from genesis.db.crud.task_states import create_intake_token
 
 
 @dataclass
@@ -167,7 +168,8 @@ class TestDecomposeDB:
     async def test_task_steps_create_and_get(self, db) -> None:
         from genesis.db.crud import task_states, task_steps
 
-        await task_states.create(db, task_id="t1", description="test task")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="test task", intake_token=token)
 
         await task_steps.create_step(
             db, task_id="t1", step_idx=0, step_type="code", description="Write code"
@@ -185,7 +187,8 @@ class TestDecomposeDB:
     async def test_task_steps_update(self, db) -> None:
         from genesis.db.crud import task_states, task_steps
 
-        await task_states.create(db, task_id="t1", description="test")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="test", intake_token=token)
         await task_steps.create_step(db, task_id="t1", step_idx=0)
 
         updated = await task_steps.update_step(
@@ -201,7 +204,8 @@ class TestDecomposeDB:
     async def test_get_last_completed_step(self, db) -> None:
         from genesis.db.crud import task_states, task_steps
 
-        await task_states.create(db, task_id="t1", description="test")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="test", intake_token=token)
         for i in range(3):
             await task_steps.create_step(db, task_id="t1", step_idx=i)
 
@@ -216,7 +220,8 @@ class TestDecomposeDB:
     async def test_get_last_completed_step_none(self, db) -> None:
         from genesis.db.crud import task_states, task_steps
 
-        await task_states.create(db, task_id="t1", description="test")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="test", intake_token=token)
         await task_steps.create_step(db, task_id="t1", step_idx=0)
 
         last = await task_steps.get_last_completed_step(db, "t1")
@@ -225,9 +230,12 @@ class TestDecomposeDB:
     async def test_task_states_list_by_phase(self, db) -> None:
         from genesis.db.crud import task_states
 
-        await task_states.create(db, task_id="t1", description="a", current_phase="executing")
-        await task_states.create(db, task_id="t2", description="b", current_phase="completed")
-        await task_states.create(db, task_id="t3", description="c", current_phase="executing")
+        t1 = await create_intake_token(db)
+        t2 = await create_intake_token(db)
+        t3 = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="a", current_phase="executing", intake_token=t1)
+        await task_states.create(db, task_id="t2", description="b", current_phase="completed", intake_token=t2)
+        await task_states.create(db, task_id="t3", description="c", current_phase="executing", intake_token=t3)
 
         rows = await task_states.list_by_phase(db, "executing")
         assert len(rows) == 2
@@ -236,10 +244,14 @@ class TestDecomposeDB:
     async def test_task_states_list_active(self, db) -> None:
         from genesis.db.crud import task_states
 
-        await task_states.create(db, task_id="t1", description="a", current_phase="executing")
-        await task_states.create(db, task_id="t2", description="b", current_phase="completed")
-        await task_states.create(db, task_id="t3", description="c", current_phase="failed")
-        await task_states.create(db, task_id="t4", description="d", current_phase="paused")
+        t1 = await create_intake_token(db)
+        t2 = await create_intake_token(db)
+        t3 = await create_intake_token(db)
+        t4 = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="a", current_phase="executing", intake_token=t1)
+        await task_states.create(db, task_id="t2", description="b", current_phase="completed", intake_token=t2)
+        await task_states.create(db, task_id="t3", description="c", current_phase="failed", intake_token=t3)
+        await task_states.create(db, task_id="t4", description="d", current_phase="paused", intake_token=t4)
 
         active = await task_states.list_active(db)
         ids = {r["task_id"] for r in active}
@@ -249,7 +261,8 @@ class TestDecomposeDB:
         from genesis.db.crud import task_states
 
         for i in range(5):
-            await task_states.create(db, task_id=f"t{i}", description=f"task {i}")
+            _tok = await create_intake_token(db)
+            await task_states.create(db, task_id=f"t{i}", description=f"task {i}", intake_token=_tok)
 
         recent = await task_states.list_all_recent(db, limit=3)
         assert len(recent) == 3
@@ -257,7 +270,8 @@ class TestDecomposeDB:
     async def test_create_step_idempotent(self, db) -> None:
         from genesis.db.crud import task_states, task_steps
 
-        await task_states.create(db, task_id="t1", description="test")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="t1", description="test", intake_token=token)
         await task_steps.create_step(db, task_id="t1", step_idx=0)
         # Second insert should not raise (INSERT OR IGNORE)
         await task_steps.create_step(db, task_id="t1", step_idx=0)

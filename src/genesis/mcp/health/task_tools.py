@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -80,7 +80,43 @@ async def _get_db() -> aiosqlite.Connection:
 # ---------------------------------------------------------------------------
 
 
-async def _impl_task_submit(plan_path: str, description: str) -> dict:
+async def _impl_intake_complete(session_description: str) -> dict:
+    """Generate a one-time intake token after /task guided intake.
+
+    Returns {"token": "..."} — pass to task_submit as intake_token.
+    This is a procedural friction gate: any code with DB access can
+    generate a token.  The goal is preventing accidental bypass of
+    the /task intake process, not adversarial security.
+    """
+    token = uuid.uuid4().hex
+    now = datetime.now(UTC).isoformat()
+    expires = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+
+    db = _db
+    own_db = False
+    if db is None:
+        try:
+            db = await _get_db()
+            own_db = True
+        except Exception as exc:
+            logger.error("intake_complete DB connection failed", exc_info=True)
+            return {"error": f"Database unavailable: {type(exc).__name__}: {exc}"}
+    try:
+        await db.execute(
+            "INSERT INTO intake_tokens (token, created_at, expires_at) VALUES (?,?,?)",
+            (token, now, expires),
+        )
+        await db.commit()
+        return {"token": token}
+    except Exception as exc:
+        logger.error("intake_complete failed", exc_info=True)
+        return {"error": f"Failed to generate intake token: {exc}"}
+    finally:
+        if own_db:
+            await db.close()
+
+
+async def _impl_task_submit(plan_path: str, description: str, intake_token: str | None = None) -> dict:
     """Submit a task for autonomous execution.
 
     When the dispatcher is wired (in-server), uses it directly.
@@ -98,7 +134,7 @@ async def _impl_task_submit(plan_path: str, description: str) -> dict:
     # In-server path: use dispatcher directly
     if _dispatcher is not None:
         try:
-            task_id = await _dispatcher.submit(plan_path, description)
+            task_id = await _dispatcher.submit(plan_path, description, intake_token=intake_token)
             return {"task_id": task_id, "status": "dispatched"}
         except ValueError as exc:
             return {"error": str(exc)}
@@ -147,6 +183,7 @@ async def _impl_task_submit(plan_path: str, description: str) -> dict:
                 blockers=None,
                 outputs=str(resolved),
                 session_id=None,
+                intake_token=intake_token,
                 created_at=now,
             )
         finally:
@@ -311,17 +348,30 @@ async def _impl_task_control(task_id: str, action: str) -> dict:
 
 
 @mcp.tool()
-async def task_submit(plan_path: str, description: str) -> dict:
+async def intake_complete(session_description: str) -> dict:
+    """Generate a one-time intake token after completing /task guided intake.
+
+    Call this AFTER the plan is written and approved, BEFORE task_submit.
+    Returns a token that must be passed to task_submit as intake_token.
+    Tokens expire after 2 hours and can only be used once.
+    """
+    return await _impl_intake_complete(session_description)
+
+
+@mcp.tool()
+async def task_submit(plan_path: str, description: str, intake_token: str = "") -> dict:
     """Submit a task for autonomous background execution.
 
-    Provide the path to an approved plan file and a brief description.
-    Genesis will execute the plan autonomously in a background session,
-    using adversarial review before delivering results. You'll be
-    notified via Telegram at key milestones and if Genesis gets stuck.
+    Provide the path to an approved plan file, a brief description, and
+    the intake_token from intake_complete. Genesis will execute the plan
+    autonomously in a background session, using adversarial review before
+    delivering results.
 
     Plan files must be in ~/.genesis/plans/ or ~/.claude/plans/.
+    The intake_token is required — generate it via intake_complete after
+    completing the /task guided intake process.
     """
-    return await _impl_task_submit(plan_path, description)
+    return await _impl_task_submit(plan_path, description, intake_token=intake_token or None)
 
 
 @mcp.tool()

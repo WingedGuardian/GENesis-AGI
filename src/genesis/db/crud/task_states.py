@@ -15,16 +15,17 @@ async def create(
     blockers: str | None = None,
     outputs: str | None = None,
     session_id: str | None = None,
+    intake_token: str | None = None,
     created_at: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO task_states
            (task_id, description, current_phase, decisions, blockers,
-            outputs, session_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
+            outputs, session_id, intake_token, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
                    COALESCE(?, datetime('now')))""",
         (task_id, description, current_phase, decisions, blockers,
-         outputs, session_id, created_at, created_at),
+         outputs, session_id, intake_token, created_at, created_at),
     )
     await db.commit()
     return task_id
@@ -131,3 +132,23 @@ async def list_all_recent(
         (limit,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def create_intake_token(db: aiosqlite.Connection) -> str:
+    """Generate an intake token for testing or internal use.
+
+    Inserts a valid token into intake_tokens and returns it.
+    The token expires in 2 hours.
+    """
+    import uuid
+    from datetime import UTC, datetime, timedelta
+
+    token = uuid.uuid4().hex
+    now = datetime.now(UTC).isoformat()
+    expires = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
+    await db.execute(
+        "INSERT INTO intake_tokens (token, created_at, expires_at) VALUES (?,?,?)",
+        (token, now, expires),
+    )
+    await db.commit()
+    return token

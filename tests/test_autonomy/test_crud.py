@@ -6,6 +6,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import approval_requests, cc_sessions, task_states
+from genesis.db.crud.task_states import create_intake_token
 from genesis.db.schema import create_all_tables
 
 
@@ -107,8 +108,10 @@ class TestApprovalRequests:
 
 class TestTaskStates:
     async def test_create_and_get(self, db):
+        token = await create_intake_token(db)
         tid = await task_states.create(
             db, task_id="task-1", description="Research topic X",
+            intake_token=token,
         )
         assert tid == "task-1"
         row = await task_states.get_by_id(db, "task-1")
@@ -116,8 +119,10 @@ class TestTaskStates:
         assert row["current_phase"] == "planning"
 
     async def test_update(self, db):
+        token = await create_intake_token(db)
         await task_states.create(
             db, task_id="task-1", description="d",
+            intake_token=token,
         )
         ok = await task_states.update(
             db, "task-1",
@@ -131,25 +136,33 @@ class TestTaskStates:
         assert row["decisions"] == '{"approach": "A"}'
 
     async def test_get_by_session(self, db):
+        t1 = await create_intake_token(db)
+        t2 = await create_intake_token(db)
+        t3 = await create_intake_token(db)
         await task_states.create(
             db, task_id="task-1", description="d", session_id="sess-1",
+            intake_token=t1,
         )
         await task_states.create(
             db, task_id="task-2", description="d2", session_id="sess-1",
+            intake_token=t2,
         )
         await task_states.create(
             db, task_id="task-3", description="d3", session_id="sess-2",
+            intake_token=t3,
         )
         results = await task_states.get_by_session(db, "sess-1")
         assert len(results) == 2
 
     async def test_delete(self, db):
-        await task_states.create(db, task_id="task-1", description="d")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="task-1", description="d", intake_token=token)
         assert await task_states.delete(db, "task-1") is True
         assert await task_states.get_by_id(db, "task-1") is None
 
     async def test_update_no_fields_returns_false(self, db):
-        await task_states.create(db, task_id="task-1", description="d")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="task-1", description="d", intake_token=token)
         result = await task_states.update(db, "task-1")
         assert result is False
 

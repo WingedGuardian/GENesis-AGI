@@ -570,8 +570,18 @@ TABLES = {
             blockers         TEXT,
             outputs          TEXT,
             session_id       TEXT,
+            intake_token     TEXT,
             created_at       TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
+    "intake_tokens": """
+        CREATE TABLE IF NOT EXISTS intake_tokens (
+            token            TEXT PRIMARY KEY,
+            created_at       TEXT NOT NULL,
+            expires_at       TEXT NOT NULL,
+            consumed_at      TEXT,
+            task_id          TEXT
         )
     """,
     "task_steps": """

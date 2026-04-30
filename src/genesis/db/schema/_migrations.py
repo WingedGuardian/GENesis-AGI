@@ -963,6 +963,50 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
     await _migrate_cognitive_state_check(db)
 
+    # Task intake gate: add intake_token column to task_states
+    await _try_alter(db,
+        "ALTER TABLE task_states ADD COLUMN intake_token TEXT",
+        "task_states.intake_token")
+
+    # Task intake gate: intake_tokens table (idempotent via IF NOT EXISTS)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS intake_tokens (
+            token            TEXT PRIMARY KEY,
+            created_at       TEXT NOT NULL,
+            expires_at       TEXT NOT NULL,
+            consumed_at      TEXT,
+            task_id          TEXT
+        )
+    """)
+
+    # Task intake gate: BEFORE INSERT trigger enforces valid intake token
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS enforce_intake_token
+        BEFORE INSERT ON task_states
+        WHEN NEW.intake_token IS NULL OR NOT EXISTS (
+            SELECT 1 FROM intake_tokens
+            WHERE token = NEW.intake_token
+              AND consumed_at IS NULL
+              AND expires_at > datetime('now')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'Task requires valid intake token. Use /task skill.');
+        END
+    """)
+
+    # Task intake gate: AFTER INSERT trigger atomically consumes the token
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS consume_intake_token
+        AFTER INSERT ON task_states
+        WHEN NEW.intake_token IS NOT NULL
+        BEGIN
+            UPDATE intake_tokens
+               SET consumed_at = datetime('now'),
+                   task_id = NEW.task_id
+             WHERE token = NEW.intake_token;
+        END
+    """)
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

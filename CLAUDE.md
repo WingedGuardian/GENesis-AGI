@@ -275,6 +275,11 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Check procedures before multi-step tasks**: use `procedure_recall` if relevant.
   Applies when a task involves external services, has failed before, or
   requires multi-step tool use.
+- **Never insert directly into `task_states`.** All task submissions MUST
+  go through `task_submit` MCP after completing `/task` intake. Direct DB
+  writes are rejected by a SQLite trigger that requires a valid intake
+  token. This is a procedural friction gate — it prevents accidental
+  bypass of the guided intake process.
 - **Never pipe background Bash commands.** `run_in_background` with piped
   commands (`| tail`, `| head`, `| grep`) produces empty output files.
   Run without pipes, or run in the foreground. If you need the last N
