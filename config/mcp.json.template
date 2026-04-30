@@ -1,5 +1,9 @@
 {
   "mcpServers": {
+    "codebase-memory-mcp": {
+      "command": "{{GENESIS_ROOT}}/.claude/mcp/run-codebase-memory",
+      "args": []
+    },
     "genesis-health": {
       "command": "{{GENESIS_ROOT}}/.claude/mcp/run-mcp-server",
       "args": ["--server", "health"]

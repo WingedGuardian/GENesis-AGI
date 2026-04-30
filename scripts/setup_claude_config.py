@@ -52,6 +52,7 @@ def check_launcher_executable(genesis_root: Path) -> None:
     for launcher in [
         genesis_root / ".claude" / "hooks" / "genesis-hook",
         genesis_root / ".claude" / "mcp" / "run-mcp-server",
+        genesis_root / ".claude" / "mcp" / "run-codebase-memory",
     ]:
         if not launcher.exists():
             print(f"WARNING: Launcher not found: {launcher}")
@@ -138,6 +139,54 @@ def configure_global_settings(genesis_root: Path, dry_run: bool) -> None:
         print(f"  These are also helpful to have: {', '.join(missing_helpful)}")
 
 
+def trigger_indexing(genesis_root: Path, dry_run: bool) -> None:
+    """Trigger code intelligence indexing in background (non-blocking).
+
+    Uses start_new_session=True + explicit log file to avoid inheriting
+    open pipes from the caller (e.g. bootstrap's `| tail -10` pipe),
+    which would cause SIGPIPE if the parent exits before the indexer finishes.
+    """
+    import shutil
+    import subprocess
+
+    if dry_run:
+        print("\nCode intelligence: (dry run — skipping indexing)")
+        return
+
+    log_path = Path.home() / ".genesis" / "code-intelligence-setup.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "a")  # noqa: SIM115 — kept open for subprocess lifetime
+
+    launched = []
+    if shutil.which("codebase-memory-mcp"):
+        subprocess.Popen(
+            ["codebase-memory-mcp", "cli", "index_repository",
+             f'{{"repo_path": "{genesis_root}"}}'],
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+        launched.append("codebase-memory-mcp")
+
+    if shutil.which("npx"):
+        subprocess.Popen(
+            ["npx", "gitnexus", "analyze", "--quiet"],
+            cwd=str(genesis_root),
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            start_new_session=True,
+        )
+        launched.append("GitNexus")
+
+    if launched:
+        print(f"\nCode intelligence: indexing in background ({', '.join(launched)})")
+        print(f"  Log: {log_path}")
+    else:
+        print("\nCode intelligence: no indexers found (install codebase-memory-mcp to enable)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Set up Claude Code config for this machine")
     parser.add_argument("--genesis-root", type=Path, help="Override genesis root path")
@@ -190,6 +239,9 @@ def main():
     if args.do_global:
         print()
         configure_global_settings(genesis_root, args.dry_run)
+
+    # Trigger code intelligence indexing (background, non-blocking)
+    trigger_indexing(genesis_root, args.dry_run)
 
     if args.dry_run:
         print("\n(dry run — no files written)")
