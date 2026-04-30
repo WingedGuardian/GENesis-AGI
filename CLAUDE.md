@@ -57,14 +57,37 @@ systemctl --user restart genesis-server           # Restart server (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
 ```
 
-## Serena — Semantic Code Analysis
+## Code Intelligence
 
-Serena is an MCP server providing LSP-powered code intelligence via Pyright.
-Available as `mcp__serena__*` tools. Complements Grep, does not replace it.
+Three tools — use the lightest that answers the question:
 
-Use for symbol references, definitions, type hierarchies, and safe refactoring.
-Use Grep instead for non-Python (config, YAML, shell, SQL, mocks).
-Full decision guide: `.claude/docs/serena-guide.md`
+- **Grep/Glob** — text patterns, any file type. Always available.
+- **Serena** (LSP/Pyright) — Python: definitions, references, type
+  hierarchies, safe rename. `mcp__serena__*` tools.
+- **GitNexus** (knowledge graph) — structural: impact analysis, execution
+  flows, community detection, route/tool mapping, change detection.
+  CLI: `gitnexus <command>`. ~34K nodes, ~51K edges.
+
+**When to reach for GitNexus (all session types):**
+- Before editing code: `gitnexus impact <symbol>` for blast radius
+- Before committing: `gitnexus detect-changes` to verify affected scope
+- Understanding a subsystem: `gitnexus context <symbol>` for 360° view,
+  or browse `gitnexus://repo/GENesis-AGI/processes` for execution flows
+- Exploring coupling: `gitnexus://repo/GENesis-AGI/clusters` for
+  functional areas, or `gitnexus cypher` for custom graph queries
+- API/MCP work: `route_map` and `tool_map` (MCP-only tools)
+
+**Development rules:**
+- MUST run impact analysis before editing any symbol — warn user if
+  risk is HIGH or CRITICAL
+- MUST run detect-changes before committing
+- Use `gitnexus rename` for multi-file renames, not find-and-replace
+
+**Known limitation:** FTS text search is broken on Linux
+(LadybugDB/ladybug#430). Use Grep/Serena for text search.
+
+Full syntax, Cypher examples, edge types, and decision matrix:
+`.claude/docs/code-intelligence-guide.md`
 
 ## Skill Library
 
