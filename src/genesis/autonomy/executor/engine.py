@@ -59,6 +59,7 @@ class CCSessionExecutor:
         event_bus: Any | None = None,
         runtime: Any | None = None,
         autonomous_dispatcher: Any | None = None,
+        exec_semaphore: asyncio.Semaphore | None = None,
     ) -> None:
         self._db = db
         self._invoker = invoker
@@ -69,6 +70,7 @@ class CCSessionExecutor:
         self._event_bus = event_bus
         self._runtime = runtime
         self._autonomous_dispatcher = autonomous_dispatcher
+        self._exec_semaphore = exec_semaphore
 
         # Step dispatch (extracted to StepDispatcher)
         self._step_dispatcher = StepDispatcher(
@@ -84,6 +86,7 @@ class CCSessionExecutor:
         self._pause_events: dict[str, asyncio.Event] = {}
         self._paused_tasks: set[str] = set()
         self._worktree_paths: dict[str, Path] = {}
+        self._semaphore_released: set[str] = set()  # tracks tasks whose semaphore was released during pause
 
     # =================================================================
     # Main lifecycle
@@ -534,6 +537,12 @@ class CCSessionExecutor:
         )
         if should_pause:
             await self._transition(task_id, TaskPhase.PAUSED)
+
+            # Release execution semaphore so another task can run
+            if self._exec_semaphore:
+                self._exec_semaphore.release()
+                self._semaphore_released.add(task_id)
+
             pause_event = asyncio.Event()
             self._pause_events[task_id] = pause_event
 
@@ -542,8 +551,15 @@ class CCSessionExecutor:
                 if cancel and cancel.is_set():
                     with contextlib.suppress(InvalidTransitionError):
                         await self._transition(task_id, TaskPhase.CANCELLED)
+                    # semaphore_released stays set — dispatcher will
+                    # skip release in _guarded_execute finally block
                     return False
                 await asyncio.sleep(0.1)
+
+            # Reacquire semaphore before resuming
+            if self._exec_semaphore:
+                await self._exec_semaphore.acquire()
+                self._semaphore_released.discard(task_id)
 
             self._paused_tasks.discard(task_id)
             await self._transition(task_id, TaskPhase.EXECUTING)
