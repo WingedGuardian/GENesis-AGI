@@ -420,3 +420,114 @@ async def test_micro_boundary_salience_stored(db):
 
     rows = await observations.query(db, source="reflection", type="micro_reflection")
     assert len(rows) == 1
+
+
+# ── Normalized dedup tests ───────────────────────────────────────────────
+
+
+def test_normalize_for_dedup_strips_numbers():
+    """Numeric variation should be collapsed."""
+    from genesis.perception.writer import ResultWriter
+
+    n = ResultWriter._normalize_for_dedup
+    assert n("memory at 78% is fine") == n("memory at 79% is fine")
+    assert n("CPU 0.45 stable") == n("CPU 0.83 stable")
+    assert n("3 of 5 signals healthy") == n("2 of 5 signals healthy")
+
+
+def test_normalize_for_dedup_preserves_structure():
+    """Structurally different summaries should NOT collapse."""
+    from genesis.perception.writer import ResultWriter
+
+    n = ResultWriter._normalize_for_dedup
+    assert n("memory is fine") != n("cpu is fine")
+    assert n("all systems nominal") != n("anomaly detected in network")
+
+
+async def test_micro_normalized_dedup_catches_near_duplicate(db):
+    """Near-identical summaries differing only in numbers should dedup."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    tick = _make_tick()
+    output1 = MicroOutput(
+        tags=["stable"], salience=0.6, anomaly=False,
+        summary="Memory usage at 78% is within normal range.",
+        signals_examined=5,
+    )
+    output2 = MicroOutput(
+        tags=["stable"], salience=0.62, anomaly=False,
+        summary="Memory usage at 79% is within normal range.",
+        signals_examined=5,
+    )
+
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    stored = await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    rows = await observations.query(db, source="reflection", type="micro_reflection")
+    assert len(rows) == 1, "Near-duplicate should be caught by normalized hash"
+    assert not stored
+
+
+async def test_micro_cooldown_blocks_rapid_non_anomaly(db):
+    """Non-anomaly micro within 20 min of a recent one should be blocked."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+
+    # Insert a recent micro_reflection with current timestamp
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-micro",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior"}',
+        priority="low",
+        created_at=now,
+    )
+
+    output = MicroOutput(
+        tags=["stable"], salience=0.6, anomaly=False,
+        summary="Different wording but same state.",
+        signals_examined=5,
+    )
+    stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
+
+    assert not stored, "Cooldown should block non-anomaly within 20 min"
+
+
+async def test_micro_cooldown_allows_anomaly(db):
+    """Anomaly bypasses cooldown even if recent micro exists."""
+    from datetime import UTC, datetime
+
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+
+    now = datetime.now(UTC).isoformat()
+    await observations.create(
+        db,
+        id="recent-micro",
+        source="reflection",
+        type="micro_reflection",
+        content='{"summary": "prior"}',
+        priority="low",
+        created_at=now,
+    )
+
+    output = MicroOutput(
+        tags=["anomaly"], salience=0.8, anomaly=True,
+        summary="Critical failure detected.",
+        signals_examined=5,
+    )
+    stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
+
+    assert stored, "Anomaly should bypass cooldown"
+    rows = await observations.query(db, source="reflection", type="micro_reflection")
+    assert len(rows) == 2  # both the prior and the anomaly

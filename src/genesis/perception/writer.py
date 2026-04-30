@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -47,6 +48,17 @@ class ResultWriter:
         """SHA-256 hash for observation dedup."""
         return hashlib.sha256(content.encode()).hexdigest()
 
+    @staticmethod
+    def _normalize_for_dedup(summary: str) -> str:
+        """Strip numbers and normalize whitespace for fuzzy micro dedup.
+
+        "memory at 78% is fine" and "memory at 79% is fine" → same string.
+        """
+        text = summary.lower()
+        text = re.sub(r"-?\d+\.?\d*%?", "N", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     async def write(
         self,
         output: MicroOutput | LightOutput,
@@ -85,6 +97,15 @@ class ResultWriter:
             logger.debug("Micro observation below salience threshold (%.2f), skipping", output.salience)
             return False
 
+        # Cooldown gate: skip if a micro_reflection was created within the last
+        # 20 minutes. Anomalies bypass — same pattern as light reflections (30 min).
+        if not output.anomaly:
+            if await observations.exists_recent_by_type(
+                db, source="reflection", type="micro_reflection", window_minutes=20,
+            ):
+                logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
+                return False
+
         content = json.dumps({
             "tags": output.tags,
             "salience": output.salience,
@@ -93,10 +114,17 @@ class ResultWriter:
             "signals_examined": output.signals_examined,
         }, sort_keys=True)
         category = "anomaly" if output.anomaly else "routine"
-        chash = self._content_hash(content)
+
+        # Normalized hash: strips numeric variation from the summary so
+        # "memory at 78% is fine" and "memory at 79% is fine" dedup correctly.
+        # Signal names + anomaly flag are included to preserve structural uniqueness.
+        norm_summary = self._normalize_for_dedup(output.summary)
+        signal_names = ",".join(sorted(s.name for s in tick.signals))
+        norm_key = f"micro:{norm_summary}|{signal_names}|{output.anomaly}"
+        chash = self._content_hash(norm_key)
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):
-            logger.debug("Micro observation dedup: skipping duplicate (hash=%s)", chash[:12])
+            logger.debug("Micro observation dedup: skipping near-duplicate (hash=%s)", chash[:12])
             return False
 
         await observations.create(
