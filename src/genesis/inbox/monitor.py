@@ -717,6 +717,7 @@ class InboxMonitor:
                         api_call_site_id=None,
                         cli_fallback_allowed=True,
                         approval_required_for_cli=True,
+                        approval_key_stable=True,
                         context=None,
                     ),
                 )

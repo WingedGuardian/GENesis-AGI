@@ -189,6 +189,15 @@ class EgoContextBuilder:
         except (json.JSONDecodeError, TypeError):
             signals = {}
 
+        # signals_json is stored as a list of {name, value, source} dicts,
+        # not a dict keyed by name. Normalize to dict for display.
+        if isinstance(signals, list):
+            signals = {
+                s["name"]: s
+                for s in signals
+                if isinstance(s, dict) and "name" in s
+            }
+
         if signals:
             lines.append("| Signal | Value | Source |")
             lines.append("|--------|-------|--------|")

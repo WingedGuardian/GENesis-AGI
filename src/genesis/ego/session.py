@@ -203,6 +203,7 @@ class EgoSession:
                     dispatch_mode="cli",
                     cli_fallback_allowed=True,
                     approval_required_for_cli=True,
+                    approval_key_stable=True,
                 ),
             )
             if decision.mode == "blocked":

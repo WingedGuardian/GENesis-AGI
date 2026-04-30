@@ -164,8 +164,7 @@ class AutonomousCliApprovalGate:
             return ("approved", None, "manual approval disabled by config")
 
         # Serialize per (subsystem, policy_id) — prevents duplicate rows
-        # from truly concurrent callers and ensures deterministic ordering
-        # for sequential Pass 3 consumption after batch-approve.
+        # from truly concurrent callers.
         lock_key = (subsystem, policy_id)
         if lock_key not in self._approval_locks:
             self._approval_locks[lock_key] = asyncio.Lock()
@@ -393,21 +392,20 @@ class AutonomousCliApprovalGate:
         is instance-only — only pending or unconsumed-approved rows are
         reused for dedup.
 
+        For recurring dispatches (ego cycles, inbox, reflections), callers
+        set ``approval_key_stable=True`` on the dispatch request so the
+        key is based on (subsystem, policy_id, action_label) only. This
+        ensures one pending request per call site, and one approval
+        authorizes exactly one dispatch.
+
         Race-safety fallback (sentinel only): if no approval_key match
         and the caller provided ``subsystem``/``policy_id``, match any
         *pending* row for the same site.  Skipped for
-        ``autonomous_cli_fallback`` — periodic ticks (ego, reflection)
-        intentionally create one approval row + Telegram message per tick
-        so the user sees every request.
-
-        Resume fallback: match any *approved* row for the same site.
-        This handles the approval-resume path: the user approved a
-        reflection, the resume triggers it on a new tick with different
-        prompt data (different approval_key), but the approved status
-        from the original request should still be honored.
+        ``autonomous_cli_fallback`` — periodic ticks should use stable
+        keys instead.
         """
         recent = await self._approval_manager.get_recent(limit=200)
-        # Pass 1: exact content-key match (preserves status-sensitive behavior).
+        # Pass 1: exact content-key match.
         for row in recent:
             context = _json_loads(row.get("context"))
             if (
@@ -422,9 +420,7 @@ class AutonomousCliApprovalGate:
                     continue
                 return row
         # Pass 2: race-safety fallback — pending rows for the same site.
-        # Skipped for autonomous_cli_fallback: periodic ticks (ego,
-        # reflection) each create their own row + Telegram notification.
-        # Sentinel retains Pass 2 because alarm-based triggers should dedup.
+        # Sentinel retains this because alarm-based triggers should dedup.
         if (
             subsystem is not None
             and policy_id is not None
@@ -440,22 +436,6 @@ class AutonomousCliApprovalGate:
                     and context.get("policy_id") == policy_id
                 ):
                     return row
-        if subsystem is None or policy_id is None:
-            return None
-        # Pass 3: resume fallback — unconsumed approved rows for the same site.
-        for row in recent:
-            if str(row.get("status") or "") != "approved":
-                continue
-            # Don't reuse consumed approvals — each dispatch needs its own.
-            if row.get("consumed_at"):
-                continue
-            context = _json_loads(row.get("context"))
-            if (
-                context.get("kind") == "autonomous_cli_fallback"
-                and context.get("subsystem") == subsystem
-                and context.get("policy_id") == policy_id
-            ):
-                return row
         return None
 
     async def find_site_pending(

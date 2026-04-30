@@ -212,11 +212,19 @@ class AutonomousDispatchRouter:
 
         request_id: str | None = None
         if request.approval_required_for_cli:
+            # When approval_key_stable is set, exclude the invocation
+            # from the approval key so recurring dispatches (ego cycles,
+            # inbox, reflections) produce a stable key across ticks.
+            # The real invocation is still used for the actual dispatch.
+            approval_invocation = (
+                None if request.approval_key_stable
+                else request.cli_invocation
+            )
             status, request_id, reason = await self._approval_gate.ensure_approval(
                 subsystem=request.subsystem,
                 policy_id=request.policy_id,
                 action_label=request.action_label,
-                invocation=request.cli_invocation,
+                invocation=approval_invocation,
                 api_call_site_id=request.api_call_site_id,
                 api_error=api_error,
                 extra_context=request.context,

@@ -265,10 +265,6 @@ class CCReflectionBridge:
         session_id = f"api:{depth.value.lower()}"
         if self._autonomous_dispatcher is not None:
             reflection_policy_id = f"reflection_{depth.value.lower()}"
-            # Each reflection tick creates its own approval row + Telegram
-            # message. No find_site_pending pre-check — the approval gate
-            # handles dedup via Pass 1 (identical content) and resume via
-            # Pass 3 (approved-but-unconsumed rows).
 
             decision = await self._autonomous_dispatcher.route(
                 request=AutonomousDispatchRequest(
@@ -283,6 +279,7 @@ class CCReflectionBridge:
                     api_call_site_id=_DEPTH_CALL_SITE.get(depth),
                     cli_fallback_allowed=True,
                     approval_required_for_cli=not skip_approval,
+                    approval_key_stable=True,
                     context={"depth": depth.value},
                 ),
             )
