@@ -120,11 +120,23 @@ class TestSubmit:
             patch("genesis.db.crud.task_states.create", new_callable=AsyncMock) as mock_create,
             patch("genesis.util.tasks.tracked_task"),
         ):
-            task_id = await dispatcher.submit(str(plan), "Test task")
+            task_id = await dispatcher.submit(str(plan), "Test task", intake_token="test-tok")
 
         assert task_id.startswith("t-")
         assert task_id in dispatcher._dispatched
         mock_create.assert_awaited_once()
+
+    async def test_submit_without_token_rejected(
+        self, dispatcher: TaskDispatcher, tmp_path: Path,
+    ) -> None:
+        """User submissions require an intake token."""
+        plan = tmp_path / "plan.md"
+        plan.write_text(VALID_PLAN)
+        with (
+            patch("genesis.autonomy.dispatcher._ALLOWED_PLAN_DIRS", [tmp_path]),
+            pytest.raises(ValueError, match="intake_token required"),
+        ):
+            await dispatcher.submit(str(plan), "No token")
 
     async def test_submit_invalid_path(self, dispatcher: TaskDispatcher) -> None:
         with pytest.raises(ValueError, match="outside allowed"):
@@ -169,7 +181,7 @@ class TestSubmit:
             patch("genesis.db.crud.task_states.create", new_callable=AsyncMock),
             patch("genesis.util.tasks.tracked_task"),
         ):
-            await d.submit(str(plan), "With events")
+            await d.submit(str(plan), "With events", intake_token="test-tok")
 
         event_bus.emit.assert_awaited_once()
 

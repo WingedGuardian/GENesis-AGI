@@ -6,6 +6,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud import approval_requests, cc_sessions, task_states
+from genesis.db.crud.task_states import create_intake_token
 from genesis.db.schema import create_all_tables
 
 
@@ -107,8 +108,10 @@ class TestApprovalRequests:
 
 class TestTaskStates:
     async def test_create_and_get(self, db):
+        token = await create_intake_token(db)
         tid = await task_states.create(
             db, task_id="task-1", description="Research topic X",
+            intake_token=token,
         )
         assert tid == "task-1"
         row = await task_states.get_by_id(db, "task-1")
@@ -116,8 +119,10 @@ class TestTaskStates:
         assert row["current_phase"] == "planning"
 
     async def test_update(self, db):
+        token = await create_intake_token(db)
         await task_states.create(
             db, task_id="task-1", description="d",
+            intake_token=token,
         )
         ok = await task_states.update(
             db, "task-1",
@@ -131,27 +136,80 @@ class TestTaskStates:
         assert row["decisions"] == '{"approach": "A"}'
 
     async def test_get_by_session(self, db):
+        t1 = await create_intake_token(db)
+        t2 = await create_intake_token(db)
+        t3 = await create_intake_token(db)
         await task_states.create(
             db, task_id="task-1", description="d", session_id="sess-1",
+            intake_token=t1,
         )
         await task_states.create(
             db, task_id="task-2", description="d2", session_id="sess-1",
+            intake_token=t2,
         )
         await task_states.create(
             db, task_id="task-3", description="d3", session_id="sess-2",
+            intake_token=t3,
         )
         results = await task_states.get_by_session(db, "sess-1")
         assert len(results) == 2
 
     async def test_delete(self, db):
-        await task_states.create(db, task_id="task-1", description="d")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="task-1", description="d", intake_token=token)
         assert await task_states.delete(db, "task-1") is True
         assert await task_states.get_by_id(db, "task-1") is None
 
     async def test_update_no_fields_returns_false(self, db):
-        await task_states.create(db, task_id="task-1", description="d")
+        token = await create_intake_token(db)
+        await task_states.create(db, task_id="task-1", description="d", intake_token=token)
         result = await task_states.update(db, "task-1")
         assert result is False
+
+    async def test_create_without_token_rejected(self, db):
+        """Trigger rejects INSERT without intake_token."""
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(db, task_id="t-bad", description="no token")
+
+    async def test_create_with_consumed_token_rejected(self, db):
+        """Trigger rejects INSERT with already-consumed token."""
+        token = await create_intake_token(db)
+        await task_states.create(
+            db, task_id="t-first", description="ok", intake_token=token
+        )
+        # Same token again should fail (consumed by AFTER INSERT trigger)
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(
+                db, task_id="t-reuse", description="reuse", intake_token=token
+            )
+
+    async def test_create_with_expired_token_rejected(self, db):
+        """Trigger rejects INSERT with expired token."""
+        # Insert a token that is already expired
+        await db.execute(
+            "INSERT INTO intake_tokens (token, created_at, expires_at) VALUES (?,?,?)",
+            ("expired-tok", "2020-01-01T00:00:00", "2020-01-01T02:00:00"),
+        )
+        await db.commit()
+        with pytest.raises(Exception, match="intake token"):
+            await task_states.create(
+                db, task_id="t-expired", description="expired", intake_token="expired-tok"
+            )
+
+    async def test_token_consumed_after_insert(self, db):
+        """AFTER INSERT trigger atomically consumes the token."""
+        token = await create_intake_token(db)
+        await task_states.create(
+            db, task_id="t-consume", description="test", intake_token=token
+        )
+        cursor = await db.execute(
+            "SELECT consumed_at, task_id FROM intake_tokens WHERE token = ?",
+            (token,),
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        assert row["consumed_at"] is not None
+        assert row["task_id"] == "t-consume"
 
 
 # ---------------------------------------------------------------------------

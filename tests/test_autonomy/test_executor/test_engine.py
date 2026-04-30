@@ -18,6 +18,7 @@ from genesis.autonomy.executor.types import (
     WorkaroundResult,
 )
 from genesis.db.crud import task_states, task_steps
+from genesis.db.crud.task_states import create_intake_token
 from genesis.db.schema import create_all_tables
 
 # ---------------------------------------------------------------------------
@@ -101,12 +102,14 @@ def mock_subprocess(monkeypatch):
 
 async def _seed_task(db, task_id="t-001", plan_path="/tmp/plan.md", phase="pending"):
     """Insert a task row for testing."""
+    token = await create_intake_token(db)
     await task_states.create(
         db,
         task_id=task_id,
         description="Test task",
         current_phase=phase,
         outputs=plan_path,
+        intake_token=token,
     )
 
 

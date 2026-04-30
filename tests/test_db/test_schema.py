@@ -37,6 +37,7 @@ EXPECTED_TABLES = [
     "events",
     "approval_requests",
     "task_states",
+    "intake_tokens",
     "knowledge_units",
     "evolution_proposals",
     "telegram_messages",
