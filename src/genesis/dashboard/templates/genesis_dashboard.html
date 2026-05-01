@@ -3895,15 +3895,15 @@
             </div>
             <div class="health-card-value" style="display:flex; flex-direction:column; gap:0.35rem;">
               <!-- Memory row -->
-              <template x-if="$store.genesisDashboard.health.infrastructure?.container_memory?.used_pct != null">
+              <template x-if="($store.genesisDashboard.health.infrastructure?.container_memory?.anon_pct ?? $store.genesisDashboard.health.infrastructure?.container_memory?.used_pct) != null">
                 <div style="display:flex; align-items:center; gap:0.5rem; font-size:0.8rem;">
                   <span style="width:3.2rem; color:var(--color-text-secondary);">Memory</span>
                   <span style="width:3rem; text-align:right; font-weight:600;"
-                        :style="`color: ${$store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50'}`"
-                        x-text="$store.genesisDashboard.health.infrastructure.container_memory.used_pct.toFixed(0) + '%'"></span>
+                        :style="(() => { const p = $store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct; return `color: ${p > 85 ? '#d9534f' : p > 75 ? '#f0ad4e' : '#4caf50'}`; })()"
+                        x-text="(($store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct) || 0).toFixed(0) + '%'"></span>
                   <div style="flex:1; height:6px; background:var(--color-background); border-radius:3px; min-width:40px;">
                     <div style="height:100%; border-radius:3px; transition:width 0.3s;"
-                         :style="'width:' + $store.genesisDashboard.health.infrastructure.container_memory.used_pct + '%; background:' + ($store.genesisDashboard.health.infrastructure.container_memory.used_pct > 85 ? '#d9534f' : $store.genesisDashboard.health.infrastructure.container_memory.used_pct > 75 ? '#f0ad4e' : '#4caf50')"></div>
+                         :style="(() => { const p = $store.genesisDashboard.health.infrastructure.container_memory.anon_pct ?? $store.genesisDashboard.health.infrastructure.container_memory.used_pct ?? 0; return 'width:' + p + '%; background:' + (p > 85 ? '#d9534f' : p > 75 ? '#f0ad4e' : '#4caf50'); })()"></div>
                   </div>
                   <span style="font-size:0.7rem; color:var(--color-text-secondary); white-space:nowrap;"
                         x-text="$store.genesisDashboard.health.infrastructure.container_memory.current_gb?.toFixed(0) + '/' + $store.genesisDashboard.health.infrastructure.container_memory.limit_gb?.toFixed(0) + ' GB'"></span>
