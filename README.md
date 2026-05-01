@@ -93,7 +93,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-45+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+50+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 <p align="center">
   <img src="docs/images/genesis-architecture.png" alt="Genesis cognitive architecture — three concentric rings" width="820">
@@ -107,7 +107,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
 
 ## Getting started
 
-*v3 alpha — architecturally complete, actively hardening. If you find a rough edge, tell Genesis to fix itself.*
+*v3 beta — cognitive architecture complete, ego module live, actively hardening. If you find a rough edge, tell Genesis to fix itself.*
 
 ### System requirements
 
@@ -181,45 +181,50 @@ Your Genesis install is one operational system: the public `GENesis-AGI` codebas
 
 ## How it thinks 🧠
 
-Three cognitive layers, running continuously:
+Four cognitive layers, running continuously:
 
 ```mermaid
 graph TB
     subgraph "Cognitive architecture"
-        AL["Awareness loop<br/><i>5-min tick, zero LLM cost</i>"]
-        RE["Reflection engine<br/><i>Micro / Light / Deep / Strategic</i>"]
+        EGO["Ego<br/><i>Two autonomous egos: decisions,<br/>proposals, execution</i>"]
+        AL["Awareness loop<br/><i>5-min tick, 18+ signals,<br/>zero LLM cost</i>"]
+        RE["Reflection engine<br/><i>Micro / Light / Deep / Strategic<br/>with relevance tagging</i>"]
         SL["Self-learning loop<br/><i>Dopaminergic feedback</i>"]
     end
 
     subgraph "Infrastructure"
-        RT["Operational runtime<br/><i>Dashboard, UI, extensions</i>"]
+        RT["Operational runtime<br/><i>Dashboard, API, extensions</i>"]
         CC["Claude Code<br/><i>Reasoning, tools, sessions</i>"]
     end
 
     subgraph "Memory and data"
         QD["Qdrant<br/><i>2 vector collections</i>"]
-        SQ["SQLite + FTS5<br/><i>Structured data</i>"]
+        SQ["SQLite + FTS5<br/><i>60+ tables</i>"]
         MCP["4 MCP servers<br/><i>memory / recon / health / outreach</i>"]
     end
 
+    EGO -->|"dispatches work"| CC
     AL -->|"depth signal"| RE
+    RE -->|"observations"| EGO
     RE -->|"interaction data"| SL
     SL -->|"weight updates"| AL
 
-    RE <--> CC
     AL <--> RT
     RE <--> MCP
     MCP <--> QD
     MCP <--> SQ
 
+    style EGO fill:#1a1a2e,stroke:#e94560,color:#fff
     style AL fill:#1a1a2e,stroke:#e94560,color:#fff
     style RE fill:#1a1a2e,stroke:#0f3460,color:#fff
     style SL fill:#1a1a2e,stroke:#533483,color:#fff
 ```
 
-Every 5 minutes, the system collects signals across all its inputs — entirely programmatic, zero LLM cost. Signals get classified by how much thinking depth they warrant. Routine health checks get a quick pass. Novel patterns in user behavior get a deep analysis. Accumulated smaller reflections trigger strategic synthesis. The depth decision is automatic, scales cost proportionally to complexity, and the three cognitive layers (awareness, reflection, self-learning) each feed the next.
+Every 5 minutes, the system collects 18+ signals across all its inputs -- entirely programmatic, zero LLM cost. Signals get classified by how much thinking depth they warrant. Routine health checks get a quick pass. Novel patterns in user behavior get a deep analysis. Accumulated smaller reflections trigger strategic synthesis. The depth decision is automatic, and each cognitive layer feeds the next.
 
-When Genesis isn't handling a user request, it doesn't sit idle. It researches topics you'll ask about tomorrow. It audits its own memory for contradictions and staleness. It tests whether its learned procedures still hold up. It works through problems it got stuck on earlier. The system you come back to on Monday is measurably sharper than the one you left on Friday — leveraging free-tier compute.
+On top of this sits the ego layer: two autonomous decision-makers that read the system's observations and act on them. The User Ego (running Opus) focuses on user goals, activity patterns, and pending work. The Genesis Ego (running Sonnet) handles system health, infrastructure, and operational decisions. Each one assembles its own context from filtered observations, proposes actions via Telegram, and dispatches Claude Code sessions to execute approved work. They run on adaptive cadence -- more frequently when things are active, backing off when they're not.
+
+When Genesis isn't handling a user request, it doesn't sit idle. It researches topics you'll ask about tomorrow. It audits its own memory for contradictions and staleness. It tests whether its learned procedures still hold up. It works through problems it got stuck on earlier. The system you come back to on Monday is measurably sharper than the one you left on Friday.
 
 <p align="center">
   <img src="docs/images/genesis-24h-timeline.svg" alt="24 hours of autonomous Genesis cognition — awareness, reflection, learning, surplus, outreach, and sessions" width="900">
@@ -281,9 +286,11 @@ Genesis earns autonomy per category through demonstrated competence across seven
 
 *L5-L7 are V5 targets — the schema supports them, the governance doesn't activate them yet.*
 
-Trust is granular, not binary. Mess up twice in a row in a category, drop a level — Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
+Trust is granular, not binary. Mess up twice in a row in a category, drop a level -- Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
-Four drives shape behavior beneath the autonomy system — Preservation, Curiosity, Cooperation, Competence — each a sensitivity multiplier, each in tension with the others. The drives adapt based on evidence from the learning loop. The tension is the point.
+The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate -- one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
+
+Four drives shape behavior beneath the autonomy system -- Preservation, Curiosity, Cooperation, Competence -- each a sensitivity multiplier, each in tension with the others. The drives adapt based on evidence from the learning loop. The tension is the point.
 
 The user has override authority. Always.
 
@@ -344,40 +351,39 @@ The `/integrate-module` skill handles onboarding automatically — discovery, co
 
 ## What's inside
 
-45+ subsystems organized into seven layers:
+50+ subsystems organized into seven layers:
 
 ```mermaid
 graph LR
     subgraph "Cognitive"
+        ego["ego 🧠"]
         awareness
         reflection
-        learning
         perception
+        learning
         calibration
     end
 
-    subgraph "Memory and data"
+    subgraph "Memory"
         memory
         knowledge
-        db
+        db["db (60+ tables)"]
         qdrant
-        bookmarks
     end
 
     subgraph "Intelligence"
         routing
         resilience
         providers
-        hosting
         CC["CC (Claude Code)"]
     end
 
     subgraph "Autonomy"
         autonomy
+        tasks["task executor"]
         sentinel
         guardian
         skills
-        workflows
     end
 
     subgraph "Communication"
@@ -394,18 +400,15 @@ graph LR
         pipeline
         browser
         research
-        security
     end
 
     subgraph "Infrastructure"
         dashboard
-        ui
         observability
         recon
         identity
-        mcp
+        mcp["mcp (4 servers)"]
         eval
-        util
     end
 ```
 
@@ -413,7 +416,7 @@ graph LR
 
 ## How it got here
 
-V3 was built in 10 phases over six months — from data schemas to full autonomous cognition. The full build story, design decisions, and lessons learned are in [`docs/journey/`](docs/journey/).
+V3 was built in 10 phases over seven months -- from data schemas to full autonomous cognition. The full build story, design decisions, and lessons learned are in [`docs/journey/`](docs/journey/).
 
 ---
 
@@ -421,26 +424,27 @@ V3 was built in 10 phases over six months — from data schemas to full autonomo
 
 ## Where it's headed 🗺️
 
-V3 is the foundation — complete, tested, running in production. What comes next is where it gets ambitious enough to need a community behind it.
+V3 is the foundation -- cognitive architecture complete, ego module live, running in production. What comes next is where it gets ambitious enough to need a community behind it.
 
-### Beta — What's landing next
+### What's landing next
 
-- **Ego loop activation** — the autonomous decision-making loop is built (9-module system with its own cadence, model, and budget). What's coming next: wiring it into the runtime so it runs on its own cadence without per-action approval gates. The mechanism exists; the governance layer that lets it run unsupervised is V4.
+- **Reflection pipeline refinement** -- the ego sees filtered, tagged observations from the reflection engine. Next: a user-focused micro template, "learn slow, unlearn fast" steering rules (user says "stop" and it stops permanently), and graduated response logic so the system handles stale goals without nagging.
+- **Surplus compute redesign** -- idle time is currently underutilized. The scheduler and executor need real teeth: better task selection, actual execution of brainstorm outputs, and research pipelines that produce actionable results.
 
-### V4 — Autonomous action
+### V4 -- Coordinated cognition
 
-V3 has perception, cognition, and learning. What it lacks is coordination — subsystems act independently, with no shared awareness of what the system is focused on. V4 fixes that.
+V3 has perception, cognition, learning, and autonomous decision-making. What it lacks is coordination -- subsystems act independently, with no shared awareness of what the system is focused on. V4 fixes that.
 
-The architecture is based on **Global Workspace Theory** (Baars, 1988) and the **LIDA cognitive cycle** (Franklin et al.) — the same frameworks used to model consciousness in cognitive science:
+The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **LIDA cognitive cycle** (Franklin et al.) -- frameworks used to model consciousness in cognitive science:
 
 **Sense → Perceive → Attend → Broadcast → Propose → Select → Act → Learn**
 
-- **Shared intent state** — every session reads what the system is focused on, what decisions have been made, and why. Continuity of purpose across sessions.
-- **Coordinated action selection** — modules propose, a workspace controller decides. No more conflicting actions from subsystems that don't know what each other are doing.
-- **Signal and drive weight adaptation** — evidence-driven calibration of attention and the four drives.
-- **Six measurable GWT markers** — if we can't measure whether the architecture is working, we're building in the dark.
+- **Shared intent state** -- every session reads what the system is focused on, what decisions have been made, and why. Continuity of purpose across sessions.
+- **Coordinated action selection** -- modules propose, a workspace controller decides. No more conflicting actions from subsystems that don't know what each other are doing.
+- **Signal and drive weight adaptation** -- evidence-driven calibration of attention and the four drives.
+- **Six measurable GWT markers** -- if we can't measure whether the architecture is working, we're building in the dark.
 
-### V5 — Self-evolution
+### V5 -- Self-evolution
 
 **Autonomous codebase evolution.** Genesis proposes changes to its own source code. It searches for developments in AI research, evaluates them against its own architecture, and integrates what makes it better. Not a human reviewing papers — the system itself.
 
