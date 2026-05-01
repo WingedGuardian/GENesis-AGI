@@ -15,7 +15,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _LOCAL_TYPES = frozenset({"ollama", "lmstudio"})
-_CC_MANAGED_TYPES = frozenset({"anthropic"})
+# Anthropic providers require ANTHROPIC_API_KEY when configured as direct
+# API providers (via LiteLLM).  CC-dispatched call sites (dispatch=cli)
+# bypass the provider chain entirely and work regardless.  Previously
+# "anthropic" was exempted here, which caused phantom circuit-breaker
+# failures: providers registered without keys, failed every API call,
+# and counted as "down" — triggering false L2 resilience state.
+_CC_MANAGED_TYPES: frozenset[str] = frozenset()
 
 
 _api_validation_cache: dict[str, dict] = {}

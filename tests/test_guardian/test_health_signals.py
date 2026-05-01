@@ -336,12 +336,13 @@ class TestCheckMemoryPressure:
 
     @pytest.mark.asyncio
     async def test_normal_memory(self, config: GuardianConfig) -> None:
-        # 50% memory usage
+        # 50% memory usage (anon + kernel)
+        stat_output = f"anon 10737418240\nfile 5368709120\nkernel 2147483648\n"
         with patch(
             "genesis.guardian.health_signals._run_subprocess",
             side_effect=[
-                (0, str(12 * 1024**3), ""),  # 12 GiB current
-                (0, str(24 * 1024**3), ""),  # 24 GiB max
+                (0, stat_output, ""),         # memory.stat
+                (0, str(24 * 1024**3), ""),   # 24 GiB max
             ],
         ):
             result = await check_memory_pressure(config)
@@ -350,12 +351,13 @@ class TestCheckMemoryPressure:
 
     @pytest.mark.asyncio
     async def test_high_memory(self, config: GuardianConfig) -> None:
-        # 90% memory usage
+        # 90% memory usage (anon + kernel)
+        stat_output = f"anon 21045339750\nfile 1073741824\nkernel 2147483648\n"
         with patch(
             "genesis.guardian.health_signals._run_subprocess",
             side_effect=[
-                (0, str(int(21.6 * 1024**3)), ""),  # 21.6 GiB current
-                (0, str(24 * 1024**3), ""),           # 24 GiB max
+                (0, stat_output, ""),         # memory.stat
+                (0, str(24 * 1024**3), ""),   # 24 GiB max
             ],
         ):
             result = await check_memory_pressure(config)
@@ -364,10 +366,11 @@ class TestCheckMemoryPressure:
 
     @pytest.mark.asyncio
     async def test_no_limit(self, config: GuardianConfig) -> None:
+        stat_output = f"anon {10 * 1024**3}\nkernel {2 * 1024**3}\n"
         with patch(
             "genesis.guardian.health_signals._run_subprocess",
             side_effect=[
-                (0, str(12 * 1024**3), ""),
+                (0, stat_output, ""),
                 (0, "max", ""),
             ],
         ):

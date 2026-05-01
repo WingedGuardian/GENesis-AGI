@@ -258,23 +258,25 @@ class StrategicTimerCollector:
 
 
 class ContainerMemoryCollector:
-    """Reports container memory usage as a percentage of cgroup limit.
+    """Reports non-reclaimable container memory (anon+kernel) as fraction of limit.
 
-    Reads /sys/fs/cgroup/memory.current and memory.max. Returns 0.0–1.0
-    where 1.0 = at the cgroup limit. Returns 0.0 if cgroup info unavailable.
+    Reads anon and kernel from /sys/fs/cgroup/memory.stat + memory.max.
+    Returns 0.0–1.0 where 1.0 = at the cgroup limit. This excludes
+    reclaimable page cache, which inflates memory.current and causes
+    false pressure signals.
     """
 
     signal_name = "container_memory_pct"
 
     async def collect(self) -> SignalReading:
-        from genesis.autonomy.watchdog import get_container_memory
+        from genesis.autonomy.watchdog import get_container_anon_memory
 
-        mem = get_container_memory()
+        mem = get_container_anon_memory()
         if mem is None or mem[1] == 0:
             return _bootstrap_placeholder_reading(self.signal_name, "cgroup")
 
-        current, limit = mem
-        pct = current / limit  # 0.0–1.0
+        anon_kernel, limit = mem
+        pct = anon_kernel / limit  # 0.0–1.0
         return SignalReading(
             name=self.signal_name,
             value=round(pct, 3),

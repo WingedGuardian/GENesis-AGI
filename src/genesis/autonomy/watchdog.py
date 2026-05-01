@@ -262,26 +262,26 @@ class WatchdogChecker:
     def _check_memory_pressure(self) -> None:
         """Proactive memory check — reclaim page cache if approaching limit.
 
-        Runs every watchdog cycle (60s). Prevents the OOM cascade where ghost
-        page cache from killed sessions accumulates and triggers increasingly
-        rapid OOM kills.
+        Runs every watchdog cycle (60s). Uses anon+kernel memory (non-reclaimable)
+        for threshold decisions. Total cgroup usage (memory.current) includes
+        reclaimable page cache, which inflates the metric and causes false alarms.
         """
-        mem = get_container_memory()
+        mem = get_container_anon_memory()
         if mem is None or mem[1] == 0:
             return  # Can't read or no limit set
 
-        current, limit = mem
-        pct = (current / limit) * 100
+        anon_kernel, limit = mem
+        pct = (anon_kernel / limit) * 100
         if pct >= 90:
             logger.error(
-                "Container memory CRITICAL: %.0f%% (%.1f/%.1f GiB) — reclaiming cache",
-                pct, current / (1024**3), limit / (1024**3),
+                "Container memory CRITICAL: %.0f%% anon+kernel (%.1f/%.1f GiB) — reclaiming cache",
+                pct, anon_kernel / (1024**3), limit / (1024**3),
             )
             reclaim_page_cache("256M")
         elif pct >= 80:
             logger.warning(
-                "Container memory HIGH: %.0f%% (%.1f/%.1f GiB) — reclaiming cache",
-                pct, current / (1024**3), limit / (1024**3),
+                "Container memory HIGH: %.0f%% anon+kernel (%.1f/%.1f GiB) — reclaiming cache",
+                pct, anon_kernel / (1024**3), limit / (1024**3),
             )
             reclaim_page_cache("128M")
 
@@ -489,6 +489,32 @@ def get_container_memory() -> tuple[int, int] | None:
         max_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
         max_bytes = int(max_raw) if max_raw != "max" else 0
         return current, max_bytes
+    except (OSError, ValueError):
+        return None
+
+
+def get_container_anon_memory() -> tuple[int, int] | None:
+    """Read non-reclaimable container memory (anon + kernel) and limit.
+
+    Unlike ``get_container_memory()`` which reads ``memory.current`` (includes
+    reclaimable page cache), this reads ``memory.stat`` for anon + kernel
+    bytes — the memory that actually matters for OOM risk.
+
+    Returns (anon_plus_kernel_bytes, max_bytes) or None if unavailable.
+    """
+    try:
+        stats: dict[str, int] = {}
+        with open("/sys/fs/cgroup/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[0] in ("anon", "kernel"):
+                    stats[parts[0]] = int(parts[1])
+        if not stats:
+            return None
+        anon_kernel = stats.get("anon", 0) + stats.get("kernel", 0)
+        max_raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        max_bytes = int(max_raw) if max_raw != "max" else 0
+        return anon_kernel, max_bytes
     except (OSError, ValueError):
         return None
 

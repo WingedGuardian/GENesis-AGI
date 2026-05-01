@@ -32,7 +32,13 @@ def init(rt: GenesisRuntime) -> None:
         delegate = LiteLLMDelegate(config)
         breakers = CircuitBreakerRegistry(config.providers)
         cost_tracker = CostTracker(db=rt._db, event_bus=rt._event_bus)
-        degradation = DegradationTracker()
+
+        from genesis.resilience.state import ResilienceStateMachine
+
+        rt._resilience_state_machine = ResilienceStateMachine()
+        logger.info("Resilience state machine created")
+
+        degradation = DegradationTracker(resilience_state=rt._resilience_state_machine)
 
         from genesis.routing.dead_letter import DeadLetterQueue
 
@@ -62,11 +68,6 @@ def init(rt: GenesisRuntime) -> None:
         rt._deferred_work_queue = DeferredWorkQueue(
             db=rt._db, event_bus=rt._event_bus,
         )
-
-        from genesis.resilience.state import ResilienceStateMachine
-
-        rt._resilience_state_machine = ResilienceStateMachine()
-        logger.info("Resilience state machine created")
 
         if rt._awareness_loop is not None:
             rt._awareness_loop.set_deferred_queue(rt._deferred_work_queue)

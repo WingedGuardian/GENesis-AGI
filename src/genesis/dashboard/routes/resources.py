@@ -26,19 +26,22 @@ def system_resources():
         logger.error("CPU probe failed", exc_info=True)
         result["cpu"] = {"status": "unavailable", "used_pct": None}
 
-    # Container memory — cgroup-based
+    # Container memory — anon+kernel (non-reclaimable) for status decisions
     try:
-        from genesis.autonomy.watchdog import get_container_memory
+        from genesis.autonomy.watchdog import get_container_anon_memory, get_container_memory
 
-        mem = get_container_memory()
-        if mem and mem[1] > 0:
-            current, limit = mem
-            pct = round(current / limit * 100, 1)
+        anon_mem = get_container_anon_memory()
+        total_mem = get_container_memory()
+        if anon_mem and anon_mem[1] > 0:
+            anon_kernel, limit = anon_mem
+            anon_pct = round(anon_kernel / limit * 100, 1)
+            total_pct = round(total_mem[0] / limit * 100, 1) if total_mem and total_mem[1] > 0 else anon_pct
             result["memory"] = {
-                "status": "healthy" if pct < 85 else ("degraded" if pct < 95 else "critical"),
-                "used_gb": round(current / (1024**3), 1),
+                "status": "healthy" if anon_pct < 85 else ("degraded" if anon_pct < 95 else "critical"),
+                "used_gb": round((total_mem[0] if total_mem else anon_kernel) / (1024**3), 1),
                 "total_gb": round(limit / (1024**3), 1),
-                "used_pct": pct,
+                "used_pct": total_pct,
+                "anon_pct": anon_pct,
             }
         else:
             result["memory"] = {"status": "unavailable"}

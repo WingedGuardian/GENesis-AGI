@@ -302,10 +302,14 @@ call_sites:
     chain:
     - claude-opus
     default_paid: true
+    dispatch: cli
+    cc_model: Opus
   16_quality_calibration:
     chain:
-    - claude-opus
+    - claude-sonnet
     default_paid: true
+    dispatch: cli
+    cc_model: Sonnet
   17_fresh_eyes_review:
     chain:
     - openrouter-deepseek-v4
@@ -335,13 +339,18 @@ call_sites:
     - groq-free
   27_pre_execution_assessment:
     chain:
-    - claude-sonnet
-    - claude-haiku
+    - minimax-m25
+    - deepseek-chat
+    - glm5
     default_paid: true
     retry_profile: user_facing
   28_observation_sweep:
     chain:
-    - claude-sonnet
+    - minimax-m25
+    - deepseek-chat
+    - glm5
+    - groq-free
+    - gemini-free
     default_paid: true
   29_retrospective_triage:
     chain:
