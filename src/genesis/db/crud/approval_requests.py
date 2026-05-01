@@ -159,6 +159,7 @@ async def find_approved_unconsumed(
              AND consumed_at IS NULL
              AND json_extract(context, '$.subsystem') = ?
              AND json_extract(context, '$.policy_id') = ?
+             AND resolved_at > datetime('now', '-24 hours')
            ORDER BY resolved_at DESC
            LIMIT 1""",
         (subsystem, policy_id),
