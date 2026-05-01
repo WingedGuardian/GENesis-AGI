@@ -96,8 +96,10 @@ Full syntax, Cypher examples, and decision matrix:
 
 ### Common Traps
 
-- **Ego sessions are inert.** `src/genesis/ego/` exists but has zero
-  production callers. Don't wire them; don't treat them as broken.
+- **Ego sessions are ACTIVE.** `src/genesis/ego/` is live (v3.0a11).
+  Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Both
+  run on adaptive cadence via the awareness loop. Changes here are
+  production changes.
 - **DB path confusion.** `genesis.db` is at `~/genesis/data/genesis.db`,
   NOT `~/genesis/genesis.db`. Use `genesis.env.genesis_db_path()`.
 - **Column names.** Use `db_schema` MCP before assuming column names.

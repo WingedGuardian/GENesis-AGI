@@ -35,12 +35,13 @@ class UserEgoContextBuilder:
 
     Data sources (ordered by signal value):
     1. User model — who the user is, what they care about
-    2. Recent conversations — what the user is working on
-    3. User-world observations — email, inbox, findings
-    4. Genesis ego escalations — things Genesis can't resolve alone
-    5. Capabilities — what Genesis CAN do but ISN'T doing
-    6. Minimal system status — one-line health summary
-    7. Open threads — pending follow-ups
+    2. User activity pulse — user-facing awareness signals
+    3. Recent conversations — what the user is working on
+    4. User-world observations — email, inbox, findings
+    5. Genesis ego escalations — things Genesis can't resolve alone
+    6. Capabilities — what Genesis CAN do but ISN'T doing
+    7. Minimal system status — one-line health summary
+    8. Open threads — pending follow-ups
     """
 
     def __init__(
@@ -65,12 +66,15 @@ class UserEgoContextBuilder:
         )
 
         sections.append(await self._user_model_section())
+        sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
         sections.append(await self._user_world_observations_section())
+        sections.append(await self._backlog_summary_section())
         sections.append(await self._genesis_escalations_section())
         sections.append(await self._capabilities_section())
         sections.append(await self._system_status_section())
         sections.append(await self._follow_ups_section())
+        sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
         sections.append(self._output_contract_section())
@@ -103,6 +107,29 @@ class UserEgoContextBuilder:
             f"*v{version}, {evidence_count} evidence points, "
             f"last synthesized {synthesized_at[:10]}*\n"
         )
+
+        # 3d: Model freshness warning — flag when model is stale
+        # relative to recent conversation activity.
+        try:
+            synth_dt = datetime.fromisoformat(synthesized_at)
+            if synth_dt.tzinfo is None:
+                synth_dt = synth_dt.replace(tzinfo=UTC)
+            age_days = (datetime.now(UTC) - synth_dt).days
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM cc_sessions "
+                "WHERE source_tag = 'foreground' "
+                "AND started_at > ?",
+                (synthesized_at,),
+            )
+            freshness_row = await cursor.fetchone()
+            sessions_since = freshness_row[0] if freshness_row else 0
+            if age_days >= 3 and sessions_since >= 3:
+                lines.append(
+                    f"**Warning: Model may be stale**: {age_days}d old, "
+                    f"{sessions_since} conversations since last synthesis\n"
+                )
+        except Exception:
+            pass  # Non-critical enrichment
 
         try:
             model = json.loads(model_json) if model_json else {}
@@ -140,6 +167,115 @@ class UserEgoContextBuilder:
             lines.append(
                 f"\n*{remaining} more fields available via memory_recall.*"
             )
+
+        lines.append("")
+        return "\n".join(lines)
+
+    # Signals that track user activity — used to filter awareness tick
+    # signals for the user ego's activity pulse section.
+    _USER_FACING_SIGNALS = frozenset({
+        "conversations_since_reflection",
+        "task_completion_quality",
+        "recon_findings_pending",
+        "stale_pending_items",
+        "user_goal_staleness",
+        "user_session_pattern",
+    })
+
+    # Human-readable interpretations for user-facing signal ranges.
+    _SIGNAL_INTERPRETATIONS: dict[str, list[tuple[float, str]]] = {
+        "user_goal_staleness": [
+            (0.7, "oldest pending goal is significantly stale (14+ days)"),
+            (0.3, "oldest pending goal is moderately stale (7-14 days)"),
+            (0.0, "pending goals are relatively fresh"),
+        ],
+        "user_session_pattern": [
+            (0.7, "user activity is significantly below their baseline"),
+            (0.3, "user activity is somewhat below their baseline"),
+            (0.0, "user activity is near their normal pattern"),
+        ],
+        "stale_pending_items": [
+            (0.7, "several pending items are aging (3+ days)"),
+            (0.3, "some pending items are aging"),
+            (0.0, "pending items are fresh"),
+        ],
+    }
+
+    @classmethod
+    def _interpret_signal(cls, name: str, value: float) -> str | None:
+        """Return a human-readable interpretation, or None to skip."""
+        thresholds = cls._SIGNAL_INTERPRETATIONS.get(name)
+        if thresholds:
+            for threshold, text in thresholds:
+                if value >= threshold:
+                    return text
+            return None
+        # Default: just show the raw value for known user-facing signals
+        if isinstance(value, float):
+            return f"{value:.2f}"
+        return str(value)
+
+    async def _user_activity_pulse_section(self) -> str:
+        """User activity signals — interpreted for ego decision-making.
+
+        Queries the latest awareness tick and surfaces user-facing signal
+        values as prose. Signals at 0.0 are skipped (nothing noteworthy).
+        """
+        lines = ["## User Activity Pulse\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT signals_json, created_at "
+                "FROM awareness_ticks "
+                "ORDER BY created_at DESC LIMIT 1"
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            logger.error("Failed to query awareness_ticks", exc_info=True)
+            lines.append("*No awareness data available.*\n")
+            return "\n".join(lines)
+
+        if not row:
+            lines.append("*No awareness ticks recorded.*\n")
+            return "\n".join(lines)
+
+        signals_json, created_at = row
+
+        try:
+            signals = json.loads(signals_json) if signals_json else {}
+        except (json.JSONDecodeError, TypeError):
+            signals = {}
+
+        # Normalize list format to dict (same as genesis_context.py)
+        if isinstance(signals, list):
+            signals = {
+                s["name"]: s
+                for s in signals
+                if isinstance(s, dict) and "name" in s
+            }
+
+        # Filter to user-facing signals with non-zero values
+        pulse_items: list[str] = []
+        for sig_name in sorted(self._USER_FACING_SIGNALS):
+            sig_info = signals.get(sig_name)
+            if not sig_info:
+                continue
+            value = sig_info.get("value", 0.0) if isinstance(sig_info, dict) else sig_info
+            if not isinstance(value, (int, float)) or value == 0.0:
+                continue
+            interpretation = self._interpret_signal(sig_name, float(value))
+            if interpretation:
+                label = sig_name.replace("_", " ").title()
+                pulse_items.append(
+                    f"- **{label}**: {interpretation} (signal: {value:.2f})"
+                )
+
+        if not pulse_items:
+            lines.append("*All user activity signals nominal.*\n")
+        else:
+            ts = created_at[:16] if created_at else "?"
+            lines.append(f"*From latest awareness tick ({ts}):*\n")
+            lines.extend(pulse_items)
 
         lines.append("")
         return "\n".join(lines)
@@ -229,6 +365,80 @@ class UserEgoContextBuilder:
 
         lines.append("")
         return "\n".join(lines)
+
+    async def _backlog_summary_section(self) -> str:
+        """Inbox, recon, and pending item backlogs."""
+        lines = ["## Backlogs\n"]
+
+        counts: list[tuple[str, int, str | None]] = []  # (label, count, oldest)
+
+        # Inbox: pending/processing items
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM inbox_items "
+                "WHERE status NOT IN ('completed', 'failed')"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Inbox", row[0], age))
+        except Exception:
+            pass  # Table may not exist
+
+        # Recon findings: unresolved
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM observations "
+                "WHERE type = 'finding' AND resolved = 0"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Recon findings", row[0], age))
+        except Exception:
+            pass
+
+        # Follow-ups awaiting user input
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*), MIN(created_at) FROM follow_ups "
+                "WHERE status = 'pending' "
+                "AND strategy = 'user_input_needed'"
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                age = self._days_ago(row[1])
+                counts.append(("Awaiting user input", row[0], age))
+        except Exception:
+            pass
+
+        if not counts:
+            lines.append("*All backlogs clear.*\n")
+        else:
+            for label, count, oldest in counts:
+                age_str = f" (oldest: {oldest})" if oldest else ""
+                lines.append(f"- **{label}**: {count} pending{age_str}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _days_ago(iso_timestamp: str | None) -> str | None:
+        """Convert ISO timestamp to 'Xd ago' string."""
+        if not iso_timestamp:
+            return None
+        try:
+            dt = datetime.fromisoformat(iso_timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            days = (datetime.now(UTC) - dt).days
+            if days == 0:
+                return "today"
+            if days == 1:
+                return "1d ago"
+            return f"{days}d ago"
+        except (ValueError, TypeError):
+            return None
 
     async def _genesis_escalations_section(self) -> str:
         """Escalations from the Genesis ego that need user ego attention."""
@@ -392,6 +602,50 @@ class UserEgoContextBuilder:
             if blocked:
                 line += f" — BLOCKED: {blocked[:100]}"
             lines.append(line)
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _proposal_history_section(self) -> str:
+        """Recent proposal outcomes for self-calibration."""
+        lines = ["## Recent Proposals (last 7 days)\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT action_type, content, status, "
+                "user_response, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "ORDER BY created_at DESC "
+                "LIMIT 15"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            lines.append("*No proposal history available.*\n")
+            return "\n".join(lines)
+
+        if not rows:
+            lines.append("*No proposals in last 7 days.*\n")
+            return "\n".join(lines)
+
+        # Summary line for quick calibration
+        from collections import Counter
+        status_counts = Counter(r[2] for r in rows)
+        parts = [f"{status_counts[s]} {s}" for s in
+                 ("approved", "rejected", "executed", "pending", "failed",
+                  "expired", "tabled", "withdrawn")
+                 if status_counts.get(s)]
+        lines.append(f"**{len(rows)} proposals**: {', '.join(parts)}\n")
+
+        lines.append("| Action | Content | Status | Response |")
+        lines.append("|--------|---------|--------|----------|")
+        for action_type, content, status, response, _created in rows:
+            short = content[:80] + "..." if len(content) > 80 else content
+            short = short.replace("\n", " ").replace("|", "/")
+            resp = (response or "\u2014")[:50]
+            lines.append(
+                f"| {action_type} | {short} | {status} | {resp} |"
+            )
 
         lines.append("")
         return "\n".join(lines)

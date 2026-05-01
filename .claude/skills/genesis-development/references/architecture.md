@@ -5,8 +5,9 @@
 Genesis core is feature-complete. Preparing for V4 work (meta-prompting,
 adaptive weights, channel learning, L5+ autonomy).
 
-**Ego sessions** (`src/genesis/ego/`) are built but **inert until beta**.
-Not registered in bootstrap; disabled by default.
+**Ego sessions** (`src/genesis/ego/`) are **ACTIVE** (v3.0a11, PRs #26/#27).
+Two egos: user ego (CEO, Opus) and Genesis ego (COO, Sonnet). Registered
+in bootstrap, running on adaptive cadence via the awareness loop.
 
 ## Groundwork Code Protection
 
