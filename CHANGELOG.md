@@ -3,7 +3,63 @@
 All notable changes to Genesis are documented here.
 
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning follows Genesis release stages (v3.0a → v3.1 → v4.0a…).
+Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…).
+
+---
+
+## [v3.0b1] - 2026-05-01
+
+First beta. The ego subsystem---Genesis's autonomous decision-making
+layer---is stable and public. Two egos (User Ego and Genesis Ego) run on
+adaptive cadence, propose actions via Telegram, and execute approved work
+autonomously. The reflection pipeline now feeds both egos balanced
+context instead of flooding one with infrastructure noise.
+
+### Added
+
+- **Ego module** (#26, #27) --- two autonomous egos with ephemeral
+  sessions, model selection, proposal board, and tiered execution.
+  User Ego (CEO, Opus) focuses on user goals; Genesis Ego (COO, Sonnet)
+  handles system health. Both dispatch CC sessions with approval gates.
+- **Reflection rebalancing** (#196) --- observations now carry relevance
+  tags (`:user`, `:genesis`, `:both`). Each ego sees what it needs
+  instead of everything. Two new signal collectors track user goal
+  staleness and session activity patterns.
+- **Ego context enrichment** (#205) --- User Ego now sees an activity
+  pulse (goal staleness, session rhythm, conversation count), model
+  freshness warnings, and backlog depth (inbox, recon, follow-ups).
+  Genesis Ego gets signal trend arrows across ticks. Both egos see
+  recent proposal outcomes for self-calibration.
+- **Sequential task execution** (#193) --- tasks execute one at a time
+  with per-step approval skipping for trusted subsystems.
+- **Task intake gate** (#199) --- SQLite trigger rejects malformed task
+  submissions before they reach the executor.
+- **Pinned follow-ups** (#185) --- follow-up items can be pinned so they
+  survive batch resolution.
+
+### Changed
+
+- **Approval gate redesign** (#198) --- stable approval keys for
+  recurring dispatches (ego cycles, inbox evaluation). One approval per
+  request, no reuse of stale approvals. Pass 3 content-blind matching
+  removed entirely.
+- **Repetitive micro reflections reduced** (#195) --- consecutive
+  identical micro observations are suppressed.
+
+### Fixed
+
+- **Genesis Ego crash** (#198) --- `signals_json` stored as a list, not
+  a dict. Every genesis ego cycle hit `AttributeError` on `.items()`.
+- **Approval notifications** (#29) --- per-tick notifications are now
+  idempotent; duplicate approvals filtered (#33).
+- **Executor worktree persistence** (#188) --- worktree paths survive
+  server restarts.
+- **Dashboard memory gauge** (#202) --- displays anonymous memory
+  percentage instead of used percentage.
+- **Resilience metrics** (#201) --- correct memory metric source, /tmp
+  pressure axis, phantom L2 autonomy level.
+- **Ego dashboard controls** (#192) --- column names, model override,
+  budget cap fixes.
 
 ---
 
