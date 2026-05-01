@@ -58,3 +58,8 @@ run `index_repository` manually.
 
 **Grep/Glob/Read** — Always available, zero overhead. Preferred for config
 files, markdown, YAML, JSON, shell scripts, SQL, and any non-code content.
+
+---
+
+For deep GitNexus reference (Cypher syntax, edge types, MCP resources,
+graph schema): `.claude/docs/code-intelligence-guide.md`
