@@ -6,6 +6,14 @@ from genesis.content.drafter import ContentDrafter
 from genesis.content.types import DraftRequest, FormatTarget
 
 
+class TestLoadVoice:
+    def test_loads_voice_md(self):
+        """_load_voice returns VOICE.md content when present."""
+        result = ContentDrafter._load_voice()
+        assert result is not None
+        assert "Genesis Voice" in result
+
+
 class TestContentDrafter:
     @pytest.mark.asyncio
     async def test_no_router_fallback(self):

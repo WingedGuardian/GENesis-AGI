@@ -87,6 +87,12 @@ class TestLoadIdentityBlock:
         assert len(result) > 0
         assert result != "You are Genesis, an autonomous AI agent."
 
+    def test_includes_voice_md(self, builder):
+        result = builder._load_identity_block()
+        # VOICE.md exists in the repo and should be appended after SOUL.md
+        assert "Genesis Voice" in result
+        assert "---" in result  # separator between SOUL and VOICE
+
     def test_fallback_when_missing(self, builder):
         with patch("pathlib.Path.exists", return_value=False):
             result = builder._load_identity_block()
