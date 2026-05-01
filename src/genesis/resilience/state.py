@@ -47,6 +47,19 @@ class CCStatus(IntEnum):
     NORMAL = 3
 
 
+class TmpPressureStatus(IntEnum):
+    """CC temp directory pressure from watchgod tiers.
+
+    Mapped from watchgod cc_tmp tier (green/yellow/orange/red).
+    Budget is configurable per-install (~/.genesis/config/watchgod.conf),
+    so tiers are relative to the configured budget, not absolute sizes.
+    """
+    CRITICAL = 0   # Red:   >90% or sacred ground breached
+    HIGH = 1       # Orange: 75-90%
+    MODERATE = 2   # Yellow: 50-75%
+    NORMAL = 3     # Green:  <50%
+
+
 # ── Transition record ────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -68,6 +81,7 @@ class ResilienceState:
     memory: MemoryStatus = MemoryStatus.NORMAL
     embedding: EmbeddingStatus = EmbeddingStatus.NORMAL
     cc: CCStatus = CCStatus.NORMAL
+    tmp_pressure: TmpPressureStatus = TmpPressureStatus.NORMAL
     timestamp: str = ""
     transitions: list[StateTransition] = field(default_factory=list)
 
@@ -90,6 +104,14 @@ class ResilienceState:
         # Embedding unavailability overrides if worse
         if self.embedding in (EmbeddingStatus.QUEUED, EmbeddingStatus.UNAVAILABLE) and level < DegradationLevel.LOCAL_COMPUTE_DOWN:
             level = DegradationLevel.LOCAL_COMPUTE_DOWN
+
+        # Tmp pressure — CRITICAL maps to L3, HIGH to L2, MODERATE to L1
+        if self.tmp_pressure == TmpPressureStatus.CRITICAL and level < DegradationLevel.ESSENTIAL:
+            level = DegradationLevel.ESSENTIAL
+        elif self.tmp_pressure == TmpPressureStatus.HIGH and level < DegradationLevel.REDUCED:
+            level = DegradationLevel.REDUCED
+        elif self.tmp_pressure == TmpPressureStatus.MODERATE and level < DegradationLevel.FALLBACK:
+            level = DegradationLevel.FALLBACK
 
         return level
 
@@ -122,6 +144,7 @@ class ResilienceStateMachine:
             "memory": _AxisFlap(),
             "embedding": _AxisFlap(),
             "cc": _AxisFlap(),
+            "tmp_pressure": _AxisFlap(),
         }
 
     @property
@@ -135,6 +158,7 @@ class ResilienceStateMachine:
             or self._state.memory != MemoryStatus.NORMAL
             or self._state.embedding != EmbeddingStatus.NORMAL
             or self._state.cc != CCStatus.NORMAL
+            or self._state.tmp_pressure != TmpPressureStatus.NORMAL
         )
 
     def update_cloud(self, status: CloudStatus) -> list[StateTransition]:
@@ -156,6 +180,9 @@ class ResilienceStateMachine:
         # .claude/plans/fluttering-humming-bentley.md for the false-alarm
         # incident that motivated this.)
         return self._update("cc", status, apply_flapping_protection=False)
+
+    def update_tmp_pressure(self, status: TmpPressureStatus) -> list[StateTransition]:
+        return self._update("tmp_pressure", status)
 
     def _update(
         self,

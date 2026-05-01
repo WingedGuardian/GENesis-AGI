@@ -577,6 +577,26 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Resilience state update failed", exc_info=True)
 
+            # Update resilience tmp_pressure axis from watchgod state
+            if self._resilience_state_machine:
+                try:
+                    from genesis.observability.service_status import collect_cc_tmp_usage
+                    from genesis.resilience.state import TmpPressureStatus
+
+                    _TIER_TO_TMP = {
+                        "green": TmpPressureStatus.NORMAL,
+                        "yellow": TmpPressureStatus.MODERATE,
+                        "orange": TmpPressureStatus.HIGH,
+                        "red": TmpPressureStatus.CRITICAL,
+                    }
+                    cc_tmp = collect_cc_tmp_usage()
+                    tier = cc_tmp.get("cc_tier", "unknown")
+                    tmp_status = _TIER_TO_TMP.get(tier)
+                    if tmp_status is not None:
+                        self._resilience_state_machine.update_tmp_pressure(tmp_status)
+                except Exception:
+                    logger.debug("tmp_pressure axis update failed", exc_info=True)
+
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from
             # the awareness tick so a slow tick (e.g. long Light reflection)

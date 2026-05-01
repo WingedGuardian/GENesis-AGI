@@ -378,7 +378,7 @@ class TestMemoryPressureCheck:
     def test_reclaims_at_80_percent(self, tmp_path: Path, fresh_status: Path):
         checker = _make_checker(tmp_path, fresh_status)
         with (
-            patch("genesis.autonomy.watchdog.get_container_memory",
+            patch("genesis.autonomy.watchdog.get_container_anon_memory",
                   return_value=(20_000_000_000, 24_000_000_000)),  # 83%
             patch("genesis.autonomy.watchdog.reclaim_page_cache") as mock_reclaim,
         ):
@@ -388,7 +388,7 @@ class TestMemoryPressureCheck:
     def test_reclaims_256m_at_90_percent(self, tmp_path: Path, fresh_status: Path):
         checker = _make_checker(tmp_path, fresh_status)
         with (
-            patch("genesis.autonomy.watchdog.get_container_memory",
+            patch("genesis.autonomy.watchdog.get_container_anon_memory",
                   return_value=(22_000_000_000, 24_000_000_000)),  # 91%
             patch("genesis.autonomy.watchdog.reclaim_page_cache") as mock_reclaim,
         ):
@@ -398,7 +398,7 @@ class TestMemoryPressureCheck:
     def test_no_reclaim_below_80_percent(self, tmp_path: Path, fresh_status: Path):
         checker = _make_checker(tmp_path, fresh_status)
         with (
-            patch("genesis.autonomy.watchdog.get_container_memory",
+            patch("genesis.autonomy.watchdog.get_container_anon_memory",
                   return_value=(15_000_000_000, 24_000_000_000)),  # 62%
             patch("genesis.autonomy.watchdog.reclaim_page_cache") as mock_reclaim,
         ):
@@ -407,5 +407,5 @@ class TestMemoryPressureCheck:
 
     def test_handles_no_memory_info(self, tmp_path: Path, fresh_status: Path):
         checker = _make_checker(tmp_path, fresh_status)
-        with patch("genesis.autonomy.watchdog.get_container_memory", return_value=None):
+        with patch("genesis.autonomy.watchdog.get_container_anon_memory", return_value=None):
             checker._check_memory_pressure()  # Should not raise

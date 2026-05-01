@@ -297,13 +297,15 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         current_ids.add(alert_id)
 
     container_mem = snap.get("infrastructure", {}).get("container_memory", {})
-    used_pct = container_mem.get("used_pct", 0)
-    if used_pct > 85:
+    # Use anon_pct (non-reclaimable memory) for alerts, not used_pct
+    # (total cgroup including reclaimable page cache).
+    anon_pct = container_mem.get("anon_pct", container_mem.get("used_pct", 0))
+    if anon_pct > 85:
         alert_id = "infra:container_memory_high"
         alerts.append({
             "id": alert_id,
-            "severity": "CRITICAL" if used_pct > 90 else "WARNING",
-            "message": f"Container memory at {used_pct}% ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB)",
+            "severity": "CRITICAL" if anon_pct > 90 else "WARNING",
+            "message": f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB total)",
         })
         current_ids.add(alert_id)
 

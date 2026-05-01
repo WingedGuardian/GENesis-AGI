@@ -15,6 +15,17 @@ _L2_SKIP = {"12_surplus_brainstorm", "13_morning_report"}
 # L3 (Essential) only keeps these call sites
 _L3_KEEP = {"2_triage", "3_micro_reflection", "21_embeddings", "22_tagging"}
 
+# Tmp pressure skip lists — separate from cloud degradation because disk
+# pressure requires different shedding than provider outages.
+# MODERATE (yellow): suppress surplus + morning report (same as cloud L2)
+_TMP_MODERATE_SKIP = {"12_surplus_brainstorm", "13_morning_report"}
+# HIGH (orange): also suppress background reflections, ego, calibration, sweeps
+_TMP_HIGH_SKIP = _TMP_MODERATE_SKIP | {
+    "5_deep_reflection", "6_strategic_reflection", "7_ego_cycle",
+    "14_weekly_self_assessment", "16_quality_calibration",
+    "28_observation_sweep",
+}
+
 
 def should_skip_call_site(call_site_id: str, level: DegradationLevel) -> bool:
     """Return True if call_site_id should be skipped at the given degradation level."""
@@ -47,4 +58,17 @@ class DegradationTracker:
         self._level = self._resilience_state.current.to_legacy_degradation_level()
 
     def should_skip(self, call_site_id: str) -> bool:
-        return should_skip_call_site(call_site_id, self._level)
+        # Check cloud/provider-based degradation first
+        if should_skip_call_site(call_site_id, self._level):
+            return True
+        # Check tmp_pressure axis independently
+        if self._resilience_state is not None:
+            from genesis.resilience.state import TmpPressureStatus
+            tmp = self._resilience_state.current.tmp_pressure
+            if tmp == TmpPressureStatus.CRITICAL:
+                return call_site_id not in _L3_KEEP
+            if tmp == TmpPressureStatus.HIGH:
+                return call_site_id in _TMP_HIGH_SKIP
+            if tmp == TmpPressureStatus.MODERATE:
+                return call_site_id in _TMP_MODERATE_SKIP
+        return False

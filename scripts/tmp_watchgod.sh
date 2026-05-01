@@ -44,8 +44,22 @@ dir_usage_mb() {
 }
 
 tmp_usage_pct() {
-    # Percentage of /tmp filesystem used
-    df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %' || echo 0
+    if df -T /tmp 2>/dev/null | grep -q tmpfs; then
+        # tmpfs: filesystem percentage is meaningful
+        df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %' || echo 0
+    else
+        # Not tmpfs (/tmp on root disk): use absolute free space thresholds.
+        # Danger is the same regardless of disk size — CC sessions need ~60MB
+        # each, sacred ground is 150MB.  Percentage-based thresholds are
+        # meaningless when measuring the whole root filesystem.
+        local free_mb
+        free_mb=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M' || echo 9999)
+        if (( free_mb > 2048 )); then echo 0       # >2GB free  → green
+        elif (( free_mb > 1024 )); then echo 60     # 1-2GB free → yellow
+        elif (( free_mb > 500 )); then echo 75      # 500M-1GB  → orange
+        else echo 90                                 # <500MB    → red
+        fi
+    fi
 }
 
 fs_free_mb() {

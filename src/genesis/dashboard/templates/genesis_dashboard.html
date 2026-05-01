@@ -3461,6 +3461,8 @@
                              ? name + ': ' + probe.free_gb?.toFixed(1) + ' GB free (' + probe.free_pct?.toFixed(0) + '% of ' + probe.total_gb?.toFixed(0) + ' GB)'
                              : probe.total_points != null
                                ? name + ': ' + probe.total_points + ' total points across ' + (probe.collections?.length || 0) + ' collections'
+                             : probe.cc_tier != null
+                               ? name + ': CC ' + probe.cc_tier + ' (' + probe.cc_used_mb + '/' + probe.cc_budget_mb + 'MB)' + (probe.sys_tier ? ', /tmp ' + probe.sys_tier + ' (' + probe.sys_used_pct + '%)' : '')
                              : name + ': ' + (probe.status || 'unknown')">
                     <span class="status-dot"
                           :style="`background: ${$store.genesisDashboard.probeStatusColor(probe)}`"></span>

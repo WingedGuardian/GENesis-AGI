@@ -394,21 +394,32 @@ async def check_tick_regularity(config: GuardianConfig) -> SuspiciousResult:
 
 
 async def check_memory_pressure(config: GuardianConfig) -> SuspiciousResult:
-    """Check container memory usage via cgroup v2."""
+    """Check container memory usage via cgroup v2.
+
+    Uses anon+kernel from memory.stat (non-reclaimable) for threshold
+    decisions instead of memory.current (which includes reclaimable page cache).
+    """
     name = "memory_pressure"
     t0 = datetime.now(UTC)
     try:
+        # Read memory.stat for anon+kernel (non-reclaimable memory)
         rc, stdout, stderr = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
-            "cat", "/sys/fs/cgroup/memory.current",
+            "cat", "/sys/fs/cgroup/memory.stat",
             timeout=config.probes.probe_timeout_s,
         )
         if rc != 0:
             return SuspiciousResult(
-                name=name, ok=True, detail=f"cgroup read failed: {stderr[:200]}",
+                name=name, ok=True, detail=f"cgroup stat read failed: {stderr[:200]}",
                 collected_at=t0.isoformat(),
             )
-        current = int(stdout.strip())
+        # Parse anon and kernel values from memory.stat
+        stats: dict[str, int] = {}
+        for line in stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[0] in ("anon", "kernel"):
+                stats[parts[0]] = int(parts[1])
+        anon_kernel = stats.get("anon", 0) + stats.get("kernel", 0)
 
         rc2, stdout2, stderr2 = await _run_subprocess(
             "incus", "exec", config.container_name, "--",
@@ -429,9 +440,9 @@ async def check_memory_pressure(config: GuardianConfig) -> SuspiciousResult:
             )
 
         max_bytes = int(max_mem)
-        pct = (current / max_bytes) * 100 if max_bytes > 0 else 0
+        pct = (anon_kernel / max_bytes) * 100 if max_bytes > 0 else 0
         ok = pct < config.suspicious.memory_warning_pct
-        detail = f"{pct:.1f}% ({current // (1024*1024)}M / {max_bytes // (1024*1024)}M)"
+        detail = f"{pct:.1f}% anon+kernel ({anon_kernel // (1024*1024)}M / {max_bytes // (1024*1024)}M)"
         return SuspiciousResult(
             name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
         )

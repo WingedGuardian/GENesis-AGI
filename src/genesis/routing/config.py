@@ -234,11 +234,19 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
         chain = cs["chain"]
         # Filter out disabled providers from chain
         chain = [p for p in chain if p not in disabled_providers]
+        dispatch = _normalize_dispatch(cs.get("dispatch"), call_site_name=name)
+
         if not chain:
-            logger.warning(
-                "Call site '%s' has no enabled providers — all were disabled", name,
+            # CLI-dispatch call sites don't use the provider chain — they
+            # spawn CC sessions directly.  An empty chain is valid for them.
+            if dispatch != "cli":
+                logger.warning(
+                    "Call site '%s' has no enabled providers — all were disabled", name,
+                )
+                continue
+            logger.info(
+                "Call site '%s' has no API providers but dispatch=cli — keeping", name,
             )
-            continue
         # Validate remaining providers exist
         for provider in chain:
             if provider not in providers:
@@ -252,8 +260,6 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
                 f"retry profile '{retry_profile}'"
             )
             raise ValueError(msg)
-
-        dispatch = _normalize_dispatch(cs.get("dispatch"), call_site_name=name)
 
         call_sites[name] = CallSiteConfig(
             id=name,
