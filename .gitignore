@@ -82,3 +82,6 @@ scripts/cops_interop.sh
 # Stealth browser skill + research (private — lives at ~/.genesis/skills/)
 src/genesis/skills/stealth-browser/
 .gitnexus
+
+# Personal skills (user-level data, lives at ~/.claude/skills/)
+.claude/skills/code-voice/

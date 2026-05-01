@@ -56,6 +56,7 @@ class GenesisEgoContextBuilder:
         sections.append(await self._observations_section())
         sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
+        sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
         sections.append(self._output_contract_section())
@@ -126,57 +127,94 @@ class GenesisEgoContextBuilder:
         return "\n".join(lines)
 
     async def _signals_section(self) -> str:
-        """Recent awareness loop signal values."""
+        """Recent awareness loop signal values with trend indicators."""
         lines = ["## Awareness Signals (latest tick)\n"]
 
         try:
             cursor = await self._db.execute(
                 "SELECT signals_json, classified_depth, created_at "
                 "FROM awareness_ticks "
-                "ORDER BY created_at DESC LIMIT 1"
+                "ORDER BY created_at DESC LIMIT 3"
             )
-            row = await cursor.fetchone()
+            rows = await cursor.fetchall()
         except Exception:
             logger.error("Failed to query awareness_ticks", exc_info=True)
             lines.append("*No awareness data available.*\n")
             return "\n".join(lines)
 
-        if not row:
+        if not rows:
             lines.append("*No awareness ticks recorded.*\n")
             return "\n".join(lines)
 
-        signals_json, depth, created_at = row
+        # Parse signals from the most recent tick (display) and previous
+        # tick (trend comparison).
+        current_row = rows[0]
+        signals_json, depth, created_at = current_row
         lines.append(f"**Last tick**: {created_at} (depth: {depth})\n")
 
-        try:
-            signals = json.loads(signals_json) if signals_json else {}
-        except (json.JSONDecodeError, TypeError):
-            signals = {}
+        signals = self._parse_signals_json(signals_json)
 
-        # signals_json is stored as a list of {name, value, source} dicts,
-        # not a dict keyed by name. Normalize to dict for display.
-        if isinstance(signals, list):
-            signals = {
-                s["name"]: s
-                for s in signals
-                if isinstance(s, dict) and "name" in s
-            }
+        # Build previous tick's signal values for trend comparison
+        prev_values: dict[str, float] = {}
+        if len(rows) >= 2:
+            prev_signals = self._parse_signals_json(rows[1][0])
+            for name, info in prev_signals.items():
+                if isinstance(info, dict):
+                    v = info.get("value")
+                    if isinstance(v, (int, float)):
+                        prev_values[name] = float(v)
 
         if signals:
-            lines.append("| Signal | Value | Source |")
-            lines.append("|--------|-------|--------|")
+            lines.append("| Signal | Value | Trend | Source |")
+            lines.append("|--------|-------|-------|--------|")
             for sig_name, sig_info in sorted(signals.items()):
                 if isinstance(sig_info, dict):
                     val = sig_info.get("value", "?")
                     src = sig_info.get("source", "?")
+                    trend = self._signal_trend(sig_name, val, prev_values)
                     if isinstance(val, float):
                         val = f"{val:.3f}"
-                    lines.append(f"| {sig_name} | {val} | {src} |")
+                    lines.append(
+                        f"| {sig_name} | {val} | {trend} | {src} |"
+                    )
                 else:
-                    lines.append(f"| {sig_name} | {sig_info} | ? |")
+                    lines.append(f"| {sig_name} | {sig_info} | \u2192 | ? |")
 
         lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _parse_signals_json(signals_json: str | None) -> dict:
+        """Parse signals_json (list or dict format) into a name-keyed dict."""
+        try:
+            signals = json.loads(signals_json) if signals_json else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        if isinstance(signals, list):
+            return {
+                s["name"]: s
+                for s in signals
+                if isinstance(s, dict) and "name" in s
+            }
+        return signals if isinstance(signals, dict) else {}
+
+    @staticmethod
+    def _signal_trend(
+        name: str,
+        current_value: object,
+        prev_values: dict[str, float],
+    ) -> str:
+        """Compute trend arrow: \u2191 (up), \u2193 (down), \u2192 (stable/new)."""
+        if not isinstance(current_value, (int, float)):
+            return "\u2192"
+        curr = float(current_value)
+        prev = prev_values.get(name)
+        if prev is None:
+            return "\u2192"  # New signal, no history
+        delta = curr - prev
+        if abs(delta) < 0.01:  # Within noise threshold
+            return "\u2192"
+        return "\u2191" if delta > 0 else "\u2193"
 
     async def _observations_section(self) -> str:
         """Genesis-internal observations — system issues needing attention."""
@@ -306,6 +344,50 @@ class GenesisEgoContextBuilder:
             lines.append(f"- **Ego spend today**: ${ego_spend:.4f}")
         except Exception:
             pass
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _proposal_history_section(self) -> str:
+        """Recent proposal outcomes for self-calibration."""
+        lines = ["## Recent Proposals (last 7 days)\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT action_type, content, status, "
+                "user_response, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "ORDER BY created_at DESC "
+                "LIMIT 15"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            lines.append("*No proposal history available.*\n")
+            return "\n".join(lines)
+
+        if not rows:
+            lines.append("*No proposals in last 7 days.*\n")
+            return "\n".join(lines)
+
+        # Summary line for quick calibration
+        from collections import Counter
+        status_counts = Counter(r[2] for r in rows)
+        parts = [f"{status_counts[s]} {s}" for s in
+                 ("approved", "rejected", "executed", "pending", "failed",
+                  "expired", "tabled", "withdrawn")
+                 if status_counts.get(s)]
+        lines.append(f"**{len(rows)} proposals**: {', '.join(parts)}\n")
+
+        lines.append("| Action | Content | Status | Response |")
+        lines.append("|--------|---------|--------|----------|")
+        for action_type, content, status, response, _created in rows:
+            short = content[:80] + "..." if len(content) > 80 else content
+            short = short.replace("\n", " ").replace("|", "/")
+            resp = (response or "\u2014")[:50]
+            lines.append(
+                f"| {action_type} | {short} | {status} | {resp} |"
+            )
 
         lines.append("")
         return "\n".join(lines)
