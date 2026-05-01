@@ -30,6 +30,10 @@ class SystemPromptAssembler:
         if soul:
             parts.append(soul)
 
+        voice = self._read("VOICE.md")
+        if voice:
+            parts.append(voice)
+
         user = self._read("USER.md")
         if user:
             parts.append(user)

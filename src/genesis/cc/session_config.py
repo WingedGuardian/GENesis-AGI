@@ -96,12 +96,19 @@ class SessionConfigBuilder:
         }
 
     def _load_identity_block(self) -> str:
-        """Load SOUL.md identity content."""
+        """Load SOUL.md + VOICE.md identity content."""
         from pathlib import Path
 
-        soul_path = Path(__file__).resolve().parent.parent / "identity" / "SOUL.md"
+        identity_dir = Path(__file__).resolve().parent.parent / "identity"
+        soul_path = identity_dir / "SOUL.md"
+        voice_path = identity_dir / "VOICE.md"
+        parts: list[str] = []
         if soul_path.exists():
-            return soul_path.read_text(encoding="utf-8")
+            parts.append(soul_path.read_text(encoding="utf-8"))
+        if voice_path.exists():
+            parts.append(voice_path.read_text(encoding="utf-8"))
+        if parts:
+            return "\n\n---\n\n".join(parts)
         logger.warning("SOUL.md not found, using minimal identity")
         return "You are Genesis, an autonomous AI agent."
 

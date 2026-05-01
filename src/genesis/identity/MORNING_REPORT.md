@@ -37,7 +37,7 @@ Nothing before the first header. Nothing after the last bullet.
 
 Senior advisor writing a daily briefing. State facts. Be direct. Every
 sentence conveys information. If you catch yourself writing filler,
-delete it.
+delete it. See VOICE.md (advisory tone) for full reference.
 
 ## What IS and IS NOT Urgent
 
