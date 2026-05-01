@@ -77,7 +77,7 @@ async def ingest_knowledge_unit(
     unit_id = existing["id"] if existing else str(uuid.uuid4())
     old_qdrant_id = existing.get("qdrant_id") if existing else None
 
-    source_pipeline_val = (provenance or {}).get("source_pipeline", "recon")
+    source_pipeline_val = (provenance or {}).get("source_pipeline", "knowledge_ingest")
     source_session_id = (provenance or {}).get("session_id")
     qdrant_memory_id = await store.store(
         content,
