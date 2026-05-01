@@ -786,7 +786,7 @@ class UserEgoContextBuilder:
             "{\n"
             '  "proposals": [\n'
             "    {\n"
-            '      "action_type": "investigate|outreach|maintenance|dispatch|config",\n'
+            '      "action_type": "investigate|outreach|maintenance|dispatch|config|recurring_pattern",\n'
             '      "action_category": "category for tracking",\n'
             '      "content": "what you want to do (specific and actionable)",\n'
             '      "rationale": "why this helps the user",\n'

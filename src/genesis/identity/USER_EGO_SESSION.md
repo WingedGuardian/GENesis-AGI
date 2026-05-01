@@ -247,7 +247,7 @@ Use MCP tools to verify beliefs first, then output valid JSON:
 {
   "proposals": [
     {
-      "action_type": "investigate|outreach|maintenance|dispatch|config",
+      "action_type": "investigate|outreach|maintenance|dispatch|config|recurring_pattern",
       "action_category": "category for tracking",
       "content": "What you want to do (specific, actionable, user-focused)",
       "rationale": "Why this helps the user",

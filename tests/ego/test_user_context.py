@@ -505,6 +505,7 @@ class TestUserEgoContextBuilder:
             "## System Status",
             "## Open Threads",
             "## Recent Proposals",
+            "## Recurring Patterns (72h)",
             "## Output Contract",
         ]
         for section in expected_sections:
@@ -769,3 +770,57 @@ class TestUserEgoContextBuilder:
         )
         result = await builder.build()
         assert "All backlogs clear" in result
+
+    # ── Recurring Patterns (72h) ──────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_recurring_patterns_detected(self, db, mock_health_data, capabilities):
+        """3+ observations of same (type, category) appear as pattern."""
+        for i in range(4):
+            await db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, category, content, priority, resolved, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))",
+                (f"pat{i}", "test", "finding", "email_recon",
+                 f"Recruiter email #{i}", "medium"),
+            )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder._recurring_patterns_section()
+        assert "finding/email_recon" in result
+        assert "\u00d74" in result
+
+    @pytest.mark.asyncio
+    async def test_recurring_patterns_below_threshold(self, db, mock_health_data, capabilities):
+        """Fewer than 3 observations do NOT trigger pattern detection."""
+        for i in range(2):
+            await db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, category, content, priority, resolved, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, datetime('now'))",
+                (f"few{i}", "test", "task_detected", "user_request",
+                 f"Task #{i}", "low"),
+            )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder._recurring_patterns_section()
+        assert "No recurring patterns detected" in result
+
+    @pytest.mark.asyncio
+    async def test_recurring_patterns_excludes_resolved(self, db, mock_health_data, capabilities):
+        """Resolved observations are excluded from pattern detection."""
+        for i in range(4):
+            await db.execute(
+                "INSERT INTO observations "
+                "(id, source, type, category, content, priority, resolved, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, datetime('now'))",
+                (f"res{i}", "test", "finding", "email_recon",
+                 f"Resolved email #{i}", "medium"),
+            )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder._recurring_patterns_section()
+        assert "No recurring patterns detected" in result
