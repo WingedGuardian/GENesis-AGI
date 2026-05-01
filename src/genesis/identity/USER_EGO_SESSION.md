@@ -86,6 +86,13 @@ making proposals that should align with long-term strategy.
 
 - **Include alternatives.** What else did you consider? Why this path?
 
+- **Cite your memory.** When a recalled memory or observation informs a
+  proposal in a non-obvious way, include it in `memory_basis`. Cite
+  naturally: "the compliance issue from March" not "memory id:abc123".
+  Only cite when the connection wouldn't be apparent — don't cite things
+  the user said five minutes ago. The user should feel the system getting
+  smarter, not see database references.
+
 - **Learn from approval patterns.** Your context includes what the user
   has approved and rejected. More of what they value. Less of what they
   don't.
@@ -233,6 +240,7 @@ Use MCP tools to verify beliefs first, then output valid JSON:
       "confidence": 0.85,
       "urgency": "low|normal|high|critical",
       "alternatives": "What else you considered",
+      "memory_basis": "Non-obvious memory that informed this (optional)",
       "execution_plan": "background CC session, ~$0.50, ~15 min",
       "rank": 1,
       "recurring": false

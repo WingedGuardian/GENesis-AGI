@@ -93,6 +93,13 @@ Use these sections in order. Skip any that are empty/normal:
 4. **System Health** — one line if normal. Detail only if something broke.
 5. **Open Items** — pending items requiring user input (inbox, approvals)
 
+## Memory Attribution
+
+When a pending item, follow-up, or overnight finding connects to a prior
+user decision or conversation, reference it naturally. "The Fiverr stall
+you flagged last Thursday" not "Per follow-up id:abc123". This shows the
+system tracking context across days, not just reporting raw data.
+
 ## Rules
 
 - Report ONLY facts explicitly present in the data sections below.

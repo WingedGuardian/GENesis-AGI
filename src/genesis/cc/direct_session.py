@@ -145,6 +145,7 @@ class DirectSessionRequest:
     notify_on_failure_only: bool = False
     source_tag: str = "direct_session"
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
+    planning_instruction: str | None = None  # opt-in: prepended to prompt
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
@@ -355,8 +356,13 @@ class DirectSessionRunner:
         # memory_store, no observation_write).
         mcp_config = self._config_builder.build_mcp_config(profile="reflection")
 
+        # Prepend planning instruction if the caller opted in.
+        prompt = request.prompt
+        if request.planning_instruction:
+            prompt = f"{request.planning_instruction}\n\n{prompt}"
+
         return CCInvocation(
-            prompt=request.prompt,
+            prompt=prompt,
             model=request.model,
             effort=request.effort,
             system_prompt=system_prompt,

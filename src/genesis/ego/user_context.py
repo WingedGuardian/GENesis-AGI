@@ -747,7 +747,8 @@ class UserEgoContextBuilder:
             '      "rationale": "why this helps the user",\n'
             '      "confidence": 0.85,\n'
             '      "urgency": "low|normal|high|critical",\n'
-            '      "alternatives": "what else you considered"\n'
+            '      "alternatives": "what else you considered",\n'
+            '      "memory_basis": "non-obvious memory that informed this (optional)"\n'
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
