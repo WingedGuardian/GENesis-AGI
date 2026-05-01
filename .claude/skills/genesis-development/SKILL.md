@@ -114,6 +114,18 @@ Full syntax, Cypher examples, and decision matrix:
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
 
+### Code Discovery
+
+Use the right tool for how you're exploring:
+
+- **Architecture overview** — CBM `get_architecture(aspects=["overview"])`
+- **Finding symbols** — CBM `search_graph(name_pattern="...")` or Serena `find_symbol`
+- **Call tracing** — CBM `trace_path(function_name="...")` or Serena `find_referencing_symbols`
+- **Impact before changes** — GitNexus `impact(path="...")`
+- **Config/doc/non-code files** — Grep/Read directly
+
+Full decision matrix: `.claude/docs/code-intelligence.md`
+
 ## Adaptive Review Protocol
 
 Choose the review level proportional to the change:
@@ -162,6 +174,7 @@ references on every trigger.
 | V3 state, build order, GROUNDWORK, architecture docs | `references/architecture.md` |
 | Phase 6 contribution pipeline, sanitizer | `references/contribution.md` |
 | Pending work, active incidents, subsystem status | `references/build-state.md` |
+| Which code tool to use (CBM vs Serena vs GitNexus vs Grep) | `.claude/docs/code-intelligence.md` |
 
 **Freshness rule:** On first read of `codebase-map.md` in a session,
 verify structural claims against current code. If a package status or

@@ -21,6 +21,46 @@
             "timeout": 5000
           }
         ]
+      },
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "clear",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+            "timeout": 2000
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -77,6 +117,16 @@
           {
             "type": "command",
             "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook procedure_advisor.py",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-discovery-gate.sh",
             "timeout": 2000
           }
         ]

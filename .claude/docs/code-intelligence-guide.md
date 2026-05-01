@@ -1,7 +1,7 @@
-# Code Intelligence — Decision Guide
+# Code Intelligence — Deep Reference
 
-Three tools for code understanding. Each has a sweet spot — use the
-lightest tool that answers the question.
+Detailed reference for Serena, GitNexus, and codebase-memory-mcp.
+For the quick decision matrix, see: `.claude/docs/code-intelligence.md`
 
 ## When to Use Which
 

@@ -61,14 +61,13 @@ systemctl --user status genesis-server            # Verify server running
 
 ## Code Intelligence
 
-Three tools — use the lightest that answers the question:
+Four tool layers for code search and analysis, lightest to richest:
 
-- **Grep/Glob** — text patterns, any file type. Always available.
-- **Serena** (LSP/Pyright) — Python: definitions, references, type
-  hierarchies, safe rename. `mcp__serena__*` tools.
-- **GitNexus** (knowledge graph) — structural: impact analysis, execution
-  flows, community detection, route/tool mapping, change detection.
-  CLI: `gitnexus <command>`. ~34K nodes, ~51K edges.
+1. **Grep/Glob/Read** — text search, file patterns, direct reads. Configs, docs, non-code.
+2. **Serena** (`mcp__serena__*`) — Python LSP. Symbol lookup, references, type hierarchies, safe rename.
+3. **codebase-memory-mcp** (`mcp__codebase-memory-mcp__*`) — 66-language code graph. search_graph, trace_path, get_architecture.
+4. **GitNexus** (`mcp__gitnexus__*`) — blast radius, impact analysis, execution flows, rename.
+   CLI: `gitnexus <command>`. ~34K nodes, ~51K edges.
 
 **When to reach for GitNexus (all session types):**
 - Before editing code: `gitnexus impact <symbol>` for blast radius
@@ -88,8 +87,7 @@ Three tools — use the lightest that answers the question:
 **Known limitation:** FTS text search is broken on Linux
 (LadybugDB/ladybug#430). Use Grep/Serena for text search.
 
-Full syntax, Cypher examples, edge types, and decision matrix:
-`.claude/docs/code-intelligence-guide.md`
+Full decision matrix: `.claude/docs/code-intelligence.md`
 
 ## Skill Library
 
