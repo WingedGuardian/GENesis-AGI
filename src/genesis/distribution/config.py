@@ -12,20 +12,18 @@ _DEFAULT_CONFIG_PATH = Path.home() / ".genesis" / "config" / "distribution.yaml"
 
 
 @dataclass(frozen=True)
-class LinkedInConfig:
-    """LinkedIn-specific distribution config."""
+class MediumConfig:
+    """Medium-specific distribution config."""
 
-    connected_account_id: str = ""
-    author_urn: str = ""
-    user_id: str = "genesis"
-    daily_post_limit: int = 80
+    username: str = ""
+    publish_status: str = "public"  # public | draft | unlisted
 
 
 @dataclass(frozen=True)
 class DistributionConfig:
     """Top-level distribution configuration."""
 
-    linkedin: LinkedInConfig = field(default_factory=LinkedInConfig)
+    medium: MediumConfig = field(default_factory=MediumConfig)
 
 
 def load_distribution_config(
@@ -43,14 +41,12 @@ def load_distribution_config(
         with path.open() as f:
             raw = yaml.safe_load(f) or {}
 
-        linkedin_raw = raw.get("linkedin", {})
-        linkedin = LinkedInConfig(
-            connected_account_id=str(linkedin_raw.get("connected_account_id", "")),
-            author_urn=str(linkedin_raw.get("author_urn", "")),
-            user_id=str(linkedin_raw.get("user_id", "genesis")),
-            daily_post_limit=int(linkedin_raw.get("daily_post_limit", 80)),
+        medium_raw = raw.get("medium", {})
+        medium = MediumConfig(
+            username=str(medium_raw.get("username", "")),
+            publish_status=str(medium_raw.get("publish_status", "public")),
         )
-        return DistributionConfig(linkedin=linkedin)
+        return DistributionConfig(medium=medium)
     except Exception:
         logger.warning("Failed to load distribution config from %s", path, exc_info=True)
         return DistributionConfig()
