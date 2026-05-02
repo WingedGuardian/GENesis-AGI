@@ -367,10 +367,23 @@ class TelegramAdapterV2(ChannelAdapter):
         except Exception:
             log.exception("Failed to stop updater — skipping restart")
             return
-        try:
-            await self._app.updater.start_polling(drop_pending_updates=False)
-            log.info("Polling restarted successfully after stall")
-        except Exception:
-            log.exception(
-                "Failed to restart polling — will retry on next stall cycle"
-            )
+        # Try up to 2 attempts with a short delay between them.
+        # Without this, a single TimedOut failure (e.g. on bootstrap_del_webhook)
+        # leaves polling dead for the full stall-backoff period (up to 15 min).
+        for attempt in range(2):
+            try:
+                await self._app.updater.start_polling(drop_pending_updates=False)
+                log.info("Polling restarted successfully after stall")
+                return
+            except Exception:
+                if attempt == 0:
+                    log.warning(
+                        "start_polling attempt 1 failed — retrying in 5s",
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(5)
+                else:
+                    log.exception(
+                        "Failed to restart polling after 2 attempts — "
+                        "will retry on next stall cycle"
+                    )
