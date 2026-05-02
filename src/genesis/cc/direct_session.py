@@ -295,9 +295,6 @@ class DirectSessionRunner:
                 output_tokens=output.output_tokens,
             )
 
-            if request.notify and not request.notify_on_failure_only:
-                await self._notify(request, result, success=True)
-
             logger.info(
                 "Direct session %s completed: %.1fs, $%.4f, %d tools",
                 session_id[:8], elapsed, output.cost_usd, len(telemetry),
