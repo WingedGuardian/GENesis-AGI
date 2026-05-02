@@ -16,7 +16,6 @@ class MediumConfig:
     """Medium-specific distribution config."""
 
     username: str = ""
-    publish_status: str = "public"  # public | draft | unlisted
 
 
 @dataclass(frozen=True)
@@ -44,7 +43,6 @@ def load_distribution_config(
         medium_raw = raw.get("medium", {})
         medium = MediumConfig(
             username=str(medium_raw.get("username", "")),
-            publish_status=str(medium_raw.get("publish_status", "public")),
         )
         return DistributionConfig(medium=medium)
     except Exception:

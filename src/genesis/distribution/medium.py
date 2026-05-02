@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Protocol
@@ -44,26 +45,32 @@ class CamoufoxBrowserClient:
         return await _impl_browser_navigate(url)
 
     async def click(self, selector: str) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_click
         return await _impl_browser_click(selector)
 
     async def fill(self, selector: str, value: str) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_fill
         return await _impl_browser_fill(selector, value)
 
     async def run_js(self, expression: str) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_run_js
         return await _impl_browser_run_js(expression)
 
     async def snapshot(self) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_snapshot
         return await _impl_browser_snapshot()
 
     async def screenshot(self) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_screenshot
         return await _impl_browser_screenshot()
 
     async def press_key(self, key: str, count: int = 1) -> dict[str, Any]:
+        await self._ensure_browser()
         from genesis.mcp.health.browser import _impl_browser_press_key
         return await _impl_browser_press_key(key, count)
 
@@ -77,24 +84,32 @@ def _extract_title(content: str) -> str:
         line = line.strip()
         if not line:
             continue
-        # Markdown heading
         match = re.match(r"^#+\s+(.+)$", line)
         if match:
             return match.group(1).strip()
-        # First non-empty line as title
         return line[:100]
     return "Untitled"
 
 
 def _extract_body(content: str) -> str:
-    """Extract body text, stripping the title line if it's a heading."""
+    """Extract body text, stripping the title line."""
     lines = content.strip().splitlines()
     if not lines:
         return content
     first = lines[0].strip()
+    # Strip markdown heading used as title
     if re.match(r"^#+\s+", first):
         return "\n".join(lines[1:]).strip()
-    return content.strip()
+    # Strip plain first line used as title
+    return "\n".join(lines[1:]).strip()
+
+
+# Login detection markers — more specific than just "Write"
+_LOGIN_MARKERS = [
+    "Write a story",
+    "New story",
+    "Your stories",
+]
 
 
 class MediumDistributor:
@@ -138,8 +153,11 @@ class MediumDistributor:
         snap = await self._browser.snapshot()
         snapshot_text = str(snap.get("snapshot", ""))
 
-        # Logged-in Medium shows "Write" button or user avatar
-        logged_in = "Write" in snapshot_text or self._username in snapshot_text
+        # Check for login-specific markers (not just "Write" which is too generic)
+        logged_in = (
+            self._username in snapshot_text
+            or any(marker in snapshot_text for marker in _LOGIN_MARKERS)
+        )
         if not logged_in:
             logger.info("Not logged in to Medium (username: %s)", self._username)
         return logged_in
@@ -192,31 +210,39 @@ class MediumDistributor:
                     error=f"Failed to open Medium editor: {result['error']}",
                 )
 
-            # Step 3: Wait for editor and type title
-            # Medium's editor uses contenteditable divs, not input fields.
-            # The title placeholder is typically the first editable element.
+            # Step 3: Verify editor loaded
+            snap = await self._browser.snapshot()
+            snap_text = str(snap.get("snapshot", ""))
+            if "Tell your story" not in snap_text and "Title" not in snap_text:
+                logger.warning("Editor may not have loaded: %s", snap_text[:200])
+
+            # Step 4: Type title into the editor
             await self._browser.click('h3[data-contents="true"], [data-testid="post-title"], h3.graf--title')
             await self._browser.run_js(
-                f"document.execCommand('insertText', false, {_js_string(title)})"
+                f"document.execCommand('insertText', false, {json.dumps(title)})"
             )
 
-            # Step 4: Move to body and insert content
+            # Step 5: Move to body and insert content
             await self._browser.press_key("Enter", count=2)
-            # Use insertText for the body — works in contenteditable
             await self._browser.run_js(
-                f"document.execCommand('insertText', false, {_js_string(body)})"
+                f"document.execCommand('insertText', false, {json.dumps(body)})"
             )
 
-            # Step 5: Trigger publish flow
-            # Click the "Publish" button (top-right)
+            # Step 6: Trigger publish flow
             await self._browser.click('button[data-testid="publishButton"], button:has-text("Publish")')
 
-            # Step 6: Handle publish dialog — click final "Publish now"
+            # Step 7: Verify publish dialog appeared
+            dialog_snap = await self._browser.snapshot()
+            dialog_text = str(dialog_snap.get("snapshot", ""))
+            if "Publish" not in dialog_text:
+                logger.warning("Publish dialog may not have appeared")
+
+            # Step 8: Confirm publish
             await self._browser.click(
                 'button[data-testid="confirmPublish"], button:has-text("Publish now")'
             )
 
-            # Step 7: Capture the URL after redirect
+            # Step 9: Capture the URL after redirect
             snap = await self._browser.snapshot()
             current_url = snap.get("url", "")
 
@@ -249,17 +275,19 @@ class MediumDistributor:
         if not self.available:
             return False
 
+        # Check login before attempting delete
+        if not await self._check_logged_in():
+            logger.warning("Cannot delete Medium post — not logged in")
+            return False
+
         try:
-            # post_id for Medium is the URL slug or full URL
             url = post_id if post_id.startswith("http") else f"https://medium.com/p/{post_id}"
             result = await self._browser.navigate(url)
             if "error" in result:
                 return False
 
-            # Click the "..." menu, then "Delete story"
             await self._browser.click('[aria-label="More actions"], button:has-text("⋯")')
             await self._browser.click('button:has-text("Delete story")')
-            # Confirm deletion
             await self._browser.click('button:has-text("Delete"), button:has-text("Confirm")')
 
             logger.info("Deleted Medium post: %s", post_id)
@@ -267,8 +295,3 @@ class MediumDistributor:
         except Exception:
             logger.error("Medium delete failed for %s", post_id, exc_info=True)
             return False
-
-
-def _js_string(s: str) -> str:
-    """Escape a Python string for safe JS string literal embedding."""
-    return "'" + s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "\\r") + "'"

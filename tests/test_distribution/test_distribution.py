@@ -14,7 +14,6 @@ from genesis.distribution.medium import (
     MediumDistributor,
     _extract_body,
     _extract_title,
-    _js_string,
 )
 from genesis.modules.content_pipeline.publisher import _row_to_publish, ensure_table
 
@@ -37,7 +36,6 @@ class TestDistributionConfig:
     def test_defaults(self):
         config = DistributionConfig()
         assert config.medium.username == ""
-        assert config.medium.publish_status == "public"
 
     def test_load_missing_file(self, tmp_path):
         config = load_distribution_config(path=tmp_path / "nonexistent.yaml")
@@ -48,11 +46,9 @@ class TestDistributionConfig:
         path.write_text(
             "medium:\n"
             "  username: testuser\n"
-            "  publish_status: draft\n"
         )
         config = load_distribution_config(path=path)
         assert config.medium.username == "testuser"
-        assert config.medium.publish_status == "draft"
 
     def test_load_empty_yaml(self, tmp_path):
         path = tmp_path / "distribution.yaml"
@@ -82,14 +78,9 @@ class TestContentExtraction:
         body = _extract_body("# Title\n\nParagraph one.\nParagraph two.")
         assert body == "Paragraph one.\nParagraph two."
 
-    def test_extract_body_keeps_plain(self):
+    def test_extract_body_strips_plain_title(self):
         body = _extract_body("First line\nSecond line")
-        assert body == "First line\nSecond line"
-
-    def test_js_string_escapes(self):
-        assert _js_string("it's") == "'it\\'s'"
-        assert _js_string("line\none") == "'line\\none'"
-        assert _js_string("back\\slash") == "'back\\\\slash'"
+        assert body == "Second line"
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +114,7 @@ class MockBrowser:
     async def snapshot(self) -> dict[str, Any]:
         self.calls.append(("snapshot", ()))
         if self._logged_in:
-            return {"snapshot": "Write a story... testuser avatar", "url": self._publish_url}
+            return {"snapshot": "Write a story... Your stories testuser avatar", "url": self._publish_url}
         return {"snapshot": "Sign in to Medium", "url": "https://medium.com/"}
 
     async def screenshot(self) -> dict[str, Any]:
