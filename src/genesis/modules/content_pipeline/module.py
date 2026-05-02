@@ -41,7 +41,7 @@ class ContentPipelineModule:
         self._auto_capture_recon: bool = False
         self._auto_capture_trends: bool = False
         self._autonomous_drafting: bool = False
-        self._platform_targets: list[str] = ["telegram", "medium", "linkedin"]
+        self._platform_targets: list[str] = ["telegram", "medium"]
         self._engagement_threshold: int = 50
 
     @property
@@ -261,8 +261,8 @@ class ContentPipelineModule:
              "value": self._autonomous_drafting, "default": False,
              "description": "Auto-draft scripts from ideas without explicit request"},
             {"name": "platform_targets", "label": "Platform Targets", "type": "list",
-             "value": self._platform_targets, "default": ["telegram", "medium", "linkedin"],
-             "description": "Platforms to generate content for (telegram, linkedin, reddit, etc.)"},
+             "value": self._platform_targets, "default": ["telegram", "medium"],
+             "description": "Platforms to generate content for (telegram, medium, reddit, etc.)"},
             {"name": "engagement_threshold", "label": "Engagement Threshold", "type": "int",
              "value": self._engagement_threshold, "default": 50, "min": 0,
              "description": "Minimum engagement score to extract lessons from outcomes"},
