@@ -229,6 +229,21 @@ class MigrationRunner:
         migration's transaction is rolled back, execution stops, and
         the remaining migrations are not attempted.
         """
+        # Pre-flight: detect duplicate migration prefixes before touching
+        # the DB.  Two files sharing a prefix (e.g. 0008_foo and 0008_bar)
+        # will cause a UNIQUE constraint failure on schema_migrations.id
+        # mid-run — catch it here with a clear diagnostic instead.
+        available = await self.get_available()
+        seen: dict[str, str] = {}
+        for mid, name, _path in available:
+            if mid in seen:
+                raise RuntimeError(
+                    f"Duplicate migration prefix '{mid}': "
+                    f"'{seen[mid]}' and '{name}'. "
+                    f"Rename one file to use the next available prefix."
+                )
+            seen[mid] = name
+
         pending = await self.get_pending()
         if not pending:
             logger.info("No pending migrations")
