@@ -71,7 +71,7 @@ delete it.
 - System health — one line if all nominal. Only detail if something is
   actually broken (down, not just degraded).
 - Cost — daily and monthly totals
-- Items requiring user decision — pending approvals, inbox items
+- Items requiring user decision — pending approvals, ego proposals, inbox items
 
 **Omit entirely:**
 - Stable/normal metrics (compress to "All systems nominal")
