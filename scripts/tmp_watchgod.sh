@@ -212,16 +212,16 @@ check_cc_tmp() {
 
 clean_sys_yellow() {
     log INFO "Zone B YELLOW — cleaning /tmp files not accessed in 7+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -name "*.sock" \
+    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +7 -delete 2>/dev/null || true
-    find /tmp -mindepth 1 -type d -empty -not -path "*/tmux-*" -not -path "*/pytest-*" \
+    find /tmp -mindepth 1 -type d -empty -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" \
         -delete 2>/dev/null || true
 }
 
 clean_sys_orange() {
     clean_sys_yellow
     log WARN "Zone B ORANGE — cleaning /tmp files not accessed in 3+ days"
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -name "*.sock" \
+    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +3 -delete 2>/dev/null || true
     mkdir -p "$ALERT_DIR"
     touch "$ALERT_DIR/tmp_warning"
@@ -230,14 +230,14 @@ clean_sys_orange() {
 clean_sys_red() {
     log WARN "Zone B RED — aggressive /tmp cleanup"
     # Files not accessed in 1+ day
-    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -name "*.sock" \
+    find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
         -atime +1 -delete 2>/dev/null || true
 
-    # If still critical, remove all regular files except last 1h, sockets, tmux, pytest
+    # If still critical, remove all regular files except last 1h, sockets, tmux, pytest, claude
     local pct_after
     pct_after=$(tmp_usage_pct)
     if (( pct_after > 85 )); then
-        find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -name "*.sock" \
+        find /tmp -type f -not -path "*/tmux-*" -not -path "*/pytest-*" -not -path "*/claude-*" -not -name "*.sock" \
             -mmin +60 -delete 2>/dev/null || true
     fi
 

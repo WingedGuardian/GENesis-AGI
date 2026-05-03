@@ -202,11 +202,19 @@ async def follow_up_create(
     Args:
         content: What needs to happen (actionable description)
         reason: Why this follow-up exists (context for future sessions/ego)
-        strategy: How to handle it:
-            - scheduled_task: Run at scheduled_at time via surplus
-            - surplus_task: Run ASAP via surplus scheduler
-            - ego_judgment: Needs ego evaluation in next cycle
-            - user_input_needed: Requires user decision, surfaced in morning report
+        strategy: How to handle it — choose based on what kind of work this requires:
+            - user_input_needed: Park this for a future interactive session. No
+              automation touches it. Use for anything requiring real CC sessions:
+              coding, plan execution, Genesis development, file edits. Surfaces in
+              morning report so the user can trigger a session when ready.
+            - surplus_task: Enqueue to the free-model surplus system. Runs on idle
+              compute using lightweight free-tier models. ONLY for pure analysis,
+              summarization, or data processing. NOT for code changes, file edits,
+              or anything requiring an interactive CC session.
+            - scheduled_task: Same as surplus_task but triggered at a specific time.
+              Same constraints — free model only, no interactive work.
+            - ego_judgment: Hand to ego for evaluation in its next cycle. Ego decides
+              whether to act, defer, or escalate. Not auto-executed.
         scheduled_at: ISO datetime for scheduled_task strategy (required if strategy is scheduled_task)
         priority: low | medium | high | critical
         pinned: If true, ego can see this follow-up but cannot auto-resolve it.

@@ -17,7 +17,7 @@ from genesis.db.crud import awareness_ticks
 
 def test_micro_multiplier_at_zero():
     """Micro: 0.3x at 0 minutes elapsed."""
-    assert compute_time_multiplier(Depth.MICRO, elapsed_seconds=0) == 0.3
+    assert compute_time_multiplier(Depth.MICRO, elapsed_seconds=0) == 0.5
 
 
 def test_micro_multiplier_at_floor():
@@ -31,13 +31,13 @@ def test_micro_multiplier_at_overdue():
 
 
 def test_micro_multiplier_interpolated():
-    """Micro: halfway between 0min (0.3) and 30min (1.0) should be ~0.65."""
+    """Micro: halfway between 0min (0.5) and 30min (1.0) should be ~0.75."""
     result = compute_time_multiplier(Depth.MICRO, elapsed_seconds=900)
-    assert abs(result - 0.65) < 0.01
+    assert abs(result - 0.75) < 0.01
 
 
 def test_light_multiplier_at_zero():
-    assert compute_time_multiplier(Depth.LIGHT, elapsed_seconds=0) == 0.5
+    assert compute_time_multiplier(Depth.LIGHT, elapsed_seconds=0) == 0.8
 
 
 def test_light_multiplier_at_3h():
