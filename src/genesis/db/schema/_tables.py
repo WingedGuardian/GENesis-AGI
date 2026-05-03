@@ -824,7 +824,11 @@ TABLES = {
             collection       TEXT NOT NULL DEFAULT 'episodic_memory',
             confidence       REAL,
             embedding_status TEXT NOT NULL DEFAULT 'embedded',
-            memory_class     TEXT DEFAULT 'fact'
+            memory_class     TEXT DEFAULT 'fact',
+            wing             TEXT,
+            room             TEXT,
+            valid_at         TEXT,
+            invalid_at       TEXT
         )
     """,
     "code_modules": """
@@ -1080,6 +1084,8 @@ INDEXES = [
     # memory metadata (companion to FTS5)
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_created ON memory_metadata(created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_collection ON memory_metadata(collection)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_meta_valid_at ON memory_metadata(valid_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_meta_invalid_at ON memory_metadata(invalid_at)",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",
