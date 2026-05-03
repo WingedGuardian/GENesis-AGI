@@ -22,8 +22,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
-
 
 # Flags that pytest accepts (non-exhaustive but covers common ones).
 # Used to distinguish "pytest -v" (no path) from "pytest tests/foo.py -v".

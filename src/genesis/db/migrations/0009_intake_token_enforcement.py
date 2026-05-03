@@ -30,6 +30,14 @@ async def up(db: aiosqlite.Connection) -> None:
         )
     """)
 
+    # Check if task_states exists (it's created by the base schema, not
+    # migrations — skip ALTER/triggers on bare DBs like CI test fixtures)
+    cursor = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_states'"
+    )
+    if not await cursor.fetchone():
+        return
+
     # Add intake_token column to task_states (idempotent)
     try:
         await db.execute(
