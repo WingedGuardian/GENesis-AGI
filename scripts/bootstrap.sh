@@ -301,6 +301,46 @@ CODEXCFG
 fi
 echo
 
+# --- Code Intelligence Tools ---
+echo "--- Installing code intelligence tools ---"
+
+# codebase-memory-mcp (code graph — 66 languages)
+if ! command -v codebase-memory-mcp &>/dev/null; then
+    echo "  codebase-memory-mcp not found — installing..."
+    curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui \
+        || echo "  WARNING: codebase-memory-mcp install failed (non-critical)"
+fi
+if command -v codebase-memory-mcp &>/dev/null; then
+    echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
+fi
+
+# GitNexus (blast radius, impact analysis, execution flows)
+if _node_version_ok; then
+    if ! command -v gitnexus &>/dev/null; then
+        echo "  GitNexus not found — installing..."
+        npm install -g gitnexus@latest 2>/dev/null || echo "  WARNING: GitNexus install failed (non-critical)"
+    fi
+    if command -v gitnexus &>/dev/null; then
+        echo "  GitNexus: $(gitnexus --version 2>/dev/null)"
+    fi
+fi
+
+# Serena (Python LSP — symbols, references, rename)
+if ! command -v uv &>/dev/null; then
+    echo "  uv not found — installing..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh 2>/dev/null \
+        || echo "  WARNING: uv install failed (non-critical)"
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if command -v uv &>/dev/null && ! command -v serena &>/dev/null; then
+    echo "  Serena not found — installing..."
+    uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+fi
+if command -v serena &>/dev/null; then
+    echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
+fi
+echo
+
 # --- Python venv ---
 echo "--- Setting up Python venv ---"
 VENV_DIR="$GENESIS_ROOT/.venv"
@@ -398,6 +438,62 @@ if [[ -n "$HOOKS_DST" ]]; then
         done
     fi
 fi
+echo
+
+# --- MCP Server Registration (Code Intelligence) ---
+echo "--- Registering code intelligence MCP servers ---"
+_register_mcp() {
+    local name="$1" scope="$2"
+    shift 2
+    local cmd_args=("$@")
+    if command -v claude &>/dev/null; then
+        # Check if already registered (avoid duplicates)
+        if claude mcp list 2>/dev/null | grep -q "\"$name\""; then
+            echo "  $name: already registered"
+            return 0
+        fi
+        claude mcp add "$name" -s "$scope" -- "${cmd_args[@]}" 2>/dev/null \
+            && echo "  $name: registered ($scope)" \
+            || echo "  WARNING: Failed to register $name"
+    else
+        echo "  WARNING: 'claude' CLI not found — skipping $name registration"
+    fi
+}
+
+if command -v gitnexus &>/dev/null; then
+    _register_mcp "gitnexus" "user" "gitnexus" "mcp"
+fi
+if command -v codebase-memory-mcp &>/dev/null; then
+    _register_mcp "codebase-memory-mcp" "user" "codebase-memory-mcp"
+fi
+if command -v serena &>/dev/null; then
+    _register_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$GENESIS_ROOT"
+fi
+echo
+
+# --- Code Intelligence Indexing ---
+echo "--- Triggering code intelligence indexing ---"
+CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
+mkdir -p "$(dirname "$CI_LOG")"
+
+if command -v gitnexus &>/dev/null; then
+    if [[ ! -d "$GENESIS_ROOT/.gitnexus" ]]; then
+        echo "  GitNexus: running initial analysis (background)..."
+        ( cd "$GENESIS_ROOT" && gitnexus analyze --quiet >> "$CI_LOG" 2>&1 ) &
+        disown 2>/dev/null || true
+    else
+        echo "  GitNexus: index exists (use 'gitnexus analyze' to rebuild)"
+    fi
+fi
+
+if command -v codebase-memory-mcp &>/dev/null; then
+    echo "  codebase-memory-mcp: indexing repository (background)..."
+    ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$GENESIS_ROOT\"}" \
+        >> "$CI_LOG" 2>&1 ) &
+    disown 2>/dev/null || true
+fi
+
+echo "  Log: $CI_LOG"
 echo
 
 # --- Timezone ---
