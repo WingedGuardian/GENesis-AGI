@@ -190,6 +190,7 @@ class TestFollowUpDispatcher:
 
         fu = await follow_ups.get_by_id(db, fid)
         task = await surplus_tasks.get_by_id(db, fu["linked_task_id"])
-        # Falls back to keyword "benchmark" → MODEL_EVAL
+        # Falls back to keyword "benchmark" → BRAINSTORM_SELF (not MODEL_EVAL,
+        # which requires model_id that keyword matching can't provide)
         from genesis.surplus.types import TaskType
-        assert task["task_type"] == str(TaskType.MODEL_EVAL)
+        assert task["task_type"] == str(TaskType.BRAINSTORM_SELF)

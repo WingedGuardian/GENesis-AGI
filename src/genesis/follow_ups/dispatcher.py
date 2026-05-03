@@ -161,8 +161,11 @@ class FollowUpDispatcher:
         # 2. Fall back to keyword matching on content
         content = fu.get("content", "").lower()
 
+        # Don't route to MODEL_EVAL via keyword — it requires model_id in
+        # payload which keyword matching can't provide.  Legitimate MODEL_EVAL
+        # follow-ups arrive via structured routing (recon pipeline) above.
         if "benchmark" in content or "eval" in content:
-            return TaskType.MODEL_EVAL, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
+            return TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
         # DEACTIVATED: anticipatory_research has no web search — route to
         # brainstorm_self until redesigned as CC session task.
         if "research" in content:
