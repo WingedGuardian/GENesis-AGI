@@ -1,8 +1,8 @@
 # Genesis Documentation
 
 > A map of everything documented. Start wherever matches your interest —
-> architecture for how it works, journey for why it was built this way,
-> reference for operational details.
+> deep-dives for subsystem internals, case studies for what Genesis does
+> in practice, architecture for design decisions, journey for how it was built.
 
 ---
 
@@ -11,6 +11,20 @@
 - [README.md](../README.md) — What Genesis is
 - [SETUP.md](../SETUP.md) — Installation and configuration
 - [SECURITY.md](../SECURITY.md) — Security model and vulnerability reporting
+
+---
+
+## How It Works
+
+Deep-dives into the subsystems that make Genesis work. Contributor-facing: understand
+the internals well enough to modify them.
+
+- [Multi-Provider Routing](architecture/routing-deep-dive.md) — Circuit breakers, rate
+  gates, fallback chains, dead-letter recovery across 20+ providers
+- [Hybrid Memory](architecture/memory-deep-dive.md) — 4-layer architecture, RRF fusion,
+  activation scoring, graceful degradation
+- [Earned Autonomy](architecture/autonomy-deep-dive.md) — Bayesian trust model, context
+  ceilings, approval gates, enforcement layers
 
 ---
 
@@ -118,6 +132,20 @@ The story of building Genesis — why each phase exists and what it taught us.
 
 - [How Genesis Evaluates Itself](journey/how-genesis-evaluates-itself.md) —
   Self-assessment as structured introspection. The mirror.
+
+---
+
+## Case Studies
+
+What Genesis does in practice. User-facing: concrete operational examples showing
+what Genesis can do for you.
+
+- [Provider Outages, Zero Interruption](case-studies/multi-provider-routing.md) —
+  How Genesis handles provider failures without interruption
+- [Three Months Later, It Remembers](case-studies/hybrid-memory.md) —
+  How Genesis recalls context across months of sessions
+- [Trust That Has to Be Earned](case-studies/earned-autonomy.md) —
+  How Genesis earns and loses autonomy through demonstrated competence
 
 ---
 
