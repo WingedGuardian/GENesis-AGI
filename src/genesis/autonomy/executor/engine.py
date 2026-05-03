@@ -332,6 +332,14 @@ class CCSessionExecutor:
                             if trace:
                                 self._tracer.record_step(trace, dd_retry)
                             continue
+                        if dd_retry.status == "blocked":
+                            await self._persist_blocker(
+                                task_id,
+                                dd_retry.blocker_description or "Blocked during due diligence retry",
+                                TaskPhase.EXECUTING,
+                                step_idx=step["idx"],
+                            )
+                            return False
 
                     # Layer 3: full research session
                     researched, research_result = (
@@ -371,6 +379,16 @@ class CCSessionExecutor:
                                 if trace:
                                     self._tracer.record_step(trace, retry)
                                 break
+                            if retry.status == "blocked":
+                                await self._persist_blocker(
+                                    task_id,
+                                    retry.blocker_description or "Blocked during exit gate retry",
+                                    TaskPhase.EXECUTING,
+                                    step_idx=step["idx"],
+                                )
+                                return False
+                            # Update result for next gate cycle so it judges fresh evidence
+                            result = retry
                     else:
                         # Hit cap 10 — force accept (safety net)
                         logger.warning(

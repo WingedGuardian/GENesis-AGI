@@ -116,12 +116,17 @@ class DeepResearcherImpl:
 
         prompt = self._build_research_prompt(step, error, prior_attempts, due_diligence_results)
 
+        # Build MCP config so the research session has access to Genesis
+        # MCP servers (memory recall, web search tools).
+        mcp_config = self._build_mcp_config()
+
         invocation = CCInvocation(
             prompt=prompt,
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=None,  # Uses default SOUL.md identity
             append_system_prompt=True,
+            mcp_config=mcp_config,
             timeout_s=1800,  # 30 min max for research
             skip_permissions=True,
             disallowed_tools=[
@@ -151,6 +156,17 @@ class DeepResearcherImpl:
             )
 
         return self._parse_research_output(output)
+
+    def _build_mcp_config(self) -> str | None:
+        """Build MCP config for research sessions (reflection profile)."""
+        try:
+            from genesis.cc.session_config import SessionConfigBuilder
+
+            builder = SessionConfigBuilder()
+            return builder.build_mcp_config(profile="reflection")
+        except Exception:
+            logger.debug("Could not build MCP config, session will use project defaults")
+            return None
 
     # ─── Private Helpers ───────────────────────────────────────��────────────
 
