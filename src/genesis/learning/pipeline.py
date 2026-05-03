@@ -155,7 +155,14 @@ def build_triage_pipeline(
                 logger.error("Procedure extraction failed (non-fatal)", exc_info=True)
 
         # 6.6. STEERING.md auto-population from user corrections
-        if outcome == OutcomeClass.APPROACH_FAILURE and identity_loader is not None:
+        # Only extract from foreground user sessions — autonomous pipelines
+        # (inbox, mail, reflection) must never write to identity files.
+        _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
+        if (
+            outcome == OutcomeClass.APPROACH_FAILURE
+            and identity_loader is not None
+            and summary.channel not in _AUTONOMOUS_CHANNELS
+        ):
             try:
                 _extract_steering_rule(summary, identity_loader)
             except Exception:
