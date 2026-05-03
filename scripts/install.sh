@@ -595,6 +595,33 @@ for tool in unzip htop tmux tree; do
     fi
 done
 
+# Code intelligence tools (optional — enhance Claude Code sessions)
+echo "    Installing code intelligence tools..."
+
+if ! command -v codebase-memory-mcp &>/dev/null; then
+    curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui 2>/dev/null \
+        && echo "    + codebase-memory-mcp installed" \
+        || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
+fi
+
+if _node_version_ok; then
+    if ! command -v gitnexus &>/dev/null; then
+        npm install -g gitnexus@latest 2>/dev/null \
+            && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
+            || echo "    NOTE: GitNexus unavailable (optional)"
+    fi
+fi
+
+if ! command -v uv &>/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if command -v uv &>/dev/null && ! command -v serena &>/dev/null; then
+    uv tool install serena-agent 2>/dev/null \
+        && echo "    + Serena installed" \
+        || echo "    NOTE: Serena unavailable (optional)"
+fi
+
 # Python venv — prefer python3.12 for venv creation
 PYTHON_BIN=$(command -v python3.12 || command -v python3)
 if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PATH/bin/pip" ]; then
@@ -834,6 +861,37 @@ if [ -f "$MCP_TEMPLATE" ]; then
     fi
 else
     echo "    - MCP template not found (skipping)"
+fi
+
+# Register code intelligence tools as MCP servers
+if command -v claude &>/dev/null; then
+    _register_ci_mcp() {
+        local name="$1" scope="$2"; shift 2
+        if ! claude mcp list 2>/dev/null | grep -q "^$name:"; then
+            claude mcp add "$name" -s "$scope" -- "$@" 2>/dev/null \
+                && echo "    + MCP: $name registered ($scope)" || true
+        fi
+    }
+    command -v gitnexus &>/dev/null && \
+        _register_ci_mcp "gitnexus" "user" "gitnexus" "mcp"
+    command -v codebase-memory-mcp &>/dev/null && \
+        _register_ci_mcp "codebase-memory-mcp" "user" "codebase-memory-mcp"
+    command -v serena &>/dev/null && \
+        _register_ci_mcp "serena" "project" "serena" "start-mcp-server" "--context" "claude-code" "--project" "$REPO_DIR"
+fi
+
+# Trigger initial code intelligence indexing (background)
+CI_LOG="$HOME/.genesis/code-intelligence-setup.log"
+mkdir -p "$(dirname "$CI_LOG")"
+if command -v gitnexus &>/dev/null && [ ! -d "$REPO_DIR/.gitnexus" ]; then
+    ( cd "$REPO_DIR" && gitnexus analyze --quiet >> "$CI_LOG" 2>&1 ) &
+    disown 2>/dev/null || true
+    echo "    + GitNexus: initial indexing (background)"
+fi
+if command -v codebase-memory-mcp &>/dev/null; then
+    ( codebase-memory-mcp cli index_repository "{\"repo_path\": \"$REPO_DIR\"}" >> "$CI_LOG" 2>&1 ) &
+    disown 2>/dev/null || true
+    echo "    + codebase-memory-mcp: indexing (background)"
 fi
 
 
