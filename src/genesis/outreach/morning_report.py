@@ -305,6 +305,9 @@ class MorningReportGenerator:
         return header + "\n" + entries
 
     async def _get_pending_items(self) -> str:
+        lines: list[str] = []
+
+        # Message queue items
         cursor = await self._db.execute(
             "SELECT message_type, source, priority, content, created_at "
             "FROM message_queue "
@@ -313,12 +316,54 @@ class MorningReportGenerator:
             "ORDER BY priority, created_at LIMIT 10"
         )
         rows = await cursor.fetchall()
-        if not rows:
-            return "No pending items."
-        return "\n".join(
-            f"- [{r[0]}] priority={r[2]}, from={r[1] or '?'}, created={r[4]}: {r[3][:200]}"
-            for r in rows
-        )
+        for r in rows:
+            lines.append(
+                f"- [{r[0]}] priority={r[2]}, from={r[1] or '?'}, "
+                f"created={r[4]}: {r[3][:200]}"
+            )
+
+        # Pending ego proposals (user needs to approve/reject on dashboard)
+        try:
+            cursor = await self._db.execute(
+                "SELECT id, content, urgency, created_at FROM ego_proposals "
+                "WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5"
+            )
+            proposals = await cursor.fetchall()
+            if proposals:
+                lines.append(
+                    f"- {len(proposals)} pending ego proposal(s) "
+                    "(approve/reject on dashboard):"
+                )
+                for p in proposals:
+                    lines.append(
+                        f"  - {(p[1] or '?')[:150]} "
+                        f"(urgency={p[2] or 'normal'})"
+                    )
+        except Exception:
+            logger.warning(
+                "Morning report: ego proposals query failed", exc_info=True,
+            )
+
+        # Pending approval requests
+        try:
+            cursor = await self._db.execute(
+                "SELECT id, description, created_at FROM approval_requests "
+                "WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5"
+            )
+            approvals = await cursor.fetchall()
+            if approvals:
+                lines.append(
+                    f"- {len(approvals)} pending approval request(s):"
+                )
+                for a in approvals:
+                    lines.append(f"  - {(a[1] or '?')[:150]}")
+        except Exception:
+            logger.warning(
+                "Morning report: approval requests query failed",
+                exc_info=True,
+            )
+
+        return "\n".join(lines) if lines else "No pending items."
 
     async def _get_follow_ups_summary(self) -> str | None:
         """Return follow-ups needing user attention + recently completed."""

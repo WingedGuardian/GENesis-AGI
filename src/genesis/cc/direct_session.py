@@ -299,9 +299,6 @@ class DirectSessionRunner:
                 output_tokens=output.output_tokens,
             )
 
-            if request.notify and not request.notify_on_failure_only:
-                await self._notify(request, result, success=True)
-
             logger.info(
                 "Direct session %s completed: %.1fs, $%.4f, %d tools",
                 session_id[:8], elapsed, output.cost_usd, len(telemetry),
@@ -416,7 +413,16 @@ class DirectSessionRunner:
         *,
         success: bool,
     ) -> None:
-        """Send Telegram notification via outreach pipeline."""
+        """Send Telegram notification via outreach pipeline.
+
+        Only failures are sent — successes are logged to the DB and visible
+        via direct_session_list MCP tool and the dashboard.  Sending success
+        notifications as ALERT was noise: "Direct Session Complete" is not
+        an alert, and in DM-only installs it drowns real alerts.
+        """
+        if success:
+            return
+
         pipeline = getattr(self._rt, "_outreach_pipeline", None)
         if pipeline is None:
             logger.debug("Outreach pipeline not available, skipping notification")
@@ -429,37 +435,23 @@ class DirectSessionRunner:
             )[:8]
         ) or "none"
 
-        if success:
-            title = "Direct Session Complete"
-            preview = result.output_text[:400] if result.output_text else "(no output)"
-            body = (
-                f"<b>{title}</b>\n\n"
-                f"Profile: {request.profile} | "
-                f"Model: {result.model_used or request.model} | "
-                f"Duration: {result.duration_s:.0f}s | "
-                f"Cost: ${result.cost_usd:.4f}\n\n"
-                f"{preview}\n\n"
-                f"Tools: {tools_str}"
-            )
-        else:
-            title = "Direct Session FAILED"
-            body = (
-                f"<b>{title}</b>\n\n"
-                f"Profile: {request.profile} | "
-                f"Model: {request.model} | "
-                f"Duration: {result.duration_s:.0f}s\n\n"
-                f"Error: {result.error or 'unknown'}\n\n"
-                f"Tools before failure: {tools_str}"
-            )
+        body = (
+            f"<b>Direct Session FAILED</b>\n\n"
+            f"Profile: {request.profile} | "
+            f"Model: {request.model} | "
+            f"Duration: {result.duration_s:.0f}s\n\n"
+            f"Error: {result.error or 'unknown'}\n\n"
+            f"Tools before failure: {tools_str}"
+        )
 
         try:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
             await pipeline.submit(OutreachRequest(
                 category=OutreachCategory.ALERT,
-                topic=f"direct_session_{'ok' if success else 'fail'}",
+                topic="direct_session_fail",
                 context=body,
-                salience_score=0.9 if not success else 0.7,
+                salience_score=0.9,
             ))
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)

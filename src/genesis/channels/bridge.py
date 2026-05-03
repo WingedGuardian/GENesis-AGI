@@ -244,7 +244,7 @@ async def main():
         for cat in (
             "conversation", "morning_report", "alert",
             "reflection_micro", "reflection_light", "reflection_deep", "reflection_strategic",
-            "surplus", "recon", "approvals",
+            "surplus", "recon", "approvals", "ego_proposals",
         ):
             await topic_manager.get_or_create_persistent(cat)
 
@@ -264,6 +264,10 @@ async def main():
         # Wire into surplus scheduler for surplus reflection posting
         if runtime.surplus_scheduler:
             runtime.surplus_scheduler.set_topic_manager(topic_manager)
+
+        # Wire into ego proposal workflow for digest delivery
+        if runtime._ego_proposal_workflow is not None:
+            runtime._ego_proposal_workflow.set_topic_manager(topic_manager)
 
         # One-shot: close orphaned per-session topics from old code (March 24-27).
         # Checks DB for a sentinel category to avoid re-running on every restart.
