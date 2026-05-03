@@ -836,6 +836,36 @@ class TestRemoteInteraction:
         assert 0.5 <= delay <= 2.0
 
     @pytest.mark.asyncio
+    async def test_human_type_uses_per_keystroke_for_remote(self):
+        """Remote CDP fires per-keystroke typing, not atomic fill."""
+        page = AsyncMock()
+        browser._active_page = page
+        browser._remote_page = page
+        browser._stealth_cm = None  # not Camoufox
+
+        with patch("genesis.mcp.health.browser.asyncio.sleep", new_callable=AsyncMock):
+            await browser._human_type(page, "#email", "hi")
+
+        # Should clear field, click to focus, then type per-character
+        page.fill.assert_awaited_once_with("#email", "", timeout=10000)
+        page.click.assert_awaited_once_with("#email", timeout=10000)
+        assert page.keyboard.type.await_count == 2  # 'h', 'i'
+
+    @pytest.mark.asyncio
+    async def test_human_type_uses_atomic_fill_for_chromium(self):
+        """Plain Chromium (dev/test) uses atomic fill, no per-keystroke."""
+        page = AsyncMock()
+        browser._active_page = page
+        browser._remote_page = None  # not remote
+        browser._stealth_cm = None  # not Camoufox
+
+        await browser._human_type(page, "#email", "hi")
+
+        # Should use atomic fill with the full value
+        page.fill.assert_awaited_once_with("#email", "hi", timeout=10000)
+        page.keyboard.type.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_fill_with_drift_returns_advisory(self):
         page = MagicMock()
         page.url = "https://other.com"

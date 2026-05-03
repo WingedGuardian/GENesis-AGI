@@ -727,17 +727,17 @@ async def _click_in_shadow_dom(page, selector: str) -> bool:
 async def _human_type(page, selector: str, value: str) -> None:
     """Type text character-by-character with human-like timing.
 
-    Camoufox mode: clears field via fill(""), then types per-keystroke
-    with randomized inter-key intervals.  This fires the full
-    keydown → keypress/input → keyup event chain per character that
-    behavioral detection systems expect from real users.
+    Camoufox and CDP remote: clears field via fill(""), then types
+    per-keystroke with randomized inter-key intervals.  This fires
+    the full keydown → keypress/input → keyup event chain per character
+    that behavioral detection systems expect from real users.
 
     Uses per-character randomization via keyboard.type() for true IKI
     jitter (Playwright's page.type delay= is fixed across all chars).
 
-    Non-Camoufox: falls back to atomic page.fill() (no delay overhead).
+    Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
-    if not _is_camoufox_active():
+    if not _is_camoufox_active() and not _is_remote_active():
         await page.fill(selector, value, timeout=10000)
         return
 
@@ -1210,8 +1210,9 @@ async def browser_fill(selector: str, value: str) -> dict:
 
     Examples: browser_fill('#email', 'user@example.com')
 
-    Per-keystroke typing is active for Camoufox — long strings take
-    proportionally longer. The tool timeout scales with string length.
+    Per-keystroke typing is active for Camoufox and CDP remote — long
+    strings take proportionally longer. The tool timeout scales with
+    string length.
     """
     timeout = min(max(60.0, len(value) * 0.25), 300.0)
     return await _with_tool_timeout(
