@@ -499,10 +499,10 @@ The complete design lives in [`docs/`](docs/), indexed at [`docs/INDEX.md`](docs
 
 ## Primitives from the Genesis portfolio
 
-Standalone libraries from the same portfolio, stabilized against Genesis's production use:
+Standalone libraries extracted from Genesis, stabilized against production use:
 
-- [**copilot-router**](https://github.com/WingedGuardian/copilot-router) — LLM routing primitive. Circuit breakers, fallback chains, per-call-site provider config.
-- [**copilot-memory**](https://github.com/WingedGuardian/copilot-memory) — Hybrid memory primitive. Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.
+- [**genesis-router**](https://github.com/WingedGuardian/genesis-router) — LLM routing with circuit breakers, self-escalation, and failover chains.
+- [**genesis-memory**](https://github.com/WingedGuardian/genesis-memory) — Hybrid AI memory: Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.
 - [**cognitive-dissonance-dspy**](https://github.com/evalops/cognitive-dissonance-dspy) — Multi-agent adversarial-review prototype using DSPy with NL→Coq formal verification.
 
 ---
