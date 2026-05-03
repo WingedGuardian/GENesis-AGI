@@ -261,3 +261,75 @@ class TestAutonomyCalibration:
         )
         # Should not raise
         await pipeline(FakeCCOutput(), "test", "terminal")
+
+
+class TestSteeringRuleExtraction:
+    """Steering rule extraction respects channel boundaries."""
+
+    @pytest.mark.asyncio
+    async def test_inbox_channel_does_not_write_steering(self, db):
+        """Inbox evaluations must never write to STEERING.md."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        await pipeline(FakeCCOutput(), "never do this wrong thing", "inbox")
+        loader.add_steering_rule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mail_channel_does_not_write_steering(self, db):
+        """Mail evaluations must never write to STEERING.md."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        await pipeline(FakeCCOutput(), "stop doing this wrong thing", "mail")
+        loader.add_steering_rule.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_terminal_channel_does_write_steering(self, db):
+        """Foreground terminal sessions should extract steering rules."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        await pipeline(FakeCCOutput(), "never do that again", "terminal")
+        loader.add_steering_rule.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_telegram_channel_does_write_steering(self, db):
+        """Foreground Telegram sessions should extract steering rules."""
+        loader = MagicMock()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=ow,
+            identity_loader=loader,
+        )
+        await pipeline(FakeCCOutput(), "don't ever do that", "telegram")
+        loader.add_steering_rule.assert_called_once()
