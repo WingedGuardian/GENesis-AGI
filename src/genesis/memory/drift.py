@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from datetime import UTC, datetime
 
 import aiosqlite
 from qdrant_client import QdrantClient
@@ -131,8 +132,8 @@ async def _identify_clusters(
     # Batch fetch metadata from SQLite
     placeholders = ",".join("?" * len(memory_ids))
     query = f"""
-        SELECT id, wing, room FROM memories
-        WHERE id IN ({placeholders}) AND wing IS NOT NULL
+        SELECT memory_id, wing, room FROM memory_metadata
+        WHERE memory_id IN ({placeholders}) AND wing IS NOT NULL
     """
     async with db.execute(query, memory_ids) as cursor:
         async for row in cursor:
@@ -182,8 +183,8 @@ async def _local_drilldown(
             placeholders = ",".join("?" * len(fts_ids))
             if fts_ids:
                 wing_query = f"""
-                    SELECT id FROM memories
-                    WHERE id IN ({placeholders}) AND wing = ?
+                    SELECT memory_id FROM memory_metadata
+                    WHERE memory_id IN ({placeholders}) AND wing = ?
                 """
                 async with db.execute(wing_query, [*fts_ids, wing]) as cursor:
                     fts_ids = [row[0] async for row in cursor]
@@ -294,7 +295,7 @@ async def drift_recall(
 
     # Compute activation scores and build results
     results: list[RetrievalResult] = []
-    now_iso = __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
 
     for mid in all_ids:
         if len(results) >= limit:
@@ -311,7 +312,7 @@ async def drift_recall(
             created_at=row.get("created_at", now_iso),
             retrieved_count=row.get("retrieved_count", 0),
             link_count=row.get("link_count", 0),
-            source=row.get("source", "unknown"),
+            source=row.get("source_type", "unknown"),
             tags=row.get("tags", "").split(",") if row.get("tags") else [],
             now=now_iso,
             memory_class=row.get("memory_class", "fact"),
@@ -332,7 +333,7 @@ async def drift_recall(
             RetrievalResult(
                 memory_id=mid,
                 content=row.get("content", ""),
-                source=row.get("source", "unknown"),
+                source=row.get("source_type", "unknown"),
                 memory_type=row.get("memory_type", "episodic"),
                 score=fused_scores[mid],
                 vector_rank=vector_rank,

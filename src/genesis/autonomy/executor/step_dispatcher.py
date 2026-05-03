@@ -355,7 +355,7 @@ class StepDispatcher:
             )
         except Exception:
             logger.error(
-                "Due diligence failed for step %d",
+                "Due diligence failed for step %s",
                 step.get("idx", "?"), exc_info=True,
             )
             return None
@@ -385,7 +385,7 @@ class StepDispatcher:
             )
         except Exception:
             logger.error(
-                "Research session failed for step %d",
+                "Research session failed for step %s",
                 step.get("idx", "?"), exc_info=True,
             )
             return None, None

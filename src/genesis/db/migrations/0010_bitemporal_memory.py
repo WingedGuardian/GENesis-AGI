@@ -20,15 +20,20 @@ import aiosqlite
 
 
 async def up(db: aiosqlite.Connection) -> None:
-    # Add bi-temporal columns
-    await db.execute("""
-        ALTER TABLE memory_metadata
-        ADD COLUMN valid_at TEXT
-    """)
-    await db.execute("""
-        ALTER TABLE memory_metadata
-        ADD COLUMN invalid_at TEXT
-    """)
+    # Add bi-temporal columns (idempotent — column may already exist from DDL)
+    cursor = await db.execute("PRAGMA table_info(memory_metadata)")
+    existing = {row[1] for row in await cursor.fetchall()}
+
+    if "valid_at" not in existing:
+        await db.execute("""
+            ALTER TABLE memory_metadata
+            ADD COLUMN valid_at TEXT
+        """)
+    if "invalid_at" not in existing:
+        await db.execute("""
+            ALTER TABLE memory_metadata
+            ADD COLUMN invalid_at TEXT
+        """)
 
     # Index for temporal queries (find facts valid at a point in time)
     await db.execute("""
