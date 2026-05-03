@@ -72,7 +72,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 - **It remembers.** Memory that compounds with every interaction — across sessions, across months. Day 180 is architecturally different from day 1.
 - **It learns.** Outcome classification, causal attribution, and procedure extraction that runs automatically after every session. Laplace-smoothed confidence, not vibes.
-- **It runs on its own.** Thinks, researches, audits, and communicates while you're not there — leveraging free-tier compute.
+- **It runs on its own.** Thinks, researches, audits, and communicates while you're not there — on free-tier compute.
 - **It earns its autonomy.** Trust granted per action category through demonstrated competence. Mess up twice, drop a level. Earn it back through performance.
 
 [**Get started →**](#getting-started)
@@ -272,7 +272,7 @@ Underpinning this is a confidence calibration system — Bayesian prediction log
 
 ## Earned autonomy 🔑
 
-Genesis earns autonomy per category through demonstrated competence across seven levels:
+Genesis earns autonomy per category through demonstrated competence:
 
 | Level | Authority | Example |
 |---|---|---|
@@ -280,11 +280,8 @@ Genesis earns autonomy per category through demonstrated competence across seven
 | L2 | Pattern execution | Running known procedures |
 | L3 | Novel task handling | Unfamiliar requests within earned categories |
 | L4 | Proactive outreach | Initiating communication based on observations |
-| L5* | System configuration | Adjusting its own thresholds and parameters |
-| L6* | Learning modification | Changing its own review schedules and calibration |
-| L7* | Identity evolution | Proposing changes to its own operating principles |
 
-*L5-L7 are V5 targets — the schema supports them, the governance doesn't activate them yet.*
+V5 extends this to L5-L7: system configuration, learning modification, and identity evolution. These require months of L4 operational data before they're safe to activate.
 
 Trust is granular, not binary. Mess up twice in a row in a category, drop a level -- Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
@@ -416,7 +413,9 @@ graph LR
 
 ## How it got here
 
-V3 was built in 10 phases over seven months -- from data schemas to full autonomous cognition. The full build story, design decisions, and lessons learned are in [`docs/journey/`](docs/journey/).
+V3 was built in 10 phases over seven months: from data schemas to full autonomous cognition, one phase earning the right to build the next. Every architectural choice made under constraint. Every subsystem shaped by what came before it.
+
+[`docs/journey/`](docs/journey/) has the full story — ten phase retrospectives, an origin story going back to V1 (a WhatsApp bot with heuristic routing), and honest documentation of what worked and what didn't. If you want to understand *why* Genesis is built the way it is, not just what it does, start there.
 
 ---
 
@@ -472,7 +471,22 @@ Nobody else is attempting this. Most agent frameworks are still building prompt 
 
 ## Architecture
 
-The complete design lives in [`docs/architecture/`](docs/architecture/):
+The complete design lives in [`docs/`](docs/), indexed at [`docs/INDEX.md`](docs/INDEX.md).
+
+**Subsystem deep-dives** — how the internals work, written for contributors:
+
+- [`routing-deep-dive.md`](docs/architecture/routing-deep-dive.md) — Multi-provider routing, circuit breakers, rate gates, dead-letter recovery
+- [`memory-deep-dive.md`](docs/architecture/memory-deep-dive.md) — 4-layer hybrid retrieval, RRF fusion, activation scoring, graceful degradation
+- [`autonomy-deep-dive.md`](docs/architecture/autonomy-deep-dive.md) — Bayesian trust model, context ceilings, approval gates, enforcement layers
+
+**Case studies** — what Genesis does in practice, written for prospective users:
+
+- [`multi-provider-routing.md`](docs/case-studies/multi-provider-routing.md) — Provider outages, zero interruption
+- [`hybrid-memory.md`](docs/case-studies/hybrid-memory.md) — Three months later, it remembers
+- [`earned-autonomy.md`](docs/case-studies/earned-autonomy.md) — Trust that has to be earned
+- [`deep-research.md`](docs/case-studies/deep-research.md) — Outperforming ChatGPT, Perplexity, and Gemini on a live research benchmark
+
+**Design foundations:**
 
 - [`genesis-v3-vision.md`](docs/architecture/genesis-v3-vision.md) — Core philosophy and identity
 - [`genesis-v3-autonomous-behavior-design.md`](docs/architecture/genesis-v3-autonomous-behavior-design.md) — Primary architecture reference
