@@ -60,12 +60,12 @@ def _update_staleness(current_signals: dict[str, float], prev_signals: dict[str,
 
 _TIME_CURVES: dict[Depth, list[tuple[int, float]]] = {
     Depth.MICRO: [
-        (0, 0.3),       # just happened
+        (0, 0.5),       # softened from 0.3 — counter reset already suppresses
         (1800, 1.0),    # 30min — floor
         (3600, 2.5),    # 60min — overdue
     ],
     Depth.LIGHT: [
-        (0, 0.5),
+        (0, 0.8),       # softened from 0.5 — counter reset already suppresses
         (10800, 1.0),   # 3h
         (21600, 1.5),   # 6h — floor
         (43200, 3.0),   # 12h — alarm
