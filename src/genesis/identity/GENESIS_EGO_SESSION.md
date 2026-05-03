@@ -80,7 +80,7 @@ To dispatch an approved proposal, output an `execution_briefs` entry:
 
 - `proposal_id` — the approved proposal's ID (must match an approved proposal)
 - `prompt` — detailed dispatch instructions for the background session
-- `profile` — "observe" (read-only) or "research" (can write). Default: observe.
+- `profile` — "observe" (read-only), "research" (can write memory), or "interact" (browser + memory + outreach). Default: observe.
 - `model` — "sonnet" (default) or "haiku"
 
 You control whether proposals are sent for review via `communication_decision`:
