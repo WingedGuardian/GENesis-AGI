@@ -2252,10 +2252,10 @@
           let memState = "healthy", memReason = "container resources within safe limits";
           if (!mem || ["unknown", "unavailable"].includes(mem.status)) {
             memState = "unknown"; memReason = "container memory data unavailable";
-          } else if (mem.used_pct > 85 || mem.status === "down") {
-            memState = "error"; memReason = "memory in danger zone (" + mem.used_pct.toFixed(0) + "%)";
-          } else if (mem.used_pct > 75 || mem.status === "degraded") {
-            memState = "degraded"; memReason = "memory usage elevated (" + mem.used_pct.toFixed(0) + "%)";
+          } else if ((mem.anon_pct ?? mem.used_pct) > 85 || mem.status === "down") {
+            memState = "error"; memReason = "memory in danger zone (" + (mem.anon_pct ?? mem.used_pct).toFixed(0) + "%)";
+          } else if ((mem.anon_pct ?? mem.used_pct) > 75 || mem.status === "degraded") {
+            memState = "degraded"; memReason = "memory usage elevated (" + (mem.anon_pct ?? mem.used_pct).toFixed(0) + "%)";
           }
 
           // Disk assessment (secondary — write failures)
