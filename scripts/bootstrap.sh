@@ -448,7 +448,7 @@ _register_mcp() {
     local cmd_args=("$@")
     if command -v claude &>/dev/null; then
         # Check if already registered (avoid duplicates)
-        if claude mcp list 2>/dev/null | grep -q "\"$name\""; then
+        if claude mcp list 2>/dev/null | grep -q "^$name:"; then
             echo "  $name: already registered"
             return 0
         fi
