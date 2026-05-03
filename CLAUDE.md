@@ -273,7 +273,9 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 
 ## Traps
 
-- **Ego** (`src/genesis/ego/`) — INERT. Zero production callers. Don't wire.
+- **Ego** (`src/genesis/ego/`) — Live autonomous decision-making cycle.
+  Wired via `genesis.runtime`. Don't add new call sites without reviewing
+  the cadence manager and budget controls.
 - **GROUNDWORK tags** — `# GROUNDWORK(id): why` is intentional. Never delete.
 - **IntervalTrigger** — Resets on restart. Use `CronTrigger` for intervals >1h.
 
