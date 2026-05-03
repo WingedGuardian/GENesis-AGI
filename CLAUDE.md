@@ -84,6 +84,15 @@ Four tool layers for code search and analysis, lightest to richest:
 - MUST run detect-changes before committing
 - Use `gitnexus rename` for multi-file renames, not find-and-replace
 
+**Exploration rule (dependency/coupling questions):**
+- If tracing who calls a function or how many sites use a symbol →
+  Serena `find_referencing_symbols`, NOT reading files manually
+- If assessing coupling, blast radius, or extraction feasibility →
+  GitNexus `impact`/`context`, NOT grepping through imports
+- Direct reads are for *known files*, not *discovery*. If you're about
+  to read 3+ files to answer a dependency question, stop and use
+  Serena/GitNexus/CBM instead.
+
 **Known limitation:** FTS text search is broken on Linux
 (LadybugDB/ladybug#430). Use Grep/Serena for text search.
 
