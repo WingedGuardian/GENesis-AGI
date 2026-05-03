@@ -252,7 +252,7 @@ Example:
 
 You can dispatch surplus tasks for investigation that benefits from free compute.
 Surplus tasks run on free APIs — use them for exploration, auditing, and analysis.
-Valid task types: code_audit, memory_audit, procedure_audit, infrastructure_monitor,
+Valid task types: code_audit, memory_audit, procedure_audit,
 brainstorm_user, brainstorm_self, meta_brainstorm, gap_clustering, self_unblock,
 anticipatory_research, prompt_effectiveness_review.
 Only dispatch when you identify specific work that needs doing. Don't dispatch

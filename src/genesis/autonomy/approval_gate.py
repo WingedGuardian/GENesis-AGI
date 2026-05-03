@@ -418,6 +418,18 @@ class AutonomousCliApprovalGate:
                     continue
                 if status_str == "approved" and row.get("consumed_at"):
                     continue
+                # Staleness guard: don't recycle approvals resolved >24h ago.
+                # Prevents historical backlogs from silently bypassing the gate.
+                if status_str == "approved":
+                    resolved_at_str = row.get("resolved_at", "")
+                    if resolved_at_str:
+                        try:
+                            resolved_dt = datetime.fromisoformat(resolved_at_str)
+                            age_hours = (datetime.now(UTC) - resolved_dt).total_seconds() / 3600
+                            if age_hours > 24:
+                                continue
+                        except (ValueError, TypeError):
+                            pass
                 return row
         # Pass 2: race-safety fallback — pending rows for the same site.
         # Sentinel retains this because alarm-based triggers should dedup.

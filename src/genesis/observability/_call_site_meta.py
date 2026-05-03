@@ -291,9 +291,9 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
     },
     "37_infrastructure_monitor": {
-        "description": "Disabled. Surplus-scheduled infrastructure trend detection. Probes built but not wired to surplus scheduler.",
+        "description": "Disabled. Deep reflections may enqueue infra monitor surplus tasks but output quality is low (generic signal summaries from free models). Not independently scheduled.",
         "category": "surplus",
-        "frequency": "Periodic (surplus scheduler)",
+        "frequency": "On deep reflection dispatch only",
         "model_tier": "slm",
         "wired": False,
     },
