@@ -84,21 +84,19 @@ def main() -> int:
         if not cmd:
             return 0
 
-        # ── git push to main ────────────────────────────────────────
+        # ── git push (any branch) ──────────────────────────────────
         if "git push" in cmd:
             _remote, branch = _get_push_remote_and_branch(cmd)
-            if branch in ("main", "master"):
-                print(
-                    "BLOCKED: Pushing directly to main is not allowed.",
-                    file=sys.stderr,
-                )
-                print(
-                    "Use the PR workflow: push to a feature branch, "
-                    "create a PR with `gh pr create`, then merge with "
-                    "`gh pr merge --squash --admin` after user approval.",
-                    file=sys.stderr,
-                )
-                return 2
+            print(
+                f"BLOCKED: git push requires user approval before "
+                f"publishing code externally (target: {branch or 'default'}).",
+                file=sys.stderr,
+            )
+            print(
+                "Ask the user: 'Ready to push?' before proceeding.",
+                file=sys.stderr,
+            )
+            return 2
 
         # ── git merge into main ─────────────────────────────────────
         if "git merge" in cmd:
@@ -113,6 +111,19 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
+
+        # ── gh pr create ───────────────────────────────────────────
+        if "gh pr create" in cmd:
+            print(
+                "BLOCKED: Creating a PR requires user approval before "
+                "publishing externally.",
+                file=sys.stderr,
+            )
+            print(
+                "Ask the user: 'Ready to create the PR?' before proceeding.",
+                file=sys.stderr,
+            )
+            return 2
 
         # ── gh pr merge without --admin ────────────────────────────
         if "gh pr merge" in cmd and "--admin" not in cmd:
