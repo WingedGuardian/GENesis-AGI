@@ -823,6 +823,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN room TEXT",
         "memory_metadata.room")
 
+    # Bi-temporal columns for temporal fact tracking (0010_bitemporal_memory)
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN valid_at TEXT",
+        "memory_metadata.valid_at")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN invalid_at TEXT",
+        "memory_metadata.invalid_at")
+
     # 2026-04-14: Move critical_failure and software_error_spike to Micro only.
     # These are delta signals — they matter when they flip state, not as
     # persistent conditions driving hourly Light reflections.

@@ -48,12 +48,9 @@ async def up(db: aiosqlite.Connection) -> None:
         WHERE valid_at IS NULL
     """)
 
-    await db.commit()
-
 
 async def down(db: aiosqlite.Connection) -> None:
     # SQLite doesn't support DROP COLUMN before 3.35.0
     # For safety, just drop the indexes
     await db.execute("DROP INDEX IF EXISTS idx_memory_meta_valid_at")
     await db.execute("DROP INDEX IF EXISTS idx_memory_meta_invalid_at")
-    await db.commit()
