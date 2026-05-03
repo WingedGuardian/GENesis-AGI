@@ -128,6 +128,29 @@ jobs:
           fi
           echo "Email scan: CLEAN"
 
+  migration-check:
+    # Catch duplicate migration prefixes before merge — two PRs creating
+    # the same NNNN_*.py prefix will collide at runtime.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check migration prefix uniqueness
+        run: |
+          set -euo pipefail
+          dir="src/genesis/db/migrations"
+          dupes=$(ls "$dir"/[0-9][0-9][0-9][0-9]_*.py 2>/dev/null \
+            | xargs -I{} basename {} \
+            | grep -oP '^\d{4}' \
+            | sort | uniq -d || true)
+          if [[ -n "$dupes" ]]; then
+            echo "::error::Duplicate migration prefixes found: $dupes"
+            for p in $dupes; do
+              echo "  Files: $(ls "$dir"/${p}_*.py)"
+            done
+            exit 1
+          fi
+          echo "Migration prefix check: CLEAN"
+
   test:
     runs-on: ubuntu-latest
     continue-on-error: true  # non-blocking while CI stabilizes

@@ -41,6 +41,21 @@ Use the lightest layer that answers your question.
   `rename` (git-aware, any language). Serena for Python refactors;
   GitNexus when you need blast-radius awareness.
 
+## Exploration & Planning Rule
+
+When exploring code for extraction, coupling analysis, or planning:
+- **Dependency tracing** ("what depends on X?", "how many callers?") →
+  Serena `find_referencing_symbols` or GitNexus `impact`
+- **Coupling analysis** ("what Genesis imports does this file have?") →
+  GitNexus `context` for 360° view
+- **Architecture understanding** ("how do these subsystems connect?") →
+  CBM `get_architecture` or `trace_path`
+- **Reading specific known files** → Direct Read/Grep
+
+Rule: Direct reads answer "what does this code do?" but NOT "what depends
+on this code?" For dependency questions, specialized tools give
+higher-confidence answers faster and catch things manual reads miss.
+
 ## Per-Tool Notes
 
 **Serena** — 1-2s LSP init on first call per session, then fast. Config:
