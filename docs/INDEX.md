@@ -151,6 +151,16 @@ what Genesis can do for you.
 
 ---
 
+## Decisions
+
+Architecture Decision Records — load-bearing choices with context and rationale.
+
+- [ADR Index](decisions/README.md) — All recorded decisions
+- [Genesis vs. CLAUDE.md AIOS](genesis-vs-claude-md.md) — Positioning and differentiation
+- [Four C's Taxonomy](reference/four-cs-taxonomy.md) — Simpler external vocabulary
+
+---
+
 ## Reference
 
 - [Testing Guide](reference/testing.md) — Test suite organization, patterns, how to run
