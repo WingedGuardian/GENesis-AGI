@@ -7,6 +7,73 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b2] - 2026-05-03
+
+Ego becomes perceptive, task execution gets smarter about blockers, and
+Genesis can now bootstrap code intelligence tools on fresh machines.
+Seventeen PRs landed — a mix of new capabilities, reliability fixes, and
+documentation that reflects what the system actually is.
+
+### Added
+
+- **Ego memory surfacing** (#207) --- the ego now pulls relevant memories
+  before proposing actions, grounds proposals in evidence, and flags
+  recurring observation patterns (Hapax-style proactive discovery).
+- **Planning-first direct sessions** (#207) --- background CC sessions
+  receive a planning instruction so they structure work before executing.
+- **Voice identity layer** (#207) --- `VOICE.md` defines output taste
+  (tone, rhythm, vocabulary) injected into content generation and ego
+  sessions.
+- **Deep research for task blockers** (#216) --- when the task executor
+  hits an unresolvable blocker, it spawns a deep-research session and
+  uses the findings to construct an exit gate, rather than spinning.
+- **Architecture Decision Records** (#217) --- seven ADRs documenting
+  load-bearing choices (ego ephemeral sessions, surplus routing, memory
+  wings, no silent timeouts, router dead-letter, LLM-first judgment).
+- **Memory DRIFT recall** (#217) --- bi-temporal columns on memory
+  metadata enable time-aware retrieval and staleness detection.
+- **Medium distribution** (#210) --- publish to Medium via Camoufox
+  browser automation with voice-calibrated formatting.
+- **Code intelligence bootstrap** (#222) --- `bootstrap.sh` and
+  `install.sh` now install and configure codebase-memory-mcp, GitNexus,
+  and Serena automatically on fresh machines. Includes MCP registration
+  and initial indexing.
+- **Architecture deep-dives and case studies** (#213) --- three
+  subsystem deep-dives (routing, memory, autonomy) and four case studies
+  showing Genesis in practice.
+- **Positioning and taxonomy docs** (#217) --- "Genesis vs. CLAUDE.md"
+  differentiator and the Four C's external vocabulary.
+
+### Changed
+
+- **Approval staleness guard** (#208) --- stale approval records are now
+  pruned on each cycle. Infrastructure monitor respects disable flag.
+- **Ego interact profile expanded** (#215) --- the interact safety
+  profile now permits content publishing dispatch.
+- **README primitives section** (#223) --- updated to reflect
+  genesis-router and genesis-memory as the two extractable libraries.
+
+### Fixed
+
+- **Surplus scoring collapse** (#209) --- scoring function no longer
+  collapses to zero when all candidates tie. Watchgod /tmp protection
+  and surplus routing corrected.
+- **Telegram polling** (#211) --- retry logic on polling timeout,
+  reduced alert noise from transient failures, morning report
+  completeness improved.
+- **Knowledge source pipeline default** (#206) --- new knowledge sources
+  default to `knowledge_ingest` pipeline instead of `recon`.
+- **Browser keystroke typing** (#221) --- CDP remote sessions now type
+  per-keystroke instead of bulk-setting input values, fixing sites that
+  validate on keypress.
+- **CI stability** (#219) --- fixed lint errors (unused imports,
+  f-string prefixes), duplicate migration prefix detection, and test
+  isolation for migration runner.
+- **STEERING.md write protection** (#214) --- autonomous learning
+  pipelines can no longer modify steering rules without user approval.
+
+---
+
 ## [v3.0b1] - 2026-05-01
 
 First beta. The ego subsystem---Genesis's autonomous decision-making
