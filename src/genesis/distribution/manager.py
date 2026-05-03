@@ -18,7 +18,7 @@ class DistributionManager:
     """Routes content to the appropriate platform distributor and records results.
 
     Each platform is registered as a ``PlatformDistributor`` keyed by its
-    slug (e.g. ``"linkedin"``).  The manager handles dispatch, result
+    slug (e.g. ``"medium"``).  The manager handles dispatch, result
     recording, and error logging.
     """
 

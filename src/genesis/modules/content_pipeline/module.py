@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from genesis.distribution.config import load_distribution_config
 from genesis.distribution.manager import DistributionManager
 from genesis.modules.content_pipeline.analytics import AnalyticsTracker
 from genesis.modules.content_pipeline.idea_bank import IdeaBank
@@ -42,7 +41,7 @@ class ContentPipelineModule:
         self._auto_capture_recon: bool = False
         self._auto_capture_trends: bool = False
         self._autonomous_drafting: bool = False
-        self._platform_targets: list[str] = ["telegram", "medium", "linkedin"]
+        self._platform_targets: list[str] = ["telegram", "medium"]
         self._engagement_threshold: int = 50
 
     @property
@@ -125,31 +124,15 @@ class ContentPipelineModule:
         logger.info("Content pipeline module deregistered")
 
     def _init_distribution(self, db: Any) -> DistributionManager:
-        """Initialize the distribution manager with available platform adapters.
+        """Initialize the distribution manager.
 
-        Gracefully degrades — if Composio isn't configured, LinkedIn
-        distribution is simply unavailable. The module still works for
-        everything else (idea capture, drafting, analytics).
+        Platform distributors that require browser automation (Medium)
+        run from CC sessions, not the genesis server. The manager here
+        handles DB record-keeping; platform adapters are registered at
+        publish time by the calling session.
         """
-        config = load_distribution_config()
         manager = DistributionManager(db=db)
-
-        try:
-            from genesis.distribution.linkedin import LinkedInDistributor
-
-            linkedin = LinkedInDistributor(config=config.linkedin)
-            if linkedin.available:
-                manager.register(linkedin)
-            else:
-                logger.info("LinkedIn distributor not available (missing credentials or config)")
-        except Exception:
-            logger.info("LinkedIn distribution not available", exc_info=True)
-
-        if manager.available_platforms:
-            logger.info("Distribution available for: %s", ", ".join(manager.available_platforms))
-        else:
-            logger.info("No distribution platforms configured — distribution disabled")
-
+        logger.info("Distribution manager initialized (platforms registered per-session)")
         return manager
 
     def get_research_profile_name(self) -> str | None:
@@ -278,8 +261,8 @@ class ContentPipelineModule:
              "value": self._autonomous_drafting, "default": False,
              "description": "Auto-draft scripts from ideas without explicit request"},
             {"name": "platform_targets", "label": "Platform Targets", "type": "list",
-             "value": self._platform_targets, "default": ["telegram", "medium", "linkedin"],
-             "description": "Platforms to generate content for (telegram, linkedin, reddit, etc.)"},
+             "value": self._platform_targets, "default": ["telegram", "medium"],
+             "description": "Platforms to generate content for (telegram, medium, reddit, etc.)"},
             {"name": "engagement_threshold", "label": "Engagement Threshold", "type": "int",
              "value": self._engagement_threshold, "default": 50, "min": 0,
              "description": "Minimum engagement score to extract lessons from outcomes"},
