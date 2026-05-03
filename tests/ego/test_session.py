@@ -472,6 +472,17 @@ class TestProcessExecutionBriefs:
         req = mock_direct_runner.spawn.call_args[0][0]
         assert req.profile == "observe"
 
+    async def test_interact_profile_accepted(self, ego_with_runner, mock_direct_runner, db):
+        """Interact profile is valid and passes through to the request."""
+        await self._insert_proposal(db, "prop_009")
+
+        briefs = [{"proposal_id": "prop_009", "prompt": "Publish a Medium post",
+                    "profile": "interact", "model": "sonnet"}]
+        await ego_with_runner._process_execution_briefs(briefs)
+
+        req = mock_direct_runner.spawn.call_args[0][0]
+        assert req.profile == "interact"
+
     async def test_empty_brief_skipped(self, ego_with_runner, mock_direct_runner, db):
         """Brief missing proposal_id or prompt is silently skipped."""
         briefs = [

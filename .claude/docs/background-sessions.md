@@ -19,15 +19,17 @@ the next few minutes → sub-agent.
 
 ## Profiles
 
-| Profile | Browser | memory_store | outreach_send | Web search |
-|---|---|---|---|---|
-| `observe` | ✗ | ✗ | ✗ | ✓ |
-| `interact` | ✓ | ✓ | ✗ | ✓ |
-| `research` | ✓ | ✓ | ✓ | ✓ |
+| Profile | Browser click/fill | memory_store | outreach_send | follow_up_create | Web search |
+|---|---|---|---|---|---|
+| `observe` | ✗ | ✗ | ✗ | ✗ | ✓ |
+| `research` | ✗ | ✓ | ✗ | ✓ | ✓ |
+| `interact` | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 All profiles block: Bash, Edit, Write, task_submit, settings_update,
-direct_session_run. The `code` profile is intentionally disabled — background
-sessions do not write code.
+direct_session_run. Use `interact` for workflows that operate external
+platforms (publishing, form filling) and need to communicate with the user.
+Use `research` for data gathering that writes to memory. Use `observe` for
+read-only investigation.
 
 ## Key Parameters
 

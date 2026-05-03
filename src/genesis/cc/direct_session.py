@@ -61,9 +61,12 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",  # No recursive spawn
+    "mcp__genesis-health__module_call",
+]
+
+_NO_OUTREACH_SEND = [
     "mcp__genesis-outreach__outreach_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
-    "mcp__genesis-health__module_call",
 ]
 
 # Composable building blocks for profile disallow lists
@@ -107,15 +110,16 @@ _NO_RECON_WRITES = [
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES
-        + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION
+        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT
+        + _NO_RECON_WRITES
     ),
     "interact": (
-        _UNIVERSAL_DISALLOW + _NO_MEMORY_WRITES
-        + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
+        + ["mcp__genesis-memory__evolution_propose"]
     ),
     "research": (
-        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
+        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION
     ),
 }
 

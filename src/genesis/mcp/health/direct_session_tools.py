@@ -279,10 +279,11 @@ async def direct_session_run(
 
     Profiles control what the session can do:
     - observe: Read everything, change nothing. Browser viewing, memory reads, web search.
-    - interact: Observe + browser clicks/fills. For social media, web tasks.
-    - research: Observe + memory/observation writes. Stores findings for future use.
+    - research: Observe + memory/observation writes + follow-ups. Stores findings for future use.
+    - interact: Full browser interaction + memory writes + outreach_send + follow-ups.
+      Use for workflows that operate external platforms and communicate with the user.
 
-    All profiles block: Bash, Edit, Write, outreach_send, task_submit, settings_update.
+    All profiles block: Bash, Edit, Write, task_submit, settings_update.
 
     Args:
         prompt: The full instructions for the background session

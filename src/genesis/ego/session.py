@@ -483,7 +483,7 @@ class EgoSession:
             logger.warning("Dispatch budget exceeded — skipping execution briefs")
             return
 
-        from genesis.cc.direct_session import DirectSessionRequest
+        from genesis.cc.direct_session import VALID_PROFILES, DirectSessionRequest
         from genesis.cc.types import CCModel, EffortLevel
 
         for brief in briefs:
@@ -506,7 +506,7 @@ class EgoSession:
 
             # Map profile and model from brief
             profile = brief.get("profile", "observe")
-            if profile not in ("observe", "research"):
+            if profile not in VALID_PROFILES:
                 profile = "observe"
             model_str = brief.get("model", "sonnet")
             model = CCModel.SONNET if model_str != "haiku" else CCModel.HAIKU

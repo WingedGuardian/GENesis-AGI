@@ -181,8 +181,8 @@ EGO_OUTPUT_SCHEMA = {
                     },
                     "profile": {
                         "type": "string",
-                        "enum": ["observe", "research"],
-                        "description": "Session profile (default: observe)",
+                        "enum": ["observe", "research", "interact"],
+                        "description": "Session profile (default: observe). Use interact for browser + memory + outreach.",
                     },
                     "model": {
                         "type": "string",
