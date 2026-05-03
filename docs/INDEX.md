@@ -146,6 +146,8 @@ what Genesis can do for you.
   How Genesis recalls context across months of sessions
 - [Trust That Has to Be Earned](case-studies/earned-autonomy.md) —
   How Genesis earns and loses autonomy through demonstrated competence
+- [Structured Research That Actually Researches](case-studies/deep-research.md) —
+  How Genesis outperformed ChatGPT, Perplexity, and Gemini on a live benchmark
 
 ---
 

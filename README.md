@@ -484,6 +484,7 @@ The complete design lives in [`docs/`](docs/), indexed at [`docs/INDEX.md`](docs
 - [`multi-provider-routing.md`](docs/case-studies/multi-provider-routing.md) — Provider outages, zero interruption
 - [`hybrid-memory.md`](docs/case-studies/hybrid-memory.md) — Three months later, it remembers
 - [`earned-autonomy.md`](docs/case-studies/earned-autonomy.md) — Trust that has to be earned
+- [`deep-research.md`](docs/case-studies/deep-research.md) — Outperforming ChatGPT, Perplexity, and Gemini on a live research benchmark
 
 **Design foundations:**
 
