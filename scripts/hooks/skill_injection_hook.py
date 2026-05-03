@@ -26,6 +26,30 @@ _MIN_CONFIDENCE = 0.3
 # Max nudges per prompt
 _MAX_NUDGES = 1
 
+# --- Process Discipline Detection ---
+# Superpowers skills aren't in the Genesis catalog but need nudges
+# when their workflow context is detected.
+
+# Intent: "about to plan or build non-trivial work"
+_PLAN_INTENT_KEYWORDS = {
+    "plan", "implement", "build", "feature", "architect", "design",
+    "refactor", "redesign", "rewrite", "migrate", "integrate",
+}
+
+# Intent: "about to write code that should be test-driven"
+_CODE_INTENT_KEYWORDS = {
+    "implement", "build", "add", "create", "fix", "feature",
+    "endpoint", "handler", "function", "class", "module",
+    "refactor", "wire", "connect",
+}
+
+# These don't need TDD/brainstorming nudges
+_EXCLUDE_KEYWORDS = {
+    "docs", "documentation", "readme", "config", "yaml", "markdown",
+    "comment", "typo", "rename", "changelog", "version", "memory",
+    "evaluate", "research", "look", "check", "review", "read",
+}
+
 
 def _ensure_catalog_fresh() -> None:
     """Regenerate the skill catalog if it's missing or stale (>1h old)."""
@@ -119,6 +143,56 @@ def _extract_keywords(prompt: str) -> list[str]:
     return [w for w in words if len(w) >= 3 and w not in stop][:10]
 
 
+def _check_process_discipline(
+    keywords: list[str], already_nudged: set[str], session_id: str
+) -> list[str]:
+    """Detect when process discipline skills should be nudged.
+
+    Returns list of nudge strings to emit (may be empty).
+    Checks for plan-intent (brainstorming) and code-intent (TDD).
+    """
+    nudges: list[str] = []
+    kw_set = set(keywords)
+
+    # Skip process nudges only when the prompt is PURELY non-code work
+    # (exclude keywords present but NO code/plan intent keywords)
+    has_code_intent = bool(kw_set & _CODE_INTENT_KEYWORDS)
+    has_plan_intent = bool(kw_set & _PLAN_INTENT_KEYWORDS)
+    has_exclude = bool(kw_set & _EXCLUDE_KEYWORDS)
+    if has_exclude and not has_code_intent and not has_plan_intent:
+        return nudges
+
+    # --- Brainstorming nudge ---
+    # When plan/build intent detected and brainstorming hasn't been used
+    if (
+        kw_set & _PLAN_INTENT_KEYWORDS
+        and "superpowers:brainstorming" not in already_nudged
+    ):
+        nudges.append(
+            "[Process] Non-trivial work detected. Consider requirements "
+            "gathering before planning — use superpowers:brainstorming to "
+            "structure design decisions and identify unknowns before entering "
+            "plan mode. Vertical slices > horizontal layers."
+        )
+        _save_session_nudge(session_id, "superpowers:brainstorming")
+
+    # --- TDD nudge ---
+    # When code-modification intent detected for features/bugfixes
+    if (
+        kw_set & _CODE_INTENT_KEYWORDS
+        and "superpowers:test-driven-development" not in already_nudged
+    ):
+        nudges.append(
+            "[Process] Code work detected. TDD applies for features and "
+            "bug fixes: write a failing test FIRST, then implement. Use "
+            "superpowers:test-driven-development. Skip for docs, config, "
+            "or refactoring with existing test coverage."
+        )
+        _save_session_nudge(session_id, "superpowers:test-driven-development")
+
+    return nudges
+
+
 def main() -> None:
     """Hook entry point."""
     try:
@@ -135,14 +209,24 @@ def main() -> None:
             return
 
         catalog = _load_catalog()
-        if not catalog.get("tier1") and not catalog.get("tier2"):
-            return
 
         keywords = _extract_keywords(prompt)
         if not keywords:
             return
 
         already_nudged = _load_session_nudges(session_id)
+
+        # --- Process discipline nudges (superpowers) ---
+        process_nudges = _check_process_discipline(
+            keywords, already_nudged, session_id
+        )
+        for nudge in process_nudges:
+            print(nudge)
+
+        # --- Genesis skill catalog nudges ---
+        if not catalog.get("tier1") and not catalog.get("tier2"):
+            sys.stdout.flush()
+            return
 
         # Score all skills
         candidates = []
