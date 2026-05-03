@@ -22,6 +22,7 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.autonomy.decomposer import TaskDecomposer
         from genesis.autonomy.dispatcher import TaskDispatcher
         from genesis.autonomy.executor.engine import CCSessionExecutor
+        from genesis.autonomy.executor.research import DeepResearcherImpl
         from genesis.autonomy.executor.review import TaskReviewer
         from genesis.autonomy.executor.trace import ExecutionTracer
         from genesis.autonomy.executor.workaround import WorkaroundSearcherImpl
@@ -47,6 +48,14 @@ async def init(rt: GenesisRuntime) -> None:
             invoker=rt._cc_invoker,
         )
         workaround = WorkaroundSearcherImpl(db=rt._db)
+        researcher = DeepResearcherImpl(
+            db=rt._db,
+            retriever=getattr(rt, "_hybrid_retriever", None),
+            router=rt._router,
+            invoker=rt._cc_invoker,
+            event_bus=rt._event_bus,
+            web_searcher=getattr(rt, "_web_searcher", None),
+        )
         tracer = ExecutionTracer(
             db=rt._db,
             memory_store=getattr(rt, "_memory_store", None),
@@ -64,6 +73,8 @@ async def init(rt: GenesisRuntime) -> None:
             decomposer=decomposer,
             reviewer=reviewer,
             workaround_searcher=workaround,
+            research_searcher=researcher,
+            router=rt._router,
             tracer=tracer,
             outreach_pipeline=getattr(rt, "_outreach_pipeline", None),
             event_bus=rt._event_bus,

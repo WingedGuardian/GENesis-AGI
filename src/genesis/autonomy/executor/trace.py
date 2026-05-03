@@ -184,17 +184,21 @@ class ExecutionTracer:
             )
             return
 
-        # Skip retrospective for trivial traces (single-step fallbacks, all failed)
         completed = sum(1 for s in trace.step_results if s.status == "completed")
-        if completed == 0:
-            logger.info(
-                "Retrospective skipped for task %s: no completed steps",
-                trace.task_id,
-            )
-            return
 
         try:
             prompt = await self._build_retrospective_prompt(trace, summary)
+
+            # Inject failure-mode guidance when all steps failed
+            if completed == 0:
+                prompt += (
+                    "\n\n## ALL-FAILED TRACE\n\n"
+                    "This task produced no completed steps. Focus on:\n"
+                    "- What went wrong and why (root cause, not symptoms)\n"
+                    "- Whether failures are transient or permanent\n"
+                    "- Use procedure_updates with outcome='failure' to document anti-patterns\n"
+                    "- DO NOT create new_procedures from failure (no 'how to fail' procedures)\n"
+                )
             result = await self._router.route_call(
                 _CALL_SITE,
                 [{"role": "user", "content": prompt}],

@@ -221,6 +221,32 @@ class WorkaroundResult:
     approach: str | None = None
 
 
+@dataclass(frozen=True)
+class ResearchResult:
+    """Result of a deep research session investigating a blocker."""
+
+    found: bool
+    approach: str | None = None  # actionable approach if found=True
+    sources: list[str] = field(default_factory=list)
+    clues: str | None = None  # partial findings even when found=False
+    concrete_blockers: list[str] = field(default_factory=list)  # what needs to change
+    session_id: str | None = None  # research session ID for traceability
+
+
+@runtime_checkable
+class ResearchSearcher(Protocol):
+    """Protocol for deep research dispatch (implemented in research.py)."""
+
+    async def inline_due_diligence(
+        self, step: dict, error: str,
+    ) -> str | None: ...
+
+    async def research(
+        self, step: dict, error: str, prior_attempts: list[str],
+        due_diligence_results: str | None = None,
+    ) -> ResearchResult | None: ...
+
+
 @runtime_checkable
 class ExecutionTracerProto(Protocol):
     """Protocol for execution trace recording (implemented in trace.py)."""

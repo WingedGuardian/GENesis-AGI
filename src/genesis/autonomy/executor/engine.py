@@ -54,6 +54,8 @@ class CCSessionExecutor:
         decomposer: Any,
         reviewer: Any,
         workaround_searcher: Any | None = None,
+        research_searcher: Any | None = None,
+        router: Any | None = None,
         tracer: Any | None = None,
         outreach_pipeline: Any | None = None,
         event_bus: Any | None = None,
@@ -65,6 +67,7 @@ class CCSessionExecutor:
         self._invoker = invoker
         self._decomposer = decomposer
         self._reviewer = reviewer
+        self._router = router
         self._tracer = tracer
         self._outreach = outreach_pipeline
         self._event_bus = event_bus
@@ -78,6 +81,7 @@ class CCSessionExecutor:
             invoker=invoker,
             autonomous_dispatcher=autonomous_dispatcher,
             workaround_searcher=workaround_searcher,
+            research_searcher=research_searcher,
         )
 
         # In-memory state
@@ -298,22 +302,94 @@ class CCSessionExecutor:
                     )
                     return False
 
-                # Handle failed step -- try workaround
+                # Handle failed step -- layered recovery
                 if result.status == "failed":
+                    wt_path = self._worktree_paths.get(task_id)
+
+                    # Layer 1: procedural memory workaround
                     recovered = await self._step_dispatcher.try_workaround(
                         task_id, step, result, step_results,
-                        worktree_path=self._worktree_paths.get(task_id),
+                        worktree_path=wt_path,
                     )
                     if recovered is not None:
                         step_results[-1] = recovered
                         if trace:
                             self._tracer.record_step(trace, recovered)
-                    else:
-                        await self._fail_task(
-                            task_id,
-                            f"Step {step['idx']} failed: {result.result[:300]}",
+                        continue
+
+                    # Layer 2: inline due diligence (quick web+memory)
+                    dd_context = await self._step_dispatcher.try_due_diligence(
+                        step, result,
+                    )
+                    if dd_context:
+                        dd_retry = await self._step_dispatcher.execute_step(
+                            task_id, step, step_results,
+                            workaround=dd_context,
+                            worktree_path=wt_path,
                         )
-                        return False
+                        if dd_retry.status == "completed":
+                            step_results[-1] = dd_retry
+                            if trace:
+                                self._tracer.record_step(trace, dd_retry)
+                            continue
+
+                    # Layer 3: full research session
+                    researched, research_result = (
+                        await self._step_dispatcher.try_research(
+                            task_id, step, result, step_results,
+                            due_diligence_results=dd_context,
+                            worktree_path=wt_path,
+                        )
+                    )
+                    if researched is not None:
+                        step_results[-1] = researched
+                        if trace:
+                            self._tracer.record_step(trace, researched)
+                        continue
+
+                    # Layer 4: exit gate loop (cap 10 — safety net only)
+                    exit_decision = None
+                    prior_rejections: list[dict] = []
+                    for _gate_cycle in range(10):
+                        exit_decision = await self._challenge_failure(
+                            task_id, step, result, research_result,
+                            prior_rejections,
+                        )
+                        if exit_decision.get("verdict") == "accept":
+                            break
+                        # Exit gate rejected — try its suggestion
+                        prior_rejections.append(exit_decision)
+                        suggested = exit_decision.get("suggested_approach", "")
+                        if suggested:
+                            retry = await self._step_dispatcher.execute_step(
+                                task_id, step, step_results,
+                                workaround=suggested,
+                                worktree_path=wt_path,
+                            )
+                            if retry.status == "completed":
+                                step_results[-1] = retry
+                                if trace:
+                                    self._tracer.record_step(trace, retry)
+                                break
+                    else:
+                        # Hit cap 10 — force accept (safety net)
+                        logger.warning(
+                            "Exit gate cap reached for task %s step %d",
+                            task_id, step["idx"],
+                        )
+
+                    if step_results[-1].status == "completed":
+                        continue  # one of the gate retries worked
+
+                    # All recovery exhausted. Record challenge + fail.
+                    await self._record_challenge(
+                        task_id, step, result, research_result, exit_decision,
+                    )
+                    await self._fail_task(
+                        task_id,
+                        f"Step {step['idx']} failed: {result.result[:300]}",
+                    )
+                    return False
 
             # --- VERIFYING (review loop, Amendment #4) ---
             deliverable = _dispatch.synthesize_deliverable(step_results)
@@ -473,6 +549,173 @@ class CCSessionExecutor:
             self._db, task_id, blockers=reason,
         )
         await self._notify(task_id, f"Task failed: {reason}", "alert")
+
+    # =================================================================
+    # Exit gate + challenge recording
+    # =================================================================
+
+    async def _challenge_failure(
+        self,
+        task_id: str,
+        step: dict,
+        result: StepResult,
+        research_result: Any,
+        prior_rejections: list[dict],
+    ) -> dict:
+        """Adversarial exit gate — challenges the failure before accepting it."""
+        if not self._router:
+            # No router → can't run exit gate → accept by default
+            return {"verdict": "accept", "confirmed_blockers": ["No exit gate available"]}
+
+        from pathlib import Path as _Path
+
+        prompt_path = _Path(__file__).resolve().parent / "prompts" / "exit_gate.md"
+        try:
+            template = prompt_path.read_text()
+        except FileNotFoundError:
+            return {"verdict": "accept", "confirmed_blockers": ["Exit gate prompt missing"]}
+
+        desc = step.get("description", step.get("title", "unknown step"))
+        research_conclusion = ""
+        concrete_blockers_text = "None identified"
+        if research_result:
+            research_conclusion = research_result.clues or "No clues found"
+            if research_result.concrete_blockers:
+                concrete_blockers_text = "\n".join(
+                    f"- {b}" for b in research_result.concrete_blockers
+                )
+
+        rejections_text = "None (first attempt)"
+        if prior_rejections:
+            rejections_text = "\n".join(
+                f"- Attempt {i+1}: {r.get('reason', '?')}"
+                for i, r in enumerate(prior_rejections)
+            )
+
+        prompt = (
+            template
+            .replace("{{step_description}}", desc)
+            .replace("{{error_text}}", result.result[:2000])
+            .replace("{{research_conclusion}}", research_conclusion)
+            .replace("{{concrete_blockers}}", concrete_blockers_text)
+            .replace("{{prior_rejections}}", rejections_text)
+        )
+
+        try:
+            llm_result = await self._router.route_call(
+                "failure_exit_gate",
+                [{"role": "user", "content": prompt}],
+            )
+            text = llm_result.content if hasattr(llm_result, "content") else str(llm_result)
+            # Parse JSON from response
+            parsed = self._parse_gate_response(text)
+            if parsed:
+                return parsed
+        except Exception:
+            logger.exception("Exit gate LLM call failed for task %s", task_id)
+
+        # On failure, default to accept (don't infinite loop)
+        return {"verdict": "accept", "confirmed_blockers": ["Exit gate call failed"]}
+
+    @staticmethod
+    def _parse_gate_response(text: str) -> dict | None:
+        """Extract JSON verdict from exit gate response."""
+        import re
+
+        json_block = re.search(r"```json\s*\n(.*?)\n\s*```", text, re.DOTALL)
+        if json_block:
+            try:
+                parsed = json.loads(json_block.group(1))
+                if "verdict" in parsed:
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # Try bare JSON object
+        for i in range(len(text) - 1, -1, -1):
+            if text[i] == "}":
+                depth = 0
+                for j in range(i, -1, -1):
+                    if text[j] == "}":
+                        depth += 1
+                    elif text[j] == "{":
+                        depth -= 1
+                    if depth == 0:
+                        try:
+                            parsed = json.loads(text[j : i + 1])
+                            if "verdict" in parsed:
+                                return parsed
+                        except json.JSONDecodeError:
+                            break
+                break
+        return None
+
+    async def _record_challenge(
+        self,
+        task_id: str,
+        step: dict,
+        result: StepResult,
+        research_result: Any,
+        exit_decision: dict | None,
+    ) -> None:
+        """Record a permanent execution_challenge observation + follow-up."""
+        desc = step.get("description", step.get("title", "unknown step"))
+
+        # Build challenge content
+        blockers = []
+        clues = None
+        what_needs_to_change = None
+        if research_result:
+            blockers = research_result.concrete_blockers or []
+            clues = research_result.clues
+        if exit_decision and exit_decision.get("verdict") == "accept":
+            what_needs_to_change = exit_decision.get("what_needs_to_change")
+            confirmed = exit_decision.get("confirmed_blockers", [])
+            if confirmed:
+                blockers = confirmed
+
+        content = json.dumps({
+            "task_id": task_id,
+            "step_description": desc,
+            "error": result.result[:1000],
+            "concrete_blockers": blockers,
+            "clues": clues,
+            "what_needs_to_change": what_needs_to_change,
+            "research_session_id": getattr(research_result, "session_id", None),
+        })
+
+        # Create permanent observation
+        try:
+            from genesis.db.crud import observations
+
+            await observations.create(
+                self._db,
+                source="task_executor",
+                obs_type="execution_challenge",
+                content=content,
+                priority="high",
+            )
+            logger.info(
+                "Recorded execution_challenge observation for task %s step %s",
+                task_id, step.get("idx", "?"),
+            )
+        except Exception:
+            logger.exception("Failed to record execution challenge observation")
+
+        # Create follow-up for ego evaluation
+        try:
+            from genesis.db.crud import follow_ups
+
+            await follow_ups.create(
+                self._db,
+                content=f"Execution challenge: step '{desc}' failed after deep research. "
+                f"Blockers: {', '.join(blockers) if blockers else 'unknown'}",
+                source="task_executor",
+                strategy="ego_judgment",
+                reason=content,
+            )
+        except Exception:
+            logger.exception("Failed to create challenge follow-up")
 
     # =================================================================
     # Blocker persistence (Amendment #1)

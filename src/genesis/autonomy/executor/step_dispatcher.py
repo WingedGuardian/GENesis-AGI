@@ -16,7 +16,7 @@ from typing import Any
 
 from genesis.autonomy.autonomous_dispatch import AutonomousDispatchRequest
 from genesis.autonomy.executor import dispatch as _dispatch
-from genesis.autonomy.executor.types import StepResult, StepType
+from genesis.autonomy.executor.types import ResearchResult, StepResult, StepType
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +39,13 @@ class StepDispatcher:
         invoker: Any,
         autonomous_dispatcher: Any | None = None,
         workaround_searcher: Any | None = None,
+        research_searcher: Any | None = None,
     ) -> None:
         self._db = db
         self._invoker = invoker
         self._autonomous_dispatcher = autonomous_dispatcher
         self._workaround = workaround_searcher
+        self._research = research_searcher
 
     async def execute_step(
         self,
@@ -337,3 +339,66 @@ class StepDispatcher:
             worktree_path=worktree_path,
         )
         return retry if retry.status == "completed" else None
+
+    async def try_due_diligence(
+        self,
+        step: dict,
+        failed_result: StepResult,
+    ) -> str | None:
+        """Quick inline research. Returns context string or None."""
+        if not self._research:
+            return None
+
+        try:
+            return await self._research.inline_due_diligence(
+                step, failed_result.result,
+            )
+        except Exception:
+            logger.error(
+                "Due diligence failed for step %d",
+                step.get("idx", "?"), exc_info=True,
+            )
+            return None
+
+    async def try_research(
+        self,
+        task_id: str,
+        step: dict,
+        failed_result: StepResult,
+        step_results: list[StepResult],
+        due_diligence_results: str | None = None,
+        *,
+        worktree_path: Path | None = None,
+    ) -> tuple[StepResult | None, ResearchResult | None]:
+        """Dispatch research session. Returns (retry_result, research_result).
+
+        If research finds an approach, retries the step with that context.
+        Returns (successful_retry, research_result) or (None, research_result).
+        """
+        if not self._research:
+            return None, None
+
+        try:
+            research_result = await self._research.research(
+                step, failed_result.result, [],
+                due_diligence_results=due_diligence_results,
+            )
+        except Exception:
+            logger.error(
+                "Research session failed for step %d",
+                step.get("idx", "?"), exc_info=True,
+            )
+            return None, None
+
+        if research_result is None or not research_result.found:
+            return None, research_result
+
+        # Retry with research-derived approach
+        retry = await self.execute_step(
+            task_id, step, step_results,
+            workaround=research_result.approach,
+            worktree_path=worktree_path,
+        )
+        if retry.status == "completed":
+            return retry, research_result
+        return None, research_result

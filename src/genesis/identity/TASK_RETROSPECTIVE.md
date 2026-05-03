@@ -78,3 +78,12 @@ Return ONLY a JSON object:
   flag when X") not vague ("be careful with Y").
 - Think about what would help if this exact task type came up again next
   week. What would you want to know?
+
+## Handling Failures
+
+If the trace shows failed steps:
+- Document failure patterns as procedure_updates with `outcome: "failure"`
+- Include `failure_condition` with the specific technical root cause
+- Include `workaround` if a workaround was attempted (even if it failed)
+- For ALL-failed traces: focus entirely on documenting what went wrong and why
+- Never create a `new_procedure` from failure — only update existing ones

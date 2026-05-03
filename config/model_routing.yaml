@@ -479,6 +479,14 @@ call_sites:
     default_paid: true
     retry_profile: background
     description: Autonomous executor non-tooling reasoning via API
+  failure_exit_gate:
+    chain:
+    - claude-sonnet
+    - openrouter-qwen36plus
+    default_paid: true
+    retry_profile: background
+    description: Adversarial exit gate — challenges task failures before allowing
+      surrender
   cc_update_analysis:
     chain:
     - mistral-large-free
