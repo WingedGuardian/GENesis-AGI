@@ -226,6 +226,31 @@ class TestProposalWorkflow:
         digest = workflow.format_digest(props, "b1")
         assert "Alternatives:" not in digest
 
+    async def test_format_digest_memory_basis_shown(self, workflow):
+        """memory_basis renders as italic text when present."""
+        props = [{"action_type": "investigate", "content": "Test",
+                  "memory_basis": "the freelance goal from March",
+                  "confidence": 0.8}]
+        digest = workflow.format_digest(props, "b1")
+        assert "<i>the freelance goal from March</i>" in digest
+
+    async def test_format_digest_memory_basis_hidden_when_empty(self, workflow):
+        """Empty memory_basis does not render."""
+        props = [{"action_type": "investigate", "content": "Test",
+                  "memory_basis": "", "confidence": 0.8}]
+        digest = workflow.format_digest(props, "b1")
+        # Should not have an empty italic tag
+        assert "<i></i>" not in digest
+
+    async def test_format_digest_memory_basis_truncated(self, workflow):
+        """Long memory_basis is truncated to 150 chars."""
+        long_basis = "X" * 200
+        props = [{"action_type": "investigate", "content": "Test",
+                  "memory_basis": long_basis, "confidence": 0.8}]
+        digest = workflow.format_digest(props, "b1")
+        assert "X" * 150 in digest
+        assert "X" * 151 not in digest
+
     async def test_send_digest_calls_topic_manager(
         self, workflow, db, mock_topic_manager,
     ):

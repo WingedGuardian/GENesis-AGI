@@ -766,7 +766,8 @@ TABLES = {
             expires_at      TEXT,                     -- auto-expiry timestamp
             rank            INTEGER,                  -- board position (lower = higher priority)
             execution_plan  TEXT,                     -- dispatch instructions for approved proposals
-            recurring       INTEGER DEFAULT 0         -- 1 if ongoing/recurring commitment
+            recurring       INTEGER DEFAULT 0,        -- 1 if ongoing/recurring commitment
+            memory_basis    TEXT DEFAULT ''            -- non-obvious memory attribution
         )
     """,
     "ego_state": """

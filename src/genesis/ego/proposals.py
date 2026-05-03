@@ -53,6 +53,11 @@ def _format_digest(
         )
         if rationale:
             lines.append(f"<i>Rationale:</i> {_ESC(rationale)}")
+        memory_basis = p.get("memory_basis", "")
+        if memory_basis:
+            if len(memory_basis) > 150:
+                memory_basis = memory_basis[:150] + "\u2026"
+            lines.append(f"<i>{_ESC(memory_basis)}</i>")
         confidence = p.get("confidence", 0.0)
         urgency = p.get("urgency", "normal")
         lines.append(
@@ -147,6 +152,7 @@ class ProposalWorkflow:
                 rank=rank_val,
                 execution_plan=p.get("execution_plan"),
                 recurring=bool(p.get("recurring", False)),
+                memory_basis=p.get("memory_basis", ""),
             )
             ids.append(pid)
 

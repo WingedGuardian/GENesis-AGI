@@ -8,6 +8,7 @@ from genesis.cc.system_prompt import SystemPromptAssembler
 @pytest.fixture
 def assembler(tmp_path):
     (tmp_path / "SOUL.md").write_text("You are Genesis.")
+    (tmp_path / "VOICE.md").write_text("Genesis Voice: be direct.")
     (tmp_path / "USER.md").write_text("User prefers concise answers.")
     (tmp_path / "CONVERSATION.md").write_text("Respond naturally.")
     return SystemPromptAssembler(identity_dir=tmp_path)
@@ -23,8 +24,17 @@ def assembler_no_user(tmp_path):
 def test_assemble_sync_parts(assembler):
     result = assembler.assemble_static()
     assert "You are Genesis." in result
+    assert "Genesis Voice: be direct." in result
     assert "User prefers concise answers." in result
     assert "Respond naturally." in result
+
+
+def test_voice_after_soul(assembler):
+    """VOICE.md appears after SOUL.md in static assembly."""
+    result = assembler.assemble_static()
+    soul_pos = result.index("You are Genesis.")
+    voice_pos = result.index("Genesis Voice: be direct.")
+    assert voice_pos > soul_pos
 
 
 def test_assemble_without_user_profile(assembler_no_user):

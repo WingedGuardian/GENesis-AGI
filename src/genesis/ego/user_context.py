@@ -77,6 +77,7 @@ class UserEgoContextBuilder:
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
+        sections.append(await self._recurring_patterns_section())
         sections.append(self._output_contract_section())
 
         return "\n".join(sections)
@@ -731,6 +732,50 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
+    async def _recurring_patterns_section(self) -> str:
+        """Detect recurring observation patterns (3+ occurrences in 72h).
+
+        Groups unresolved observations by (type, category) and surfaces
+        clusters that may warrant automation or systematic response.
+        """
+        lines = ["## Recurring Patterns (72h)\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT type, category, COUNT(*) AS cnt, "
+                "  MAX(content) AS sample, MAX(created_at) AS latest "
+                "FROM observations "
+                "WHERE created_at >= datetime('now', '-3 days') "
+                "  AND resolved = 0 "
+                "GROUP BY type, category "
+                "HAVING cnt >= 3 "
+                "ORDER BY cnt DESC "
+                "LIMIT 5"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            logger.error("Failed to query recurring patterns", exc_info=True)
+            lines.append("*Could not query patterns.*\n")
+            return "\n".join(lines)
+
+        if not rows:
+            lines.append("*No recurring patterns detected.*\n")
+            return "\n".join(lines)
+
+        lines.append(
+            f"**{len(rows)} pattern(s)** appearing 3+ times "
+            f"(may warrant automation):\n"
+        )
+        for obs_type, category, cnt, sample, _latest in rows:
+            cat_str = f"/{category}" if category else ""
+            short = (sample or "")[:100].replace("\n", " ")
+            if len(sample or "") > 100:
+                short += "\u2026"
+            lines.append(f"- **[{obs_type}{cat_str}]** \u00d7{cnt} \u2014 {short}")
+
+        lines.append("")
+        return "\n".join(lines)
+
     @staticmethod
     def _output_contract_section() -> str:
         """Remind the ego of its required output format."""
@@ -741,13 +786,14 @@ class UserEgoContextBuilder:
             "{\n"
             '  "proposals": [\n'
             "    {\n"
-            '      "action_type": "investigate|outreach|maintenance|dispatch|config",\n'
+            '      "action_type": "investigate|outreach|maintenance|dispatch|config|recurring_pattern",\n'
             '      "action_category": "category for tracking",\n'
             '      "content": "what you want to do (specific and actionable)",\n'
             '      "rationale": "why this helps the user",\n'
             '      "confidence": 0.85,\n'
             '      "urgency": "low|normal|high|critical",\n'
-            '      "alternatives": "what else you considered"\n'
+            '      "alternatives": "what else you considered",\n'
+            '      "memory_basis": "non-obvious memory that informed this (optional)"\n'
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'

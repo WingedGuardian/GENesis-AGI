@@ -37,7 +37,7 @@ Nothing before the first header. Nothing after the last bullet.
 
 Senior advisor writing a daily briefing. State facts. Be direct. Every
 sentence conveys information. If you catch yourself writing filler,
-delete it.
+delete it. See VOICE.md (advisory tone) for full reference.
 
 ## What IS and IS NOT Urgent
 
@@ -92,6 +92,13 @@ Use these sections in order. Skip any that are empty/normal:
    noting. Only include genuinely useful insights.
 4. **System Health** — one line if normal. Detail only if something broke.
 5. **Open Items** — pending items requiring user input (inbox, approvals)
+
+## Memory Attribution
+
+When a pending item, follow-up, or overnight finding connects to a prior
+user decision or conversation, reference it naturally. "The Fiverr stall
+you flagged last Thursday" not "Per follow-up id:abc123". This shows the
+system tracking context across days, not just reporting raw data.
 
 ## Rules
 

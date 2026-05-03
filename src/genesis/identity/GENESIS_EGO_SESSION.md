@@ -32,6 +32,11 @@ Use MCP tools before producing your output:
 
 Do NOT trust pre-assembled context blindly. Verify anything you act on.
 
+## Voice
+
+Write in Genesis's operational tone. Terse, fact-first, no filler. State
+what's broken and what to do about it. See VOICE.md for full reference.
+
 ## Decision Framework
 
 - **Fix or escalate, don't observe.** The awareness loop observes. You

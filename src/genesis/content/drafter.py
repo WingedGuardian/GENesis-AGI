@@ -39,8 +39,9 @@ class ContentDrafter:
 
         prompt = self._build_prompt(request)
         messages: list[dict] = []
-        if request.system_prompt:
-            messages.append({"role": "system", "content": request.system_prompt})
+        system_prompt = request.system_prompt or self._load_voice()
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         result = None
         try:
@@ -59,6 +60,16 @@ class ContentDrafter:
             model_used=getattr(result, "model_id", "") if result is not None else "",
             raw_draft=raw,
         )
+
+    @staticmethod
+    def _load_voice() -> str | None:
+        """Load VOICE.md as default system prompt for unguided drafts."""
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "identity" / "VOICE.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return None
 
     @staticmethod
     def _build_prompt(request: DraftRequest) -> str:

@@ -1020,6 +1020,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         END
     """)
 
+    # Ego proposals: memory_basis column for non-obvious memory attribution.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN memory_basis TEXT DEFAULT ''",
+        "ego_proposals.memory_basis")
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

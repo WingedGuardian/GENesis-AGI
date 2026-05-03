@@ -185,6 +185,7 @@ async def create_proposal(
     rank: int | None = None,
     execution_plan: str | None = None,
     recurring: bool = False,
+    memory_basis: str = "",
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -194,12 +195,12 @@ async def create_proposal(
            (id, action_type, action_category, content, rationale,
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
-            recurring)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            recurring, memory_basis)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, action_type, action_category, content, rationale,
          confidence, urgency, alternatives, status, cycle_id,
          batch_id, created_at, expires_at, rank, execution_plan,
-         1 if recurring else 0),
+         1 if recurring else 0, memory_basis),
     )
     await db.commit()
     return id

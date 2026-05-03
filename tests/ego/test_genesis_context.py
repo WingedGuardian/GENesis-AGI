@@ -96,7 +96,8 @@ async def db():
                 expires_at      TEXT,
                 rank            INTEGER,
                 execution_plan  TEXT,
-                recurring       INTEGER DEFAULT 0
+                recurring       INTEGER DEFAULT 0,
+                memory_basis    TEXT DEFAULT ''
             )
         """)
         await conn.execute("""

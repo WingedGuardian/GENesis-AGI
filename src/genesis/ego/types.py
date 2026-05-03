@@ -61,6 +61,7 @@ class EgoProposal:
     confidence: float = 0.0  # 0.0-1.0
     urgency: str = ProposalUrgency.NORMAL
     alternatives: str = ""  # what else was considered
+    memory_basis: str = ""  # non-obvious memory that informed this proposal
     status: str = ProposalStatus.PENDING
     user_response: str | None = None  # rejection reason, etc.
     created_at: str = field(
@@ -140,6 +141,10 @@ EGO_OUTPUT_SCHEMA = {
                     "urgency": {"type": "string",
                                 "enum": ["low", "normal", "high", "critical"]},
                     "alternatives": {"type": "string"},
+                    "memory_basis": {
+                        "type": "string",
+                        "description": "Non-obvious memory or observation that informed this proposal. Cite naturally.",
+                    },
                     "execution_plan": {
                         "type": "string",
                         "description": "Brief dispatch plan (e.g., 'background CC session, ~$0.50, ~15 min')",
