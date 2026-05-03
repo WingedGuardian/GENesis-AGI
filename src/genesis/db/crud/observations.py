@@ -15,6 +15,7 @@ _PERMANENT_TYPES: frozenset[str] = frozenset({
     "feedback_rule",             # Learned behavioral rules
     "genesis_version_baseline",  # Single reference point, replaced on next version
     "cc_version_baseline",       # Single reference point, replaced on next version
+    "execution_challenge",       # Task failure post-mortem — resolved manually
 })
 
 # Default TTL for types not explicitly listed. Any new type that appears without
