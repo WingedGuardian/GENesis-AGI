@@ -231,8 +231,8 @@ class DeepResearcherImpl:
                 _DD_CALL_SITE,
                 [{"role": "user", "content": prompt}],
             )
-            text = result.content if hasattr(result, "content") else str(result)
-            if "NOT_RELEVANT" in text:
+            text = (result.content if hasattr(result, "content") else str(result)) or ""
+            if not text or "NOT_RELEVANT" in text:
                 return None
             return text.strip()[:2000]
         except Exception:

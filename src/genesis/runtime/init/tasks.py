@@ -54,6 +54,8 @@ async def init(rt: GenesisRuntime) -> None:
             router=rt._router,
             invoker=rt._cc_invoker,
             event_bus=rt._event_bus,
+            # GROUNDWORK(web-dd): web_searcher not yet on runtime; due diligence
+            # degrades to memory-only until WebSearcher is wired as a service.
             web_searcher=getattr(rt, "_web_searcher", None),
         )
         tracer = ExecutionTracer(

@@ -446,8 +446,10 @@ class TestRecordChallenge:
             # Observation was created
             mock_obs.assert_called_once()
             obs_call = mock_obs.call_args
-            assert obs_call.kwargs["obs_type"] == "execution_challenge"
+            assert obs_call.kwargs["type"] == "execution_challenge"
             assert obs_call.kwargs["priority"] == "high"
+            assert "id" in obs_call.kwargs
+            assert "created_at" in obs_call.kwargs
 
             # Follow-up was created
             mock_fu.assert_called_once()

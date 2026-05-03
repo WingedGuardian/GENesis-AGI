@@ -606,7 +606,7 @@ class CCSessionExecutor:
                 "failure_exit_gate",
                 [{"role": "user", "content": prompt}],
             )
-            text = llm_result.content if hasattr(llm_result, "content") else str(llm_result)
+            text = (llm_result.content if hasattr(llm_result, "content") else str(llm_result)) or ""
             # Parse JSON from response
             parsed = self._parse_gate_response(text)
             if parsed:
@@ -686,14 +686,18 @@ class CCSessionExecutor:
 
         # Create permanent observation
         try:
+            import uuid
+
             from genesis.db.crud import observations
 
             await observations.create(
                 self._db,
+                id=str(uuid.uuid4()),
                 source="task_executor",
-                obs_type="execution_challenge",
+                type="execution_challenge",
                 content=content,
                 priority="high",
+                created_at=datetime.now(UTC).isoformat(),
             )
             logger.info(
                 "Recorded execution_challenge observation for task %s step %s",
