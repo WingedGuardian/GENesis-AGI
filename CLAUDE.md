@@ -28,6 +28,9 @@ reflection) → Services (routing, memory, outreach, autonomy, surplus) → Data
 - **Env scrub**: `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` is NOT used — Genesis
   hooks and MCP servers require inherited API keys (DeepInfra, Qwen, etc.).
 - **Setup**: `./scripts/bootstrap.sh` (venv, config, services, memory)
+- **Temp files**: `~/tmp/` for transient downloads (media, audio, exports).
+  NEVER use `/tmp/` — it is a 512MB tmpfs shared across all CC sessions.
+  Clean up after use.
 
 ## Process Management
 
