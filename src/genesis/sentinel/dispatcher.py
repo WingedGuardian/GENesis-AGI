@@ -1342,26 +1342,43 @@ class SentinelDispatcher:
         # if empty, an empty set is data that confirms absence).
         self._recent_alarm_sets.append(current_ids)
 
-        # If alarms have cleared while we're waiting for approval, cancel
-        # the pending approval and go back to HEALTHY.
-        if not alarms and self._state.state in (
+        # If the specific alarm(s) that triggered this dispatch have cleared
+        # while we're waiting for approval, cancel the pending approval and
+        # go back to HEALTHY.  We check the *pending* alarm IDs specifically
+        # (not all system alarms) so an unrelated WARNING doesn't keep the
+        # sentinel stuck on a resolved CRITICAL.
+        if self._state.state in (
             SentinelState.AWAITING_DISPATCH_APPROVAL,
             SentinelState.AWAITING_ACTION_APPROVAL,
         ):
-            request_id = self._state.pending_request_id
-            if request_id and self._approval_gate is not None:
+            pending_ids = set()
+            if self._state.pending_request_json:
                 try:
-                    await self._approval_gate.resolve_request(
-                        request_id, decision="cancelled", resolved_by="alarm_cleared",
-                    )
-                except Exception:
-                    logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
-            logger.info("Alarms cleared — cancelling pending sentinel approval %s", request_id)
-            async with self._lock:
-                self._state.clear_pending()
-                self._state.transition(SentinelState.HEALTHY, reason="alarms cleared while awaiting approval")
-                save_state(self._state)
-            return None
+                    import json
+                    req = json.loads(self._state.pending_request_json)
+                    pending_ids = {a.get("alert_id", "") for a in req.get("alarms", [])}
+                    pending_ids.discard("")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            # Fall back to pending_pattern (single alarm ID) if no list
+            if not pending_ids and self._state.pending_pattern:
+                pending_ids = {self._state.pending_pattern}
+
+            if pending_ids and not (pending_ids & current_ids):
+                request_id = self._state.pending_request_id
+                if request_id and self._approval_gate is not None:
+                    try:
+                        await self._approval_gate.resolve_request(
+                            request_id, decision="cancelled", resolved_by="alarm_cleared",
+                        )
+                    except Exception:
+                        logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
+                logger.info("Pending alarms %s cleared — cancelling sentinel approval %s", pending_ids, request_id)
+                async with self._lock:
+                    self._state.clear_pending()
+                    self._state.transition(SentinelState.HEALTHY, reason="pending alarms cleared while awaiting approval")
+                    save_state(self._state)
+                return None
 
         if not alarms:
             return None

@@ -155,6 +155,7 @@ class GenesisVersionCollector:
             try:
                 await self._store_version_change(last_known, current_head)
                 await self._resolve_pending_update_available(current_head)
+                await self._resolve_pending_update_failed(current_head)
             except Exception:
                 logger.error(
                     "Failed to store Genesis version change %s -> %s",
@@ -412,6 +413,26 @@ class GenesisVersionCollector:
             "  AND type = 'genesis_update_available' "
             "  AND resolved = 0",
             (now, f"resolved by local update to {current_head}"),
+        )
+        await self._db.commit()
+
+    async def _resolve_pending_update_failed(self, current_head: str) -> None:
+        """Resolve any unresolved genesis_update_failed observations.
+
+        Called when the local HEAD changes (an update was applied).
+        If Genesis successfully updates past a previously failed version,
+        the failure observation is no longer relevant — resolve it so the
+        alert clears and the sentinel can auto-unstick.
+        """
+        now = datetime.now(UTC).isoformat()
+        await self._db.execute(
+            "UPDATE observations "
+            "SET resolved = 1, resolved_at = ?, "
+            "    resolution_notes = ? "
+            "WHERE source = 'genesis_version' "
+            "  AND type = 'genesis_update_failed' "
+            "  AND resolved = 0",
+            (now, f"resolved by successful update to {current_head}"),
         )
         await self._db.commit()
 

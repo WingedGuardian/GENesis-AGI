@@ -2398,7 +2398,7 @@
           if (probe?.status) return map[probe.status] || "#666";
           // Disk: derive status from free_pct
           if (probe?.free_pct != null) {
-            if (probe.free_pct > 20) return "#4caf50";
+            if (probe.free_pct >= 20) return "#4caf50";
             if (probe.free_pct > 10) return "#f0ad4e";
             return "#d9534f";
           }
