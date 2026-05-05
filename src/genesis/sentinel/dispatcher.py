@@ -214,13 +214,12 @@ class SentinelDispatcher:
         # dispatching. Prevents single-tick flaps from waking the Sentinel.
         self._recent_alarm_sets: deque[set[str]] = deque(maxlen=_ALARM_RING_SIZE)
 
-        # Load dispatch approval policy (legacy path, used when approval_gate is None)
+        # Load dispatch approval policy — sentinel inherits from the global
+        # manual_approval_required setting (no separate sentinel toggle).
         try:
             from genesis.autonomy.cli_policy import load_autonomous_cli_policy
             policy = load_autonomous_cli_policy()
-            self._require_approval = policy.as_dict().get(
-                "manual_approval_required_sentinel", True,
-            )
+            self._require_approval = policy.manual_approval_required
         except Exception:
             self._require_approval = True
 

@@ -42,7 +42,7 @@ def _env_int(name: str, default: int) -> int:
 @dataclass(frozen=True)
 class AutonomousCliPolicy:
     autonomous_cli_fallback_enabled: bool = True
-    manual_approval_required: bool = True
+    manual_approval_required: bool = False
     reask_interval_hours: int = 24
     approval_channel: str = "telegram"
     shared_export_enabled: bool = True
@@ -60,7 +60,7 @@ def load_autonomous_cli_policy(path: Path | None = None) -> AutonomousCliPolicy:
             "GENESIS_AUTONOMOUS_CLI_FALLBACK_ENABLED", True,
         ),
         manual_approval_required=_env_bool(
-            "GENESIS_AUTONOMOUS_CLI_APPROVAL_ENABLED", True,
+            "GENESIS_AUTONOMOUS_CLI_APPROVAL_ENABLED", False,
         ),
         reask_interval_hours=max(
             1, _env_int("GENESIS_AUTONOMOUS_CLI_REASK_INTERVAL_HOURS", 24),
