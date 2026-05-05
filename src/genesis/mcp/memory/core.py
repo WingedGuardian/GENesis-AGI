@@ -54,6 +54,32 @@ async def memory_recall(
         wing=wing, room=room, expand_query_terms=expand_query_terms,
     )
 
+    # Drift fallback: when standard recall returns sparse results, try the
+    # 3-phase drift retrieval (global scan → cluster drill-down → weighted RRF)
+    # which handles complex/ambiguous queries better.
+    if len(results) < min(3, limit) and limit >= 3:
+        try:
+            from genesis.memory.drift import drift_recall
+
+            drift_results = await drift_recall(
+                query,
+                db=memory_mod._db,
+                qdrant_client=memory_mod._qdrant,
+                embedding_provider=memory_mod._retriever._embeddings,
+                source=source,
+                limit=limit,
+                min_activation=min_activation,
+            )
+            if len(drift_results) > len(results):
+                logger.info(
+                    "drift_recall fallback: standard=%d → drift=%d results"
+                    " (query=%r)",
+                    len(results), len(drift_results), query[:80],
+                )
+                results = drift_results
+        except Exception:
+            logger.warning("drift_recall fallback failed", exc_info=True)
+
     if compact:
         return [
             {

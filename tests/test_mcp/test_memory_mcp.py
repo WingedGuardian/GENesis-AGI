@@ -1091,6 +1091,37 @@ async def test_memory_recall_passes_expand_query_terms_true():
     old_store, old_db, old_retriever, old_qdrant = (
         mod._store, mod._db, mod._retriever, mod._qdrant,
     )
+# ─── drift_recall fallback tests ────────────────────────────────────────────
+
+
+def _drift_patch():
+    """Import the drift module and return a patch target for drift_recall."""
+    import genesis.memory.drift as drift_mod
+    return drift_mod
+
+
+async def test_memory_recall_drift_fallback_fires_on_sparse_results():
+    """When standard recall returns < 3 results, drift_recall is tried."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory.types import RetrievalResult
+
+    def _make_result(mid: str, pipeline: str = "hybrid") -> RetrievalResult:
+        return RetrievalResult(
+            memory_id=mid, content=f"content-{mid}", source="test",
+            memory_type="episodic", score=0.5, vector_rank=1, fts_rank=1,
+            activation_score=0.3, payload={}, source_pipeline=pipeline,
+        )
+
+    sparse_results = [_make_result("a")]
+    drift_results = [_make_result("x", "drift"), _make_result("y", "drift"),
+                     _make_result("z", "drift")]
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = AsyncMock(return_value=sparse_results)
+    mock_retriever._embeddings = MagicMock()
+
+    drift_mod = _drift_patch()
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
     try:
         mod._store = MagicMock()
         mod._db = MagicMock()
@@ -1128,6 +1159,38 @@ async def test_memory_recall_expand_query_terms_defaults_false():
     old_store, old_db, old_retriever, old_qdrant = (
         mod._store, mod._db, mod._retriever, mod._qdrant,
     )
+        with patch.object(drift_mod, "drift_recall",
+                          new_callable=AsyncMock, return_value=drift_results):
+            tools = await _get_tools()
+            results = await tools["memory_recall"].fn(
+                query="test query", limit=10, compact=True,
+            )
+            # Should get drift results (3) instead of sparse (1)
+            assert len(results) == 3
+            assert all(r["source_pipeline"] == "drift" for r in results)
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_no_drift_when_results_sufficient():
+    """When standard recall returns >= 3 results, drift is NOT called."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory.types import RetrievalResult
+
+    def _make_result(mid: str) -> RetrievalResult:
+        return RetrievalResult(
+            memory_id=mid, content=f"content-{mid}", source="test",
+            memory_type="episodic", score=0.5, vector_rank=1, fts_rank=1,
+            activation_score=0.3, payload={}, source_pipeline="hybrid",
+        )
+
+    good_results = [_make_result("a"), _make_result("b"), _make_result("c")]
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = AsyncMock(return_value=good_results)
+
+    drift_mod = _drift_patch()
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
     try:
         mod._store = MagicMock()
         mod._db = MagicMock()
@@ -1147,3 +1210,84 @@ async def test_memory_recall_expand_query_terms_defaults_false():
         mod._db = old_db
         mod._retriever = old_retriever
         mod._qdrant = old_qdrant
+        with patch.object(drift_mod, "drift_recall",
+                          new_callable=AsyncMock) as mock_drift:
+            tools = await _get_tools()
+            results = await tools["memory_recall"].fn(
+                query="test query", limit=10, compact=True,
+            )
+            assert len(results) == 3
+            mock_drift.assert_not_called()
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_drift_fallback_failure_is_silent():
+    """If drift_recall raises, original sparse results are returned."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory.types import RetrievalResult
+
+    sparse = [RetrievalResult(
+        memory_id="a", content="c", source="t", memory_type="episodic",
+        score=0.5, vector_rank=1, fts_rank=1, activation_score=0.3,
+        payload={}, source_pipeline="hybrid",
+    )]
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = AsyncMock(return_value=sparse)
+    mock_retriever._embeddings = MagicMock()
+
+    drift_mod = _drift_patch()
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        with patch.object(drift_mod, "drift_recall",
+                          new_callable=AsyncMock,
+                          side_effect=RuntimeError("embedding provider down")):
+            tools = await _get_tools()
+            results = await tools["memory_recall"].fn(
+                query="test query", limit=10, compact=True,
+            )
+            # Falls back to original sparse results
+            assert len(results) == 1
+            assert results[0]["memory_id"] == "a"
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_no_drift_when_limit_below_3():
+    """Drift should not fire when limit < 3 (caller only wants 1-2 results)."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory.types import RetrievalResult
+
+    sparse = [RetrievalResult(
+        memory_id="a", content="c", source="t", memory_type="episodic",
+        score=0.5, vector_rank=1, fts_rank=1, activation_score=0.3,
+        payload={}, source_pipeline="hybrid",
+    )]
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = AsyncMock(return_value=sparse)
+
+    drift_mod = _drift_patch()
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        with patch.object(drift_mod, "drift_recall",
+                          new_callable=AsyncMock) as mock_drift:
+            tools = await _get_tools()
+            results = await tools["memory_recall"].fn(
+                query="test", limit=2, compact=True,
+            )
+            assert len(results) == 1
+            mock_drift.assert_not_called()
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
