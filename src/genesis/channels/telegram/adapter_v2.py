@@ -61,6 +61,7 @@ class TelegramAdapterV2(ChannelAdapter):
         reply_waiter: object | None = None,
         engagement_tracker: object | None = None,
         autonomous_cli_gate: object | None = None,
+        proposal_workflow: object | None = None,
     ):
         self.token = token
         self.conversation_loop = conversation_loop
@@ -70,6 +71,7 @@ class TelegramAdapterV2(ChannelAdapter):
         self._reply_waiter = reply_waiter
         self._engagement_tracker = engagement_tracker
         self._autonomous_cli_gate = autonomous_cli_gate
+        self._proposal_workflow = proposal_workflow
         self._app = None
 
         # Transport layer components
@@ -135,6 +137,7 @@ class TelegramAdapterV2(ChannelAdapter):
             typing_breaker=self._typing_breaker,
             dedupe=self._dedupe,
             autonomous_cli_gate=self._autonomous_cli_gate,
+            proposal_workflow=self._proposal_workflow,
         )
 
         self._app = (

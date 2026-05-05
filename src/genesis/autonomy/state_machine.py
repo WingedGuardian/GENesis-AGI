@@ -242,6 +242,57 @@ class AutonomyManager:
         )
         return True
 
+    async def promote(
+        self, category: str, to_level: int, *, reason: str = ""
+    ) -> bool:
+        """Explicit promotion — only called on user approval.
+
+        Returns True if promotion succeeded, False if category not found
+        or to_level is not actually a promotion.
+        """
+        state = await self.get_state(category)
+        if state is None:
+            logger.error("Cannot promote — category %s not found in DB", category)
+            return False
+
+        level_before = int(state.current_level)
+        success = await crud.promote(
+            self._db, state.id, to_level=to_level, updated_at=_now_iso()
+        )
+        if success:
+            self._emit_promotion_event(category, level_before, to_level)
+            logger.info(
+                "Autonomy promoted: %s L%d → L%d%s",
+                category, level_before, to_level,
+                f" reason={reason}" if reason else "",
+            )
+        return success
+
+    async def force_regress(
+        self, category: str, to_level: int = 1, *, reason: str = "user_revoked"
+    ) -> bool:
+        """Hard reset — resets BOTH current and earned level.
+
+        Used for user revocation. Unlike Bayesian regression (which only
+        lowers current_level), this resets earned_level too — a full reset.
+        """
+        state = await self.get_state(category)
+        if state is None:
+            logger.error("Cannot force_regress — category %s not found in DB", category)
+            return False
+
+        level_before = int(state.current_level)
+        success = await crud.force_regress(
+            self._db, state.id, to_level=to_level, reason=reason, updated_at=_now_iso()
+        )
+        if success and level_before != to_level:
+            self._emit_regression_event(category, level_before, to_level, _now_iso())
+            logger.warning(
+                "Autonomy force-regressed: %s L%d → L%d (%s)",
+                category, level_before, to_level, reason,
+            )
+        return success
+
     # ------------------------------------------------------------------
     # Correction / success tracking
     # ------------------------------------------------------------------
@@ -285,31 +336,20 @@ class AutonomyManager:
     async def record_success(self, category: str) -> tuple[bool, bool]:
         """Record a successful autonomous action for *category*.
 
-        Returns ``(success, promoted)``.  If a promotion occurred, emits
-        an ``autonomy.promotion`` event via the event bus.
+        Returns ``(success, promoted)``.  Promotion no longer happens
+        automatically — it requires explicit user approval via promote().
+        The second tuple element is always False.
         """
         state = await self.get_state(category)
         if state is None:
             logger.error("Cannot record success — category %s not found", category)
             return False, False
 
-        level_before = int(state.current_level)
         success = await crud.record_success(self._db, state.id, updated_at=_now_iso())
         if not success:
             return False, False
 
-        updated = await self.get_state(category)
-        level_after = int(updated.current_level) if updated else level_before
-        promoted = level_after > level_before
-
-        if promoted:
-            logger.info(
-                "Autonomy promotion for %s: L%d → L%d",
-                category, level_before, level_after,
-            )
-            self._emit_promotion_event(category, level_before, level_after)
-
-        return True, promoted
+        return True, False
 
     # ------------------------------------------------------------------
     # Event emission
