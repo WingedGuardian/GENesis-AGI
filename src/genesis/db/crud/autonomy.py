@@ -163,26 +163,61 @@ async def record_correction(
 async def record_success(
     db: aiosqlite.Connection, id: str, *, updated_at: str
 ) -> bool:
-    """Record success. Bayesian promotion: recompute posterior, promote if threshold crossed."""
+    """Record success. Increments counter only — promotion requires explicit approve."""
     row = await get_by_id(db, id)
     if not row:
         return False
     new_successes = row["total_successes"] + 1
 
-    # Bayesian promotion — promote by at most 1 level at a time
-    target = bayesian_level(new_successes, row["total_corrections"])
-    new_level = row["current_level"]
-    new_earned = row["earned_level"]
-    if target > new_level:
-        new_level = min(new_level + 1, target)  # promote by at most 1
-        new_earned = max(new_earned, new_level)
-
     cursor = await db.execute(
         """UPDATE autonomy_state SET
            total_successes = ?, consecutive_corrections = 0,
+           updated_at = ?
+           WHERE id = ?""",
+        (new_successes, updated_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def promote(
+    db: aiosqlite.Connection, id: str, *, to_level: int, updated_at: str
+) -> bool:
+    """Explicit promotion — only called on user approval."""
+    row = await get_by_id(db, id)
+    if not row or to_level < 1 or to_level > 7:
+        return False
+    if to_level <= row["current_level"]:
+        return False  # Not a promotion
+    new_earned = max(row["earned_level"], to_level)
+    cursor = await db.execute(
+        """UPDATE autonomy_state SET
            current_level = ?, earned_level = ?, updated_at = ?
            WHERE id = ?""",
-        (new_successes, new_level, new_earned, updated_at, id),
+        (to_level, new_earned, updated_at, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def force_regress(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    to_level: int = 1,
+    reason: str = "user_revoked",
+    updated_at: str,
+) -> bool:
+    """Hard reset — resets BOTH current and earned level. For user revocation."""
+    row = await get_by_id(db, id)
+    if not row or to_level < 1 or to_level > 7:
+        return False
+    cursor = await db.execute(
+        """UPDATE autonomy_state SET
+           current_level = ?, earned_level = ?,
+           regression_reason = ?, last_regression_at = ?, updated_at = ?
+           WHERE id = ?""",
+        (to_level, to_level, reason, updated_at, updated_at, id),
     )
     await db.commit()
     return cursor.rowcount > 0

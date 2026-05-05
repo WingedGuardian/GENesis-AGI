@@ -158,26 +158,77 @@ def test_bayesian_posterior_computation():
     assert abs(bayesian_posterior(50, 2) - 0.944) < 0.01
 
 
-async def test_success_promotes_bayesian(db):
-    """Successes promote level when posterior crosses threshold."""
+async def test_success_does_not_auto_promote(db):
+    """record_success increments counter but does NOT change level."""
     await autonomy.create(db, id="promo1", category="promo1", updated_at="2026-01-01", current_level=1)
-    # Accumulate successes to cross L2 threshold (posterior >= 0.30)
-    # 1S + 0C → 2/3 = 0.667 → bayesian L3, but promote by 1 → L2
+    # Even with high posterior, level stays unchanged
     await autonomy.record_success(db, "promo1", updated_at="t1")
     row = await autonomy.get_by_id(db, "promo1")
-    assert row["current_level"] == 2  # promoted from L1 to L2
-    assert row["earned_level"] == 2
+    assert row["current_level"] == 1  # NOT promoted
+    assert row["earned_level"] == 1
+    assert row["total_successes"] == 1
+    assert row["consecutive_corrections"] == 0
 
 
-async def test_success_promotes_incrementally(db):
-    """Promotion happens one level at a time, even if posterior is much higher."""
+async def test_success_many_does_not_promote(db):
+    """Even many successes do not auto-promote — requires explicit promote()."""
     await autonomy.create(db, id="promo2", category="promo2", updated_at="2026-01-01", current_level=1)
     await db.execute("UPDATE autonomy_state SET total_successes = 49 WHERE id = 'promo2'")
     await db.commit()
-    # 50th success: 50S+0C → 51/52 = 0.98 → bayesian L4, but promote only to L2
     await autonomy.record_success(db, "promo2", updated_at="t1")
     row = await autonomy.get_by_id(db, "promo2")
-    assert row["current_level"] == 2  # only +1 from L1
+    assert row["current_level"] == 1  # Still L1 — no auto-promote
+    assert row["total_successes"] == 50
+
+
+async def test_promote_explicit(db):
+    """promote() explicitly raises level on user approval."""
+    await autonomy.create(db, id="pro1", category="pro1", updated_at="2026-01-01", current_level=1)
+    result = await autonomy.promote(db, "pro1", to_level=2, updated_at="t1")
+    assert result is True
+    row = await autonomy.get_by_id(db, "pro1")
+    assert row["current_level"] == 2
+    assert row["earned_level"] == 2
+
+
+async def test_promote_rejects_non_promotion(db):
+    """promote() returns False if to_level <= current."""
+    await autonomy.create(db, id="pro2", category="pro2", updated_at="2026-01-01", current_level=3)
+    result = await autonomy.promote(db, "pro2", to_level=2, updated_at="t1")
+    assert result is False
+    result = await autonomy.promote(db, "pro2", to_level=3, updated_at="t1")
+    assert result is False
+
+
+async def test_promote_rejects_invalid_level(db):
+    """promote() validates level range 1-7."""
+    await autonomy.create(db, id="pro3", category="pro3", updated_at="2026-01-01", current_level=1)
+    assert await autonomy.promote(db, "pro3", to_level=0, updated_at="t1") is False
+    assert await autonomy.promote(db, "pro3", to_level=8, updated_at="t1") is False
+
+
+async def test_promote_nonexistent(db):
+    """promote() returns False for missing id."""
+    assert await autonomy.promote(db, "ghost", to_level=2, updated_at="t1") is False
+
+
+async def test_force_regress(db):
+    """force_regress() resets BOTH current and earned level."""
+    await autonomy.create(
+        db, id="fr1", category="fr1", updated_at="2026-01-01",
+        current_level=4, earned_level=4,
+    )
+    result = await autonomy.force_regress(db, "fr1", to_level=1, reason="user_revoked", updated_at="t1")
+    assert result is True
+    row = await autonomy.get_by_id(db, "fr1")
+    assert row["current_level"] == 1
+    assert row["earned_level"] == 1  # earned also reset
+    assert row["regression_reason"] == "user_revoked"
+
+
+async def test_force_regress_nonexistent(db):
+    """force_regress() returns False for missing id."""
+    assert await autonomy.force_regress(db, "ghost", updated_at="t1") is False
 
 
 # ─── person_id tests ─────────────────────────────────────────────────────────
