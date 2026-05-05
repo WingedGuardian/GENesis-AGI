@@ -323,3 +323,101 @@ class TestCheckCeiling:
     def test_ceiling_check_fails(self, manager):
         """outreach ceiling is 2, required L3 -> False."""
         assert manager.check_ceiling("outreach", 3) is False
+
+
+# ---------------------------------------------------------------------------
+# TestPromote
+# ---------------------------------------------------------------------------
+
+
+class TestPromote:
+    @pytest.mark.asyncio
+    async def test_promote_success(self, manager):
+        """promote() raises level and emits event."""
+        await manager.load_or_create_defaults()
+        ok = await manager.promote("direct_session", 2)
+        assert ok is True
+        state = await manager.get_state("direct_session")
+        assert state is not None
+        assert state.current_level == AutonomyLevel.L2
+        assert state.earned_level == AutonomyLevel.L2
+
+    @pytest.mark.asyncio
+    async def test_promote_emits_event(self, db, config_file):
+        event_bus = MagicMock()
+        event_bus.emit = AsyncMock()
+        mgr = AutonomyManager(db=db, event_bus=event_bus, config_path=config_file)
+        await mgr.load_or_create_defaults()
+        await mgr.promote("direct_session", 3)
+        await asyncio.sleep(0)
+        event_bus.emit.assert_called_once()
+        args = event_bus.emit.call_args
+        assert args[0][2] == "autonomy.promotion"
+        assert args[1]["category"] == "direct_session"
+        assert args[1]["level_before"] == 1
+        assert args[1]["level_after"] == 3
+
+    @pytest.mark.asyncio
+    async def test_promote_rejects_non_promotion(self, manager):
+        """promote() returns False if to_level <= current."""
+        await manager.load_or_create_defaults()
+        await manager.set_level("direct_session", 3)
+        assert await manager.promote("direct_session", 2) is False
+        assert await manager.promote("direct_session", 3) is False
+
+    @pytest.mark.asyncio
+    async def test_promote_missing_category(self, manager):
+        assert await manager.promote("nonexistent", 2) is False
+
+    @pytest.mark.asyncio
+    async def test_record_success_never_promotes(self, manager):
+        """record_success() always returns promoted=False now."""
+        await manager.load_or_create_defaults()
+        # Many successes — still no promotion
+        for _ in range(20):
+            ok, promoted = await manager.record_success("direct_session")
+            assert ok is True
+            assert promoted is False
+        state = await manager.get_state("direct_session")
+        assert state.current_level == AutonomyLevel.L1  # unchanged
+
+
+# ---------------------------------------------------------------------------
+# TestForceRegress
+# ---------------------------------------------------------------------------
+
+
+class TestForceRegress:
+    @pytest.mark.asyncio
+    async def test_force_regress_resets_both_levels(self, manager):
+        """force_regress() resets both current and earned level."""
+        await manager.load_or_create_defaults()
+        await manager.set_level("direct_session", 4)
+        state = await manager.get_state("direct_session")
+        assert state.earned_level == AutonomyLevel.L4
+
+        ok = await manager.force_regress("direct_session", to_level=1, reason="user_revoked")
+        assert ok is True
+        state = await manager.get_state("direct_session")
+        assert state.current_level == AutonomyLevel.L1
+        assert state.earned_level == AutonomyLevel.L1  # earned also reset
+
+    @pytest.mark.asyncio
+    async def test_force_regress_emits_event(self, db, config_file):
+        event_bus = MagicMock()
+        event_bus.emit = AsyncMock()
+        mgr = AutonomyManager(db=db, event_bus=event_bus, config_path=config_file)
+        await mgr.load_or_create_defaults()
+        await mgr.set_level("direct_session", 3)
+        event_bus.reset_mock()
+        await mgr.force_regress("direct_session", to_level=1, reason="test")
+        await asyncio.sleep(0)
+        event_bus.emit.assert_called_once()
+        args = event_bus.emit.call_args
+        assert args[0][2] == "autonomy.regression"
+        assert args[1]["level_before"] == 3
+        assert args[1]["level_after"] == 1
+
+    @pytest.mark.asyncio
+    async def test_force_regress_missing_category(self, manager):
+        assert await manager.force_regress("nonexistent") is False
