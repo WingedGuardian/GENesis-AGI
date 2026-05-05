@@ -221,6 +221,26 @@
                         "command": "echo \"$CLAUDE_TOOL_INPUT\" | ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook behavioral_linter.py"
                     }
                 ]
+            },
+            {
+                "matcher": "WebFetch|WebSearch",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/web_tools_gate.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Agent",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
+                        "timeout": 2000
+                    }
+                ]
             }
         ],
         "Stop": [

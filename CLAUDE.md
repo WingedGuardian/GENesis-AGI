@@ -111,8 +111,18 @@ one matches.
 
 ## Web Tools
 
-CC WebSearch for general lookups, SearXNG for structured/bulk queries,
-Crawl4AI for JS-rendered pages, ATS APIs for job listings.
+**MCP tools (canonical — work in ALL session types):**
+- `web_fetch(url)` — fetch any URL with anti-bot bypass (Scrapling→Crawl4AI→httpx)
+- `web_search(query)` — search web (SearXNG→Brave, or explicit tavily/exa/perplexity)
+
+**CC built-in tools (foreground convenience):**
+- CC `WebFetch` — AI-processed summary (use when you need a summary, not raw content)
+- CC `WebSearch` — quick general lookups (fine for simple questions)
+
+**Default to MCP tools.** They handle anti-bot, work in background sessions,
+and return structured data. Use CC tools only when AI summarization is the goal.
+
+Browser tools for interactive pages. ATS APIs for job listings.
 Full decision guide: `.claude/docs/web-tools-guide.md`
 
 ## Background Sessions
