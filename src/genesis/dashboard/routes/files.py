@@ -12,7 +12,7 @@ import re
 import stat
 from pathlib import Path
 
-from flask import jsonify, request
+from flask import jsonify, request, send_file
 
 from genesis.dashboard._blueprint import blueprint
 
@@ -309,6 +309,36 @@ def file_delete():
         return jsonify({"error": "Delete failed"}), 500
 
     return jsonify({"status": "ok", "path": str(raw_path)})
+
+
+@blueprint.route("/api/genesis/files/download")
+def file_download():
+    """Download a file as an attachment.
+
+    Query params:
+        path – absolute file path
+    """
+    raw_path = request.args.get("path")
+    if not raw_path:
+        return jsonify({"error": "path required"}), 400
+
+    target = Path(raw_path).resolve()
+    if not _is_allowed(target):
+        return jsonify({"error": "Path not allowed"}), 403
+    if not target.is_file():
+        return jsonify({"error": "Not a file"}), 404
+    if target.stat().st_size > _MAX_UPLOAD_SIZE:
+        return jsonify({"error": f"File too large (>{_MAX_UPLOAD_SIZE // (1024 * 1024)}MB)"}), 413
+
+    try:
+        return send_file(
+            target,
+            as_attachment=True,
+            download_name=target.name,
+            mimetype="application/octet-stream",
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "File no longer exists"}), 404
 
 
 @blueprint.route("/api/genesis/files/upload", methods=["POST"])

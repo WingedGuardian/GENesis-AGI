@@ -7268,6 +7268,12 @@
                   <span style="font-size:0.72rem; font-family:monospace; color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:70%;"
                         x-text="$store.genesisDashboard.fileBrowser.selectedFile"></span>
                   <div style="display:flex; gap:0.3rem;">
+                    <button @click="window.open('/api/genesis/files/download?path=' + encodeURIComponent($store.genesisDashboard.fileBrowser.selectedFile), '_blank')"
+                            style="font-size:0.7rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;
+                                   background:rgba(33,150,243,0.15); color:#2196F3; border:1px solid rgba(33,150,243,0.3);"
+                            title="Download file">
+                      <span class="material-symbols-outlined" style="font-size:0.85rem; vertical-align:middle;">download</span>
+                    </button>
                     <template x-if="$store.genesisDashboard.fileBrowser.fileWritable && $store.genesisDashboard.fileBrowser.fileDirty">
                       <button @click="$store.genesisDashboard.saveFile()"
                               :disabled="$store.genesisDashboard.fileBrowser.saving"
