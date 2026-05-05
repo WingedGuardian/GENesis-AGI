@@ -41,7 +41,14 @@ def _get_searcher():
 
 
 def _is_challenge_response(text: str, status_code: int) -> bool:
-    """Detect anti-bot challenge responses that need JS rendering."""
+    """Detect anti-bot challenge responses that need JS rendering.
+
+    Intentional trade-off: only checks markers in short pages (<500 chars).
+    Most Cloudflare challenges return 403/503 (caught by status check).
+    Rare 200+challenge pages that exceed 500 chars will not trigger escalation
+    — acceptable because large pages with challenge markers mixed into real
+    content would cause false positives on legitimate pages.
+    """
     if status_code in (403, 429, 503):
         return True
     if not text or len(text) < 500:
@@ -113,7 +120,7 @@ async def _impl_web_fetch(
             "url": result.url,
             "title": result.title,
             "content": result.text,
-            "backend_used": "scrapling" if result.text else "httpx",
+            "backend_used": "scrapling" if not result.error else "httpx",
             "status_code": result.status_code,
             "truncated": result.truncated,
             "error": result.error,
