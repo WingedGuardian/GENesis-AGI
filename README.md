@@ -40,7 +40,7 @@
 
 We have the most capable AI models ever created, and we're using them like search bars with better grammar.
 
-Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step. 
+Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
 
 But now? **Personal AGI is here.**
 
@@ -53,7 +53,7 @@ Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
 
 <br>
 
-Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are neccessarily the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
+Truthfully, no, I do not genuinely consider this to be "true" AGI. In order to get to something resembling "true" AGI, it would need to be built from first principles, which would require the orchestration (that IS Genesis) to be built into the LLM layer, the most foundational part of Genesis' compute layer itself. Nor am I of any particular belief that LLMs are necessarily the right architecture for this pursuit in the first place. But because I cannot change the LLM layer, and no better technology currently exists, this is the best I can do today. Call it "proto-AGI;" "pseudo-AGI" even.
 
 But what I can tell you is this: Genesis is far closer to AGI than anything else I've seen, and even if it's not AGI from first principles, it mimics a lot of the same outcomes and behaviours and capabilities that AGI would presumably need to exhibit. If AGI sounds like something you'd like to help contribute to, [**come build with us →**](#get-involved)
 
@@ -290,7 +290,7 @@ Total budget: under 1.5 seconds. If the embedding provider is down, vector searc
 
 **Not just documents in a vector space:**
 
-11,000+ memories. 8,000+ typed graph links. 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it.
+Memories aren't isolated documents — they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. Within weeks of use, thousands of memories accumulate with tens of thousands of graph links between them.
 
 Activation scoring ensures relevance isn't just cosine similarity — it's time-aware decay (configurable half-lives: 30-60 days by source type), access frequency (log scale, capping at 20 retrievals), graph connectivity, and class weighting. A steering rule from month one outranks a casual observation from yesterday.
 
@@ -303,7 +303,7 @@ Activation scoring ensures relevance isn't just cosine similarity — it's time-
 
 **Session extraction:** After conversations end, a pipeline extracts what mattered — entities, decisions, evaluations, action items, relationships — each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
 
-**Wing taxonomy:** Memory is classified into 7 structural domains (memory, learning, routing, infrastructure, channels, autonomy, general) with subtopics. Querying within a specific domain cuts noise from the full 11K store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
+**Wing taxonomy:** Memory is classified into 7 structural domains (memory, learning, routing, infrastructure, channels, autonomy, general) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
 
 After six months of operation, Genesis doesn't just have more memories — it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. That's what separates this from a chatbot with a vector database.
 
@@ -374,7 +374,7 @@ Genesis earns autonomy per category through demonstrated competence:
 
 V5 extends this to L5-L7: system configuration, learning modification, and identity evolution. These require months of L4 operational data before they're safe to activate.
 
-Trust is granular, not binary. Mess up twice in a row in a category, drop a level -- Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
+Trust is granular, not binary. First failure in a category triggers demotion — Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
 The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate -- one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
 
