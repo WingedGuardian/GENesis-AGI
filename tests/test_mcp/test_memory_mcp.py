@@ -1291,3 +1291,37 @@ async def test_memory_recall_no_drift_when_limit_below_3():
             mock_drift.assert_not_called()
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_no_drift_when_wing_specified():
+    """Drift should not fire when wing filter is set — drift ignores wing/room."""
+    import genesis.mcp.memory_mcp as mod
+    from genesis.memory.types import RetrievalResult
+
+    sparse = [RetrievalResult(
+        memory_id="a", content="c", source="t", memory_type="episodic",
+        score=0.5, vector_rank=1, fts_rank=1, activation_score=0.3,
+        payload={"wing": "infrastructure"}, source_pipeline="hybrid",
+    )]
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall = AsyncMock(return_value=sparse)
+
+    drift_mod = _drift_patch()
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        with patch.object(drift_mod, "drift_recall",
+                          new_callable=AsyncMock) as mock_drift:
+            tools = await _get_tools()
+            results = await tools["memory_recall"].fn(
+                query="test", limit=10, wing="infrastructure", compact=True,
+            )
+            assert len(results) == 1
+            mock_drift.assert_not_called()
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old

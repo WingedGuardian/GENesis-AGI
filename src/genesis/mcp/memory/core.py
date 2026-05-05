@@ -20,6 +20,25 @@ def _memory_mod():
 logger = logging.getLogger(__name__)
 
 
+def _increment_retrieved(qdrant, results) -> None:
+    """Increment retrieved_count for results not tracked by HybridRetriever."""
+    from genesis.qdrant import collections as qdrant_ops
+
+    for r in results:
+        for coll in ("episodic_memory", "knowledge_base"):
+            try:
+                pts = qdrant.retrieve(coll, ids=[r.memory_id], with_payload=True)
+                if pts:
+                    old = (pts[0].payload or {}).get("retrieved_count", 0)
+                    qdrant_ops.update_payload(
+                        qdrant, collection=coll, point_id=r.memory_id,
+                        payload={"retrieved_count": old + 1},
+                    )
+                    break
+            except Exception:
+                pass
+
+
 @mcp.tool()
 async def memory_recall(
     query: str,
@@ -57,7 +76,14 @@ async def memory_recall(
     # Drift fallback: when standard recall returns sparse results, try the
     # 3-phase drift retrieval (global scan → cluster drill-down → weighted RRF)
     # which handles complex/ambiguous queries better.
-    if len(results) < min(3, limit) and limit >= 3:
+    # Skip when wing/room filters are set — drift discovers clusters dynamically
+    # and would silently violate the caller's filter constraints.
+    if (
+        len(results) < min(3, limit)
+        and limit >= 3
+        and not wing
+        and not room
+    ):
         try:
             from genesis.memory.drift import drift_recall
 
@@ -77,6 +103,9 @@ async def memory_recall(
                     len(results), len(drift_results), query[:80],
                 )
                 results = drift_results
+                # Track drift results as retrieved — HybridRetriever.recall()
+                # handles this internally, but drift_recall does not.
+                _increment_retrieved(memory_mod._qdrant, drift_results)
         except Exception:
             logger.warning("drift_recall fallback failed", exc_info=True)
 
