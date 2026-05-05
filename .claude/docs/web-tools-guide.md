@@ -2,6 +2,26 @@
 
 Genesis has multiple web tools across two execution contexts.
 
+
+## Canonical Interface (MCP — all session types)
+
+These are the PRIMARY tools. Use them by default in all contexts.
+
+| Need | Tool | Notes |
+|------|------|-------|
+| Fetch URL content | `web_fetch(url)` | Anti-bot, JS fallback, structured output |
+| Search the web | `web_search(query)` | SearXNG unlimited, structured results |
+| AI-summarized fetch | CC `WebFetch` | Foreground only — when you need AI summary |
+| Quick general lookup | CC `WebSearch` | Foreground only — simple questions |
+| JS-heavy SPA | `web_fetch(url, backend="crawl4ai")` | Playwright rendering |
+| Semantic search | `web_search(query, backend="exa")` | Find similar by meaning |
+| Synthesized answer | `web_search(query, backend="perplexity")` | Multi-source synthesis |
+| Page interaction | `browser_navigate` + `browser_click` | Login, forms, visual |
+
+**Default rule:** `web_fetch`/`web_search` first. CC tools for AI summaries only.
+Browser for interaction. ATS APIs for job listings.
+
+---
 ## Search — "I need to find something"
 
 | Tool | Context | Use when... | Free tier |

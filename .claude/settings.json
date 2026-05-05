@@ -1,314 +1,344 @@
 {
-  "env": {
-    "DISABLE_AUTOUPDATER": "1"
-  },
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py",
-            "timeout": 5000
-          }
+    "env": {
+        "DISABLE_AUTOUPDATER": "1"
+    },
+    "hooks": {
+        "SessionStart": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_context.py",
+                        "timeout": 5000
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook check_stale_pending.py",
+                        "timeout": 5000
+                    }
+                ]
+            },
+            {
+                "matcher": "startup",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "resume",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "clear",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
+                        "timeout": 2000
+                    }
+                ]
+            }
+        ],
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_urgent_alerts.py",
+                        "timeout": 3000
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_prompt.py",
+                        "timeout": 3000
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook proactive_memory_hook.py",
+                        "timeout": 1650
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/skill_injection_hook.py",
+                        "timeout": 500
+                    }
+                ]
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook contribution_offer_hook.py",
+                        "timeout": 500
+                    }
+                ]
+            }
+        ],
+        "PreToolUse": [
+            {
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook procedure_advisor.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Read|Grep|Glob",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-discovery-gate.sh",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); BG=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r \".run_in_background // false\" 2>/dev/null); if [ \"$BG\" = \"true\" ] && echo \"$CMD\" | grep -qF \"|\"; then echo \"BLOCKED: Piped commands with run_in_background produce empty output.\" >&2; echo \"Run without pipes, or run in foreground.\" >&2; exit 2; fi; if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/destructive_command_guard.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/protected_paths_guard.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/git_push_guard.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/concurrent_test_guard.py",
+                        "timeout": 3000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/full_suite_guard.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_commit.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "WebFetch",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash -c 'URL=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read /tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
+                    }
+                ]
+            },
+            {
+                "matcher": "Write|Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "echo \"$CLAUDE_TOOL_INPUT\" | ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook pretool_check.py"
+                    },
+                    {
+                        "type": "command",
+                        "command": "echo \"$CLAUDE_TOOL_INPUT\" | ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook behavioral_linter.py"
+                    }
+                ]
+            },
+            {
+                "matcher": "WebFetch|WebSearch",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/web_tools_gate.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Agent",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/agent_tool_guidance.py",
+                        "timeout": 2000
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_stop_hook.py",
+                        "timeout": 2000
+                    }
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_end.py",
+                        "timeout": 1500
+                    }
+                ]
+            }
+        ],
+        "PostToolUse": [
+            {
+                "matcher": "Read|Edit|Write|Glob|Grep",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_context_hook.py",
+                        "timeout": 500
+                    }
+                ]
+            },
+            {
+                "matcher": "Edit|Write",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "bash -c 'FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .file_path 2>/dev/null); if [[ \"$FILE\" == *.py ]]; then RUFF=/home/ubuntu/genesis/.venv/bin/ruff; \"$RUFF\" format --quiet \"$FILE\" 2>/dev/null; \"$RUFF\" check --fix --quiet \"$FILE\" 2>/dev/null; fi; true'",
+                        "timeout": 3000
+                    }
+                ]
+            },
+            {
+                "matcher": "Write|Edit",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_modification_audit_hook.py",
+                        "timeout": 500
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_invalidate_on_commit.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "WebFetch|browser_navigate|browser_snapshot|browser_click|browser_evaluate|browser_run_code",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook content_safety_hook.py",
+                        "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": ".*",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/session_observer_hook.py",
+                        "timeout": 500
+                    }
+                ]
+            },
+            {
+                "matcher": "ExitPlanMode",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook plan_bookmark_hook.py",
+                        "timeout": 2000
+                    }
+                ]
+            }
         ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook check_stale_pending.py",
-            "timeout": 5000
-          }
-        ]
-      },
-      {
-        "matcher": "startup",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "clear",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "compact",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-            "timeout": 2000
-          }
-        ]
-      }
-    ],
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_urgent_alerts.py",
-            "timeout": 3000
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_prompt.py",
-            "timeout": 3000
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook proactive_memory_hook.py",
-            "timeout": 1650
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/skill_injection_hook.py",
-            "timeout": 500
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook contribution_offer_hook.py",
-            "timeout": 500
-          }
-        ]
-      }
-    ],
-    "PreToolUse": [
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook procedure_advisor.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "Read|Grep|Glob",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-discovery-gate.sh",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); BG=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r \".run_in_background // false\" 2>/dev/null); if [ \"$BG\" = \"true\" ] && echo \"$CMD\" | grep -qF \"|\"; then echo \"BLOCKED: Piped commands with run_in_background produce empty output.\" >&2; echo \"Run without pipes, or run in foreground.\" >&2; exit 2; fi; if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/destructive_command_guard.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/git_push_guard.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/concurrent_test_guard.py",
-            "timeout": 3000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/full_suite_guard.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_enforcement_commit.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "WebFetch",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -c 'URL=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .url 2>/dev/null); if echo \"$URL\" | grep -qiE \"(youtube\\.com|youtu\\.be)\"; then echo \"BLOCKED: YouTube URLs fail with SSL certificate errors in this environment.\" >&2; echo \"\" >&2; echo \"Use yt-dlp via Bash instead (installed and on PATH):\" >&2; echo \"  Metadata: yt-dlp --skip-download --print \\\"%(title)s|||%(uploader)s|||%(view_count)s|||%(duration)s|||%(description)s\\\" URL\" >&2; echo \"  Transcript: yt-dlp --write-auto-sub --skip-download --sub-lang en -o \\\"/tmp/%(id)s\\\" URL\" >&2; echo \"  Then read /tmp/VIDEO_ID.en.vtt for the full transcript.\" >&2; exit 2; fi'"
-          }
-        ]
-      },
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook pretool_check.py"
-          },
-          {
-            "type": "command",
-            "command": "echo \"$CLAUDE_TOOL_INPUT\" | ${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook behavioral_linter.py"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_stop_hook.py",
-            "timeout": 2000
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook genesis_session_end.py",
-            "timeout": 1500
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "Read|Edit|Write|Glob|Grep",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_context_hook.py",
-            "timeout": 500
-          }
-        ]
-      },
-      {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash -c 'FILE=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .file_path 2>/dev/null); if [[ \"$FILE\" == *.py ]]; then RUFF=/home/ubuntu/genesis/.venv/bin/ruff; \"$RUFF\" format --quiet \"$FILE\" 2>/dev/null; \"$RUFF\" check --fix --quiet \"$FILE\" 2>/dev/null; fi; true'",
-            "timeout": 3000
-          }
-        ]
-      },
-      {
-        "matcher": "Write|Edit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook file_modification_audit_hook.py",
-            "timeout": 500
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook review_invalidate_on_commit.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": "WebFetch|browser_navigate|browser_snapshot|browser_click|browser_evaluate|browser_run_code",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook content_safety_hook.py",
-            "timeout": 2000
-          }
-        ]
-      },
-      {
-        "matcher": ".*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/session_observer_hook.py",
-            "timeout": 500
-          }
-        ]
-      },
-      {
-        "matcher": "ExitPlanMode",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook plan_bookmark_hook.py",
-            "timeout": 2000
-          }
-        ]
-      }
-    ]
-  },
-  "enabledPlugins": {
-    "claude-code-setup@claude-plugins-official": true
-  }
+    },
+    "enabledPlugins": {
+        "claude-code-setup@claude-plugins-official": true
+    }
 }

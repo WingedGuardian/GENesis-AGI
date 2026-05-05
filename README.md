@@ -70,7 +70,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## Genesis in 30 seconds
 
-- **It remembers.** Memory that compounds with every interaction — across sessions, across months. Day 180 is architecturally different from day 1.
+- **It remembers.** 4-layer memory — essential knowledge, proactive recall, deep search, knowledge pipeline — with 11,000+ memories and 8,000+ graph links that compound across months. Day 180 is architecturally different from day 1.
 - **It learns.** Outcome classification, causal attribution, and procedure extraction that runs automatically after every session. Laplace-smoothed confidence, not vibes.
 - **It runs on its own.** Thinks, researches, audits, and communicates while you're not there — on free-tier compute.
 - **It earns its autonomy.** Trust granted per action category through demonstrated competence. Mess up twice, drop a level. Earn it back through performance.
@@ -234,39 +234,115 @@ When Genesis isn't handling a user request, it doesn't sit idle. It researches t
 
 ## Memory 🗄️
 
-Genesis runs a hybrid memory architecture: two Qdrant vector collections, SQLite with FTS5 full-text search, and a knowledge graph — all working together in parallel.
+Most AI memory is a vector database with a retrieval function. Genesis runs a four-layer architecture — because "what are we working on?", "what's relevant right now?", "find everything about X", and "what does the external documentation say?" are fundamentally different operations that need different retrieval strategies.
 
-Every memory query runs simultaneously against semantic vector search and exact keyword search, then fuses results through Reciprocal Rank Fusion. Vector search catches meaning; keyword search catches exact terms. The fusion catches what you actually meant.
+```
+L1: Essential Knowledge (~300 tokens, injected at every session start)
+    Pure DB queries. No LLM, no network, no latency.
+    Content: active context, recent decisions, structural overview.
+    → The forest view. Always available, even if everything else is down.
 
-Memories aren't isolated documents in a vector space — they're connected. The knowledge graph creates typed links between memories: references, contradictions, supersessions, elaborations. When Genesis recalls a fact, it can walk the graph to find what supports it, what contradicts it, and what replaced it.
+L2: Proactive Recall (fires on every user message, <1.5s)
+    Surfaces the top 3 relevant memories automatically — before Genesis
+    even starts thinking about your question.
+    Hybrid: FTS5 keyword + Qdrant vector + activation scoring → RRF fusion.
+    → You never have to ask "do you remember?" — it already checked.
 
-After conversations end, an extraction pipeline automatically identifies entities, decisions, evaluations, and key moments, storing them as searchable episodic memory with provenance tracking. The system doesn't just remember what you said. It extracts what mattered.
+L3: Deep Search (on-demand, ~1-2s)
+    Full pipeline: 4 ranked signals fused via Reciprocal Rank Fusion.
+    Wing/room filtering, intent classification, graph traversal.
+    → When you need everything Genesis knows about a topic.
 
-If the embedding provider goes down, retrieval automatically falls back to keyword-only mode. Memory degrades gracefully rather than going dark.
+L4: Knowledge Pipeline (external, permanent)
+    Ingests from text, PDF, audio, video, web pages, YouTube transcripts.
+    Separate vector collection. Idempotent — re-ingesting updates, never duplicates.
+    → Domain knowledge that doesn't decay with time.
+```
 
-**Three memory types:**
+LLMs lose the forest for the trees — that's a known weakness of large-context reasoning. The layer model is the architectural compensation: L1 maintains the forest (what are we doing, what have we decided, what matters), while L2-L3 drill into specific trees on demand. L4 provides the reference library.
 
-| Type | What it stores | How confidence works |
+**What actually happens when you send a message:**
+
+Every prompt triggers L2 before Genesis starts reasoning about your question:
+
+1. Your message hits a pre-processing hook
+2. In parallel: FTS5 searches for exact keyword matches (~5ms), Qdrant searches for semantic similarity (1024-dim embeddings, ~400ms)
+3. Activation scoring weighs each candidate: `confidence × recency × (access_freq + connectivity) × class_weight`
+4. Reciprocal Rank Fusion combines the ranked lists — memories appearing in multiple signals accumulate score
+5. Top 3 results inject into context with provenance metadata
+
+Total budget: under 1.5 seconds. If the embedding provider is down, vector search is skipped — FTS5 still works because it's compiled into SQLite with zero external dependencies. Memory degrades gracefully, never goes dark.
+
+**Not just documents in a vector space:**
+
+11,000+ memories. 8,000+ typed graph links. 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it.
+
+Activation scoring ensures relevance isn't just cosine similarity — it's time-aware decay (configurable half-lives: 30-60 days by source type), access frequency (log scale, capping at 20 retrievals), graph connectivity, and class weighting. A steering rule from month one outranks a casual observation from yesterday.
+
+**Two collections, different lifecycles:**
+
+| Collection | What lives there | Lifecycle |
 |---|---|---|
-| **Episodic** | What happened, when, in what context | Searchable by meaning and exact terms |
-| **Procedural** | Reusable learned procedures | Laplace-smoothed: `(successes + 1) / (total + 2)` |
-| **Observations** | Transient working memory | Lifecycle-tracked, expires when no longer useful |
+| **Episodic** | Conversations, decisions, reflections, evaluations | Decays over time. Subject to correction. |
+| **Knowledge** | External domain data, ingested reference material | Permanent. Authoritative. Re-ingested, never duplicated. |
 
-The knowledge pipeline ingests from any format — text, PDF, audio, video, web pages, YouTube transcripts — running each through a multi-step extraction chain that normalizes structure, generates embeddings, and indexes for hybrid retrieval.
+**Session extraction:** After conversations end, a pipeline extracts what mattered — entities, decisions, evaluations, action items, relationships — each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
+
+**Wing taxonomy:** Memory is classified into 7 structural domains (memory, learning, routing, infrastructure, channels, autonomy, general) with subtopics. Querying within a specific domain cuts noise from the full 11K store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
+
+After six months of operation, Genesis doesn't just have more memories — it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. That's what separates this from a chatbot with a vector database.
 
 <p align="center">
-  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth — 6,070 memories across 16 days" width="760">
+  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth" width="760">
 </p>
 
 ---
 
 ## Self-learning 📈
 
-After every meaningful interaction, a six-stage pipeline runs automatically: decide whether to learn from this at all, classify what actually happened vs. what was expected, measure whether anything improved, attribute *why* the outcome happened, persist what's worth keeping, and extract any reusable procedure with calibrated confidence.
+Most AI systems log what happened. Genesis classifies *why* it happened, extracts a reusable principle, and verifies that principle works next time. The pipeline runs automatically after every meaningful interaction:
 
-The key distinction: Genesis doesn't just learn *what* to do differently — it classifies *why* things work or don't. Approach failure, capability gap, and external blocker are different diagnoses that route to different subsystems. Most systems conflate them. If you treat "I did it wrong" and "I can't do it yet" the same way, you learn the wrong lessons every time.
+```
+1. Triage        → Should we learn from this at all? (5 depth levels)
+2. Outcome       → What happened vs. what was expected? (5 outcome classes)
+3. Delta         → How did delivery differ from request?
+4. Attribution   → WHY did the outcome happen? (6 causal types)
+5. Persistence   → Store observations, update user model, route signals
+6. Extraction    → Extract reusable procedures with calibrated confidence
+```
 
-Underpinning this is a confidence calibration system — Bayesian prediction logging across observations, reflections, and memory writes. Genesis tracks not just what it learned, but how *right* it was about what it learned, and adjusts future confidence accordingly. This system is active in production.
+**Triage isn't binary.** Not everything deserves the same analysis. A trivial status check gets `SKIP`. A failed approach with a workaround gets `FULL_PLUS_WORKAROUND` — the deepest analysis tier, triggering procedure extraction and drive adaptation. The classifier gates compute spend, not learning opportunity.
+
+**Outcome classification separates diagnoses that most systems conflate:**
+
+| Outcome | What it means | Why it matters |
+|---|---|---|
+| `success` | Task completed as requested | Reinforces approach confidence |
+| `approach_failure` | Wrong approach, could do better | Triggers procedure extraction |
+| `capability_gap` | Genesis lacks the ability | Routes to capability tracking, not self-blame |
+| `external_blocker` | External system prevented completion | Routes to infrastructure, not behavior change |
+| `workaround_success` | Primary failed, alternative worked | Extracts the workaround as a procedure |
+
+If you treat "I did it wrong" and "I can't do it yet" the same way, you learn the wrong lessons every time.
+
+**Causal attribution asks *why*:** Was it an external limitation? A gap in the user model? A misinterpretation of scope? Each of the 6 attribution types routes to a different subsystem — a user model gap triggers a high-priority observation; an external limitation routes to infrastructure awareness. The diagnosis determines the treatment.
+
+**Procedure extraction builds reusable knowledge:**
+
+Extracted procedures start at L4 (advisory-only, never auto-injected) and promote through tiers as they prove themselves:
+
+```
+L4 (new)     → Advisory only. Auto-extracted, unproven.
+L3 (proven)  → Injected at session start. Requires 3+ successes, ≥65% confidence.
+L2 (reliable)→ Higher injection priority. Requires 5+ successes, ≥75% confidence.
+L1 (core)    → Trigger-cached, instant recall. Requires 8+ successes, ≥85% confidence.
+```
+
+Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at ~67% confidence — not zero, not certain. Evidence moves it. Three consecutive failures and `failure_count >= success_count + 3` triggers demotion. Confidence below 30% with enough samples quarantines the procedure entirely.
+
+**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight — no single event overcorrects. Protected behaviors (honesty, transparency, pushback) cannot be eroded by weak signals regardless of volume.
+
+This isn't "log what happened and hope the next session reads it." It's a closed loop: classify outcome → diagnose cause → extract principle → verify principle → promote or demote. The system gets measurably better at its job over time, and it can show you the receipts.
 
 ---
 

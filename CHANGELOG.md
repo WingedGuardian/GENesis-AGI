@@ -7,6 +7,50 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b3] - 2026-05-05
+
+Web tools get MCP exposure so background sessions and subagents can
+actually use them. Ego proposals flow through approval correctly.
+SSH dispatch enables cross-machine module communication.
+
+### Added
+
+- **SSH IPC adapter** (#225) --- external modules can now dispatch
+  prompts to remote Claude Code instances over SSH. Two modes: CC
+  (structured JSON) and SHELL (raw commands). Enables module
+  communication without standing up HTTP services.
+- **Protected paths guard** (#226) --- PreToolUse hook blocks accidental
+  deletion of session transcripts, backups, snapshots, browser profiles,
+  and the production database.
+
+### Changed
+
+- **Web tools exposed via MCP** (#229) --- `web_fetch` and `web_search`
+  are now MCP tools on genesis-health, making Scrapling, Crawl4AI,
+  SearXNG, and the paid search backends accessible to background
+  sessions, ego, and subagents (previously required Bash/Python imports).
+  Behavioral nudges steer sessions toward these over CC's built-in
+  WebFetch/WebSearch.
+- **Ego proposal flow** (#228) --- proposals now route through the
+  approval gate correctly. Auto-promote removed; all proposals require
+  explicit approval before execution.
+- **Sentinel alarm clearing** (#227) --- auto-clear fires only when the
+  specific pending alarm resolves, not all alarms indiscriminately.
+- **Temp file conventions** (#226) --- `~/tmp/` documented as the
+  standard transient path. `/tmp/` (512MB tmpfs) is off-limits.
+
+### Fixed
+
+- **Migration runner compatibility** (#230) --- migration 0010 handles
+  databases that lack the `memory_metadata` table (test fixtures, fresh
+  installs before DDL runs).
+- **Dashboard memory bar** --- uses correct anonymization percentage for
+  status assessment.
+- **Drift recall and step dispatcher** --- critical bugs in recall
+  query, bi-temporal column migration, and dispatcher routing.
+
+---
+
 ## [v3.0b2] - 2026-05-03
 
 Ego becomes perceptive, task execution gets smarter about blockers, and

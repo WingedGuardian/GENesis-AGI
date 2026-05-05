@@ -159,7 +159,7 @@ class CCSessionExecutor:
         # Start trace
         trace: ExecutionTrace | None = None
         if self._tracer:
-            trace = self._tracer.start_trace(task_id, "user", description)
+            trace = self._tracer.start_trace(task_id, "genesis", description)
 
         try:
             if resuming:

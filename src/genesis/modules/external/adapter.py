@@ -154,7 +154,8 @@ class ExternalProgramAdapter:
         """Execute a named operation from the manifest via IPC.
 
         Translates manifest entries (method, path, params) to IPC calls.
-        Path parameters like {id} are substituted from params.
+        HTTP operations substitute path parameters like {id} from params.
+        CC/SHELL operations pass params directly to the SSH adapter.
         """
         ops = self._config.operations
         if operation_name not in ops:
@@ -169,16 +170,20 @@ class ExternalProgramAdapter:
         path = op.get("path", "/")
         request_params = dict(params or {})
 
-        # Substitute path parameters like /api/jobs/{id}
-        import re
-        path_params = re.findall(r"\{(\w+)\}", path)
-        for pp in path_params:
-            if pp in request_params:
-                path = path.replace(f"{{{pp}}}", str(request_params.pop(pp)))
-            else:
-                return {"error": f"Missing required path parameter: {pp}"}
-
         try:
+            # SSH-based operations: pass params directly to adapter
+            if method.upper() in ("CC", "SHELL"):
+                return await self._ipc.send(path, data=request_params or None, method=method)
+
+            # HTTP operations: substitute path parameters like /api/jobs/{id}
+            import re
+            path_params = re.findall(r"\{(\w+)\}", path)
+            for pp in path_params:
+                if pp in request_params:
+                    path = path.replace(f"{{{pp}}}", str(request_params.pop(pp)))
+                else:
+                    return {"error": f"Missing required path parameter: {pp}"}
+
             result = await self._ipc.send(
                 path,
                 data=request_params if request_params else None,

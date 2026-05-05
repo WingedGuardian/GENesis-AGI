@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -299,3 +300,79 @@ class ProposalWorkflow:
     def set_memory_store(self, store: MemoryStore) -> None:
         """Attach a MemoryStore for storing correction memories on rejection."""
         self._memory_store = store
+
+
+# ---------------------------------------------------------------------------
+# Reply parser — converts user Telegram text into proposal decisions
+# ---------------------------------------------------------------------------
+
+_APPROVE_WORDS = {"approve", "approved", "yes", "accept", "go", "ok", "okay"}
+_REJECT_WORDS = {"reject", "rejected", "no", "deny", "denied", "skip", "nope"}
+
+# Pattern: "1 approve" or "approve 1" or "1 yes" or "reject 2: reason"
+_NUMBERED_PATTERN = re.compile(
+    r"(?:(\d+)\s*[.:)?\-]?\s*(\w+)|(\w+)\s+(\d+))"
+    r"(?:\s*[:\-]\s*(.+))?",
+    re.IGNORECASE,
+)
+
+
+def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
+    """Parse user reply into proposal decisions.
+
+    Supported formats (case-insensitive, comma/newline separated):
+      "1 approve, 2 reject: reason"
+      "approve 1, reject 2: reason"
+      "approve all" / "reject all"
+
+    Returns {1-based-index: (status, optional_reason)} or empty dict
+    if unparseable.  Empty dict means fall through to correction store.
+
+    IMPORTANT: bare "approve" without "all" or a number does NOT match —
+    it falls through to avoid false positives on conversational replies.
+    """
+    stripped = text.strip().lower()
+
+    # Bulk operations
+    if stripped in ("approve all", "approved all", "accept all", "yes all", "go ahead"):
+        return {0: ("approved", None)}  # 0 = sentinel for "all"
+    if stripped in ("reject all", "rejected all", "deny all", "no all"):
+        return {0: ("rejected", None)}
+
+    # Try numbered decisions (comma or newline separated)
+    decisions: dict[int, tuple[str, str | None]] = {}
+    parts = re.split(r"[,\n]+", text.strip())
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        m = _NUMBERED_PATTERN.match(part)
+        if not m:
+            continue
+
+        # Two capture groups: "1 approve" or "approve 1"
+        if m.group(1) and m.group(2):
+            num_str, word = m.group(1), m.group(2).lower()
+            reason = m.group(5)
+        elif m.group(3) and m.group(4):
+            word, num_str = m.group(3).lower(), m.group(4)
+            reason = m.group(5)
+        else:
+            continue
+
+        try:
+            idx = int(num_str)
+        except ValueError:
+            continue
+
+        if idx < 1:
+            continue
+
+        if word in _APPROVE_WORDS:
+            decisions[idx] = ("approved", reason.strip() if reason else None)
+        elif word in _REJECT_WORDS:
+            decisions[idx] = ("rejected", reason.strip() if reason else None)
+        # Unknown word → skip this part (don't fail the whole parse)
+
+    return decisions

@@ -75,13 +75,17 @@ def _get_adapters() -> dict:
 
 
 async def _ensure_adapter_started(adapter) -> None:
-    """Start the IPC adapter and mark healthy if not already running."""
-    if adapter.ipc._client is None:
+    """Start the IPC adapter and mark healthy if not already running.
+
+    Each adapter type owns its readiness semantics via ``needs_start``:
+    HTTP needs a client, stdio needs a process, SSH is always ready.
+    """
+    if adapter.ipc.needs_start:
         await adapter.ipc.start()
-        # In standalone MCP context, register() never ran. Mark healthy
-        # if health check passes so execute_operation doesn't reject.
-        if not adapter.healthy:
-            await adapter.check_health()
+    # In standalone MCP context, register() never ran. Mark healthy
+    # if health check passes so execute_operation doesn't reject.
+    if not adapter.healthy:
+        await adapter.check_health()
 
 
 async def _impl_module_call(
@@ -121,15 +125,20 @@ async def _impl_module_list() -> dict:
     result = {}
     for name, adapter in adapters.items():
         ops = adapter.list_operations()
-        result[name] = {
+        ipc = adapter.config.ipc
+        entry: dict = {
             "description": adapter.config.description,
             "enabled": adapter.enabled,
-            "ipc_method": adapter.config.ipc.method,
-            "ipc_url": adapter.config.ipc.url,
+            "ipc_method": ipc.method,
             "operations": {
                 op_name: op.get("description", "") for op_name, op in ops.items()
             },
         }
+        if ipc.method == "ssh":
+            entry["ipc_host"] = ipc.ssh_host
+        else:
+            entry["ipc_url"] = ipc.url
+        result[name] = entry
     return result
 
 
@@ -142,15 +151,19 @@ async def module_call(
     """Execute an operation on an external module.
 
     Looks up the module by name, finds the operation in its manifest,
-    and executes via IPC (HTTP or stdio). Pass params as a dict for
-    query parameters or request body fields.
+    and executes via IPC (HTTP, stdio, or SSH). Pass params as a dict
+    for query parameters, request body fields, or SSH dispatch options.
 
     Call with just module_name (no operation) to see available operations.
 
     Examples:
-        module_call("Career Agent", "list_jobs", {"min_score": 80})
-        module_call("Career Agent", "pipeline")
-        module_call("Career Agent", "trigger_discovery")
+        module_call("My Module", "list_items", {"min_score": 80})
+        module_call("My Module", "status")
+        module_call("Remote Agent", "dispatch", {
+            "prompt": "Analyze the latest data",
+            "model": "sonnet", "effort": "high"
+        })
+        module_call("Remote Agent", "version")
     """
     return await _impl_module_call(module_name, operation, params)
 

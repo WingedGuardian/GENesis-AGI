@@ -23,13 +23,19 @@ class HealthCheckConfig:
 class IPCConfig:
     """Inter-process communication configuration."""
 
-    method: Literal["http", "stdio"] = "http"
+    method: Literal["http", "stdio", "ssh"] = "http"
     url: str | None = None
     timeout: int = 30
     # stdio-specific
     command: list[str] = field(default_factory=list)
     working_dir: Path | None = None
     env: dict[str, str] = field(default_factory=dict)
+    # ssh-specific
+    ssh_host: str | None = None  # user@host
+    ssh_key: str | None = None  # path to identity file
+    ssh_connect_timeout: int = 10
+    remote_working_dir: str | None = None  # cd here before running
+    remote_claude_path: str = "claude"  # claude CLI path on remote
 
 
 @dataclass
@@ -89,6 +95,11 @@ class ProgramConfig:
             command=ipc_data.get("command", []),
             working_dir=Path(ipc_data["working_dir"]) if ipc_data.get("working_dir") else None,
             env=ipc_data.get("env", {}),
+            ssh_host=ipc_data.get("ssh_host"),
+            ssh_key=ipc_data.get("ssh_key"),
+            ssh_connect_timeout=ipc_data.get("ssh_connect_timeout", 10),
+            remote_working_dir=ipc_data.get("remote_working_dir"),
+            remote_claude_path=ipc_data.get("remote_claude_path", "claude"),
         )
 
         hc_data = data.get("health_check")
