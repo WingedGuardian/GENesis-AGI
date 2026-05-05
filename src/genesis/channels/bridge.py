@@ -201,6 +201,7 @@ async def main():
         reply_waiter=reply_waiter,
         engagement_tracker=runtime.engagement_tracker,
         autonomous_cli_gate=autonomous_cli_gate,
+        proposal_workflow=runtime._ego_proposal_workflow,
     )
 
     # Register adapter so outreach pipeline can deliver via Telegram

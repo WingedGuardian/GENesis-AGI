@@ -697,6 +697,64 @@ async def _try_bare_approval_resolution(
     return True
 
 
+
+async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -> bool:
+    """Resolve a proposal batch from a quote-reply to an ego digest.
+
+    Returns True if resolved (caller should return), False to continue chain.
+    """
+    if ctx.proposal_workflow is None or ctx.db is None:
+        return False
+    try:
+        from genesis.db.crud import ego as ego_crud
+        from genesis.ego.proposals import parse_proposal_decisions
+
+        batch_id = await ego_crud.get_batch_for_delivery(ctx.db, reply_to_id)
+        if batch_id is None:
+            return False
+
+        decisions = parse_proposal_decisions(msg.text)
+        if not decisions:
+            return False  # Unparseable — fall through to correction store
+
+        # Handle "approve all" / "reject all" (sentinel key 0)
+        if 0 in decisions:
+            status, reason = decisions[0]
+            # Get all proposals in this batch and resolve them all
+            proposals = await ego_crud.list_proposals_by_batch(ctx.db, batch_id)
+            all_decisions = {
+                i + 1: (status, reason) for i in range(len(proposals))
+            }
+            results = await ctx.proposal_workflow.resolve_proposals(
+                batch_id, all_decisions,
+            )
+        else:
+            results = await ctx.proposal_workflow.resolve_proposals(
+                batch_id, decisions,
+            )
+
+        # Send confirmation
+        approved = sum(1 for s in results.values() if s == "approved")
+        rejected = sum(1 for s in results.values() if s == "rejected")
+        parts = []
+        if approved:
+            parts.append(f"{approved} approved")
+        if rejected:
+            parts.append(f"{rejected} rejected")
+        already = len(decisions) - len(results) if 0 not in decisions else 0
+        if already > 0:
+            parts.append(f"{already} already resolved")
+        summary = ", ".join(parts) or "no changes"
+        try:
+            await msg.reply_text(f"✅ Resolved: {summary}")
+        except Exception:
+            log.debug("Failed to send proposal resolution ack", exc_info=True)
+        return True
+    except Exception:
+        log.warning("Proposal resolution failed", exc_info=True)
+        return False
+
+
 async def _try_ego_correction_store(ctx: HandlerContext, msg) -> bool:
     """Store non-reply messages in the ego_proposals topic as user corrections.
 
@@ -790,6 +848,11 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
                     return
             except Exception:
                 log.warning("Failed to resolve approval reply", exc_info=True)
+
+        # Resolve proposal batch approvals from quote-reply to ego digest
+        if await _try_proposal_resolution(ctx, msg, reply_to_id):
+            log.info("Proposal batch resolved for delivery %s", reply_to_id)
+            return
 
         # Record engagement if this is a reply to an outreach message
         if ctx.engagement_tracker and ctx.db:

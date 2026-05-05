@@ -45,6 +45,9 @@ class HandlerContext:
     # handler only resolves bare approve/reject messages *inside* that
     # topic, not general conversation.  Set alongside autonomous_cli_gate.
     approvals_thread_id: int | None = None
+    # Proposal approval workflow — injected by the channels bridge so
+    # quote-replies to ego proposal digests can resolve proposals inline.
+    proposal_workflow: object | None = None
 
     draft_streaming_enabled: bool = True
     typing_breaker_instance: TypingCircuitBreaker = field(init=False)

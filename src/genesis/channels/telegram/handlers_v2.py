@@ -62,6 +62,7 @@ def make_handlers_v2(
     typing_breaker: TypingCircuitBreaker | None = None,
     dedupe: TelegramUpdateDedupe | None = None,
     autonomous_cli_gate: object | None = None,
+    proposal_workflow: object | None = None,
 ):
     """Return V2 handler callbacks."""
     draft_streaming_enabled = os.environ.get(
@@ -81,6 +82,7 @@ def make_handlers_v2(
         dedupe=dedupe,
         draft_streaming_enabled=draft_streaming_enabled,
         autonomous_cli_gate=autonomous_cli_gate,
+        proposal_workflow=proposal_workflow,
     )
 
     def _wrap(cmd_fn):
