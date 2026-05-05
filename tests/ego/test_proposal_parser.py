@@ -1,6 +1,10 @@
 """Tests for parse_proposal_decisions() — Telegram reply parser."""
 
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
 from genesis.ego.proposals import parse_proposal_decisions
 
 
@@ -128,3 +132,130 @@ class TestEdgeCases:
         assert result[1][0] == "rejected"
         # Reason captures everything after first colon
         assert "reason" in result[1][1]
+
+
+# ---------------------------------------------------------------------------
+# Integration test for _try_proposal_resolution handler
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_try_proposal_resolution_approve_all():
+    """End-to-end: quote-reply 'approve all' resolves entire batch."""
+    from genesis.channels.telegram._handler_messages import _try_proposal_resolution
+
+    # Mock context
+    ctx = MagicMock()
+    ctx.db = AsyncMock()
+
+    # Mock proposal_workflow
+    workflow = AsyncMock()
+    workflow.resolve_proposals = AsyncMock(return_value={
+        "prop-1": "approved",
+        "prop-2": "approved",
+    })
+    ctx.proposal_workflow = workflow
+
+    # Mock message
+    msg = MagicMock()
+    msg.text = "approve all"
+    msg.reply_text = AsyncMock()
+
+    reply_to_id = "12345"
+
+    with patch(
+        "genesis.db.crud.ego.get_batch_for_delivery",
+        new_callable=AsyncMock,
+        return_value="batch-abc",
+    ), patch(
+        "genesis.db.crud.ego.list_proposals_by_batch",
+        new_callable=AsyncMock,
+        return_value=[{"id": "prop-1"}, {"id": "prop-2"}],
+    ):
+        result = await _try_proposal_resolution(ctx, msg, reply_to_id)
+
+    assert result is True
+    workflow.resolve_proposals.assert_called_once()
+    call_args = workflow.resolve_proposals.call_args
+    assert call_args[0][0] == "batch-abc"  # batch_id
+    # All proposals should be approved
+    decisions = call_args[0][1]
+    assert all(s == "approved" for s, _ in decisions.values())
+    msg.reply_text.assert_called_once()
+    assert "2 approved" in msg.reply_text.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_try_proposal_resolution_no_match():
+    """Returns False when delivery_id doesn't match any batch."""
+    from genesis.channels.telegram._handler_messages import _try_proposal_resolution
+
+    ctx = MagicMock()
+    ctx.db = AsyncMock()
+    ctx.proposal_workflow = MagicMock()
+
+    msg = MagicMock()
+    msg.text = "approve all"
+
+    with patch(
+        "genesis.db.crud.ego.get_batch_for_delivery",
+        new_callable=AsyncMock,
+        return_value=None,
+    ):
+        result = await _try_proposal_resolution(ctx, msg, "99999")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_try_proposal_resolution_unparseable_falls_through():
+    """Unparseable text returns False (falls through to correction store)."""
+    from genesis.channels.telegram._handler_messages import _try_proposal_resolution
+
+    ctx = MagicMock()
+    ctx.db = AsyncMock()
+    ctx.proposal_workflow = MagicMock()
+
+    msg = MagicMock()
+    msg.text = "hmm let me think about this"
+
+    with patch(
+        "genesis.db.crud.ego.get_batch_for_delivery",
+        new_callable=AsyncMock,
+        return_value="batch-xyz",
+    ):
+        result = await _try_proposal_resolution(ctx, msg, "12345")
+
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_try_proposal_resolution_numbered():
+    """Numbered decisions resolve specific proposals."""
+    from genesis.channels.telegram._handler_messages import _try_proposal_resolution
+
+    ctx = MagicMock()
+    ctx.db = AsyncMock()
+    workflow = AsyncMock()
+    workflow.resolve_proposals = AsyncMock(return_value={
+        "prop-1": "approved",
+        "prop-2": "rejected",
+    })
+    ctx.proposal_workflow = workflow
+
+    msg = MagicMock()
+    msg.text = "1 approve, 2 reject: bad idea"
+    msg.reply_text = AsyncMock()
+
+    with patch(
+        "genesis.db.crud.ego.get_batch_for_delivery",
+        new_callable=AsyncMock,
+        return_value="batch-abc",
+    ):
+        result = await _try_proposal_resolution(ctx, msg, "12345")
+
+    assert result is True
+    call_args = workflow.resolve_proposals.call_args
+    decisions = call_args[0][1]
+    assert decisions[1] == ("approved", None)
+    assert decisions[2] == ("rejected", "bad idea")

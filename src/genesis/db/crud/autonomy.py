@@ -185,7 +185,7 @@ async def promote(
 ) -> bool:
     """Explicit promotion — only called on user approval."""
     row = await get_by_id(db, id)
-    if not row or to_level < 1 or to_level > 7:
+    if not row or to_level < 1 or to_level > 4:
         return False
     if to_level <= row["current_level"]:
         return False  # Not a promotion
@@ -210,8 +210,10 @@ async def force_regress(
 ) -> bool:
     """Hard reset — resets BOTH current and earned level. For user revocation."""
     row = await get_by_id(db, id)
-    if not row or to_level < 1 or to_level > 7:
+    if not row or to_level < 1 or to_level > 4:
         return False
+    if to_level >= row["current_level"]:
+        return False  # Not a regression
     cursor = await db.execute(
         """UPDATE autonomy_state SET
            current_level = ?, earned_level = ?,

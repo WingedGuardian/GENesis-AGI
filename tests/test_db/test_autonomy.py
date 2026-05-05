@@ -201,10 +201,10 @@ async def test_promote_rejects_non_promotion(db):
 
 
 async def test_promote_rejects_invalid_level(db):
-    """promote() validates level range 1-7."""
+    """promote() validates level range 1-4."""
     await autonomy.create(db, id="pro3", category="pro3", updated_at="2026-01-01", current_level=1)
     assert await autonomy.promote(db, "pro3", to_level=0, updated_at="t1") is False
-    assert await autonomy.promote(db, "pro3", to_level=8, updated_at="t1") is False
+    assert await autonomy.promote(db, "pro3", to_level=5, updated_at="t1") is False
 
 
 async def test_promote_nonexistent(db):
@@ -224,6 +224,28 @@ async def test_force_regress(db):
     assert row["current_level"] == 1
     assert row["earned_level"] == 1  # earned also reset
     assert row["regression_reason"] == "user_revoked"
+
+
+async def test_force_regress_rejects_upward(db):
+    """force_regress() rejects 'regression' to a higher level."""
+    await autonomy.create(
+        db, id="fr2", category="fr2", updated_at="2026-01-01",
+        current_level=2, earned_level=2,
+    )
+    result = await autonomy.force_regress(db, "fr2", to_level=3, reason="test", updated_at="t1")
+    assert result is False
+    row = await autonomy.get_by_id(db, "fr2")
+    assert row["current_level"] == 2  # unchanged
+
+
+async def test_force_regress_rejects_same_level(db):
+    """force_regress() rejects 'regression' to same level."""
+    await autonomy.create(
+        db, id="fr3", category="fr3", updated_at="2026-01-01",
+        current_level=2, earned_level=2,
+    )
+    result = await autonomy.force_regress(db, "fr3", to_level=2, reason="test", updated_at="t1")
+    assert result is False
 
 
 async def test_force_regress_nonexistent(db):
