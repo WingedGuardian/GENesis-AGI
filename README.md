@@ -179,7 +179,7 @@ Your Genesis install is one operational system: the public `GENesis-AGI` codebas
 
 ---
 
-## How it thinks 🧠
+## How it thinks
 
 Four cognitive layers, running continuously:
 
@@ -232,7 +232,7 @@ When Genesis isn't handling a user request, it doesn't sit idle. It researches t
 
 ---
 
-## Memory 🗄️
+## Memory
 
 Most AI memory is a vector database with a retrieval function. Genesis runs a four-layer architecture — because "what are we working on?", "what's relevant right now?", "find everything about X", and "what does the external documentation say?" are fundamentally different operations that need different retrieval strategies.
 
@@ -298,7 +298,7 @@ After six months of operation, Genesis doesn't just have more memories — it ha
 
 ---
 
-## Self-learning 📈
+## Self-learning
 
 Most AI systems log what happened. Genesis classifies *why* it happened, extracts a reusable principle, and verifies that principle works next time. The pipeline runs automatically after every meaningful interaction:
 
@@ -346,7 +346,7 @@ This isn't "log what happened and hope the next session reads it." It's a closed
 
 ---
 
-## Earned autonomy 🔑
+## Earned autonomy
 
 Genesis earns autonomy per category through demonstrated competence:
 
@@ -369,7 +369,7 @@ The user has override authority. Always.
 
 ---
 
-## Infrastructure 🏥🛡️
+## Infrastructure
 
 Genesis manages its own infrastructure. When something breaks, it diagnoses and fixes it. When it can't, it tells you why via Telegram — not because you noticed something was wrong, but because the system told you.
 
@@ -390,7 +390,7 @@ Genesis also routes LLM work across model tiers automatically — starting with 
 
 ---
 
-## Real-world integration 🌐
+## Real-world integration
 
 Genesis operates in the real world through always-on channels:
 
@@ -410,7 +410,7 @@ Genesis operates in the real world through always-on channels:
 
 ---
 
-## Modules 🔌
+## Modules
 
 Genesis has a pluggable capability module system. Any program with an interface can plug into Genesis's cognitive stack — memory, learning, reflection, outreach, compute routing — without touching a line of core code or the module's own code.
 
@@ -497,7 +497,7 @@ V3 was built in 10 phases over seven months: from data schemas to full autonomou
 
 <a id="where-its-headed"></a>
 
-## Where it's headed 🗺️
+## Where it's headed
 
 V3 is the foundation -- cognitive architecture complete, ego module live, running in production. What comes next is where it gets ambitious enough to need a community behind it.
 
@@ -585,7 +585,7 @@ Standalone libraries extracted from Genesis, stabilized against production use:
 
 <a id="get-involved"></a>
 
-## Get involved 🤝
+## Get involved
 
 V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates — the memory architecture, the autonomy model, or the audacity of building a self-evolving agent — there's work to do.
 
