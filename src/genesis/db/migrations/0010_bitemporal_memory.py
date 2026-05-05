@@ -20,6 +20,14 @@ import aiosqlite
 
 
 async def up(db: aiosqlite.Connection) -> None:
+    # Skip if memory_metadata doesn't exist yet (fresh DB without DDL schema).
+    # The DDL schema creates the table with these columns already.
+    tables = await db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='memory_metadata'"
+    )
+    if not await tables.fetchone():
+        return  # Table doesn't exist — DDL will create it with columns included
+
     # Add bi-temporal columns (idempotent — column may already exist from DDL)
     cursor = await db.execute("PRAGMA table_info(memory_metadata)")
     existing = {row[1] for row in await cursor.fetchall()}
