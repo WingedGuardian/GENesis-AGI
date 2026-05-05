@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -304,8 +305,6 @@ class ProposalWorkflow:
 # ---------------------------------------------------------------------------
 # Reply parser — converts user Telegram text into proposal decisions
 # ---------------------------------------------------------------------------
-
-import re
 
 _APPROVE_WORDS = {"approve", "approved", "yes", "accept", "go", "ok", "okay"}
 _REJECT_WORDS = {"reject", "rejected", "no", "deny", "denied", "skip", "nope"}

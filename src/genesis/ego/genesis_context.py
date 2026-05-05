@@ -59,6 +59,7 @@ class GenesisEgoContextBuilder:
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
+        sections.append(await self._autonomy_readiness_section())
         sections.append(self._output_contract_section())
 
         return "\n".join(sections)
@@ -469,6 +470,40 @@ class GenesisEgoContextBuilder:
             short = (content or "")[:200].replace("\n", " ")
             ts = (created_at or "?")[:16]
             lines.append(f"- [{ts}] [{priority}] {short}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _autonomy_readiness_section(self) -> str:
+        """Show autonomy posteriors so ego can propose promotion when ready."""
+        from genesis.db.crud import autonomy as autonomy_crud
+        from genesis.db.crud.autonomy import bayesian_level, bayesian_posterior
+
+        try:
+            states = await autonomy_crud.list_all(self._db)
+        except Exception:
+            return ""
+        if not states:
+            return ""
+
+        lines = ["## Autonomy Readiness\n"]
+        for row in states:
+            cat = row["category"]
+            level = row["current_level"]
+            earned = row["earned_level"]
+            successes = row["total_successes"]
+            corrections = row["total_corrections"]
+            posterior = bayesian_posterior(successes, corrections)
+            target = bayesian_level(successes, corrections)
+            status = f"L{level}"
+            if earned > level:
+                status += f" (earned L{earned})"
+            readiness = ""
+            if target > level:
+                readiness = f" — **ready for L{min(level + 1, target)}** (posterior={posterior:.3f})"
+            else:
+                readiness = f" (posterior={posterior:.3f})"
+            lines.append(f"- {cat}: {status}{readiness} [{successes}S/{corrections}C]")
 
         lines.append("")
         return "\n".join(lines)
