@@ -70,6 +70,7 @@ from genesis.mcp.health import settings as _settings  # noqa: E402
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
+from genesis.mcp.health import web_tools as _web_tools  # noqa: E402
 
 codebase = _codebase
 db_schema = _db_schema
