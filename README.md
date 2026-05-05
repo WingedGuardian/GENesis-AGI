@@ -429,7 +429,7 @@ The `/integrate-module` skill handles onboarding automatically — discovery, co
 ```mermaid
 graph LR
     subgraph "Cognitive"
-        ego["ego 🧠"]
+        ego["ego"]
         awareness
         reflection
         perception
@@ -579,7 +579,7 @@ Standalone libraries extracted from Genesis, stabilized against production use:
 
 - [**genesis-router**](https://github.com/WingedGuardian/genesis-router) — LLM routing with circuit breakers, self-escalation, and failover chains.
 - [**genesis-memory**](https://github.com/WingedGuardian/genesis-memory) — Hybrid AI memory: Qdrant vectors + SQLite FTS5 + multi-factor scoring + MCP server.
-- [**cognitive-dissonance-dspy**](https://github.com/evalops/cognitive-dissonance-dspy) — Multi-agent adversarial-review prototype using DSPy with NL→Coq formal verification.
+- [**genesis-task-executor**](https://github.com/WingedGuardian/genesis-task-executor) — Autonomous LLM task executor with formal state machine, 4-layer failure recovery, and adversarial verification.
 
 ---
 
