@@ -1,6 +1,5 @@
 """Tests for parse_proposal_decisions() — Telegram reply parser."""
 
-import pytest
 
 from genesis.ego.proposals import parse_proposal_decisions
 
