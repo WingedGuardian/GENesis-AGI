@@ -70,10 +70,25 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## Genesis in 30 seconds
 
-- **It remembers.** 4-layer memory — essential knowledge, proactive recall, deep search, knowledge pipeline — with 11,000+ memories and 8,000+ graph links that compound across months. Day 180 is architecturally different from day 1.
-- **It learns.** Outcome classification, causal attribution, and procedure extraction that runs automatically after every session. Laplace-smoothed confidence, not vibes.
-- **It runs on its own.** Thinks, researches, audits, and communicates while you're not there — on free-tier compute.
-- **It earns its autonomy.** Trust granted per action category through demonstrated competence. Mess up twice, drop a level. Earn it back through performance.
+Personal AI does what you tell it. Personal AGI does what you *need*.
+
+Your current AI — however capable — is reactive, stateless, and session-scoped. You direct it. You re-explain context every time. It's equally ignorant about you on day 100 as day 1. It's a tool: smart in the moment, dumb about you.
+
+Genesis is different:
+
+- **It knows what to do without being told** — because it's accumulated months of context about your projects, your decisions, your patterns. You never re-explain yourself.
+- **It acts between sessions** — thinking, researching, monitoring, surfacing what matters while you're not there. Not waiting for a prompt.
+- **It has judgment that improves with evidence** — earned autonomy per action category. First failure triggers demotion. Trust is rebuilt through performance, not time.
+- **It's a fundamentally different system at month 6 than month 1** — not because of updates you installed, but because of what it learned living alongside you.
+
+With personal AI, you are the intelligence directing the tool. With personal AGI, it is an intelligence working alongside you — and the amount you need to manage shrinks over time.
+
+**How it does this:**
+
+- **4-layer memory** — essential knowledge, proactive recall, deep search, knowledge pipeline. Hybrid retrieval that compounds across months, not conversations.
+- **Closed-loop learning** — outcome classification, causal attribution, procedure extraction. Laplace-smoothed confidence, not vibes.
+- **Background cognition** — thinks, researches, audits, and communicates on free-tier compute while you sleep.
+- **Earned autonomy** — trust granted per action category through demonstrated competence. The system gets measurably better at its job, and it can show you the receipts.
 
 [**Get started →**](#getting-started)
 
