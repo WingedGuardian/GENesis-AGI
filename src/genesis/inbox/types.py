@@ -38,7 +38,7 @@ class InboxConfig:
     enabled: bool = True
     model: str = "sonnet"
     effort: str = "high"
-    timeout_s: int = 600
+    timeout_s: int = 900
     max_retries: int = 3
     recursive: bool = False
     timezone: str = "UTC"

@@ -10,7 +10,7 @@ inbox_monitor:
   batch_size: 1
   model: "sonnet"
   effort: "medium"
-  timeout_s: 600
+  timeout_s: 900
   # max_retries: 3        # Max retry attempts before permanently excluding a failed item
   # recursive: false      # Set true to scan subdirectories recursively
   timezone: "UTC"  # Used for response file dates (supports DST)

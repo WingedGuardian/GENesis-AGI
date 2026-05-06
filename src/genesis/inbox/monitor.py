@@ -529,6 +529,36 @@ class InboxMonitor:
                     created_at=now_iso,
                 )
                 continue
+            # Dedup: reuse existing retriable failed item instead of
+            # creating a duplicate row with retry_count=0.
+            existing_failed = await inbox_items.get_retriable_failed(
+                self._db, str(f), max_retries=self._config.max_retries,
+            )
+            if existing_failed:
+                logger.info(
+                    "Reusing failed item %s for %s (retry_count=%d)",
+                    existing_failed["id"][:8], f,
+                    existing_failed["retry_count"],
+                )
+                await inbox_items.update_status(
+                    self._db, existing_failed["id"],
+                    status="pending",
+                    error_message=None,
+                )
+                # Update content_hash so the resume pass hash-check
+                # doesn't false-positive if this enters the approval gate.
+                if existing_failed["content_hash"] != h:
+                    await self._db.execute(
+                        "UPDATE inbox_items SET content_hash = ? WHERE id = ?",
+                        (h, existing_failed["id"]),
+                    )
+                    await self._db.commit()
+                pending_items.append(InboxItem(
+                    id=existing_failed["id"], file_path=str(f),
+                    content=content, content_hash=h, detected_at=now_iso,
+                ))
+                continue
+
             await inbox_items.create(
                 self._db,
                 id=item_id,

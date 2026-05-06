@@ -260,10 +260,6 @@ class CCInvoker:
             ) from None
         except TimeoutError:
             elapsed_s = time.monotonic() - start
-            logger.error(
-                "CC session TIMEOUT after %.0fs (PID %s, limit=%ds)",
-                elapsed_s, proc.pid, invocation.timeout_s,
-            )
             try:
                 pgid = os.getpgid(proc.pid)
                 if pgid <= 1:
@@ -272,6 +268,22 @@ class CCInvoker:
             except (ProcessLookupError, PermissionError, ValueError, TypeError):
                 proc.kill()
             await proc.wait()
+
+            # Capture stderr for diagnostics (mirrors run_streaming pattern)
+            stderr_text = ""
+            if proc.stderr:
+                try:
+                    stderr_data = await proc.stderr.read()
+                    if isinstance(stderr_data, bytes):
+                        stderr_text = stderr_data.decode(errors="replace")[:1000]
+                except Exception:
+                    pass
+
+            logger.error(
+                "CC session TIMEOUT after %.0fs (PID %s, limit=%ds)%s",
+                elapsed_s, proc.pid, invocation.timeout_s,
+                f" stderr: {stderr_text}" if stderr_text else "",
+            )
             raise CCTimeoutError(f"Timeout after {invocation.timeout_s}s") from None
         finally:
             self._active_proc = None
