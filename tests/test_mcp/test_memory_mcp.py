@@ -1058,3 +1058,92 @@ async def test_conversation_history_unknown_channel():
         mod._store = old_store
         mod._db = old_db
         mod._retriever = old_retriever
+
+
+# ─── expand_query_terms pass-through tests ───────────────────────────────────
+
+
+def _make_retrieval_result(mid="a", content="test", score=0.9):
+    """Build a minimal RetrievalResult for mocking."""
+    from genesis.memory.types import RetrievalResult
+
+    return RetrievalResult(
+        memory_id=mid,
+        content=content,
+        source="test",
+        memory_type="episodic",
+        score=score,
+        vector_rank=1,
+        fts_rank=1,
+        activation_score=0.5,
+        payload={"wing": "", "room": ""},
+        memory_class="fact",
+    )
+
+
+async def test_memory_recall_passes_expand_query_terms_true():
+    """When expand_query_terms=True, it reaches retriever.recall()."""
+    import genesis.mcp.memory_mcp as mod
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall.return_value = [_make_retrieval_result()]
+
+    old_store, old_db, old_retriever, old_qdrant = (
+        mod._store, mod._db, mod._retriever, mod._qdrant,
+    )
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="configure routing",
+            expand_query_terms=True,
+            include_graph=False,
+        )
+
+        mock_retriever.recall.assert_called_once()
+        call_kwargs = mock_retriever.recall.call_args[1]
+        assert call_kwargs["expand_query_terms"] is True
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+        mod._qdrant = old_qdrant
+
+
+async def test_memory_recall_expand_query_terms_defaults_false():
+    """By default, expand_query_terms is False (no expansion)."""
+    import genesis.mcp.memory_mcp as mod
+
+    mock_retriever = AsyncMock()
+    mock_retriever.recall.return_value = [
+        _make_retrieval_result(),
+        _make_retrieval_result(mid="b"),
+        _make_retrieval_result(mid="c"),
+    ]
+
+    old_store, old_db, old_retriever, old_qdrant = (
+        mod._store, mod._db, mod._retriever, mod._qdrant,
+    )
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="test query",
+            include_graph=False,
+        )
+
+        call_kwargs = mock_retriever.recall.call_args[1]
+        assert call_kwargs["expand_query_terms"] is False
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+        mod._qdrant = old_qdrant
