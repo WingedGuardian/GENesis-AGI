@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from genesis.routing.standalone import NullCostTracker
 from genesis.routing.types import BudgetStatus
 
