@@ -111,7 +111,7 @@ class EgoConfig:
     ego_dispatch_budget_usd: float = 2.50  # daily cap for dispatched sessions
     morning_report_hour: int = 8  # 24h format, local time
     morning_report_minute: int = 0
-    morning_report_timezone: str = "UTC"
+    # morning_report_timezone removed — uses genesis.env.user_timezone()
     consecutive_failure_limit: int = 3  # circuit breaker threshold
     failure_backoff_minutes: int = 60  # pause after N failures
     batch_digest: bool = True  # send proposals as daily batch

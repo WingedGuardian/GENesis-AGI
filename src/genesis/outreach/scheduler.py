@@ -7,6 +7,7 @@ import logging
 import aiosqlite
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from genesis.env import user_timezone
 from genesis.outreach.config import OutreachConfig
 from genesis.outreach.engagement import EngagementTracker
 from genesis.outreach.morning_report import MorningReportGenerator
@@ -52,12 +53,13 @@ class OutreachScheduler:
             logger.warning("OutreachScheduler.start() called while already running — restarting")
         self._scheduler = AsyncIOScheduler()
         hour, minute = self._config.morning_report_time.split(":")
+        tz = user_timezone()
         self._scheduler.add_job(
             self._morning_report_job,
             "cron",
             hour=int(hour),
             minute=int(minute),
-            timezone=self._config.morning_report_timezone,
+            timezone=tz,
             id="outreach_morning_report",
             replace_existing=True,
         )
@@ -81,7 +83,7 @@ class OutreachScheduler:
             "cron",
             hour=cal_hour,
             minute=cal_minute,
-            timezone=self._config.morning_report_timezone,
+            timezone=tz,
             id="outreach_calibration",
             replace_existing=True,
         )
@@ -103,7 +105,7 @@ class OutreachScheduler:
         )
         self._scheduler.start()
         logger.info("OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m)",
-                     hour, minute, self._config.morning_report_timezone,
+                     hour, minute, tz,
                      self._config.engagement_poll_minutes)
 
     async def stop(self) -> None:

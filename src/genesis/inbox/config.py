@@ -7,7 +7,6 @@ from pathlib import Path
 
 import yaml
 
-from genesis.env import user_timezone
 from genesis.inbox.types import InboxConfig
 
 
@@ -59,7 +58,6 @@ def _parse(raw: dict) -> InboxConfig:
         timeout_s=int(section.get("timeout_s", 600)),
         max_retries=int(section.get("max_retries", 3)),
         recursive=bool(section.get("recursive", False)),
-        timezone=str(section.get("timezone", user_timezone())),
         evaluation_cooldown_seconds=int(
             section.get("evaluation_cooldown_seconds", 3600),
         ),

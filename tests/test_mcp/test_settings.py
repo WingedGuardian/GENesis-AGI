@@ -193,15 +193,16 @@ async def test_settings_update_inbox_monitor(config_dir: Path):
     assert merged["inbox_monitor"]["timezone"] == "America/New_York"  # Preserved from base
 
 
-async def test_settings_update_inbox_bad_timezone(config_dir: Path):
+async def test_settings_update_inbox_timezone_ignored(config_dir: Path):
+    """Timezone field is silently ignored — uses system timezone now."""
     _write_config(config_dir, "inbox_monitor.yaml", {
         "inbox_monitor": {"enabled": True},
     })
     result = await _impl_settings_update("inbox_monitor", {
         "inbox_monitor": {"timezone": "Mars/Olympus_Mons"},
     })
-    assert result["error"] == "validation failed"
-    assert any("timezone" in e for e in result["validation_errors"])
+    # No validation error — timezone key is ignored, passes through as unknown YAML
+    assert "error" not in result
 
 
 async def test_settings_update_readonly_rejected():
@@ -389,12 +390,9 @@ class TestValidateInboxMonitor:
         errs = _validate_inbox_monitor({"inbox_monitor": {"effort": "insane"}})
         assert len(errs) == 1
 
-    def test_invalid_timezone(self):
+    def test_timezone_ignored(self):
+        """Timezone field is no longer validated — uses system timezone."""
         errs = _validate_inbox_monitor({"inbox_monitor": {"timezone": "Fake/Zone"}})
-        assert len(errs) == 1
-
-    def test_valid_timezone(self):
-        errs = _validate_inbox_monitor({"inbox_monitor": {"timezone": "UTC"}})
         assert errs == []
 
     def test_flat_changes_also_work(self):

@@ -57,7 +57,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
     ),
     "inbox_monitor": SettingsDomain(
         name="inbox_monitor",
-        description="Inbox monitor (watch path, batch size, model, effort, timezone)",
+        description="Inbox monitor (watch path, batch size, model, effort)",
         config_filename="inbox_monitor.yaml",
         readonly=False,
         needs_restart=True,
@@ -361,12 +361,7 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             f"got '{section['effort']}'"
         )
 
-    if "timezone" in section:
-        import zoneinfo
-        try:
-            zoneinfo.ZoneInfo(section["timezone"])
-        except (KeyError, zoneinfo.ZoneInfoNotFoundError):
-            errors.append(f"inbox_monitor.timezone '{section['timezone']}' is not a valid timezone")
+    # timezone removed — uses system timezone from genesis.env.user_timezone()
 
     return errors
 

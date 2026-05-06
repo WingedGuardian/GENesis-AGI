@@ -126,13 +126,11 @@ async def get_config():
         "quiet_hours": {
             "start": _config.quiet_hours.start,
             "end": _config.quiet_hours.end,
-            "timezone": _config.quiet_hours.timezone,
         },
         "channel_preferences": _config.channel_preferences,
         "thresholds": _config.thresholds,
         "rate_limits": {"max_daily": _config.max_daily, "surplus_daily": _config.surplus_daily},
         "morning_report": {
             "time": _config.morning_report_time,
-            "timezone": _config.morning_report_timezone,
         },
     })

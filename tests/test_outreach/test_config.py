@@ -50,5 +50,6 @@ engagement:
 
 
 def test_quiet_hours_dataclass():
-    qh = QuietHours(start="22:00", end="07:00", timezone="UTC")
-    assert qh.timezone == "UTC"
+    qh = QuietHours(start="22:00", end="07:00")
+    assert qh.start == "22:00"
+    assert qh.end == "07:00"

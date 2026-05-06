@@ -45,7 +45,6 @@ async def init(rt: GenesisRuntime) -> None:
 
         writer = ResponseWriter(
             watch_path=config.watch_path,
-            timezone=config.timezone,
         )
 
         rt._inbox_monitor = InboxMonitor(
