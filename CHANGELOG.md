@@ -7,6 +7,46 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b4] - 2026-05-06
+
+Settings get a proper overhaul, ego recovers from a multi-day deadlock,
+and memory recall learns to try harder when results are thin.
+
+### Added
+
+- **Dashboard PWA support** (#242) --- manifest + service worker make
+  the dashboard installable as a standalone mobile app. Memory tab gains
+  a 30-day growth sparkline and wing distribution badges.
+- **File download** (#232) --- Files tab gets a download button with
+  50MB cap, path traversal protection, and symlink-aware security.
+- **Drift recall fallback** (#233) --- when `memory_recall` returns
+  sparse results (<3), the 3-phase drift retrieval algorithm
+  (global scan → cluster drill-down → weighted RRF) fires automatically.
+  Silent degradation on failure.
+- **Query term expansion** (#234) --- `expand_query_terms` parameter
+  exposed on the `memory_recall` MCP tool, enabling tag co-occurrence
+  query expansion for ambiguous searches.
+
+### Changed
+
+- **Settings consolidation** (#240) --- all per-subsystem timezone
+  fields replaced by `genesis.env.user_timezone()`. Dashboard settings
+  tab gets domain ordering, expanded form domains, and descriptions
+  for all 18 settings groups.
+- **Inbox retry dedup** (#243) --- scanner reuses existing failed rows
+  instead of creating duplicates on retry. CC invoker captures stderr
+  on timeout for diagnostics. Evaluation timeout raised to 900s.
+
+### Fixed
+
+- **Ego deadlock** (#241) --- approval blocks no longer trip the circuit
+  breaker (new `CycleBlockedError` exception). Approval requests get
+  timeouts (1h CLI, 2h sentinel). Telegram proposals split at 4096 chars
+  instead of failing silently. Proposal field truncation limits raised
+  4–5x.
+
+---
+
 ## [v3.0b3] - 2026-05-05
 
 Web tools get MCP exposure so background sessions and subagents can
