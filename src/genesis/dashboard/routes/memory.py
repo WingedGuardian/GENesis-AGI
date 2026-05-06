@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+import aiosqlite
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
@@ -190,5 +191,33 @@ async def memory_stats():
         stats["pending_embeddings"] = await pending_embeddings.count_pending(rt.db)
     except Exception:
         stats["pending_embeddings"] = None
+
+    # Daily growth — last 30 days
+    try:
+        rt.db.row_factory = aiosqlite.Row
+        rows = await rt.db.execute_fetchall(
+            """SELECT date(created_at) as day, count(*) as count
+               FROM memory_metadata
+               WHERE created_at > datetime('now', '-30 days')
+               GROUP BY day ORDER BY day"""
+        )
+        stats["daily_growth"] = [{"day": r["day"], "count": r["count"]} for r in rows]
+    except Exception:
+        logger.error("Memory growth query failed", exc_info=True)
+        stats["daily_growth"] = []
+
+    # Wing distribution
+    try:
+        rt.db.row_factory = aiosqlite.Row
+        rows = await rt.db.execute_fetchall(
+            """SELECT wing, count(*) as count
+               FROM memory_metadata
+               WHERE wing IS NOT NULL AND wing != ''
+               GROUP BY wing ORDER BY count DESC"""
+        )
+        stats["wings"] = [{"wing": r["wing"], "count": r["count"]} for r in rows]
+    except Exception:
+        logger.error("Wing distribution query failed", exc_info=True)
+        stats["wings"] = []
 
     return jsonify(stats)
