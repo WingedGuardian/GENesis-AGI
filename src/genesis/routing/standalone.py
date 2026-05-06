@@ -12,6 +12,7 @@ rt._router is already set, create_standalone_router() is a no-op.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from genesis.routing.types import BudgetStatus
 
@@ -35,7 +36,7 @@ class NullCostTracker:
         self,
         call_site_id: str,
         provider: str,
-        result: object,
+        result: Any,  # CallResult at runtime
         *,
         cost_known: bool = True,
     ) -> None:

@@ -50,3 +50,29 @@ class TestCreateStandaloneRouter:
 
         assert rt._router is not None
         GenesisRuntime.reset()
+
+
+class TestNullCostTrackerExtended:
+    async def test_check_budget_with_task_id(self):
+        ct = NullCostTracker()
+        status = await ct.check_budget(task_id="some-task")
+        assert status == BudgetStatus.UNDER_LIMIT
+
+
+class TestCreateStandaloneRouterFailure:
+    async def test_bootstrap_failure_leaves_router_none(self):
+        """If config is missing, router stays None without raising."""
+        from unittest.mock import patch
+
+        from genesis.routing.standalone import create_standalone_router
+        from genesis.runtime._core import GenesisRuntime
+
+        GenesisRuntime.reset()
+        rt = GenesisRuntime.instance()
+        assert rt._router is None
+
+        with patch("genesis.env.repo_root", return_value="/nonexistent"):
+            create_standalone_router()
+
+        assert rt._router is None  # failed gracefully
+        GenesisRuntime.reset()

@@ -103,9 +103,10 @@ def _bootstrap_health() -> None:
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
+            except ImportError:
+                logger.warning("genesis.routing.standalone not available", exc_info=True)
+            else:
                 create_standalone_router()
-            except Exception:
-                logger.warning("Standalone router bootstrap failed", exc_info=True)
 
             svc = StandaloneHealthDataService(
                 status_path=_DEFAULT_STATUS,
@@ -178,9 +179,10 @@ def _bootstrap_memory() -> None:
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
+            except ImportError:
+                logger.warning("genesis.routing.standalone not available", exc_info=True)
+            else:
                 create_standalone_router()
-            except Exception:
-                logger.warning("Standalone router bootstrap failed", exc_info=True)
 
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
             embedding = EmbeddingProvider()
@@ -219,9 +221,10 @@ def _bootstrap_recon() -> None:
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
+            except ImportError:
+                logger.warning("genesis.routing.standalone not available", exc_info=True)
+            else:
                 create_standalone_router()
-            except Exception:
-                logger.warning("Standalone router bootstrap failed", exc_info=True)
 
             init_recon_mcp(db=db)
             clear_mcp_crash("recon")
@@ -264,9 +267,10 @@ def _bootstrap_outreach() -> None:
             # Bootstrap standalone router for LLM-dependent tools
             try:
                 from genesis.routing.standalone import create_standalone_router
+            except ImportError:
+                logger.warning("genesis.routing.standalone not available", exc_info=True)
+            else:
                 create_standalone_router()
-            except Exception:
-                logger.warning("Standalone router bootstrap failed", exc_info=True)
 
             init_outreach_mcp(pipeline=None, engagement=None, config=None, db=db)
             clear_mcp_crash("outreach")
