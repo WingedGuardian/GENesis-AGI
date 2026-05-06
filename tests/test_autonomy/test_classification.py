@@ -77,6 +77,18 @@ class TestGetTimeout:
         c = self._make_classifier()
         assert c.get_timeout("totally_unknown") is None
 
+    def test_autonomous_cli_fallback_timeout(self) -> None:
+        c = self._make_classifier()
+        assert c.get_timeout("autonomous_cli_fallback") == 3600
+
+    def test_sentinel_dispatch_timeout(self) -> None:
+        c = self._make_classifier()
+        assert c.get_timeout("sentinel_dispatch") == 7200
+
+    def test_sentinel_action_timeout(self) -> None:
+        c = self._make_classifier()
+        assert c.get_timeout("sentinel_action") == 7200
+
 
 # ---------------------------------------------------------------------------
 # TestConfigLoading

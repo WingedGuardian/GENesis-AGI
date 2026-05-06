@@ -82,6 +82,28 @@ def _reply_decision(reply_text: str) -> str | None:
     return None
 
 
+async def _is_timed_out(row: dict[str, Any], approval_manager: Any) -> bool:
+    """Check if a pending approval has expired. Auto-resolves if so."""
+    if str(row.get("status") or "") != "pending":
+        return False
+    timeout_at_str = row.get("timeout_at", "")
+    if not timeout_at_str:
+        return False
+    try:
+        timeout_dt = datetime.fromisoformat(timeout_at_str)
+        if datetime.now(UTC) >= timeout_dt:
+            await approval_manager.resolve(
+                row["id"],
+                status="expired",
+                resolved_by="timeout_auto_expire",
+            )
+            logger.info("Auto-expired timed-out approval %s", row["id"])
+            return True
+    except (ValueError, TypeError):
+        pass
+    return False
+
+
 class AutonomousCliApprovalGate:
     """Manual-approval gate for autonomous CLI fallback dispatch."""
 
@@ -419,25 +441,10 @@ class AutonomousCliApprovalGate:
                 if status_str == "approved" and row.get("consumed_at"):
                     continue
                 # Timeout guard: auto-expire pending requests past timeout_at.
-                if status_str == "pending":
-                    timeout_at_str = row.get("timeout_at", "")
-                    if timeout_at_str:
-                        try:
-                            timeout_dt = datetime.fromisoformat(timeout_at_str)
-                            if datetime.now(UTC) >= timeout_dt:
-                                # Auto-expire the stale request
-                                await self._approval_manager.resolve(
-                                    row["id"],
-                                    status="expired",
-                                    resolved_by="timeout_auto_expire",
-                                )
-                                logger.info(
-                                    "Auto-expired timed-out approval %s",
-                                    row["id"],
-                                )
-                                continue
-                        except (ValueError, TypeError):
-                            pass
+                if status_str == "pending" and await _is_timed_out(
+                    row, self._approval_manager,
+                ):
+                    continue
                 # Staleness guard: don't recycle approvals resolved >24h ago.
                 # Prevents historical backlogs from silently bypassing the gate.
                 if status_str == "approved":
@@ -460,6 +467,8 @@ class AutonomousCliApprovalGate:
         ):
             for row in recent:
                 if str(row.get("status") or "") != "pending":
+                    continue
+                if await _is_timed_out(row, self._approval_manager):
                     continue
                 context = _json_loads(row.get("context"))
                 if (
@@ -487,6 +496,8 @@ class AutonomousCliApprovalGate:
         pending = await self._approval_manager.get_pending()
         for row in pending:
             if row.get("action_type") != "autonomous_cli_fallback":
+                continue
+            if await _is_timed_out(row, self._approval_manager):
                 continue
             context = _json_loads(row.get("context"))
             if (

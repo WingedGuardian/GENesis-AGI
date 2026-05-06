@@ -142,8 +142,11 @@ class EgoSession:
             Determines model and effort for this cycle. If None,
             inferred from ``is_morning_report``.
 
-        Returns the stored EgoCycle, or None if the cycle was skipped
-        (budget exceeded) or failed (CC error).
+        Returns the stored EgoCycle, or None if the cycle failed (CC error).
+
+        Raises:
+            BudgetExceededError: Daily budget cap exceeded (not a failure).
+            CycleBlockedError: Approval gate blocked the cycle (not a failure).
         """
         # Resolve cycle type
         if cycle_type is None:

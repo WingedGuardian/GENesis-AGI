@@ -163,7 +163,7 @@ class TopicManager:
         chunks = _split_for_telegram(text)
         first_msg_id: str | None = None
 
-        for chunk in chunks:
+        for i, chunk in enumerate(chunks):
             msg_id = await self._send_single(
                 chunk, thread_id=thread_id, category=category,
                 parse_mode=parse_mode,
@@ -175,7 +175,7 @@ class TopicManager:
                     return None
                 logger.warning(
                     "Partial delivery to '%s': %d/%d chunks sent",
-                    category, chunks.index(chunk), len(chunks),
+                    category, i, len(chunks),
                 )
                 break
             if first_msg_id is None:
