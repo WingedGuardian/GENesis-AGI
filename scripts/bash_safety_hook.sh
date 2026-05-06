@@ -30,6 +30,16 @@ if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     exit 2
 fi
 
+# Push / PR protection — requires explicit user approval every time
+if echo "$CMD" | grep -qE "^git push|[;&|] *git push"; then
+    echo "BLOCKED: git push requires explicit user approval. Ask the user before pushing." >&2
+    exit 2
+fi
+if echo "$CMD" | grep -qE "^gh pr create|[;&|] *gh pr create"; then
+    echo "BLOCKED: PR creation requires explicit user approval. Ask the user before creating a PR." >&2
+    exit 2
+fi
+
 # Other destructive commands
 case "$CMD" in
     *"rm -rf /"*|*"rm -rf ~"*|*"rm -rf ."*|*"rm -rf .."*)
