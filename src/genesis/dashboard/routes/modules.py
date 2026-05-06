@@ -111,7 +111,7 @@ async def modules_list():
             entry["description"] = mod.config.description or entry["description"]
             entry["ipc_url"] = mod.config.ipc.url
             entry["ipc_method"] = mod.config.ipc.method
-            entry["ipc_healthy"] = mod.healthy
+            entry["ipc_healthy"] = mod.healthy  # refreshed by _build_module_health below
             entry["ipc_error"] = mod.last_health_error
             if mod.config.lifecycle:
                 entry["has_lifecycle"] = True
@@ -226,7 +226,8 @@ async def _build_module_health(rt, mod) -> dict:
     if not mod.enabled:
         health["status"] = "disabled"
     elif isinstance(mod, ExternalProgramAdapter):
-        # External modules: use real IPC health, not pipeline job data
+        # External modules: live health check with cache
+        await mod.check_health_cached()
         if mod.healthy:
             health["status"] = "healthy"
         else:

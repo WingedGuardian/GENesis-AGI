@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from genesis.modules.external.config import ProgramConfig
 from genesis.modules.external.ipc import create_ipc_adapter
+
+_HEALTH_CACHE_TTL_S = 60  # seconds
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,7 @@ class ExternalProgramAdapter:
         self._runtime: Any = None
         self._healthy: bool = False
         self._last_health_error: str | None = None
+        self._last_health_check_at: datetime | None = None
 
     @property
     def name(self) -> str:
@@ -54,6 +58,34 @@ class ExternalProgramAdapter:
     def last_health_error(self) -> str | None:
         return self._last_health_error
 
+    async def check_health_cached(self) -> bool:
+        """Run a live health check with TTL caching."""
+        now = datetime.now(UTC)
+        if (
+            self._last_health_check_at is not None
+            and (now - self._last_health_check_at).total_seconds() < _HEALTH_CACHE_TTL_S
+        ):
+            return self._healthy
+
+        if not self._config.health_check:
+            self._healthy = True
+            self._last_health_error = None
+            self._last_health_check_at = now
+            return True
+
+        try:
+            self._healthy = await self._ipc.health_check(
+                self._config.health_check.endpoint,
+                self._config.health_check.expected_status,
+            )
+            self._last_health_error = None if self._healthy else "Health check returned unhealthy"
+        except Exception as exc:
+            self._healthy = False
+            self._last_health_error = str(exc)
+
+        self._last_health_check_at = now
+        return self._healthy
+
     @property
     def config(self) -> ProgramConfig:
         return self._config
@@ -72,12 +104,14 @@ class ExternalProgramAdapter:
                     self._config.health_check.endpoint,
                     self._config.health_check.expected_status,
                 )
+                self._last_health_check_at = datetime.now(UTC)
                 if self._healthy:
                     logger.info("External module '%s' registered and healthy", self.name)
                 else:
                     logger.warning("External module '%s' registered but health check failed", self.name)
             else:
                 self._healthy = True
+                self._last_health_check_at = datetime.now(UTC)
                 logger.info("External module '%s' registered (no health check configured)", self.name)
         except Exception as exc:
             self._healthy = False

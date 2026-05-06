@@ -1,9 +1,10 @@
 """Response writer — Obsidian-compatible markdown with atomic writes.
 
-Responses are written as sibling files next to the source:
+Responses are written as numbered sibling files next to the source:
   Input:    Untitled.md
-  Response: Untitled.genesis.md
+  Response: Untitled-1.genesis.md, Untitled-2.genesis.md, ...
 
+Every evaluation gets a unique monotonically increasing number.
 No subdirectory needed — the .genesis.md suffix marks response files.
 """
 
@@ -45,7 +46,7 @@ class ResponseWriter:
         """Write an evaluation response file atomically.
 
         For single-item batches, the response is a sibling of the source file:
-          source.md → source.genesis.md
+          source.md → source-N.genesis.md (monotonically numbered)
 
         For multi-item batches, the response uses the batch ID:
           <date>-inbox-<batch_slug>.genesis.md
@@ -58,20 +59,19 @@ class ResponseWriter:
         date_file = now_local.strftime("%Y-%m-%d")
 
         if item_count == 1 and source_files:
-            # Sibling response: Untitled.md → Untitled.genesis.md
+            # Sibling response: Untitled.md → Untitled-1.genesis.md
             source = Path(source_files[0])
             stem = source.stem  # "Untitled" from "Untitled.md"
-            target = source.parent / f"{stem}{RESPONSE_SUFFIX}"
+            base_dir = source.parent
         else:
             # Multi-item batch: date-based filename in watch_path
             slug = batch_id[:8]
-            target = self._watch_path / f"{date_file}-inbox-{slug}{RESPONSE_SUFFIX}"
+            stem = f"{date_file}-inbox-{slug}"
+            base_dir = self._watch_path
 
-        # Ensure unique filename — monotonically increasing, never reuses numbers
-        if target.exists():
-            base = target.with_suffix("").with_suffix("")  # strip .genesis.md
-            next_num = _next_counter(base.parent, base.name, RESPONSE_SUFFIX)
-            target = base.parent / f"{base.name}-{next_num}{RESPONSE_SUFFIX}"
+        # Always numbered — monotonically increasing, never reuses numbers
+        next_num = _next_counter(base_dir, stem, RESPONSE_SUFFIX)
+        target = base_dir / f"{stem}-{next_num}{RESPONSE_SUFFIX}"
 
         frontmatter_data = {
             "date": datetime_str,
