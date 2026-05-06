@@ -161,6 +161,29 @@ async def set_state(
     await db.commit()
 
 
+_VALID_MODES = frozenset({"active", "low_activity", "urgent"})
+
+
+async def get_mode(db, ego_key: str = "ego_mode") -> str:
+    """Get the ego operating mode. Defaults to 'active'."""
+    mode = await get_state(db, ego_key)
+    if not mode:
+        return "active"
+    base = mode.split(":")[0]
+    return mode if base in (_VALID_MODES | {"focused"}) else "active"
+
+
+async def set_mode(db, mode: str, ego_key: str = "ego_mode") -> None:
+    """Set the ego operating mode. Validates mode value.
+
+    Valid modes: active, focused:<topic>, low_activity, urgent.
+    """
+    base = mode.split(":")[0]
+    if base not in (_VALID_MODES | {"focused"}):
+        raise ValueError(f"Invalid ego mode: {mode!r}")
+    await set_state(db, key=ego_key, value=mode)
+
+
 # ---------------------------------------------------------------------------
 # ego_proposals
 # ---------------------------------------------------------------------------
