@@ -1,0 +1,16 @@
+{
+  "name": "Genesis",
+  "short_name": "Genesis",
+  "description": "Genesis Neural Monitor",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0f1117",
+  "theme_color": "#0f1117",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon"
+    }
+  ]
+}
