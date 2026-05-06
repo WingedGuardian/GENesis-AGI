@@ -42,12 +42,13 @@ class _MemoryStore(Protocol):
 
 
 def _normalize_for_dedup(text: str) -> str:
-    """Strip numeric variation so near-identical observations dedup.
+    """Strip metric-style numeric variation for dedup.
 
-    "user_goal_staleness=0.945" and "user_goal_staleness=1.0" become
-    the same normalized string.
+    Normalizes numbers after '=' signs so "staleness=0.945" and
+    "staleness=1.0" dedup. Preserves numbers in other contexts
+    (IPs, dates, host identifiers) to avoid false-positive dedup.
     """
-    return _re.sub(r"\d+\.?\d*", "N", text).strip().lower()
+    return _re.sub(r"(?<==)\d+\.?\d*", "N", text).strip().lower()
 
 
 class ObservationWriter:

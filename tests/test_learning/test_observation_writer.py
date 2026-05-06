@@ -140,8 +140,8 @@ class TestObservationDedup:
         count = (await cursor.fetchone())[0]
         assert count == 1
 
-    async def test_numeric_variation_deduped(self, db):
-        """Observations differing only by numbers are deduped."""
+    async def test_metric_variation_deduped(self, db):
+        """Observations differing only by metric values (after =) are deduped."""
         writer = ObservationWriter()
         await writer.write(
             db, source="test", type="metric", content="staleness=0.945", priority="low",
@@ -154,6 +154,21 @@ class TestObservationDedup:
         )
         count = (await cursor.fetchone())[0]
         assert count == 1
+
+    async def test_non_metric_numbers_not_deduped(self, db):
+        """Numbers in non-metric context (IPs, dates) are NOT deduped."""
+        writer = ObservationWriter()
+        await writer.write(
+            db, source="test", type="alert", content="host 1 cpu spike", priority="high",
+        )
+        await writer.write(
+            db, source="test", type="alert", content="host 2 cpu spike", priority="high",
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'alert'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 2
 
     async def test_different_types_not_deduped(self, db):
         """Same content with different types are distinct."""

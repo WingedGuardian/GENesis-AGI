@@ -734,7 +734,6 @@ class OutputRouter:
         if self._observation_writer is not None:
             return await self._observation_writer.write(
                 db, source=source, type=type, content=content, priority=priority,
-                content_hash=content_hash,
             )
 
         obs_id = str(uuid.uuid4())
