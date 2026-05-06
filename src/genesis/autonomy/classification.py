@@ -41,6 +41,9 @@ _DEFAULT_APPROVAL_POLICY: dict[str, str] = {
 _DEFAULT_APPROVAL_TIMEOUTS: dict[str, int | None] = {
     "outreach": 3600,
     "task_proposal": 86400,
+    "autonomous_cli_fallback": 3600,    # 1h — ego/reflection/sentinel cycles
+    "sentinel_dispatch": 7200,           # 2h — sentinel needs more response time
+    "sentinel_action": 7200,
     "irreversible": None,
 }
 

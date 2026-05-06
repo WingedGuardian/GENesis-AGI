@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import re as _re
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Protocol
@@ -39,6 +41,16 @@ class _MemoryStore(Protocol):
     ) -> str: ...
 
 
+def _normalize_for_dedup(text: str) -> str:
+    """Strip metric-style numeric variation for dedup.
+
+    Normalizes numbers after '=' signs so "staleness=0.945" and
+    "staleness=1.0" dedup. Preserves numbers in other contexts
+    (IPs, dates, host identifiers) to avoid false-positive dedup.
+    """
+    return _re.sub(r"(?<==)\d+\.?\d*", "N", text).strip().lower()
+
+
 class ObservationWriter:
     """Write observations to the DB and optionally to the MemoryStore."""
 
@@ -64,7 +76,12 @@ class ObservationWriter:
         # Compute TTL-based expiry
         expires_at = self._compute_expires_at(type, now_dt)
 
-        await observations.create(
+        # Compute normalized content_hash for dedup if not provided.
+        if content_hash is None:
+            norm = _normalize_for_dedup(f"{type}:{content}")
+            content_hash = hashlib.sha256(norm.encode()).hexdigest()
+
+        result = await observations.create(
             db,
             id=obs_id,
             source=source,
@@ -75,7 +92,14 @@ class ObservationWriter:
             created_at=now,
             content_hash=content_hash,
             expires_at=expires_at,
+            skip_if_duplicate=True,
         )
+        if result is None:
+            logger.debug(
+                "Observation dedup: skipped duplicate %s (hash=%s)",
+                type, content_hash[:12],
+            )
+            return obs_id
 
         if self._memory_store is not None and type not in _SKIP_EMBED_TYPES:
             try:

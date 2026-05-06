@@ -131,3 +131,39 @@ class TestAssembleContext:
         # Should not raise
         ctx = await engine.assemble_context(context_builder=mock_context_builder)
         assert "Capabilities" in ctx
+
+
+class TestModeInjection:
+    async def test_default_mode_is_active(self, engine, mock_context_builder):
+        """Without a stored mode, context includes 'ACTIVE'."""
+        ctx = await engine.assemble_context(context_builder=mock_context_builder)
+        assert "Operating Mode: ACTIVE" in ctx
+        assert "system-level control parameter" in ctx
+
+    async def test_stored_mode_injected(self, engine, db, mock_context_builder):
+        """Stored mode appears in context."""
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_mode(db, "focused:beta-launch", ego_key="ego_mode")
+        ctx = await engine.assemble_context(context_builder=mock_context_builder)
+        assert "FOCUSED:BETA-LAUNCH" in ctx
+
+    async def test_mode_before_focus(self, engine, db, mock_context_builder):
+        """Mode section appears before Previous Focus."""
+        from genesis.db.crud import ego as ego_crud
+        await ego_crud.set_state(db, key="ego_focus_summary", value="test focus")
+        ctx = await engine.assemble_context(context_builder=mock_context_builder)
+        mode_pos = ctx.index("Operating Mode")
+        focus_pos = ctx.index("Previous Focus")
+        assert mode_pos < focus_pos
+
+    async def test_genesis_ego_mode_key(self, db, mock_context_builder):
+        """Genesis ego uses genesis_ego_mode key."""
+        from genesis.db.crud import ego as ego_crud
+        from genesis.ego.compaction import CompactionEngine
+        engine = CompactionEngine(
+            db=db,
+            focus_summary_key="genesis_ego_focus_summary",
+        )
+        await ego_crud.set_mode(db, "urgent", ego_key="genesis_ego_mode")
+        ctx = await engine.assemble_context(context_builder=mock_context_builder)
+        assert "URGENT" in ctx

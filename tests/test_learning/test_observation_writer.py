@@ -119,3 +119,81 @@ class TestObservationWriter:
         )
         cursor = await db.execute("SELECT * FROM observations WHERE id = ?", (obs_id,))
         assert await cursor.fetchone() is not None
+
+
+class TestObservationDedup:
+    async def test_duplicate_observation_skipped(self, db):
+        """Writing the same observation twice skips the duplicate."""
+        writer = ObservationWriter()
+        id1 = await writer.write(
+            db, source="test", type="test_obs", content="hello world", priority="medium",
+        )
+        id2 = await writer.write(
+            db, source="test", type="test_obs", content="hello world", priority="medium",
+        )
+        # Both return IDs but only one row exists
+        assert id1 is not None
+        assert id2 is not None
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'test_obs'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 1
+
+    async def test_metric_variation_deduped(self, db):
+        """Observations differing only by metric values (after =) are deduped."""
+        writer = ObservationWriter()
+        await writer.write(
+            db, source="test", type="metric", content="staleness=0.945", priority="low",
+        )
+        await writer.write(
+            db, source="test", type="metric", content="staleness=1.0", priority="low",
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'metric'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 1
+
+    async def test_non_metric_numbers_not_deduped(self, db):
+        """Numbers in non-metric context (IPs, dates) are NOT deduped."""
+        writer = ObservationWriter()
+        await writer.write(
+            db, source="test", type="alert", content="host 1 cpu spike", priority="high",
+        )
+        await writer.write(
+            db, source="test", type="alert", content="host 2 cpu spike", priority="high",
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'alert'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 2
+
+    async def test_different_types_not_deduped(self, db):
+        """Same content with different types are distinct."""
+        writer = ObservationWriter()
+        await writer.write(
+            db, source="test", type="type_a", content="hello", priority="medium",
+        )
+        await writer.write(
+            db, source="test", type="type_b", content="hello", priority="medium",
+        )
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = 'test'"
+        )
+        count = (await cursor.fetchone())[0]
+        assert count == 2
+
+    async def test_explicit_content_hash_respected(self, db):
+        """When caller provides content_hash, it's used as-is."""
+        writer = ObservationWriter()
+        await writer.write(
+            db, source="test", type="test_obs", content="hello",
+            priority="medium", content_hash="custom_hash_123",
+        )
+        cursor = await db.execute(
+            "SELECT content_hash FROM observations WHERE source = 'test'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == "custom_hash_123"

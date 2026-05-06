@@ -12,6 +12,7 @@ import pytest
 
 from genesis.db.schema import TABLES
 from genesis.ego.cadence import EgoCadenceManager
+from genesis.ego.session import CycleBlockedError
 from genesis.ego.types import EgoConfig, EgoCycle
 
 # ---------------------------------------------------------------------------
@@ -162,6 +163,22 @@ class TestCadenceTick:
         mock_session.run_cycle.side_effect = RuntimeError("boom")
         await cadence._on_tick()
         assert cadence.consecutive_failures == 1
+
+    async def test_tick_cycle_blocked_does_not_trip_breaker(
+        self, cadence, mock_session,
+    ):
+        """CycleBlockedError is a gate, not a failure — no circuit breaker impact."""
+        mock_session.run_cycle.side_effect = CycleBlockedError("approval pending")
+        await cadence._on_tick()
+        assert cadence.consecutive_failures == 0
+
+    async def test_morning_report_cycle_blocked_does_not_trip_breaker(
+        self, cadence, mock_session,
+    ):
+        """CycleBlockedError in morning report also doesn't trip breaker."""
+        mock_session.run_cycle.side_effect = CycleBlockedError("approval pending")
+        await cadence._on_morning_report()
+        assert cadence.consecutive_failures == 0
 
 
 # ---------------------------------------------------------------------------

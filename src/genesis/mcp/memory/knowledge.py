@@ -646,7 +646,12 @@ def _get_orchestrator():
 
     rt = GenesisRuntime.instance()
     if rt._router is None:
-        raise RuntimeError("Router not available — Genesis not fully bootstrapped")
+        from genesis.routing.standalone import create_standalone_router
+        create_standalone_router()
+    if rt._router is None:
+        raise RuntimeError(
+            "Router not available — standalone bootstrap also failed"
+        )
 
     return KnowledgeOrchestrator(
         registry=build_default_registry(),
@@ -749,7 +754,10 @@ async def resume_review(
 
     rt = GenesisRuntime.instance()
     if rt._router is None:
-        return {"error": "Router not available"}
+        from genesis.routing.standalone import create_standalone_router
+        create_standalone_router()
+    if rt._router is None:
+        return {"error": "Router not available — standalone bootstrap failed"}
 
     # Resolve resume text
     resume_text = resume_source

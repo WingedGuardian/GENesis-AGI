@@ -274,13 +274,14 @@ class Router:
                     )
 
                 # Record last run for neural monitor
-                await record_last_run(
-                    self.cost_tracker.db, call_site_id,
-                    provider=provider_name, model_id=provider_cfg.model_id,
-                    response_text=result.content,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                )
+                if self.cost_tracker and self.cost_tracker.db:
+                    await record_last_run(
+                        self.cost_tracker.db, call_site_id,
+                        provider=provider_name, model_id=provider_cfg.model_id,
+                        response_text=result.content,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                    )
 
 
                 return RoutingResult(

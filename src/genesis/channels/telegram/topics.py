@@ -149,10 +149,50 @@ class TopicManager:
         *,
         parse_mode: str | None = "HTML",
     ) -> str | None:
-        """Send a message to a category's persistent topic. Returns message_id or None."""
+        """Send a message to a category's persistent topic. Returns message_id or None.
+
+        Splits long messages to stay within Telegram's 4096-char limit.
+        Returns the message_id of the first chunk (used for reply mapping).
+        """
+        from genesis.channels.telegram._handler_helpers import _split_for_telegram
+
         thread_id = await self.get_or_create_persistent(category)
         if thread_id is None:
             return None
+
+        chunks = _split_for_telegram(text)
+        first_msg_id: str | None = None
+
+        for i, chunk in enumerate(chunks):
+            msg_id = await self._send_single(
+                chunk, thread_id=thread_id, category=category,
+                parse_mode=parse_mode,
+            )
+            if msg_id is None:
+                # If the first chunk fails, abort entirely.
+                # If a later chunk fails, return what we have.
+                if first_msg_id is None:
+                    return None
+                logger.warning(
+                    "Partial delivery to '%s': %d/%d chunks sent",
+                    category, i, len(chunks),
+                )
+                break
+            if first_msg_id is None:
+                first_msg_id = msg_id
+
+        return first_msg_id
+
+    async def _send_single(
+        self,
+        text: str,
+        *,
+        thread_id: int,
+        category: str,
+        parse_mode: str | None = "HTML",
+    ) -> str | None:
+        """Send a single message chunk to a topic. Handles retries for
+        deleted topics and parse failures. Returns message_id or None."""
         try:
             kwargs: dict = {
                 "chat_id": self._chat_id,
