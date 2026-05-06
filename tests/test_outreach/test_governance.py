@@ -19,21 +19,21 @@ from genesis.outreach.types import (
 @pytest.fixture
 def config():
     return OutreachConfig(
-        quiet_hours=QuietHours(start="22:00", end="07:00", timezone="UTC"),
+        quiet_hours=QuietHours(start="22:00", end="07:00"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
         max_daily=5,
         surplus_daily=1,
         content_daily=3,
         morning_report_time="07:00",
-        morning_report_timezone="UTC",
+        # morning_report_timezone removed — uses user_timezone()
         engagement_timeout_hours=24,
         engagement_poll_minutes=60,
     )
 
 
 # Narrow quiet window that won't interfere with test execution.
-_NO_QUIET_HOURS = QuietHours(start="02:00", end="02:30", timezone="UTC")
+_NO_QUIET_HOURS = QuietHours(start="02:00", end="02:30")
 
 
 def _cfg_no_quiet(**overrides):
@@ -45,7 +45,7 @@ def _cfg_no_quiet(**overrides):
         surplus_daily=1,
         content_daily=3,
         morning_report_time="07:00",
-        morning_report_timezone="UTC",
+        # morning_report_timezone removed — uses user_timezone()
         engagement_timeout_hours=24,
         engagement_poll_minutes=60,
     )

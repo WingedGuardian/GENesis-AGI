@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import UTC, datetime, time
-from zoneinfo import ZoneInfo
 
 import aiosqlite
 
+from genesis.env import user_timezone
 from genesis.outreach.config import OutreachConfig
 from genesis.outreach.types import (
     GovernanceResult,
@@ -149,8 +149,9 @@ class GovernanceGate:
         )
 
     def _in_quiet_hours(self) -> bool:
+        from zoneinfo import ZoneInfo
         try:
-            tz = ZoneInfo(self._config.quiet_hours.timezone)
+            tz = ZoneInfo(user_timezone())
         except Exception:
             tz = UTC
         now = datetime.now(tz).time()

@@ -258,7 +258,7 @@ def test_autonomous_cli_policy_endpoint_uses_runtime_export_status(client):
     mock_exporter.status.return_value = {
         "effective_policy": {
             "autonomous_cli_fallback_enabled": True,
-            "manual_approval_required": True,
+            "manual_approval_required": False,
             "reask_interval_hours": 24,
             "approval_channel": "telegram",
             "shared_export_enabled": True,
@@ -277,7 +277,7 @@ def test_autonomous_cli_policy_endpoint_uses_runtime_export_status(client):
 
     assert resp.status_code == 200
     data = resp.get_json()
-    assert data["effective_policy"]["manual_approval_required"] is True
+    assert data["effective_policy"]["manual_approval_required"] is False
     assert data["last_export_path"].endswith("autonomous_cli_policy.json")
 
 

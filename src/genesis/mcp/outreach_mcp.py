@@ -190,7 +190,6 @@ async def outreach_preferences(
                 "quiet_hours": {
                     "start": _config.quiet_hours.start,
                     "end": _config.quiet_hours.end,
-                    "timezone": _config.quiet_hours.timezone,
                 },
                 "thresholds": _config.thresholds,
                 "rate_limits": {
@@ -207,7 +206,6 @@ async def outreach_preferences(
             "quiet_hours": {
                 "start": cfg.quiet_hours.start,
                 "end": cfg.quiet_hours.end,
-                "timezone": cfg.quiet_hours.timezone,
             },
             "thresholds": cfg.thresholds,
             "rate_limits": {
@@ -244,14 +242,13 @@ async def outreach_preferences(
         quiet_hours=QuietHours(
             start=qh.get("start", current.quiet_hours.start),
             end=qh.get("end", current.quiet_hours.end),
-            timezone=qh.get("timezone", current.quiet_hours.timezone),
         ),
         channel_preferences={**current.channel_preferences, **preferences.get("channel_preferences", {})},
         thresholds={**current.thresholds, **preferences.get("thresholds", {})},
         max_daily=int(rl.get("max_daily", current.max_daily)),
         surplus_daily=int(rl.get("surplus_daily", current.surplus_daily)),
+        content_daily=int(rl.get("content_daily", current.content_daily)),
         morning_report_time=mr.get("trigger_time", current.morning_report_time),
-        morning_report_timezone=mr.get("timezone", current.morning_report_timezone),
         engagement_timeout_hours=int(eng.get("timeout_hours", current.engagement_timeout_hours)),
         engagement_poll_minutes=int(eng.get("poll_interval_minutes", current.engagement_poll_minutes)),
         immediate_escalation_alerts=current.immediate_escalation_alerts,

@@ -224,6 +224,7 @@
         settingsData: {},         // domain_name → config object
         settingsEditing: null,    // domain being edited
         settingsViewing: null,    // readonly domain being viewed
+        systemTimezone: null,     // from /api/genesis/settings/timezone
         settingsSaving: false,
         settingsRestartMessage: null,
 
@@ -1116,6 +1117,11 @@
             const resp = await fetchApi("/api/genesis/settings");
             if (resp && resp.ok) { this.settingsDomains = await resp.json(); }
           } catch (e) { console.warn("Settings index failed:", e); }
+          // Also fetch the system timezone
+          try {
+            const tzResp = await fetchApi("/api/genesis/settings/timezone");
+            if (tzResp && tzResp.ok) { this.systemTimezone = (await tzResp.json()).timezone; }
+          } catch (e) { /* ignore */ }
         },
         async fetchSettingsData(domain) {
           try {
@@ -1275,13 +1281,12 @@
           ego_thinking_budget_usd: 'Thinking Budget ($)',
           ego_dispatch_budget_usd: 'Dispatch Budget ($)',
           morning_report_hour: 'Morning Report Hour', morning_report_minute: 'Morning Report Minute',
-          morning_report_timezone: 'Morning Report Timezone',
           shadow_morning_report: 'Shadow Morning Report',
           consecutive_failure_limit: 'Failure Limit', failure_backoff_minutes: 'Failure Backoff (min)',
           // Inbox Monitor
           watch_path: 'Watch Path', response_dir: 'Response Dir Pattern',
           check_interval_seconds: 'Check Interval (sec)', batch_size: 'Batch Size',
-          effort: 'Effort Level', timeout_s: 'Timeout (sec)', timezone: 'Timezone',
+          effort: 'Effort Level', timeout_s: 'Timeout (sec)',
           // Outreach
           start: 'Start Time', end: 'End Time',
           default: 'Default Channel', blocker: 'Blocker Channel',
@@ -1289,6 +1294,28 @@
           max_daily: 'Max Daily Messages', surplus_daily: 'Surplus Daily Limit',
           trigger_time: 'Trigger Time', timeout_hours: 'Timeout (hours)',
           poll_interval_minutes: 'Poll Interval (min)',
+          // Surplus
+          interval_minutes: 'Dispatch Interval (min)', task_expiry_hours: 'Task Expiry (hours)',
+          max_iterations_per_cycle: 'Max Iterations/Cycle',
+          brainstorm_check_hours: 'Brainstorm Check (hours)',
+          code_audit_hours: 'Code Audit (hours)', code_index_hours: 'Code Index (hours)',
+          recon_gather_hours: 'Recon Gather (hours)', maintenance_hours: 'Maintenance (hours)',
+          analytical_hours: 'Analytical (hours)', follow_up_dispatch_minutes: 'Follow-up Dispatch (min)',
+          memory_extraction_hours: 'Memory Extraction (hours)',
+          // Resilience
+          transition_count: 'Transition Count', window_seconds: 'Window (sec)',
+          stabilization_seconds: 'Stabilization (sec)',
+          confirmation_probes: 'Confirmation Probes', confirmation_interval_s: 'Confirmation Interval (sec)',
+          drain_pace_s: 'Drain Pace (sec)', embedding_pace_per_min: 'Embedding Pace/min',
+          queue_overflow_threshold: 'Queue Overflow Threshold',
+          max_sessions_per_hour: 'Max Sessions/Hour', throttle_threshold_pct: 'Throttle Threshold (%)',
+          // Confidence Gates
+          min_confidence: 'Min Confidence', min_separability: 'Min Separability',
+          shadow_mode: 'Shadow Mode',
+          // Updates
+          interval_hours: 'Check Interval (hours)',
+          auto_apply: 'Auto Apply', allowed_impacts: 'Allowed Impacts',
+          backup_before_update: 'Backup Before Update',
         },
         _SETTING_DESCS: {
           // Autonomous CLI Policy
@@ -1321,7 +1348,6 @@
           ego_dispatch_budget_usd: 'Daily cap for dispatched background sessions',
           morning_report_hour: 'Hour (0\u201323) to send the daily morning report',
           morning_report_minute: 'Minute (0\u201359) for morning report delivery',
-          morning_report_timezone: 'Timezone for morning report scheduling',
           shadow_morning_report: 'Send reports to a test topic for validation before going live',
           consecutive_failure_limit: 'Consecutive failures before circuit breaker trips',
           failure_backoff_minutes: 'Cooldown period after consecutive failures before retrying',
@@ -1332,7 +1358,6 @@
           batch_size: 'Maximum files to process per scan cycle (1\u201310)',
           effort: 'Processing depth: low (fast), medium (balanced), or high (thorough)',
           timeout_s: 'Max seconds per inbox item processing before timeout',
-          timezone: 'Timezone for scheduling and timestamps',
           // Outreach
           start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
           end: 'Quiet hours end \u2014 outreach resumes after this time (e.g., 07:00)',
@@ -1346,6 +1371,38 @@
           trigger_time: 'Daily time when digest/report delivery fires (e.g., 08:00)',
           timeout_hours: 'Max hours to wait for outreach delivery confirmation',
           poll_interval_minutes: 'How often (in minutes) to check for pending outreach items',
+          // Surplus
+          interval_minutes: 'How often the surplus dispatch loop runs',
+          task_expiry_hours: 'Pending tasks older than this are discarded',
+          max_iterations_per_cycle: 'Maximum tasks dispatched per surplus cycle',
+          brainstorm_check_hours: 'Hours between brainstorm surplus runs',
+          code_audit_hours: 'Hours between code audit runs',
+          code_index_hours: 'Hours between code indexing runs',
+          recon_gather_hours: 'Hours between recon gathering runs',
+          maintenance_hours: 'Hours between maintenance task runs',
+          analytical_hours: 'Hours between analytical runs (0 = disabled)',
+          follow_up_dispatch_minutes: 'Minutes between follow-up dispatch checks',
+          memory_extraction_hours: 'Hours between memory extraction runs',
+          // Resilience
+          transition_count: 'State transitions in window before flagging as flapping',
+          window_seconds: 'Time window for flapping detection',
+          stabilization_seconds: 'Seconds a service must stay stable after recovery',
+          confirmation_probes: 'Health probes required to confirm recovery',
+          confirmation_interval_s: 'Seconds between confirmation probes',
+          drain_pace_s: 'Seconds between draining queued items',
+          embedding_pace_per_min: 'Max embedding operations per minute during recovery',
+          queue_overflow_threshold: 'Queue size that triggers overflow alert',
+          max_sessions_per_hour: 'Max CC sessions per hour before throttling',
+          throttle_threshold_pct: 'API usage percentage that triggers rate throttling',
+          // Confidence Gates
+          min_confidence: 'Minimum confidence score to accept (0.0\u20131.0)',
+          min_separability: 'Minimum separability score for deep reflection (0.0\u20131.0)',
+          shadow_mode: 'Log what would be filtered but do not enforce',
+          // Updates
+          interval_hours: 'Hours between checking for upstream updates',
+          auto_apply: 'Automatically apply safe updates without approval',
+          allowed_impacts: 'Impact levels eligible for auto-apply',
+          backup_before_update: 'Run backup before applying any update',
         },
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
@@ -1357,25 +1414,34 @@
           alert: ['telegram', 'email', 'dashboard'],
           surplus: ['telegram', 'email', 'dashboard'],
           digest: ['telegram', 'email', 'dashboard'],
-          timezone: [
-            'America/New_York', 'America/Chicago', 'America/Denver',
-            'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu',
-            'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
-            'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
-            'Australia/Sydney', 'Pacific/Auckland', 'UTC',
-          ],
-          morning_report_timezone: [
-            'America/New_York', 'America/Chicago', 'America/Denver',
-            'America/Los_Angeles', 'America/Anchorage', 'Pacific/Honolulu',
-            'Europe/London', 'Europe/Paris', 'Europe/Berlin', 'Europe/Moscow',
-            'Asia/Tokyo', 'Asia/Shanghai', 'Asia/Kolkata', 'Asia/Dubai',
-            'Australia/Sydney', 'Pacific/Auckland', 'UTC',
-          ],
         },
+        // Display order for settings domains — most important first
+        _DOMAIN_ORDER: [
+          'autonomous_cli_policy', 'ego', 'outreach', 'tts',
+          'inbox_monitor', 'surplus', 'resilience', 'confidence_gates',
+          'updates', 'recon_schedules', 'recon_watchlist', 'recon_sources',
+          'autonomy', 'autonomy_rules', 'guardian',
+          'model_profiles', 'model_routing', 'content_sanitization',
+        ],
         _DOMAIN_LABELS: {
-          tts: 'Text-to-Speech', ego: 'Autonomous Ego',
-          inbox_monitor: 'Inbox Monitor', outreach: 'Outreach Pipeline',
           autonomous_cli_policy: 'Autonomous CLI Policy',
+          ego: 'Autonomous Ego', outreach: 'Outreach Pipeline',
+          tts: 'Text-to-Speech', inbox_monitor: 'Inbox Monitor',
+          surplus: 'Surplus Compute', resilience: 'Resilience',
+          confidence_gates: 'Confidence Gates', updates: 'Updates',
+          recon_schedules: 'Recon Schedules', recon_watchlist: 'Recon Watchlist',
+          recon_sources: 'Recon Sources',
+          autonomy: 'Autonomy Levels', autonomy_rules: 'Autonomy Rules',
+          guardian: 'Guardian', model_profiles: 'Model Profiles',
+          model_routing: 'Model Routing',
+          content_sanitization: 'Content Sanitization',
+        },
+        _sortedDomains(domains) {
+          const order = this._DOMAIN_ORDER;
+          return [...domains].sort((a, b) => {
+            const ai = order.indexOf(a.name), bi = order.indexOf(b.name);
+            return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+          });
         },
         _settingLabel(key) {
           return this._SETTING_LABELS[key] || key.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
@@ -5421,13 +5487,19 @@
                     @click="$store.genesisDashboard.settingsRestartMessage = null">Dismiss</button>
           </div>
         </template>
+        <!-- System timezone display -->
+        <div style="font-size:0.72rem; color:var(--color-text-secondary); margin-bottom:0.75rem; display:flex; align-items:center; gap:0.4rem;">
+          <span class="material-symbols-outlined" style="font-size:0.9rem;">schedule</span>
+          System timezone: <strong x-text="$store.genesisDashboard.systemTimezone || 'loading...'" style="color:var(--color-text);"></strong>
+          <span style="font-size:0.65rem;">(all schedules use this timezone)</span>
+        </div>
         <template x-if="!$store.genesisDashboard.settingsDomains">
           <div style="padding:1rem; text-align:center; color:var(--color-text-secondary);">Loading...</div>
         </template>
         <template x-if="$store.genesisDashboard.settingsDomains">
           <div>
             <!-- Form domains (TTS, Ego, Inbox, Outreach) -->
-            <template x-for="domain in $store.genesisDashboard.settingsDomains.filter(d => d.has_form)" :key="domain.name">
+            <template x-for="domain in $store.genesisDashboard._sortedDomains($store.genesisDashboard.settingsDomains.filter(d => d.has_form))" :key="domain.name">
               <div class="card" :data-settings-domain="domain.name" style="padding:1rem; margin-bottom:0.75rem;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
                   <div>
@@ -5559,9 +5631,9 @@
               </div>
             </template>
 
-            <!-- Settings Index: all domains -->
+            <!-- Settings Index: non-form domains -->
             <div style="margin-top:1rem;">
-              <h3 style="font-size:0.85rem; margin:0 0 0.5rem 0; color:var(--color-text-secondary);">All Configurable Settings</h3>
+              <h3 style="font-size:0.85rem; margin:0 0 0.5rem 0; color:var(--color-text-secondary);">Other Settings</h3>
               <table style="width:100%; font-size:0.78rem; border-collapse:collapse;">
                 <thead>
                   <tr style="border-bottom:1px solid var(--color-border); text-align:left;">
@@ -5571,7 +5643,7 @@
                   </tr>
                 </thead>
                 <tbody>
-                  <template x-for="domain in $store.genesisDashboard.settingsDomains" :key="domain.name">
+                  <template x-for="domain in $store.genesisDashboard._sortedDomains($store.genesisDashboard.settingsDomains.filter(d => !d.has_form))" :key="domain.name">
                     <tr style="border-bottom:1px solid var(--color-border);"
                         :style="domain.readonly ? 'cursor:pointer;' : ''"
                         @click="domain.readonly && $store.genesisDashboard.viewSettings(domain.name)">
@@ -5620,13 +5692,10 @@
                         </template>
                       </td>
                       <td style="padding:4px 8px;">
-                        <template x-if="domain.has_form">
-                          <span style="color:#4caf50;">Form above</span>
-                        </template>
-                        <template x-if="!domain.has_form && !domain.readonly && domain.dedicated_tool">
+                        <template x-if="!domain.readonly && domain.dedicated_tool">
                           <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update my ' + domain.name.replace(/_/g, ' ') + '&quot;'"></em></span>
                         </template>
-                        <template x-if="!domain.has_form && !domain.readonly && !domain.dedicated_tool">
+                        <template x-if="!domain.readonly && !domain.dedicated_tool">
                           <span title="Say this to Genesis in conversation to change these settings" style="cursor:help;">Chat: <em x-text="'&quot;update ' + domain.name.replace(/_/g, ' ') + ' settings&quot;'"></em></span>
                         </template>
                         <template x-if="domain.readonly">

@@ -8,5 +8,5 @@ mail_monitor:
   max_retries: 3
   imap_timeout_s: 30
   max_emails_per_run: 50               # Safety cap per batch run
-  timezone: "UTC"
+  # timezone uses system setting from ~/.genesis/config/genesis.yaml
   min_relevance: 3                     # Layer 1 filter: only relevance >= this goes to judge

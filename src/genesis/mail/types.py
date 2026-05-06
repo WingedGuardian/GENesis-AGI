@@ -18,7 +18,7 @@ class MailConfig:
     max_retries: int = 3
     imap_timeout_s: int = 30
     max_emails_per_run: int = 50  # Safety cap per batch run
-    timezone: str = "UTC"
+    # timezone removed — uses genesis.env.user_timezone()
     min_relevance: int = 3  # Layer 1 filter: only relevance >= this goes to judge
 
 

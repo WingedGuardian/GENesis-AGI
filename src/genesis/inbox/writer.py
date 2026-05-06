@@ -16,10 +16,11 @@ import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 
+from genesis.env import user_timezone
 from genesis.inbox.scanner import RESPONSE_SUFFIX
 
 logger = logging.getLogger(__name__)
@@ -30,9 +31,14 @@ _COUNTER_FILE = ".genesis-counters.json"
 class ResponseWriter:
     """Writes evaluation results as Obsidian-compatible markdown."""
 
-    def __init__(self, *, watch_path: Path, timezone: str = "UTC"):
+    def __init__(self, *, watch_path: Path, timezone: str = ""):
         self._watch_path = watch_path
-        self._tz = ZoneInfo(timezone)
+        tz_name = timezone or user_timezone()
+        try:
+            self._tz = ZoneInfo(tz_name)
+        except (KeyError, ZoneInfoNotFoundError):
+            logger.warning("Invalid timezone %r, falling back to UTC", tz_name)
+            self._tz = ZoneInfo("UTC")
 
     async def write_response(
         self,

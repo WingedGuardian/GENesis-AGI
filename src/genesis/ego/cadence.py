@@ -20,6 +20,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.ego.session import BudgetExceededError
 from genesis.ego.types import EgoConfig
+from genesis.env import user_timezone
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -85,12 +86,13 @@ class EgoCadenceManager:
             misfire_grace_time=300,
         )
         if self._config.morning_report_enabled:
+            tz = user_timezone()
             self._scheduler.add_job(
                 self._on_morning_report,
                 CronTrigger(
                     hour=self._config.morning_report_hour,
                     minute=self._config.morning_report_minute,
-                    timezone=self._config.morning_report_timezone,
+                    timezone=tz,
                 ),
                 id="ego_morning_report",
                 max_instances=1,
@@ -101,7 +103,7 @@ class EgoCadenceManager:
         morning_str = (
             f", morning={self._config.morning_report_hour:02d}:"
             f"{self._config.morning_report_minute:02d} "
-            f"{self._config.morning_report_timezone}"
+            f"{user_timezone()}"
             if self._config.morning_report_enabled
             else ", morning=disabled"
         )

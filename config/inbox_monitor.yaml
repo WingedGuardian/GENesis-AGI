@@ -13,4 +13,4 @@ inbox_monitor:
   timeout_s: 600
   # max_retries: 3        # Max retry attempts before permanently excluding a failed item
   # recursive: false      # Set true to scan subdirectories recursively
-  timezone: "UTC"  # Used for response file dates (supports DST)
+  # timezone uses system setting from ~/.genesis/config/genesis.yaml
