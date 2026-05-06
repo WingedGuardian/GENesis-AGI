@@ -334,6 +334,37 @@ async def count_by_file_path(db: aiosqlite.Connection, file_path: str) -> int:
     return row[0] if row else 0
 
 
+
+async def get_retriable_failed(
+    db: aiosqlite.Connection, file_path: str, *, max_retries: int = 3,
+) -> dict | None:
+    """Return the most recent failed item for *file_path* that is still retriable.
+
+    An item is retriable when ``retry_count < max_retries``.  Returns
+    ``None`` if no such item exists.
+
+    Excludes approval-invalidated items (``approval_invalidated:``
+    prefix) — these represent intentional failures where the old
+    approval no longer applies (content changed, file vanished) and
+    must get fresh rows with fresh approvals.
+
+    Used by the scanner dedup logic: when a file reappears as "new"
+    because ``get_all_known`` excluded retriable failures, the monitor
+    reuses the existing row rather than creating a duplicate with
+    ``retry_count=0``.
+    """
+    cursor = await db.execute(
+        """SELECT * FROM inbox_items
+           WHERE file_path = ? AND status = 'failed' AND retry_count < ?
+             AND (error_message IS NULL
+                  OR error_message NOT LIKE ? || '%')
+           ORDER BY created_at DESC LIMIT 1""",
+        (file_path, max_retries, APPROVAL_INVALIDATED_PREFIX),
+    )
+    row = await cursor.fetchone()
+    return dict(row) if row else None
+
+
 async def query_pending(db: aiosqlite.Connection, *, limit: int = 50) -> list[dict]:
     cursor = await db.execute(
         "SELECT * FROM inbox_items WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",

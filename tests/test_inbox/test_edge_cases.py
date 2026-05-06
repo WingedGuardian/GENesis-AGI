@@ -400,10 +400,11 @@ async def test_failed_item_retried_on_content_change(
 
 @pytest.mark.asyncio
 async def test_failed_item_retried_same_content(
-    monitor, inbox_dir, mock_invoker,
+    monitor, inbox_dir, mock_invoker, db,
 ):
-    """After a failure, the same content should be retried on next tick
-    (failed items are excluded from known set)."""
+    """After a failure, the same content should be retried on next tick.
+    The existing failed row is reused (not duplicated) to maintain proper
+    retry_count tracking."""
     mock_invoker.run.return_value = CCOutput(
         session_id="", text="", model_used="sonnet", cost_usd=0.0,
         input_tokens=0, output_tokens=0, duration_ms=1000, exit_code=1,
@@ -418,6 +419,14 @@ async def test_failed_item_retried_same_content(
     result2 = await monitor.check_once()
     assert result2.items_new == 1  # Detected as new since failed is excluded
     assert result2.batches_dispatched == 1
+
+    # Verify dedup: only one DB row for this file (reused, not duplicated)
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT id, status, retry_count FROM inbox_items "
+        "WHERE file_path LIKE '%flaky.md'",
+    )).fetchall())]
+    assert len(rows) == 1, f"Expected 1 row (dedup), got {len(rows)}: {rows}"
+    assert rows[0]["status"] == "completed"
 
 
 # ── Retry cap tests ──────────────────────────────────────────────────
@@ -467,6 +476,109 @@ async def test_retriable_failure_allows_reprocessing(db):
 
     known = await inbox_items.get_all_known(db, max_retries=3)
     assert "/inbox/retriable.md" not in known
+
+
+# ── Retry dedup tests ─────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retry_reuses_existing_failed_item(monitor, inbox_dir, mock_invoker, db):
+    """When a failed item is retried, the monitor should reuse the existing
+    DB row rather than creating a duplicate with retry_count=0."""
+    mock_invoker.run.return_value = CCOutput(
+        session_id="", text="", model_used="sonnet", cost_usd=0.0,
+        input_tokens=0, output_tokens=0, duration_ms=1000, exit_code=1,
+        is_error=True, error_message="CC error: Timeout after 600s",
+    )
+    (inbox_dir / "timeout.md").write_text("content that times out")
+    result1 = await monitor.check_once()
+    assert len(result1.errors) == 1
+
+    # Get the failed item's ID
+    rows_after_fail = [dict(r) for r in (await (await db.execute(
+        "SELECT id, status, retry_count FROM inbox_items "
+        "WHERE file_path LIKE '%timeout.md'",
+    )).fetchall())]
+    assert len(rows_after_fail) == 1
+    assert rows_after_fail[0]["status"] == "failed"
+    assert rows_after_fail[0]["retry_count"] == 1
+    original_id = rows_after_fail[0]["id"]
+
+    # Fix the invoker — retry should reuse the existing row
+    mock_invoker.run.return_value = _success_output("success on retry")
+    result2 = await monitor.check_once()
+    assert result2.items_new == 1  # Scanner still sees it as "new"
+    assert result2.batches_dispatched == 1
+
+    # Verify: still only ONE row for this file, same ID reused
+    rows_after_retry = [dict(r) for r in (await (await db.execute(
+        "SELECT id, status, retry_count FROM inbox_items "
+        "WHERE file_path LIKE '%timeout.md'",
+    )).fetchall())]
+    assert len(rows_after_retry) == 1, (
+        f"Expected 1 row (reused), got {len(rows_after_retry)}: {rows_after_retry}"
+    )
+    assert rows_after_retry[0]["id"] == original_id
+    assert rows_after_retry[0]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_retry_dedup_skips_invalidated_items(db):
+    """get_retriable_failed must NOT return approval-invalidated items."""
+    await inbox_items.create(
+        db, id="inv1", file_path="/inbox/changed.md",
+        content_hash="old_hash", created_at="2026-03-11T00:00:00+00:00",
+    )
+    # Mark as failed with approval_invalidated prefix
+    await inbox_items.update_status(
+        db, "inv1", status="failed",
+        error_message="approval_invalidated:content changed",
+    )
+
+    # Should NOT find the invalidated item
+    result = await inbox_items.get_retriable_failed(
+        db, "/inbox/changed.md", max_retries=3,
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_retry_dedup_finds_transient_failures(db):
+    """get_retriable_failed should find items that failed due to transient errors."""
+    await inbox_items.create(
+        db, id="trans1", file_path="/inbox/flaky.md",
+        content_hash="abc", created_at="2026-03-11T00:00:00+00:00",
+    )
+    await inbox_items.update_status(
+        db, "trans1", status="failed",
+        error_message="CC invocation failed: Timeout after 600s",
+    )
+
+    result = await inbox_items.get_retriable_failed(
+        db, "/inbox/flaky.md", max_retries=3,
+    )
+    assert result is not None
+    assert result["id"] == "trans1"
+    assert result["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_dedup_respects_max_retries(db):
+    """get_retriable_failed should NOT find items that exhausted retries."""
+    await inbox_items.create(
+        db, id="exhausted1", file_path="/inbox/perm.md",
+        content_hash="abc", created_at="2026-03-11T00:00:00+00:00",
+    )
+    # Fail 3 times (max_retries=3)
+    for _ in range(3):
+        await inbox_items.update_status(
+            db, "exhausted1", status="failed", error_message="err",
+        )
+
+    result = await inbox_items.get_retriable_failed(
+        db, "/inbox/perm.md", max_retries=3,
+    )
+    assert result is None
 
 
 # ── Concurrency guard tests ──────────────────────────────────────────

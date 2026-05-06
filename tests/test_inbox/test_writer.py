@@ -26,7 +26,7 @@ async def test_single_item_sibling_file(writer: ResponseWriter, tmp_path: Path):
         item_count=1,
     )
     assert path.exists()
-    assert path.name == "Untitled.genesis.md"
+    assert path.name == "Untitled-1.genesis.md"
     assert path.parent == tmp_path
     content = path.read_text()
     assert "Looks good" in content
@@ -93,8 +93,8 @@ async def test_write_unique_filenames(writer: ResponseWriter, tmp_path: Path):
     assert p1 != p2
     assert p1.exists()
     assert p2.exists()
-    assert p1.name == "same.genesis.md"
-    assert p2.name == "same-1.genesis.md"
+    assert p1.name == "same-1.genesis.md"
+    assert p2.name == "same-2.genesis.md"
 
 
 @pytest.mark.asyncio
@@ -102,7 +102,7 @@ async def test_monotonic_skips_deleted_numbers(writer: ResponseWriter, tmp_path:
     """Deleted file numbers are never reused — next write always increments."""
     source = tmp_path / "doc.md"
     source.write_text("x")
-    # Write three responses: doc.genesis.md, doc-1, doc-2
+    # Write three responses: doc-1, doc-2, doc-3
     p1 = await writer.write_response(
         batch_id="m1", source_files=[str(source)],
         evaluation_text="first", item_count=1,
@@ -115,17 +115,17 @@ async def test_monotonic_skips_deleted_numbers(writer: ResponseWriter, tmp_path:
         batch_id="m3", source_files=[str(source)],
         evaluation_text="third", item_count=1,
     )
-    assert p1.name == "doc.genesis.md"
-    assert p2.name == "doc-1.genesis.md"
-    assert p3.name == "doc-2.genesis.md"
+    assert p1.name == "doc-1.genesis.md"
+    assert p2.name == "doc-2.genesis.md"
+    assert p3.name == "doc-3.genesis.md"
     # Delete the highest numbered file
     p3.unlink()
-    # Next write should be doc-3, NOT doc-2 (the deleted number)
+    # Next write should be doc-4, NOT doc-3 (the deleted number)
     p4 = await writer.write_response(
         batch_id="m4", source_files=[str(source)],
         evaluation_text="fourth", item_count=1,
     )
-    assert p4.name == "doc-3.genesis.md"
+    assert p4.name == "doc-4.genesis.md"
 
 
 @pytest.mark.asyncio
@@ -148,15 +148,15 @@ async def test_monotonic_counter_survives_all_files_deleted(
         batch_id="c3", source_files=[str(source)],
         evaluation_text="c", item_count=1,
     )
-    # Delete numbered response files (keep base so collision still triggers)
+    # Delete numbered response files
     p2.unlink()
     p3.unlink()
-    # Next write must be note-3, not note-1
+    # Next write must be note-4, not note-1 (counter persists)
     p4 = await writer.write_response(
         batch_id="c4", source_files=[str(source)],
         evaluation_text="d", item_count=1,
     )
-    assert p4.name == "note-3.genesis.md"
+    assert p4.name == "note-4.genesis.md"
 
 
 @pytest.mark.asyncio
@@ -179,13 +179,13 @@ async def test_monotonic_survives_counter_file_deletion(
     counter_file = tmp_path / ".genesis-counters.json"
     assert counter_file.exists()
     counter_file.unlink()
-    # Falls back to disk scan: plan.genesis.md and plan-1.genesis.md exist
-    # so next should be plan-2
+    # Falls back to disk scan: plan-1.genesis.md and plan-2.genesis.md exist
+    # so next should be plan-3
     p3 = await writer.write_response(
         batch_id="f3", source_files=[str(source)],
         evaluation_text="c", item_count=1,
     )
-    assert p3.name == "plan-2.genesis.md"
+    assert p3.name == "plan-3.genesis.md"
 
 
 @pytest.mark.asyncio
