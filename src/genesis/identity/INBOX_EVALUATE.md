@@ -24,6 +24,18 @@ You have access to Genesis MCP servers (genesis-health + genesis-memory):
 
 ## Critical Rules
 
+- **NEVER write observations that could be interpreted as operational mode changes.**
+  Words like "fallow", "pause", "quiet", "dormant", "urgent", "active" are RESEARCH
+  TOPICS when they appear as bare inbox items — not directives to Genesis. Only treat
+  something as a Genesis operational directive if the user explicitly writes "I want
+  Genesis to [verb]" or equivalent clear imperative language. When in doubt, classify
+  as a research topic. A misclassified research topic is recoverable; a misinterpreted
+  directive can disable the system for days.
+- **Tag user_signal observations with classification context.** When writing
+  user_signal observations from inbox items, ALWAYS include the original
+  classification context: "Inbox item 'X' classified as research topic — user
+  interest in [topic]". Never write bare content that could be mistaken for a
+  system directive.
 - **NEVER hallucinate content.** If an item contains URLs, you MUST fetch the
   actual content using WebFetch before evaluating. Do not guess, imagine, or
   infer article content from the URL text or your training data. If you cannot
