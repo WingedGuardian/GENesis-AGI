@@ -99,6 +99,14 @@ def _bootstrap_health() -> None:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
         try:
+
+            # Bootstrap standalone router for LLM-dependent tools
+            try:
+                from genesis.routing.standalone import create_standalone_router
+                create_standalone_router()
+            except Exception:
+                logger.warning("Standalone router bootstrap failed", exc_info=True)
+
             svc = StandaloneHealthDataService(
                 status_path=_DEFAULT_STATUS,
                 db=db,
@@ -166,6 +174,14 @@ def _bootstrap_memory() -> None:
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
 
         try:
+
+            # Bootstrap standalone router for LLM-dependent tools
+            try:
+                from genesis.routing.standalone import create_standalone_router
+                create_standalone_router()
+            except Exception:
+                logger.warning("Standalone router bootstrap failed", exc_info=True)
+
             qdrant = QdrantClient(url=qdrant_url(), timeout=5)
             embedding = EmbeddingProvider()
             init(db=db, qdrant_client=qdrant, embedding_provider=embedding)
@@ -199,6 +215,14 @@ def _bootstrap_recon() -> None:
         await db.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
 
         try:
+
+            # Bootstrap standalone router for LLM-dependent tools
+            try:
+                from genesis.routing.standalone import create_standalone_router
+                create_standalone_router()
+            except Exception:
+                logger.warning("Standalone router bootstrap failed", exc_info=True)
+
             init_recon_mcp(db=db)
             clear_mcp_crash("recon")
             yield
@@ -237,6 +261,13 @@ def _bootstrap_outreach() -> None:
         try:
             # Standalone: pipeline=None means outreach_send returns "not initialized".
             # DB-only tools (outreach_queue, outreach_digest, outreach_engagement) work.
+            # Bootstrap standalone router for LLM-dependent tools
+            try:
+                from genesis.routing.standalone import create_standalone_router
+                create_standalone_router()
+            except Exception:
+                logger.warning("Standalone router bootstrap failed", exc_info=True)
+
             init_outreach_mcp(pipeline=None, engagement=None, config=None, db=db)
             clear_mcp_crash("outreach")
             yield
