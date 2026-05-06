@@ -243,13 +243,13 @@ class TestProposalWorkflow:
         assert "<i></i>" not in digest
 
     async def test_format_digest_memory_basis_truncated(self, workflow):
-        """Long memory_basis is truncated to 150 chars."""
-        long_basis = "X" * 200
+        """Long memory_basis is truncated to 500 chars."""
+        long_basis = "X" * 600
         props = [{"action_type": "investigate", "content": "Test",
                   "memory_basis": long_basis, "confidence": 0.8}]
         digest = workflow.format_digest(props, "b1")
-        assert "X" * 150 in digest
-        assert "X" * 151 not in digest
+        assert "X" * 500 in digest
+        assert "X" * 501 not in digest
 
     async def test_send_digest_calls_topic_manager(
         self, workflow, db, mock_topic_manager,

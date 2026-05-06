@@ -418,6 +418,26 @@ class AutonomousCliApprovalGate:
                     continue
                 if status_str == "approved" and row.get("consumed_at"):
                     continue
+                # Timeout guard: auto-expire pending requests past timeout_at.
+                if status_str == "pending":
+                    timeout_at_str = row.get("timeout_at", "")
+                    if timeout_at_str:
+                        try:
+                            timeout_dt = datetime.fromisoformat(timeout_at_str)
+                            if datetime.now(UTC) >= timeout_dt:
+                                # Auto-expire the stale request
+                                await self._approval_manager.resolve(
+                                    row["id"],
+                                    status="expired",
+                                    resolved_by="timeout_auto_expire",
+                                )
+                                logger.info(
+                                    "Auto-expired timed-out approval %s",
+                                    row["id"],
+                                )
+                                continue
+                        except (ValueError, TypeError):
+                            pass
                 # Staleness guard: don't recycle approvals resolved >24h ago.
                 # Prevents historical backlogs from silently bypassing the gate.
                 if status_str == "approved":

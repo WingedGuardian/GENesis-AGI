@@ -52,6 +52,14 @@ class BudgetExceededError(Exception):
     """Raised when the ego's daily budget cap is exceeded."""
 
 
+class CycleBlockedError(Exception):
+    """Raised when the ego cycle is blocked by an approval gate.
+
+    This is a gate, not a failure -- the circuit breaker should NOT
+    count it toward consecutive failures.
+    """
+
+
 class EgoSession:
     """Ephemeral CC session for ego thinking cycles.
 
@@ -208,7 +216,7 @@ class EgoSession:
             )
             if decision.mode == "blocked":
                 logger.warning("Ego cycle blocked: %s", decision.reason)
-                return None
+                raise CycleBlockedError(decision.reason or "approval pending")
 
         if output is None:
             try:

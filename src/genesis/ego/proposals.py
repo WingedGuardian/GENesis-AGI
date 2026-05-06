@@ -42,11 +42,11 @@ def _format_digest(
 
     for i, p in enumerate(proposals, 1):
         content = p.get("content", "")
-        if len(content) > 200:
-            content = content[:200] + "\u2026"
+        if len(content) > 800:
+            content = content[:800] + "\u2026"
         rationale = p.get("rationale", "")
-        if len(rationale) > 150:
-            rationale = rationale[:150] + "\u2026"
+        if len(rationale) > 500:
+            rationale = rationale[:500] + "\u2026"
 
         lines.append(
             f"<b>{i}.</b> <b>[{_ESC(p.get('action_type', '?'))}]</b> "
@@ -56,8 +56,8 @@ def _format_digest(
             lines.append(f"<i>Rationale:</i> {_ESC(rationale)}")
         memory_basis = p.get("memory_basis", "")
         if memory_basis:
-            if len(memory_basis) > 150:
-                memory_basis = memory_basis[:150] + "\u2026"
+            if len(memory_basis) > 500:
+                memory_basis = memory_basis[:500] + "\u2026"
             lines.append(f"<i>{_ESC(memory_basis)}</i>")
         confidence = p.get("confidence", 0.0)
         urgency = p.get("urgency", "normal")
@@ -67,8 +67,8 @@ def _format_digest(
         )
         alts = p.get("alternatives", "")
         if alts:
-            if len(alts) > 150:
-                alts = alts[:150] + "\u2026"
+            if len(alts) > 300:
+                alts = alts[:300] + "\u2026"
             lines.append(f"<i>Alternatives:</i> {_ESC(alts)}")
         lines.append("")
 
