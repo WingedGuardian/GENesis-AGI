@@ -15,9 +15,13 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
+
+import yaml
 
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.system_prompt import SystemPromptAssembler
+from genesis.cc.types import CCModel, EffortLevel
 from genesis.env import secrets_path
 from genesis.runtime import GenesisRuntime
 
@@ -86,6 +90,35 @@ def _load_bridge_config() -> dict | None:
     }
 
 
+_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+
+
+def _load_channel_defaults() -> tuple[CCModel, EffortLevel]:
+    """Load default model/effort for Telegram from channels.yaml."""
+    model_map = {"opus": CCModel.OPUS, "sonnet": CCModel.SONNET, "haiku": CCModel.HAIKU}
+    effort_map = {
+        "low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
+        "high": EffortLevel.HIGH, "max": EffortLevel.MAX,
+    }
+    data: dict = {}
+    for fname in ("channels.yaml", "channels.local.yaml"):
+        path = _CONFIG_DIR / fname
+        if path.is_file():
+            try:
+                with open(path) as f:
+                    loaded = yaml.safe_load(f) or {}
+                tg = loaded.get("telegram", {})
+                if isinstance(tg, dict):
+                    data.update(tg)
+            except Exception:
+                log.warning("Failed to read %s", path, exc_info=True)
+
+    model = model_map.get(data.get("default_model", ""), CCModel.SONNET)
+    effort = effort_map.get(data.get("default_effort", ""), EffortLevel.MEDIUM)
+    log.info("Channel defaults: model=%s, effort=%s", model.value, effort.value)
+    return model, effort
+
+
 async def _run_headless(runtime: GenesisRuntime) -> None:
     """Keep the bridge process alive without Telegram.
 
@@ -134,6 +167,8 @@ async def main():
     except Exception:
         log.warning("Failed to initialize failure detector", exc_info=True)
 
+    default_model, default_effort = _load_channel_defaults()
+
     conversation_loop = ConversationLoop(
         db=runtime.db,
         invoker=runtime.cc_invoker,
@@ -144,6 +179,8 @@ async def main():
         session_manager=runtime.session_manager,
         contingency=runtime.contingency_dispatcher,
         failure_detector=failure_detector,
+        default_model=default_model,
+        default_effort=default_effort,
     )
 
     # Resolve TTS provider (first available, if any)

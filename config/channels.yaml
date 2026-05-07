@@ -1,0 +1,6 @@
+# Channel defaults — model and effort for new sessions by channel.
+# Override locally in channels.local.yaml (never edit this file).
+
+telegram:
+  default_model: sonnet
+  default_effort: medium
