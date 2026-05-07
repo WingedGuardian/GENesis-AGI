@@ -541,7 +541,8 @@ class UserEgoContextBuilder:
         )
 
         # Cost tracking is NOT the user ego's domain — it belongs to the
-        # Genesis ego (infrastructure) or the dashboard.  Removed per audit.
+        # Genesis ego (see genesis_context.py) or the dashboard.  Removed
+        # per audit: user ego was creating cost-focused follow-ups.
 
         lines.append("")
         return "\n".join(lines)

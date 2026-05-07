@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -76,17 +75,6 @@ class ResultWriter:
         if has_user:
             return "user"
         return "genesis"
-
-    @staticmethod
-    def _normalize_for_dedup(summary: str) -> str:
-        """Strip numbers and normalize whitespace for fuzzy micro dedup.
-
-        "memory at 78% is fine" and "memory at 79% is fine" → same string.
-        """
-        text = summary.lower()
-        text = re.sub(r"-?\d+\.?\d*%?", "N", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
 
     async def write(
         self,
