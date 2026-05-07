@@ -1260,3 +1260,48 @@ async def test_resume_pass_invalidates_row_on_missing_approval(
         (r["error_message"] or "").startswith(inbox_items.APPROVAL_INVALIDATED_PREFIX)
         for r in failed
     )
+
+
+def test_passes_coherence_check_valid():
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nThis article from example.com " + "x" * 300
+    source = "Check out https://example.com/article"
+    assert _passes_coherence_check(evaluation, source) is True
+
+
+def test_coherence_check_rejects_empty():
+    from genesis.inbox.monitor import _passes_coherence_check
+    assert _passes_coherence_check("", "some source") is False
+
+
+def test_coherence_check_rejects_short():
+    from genesis.inbox.monitor import _passes_coherence_check
+    assert _passes_coherence_check("# Inbox Evaluation\nShort.", "src") is False
+
+
+def test_coherence_check_rejects_missing_heading():
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "Some evaluation text " * 30  # >300 chars, no heading
+    assert _passes_coherence_check(evaluation, "src") is False
+
+
+def test_coherence_check_rejects_no_url_mentions():
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "# Inbox Evaluation\n\n" + "No URLs mentioned here " * 20
+    source = "Check https://github.com/some/repo"
+    assert _passes_coherence_check(evaluation, source) is False
+
+
+def test_coherence_check_passes_with_url_domain():
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "# Inbox Evaluation\n\nThis article from github.com " + "x" * 300
+    source = "Check https://github.com/some/repo"
+    assert _passes_coherence_check(evaluation, source) is True
+
+
+def test_coherence_check_no_urls_in_source():
+    from genesis.inbox.monitor import _passes_coherence_check
+    # No URLs in source content — URL check is skipped, other checks pass
+    evaluation = "# Inbox Evaluation\n\n" + "Analysis of the plain text content " * 15
+    source = "Just some plain text with no links"
+    assert _passes_coherence_check(evaluation, source) is True
