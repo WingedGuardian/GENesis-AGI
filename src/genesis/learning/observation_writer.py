@@ -42,13 +42,26 @@ class _MemoryStore(Protocol):
 
 
 def _normalize_for_dedup(text: str) -> str:
-    """Strip metric-style numeric variation for dedup.
+    """Normalize numeric variation for semantic dedup.
 
-    Normalizes numbers after '=' signs so "staleness=0.945" and
-    "staleness=1.0" dedup. Preserves numbers in other contexts
-    (IPs, dates, host identifiers) to avoid false-positive dedup.
+    Targets: metric values (key=N), JSON numeric values ("key": N),
+    comma-separated counts, standalone floats/ints in narrative.
+    Preserves: hex hashes, UUIDs, IPs, ISO timestamps, version strings.
+
+    Steps are ordered specific->general so structural patterns (JSON values)
+    are caught first, and the general standalone-int rule only handles leftovers.
     """
-    return _re.sub(r"(?<==)\d+\.?\d*", "N", text).strip().lower()
+    # 1. Metric-style: key=value (existing pattern)
+    out = _re.sub(r"(?<==)\d+\.?\d*", "N", text)
+    # 2. JSON numeric values: "key": 0.85 or "key": 42
+    out = _re.sub(r'("[\w_]+":\s*)\d+\.?\d*', r"\1N", out)
+    # 3. Comma-separated counts: 6,260
+    out = _re.sub(r"\b\d{1,3}(?:,\d{3})+\b", "N", out)
+    # 4. Standalone floats in narrative: ~31.7h, 0.92
+    out = _re.sub(r"(?<![0-9a-fA-F.:\-])\d+\.\d+(?![0-9a-fA-F.:\-])", "N", out)
+    # 5. Standalone ints 1-5 digits, not part of hex/UUID/IP/timestamp
+    out = _re.sub(r"(?<![0-9a-fA-F.\-:])\b\d{1,5}\b(?![0-9a-fA-F\-:.])", "N", out)
+    return out.strip().lower()
 
 
 class ObservationWriter:

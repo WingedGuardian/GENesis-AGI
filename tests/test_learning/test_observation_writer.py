@@ -159,10 +159,10 @@ class TestObservationDedup:
         """Numbers in non-metric context (IPs, dates) are NOT deduped."""
         writer = ObservationWriter()
         await writer.write(
-            db, source="test", type="alert", content="host 1 cpu spike", priority="high",
+            db, source="test", type="alert", content="cpu spike on web-server", priority="high",
         )
         await writer.write(
-            db, source="test", type="alert", content="host 2 cpu spike", priority="high",
+            db, source="test", type="alert", content="memory pressure on db-primary", priority="high",
         )
         cursor = await db.execute(
             "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'alert'"
