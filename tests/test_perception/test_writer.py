@@ -531,3 +531,59 @@ async def test_micro_cooldown_allows_anomaly(db):
     assert stored, "Anomaly should bypass cooldown"
     rows = await observations.query(db, source="reflection", type="micro_reflection")
     assert len(rows) == 2  # both the prior and the anomaly
+
+
+async def test_write_micro_dedup_same_structure(db):
+    """Two micro outputs with same tags/anomaly/signals but different summaries should dedup."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output1 = MicroOutput(
+        tags=["anomaly_detected", "staleness"],
+        salience=0.7,
+        anomaly=True,
+        summary="Significant anomaly in user_goal_staleness signal at 1.0",
+        signals_examined=21,
+    )
+    output2 = MicroOutput(
+        tags=["anomaly_detected", "staleness"],
+        salience=0.7,
+        anomaly=True,
+        summary="The combination of signals indicates user_goal_staleness anomaly",
+        signals_examined=22,
+    )
+    tick = _make_tick()
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1, f"Expected 1 observation (dedup), got {len(obs)}"
+
+
+async def test_write_micro_different_structure_not_deduped(db):
+    """Micro outputs with different tags should NOT dedup."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output1 = MicroOutput(
+        tags=["anomaly_detected"],
+        salience=0.7,
+        anomaly=True,
+        summary="CPU spike detected.",
+        signals_examined=5,
+    )
+    output2 = MicroOutput(
+        tags=["idle", "resource_normal"],
+        salience=0.6,
+        anomaly=False,
+        summary="All systems normal.",
+        signals_examined=5,
+    )
+    tick = _make_tick()
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 2, f"Expected 2 observations (different structure), got {len(obs)}"
