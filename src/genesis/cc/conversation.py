@@ -50,6 +50,8 @@ class ConversationLoop:
         session_manager: SessionManager | None = None,
         contingency: CCContingencyDispatcher | None = None,
         failure_detector: object | None = None,
+        default_model: CCModel = CCModel.SONNET,
+        default_effort: EffortLevel = EffortLevel.MEDIUM,
     ):
         self._db = db
         self._invoker = invoker
@@ -64,6 +66,8 @@ class ConversationLoop:
         self._context_injector = context_injector
         self._contingency = contingency
         self._failure_detector = failure_detector
+        self._default_model = default_model
+        self._default_effort = default_effort
         self._session_locks: dict[str, asyncio.Lock] = {}
 
     async def interrupt(self) -> None:
@@ -135,12 +139,12 @@ class ConversationLoop:
             await self._session_mgr.complete(session["id"])
             session = None
 
-        # Resolve model/effort: explicit override > session stored > default
+        # Resolve model/effort: explicit override > session stored > config default
         model = intent.model_override or (
-            CCModel(session["model"]) if session and session.get("model") else CCModel.SONNET
+            CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
         effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else EffortLevel.MEDIUM
+            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
         )
 
         # Get or create session, persist any model/effort changes
@@ -327,10 +331,10 @@ class ConversationLoop:
             session = None
 
         model = intent.model_override or (
-            CCModel(session["model"]) if session and session.get("model") else CCModel.SONNET
+            CCModel(session["model"]) if session and session.get("model") else self._default_model
         )
         effort = intent.effort_override or (
-            EffortLevel(session["effort"]) if session and session.get("effort") else EffortLevel.MEDIUM
+            EffortLevel(session["effort"]) if session and session.get("effort") else self._default_effort
         )
 
         session = await self._session_mgr.get_or_create_foreground(

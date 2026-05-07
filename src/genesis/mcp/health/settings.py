@@ -178,6 +178,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=True,
     ),
+    "channels": SettingsDomain(
+        name="channels",
+        description="Channel defaults (model and effort for new Telegram sessions)",
+        config_filename="channels.yaml",
+        readonly=False,
+        needs_restart=True,
+    ),
 }
 
 
@@ -507,6 +514,36 @@ def _validate_ego(changes: dict) -> list[str]:
     return validate_ego_config(changes)
 
 
+def _validate_channels(changes: dict) -> list[str]:
+    """Validate channel defaults config changes."""
+    errors: list[str] = []
+    valid_models = {"opus", "sonnet", "haiku"}
+    valid_efforts = {"low", "medium", "high", "max"}
+
+    tg = changes.get("telegram", {})
+    if not isinstance(tg, dict):
+        errors.append("telegram must be a mapping")
+        return errors
+
+    for key in tg:
+        if key not in ("default_model", "default_effort"):
+            errors.append(f"Unknown key 'telegram.{key}'. Valid: default_model, default_effort")
+
+    if "default_model" in tg and tg["default_model"] not in valid_models:
+        errors.append(
+            f"telegram.default_model must be one of {sorted(valid_models)}, "
+            f"got '{tg['default_model']}'"
+        )
+
+    if "default_effort" in tg and tg["default_effort"] not in valid_efforts:
+        errors.append(
+            f"telegram.default_effort must be one of {sorted(valid_efforts)}, "
+            f"got '{tg['default_effort']}'"
+        )
+
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
@@ -515,6 +552,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "updates": _validate_updates,
     "surplus": _validate_surplus,
     "ego": _validate_ego,
+    "channels": _validate_channels,
 }
 
 

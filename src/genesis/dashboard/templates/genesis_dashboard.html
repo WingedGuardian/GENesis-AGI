@@ -1362,6 +1362,9 @@
           batch_size: 'Maximum files to process per scan cycle (1\u201310)',
           effort: 'Processing depth: low (fast), medium (balanced), or high (thorough)',
           timeout_s: 'Max seconds per inbox item processing before timeout',
+          // Channels
+          telegram: 'Telegram',
+          default_model: 'Default Model', default_effort: 'Default Effort',
           // Outreach
           start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
           end: 'Quiet hours end \u2014 outreach resumes after this time (e.g., 07:00)',
@@ -1407,6 +1410,9 @@
           auto_apply: 'Automatically apply safe updates without approval',
           allowed_impacts: 'Impact levels eligible for auto-apply',
           backup_before_update: 'Run backup before applying any update',
+          // Channels
+          default_model: 'Model for new Telegram sessions (opus = highest quality, haiku = fastest)',
+          default_effort: 'Effort level for new Telegram sessions (higher = more thorough)',
         },
         _SETTING_CHOICES: {
           provider: ['elevenlabs', 'fish_audio', 'cartesia'],
@@ -1418,10 +1424,12 @@
           alert: ['telegram', 'email', 'dashboard'],
           surplus: ['telegram', 'email', 'dashboard'],
           digest: ['telegram', 'email', 'dashboard'],
+          default_model: ['opus', 'sonnet', 'haiku'],
+          default_effort: ['low', 'medium', 'high', 'max'],
         },
         // Display order for settings domains — most important first
         _DOMAIN_ORDER: [
-          'autonomous_cli_policy', 'ego', 'outreach', 'tts',
+          'channels', 'autonomous_cli_policy', 'ego', 'outreach', 'tts',
           'inbox_monitor', 'surplus', 'resilience', 'confidence_gates',
           'updates', 'recon_schedules', 'recon_watchlist', 'recon_sources',
           'autonomy', 'autonomy_rules', 'guardian',
@@ -1439,6 +1447,7 @@
           guardian: 'Guardian', model_profiles: 'Model Profiles',
           model_routing: 'Model Routing',
           content_sanitization: 'Content Sanitization',
+          channels: 'Channels',
         },
         _sortedDomains(domains) {
           const order = this._DOMAIN_ORDER;
