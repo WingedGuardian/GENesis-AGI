@@ -115,4 +115,15 @@ async def assemble_diagnostic_context(
         except Exception:
             logger.debug("Failed to query recent observations", exc_info=True)
 
+    # 6. Essential knowledge (recent operational context)
+    try:
+        from pathlib import Path
+        ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
+        if ek_path.exists():
+            ek_text = ek_path.read_text().strip()
+            if ek_text:
+                sections.append(f"## Essential Knowledge (Recent Context)\n\n{ek_text}")
+    except Exception:
+        logger.debug("Failed to read essential knowledge", exc_info=True)
+
     return "\n\n".join(sections)

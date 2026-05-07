@@ -939,7 +939,7 @@ class SentinelDispatcher:
         # Create background session
         session = await self._session_manager.create_background(
             session_type=SessionType.BACKGROUND_TASK,
-            model=CCModel.SONNET,
+            model=CCModel.OPUS,
             effort=EffortLevel.HIGH,
             source_tag="sentinel",
         )
@@ -957,7 +957,7 @@ class SentinelDispatcher:
 
             invocation = CCInvocation(
                 prompt=full_prompt,
-                model=CCModel.SONNET,
+                model=CCModel.OPUS,
                 effort=EffortLevel.HIGH,
                 timeout_s=900,
                 skip_permissions=True,
