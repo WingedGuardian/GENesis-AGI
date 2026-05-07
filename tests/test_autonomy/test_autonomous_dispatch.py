@@ -748,7 +748,7 @@ def test_policy_exporter_writes_shared_mount_json(tmp_path: Path):
     assert out.exists()
     status = exporter.status()
     assert status["last_export_path"] == str(out)
-    assert status["effective_policy"]["manual_approval_required"] is False
+    assert status["effective_policy"]["manual_approval_required"] is True
 
 
 # ---------------------------------------------------------------------------
