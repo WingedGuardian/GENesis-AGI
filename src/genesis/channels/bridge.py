@@ -18,9 +18,8 @@ import time
 
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.system_prompt import SystemPromptAssembler
-from genesis.cc.types import CCModel, EffortLevel
+from genesis.channels.config import load_channel_defaults as _load_channel_defaults  # noqa: F401
 from genesis.env import secrets_path
-from genesis.mcp.health.settings import _load_yaml_merged
 from genesis.runtime import GenesisRuntime
 
 logging.basicConfig(
@@ -88,32 +87,9 @@ def _load_bridge_config() -> dict | None:
     }
 
 
-def _load_channel_defaults() -> tuple[CCModel, EffortLevel]:
-    """Load default model/effort for Telegram from channels.yaml."""
-    data = _load_yaml_merged("channels.yaml")
-    tg = data.get("telegram", {})
-    if not isinstance(tg, dict):
-        tg = {}
 
-    raw_model = tg.get("default_model", "")
-    raw_effort = tg.get("default_effort", "")
-
-    try:
-        model = CCModel(raw_model)
-    except ValueError:
-        if raw_model:
-            log.warning("Unknown default_model %r in channels config, falling back to sonnet", raw_model)
-        model = CCModel.SONNET
-
-    try:
-        effort = EffortLevel(raw_effort)
-    except ValueError:
-        if raw_effort:
-            log.warning("Unknown default_effort %r in channels config, falling back to medium", raw_effort)
-        effort = EffortLevel.MEDIUM
-
-    log.info("Channel defaults: model=%s, effort=%s", model.value, effort.value)
-    return model, effort
+# _load_channel_defaults is imported from genesis.channels.config above
+# and re-exported for backwards compatibility with standalone.py.
 
 
 async def _run_headless(runtime: GenesisRuntime) -> None:
