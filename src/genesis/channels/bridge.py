@@ -15,14 +15,12 @@ import os
 import signal
 import sys
 import time
-from pathlib import Path
-
-import yaml
 
 from genesis.cc.conversation import ConversationLoop
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCModel, EffortLevel
 from genesis.env import secrets_path
+from genesis.mcp.health.settings import _load_yaml_merged
 from genesis.runtime import GenesisRuntime
 
 logging.basicConfig(
@@ -90,31 +88,30 @@ def _load_bridge_config() -> dict | None:
     }
 
 
-_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
-
-
 def _load_channel_defaults() -> tuple[CCModel, EffortLevel]:
     """Load default model/effort for Telegram from channels.yaml."""
-    model_map = {"opus": CCModel.OPUS, "sonnet": CCModel.SONNET, "haiku": CCModel.HAIKU}
-    effort_map = {
-        "low": EffortLevel.LOW, "medium": EffortLevel.MEDIUM,
-        "high": EffortLevel.HIGH, "max": EffortLevel.MAX,
-    }
-    data: dict = {}
-    for fname in ("channels.yaml", "channels.local.yaml"):
-        path = _CONFIG_DIR / fname
-        if path.is_file():
-            try:
-                with open(path) as f:
-                    loaded = yaml.safe_load(f) or {}
-                tg = loaded.get("telegram", {})
-                if isinstance(tg, dict):
-                    data.update(tg)
-            except Exception:
-                log.warning("Failed to read %s", path, exc_info=True)
+    data = _load_yaml_merged("channels.yaml")
+    tg = data.get("telegram", {})
+    if not isinstance(tg, dict):
+        tg = {}
 
-    model = model_map.get(data.get("default_model", ""), CCModel.SONNET)
-    effort = effort_map.get(data.get("default_effort", ""), EffortLevel.MEDIUM)
+    raw_model = tg.get("default_model", "")
+    raw_effort = tg.get("default_effort", "")
+
+    try:
+        model = CCModel(raw_model)
+    except ValueError:
+        if raw_model:
+            log.warning("Unknown default_model %r in channels config, falling back to sonnet", raw_model)
+        model = CCModel.SONNET
+
+    try:
+        effort = EffortLevel(raw_effort)
+    except ValueError:
+        if raw_effort:
+            log.warning("Unknown default_effort %r in channels config, falling back to medium", raw_effort)
+        effort = EffortLevel.MEDIUM
+
     log.info("Channel defaults: model=%s, effort=%s", model.value, effort.value)
     return model, effort
 
