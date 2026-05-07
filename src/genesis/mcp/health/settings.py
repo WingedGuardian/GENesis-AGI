@@ -517,8 +517,13 @@ def _validate_ego(changes: dict) -> list[str]:
 def _validate_channels(changes: dict) -> list[str]:
     """Validate channel defaults config changes."""
     errors: list[str] = []
+    valid_top_keys = {"telegram"}
     valid_models = {"opus", "sonnet", "haiku"}
     valid_efforts = {"low", "medium", "high", "max"}
+
+    for key in changes:
+        if key not in valid_top_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_top_keys))}")
 
     tg = changes.get("telegram", {})
     if not isinstance(tg, dict):
