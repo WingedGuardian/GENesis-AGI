@@ -73,6 +73,19 @@ class UserModelEvolver:
             self._db, type="user_model_delta", resolved=False
         )
         if not pending:
+            # Touch synthesized_at to confirm model is current even when
+            # no new deltas exist.  Without this, the user_goal_staleness
+            # signal's project-staleness path decays to 1.0 whenever the
+            # delta pipeline is idle (no new observations to process).
+            try:
+                await self._db.execute(
+                    "UPDATE user_model_cache SET synthesized_at = ? "
+                    "WHERE id = 'current'",
+                    (datetime.now(UTC).isoformat(),),
+                )
+                await self._db.commit()
+            except Exception:
+                logger.debug("Failed to touch synthesized_at", exc_info=True)
             return None
 
         # Get current model
