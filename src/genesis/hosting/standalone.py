@@ -337,7 +337,7 @@ class StandaloneAdapter:
         wiring for forum topic routing (reflection, outreach, awareness).
         """
         try:
-            from genesis.channels.bridge import _load_bridge_config
+            from genesis.channels.bridge import _load_bridge_config, _load_channel_defaults
 
             config = _load_bridge_config()
             if config is None:
@@ -358,6 +358,8 @@ class StandaloneAdapter:
                 logger.warning("Failed to init failure detector", exc_info=True)
 
             rt = self._runtime
+            default_model, default_effort = _load_channel_defaults()
+
             conversation_loop = ConversationLoop(
                 db=rt.db,
                 invoker=rt.cc_invoker,
@@ -368,6 +370,8 @@ class StandaloneAdapter:
                 session_manager=rt.session_manager,
                 contingency=rt.contingency_dispatcher,
                 failure_detector=failure_detector,
+                default_model=default_model,
+                default_effort=default_effort,
             )
 
             # TTS
