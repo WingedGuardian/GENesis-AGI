@@ -463,8 +463,20 @@ class EgoSession:
                 "Created proposal batch %s with %d proposals",
                 batch_id, len(ids),
             )
+
+            # Structural validation — annotates digest, doesn't block
+            validation_issues = await self._proposals.validate_batch(proposals)
+            if validation_issues:
+                logger.warning(
+                    "Proposal validation issues in batch %s: %s",
+                    batch_id, "; ".join(validation_issues),
+                )
+
             if communication_decision in ("send_digest", "urgent_notify"):
-                delivery = await self._proposals.send_digest(batch_id)
+                delivery = await self._proposals.send_digest(
+                    batch_id,
+                    validation_warnings=validation_issues or None,
+                )
                 if delivery:
                     logger.info("Ego digest sent (delivery_id=%s)", delivery)
             else:

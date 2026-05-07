@@ -333,3 +333,44 @@ class TestProposalWorkflow:
         assert results[ids[0]] == "rejected"
         row = await ego_crud.get_proposal(db, ids[0])
         assert row["status"] == "rejected"
+
+
+class TestValidateBatch:
+    """Tests for structural proposal validation."""
+
+    @pytest.fixture
+    def workflow_with_db(self, db, mock_topic_manager, mock_memory_store):
+        return ProposalWorkflow(
+            db=db,
+            topic_manager=mock_topic_manager,
+            memory_store=mock_memory_store,
+        )
+
+    @pytest.mark.asyncio
+    async def test_low_confidence_execute_flagged(self, workflow_with_db):
+        proposals = [{"action_type": "execute", "confidence": 0.3, "content": "deploy hotfix", "rationale": "Server is degrading rapidly"}]
+        issues = await workflow_with_db.validate_batch(proposals)
+        assert len(issues) == 1
+        assert "low confidence" in issues[0]
+
+    @pytest.mark.asyncio
+    async def test_empty_rationale_flagged(self, workflow_with_db):
+        proposals = [{"action_type": "investigate", "confidence": 0.8, "content": "check logs", "rationale": ""}]
+        issues = await workflow_with_db.validate_batch(proposals)
+        assert len(issues) == 1
+        assert "rationale" in issues[0]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_content_flagged(self, workflow_with_db):
+        proposals = [
+            {"action_type": "investigate", "confidence": 0.8, "content": "check logs", "rationale": "Something seems off with the error rates"},
+            {"action_type": "investigate", "confidence": 0.8, "content": "check logs", "rationale": "Errors are elevated across services"},
+        ]
+        issues = await workflow_with_db.validate_batch(proposals)
+        assert any("duplicate" in i for i in issues)
+
+    @pytest.mark.asyncio
+    async def test_clean_proposal_no_issues(self, workflow_with_db):
+        proposals = [{"action_type": "investigate", "confidence": 0.85, "content": "review API latency trends", "rationale": "Latency p99 has been climbing for 3 days"}]
+        issues = await workflow_with_db.validate_batch(proposals)
+        assert issues == []

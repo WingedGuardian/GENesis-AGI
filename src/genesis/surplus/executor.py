@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import observations
@@ -21,6 +22,16 @@ if TYPE_CHECKING:
     from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
+
+# Low-information patterns: surplus outputs matching these contribute no value.
+_LOW_INFO_PATTERNS = re.compile(
+    r"no significant (changes?|activity|events?|issues?)"
+    r"|system (is )?(operating|running) (normally|as expected)"
+    r"|nothing (notable|significant|unusual|new)"
+    r"|all (systems?|metrics?) (are )?(within|normal|stable|healthy)"
+    r"|no action (required|needed|necessary)",
+    re.IGNORECASE,
+)
 
 
 class StubExecutor:
@@ -237,6 +248,11 @@ class SurplusLLMExecutor:
         # Quality gate: NOMINAL means nothing noteworthy — skip insight + Telegram
         if content.upper().startswith("NOMINAL") and len(content) < 40:
             logger.info("Surplus task %s reported NOMINAL — skipping insight", task.task_type)
+            return ExecutorResult(success=True, content="", insights=[])
+
+        # Low-information gate: skip outputs that say nothing actionable
+        if _LOW_INFO_PATTERNS.search(content) and len(content) < 200:
+            logger.info("Surplus task %s produced low-information output — skipping", task.task_type)
             return ExecutorResult(success=True, content="", insights=[])
 
         # Post to Telegram surplus topic

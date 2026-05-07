@@ -159,10 +159,10 @@ class TestObservationDedup:
         """Numbers in non-metric context (IPs, dates) are NOT deduped."""
         writer = ObservationWriter()
         await writer.write(
-            db, source="test", type="alert", content="host 1 cpu spike", priority="high",
+            db, source="test", type="alert", content="cpu spike on web-server", priority="high",
         )
         await writer.write(
-            db, source="test", type="alert", content="host 2 cpu spike", priority="high",
+            db, source="test", type="alert", content="memory pressure on db-primary", priority="high",
         )
         cursor = await db.execute(
             "SELECT COUNT(*) FROM observations WHERE source = 'test' AND type = 'alert'"
@@ -197,3 +197,55 @@ class TestObservationDedup:
         )
         row = await cursor.fetchone()
         assert row[0] == "custom_hash_123"
+
+
+class TestBroaderNormalization:
+    """Tests for the expanded _normalize_for_dedup pipeline."""
+
+    def test_json_floats_normalize(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup('"salience": 0.85')
+        b = _normalize_for_dedup('"salience": 0.7')
+        assert a == b
+
+    def test_comma_counts_normalize(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("DB has 6,260 rows")
+        b = _normalize_for_dedup("DB has 7,180 rows")
+        assert a == b
+
+    def test_narrative_floats_normalize(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("~31.7h backlog")
+        b = _normalize_for_dedup("~32.1h backlog")
+        assert a == b
+
+    def test_standalone_ints_normalize(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("now 28 behind")
+        b = _normalize_for_dedup("now 30 behind")
+        assert a == b
+
+    def test_hex_hashes_preserved(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("commit 984cc249")
+        b = _normalize_for_dedup("commit 0b0942cc")
+        assert a != b
+
+    def test_ip_addresses_preserved(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("host 10.176.34.199")
+        b = _normalize_for_dedup("host 10.176.34.200")
+        assert a != b
+
+    def test_iso_timestamps_preserved(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("2026-05-07T06:12:08")
+        b = _normalize_for_dedup("2026-05-08T06:12:08")
+        assert a != b
+
+    def test_metric_style_existing(self):
+        from genesis.learning.observation_writer import _normalize_for_dedup
+        a = _normalize_for_dedup("staleness=0.945")
+        b = _normalize_for_dedup("staleness=1.0")
+        assert a == b

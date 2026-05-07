@@ -110,6 +110,32 @@ def _is_acknowledged(response_text: str) -> bool:
     return bool(_ACKNOWLEDGED_RE.search(response_text))
 
 
+def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
+    """Structural coherence check on inbox evaluation output.
+
+    Returns True if the evaluation meets minimum structural expectations
+    from the INBOX_EVALUATE.md system prompt. False triggers an annotation
+    but does not block writing the response.
+    """
+    if not evaluation or len(evaluation.strip()) < 300:
+        return False  # Too short for any real evaluation
+
+    # Must contain expected structural marker
+    if "# Inbox Evaluation" not in evaluation:
+        return False
+
+    # Source URLs should appear in evaluation (domain-level check)
+    urls = re.findall(r"https?://([^\s/]+)", source_content)
+    if urls:
+        eval_lower = evaluation.lower()
+        url_hits = sum(1 for u in urls if u.lower() in eval_lower)
+        if url_hits == 0:
+            return False  # Evaluation doesn't reference ANY source URLs
+
+    return True
+
+
+
 class InboxMonitor:
     """Peripheral service that watches a folder and dispatches to CC sessions."""
 
@@ -914,6 +940,21 @@ class InboxMonitor:
                 batches_dispatched += 1
                 continue
 
+            # Coherence check: annotate low-quality evaluations
+            batch_content = "\n".join(item.content for item in batch)
+            if not _passes_coherence_check(output.text, batch_content):
+                logger.warning(
+                    "Inbox batch %s failed coherence check — annotating",
+                    batch_id[:8],
+                )
+                output_text = (
+                    "\u26a0\ufe0f **Low-confidence evaluation** "
+                    "(failed structural coherence check)\n\n"
+                    + output.text
+                )
+            else:
+                output_text = output.text
+
             # Write response file
             response_path = None
             if self._writer:
@@ -921,7 +962,7 @@ class InboxMonitor:
                     response_path = await self._writer.write_response(
                         batch_id=batch_id,
                         source_files=[item.file_path for item in batch],
-                        evaluation_text=output.text,
+                        evaluation_text=output_text,
                         item_count=len(batch),
                     )
                 except Exception as exc:
@@ -929,8 +970,7 @@ class InboxMonitor:
                     errors.append(err)
                     logger.error(err)
 
-            batch_content = "\n".join(item.content for item in batch)
-            url_failures = _has_url_failures(output.text, batch_content)
+            url_failures = _has_url_failures(output_text, batch_content)
             if url_failures:
                 logger.warning(
                     "URL failures detected in batch %s — marking as failed "

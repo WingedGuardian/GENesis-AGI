@@ -165,6 +165,30 @@ class ProposalWorkflow:
 
     # -- Formatting --------------------------------------------------------
 
+    async def validate_batch(self, proposals: list[dict]) -> list[str]:
+        """Structural sanity checks on proposals before Telegram delivery."""
+        issues: list[str] = []
+        contents: list[str] = [p.get("content", "") for p in proposals]
+        for p in proposals:
+            title = (p.get("content") or "?")[:40]
+
+            # 1. Low confidence + high-impact action
+            conf = float(p.get("confidence", 0))
+            action = p.get("action_type", "")
+            if action in ("execute", "deploy", "modify", "dispatch") and conf < 0.6:
+                issues.append(f"'{title}': low confidence ({conf:.0%}) for {action}")
+
+            # 2. Empty rationale (why does this proposal exist?)
+            rationale = (p.get("rationale") or "").strip()
+            if len(rationale) < 20:
+                issues.append(f"'{title}': missing or thin rationale")
+
+            # 3. Duplicate content within the same batch
+            if contents.count(p.get("content", "")) > 1:
+                issues.append(f"'{title}': duplicate within batch")
+
+        return issues
+
     def format_digest(
         self,
         proposals: list[dict],
@@ -175,7 +199,12 @@ class ProposalWorkflow:
 
     # -- Delivery ----------------------------------------------------------
 
-    async def send_digest(self, batch_id: str) -> str | None:
+    async def send_digest(
+        self,
+        batch_id: str,
+        *,
+        validation_warnings: list[str] | None = None,
+    ) -> str | None:
         """Send the batch digest to Telegram. Returns delivery_id or None.
 
         TODO(batch-4): Register ReplyWaiter BEFORE sending to close the
@@ -193,6 +222,12 @@ class ProposalWorkflow:
             return None
 
         digest_html = self.format_digest(proposals, batch_id)
+
+        # Prepend validation warnings if any
+        if validation_warnings:
+            warn_lines = "\n".join(f"  - {w}" for w in validation_warnings)
+            digest_html = f"\u26a0\ufe0f <b>Validation:</b>\n{warn_lines}\n\n{digest_html}"
+
         delivery_id = await self._topic_manager.send_to_category(
             TOPIC_CATEGORY, digest_html,
         )

@@ -34,7 +34,7 @@ async def test_write_micro_creates_observation(db):
         tags=["idle", "resource_normal"],
         salience=0.6,
         anomaly=False,
-        summary="All systems normal.",
+        summary="Memory usage elevated at 82% on primary node.",
         signals_examined=5,
     )
     await writer.write(output, Depth.MICRO, _make_tick(), db=db)
@@ -124,13 +124,13 @@ async def test_write_micro_with_memory_store(db):
         tags=["idle", "resource_normal"],
         salience=0.6,
         anomaly=False,
-        summary="All systems normal.",
+        summary="Memory usage elevated at 82% on primary node.",
         signals_examined=5,
     )
     await writer.write(output, Depth.MICRO, _make_tick(), db=db)
 
     store.store.assert_awaited_once_with(
-        "All systems normal.",
+        "Memory usage elevated at 82% on primary node.",
         "reflection",
         memory_type="episodic",
         tags=["idle", "resource_normal"],
@@ -559,7 +559,7 @@ async def test_write_micro_different_structure_not_deduped(db):
         tags=["idle", "resource_normal"],
         salience=0.6,
         anomaly=False,
-        summary="All systems normal.",
+        summary="Memory usage elevated at 82% on primary node.",
         signals_examined=5,
     )
     tick = _make_tick()
@@ -568,3 +568,41 @@ async def test_write_micro_different_structure_not_deduped(db):
 
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 2, f"Expected 2 observations (different structure), got {len(obs)}"
+
+
+async def test_micro_low_info_gate_rejects(db):
+    """Low-information micro observation is gated."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["idle"],
+        salience=0.7,
+        anomaly=False,
+        summary="No significant changes detected in system state.",
+        signals_examined=3,
+    )
+    stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
+    assert stored is False
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 0
+
+
+async def test_micro_low_info_gate_passes_real_content(db):
+    """Informative micro observation passes the low-info gate."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output = MicroOutput(
+        tags=["memory", "elevated"],
+        salience=0.7,
+        anomaly=False,
+        summary="Memory backlog at 92% for 18 hours — needs investigation.",
+        signals_examined=5,
+    )
+    stored = await writer.write(output, Depth.MICRO, _make_tick(), db=db)
+    assert stored is True
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1
