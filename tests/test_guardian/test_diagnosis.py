@@ -246,3 +246,20 @@ class TestRecoveryAction:
             RecoveryAction.ESCALATE,
         ]
         assert all(a in RecoveryAction for a in ordered)
+
+
+def test_prompt_includes_essential_knowledge(tmp_path, monkeypatch):
+    """Essential knowledge file should appear in guardian diagnosis prompt."""
+    from pathlib import Path
+
+    from genesis.guardian.diagnosis import _build_diagnosis_prompt
+
+    ek_dir = tmp_path / ".genesis"
+    ek_dir.mkdir()
+    (ek_dir / "essential_knowledge.md").write_text("Wing: infrastructure\nActive: approval gate fix")
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+
+    snap = _snap(container_status="Running")
+    prompt = _build_diagnosis_prompt(snap, "test signal", "genesis")
+    assert "Essential Knowledge" in prompt
+    assert "approval gate fix" in prompt

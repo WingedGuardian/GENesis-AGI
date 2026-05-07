@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -117,7 +118,6 @@ async def assemble_diagnostic_context(
 
     # 6. Essential knowledge (recent operational context)
     try:
-        from pathlib import Path
         ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
         if ek_path.exists():
             ek_text = ek_path.read_text().strip()
