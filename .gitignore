@@ -46,6 +46,7 @@ config/.generated/
 # Auto-generated identity files (runtime-regenerated, seeds in .example)
 src/genesis/identity/TRIAGE_CALIBRATION.md
 src/genesis/identity/USER_KNOWLEDGE.md
+src/genesis/identity/EGO_NOTEPAD.md
 config/*.local.yaml
 .gstack/
 .context/

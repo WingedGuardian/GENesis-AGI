@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -66,6 +67,7 @@ class UserEgoContextBuilder:
         )
 
         sections.append(await self._user_model_section())
+        sections.append(self._ego_notepad_section())
         sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
         sections.append(await self._user_world_observations_section())
@@ -172,6 +174,24 @@ class UserEgoContextBuilder:
 
         lines.append("")
         return "\n".join(lines)
+
+    # -- Ego notepad (persistent qualitative observations) --
+
+    _NOTEPAD_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_NOTEPAD.md"
+    _NOTEPAD_MARKER = "# Ego Notepad"
+
+    def _ego_notepad_section(self) -> str:
+        """Inject the ego's persistent notepad into context."""
+        try:
+            if not self._NOTEPAD_PATH.exists():
+                return ""
+            content = self._NOTEPAD_PATH.read_text().strip()
+            if not content or self._NOTEPAD_MARKER not in content:
+                return ""
+            return f"## Your Knowledge Notepad\n\n{content}\n"
+        except Exception:
+            logger.warning("Failed to read ego notepad", exc_info=True)
+            return ""
 
     # Signals that track user activity — used to filter awareness tick
     # signals for the user ego's activity pulse section.

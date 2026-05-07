@@ -240,5 +240,29 @@ EGO_OUTPUT_SCHEMA = {
             },
             "description": "Issues to escalate to user ego (Genesis ego only)",
         },
+        "knowledge_updates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["section", "action", "content"],
+                "properties": {
+                    "section": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["add", "update", "remove"],
+                    },
+                    "content": {"type": "string"},
+                    "replaces": {
+                        "type": "string",
+                        "description": "For update/remove: text of the entry to replace or remove",
+                    },
+                },
+            },
+            "description": (
+                "Updates to your persistent knowledge notepad (EGO_NOTEPAD.md). "
+                "Only include when you have genuinely new observations. "
+                "Omit entirely if nothing new."
+            ),
+        },
     },
 }
