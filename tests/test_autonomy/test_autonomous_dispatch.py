@@ -14,6 +14,7 @@ from genesis.autonomy.autonomous_dispatch import (
     AutonomousDispatchRouter,
 )
 from genesis.autonomy.cli_policy import (
+    AutonomousCliPolicy,
     AutonomousCliPolicyExporter,
     load_autonomous_cli_policy,
 )
@@ -83,6 +84,7 @@ def approval_gate(runtime, approval_manager):
     return AutonomousCliApprovalGate(
         runtime=runtime,
         approval_manager=approval_manager,
+        policy_loader=lambda: AutonomousCliPolicy(manual_approval_required=True),
     )
 
 
@@ -748,7 +750,7 @@ def test_policy_exporter_writes_shared_mount_json(tmp_path: Path):
     assert out.exists()
     status = exporter.status()
     assert status["last_export_path"] == str(out)
-    assert status["effective_policy"]["manual_approval_required"] is False
+    assert status["effective_policy"]["manual_approval_required"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -934,3 +936,14 @@ async def test_dispatch_cli_honours_fallback_disabled_flag(approval_gate):
     router.route_call.assert_not_called()
     assert decision.mode == "blocked"
     assert "CLI fallback disabled" in decision.reason
+
+
+def test_local_overlay_overrides_yaml(tmp_path: Path):
+    """Local .local.yaml overlay should override the base YAML value."""
+    base = tmp_path / "policy.yaml"
+    base.write_text("manual_approval_required: false\n")
+    local = tmp_path / "policy.local.yaml"
+    local.write_text("manual_approval_required: true\n")
+    policy = load_autonomous_cli_policy(base)
+    assert policy.manual_approval_required is True
+    assert policy.source == f"config:{base.name}"

@@ -123,12 +123,65 @@ repeat the same actions. Either try something different or escalate.
     except Exception:
         logger.debug("Failed to read sentinel state for diagnosis prompt", exc_info=True)
 
+    # Read essential knowledge for operational context
+    ek_section = ""
+    try:
+        ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
+        if ek_path.exists():
+            ek_text = ek_path.read_text().strip()
+            if ek_text:
+                ek_section = f"""
+## Essential Knowledge (Recent Context)
+
+{ek_text}
+"""
+    except Exception:
+        logger.debug("Failed to read essential knowledge for guardian", exc_info=True)
+
     return f"""You are the Genesis Guardian — the system's last line of defense.
 Genesis appears to be down. You are running on the host VM with full tool access.
 Genesis runs inside the Incus container "{container_name}".
 
 Your job: investigate the root cause, attempt recovery, and verify the fix worked.
 You are the doctor — examine the patient, treat them, confirm the treatment worked.
+
+## How to Think
+
+**Plan before acting.** Before attempting any recovery, you must have a diagnosis
+you're confident in. The sequence is always: gather evidence → form hypothesis →
+test hypothesis → attempt recovery → verify outcome. Never attempt recovery based
+on a hunch.
+
+**Adapt and overcome.** Your default toward any obstacle is "how do I get past
+this?" If one diagnostic approach fails, try a different angle. Check different
+logs, query different metrics, look at the problem from the other side. Giving up
+is the conclusion of a thorough search, not the first response to difficulty.
+
+**No temporary fixes.** Find root causes. If a service keeps crashing, don't just
+restart it — find out why it's crashing. A restart without understanding is a
+delay, not a fix.
+
+**Verify every outcome.** After every action, verify it worked. Don't assume a
+restart succeeded — check the service status, read the logs, hit the health
+endpoint.
+
+## Known Pitfalls
+
+These are hard-won lessons from production incidents. Violating any of these
+can cause catastrophic damage:
+
+- **Never `pip install -e` to a worktree** — it redirects ALL system imports
+  to the worktree path and crashes the bridge.
+- **Always validate pgid > 1 before `os.killpg()`** — `int(AsyncMock().pid)`
+  returns 1 in Python 3.12. Sending a signal to pgid 1 kills ALL processes.
+- **/tmp inside the container is a 512MB tmpfs** — filling it kills CC's shell
+  across ALL sessions. Use `~/tmp/` for transient files.
+- **Never kill the genesis-server process directly** — always use
+  `systemctl --user restart genesis-server`. Direct kills leave the lock file.
+- **Server management is systemd only** — never use `nohup` or bare
+  `python -m genesis serve`.
+- **Use `incus exec`/`incus file push`** for container operations, NOT direct
+  host VM file access.
 {sentinel_section}
 
 ## Initial Diagnostic Data
@@ -139,6 +192,7 @@ You are the doctor — examine the patient, treat them, confirm the treatment wo
 
 {signal_summary}
 {briefing_section}
+{ek_section}
 {_FAILURE_INVENTORY}
 
 ## Available Commands

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -114,5 +115,15 @@ async def assemble_diagnostic_context(
                 sections.append("## Unresolved Observations\n\n" + "\n".join(obs_lines))
         except Exception:
             logger.debug("Failed to query recent observations", exc_info=True)
+
+    # 6. Essential knowledge (recent operational context)
+    try:
+        ek_path = Path.home() / ".genesis" / "essential_knowledge.md"
+        if ek_path.exists():
+            ek_text = ek_path.read_text().strip()
+            if ek_text:
+                sections.append(f"## Essential Knowledge (Recent Context)\n\n{ek_text}")
+    except Exception:
+        logger.debug("Failed to read essential knowledge", exc_info=True)
 
     return "\n\n".join(sections)
