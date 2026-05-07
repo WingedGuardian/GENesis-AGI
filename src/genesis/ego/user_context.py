@@ -540,19 +540,9 @@ class UserEgoContextBuilder:
             "issues if they directly impact the user.\n"
         )
 
-        # Cost status (brief)
-        try:
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_events "
-                "WHERE created_at >= ?",
-                (today,),
-            )
-            row = await cursor.fetchone()
-            daily_spend = row[0] if row else 0.0
-            lines.append(f"**Today's spend**: ${daily_spend:.2f}")
-        except Exception:
-            pass
+        # Cost tracking is NOT the user ego's domain — it belongs to the
+        # Genesis ego (see genesis_context.py) or the dashboard.  Removed
+        # per audit: user ego was creating cost-focused follow-ups.
 
         lines.append("")
         return "\n".join(lines)

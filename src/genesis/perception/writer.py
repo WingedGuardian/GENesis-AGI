@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -77,17 +76,6 @@ class ResultWriter:
             return "user"
         return "genesis"
 
-    @staticmethod
-    def _normalize_for_dedup(summary: str) -> str:
-        """Strip numbers and normalize whitespace for fuzzy micro dedup.
-
-        "memory at 78% is fine" and "memory at 79% is fine" → same string.
-        """
-        text = summary.lower()
-        text = re.sub(r"-?\d+\.?\d*%?", "N", text)
-        text = re.sub(r"\s+", " ", text).strip()
-        return text
-
     async def write(
         self,
         output: MicroOutput | LightOutput,
@@ -145,12 +133,13 @@ class ResultWriter:
         relevance = self._relevance_from_signals(tick)
         category = f"{base_category}:{relevance}"
 
-        # Normalized hash: strips numeric variation from the summary so
-        # "memory at 78% is fine" and "memory at 79% is fine" dedup correctly.
-        # Signal names + anomaly flag are included to preserve structural uniqueness.
-        norm_summary = self._normalize_for_dedup(output.summary)
+        # Structural dedup: hash on tags + salience band + anomaly flag +
+        # signal names.  LLM-generated summaries vary too much per tick to
+        # be useful as dedup keys — even after number normalization, the
+        # sentence structure changes and the hash never collides.
         signal_names = ",".join(sorted(s.name for s in tick.signals))
-        norm_key = f"micro:{norm_summary}|{signal_names}|{output.anomaly}"
+        salience_band = round(output.salience, 1)
+        norm_key = f"micro:{','.join(sorted(output.tags))}|{salience_band}|{output.anomaly}|{signal_names}"
         chash = self._content_hash(norm_key)
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):

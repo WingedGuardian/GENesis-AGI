@@ -49,6 +49,7 @@ fi
 
 # ── Defaults ─────────────────────────────────────────────────
 CONTAINER_NAME="genesis"
+CONTAINER_IMAGE="${GENESIS_CONTAINER_IMAGE:-images:ubuntu/noble}"
 RAM="24GiB"
 DISK="30GB"
 CPUS="8"
@@ -487,9 +488,10 @@ if ! incus info "$CONTAINER_NAME" &>/dev/null; then
         echo "  + Guardian state reset (stale from previous container)"
     fi
 
-    echo "  Creating container '$CONTAINER_NAME'..."
-    # images:ubuntu/noble — the images: remote is always available after incus admin init
-    incus launch images:ubuntu/noble "$CONTAINER_NAME"
+    echo "  Creating container '$CONTAINER_NAME' from $CONTAINER_IMAGE..."
+    # Override with GENESIS_CONTAINER_IMAGE env var for non-Ubuntu distros.
+    # Default: images:ubuntu/noble (the images: remote is always available).
+    incus launch "$CONTAINER_IMAGE" "$CONTAINER_NAME"
     echo "  + Container created"
 
     # Apply resource limits
@@ -664,7 +666,7 @@ incus exec "$CONTAINER_NAME" -- bash -c '
         git curl sudo \
         python3 python3-pip \
         nodejs npm || { echo "  FATAL: package install failed"; exit 1; }
-    # Install venv — try version-specific first (noble = 3.12), then generic
+    # Install venv — try version-specific first, then generic fallback
     apt-get install -y -q python3.12-venv 2>/dev/null || \
         apt-get install -y -q python3-venv || \
         { echo "  FATAL: could not install python3-venv"; exit 1; }

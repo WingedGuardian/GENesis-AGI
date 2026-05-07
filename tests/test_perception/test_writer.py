@@ -422,30 +422,11 @@ async def test_micro_boundary_salience_stored(db):
     assert len(rows) == 1
 
 
-# ── Normalized dedup tests ───────────────────────────────────────────────
+# ── Structural dedup tests ────────────────────────────────────────────────
 
 
-def test_normalize_for_dedup_strips_numbers():
-    """Numeric variation should be collapsed."""
-    from genesis.perception.writer import ResultWriter
-
-    n = ResultWriter._normalize_for_dedup
-    assert n("memory at 78% is fine") == n("memory at 79% is fine")
-    assert n("CPU 0.45 stable") == n("CPU 0.83 stable")
-    assert n("3 of 5 signals healthy") == n("2 of 5 signals healthy")
-
-
-def test_normalize_for_dedup_preserves_structure():
-    """Structurally different summaries should NOT collapse."""
-    from genesis.perception.writer import ResultWriter
-
-    n = ResultWriter._normalize_for_dedup
-    assert n("memory is fine") != n("cpu is fine")
-    assert n("all systems nominal") != n("anomaly detected in network")
-
-
-async def test_micro_normalized_dedup_catches_near_duplicate(db):
-    """Near-identical summaries differing only in numbers should dedup."""
+async def test_micro_structural_dedup_catches_near_duplicate(db):
+    """Same tags + salience band + anomaly should dedup regardless of summary text."""
     from genesis.db.crud import observations
     from genesis.perception.writer import ResultWriter
 
@@ -531,3 +512,59 @@ async def test_micro_cooldown_allows_anomaly(db):
     assert stored, "Anomaly should bypass cooldown"
     rows = await observations.query(db, source="reflection", type="micro_reflection")
     assert len(rows) == 2  # both the prior and the anomaly
+
+
+async def test_write_micro_dedup_same_structure(db):
+    """Two micro outputs with same tags/anomaly/signals but different summaries should dedup."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output1 = MicroOutput(
+        tags=["anomaly_detected", "staleness"],
+        salience=0.7,
+        anomaly=True,
+        summary="Significant anomaly in user_goal_staleness signal at 1.0",
+        signals_examined=21,
+    )
+    output2 = MicroOutput(
+        tags=["anomaly_detected", "staleness"],
+        salience=0.7,
+        anomaly=True,
+        summary="The combination of signals indicates user_goal_staleness anomaly",
+        signals_examined=22,
+    )
+    tick = _make_tick()
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1, f"Expected 1 observation (dedup), got {len(obs)}"
+
+
+async def test_write_micro_different_structure_not_deduped(db):
+    """Micro outputs with different tags should NOT dedup."""
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output1 = MicroOutput(
+        tags=["anomaly_detected"],
+        salience=0.7,
+        anomaly=True,
+        summary="CPU spike detected.",
+        signals_examined=5,
+    )
+    output2 = MicroOutput(
+        tags=["idle", "resource_normal"],
+        salience=0.6,
+        anomaly=False,
+        summary="All systems normal.",
+        signals_examined=5,
+    )
+    tick = _make_tick()
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 2, f"Expected 2 observations (different structure), got {len(obs)}"

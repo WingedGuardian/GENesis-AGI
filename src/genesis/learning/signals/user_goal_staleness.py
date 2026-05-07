@@ -57,9 +57,10 @@ class UserGoalStalenessCollector:
             source="follow_ups+user_model",
             collected_at=now.isoformat(),
             baseline_note=(
-                "0.0=all user goals fresh or none tracked. "
-                "0.5=goals aging 7+ days without engagement. "
-                "1.0=14+ days stale."
+                "0.0=fresh or none tracked. 0.5=7+ days stale. "
+                "1.0=14+ days stale (EXPECTED when old follow-ups "
+                "exist — not a system anomaly, not noteworthy unless "
+                "it changed sharply from a prior tick)."
             ),
         )
 
