@@ -42,6 +42,17 @@ _LIGHT_FOCUS_RELEVANCE: dict[str, str] = {
     "anomaly": "genesis",
 }
 
+# Low-information patterns: observations matching these contribute no value.
+# Applied after salience + cooldown gates in _write_micro().
+_LOW_INFO_PATTERNS = re.compile(
+    r"no significant (changes?|activity|events?|issues?)"
+    r"|system (is )?(operating|running) (normally|as expected)"
+    r"|nothing (notable|significant|unusual|new)"
+    r"|all (systems?|metrics?) (are )?(within|normal|stable|healthy)"
+    r"|no action (required|needed|necessary)",
+    re.IGNORECASE,
+)
+
 
 class ResultWriter:
     """Stores reflection outputs to the database and emits events.
@@ -120,6 +131,13 @@ class ResultWriter:
             db, source="reflection", type="micro_reflection", window_minutes=20,
         ):
             logger.debug("Micro reflection cooldown: skipping (recent exists within 20m)")
+            return False
+
+        # Low-information gate: skip observations with no actionable content.
+        # The normalization fix (observation_writer) is the primary dedup fix;
+        # this catches genuinely empty observations that pass salience + cooldown.
+        if _LOW_INFO_PATTERNS.search(output.summary):
+            logger.debug("Micro-reflection skipped: low-information content")
             return False
 
         content = json.dumps({

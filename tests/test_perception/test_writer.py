@@ -34,7 +34,7 @@ async def test_write_micro_creates_observation(db):
         tags=["idle", "resource_normal"],
         salience=0.6,
         anomaly=False,
-        summary="All systems normal.",
+        summary="Memory usage elevated at 82% on primary node.",
         signals_examined=5,
     )
     await writer.write(output, Depth.MICRO, _make_tick(), db=db)
@@ -124,13 +124,13 @@ async def test_write_micro_with_memory_store(db):
         tags=["idle", "resource_normal"],
         salience=0.6,
         anomaly=False,
-        summary="All systems normal.",
+        summary="Memory usage elevated at 82% on primary node.",
         signals_examined=5,
     )
     await writer.write(output, Depth.MICRO, _make_tick(), db=db)
 
     store.store.assert_awaited_once_with(
-        "All systems normal.",
+        "Memory usage elevated at 82% on primary node.",
         "reflection",
         memory_type="episodic",
         tags=["idle", "resource_normal"],
