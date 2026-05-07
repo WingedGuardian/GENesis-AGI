@@ -136,7 +136,8 @@ class ResultWriter:
         # Low-information gate: skip observations with no actionable content.
         # The normalization fix (observation_writer) is the primary dedup fix;
         # this catches genuinely empty observations that pass salience + cooldown.
-        if _LOW_INFO_PATTERNS.search(output.summary):
+        # Anomalies bypass — same as salience and cooldown gates.
+        if not output.anomaly and _LOW_INFO_PATTERNS.search(output.summary):
             logger.debug("Micro-reflection skipped: low-information content")
             return False
 

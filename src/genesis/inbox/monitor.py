@@ -117,8 +117,6 @@ def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
     from the INBOX_EVALUATE.md system prompt. False triggers an annotation
     but does not block writing the response.
     """
-    import re as _re
-
     if not evaluation or len(evaluation.strip()) < 300:
         return False  # Too short for any real evaluation
 
@@ -127,7 +125,7 @@ def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
         return False
 
     # Source URLs should appear in evaluation (domain-level check)
-    urls = _re.findall(r"https?://([^\s/]+)", source_content)
+    urls = re.findall(r"https?://([^\s/]+)", source_content)
     if urls:
         eval_lower = evaluation.lower()
         url_hits = sum(1 for u in urls if u.lower() in eval_lower)
@@ -972,8 +970,7 @@ class InboxMonitor:
                     errors.append(err)
                     logger.error(err)
 
-            batch_content = "\n".join(item.content for item in batch)
-            url_failures = _has_url_failures(output.text, batch_content)
+            url_failures = _has_url_failures(output_text, batch_content)
             if url_failures:
                 logger.warning(
                     "URL failures detected in batch %s — marking as failed "
