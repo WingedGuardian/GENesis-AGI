@@ -7,6 +7,56 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b5] - 2026-05-07
+
+Sentinel gets smarter, ego learns its boundaries, and a cascade of
+observation spam gets silenced at the source.
+
+### Changed
+
+- **Sentinel upgraded to Opus** (#245) --- the container-side health
+  guardian now runs on the strongest available model. Both Sentinel and
+  Guardian prompts gain planning directives, tenacity rules, known
+  pitfalls from production incidents, and live operational context
+  injection from essential knowledge.
+- **Ego domain boundaries** (#248) --- User Ego no longer tracks
+  operational costs or opines on config values. Genesis Ego stays in its
+  infrastructure lane. Both egos receive explicit rules separating user
+  career goals from Genesis marketing goals.
+
+### Fixed
+
+- **Observation spam eliminated** (#248) --- micro-reflection dedup
+  was hashing LLM-generated summary text, which varies each tick. Now
+  hashes structural properties (tags, anomaly flag, signal names).
+  Stops the 21+ duplicate `user_goal_staleness` observations per day.
+- **Approval gate restored** (#245) --- PR #240 accidentally set the
+  live config to `manual_approval_required: false`. Fixed with
+  three-layer config separation: code default (True, safe fallback),
+  repo YAML (false, friction-free installs), local overlay (user
+  preference, gitignored).
+- **Telegram polling reconnected** (#245) --- adapter_v2 was stuck in
+  a stall loop (26 consecutive 900s stalls). Server restart
+  reinitialized the connection cleanly.
+- **Files tab fills viewport** (#245) --- the 1400px max-width
+  constraint lifts when the Files tab is active. File content viewer
+  now resizable in both directions (#247).
+- **Download button visible** (#245) --- enlarged with text label.
+
+### Removed
+
+- **CC version watcher deactivated** (#248) --- the automatic Claude
+  Code update signal was generating noise. Genesis version watcher
+  (upstream update detection) stays active.
+
+### Infrastructure
+
+- **Ubuntu/noble portability** (#248) --- `scripts/host-setup.sh` now
+  accepts `GENESIS_CONTAINER_IMAGE` env var override instead of
+  hardcoding `images:ubuntu/noble`.
+
+---
+
 ## [v3.0b4] - 2026-05-06
 
 Settings get a proper overhaul, ego recovers from a multi-day deadlock,
