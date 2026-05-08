@@ -26,7 +26,7 @@ _MAX_CHUNK_CHARS = 40_000
 _MAX_CONCURRENT_CHUNKS = 4
 
 # Minimum extraction ratio (output chars / input chars). Below this, flag as thin.
-_MIN_EXTRACTION_RATIO = 0.10
+MIN_EXTRACTION_RATIO = 0.10
 
 _DISTILLATION_SYSTEM_PROMPT = """\
 You are a knowledge distillation engine. Your job is to extract structured
@@ -154,7 +154,7 @@ class DistillationPipeline:
 
     def __init__(self, router: object) -> None:
         self._router = router
-        self._last_extraction_ratio: float = 0.0
+        self.last_extraction_ratio: float = 0.0
 
     async def distill(
         self,
@@ -177,7 +177,7 @@ class DistillationPipeline:
                 called after each chunk completes. Used for progress tracking.
         """
         if not content.text.strip():
-            self._last_extraction_ratio = 0.0
+            self.last_extraction_ratio = 0.0
             return []
 
         total_chars = len(content.text)
@@ -262,19 +262,19 @@ class DistillationPipeline:
 
         # Track extraction ratio for quality monitoring
         output_chars = sum(len(u.body) for u in all_units)
-        self._last_extraction_ratio = output_chars / total_chars if total_chars > 0 else 0.0
+        self.last_extraction_ratio = output_chars / total_chars if total_chars > 0 else 0.0
 
-        if self._last_extraction_ratio < _MIN_EXTRACTION_RATIO and all_units:
+        if self.last_extraction_ratio < MIN_EXTRACTION_RATIO and all_units:
             logger.warning(
                 "Thin extraction: %.1f%% ratio (%d output chars / %d input chars, %d units) from %s",
-                self._last_extraction_ratio * 100, output_chars, total_chars,
+                self.last_extraction_ratio * 100, output_chars, total_chars,
                 len(all_units), content.source_path,
             )
 
         logger.info(
             "Distilled %d knowledge units from %s (%d chunks, %d concurrent, %.1f%% extraction ratio)",
             len(all_units), content.source_path, len(chunks), _MAX_CONCURRENT_CHUNKS,
-            self._last_extraction_ratio * 100,
+            self.last_extraction_ratio * 100,
         )
         return all_units
 

@@ -106,7 +106,7 @@ async def test_thin_extraction_quality_flag(tmp_path: Path):
     orch = _make_orchestrator(tmp_path, mock_distill_result=units)
 
     # Simulate a low extraction ratio on the distillation pipeline
-    orch._distillation._last_extraction_ratio = 0.02  # 2% — below 10% floor
+    orch._distillation.last_extraction_ratio = 0.02  # 2% — below 10% floor
 
     with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
                new_callable=AsyncMock, return_value=["unit-1"]):

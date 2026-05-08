@@ -155,8 +155,8 @@ def test_max_chunk_chars_default():
 
 def test_min_extraction_ratio_default():
     """Minimum extraction ratio should be 10%."""
-    from genesis.knowledge.distillation import _MIN_EXTRACTION_RATIO
-    assert _MIN_EXTRACTION_RATIO == 0.10
+    from genesis.knowledge.distillation import MIN_EXTRACTION_RATIO
+    assert MIN_EXTRACTION_RATIO == 0.10
 
 
 async def test_distill_passes_doc_stats():
@@ -236,8 +236,8 @@ async def test_extraction_ratio_tracked():
 
     units = await pipeline.distill(content, project_type="test")
     assert len(units) == 1
-    assert pipeline._last_extraction_ratio > 0
-    assert abs(pipeline._last_extraction_ratio - 0.20) < 0.01
+    assert pipeline.last_extraction_ratio > 0
+    assert abs(pipeline.last_extraction_ratio - 0.20) < 0.01
 
 
 async def test_extraction_ratio_zero_on_empty():
@@ -247,4 +247,4 @@ async def test_extraction_ratio_zero_on_empty():
     content = ProcessedContent(text="   ", source_type="text", source_path="empty.txt")
 
     await pipeline.distill(content, project_type="test")
-    assert pipeline._last_extraction_ratio == 0.0
+    assert pipeline.last_extraction_ratio == 0.0
