@@ -115,6 +115,9 @@ async def _impl_module_call(
             },
         }
 
+    if not adapter.enabled:
+        return {"error": f"Module '{module_name}' is disabled"}
+
     await _ensure_adapter_started(adapter)
     return await adapter.execute_operation(operation.strip(), params)
 
