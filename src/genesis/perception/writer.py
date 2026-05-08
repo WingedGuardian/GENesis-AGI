@@ -153,13 +153,13 @@ class ResultWriter:
         relevance = self._relevance_from_signals(tick)
         category = f"{base_category}:{relevance}"
 
-        # Structural dedup: hash on tags + salience band + anomaly flag +
-        # signal names.  LLM-generated summaries vary too much per tick to
-        # be useful as dedup keys — even after number normalization, the
-        # sentence structure changes and the hash never collides.
+        # Structural dedup: hash on salience band + anomaly flag + signal
+        # names.  Tags are excluded — they are LLM-generated and vary wildly
+        # across ticks even for identical underlying conditions (61 distinct
+        # tag combos for 72 observations in one week of staleness noise).
         signal_names = ",".join(sorted(s.name for s in tick.signals))
         salience_band = round(output.salience, 1)
-        norm_key = f"micro:{','.join(sorted(output.tags))}|{salience_band}|{output.anomaly}|{signal_names}"
+        norm_key = f"micro:|{salience_band}|{output.anomaly}|{signal_names}"
         chash = self._content_hash(norm_key)
 
         if await observations.exists_by_hash(db, source="reflection", content_hash=chash, unresolved_only=True):
