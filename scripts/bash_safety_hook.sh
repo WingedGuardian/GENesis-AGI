@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Bash commands — blocks destructive operations.
-# Called with CLAUDE_TOOL_INPUT as JSON via stdin/env.
+# CC passes tool input as JSON on stdin with schema:
+#   { "tool_input": { "command": "..." }, "tool_name": "Bash", ... }
 
-CMD=$(echo "$CLAUDE_TOOL_INPUT" | jq -r .command 2>/dev/null)
+CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
 # pip install -e from/to worktree — catches both explicit worktree paths AND
