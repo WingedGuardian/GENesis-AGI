@@ -1028,6 +1028,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         END
     """)
 
+    # Fix: user_goal_staleness was seeded with ["Micro","Light"] but is a
+    # strategic-level signal that generates noise at Micro depth (72 identical
+    # anomaly observations in 7 days).  Scope to Light only.
+    await db.execute(
+        "UPDATE signal_weights SET feeds_depths = '[\"Light\"]' "
+        "WHERE signal_name = 'user_goal_staleness'"
+    )
+
     # Ego proposals: memory_basis column for non-obvious memory attribution.
     await _try_alter(db,
         "ALTER TABLE ego_proposals ADD COLUMN memory_basis TEXT DEFAULT ''",
