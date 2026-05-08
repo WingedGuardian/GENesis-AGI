@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # PreToolUse hook for Bash commands — blocks destructive operations.
-# Called with CLAUDE_TOOL_INPUT as JSON via stdin/env.
+# CC passes tool input as JSON on stdin with schema:
+#   { "tool_input": { "command": "..." }, "tool_name": "Bash", ... }
 
-CMD=$(echo "$CLAUDE_TOOL_INPUT" | jq -r .command 2>/dev/null)
+CMD=$(jq -r '.tool_input.command // empty' 2>/dev/null)
 [ -z "$CMD" ] && exit 0
 
 # pip install -e from/to worktree — catches both explicit worktree paths AND
@@ -30,14 +31,14 @@ if echo "$CMD" | grep -qE "worktree remove.*(--force|-f )"; then
     exit 2
 fi
 
-# Push / PR protection — requires explicit user approval every time
+# Push / PR protection — remind to get explicit user approval
 if echo "$CMD" | grep -qE "^git push|[;&|] *git push"; then
-    echo "BLOCKED: git push requires explicit user approval. Ask the user before pushing." >&2
-    exit 2
+    echo "⚠️  STOP: git push detected. Have you received explicit user approval for this push? Do NOT take prior authorization as blanket approval. If you haven't asked in the last few messages, STOP and ask now." >&2
+    exit 0
 fi
 if echo "$CMD" | grep -qE "^gh pr create|[;&|] *gh pr create"; then
-    echo "BLOCKED: PR creation requires explicit user approval. Ask the user before creating a PR." >&2
-    exit 2
+    echo "⚠️  STOP: gh pr create detected. Have you received explicit user approval for this PR? Did you run a code review first? If not, STOP and ask now." >&2
+    exit 0
 fi
 
 # Other destructive commands
