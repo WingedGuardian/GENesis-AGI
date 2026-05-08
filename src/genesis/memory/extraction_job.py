@@ -205,6 +205,26 @@ async def run_extraction_cycle(
                     summary["entities_extracted"] += 1
                     session_extraction_count += 1
 
+                    # Store SVO event if temporal + verb present
+                    if extraction.event_verb and extraction.temporal:
+                        try:
+                            from genesis.db.crud import memory_events
+                            await memory_events.insert(
+                                db,
+                                memory_id=memory_id,
+                                subject=extraction.event_subject or "unknown",
+                                verb=extraction.event_verb,
+                                object=extraction.event_object,
+                                event_date=extraction.temporal,
+                                confidence=extraction.confidence,
+                                source_session_id=cc_session_id,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "Failed to store SVO event for %s",
+                                memory_id, exc_info=True,
+                            )
+
                     # Create typed links from extraction relationships
                     if linker and extraction.relationships:
                         try:
