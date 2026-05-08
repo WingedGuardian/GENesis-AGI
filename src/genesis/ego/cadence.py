@@ -98,6 +98,15 @@ class EgoCadenceManager:
                 max_instances=1,
                 misfire_grace_time=600,
             )
+        # Mechanical sweep: dispatch approved proposals every 30 min,
+        # independent of ego LLM cycles.
+        self._scheduler.add_job(
+            self._session.sweep_approved_proposals,
+            IntervalTrigger(minutes=30),
+            id="ego_sweep_approved",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
         self._scheduler.start()
         self._running = True
         morning_str = (

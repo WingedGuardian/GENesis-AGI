@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -706,6 +706,94 @@ class EgoSession:
         except Exception:
             logger.error("Failed to apply ego notepad updates", exc_info=True)
 
+    # -- Approved proposal sweep --------------------------------------------
+
+    async def sweep_approved_proposals(self) -> list[str]:
+        """Mechanically dispatch approved proposals via DirectSessionRunner.
+
+        Called on a fixed 30-minute interval by EgoCadenceManager,
+        independent of ego LLM cycles. This ensures approved work gets
+        dispatched even when the ego is in stay_quiet mode.
+
+        Returns list of dispatched proposal IDs.
+        """
+        if self._direct_session_runner is None:
+            return []
+
+        if not await self._check_dispatch_budget():
+            logger.info("Sweep skipped — dispatch budget exceeded")
+            return []
+
+        from genesis.cc.direct_session import DirectSessionRequest
+
+        approved = await ego_crud.list_proposals(
+            self._db, status="approved", limit=5,
+        )
+        if not approved:
+            return []
+
+        dispatched: list[str] = []
+        for prop in approved:
+            # Staleness guard — skip proposals approved more than 48h ago.
+            # resolved_at is set by resolve_proposal() at approval time.
+            try:
+                approved_at = datetime.fromisoformat(prop["resolved_at"])
+                if datetime.now(UTC) - approved_at > timedelta(hours=48):
+                    continue
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            prompt = (
+                f"Execute this approved proposal:\n\n"
+                f"{prop['content']}\n\n"
+                f"Execution plan: {prop.get('execution_plan') or 'N/A'}\n\n"
+                f"Context: {prop.get('rationale') or ''}"
+            )
+            profile = _infer_profile(prop.get("action_type", ""))
+
+            try:
+                request = DirectSessionRequest(
+                    prompt=prompt,
+                    profile=profile,
+                    model=CCModel.SONNET,
+                    effort=EffortLevel.HIGH,
+                    notify=True,
+                    source_tag="ego_dispatch",
+                    caller_context=f"ego_proposal:{prop['id']}",
+                )
+                session_id = await self._direct_session_runner.spawn(request)
+                ok = await ego_crud.execute_proposal(
+                    self._db, prop["id"],
+                    status="executed",
+                    user_response=f"session:{session_id}",
+                )
+                if ok:
+                    dispatched.append(prop["id"])
+                    logger.info(
+                        "Sweep dispatched proposal %s → session %s",
+                        prop["id"], session_id,
+                    )
+            except Exception:
+                logger.error(
+                    "Sweep failed to dispatch proposal %s",
+                    prop["id"], exc_info=True,
+                )
+                try:
+                    await ego_crud.execute_proposal(
+                        self._db, prop["id"],
+                        status="failed",
+                        user_response="sweep_dispatch_error",
+                    )
+                except Exception:
+                    logger.error(
+                        "Failed to mark proposal %s as failed",
+                        prop["id"], exc_info=True,
+                    )
+
+        if dispatched:
+            logger.info("Sweep dispatched %d approved proposal(s)", len(dispatched))
+        return dispatched
+
     async def _check_budget(self) -> bool:
         """True if daily ego thinking spend is under the budget cap."""
         try:
@@ -737,6 +825,18 @@ class EgoSession:
 
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
+
+_INTERACT_TYPES = frozenset({"outreach", "dispatch"})
+_RESEARCH_TYPES = frozenset({"investigate"})
+
+
+def _infer_profile(action_type: str) -> str:
+    """Map proposal action_type to a DirectSession profile."""
+    if action_type in _INTERACT_TYPES:
+        return "interact"
+    if action_type in _RESEARCH_TYPES:
+        return "research"
+    return "observe"
 
 
 def _validate_output(data: dict) -> dict | None:
