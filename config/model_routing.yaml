@@ -51,6 +51,13 @@ providers:
     free: true
     rpm_limit: 20
     open_duration_s: 120
+  openrouter-haiku:
+    type: openrouter
+    model: anthropic/claude-haiku-4.5
+    profile: claude-haiku-4.5
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   cerebras-qwen:
     type: cerebras
@@ -428,7 +435,7 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
-    - claude-haiku
+    - openrouter-haiku
     - mistral-large-free
     - groq-free
     - gemini-free
