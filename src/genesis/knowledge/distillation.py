@@ -184,7 +184,8 @@ class DistillationPipeline:
 
         # Use sections if available, otherwise chunk the full text
         if content.sections and len(content.sections) > 1:
-            chunks = content.sections
+            # Merge small sections into properly-sized chunks for efficiency
+            chunks = _chunk_text("\n\n".join(content.sections))
         else:
             chunks = _chunk_text(content.text)
 
