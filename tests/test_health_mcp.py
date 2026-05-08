@@ -32,7 +32,6 @@ _HEALTHY_DEFAULTS = {
     },
     "infrastructure": {
         "disk": {"free_pct": 80, "free_gb": 100, "total_gb": 140},
-        "tmpfs": {"free_pct": 90, "free_mb": 460, "total_mb": 512},
         "qdrant_collections": {"status": "healthy", "missing": []},
     },
 }

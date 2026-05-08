@@ -228,61 +228,6 @@ async def probe_scheduler(
         )
 
 
-async def probe_tmp(
-    tmp_path: str = "/tmp",
-    *,
-    warn_pct: float = 80.0,
-    critical_pct: float = 90.0,
-    clock=None,
-) -> ProbeResult:
-    """Probe /tmp filesystem usage.
-
-    /tmp is a 512M tmpfs in this container -- filling it kills CC's shell.
-    Returns ProbeResult with details={"pct_used": float, "used_mb": float, "total_mb": float}.
-    """
-    _clock = clock or (lambda: datetime.now(UTC))
-    start = time.monotonic()
-    try:
-        st = os.statvfs(tmp_path)
-        total = st.f_blocks * st.f_frsize
-        free = st.f_bavail * st.f_frsize
-        used = total - free
-        pct = (used / total * 100) if total > 0 else 0.0
-        latency = (time.monotonic() - start) * 1000
-
-        if pct >= critical_pct:
-            status = ProbeStatus.DOWN
-            msg = f"/tmp at {pct:.1f}% ({used / (1024*1024):.0f}/{total / (1024*1024):.0f} MB)"
-        elif pct >= warn_pct:
-            status = ProbeStatus.DEGRADED
-            msg = f"/tmp at {pct:.1f}%"
-        else:
-            status = ProbeStatus.HEALTHY
-            msg = ""
-
-        return ProbeResult(
-            name="tmp_usage",
-            status=status,
-            latency_ms=round(latency, 2),
-            message=msg,
-            checked_at=_clock().isoformat(),
-            details={
-                "pct_used": round(pct, 1),
-                "used_mb": round(used / (1024 * 1024), 1),
-                "total_mb": round(total / (1024 * 1024), 1),
-            },
-        )
-    except OSError as exc:
-        latency = (time.monotonic() - start) * 1000
-        return ProbeResult(
-            name="tmp_usage",
-            status=ProbeStatus.DOWN,
-            latency_ms=round(latency, 2),
-            message=f"Cannot stat {tmp_path}: {exc}",
-            checked_at=_clock().isoformat(),
-        )
-
-
 async def probe_disk(
     mount_path: str = "/",
     *,
@@ -531,7 +476,6 @@ async def collect_probe_results(
     tasks = [
         _safe("qdrant", probe_qdrant()),
         *([] if not ollama_enabled() else [_safe("ollama", probe_ollama())]),
-        _safe("tmp_usage", probe_tmp()),
         _safe("disk", probe_disk()),
         _safe("guardian", probe_guardian(guardian_remote=guardian_remote)),
         _safe("browser_processes", probe_browser_processes()),

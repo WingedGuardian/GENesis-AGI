@@ -63,12 +63,6 @@ class TestSnapshot:
         snap = asyncio.run(svc.snapshot())
         assert "services" in snap
 
-    def test_infrastructure_includes_tmpfs(self, mock_db):
-        svc = HealthDataService(db=mock_db)
-        snap = asyncio.run(svc.snapshot())
-        infra = snap["infrastructure"]
-        assert "tmpfs" in infra
-
     def test_no_db_returns_unknown(self):
         svc = HealthDataService()
         snap = asyncio.run(svc.snapshot())

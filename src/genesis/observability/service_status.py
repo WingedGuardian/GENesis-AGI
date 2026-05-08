@@ -305,18 +305,3 @@ def collect_cc_tmp_usage() -> dict:
     except (json.JSONDecodeError, OSError):
         return {"status": "error", "error": "cannot read watchgod state"}
 
-
-def collect_tmpfs_usage() -> dict:
-    """Check /tmp tmpfs usage. Returns dict with size, used, free, free_pct."""
-    import shutil
-
-    try:
-        usage = shutil.disk_usage("/tmp")
-        free_pct = round(usage.free / usage.total * 100, 1)
-        return {
-            "total_mb": round(usage.total / (1024**2), 1),
-            "free_mb": round(usage.free / (1024**2), 1),
-            "free_pct": free_pct,
-        }
-    except Exception:
-        return {"status": "unknown"}

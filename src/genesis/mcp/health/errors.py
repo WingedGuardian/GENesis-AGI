@@ -285,17 +285,6 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         })
         current_ids.add(alert_id)
 
-    tmpfs = snap.get("infrastructure", {}).get("tmpfs", {})
-    tmp_free_pct = tmpfs.get("free_pct")
-    if tmp_free_pct is not None and tmp_free_pct < 20:
-        alert_id = "infra:tmpfs_low"
-        alerts.append({
-            "id": alert_id,
-            "severity": "CRITICAL" if tmp_free_pct < 10 else "WARNING",
-            "message": f"/tmp tmpfs low: {tmp_free_pct}% free ({tmpfs.get('free_mb', '?')}MB) — filling /tmp kills CC sessions",
-        })
-        current_ids.add(alert_id)
-
     container_mem = snap.get("infrastructure", {}).get("container_memory", {})
     # Use anon_pct (non-reclaimable memory) for alerts, not used_pct
     # (total cgroup including reclaimable page cache).

@@ -11,7 +11,6 @@ from genesis.observability.health import (
     probe_ollama,
     probe_qdrant,
     probe_scheduler,
-    probe_tmp,
 )
 from genesis.observability.types import ProbeStatus
 
@@ -110,39 +109,6 @@ def _fake_statvfs(total_blocks, free_blocks, frsize=4096):
     result.f_bavail = free_blocks
     result.f_frsize = frsize
     return result
-
-
-class TestProbeTmp:
-    @pytest.mark.asyncio
-    async def test_healthy_low_usage(self):
-        # 30% used: 300 of 1000 blocks used
-        with patch("os.statvfs", return_value=_fake_statvfs(1000, 700)):
-            result = await probe_tmp(clock=FROZEN_CLOCK)
-        assert result.status == ProbeStatus.HEALTHY
-        assert result.name == "tmp_usage"
-        assert result.details["pct_used"] == 30.0
-
-    @pytest.mark.asyncio
-    async def test_degraded_at_warn(self):
-        # 85% used (between warn=80% and critical=90%)
-        with patch("os.statvfs", return_value=_fake_statvfs(1000, 150)):
-            result = await probe_tmp(clock=FROZEN_CLOCK)
-        assert result.status == ProbeStatus.DEGRADED
-
-    @pytest.mark.asyncio
-    async def test_down_at_critical(self):
-        # 90% used
-        with patch("os.statvfs", return_value=_fake_statvfs(1000, 100)):
-            result = await probe_tmp(clock=FROZEN_CLOCK)
-        assert result.status == ProbeStatus.DOWN
-        assert "/tmp" in result.message
-
-    @pytest.mark.asyncio
-    async def test_oserror_returns_down(self):
-        with patch("os.statvfs", side_effect=OSError("no such")):
-            result = await probe_tmp(clock=FROZEN_CLOCK)
-        assert result.status == ProbeStatus.DOWN
-        assert "Cannot stat" in result.message
 
 
 class TestProbeDisk:
