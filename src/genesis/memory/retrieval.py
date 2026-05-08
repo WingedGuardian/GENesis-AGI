@@ -59,7 +59,7 @@ class HybridRetriever:
         source: str = "both",
         limit: int = 10,
         min_activation: float = 0.0,
-        expand_query_terms: bool = False,
+        expand_query_terms: bool = True,
         wing: str | None = None,
         room: str | None = None,
     ) -> list[RetrievalResult]:
@@ -124,12 +124,14 @@ class HybridRetriever:
                 logger.warning("Query expansion failed, using original", exc_info=True)
 
         # 3. FTS5 text search (using expanded query)
-        fts_collection = collections[0] if len(collections) == 1 else None
+        # Search all of memory_fts (no collection filter) so that references
+        # and knowledge entries surface even when source="episodic". The RRF
+        # fusion handles ranking across collections.
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
         fts_results = await memory_crud.search_ranked(
             self._db,
             query=fts_query,
-            collection=fts_collection,
+            collection=None,
             limit=candidate_limit,
             boolean=fts_is_boolean,
         )

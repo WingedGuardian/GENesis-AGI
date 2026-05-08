@@ -77,7 +77,9 @@ def compute_activation(
     access_freq = min(1.0, math.log(1 + retrieved_count) / math.log(1 + 20))
     connectivity = min(1.0, math.log(1 + link_count) / math.log(1 + 10))
     class_weight = CLASS_WEIGHTS.get(memory_class, 1.0)
-    final = confidence * recency * (0.5 + 0.3 * access_freq + 0.2 * connectivity) * class_weight
+    # Floor of 0.6 ensures never-retrieved memories aren't unfairly penalized
+    # (cold-start problem). Coefficients sum to 1.0 at maximum.
+    final = confidence * recency * (0.6 + 0.25 * access_freq + 0.15 * connectivity) * class_weight
 
     return ActivationScore(
         memory_id="",
