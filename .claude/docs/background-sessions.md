@@ -79,6 +79,22 @@ Failure modes:
 - **Rate limit during wait** → countdown expires → same as timeout
 - **Crash** → Telegram notification, same recovery path
 
+## Memory Storage for Research Sessions
+
+The core philosophy: **internal → episodic, external → knowledge base.**
+
+**External research** (web sources, online data, third-party information):
+- `memory_type`: `"knowledge"` (routes to `knowledge_base` collection)
+- `confidence`: `0.5` (default — not vetted yet)
+- After human review, promote via `knowledge_ingest` (0.85 confidence boost + dedup)
+
+**Internal research** (about Genesis itself, codebase analysis, architecture):
+- `memory_type`: `"episodic"` (routes to `episodic_memory` collection)
+- This is Genesis reflecting on itself — internal context, not external facts
+
+For both types, include a descriptive `source` tag (e.g. `"research_session"`,
+`"podcast_research"`) and topic `tags` for recall.
+
 ## MCP Tool
 
 ```

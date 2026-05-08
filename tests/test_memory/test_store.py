@@ -173,8 +173,8 @@ async def test_store_collection_override_bypasses_map(store):
 
 
 @pytest.mark.asyncio()
-async def test_store_knowledge_type_defaults_to_episodic(store):
-    """memory_type='knowledge' without collection override routes to episodic_memory."""
+async def test_store_knowledge_type_defaults_to_knowledge_base(store):
+    """memory_type='knowledge' without collection override routes to knowledge_base."""
     with patch("genesis.memory.store.upsert_point") as mock_upsert, \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
@@ -183,7 +183,7 @@ async def test_store_knowledge_type_defaults_to_episodic(store):
         await store.store("internal fact", "session_extraction", memory_type="knowledge")
 
     call_kwargs = mock_upsert.call_args
-    assert call_kwargs.kwargs["collection"] == "episodic_memory"
+    assert call_kwargs.kwargs["collection"] == "knowledge_base"
 
 
 @pytest.mark.asyncio()

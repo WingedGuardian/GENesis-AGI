@@ -237,6 +237,7 @@ async def memory_store(
     memory_class: str | None = None,
     wing: str | None = None,
     room: str | None = None,
+    collection: str | None = None,
 ) -> str:
     """Store memory with source metadata and type tag. Returns memory_id.
 
@@ -245,6 +246,8 @@ async def memory_store(
             Auto-classified from content if not provided.
         wing: Structural domain (auto-classified if not provided).
         room: Topic within the wing (auto-classified if not provided).
+        collection: Explicit Qdrant collection override. Bypasses the default
+            collection routing when provided (e.g. "knowledge_base").
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -252,7 +255,7 @@ async def memory_store(
     return await memory_mod._store.store(
         content, source, memory_type=memory_type, tags=tags, confidence=confidence,
         memory_class=memory_class, source_pipeline="conversation",
-        wing=wing, room=room,
+        wing=wing, room=room, collection=collection,
     )
 
 

@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 _COLLECTION_MAP = {
     "episodic": "episodic_memory",
-    "knowledge": "episodic_memory",  # Internal knowledge lives with episodic
+    "knowledge": "knowledge_base",  # External knowledge → knowledge_base
 }
 
 
