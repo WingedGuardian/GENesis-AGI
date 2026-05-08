@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -64,6 +65,7 @@ class HybridRetriever:
         room: str | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF."""
+        _t0 = time.monotonic()
         if source not in _SOURCE_TO_COLLECTIONS:
             msg = f"source must be one of {list(_SOURCE_TO_COLLECTIONS)}, got {source!r}"
             raise ValueError(msg)
@@ -343,5 +345,17 @@ class HybridRetriever:
                     intent_confidence=intent.confidence,
                 ),
             )
+
+        # J-9 eval: log recall event for memory retrieval quality measurement
+        from genesis.eval.j9_hooks import emit_recall_fired
+        await emit_recall_fired(
+            self._db,
+            query=query,
+            result_count=len(results),
+            top_scores=[r.score for r in results[:5]],
+            memory_ids=[r.memory_id for r in results[:10]],
+            latency_ms=(time.monotonic() - _t0) * 1000,
+            source=source,
+        )
 
         return results
