@@ -18,23 +18,33 @@ logger = logging.getLogger(__name__)
 
 _CALL_SITE = "40_knowledge_distillation"
 
-# Max characters per chunk sent to the LLM for distillation
-_MAX_CHUNK_CHARS = 12000
+# Max characters per chunk sent to the LLM for distillation.
+# Sized for Haiku (200K context) / Mistral Large (128K) — ~10K tokens per chunk.
+_MAX_CHUNK_CHARS = 40_000
 
 # Max concurrent LLM calls for parallel chunk processing
 _MAX_CONCURRENT_CHUNKS = 4
 
+# Minimum extraction ratio (output chars / input chars). Below this, flag as thin.
+MIN_EXTRACTION_RATIO = 0.10
+
 _DISTILLATION_SYSTEM_PROMPT = """\
 You are a knowledge distillation engine. Your job is to extract structured
-knowledge units from raw content.
+knowledge units from raw content, preserving the depth and nuance of the
+source material.
 
-For each meaningful concept, fact, or insight in the content, produce a
-knowledge unit. Each unit should capture UNDERSTANDING, not reproduction
-— distill the material into what someone would need to know.
+For each meaningful concept, principle, pattern, best practice, or insight
+in the content, produce a knowledge unit. Each unit should capture
+UNDERSTANDING — distill the material into what a senior practitioner would
+need to know, including specifics, examples, and operational detail.
 
 Output a JSON array of objects with these fields:
 - concept: Short title (max 200 chars) — what this unit is about
-- body: The distilled knowledge (1-3 paragraphs)
+- body: The distilled knowledge — be as thorough as the source warrants.
+  For reference material, frameworks, and technical guides, include
+  specific details, thresholds, configuration values, and actionable
+  guidance. A 1-paragraph body is fine for a simple fact; a multi-paragraph
+  body is expected for a rich topic.
 - domain: Knowledge domain (e.g., "aws", "python", "leadership", "resume-advice")
 - relationships: JSON array of related concepts (strings)
 - caveats: JSON array of limitations or qualifications
@@ -44,7 +54,12 @@ Output a JSON array of objects with these fields:
 Rules:
 - Extract UNDERSTANDING, not quotes. Paraphrase and synthesize.
 - Each unit should stand alone — readable without the source.
-- Skip trivial or redundant content.
+- Be THOROUGH. Extract every distinct concept, pattern, and practice.
+  Err on the side of extracting more units rather than fewer.
+  A comprehensive framework document should produce many units.
+- Preserve operational specifics: numbers, thresholds, configuration
+  values, command examples, decision criteria. These are the details
+  that make knowledge actionable.
 - If the content is poorly structured or unclear, set confidence < 0.5.
 - Return an empty array if there's nothing meaningful to extract.
 - These are machine-extracted summaries, not authoritative facts. Include
@@ -139,6 +154,7 @@ class DistillationPipeline:
 
     def __init__(self, router: object) -> None:
         self._router = router
+        self.last_extraction_ratio: float = 0.0
 
     async def distill(
         self,
@@ -161,13 +177,18 @@ class DistillationPipeline:
                 called after each chunk completes. Used for progress tracking.
         """
         if not content.text.strip():
+            self.last_extraction_ratio = 0.0
             return []
+
+        total_chars = len(content.text)
 
         # Use sections if available, otherwise chunk the full text
         if content.sections and len(content.sections) > 1:
             chunks = content.sections
         else:
             chunks = _chunk_text(content.text)
+
+        total_chunks = len(chunks)
 
         # Process chunks in parallel with concurrency limit
         sem = asyncio.Semaphore(_MAX_CONCURRENT_CHUNKS)
@@ -176,6 +197,8 @@ class DistillationPipeline:
             async with sem:
                 raw_units = await self._distill_chunk(
                     chunk, content, project_type, domain, user_context,
+                    chunk_index=i, total_chunks=total_chunks,
+                    total_chars=total_chars,
                 )
                 units = []
                 for raw in raw_units:
@@ -237,9 +260,21 @@ class DistillationPipeline:
             if isinstance(r, Exception):
                 logger.warning("Chunk distillation failed: %s", r)
 
+        # Track extraction ratio for quality monitoring
+        output_chars = sum(len(u.body) for u in all_units)
+        self.last_extraction_ratio = output_chars / total_chars if total_chars > 0 else 0.0
+
+        if self.last_extraction_ratio < MIN_EXTRACTION_RATIO and all_units:
+            logger.warning(
+                "Thin extraction: %.1f%% ratio (%d output chars / %d input chars, %d units) from %s",
+                self.last_extraction_ratio * 100, output_chars, total_chars,
+                len(all_units), content.source_path,
+            )
+
         logger.info(
-            "Distilled %d knowledge units from %s (%d chunks, %d concurrent)",
+            "Distilled %d knowledge units from %s (%d chunks, %d concurrent, %.1f%% extraction ratio)",
             len(all_units), content.source_path, len(chunks), _MAX_CONCURRENT_CHUNKS,
+            self.last_extraction_ratio * 100,
         )
         return all_units
 
@@ -250,9 +285,23 @@ class DistillationPipeline:
         project_type: str,
         domain: str,
         user_context: str | None = None,
+        *,
+        chunk_index: int = 0,
+        total_chunks: int = 1,
+        total_chars: int = 0,
     ) -> list[dict]:
         """Send a single chunk through the LLM for distillation."""
         context_hint = ""
+
+        # Document scale — helps the LLM calibrate extraction depth
+        if total_chars > 0:
+            context_hint += f"\nDocument: {total_chars:,} characters total"
+            context_hint += f", chunk {chunk_index + 1} of {total_chunks}"
+        if content.metadata.get("page_count"):
+            context_hint += f" ({content.metadata['page_count']} pages)"
+        if content.metadata.get("duration"):
+            mins = int(content.metadata["duration"]) // 60
+            context_hint += f" ({mins} min video)"
 
         # Include user-provided context about the document
         if user_context:

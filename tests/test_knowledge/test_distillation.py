@@ -142,3 +142,109 @@ async def test_distill_llm_failure():
 
     units = await pipeline.distill(content, project_type="test")
     assert units == []
+
+
+# ─── New tests: chunk size, doc stats, extraction ratio ────────────────────
+
+
+def test_max_chunk_chars_default():
+    """Default chunk size should be 40K (upgraded from 12K)."""
+    from genesis.knowledge.distillation import _MAX_CHUNK_CHARS
+    assert _MAX_CHUNK_CHARS == 40_000
+
+
+def test_min_extraction_ratio_default():
+    """Minimum extraction ratio should be 10%."""
+    from genesis.knowledge.distillation import MIN_EXTRACTION_RATIO
+    assert MIN_EXTRACTION_RATIO == 0.10
+
+
+async def test_distill_passes_doc_stats():
+    """LLM user message should include document scale information."""
+    mock_router = MagicMock()
+    mock_result = MagicMock()
+    mock_result.success = True
+    mock_result.content = json.dumps([
+        {
+            "concept": "Test Concept",
+            "body": "Test body content.",
+            "domain": "test",
+            "confidence": 0.9,
+        },
+    ])
+    mock_router.route_call = AsyncMock(return_value=mock_result)
+
+    pipeline = DistillationPipeline(router=mock_router)
+    content = ProcessedContent(
+        text="A" * 500,
+        source_type="text",
+        source_path="/test.txt",
+    )
+
+    await pipeline.distill(content, project_type="test", domain="test")
+
+    # Verify route_call was called and user message contains doc stats
+    assert mock_router.route_call.called
+    call_args = mock_router.route_call.call_args
+    messages = call_args[0][1]  # Second positional arg
+    user_msg = messages[1]["content"]
+    assert "500 characters total" in user_msg
+    assert "chunk 1 of 1" in user_msg
+
+
+async def test_distill_passes_page_count():
+    """LLM user message should include page count from metadata."""
+    mock_router = MagicMock()
+    mock_result = MagicMock()
+    mock_result.success = True
+    mock_result.content = json.dumps([
+        {"concept": "Test", "body": "Body.", "domain": "test", "confidence": 0.9},
+    ])
+    mock_router.route_call = AsyncMock(return_value=mock_result)
+
+    pipeline = DistillationPipeline(router=mock_router)
+    content = ProcessedContent(
+        text="Some PDF content here.",
+        source_type="pdf",
+        source_path="/test.pdf",
+        metadata={"page_count": 42},
+    )
+
+    await pipeline.distill(content, project_type="test", domain="test")
+
+    user_msg = mock_router.route_call.call_args[0][1][1]["content"]
+    assert "42 pages" in user_msg
+
+
+async def test_extraction_ratio_tracked():
+    """Pipeline should track extraction ratio after distillation."""
+    mock_router = MagicMock()
+    mock_result = MagicMock()
+    mock_result.success = True
+    # 100 chars input, body is ~20 chars → ~20% ratio
+    mock_result.content = json.dumps([
+        {"concept": "Test", "body": "A" * 20, "domain": "test", "confidence": 0.9},
+    ])
+    mock_router.route_call = AsyncMock(return_value=mock_result)
+
+    pipeline = DistillationPipeline(router=mock_router)
+    content = ProcessedContent(
+        text="B" * 100,
+        source_type="text",
+        source_path="/test.txt",
+    )
+
+    units = await pipeline.distill(content, project_type="test")
+    assert len(units) == 1
+    assert pipeline.last_extraction_ratio > 0
+    assert abs(pipeline.last_extraction_ratio - 0.20) < 0.01
+
+
+async def test_extraction_ratio_zero_on_empty():
+    """Extraction ratio should be 0 when no content."""
+    mock_router = MagicMock()
+    pipeline = DistillationPipeline(router=mock_router)
+    content = ProcessedContent(text="   ", source_type="text", source_path="empty.txt")
+
+    await pipeline.distill(content, project_type="test")
+    assert pipeline.last_extraction_ratio == 0.0
