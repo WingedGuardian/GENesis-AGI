@@ -306,6 +306,39 @@ class TestExternalProgramAdapter:
         assert await adapter.check_health() is True
         assert adapter.healthy is True
 
+    @pytest.mark.asyncio
+    async def test_execute_operation_disabled(self):
+        adapter = self._make_adapter(
+            enabled=False,
+            operations={"status": {"method": "SHELL", "command": "echo ok"}},
+        )
+        adapter._healthy = True
+        result = await adapter.execute_operation("status")
+        assert "error" in result
+        assert "disabled" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_execute_operation_unhealthy(self):
+        adapter = self._make_adapter(
+            enabled=True,
+            operations={"status": {"method": "SHELL", "command": "echo ok"}},
+        )
+        adapter._healthy = False
+        result = await adapter.execute_operation("status")
+        assert "error" in result
+        assert "not healthy" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_execute_operation_unknown(self):
+        adapter = self._make_adapter(
+            enabled=True,
+            operations={"status": {"method": "SHELL", "command": "echo ok"}},
+        )
+        adapter._healthy = True
+        result = await adapter.execute_operation("nonexistent")
+        assert "error" in result
+        assert "Unknown operation" in result["error"]
+
 
 # ---------------------------------------------------------------------------
 # YAML auto-discovery integration
