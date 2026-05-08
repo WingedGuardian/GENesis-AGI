@@ -703,6 +703,35 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # J-9 eval daily batch — enqueue surplus task for memory relevance scoring
+        async def _enqueue_j9_eval_batch():
+            try:
+                from genesis.surplus.types import ComputeTier, TaskType
+                if rt._surplus_scheduler is not None:
+                    pending = await rt._surplus_scheduler._queue.pending_by_type(
+                        TaskType.J9_EVAL_BATCH,
+                    )
+                    if pending == 0:
+                        await rt._surplus_scheduler._queue.enqueue(
+                            TaskType.J9_EVAL_BATCH,
+                            ComputeTier.CHEAP_PAID,
+                            0.5,
+                            "competence",
+                        )
+                        logger.info("J9 eval batch task enqueued")
+                rt.record_job_success("j9_eval_batch_enqueue")
+            except Exception as exc:
+                rt.record_job_failure("j9_eval_batch_enqueue", str(exc))
+                logger.exception("J9 eval batch enqueue failed")
+
+        rt._learning_scheduler.add_job(
+            _enqueue_j9_eval_batch,
+            CronTrigger(hour=4, minute=45),
+            id="j9_eval_batch_enqueue",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         # J-9 eval weekly aggregation (Sundays 5am — after skill evolution)
         async def _run_j9_eval_aggregation():
             try:

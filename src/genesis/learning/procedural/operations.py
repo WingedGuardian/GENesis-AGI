@@ -184,11 +184,14 @@ async def record_success(db: aiosqlite.Connection, procedure_id: str) -> bool:
     )
     # J-9 eval: log procedure outcome
     if result:
-        from genesis.eval.j9_hooks import emit_procedure_outcome
-        await emit_procedure_outcome(
-            db, procedure_id=procedure_id, success=True,
-            confidence_after=confidence,
-        )
+        try:
+            from genesis.eval.j9_hooks import emit_procedure_outcome
+            await emit_procedure_outcome(
+                db, procedure_id=procedure_id, success=True,
+                confidence_after=confidence,
+            )
+        except Exception:
+            pass  # eval instrumentation must never break procedure recording
     return result
 
 
@@ -229,11 +232,14 @@ async def record_failure(
     )
     # J-9 eval: log procedure outcome
     if result:
-        from genesis.eval.j9_hooks import emit_procedure_outcome
-        await emit_procedure_outcome(
-            db, procedure_id=procedure_id, success=False,
-            confidence_after=confidence,
-        )
+        try:
+            from genesis.eval.j9_hooks import emit_procedure_outcome
+            await emit_procedure_outcome(
+                db, procedure_id=procedure_id, success=False,
+                confidence_after=confidence,
+            )
+        except Exception:
+            pass  # eval instrumentation must never break procedure recording
     return result
 
 

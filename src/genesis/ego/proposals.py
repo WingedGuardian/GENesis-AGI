@@ -283,14 +283,17 @@ class ProposalWorkflow:
                     f" ({reason})" if reason else "",
                 )
                 # J-9 eval: log proposal resolution for ego quality tracking
-                from genesis.eval.j9_hooks import emit_proposal_resolved
-                await emit_proposal_resolved(
-                    self._db,
-                    proposal_id=prop["id"],
-                    status=status,
-                    confidence=prop.get("confidence"),
-                    action_type=prop.get("action_type"),
-                )
+                try:
+                    from genesis.eval.j9_hooks import emit_proposal_resolved
+                    await emit_proposal_resolved(
+                        self._db,
+                        proposal_id=prop["id"],
+                        status=status,
+                        confidence=prop.get("confidence"),
+                        action_type=prop.get("action_type"),
+                    )
+                except Exception:
+                    pass  # eval instrumentation must never break proposals
                 # Auto-store correction memory on rejection with reason
                 if (
                     status == ProposalStatus.REJECTED

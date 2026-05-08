@@ -347,15 +347,18 @@ class HybridRetriever:
             )
 
         # J-9 eval: log recall event for memory retrieval quality measurement
-        from genesis.eval.j9_hooks import emit_recall_fired
-        await emit_recall_fired(
-            self._db,
-            query=query,
-            result_count=len(results),
-            top_scores=[r.score for r in results[:5]],
-            memory_ids=[r.memory_id for r in results[:10]],
-            latency_ms=(time.monotonic() - _t0) * 1000,
-            source=source,
-        )
+        try:
+            from genesis.eval.j9_hooks import emit_recall_fired
+            await emit_recall_fired(
+                self._db,
+                query=query,
+                result_count=len(results),
+                top_scores=[r.score for r in results[:5]],
+                memory_ids=[r.memory_id for r in results[:10]],
+                latency_ms=(time.monotonic() - _t0) * 1000,
+                source=source,
+            )
+        except Exception:
+            pass  # eval instrumentation must never break recall
 
         return results

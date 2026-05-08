@@ -95,13 +95,16 @@ async def procedure_recall(
 
     # J-9 eval: log procedure invocations for learning effectiveness tracking
     if results:
-        from genesis.eval.j9_hooks import emit_procedure_invoked
-        for r in results:
-            await emit_procedure_invoked(
-                memory_mod._db,
-                procedure_id=r.get("procedure_id", ""),
-                confidence=r.get("confidence", 0.0),
-                matched_tags=tags[:10] if tags else [],
-            )
+        try:
+            from genesis.eval.j9_hooks import emit_procedure_invoked
+            for r in results:
+                await emit_procedure_invoked(
+                    memory_mod._db,
+                    procedure_id=r.get("procedure_id", ""),
+                    confidence=r.get("confidence", 0.0),
+                    matched_tags=tags[:10] if tags else [],
+                )
+        except Exception:
+            pass  # eval instrumentation must never break procedure recall
 
     return results

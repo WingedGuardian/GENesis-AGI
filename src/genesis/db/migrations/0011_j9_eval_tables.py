@@ -54,7 +54,11 @@ async def up(db: aiosqlite.Connection) -> None:
             period_end   TEXT NOT NULL,
             period_type  TEXT NOT NULL
                          CHECK (period_type IN ('daily', 'weekly')),
-            dimension    TEXT NOT NULL,
+            dimension    TEXT NOT NULL
+                         CHECK (dimension IN (
+                             'memory', 'ego', 'procedure', 'cognitive',
+                             'system', 'composite'
+                         )),
             metrics_json TEXT NOT NULL,
             sample_count INTEGER NOT NULL,
             created_at   TEXT NOT NULL
@@ -65,5 +69,3 @@ async def up(db: aiosqlite.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period "
         "ON eval_snapshots(dimension, period_end)"
     )
-
-    await db.commit()

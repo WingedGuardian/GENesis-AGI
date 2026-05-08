@@ -125,19 +125,10 @@ async def _compute_memory_quality(
         if not found_relevant:
             mrrs.append(0.0)
 
-    # Also check recall_used events for usage rate
-    used_events = await j9_eval.get_events(
-        db, dimension="memory", event_type="recall_used",
-        since=since, until=until, limit=5000,
-    )
-    total_used = sum(1 for ev in used_events if ev.get("metrics", {}).get("used"))
-    total_usage_checked = len(used_events)
-
     metrics = {
         "precision_at_5": round(sum(precisions) / len(precisions), 4) if precisions else None,
         "hit_rate": round(hits / total_recalls, 4) if total_recalls else None,
         "mrr": round(sum(mrrs) / len(mrrs), 4) if mrrs else None,
-        "usage_rate": round(total_used / total_usage_checked, 4) if total_usage_checked else None,
         "total_recalls": total_recalls,
         "total_memories_judged": len(relevance_events),
     }
