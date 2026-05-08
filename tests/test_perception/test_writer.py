@@ -606,3 +606,35 @@ async def test_micro_low_info_gate_passes_real_content(db):
     assert stored is True
     obs = await observations.query(db, source="reflection")
     assert len(obs) == 1
+
+
+async def test_write_micro_dedup_ignores_tag_variation(db):
+    """Two micro outputs with DIFFERENT tags but same signals/salience/anomaly should dedup.
+
+    LLM-generated tags vary wildly across ticks (61 distinct combos for 72
+    observations in production).  Tags must not be part of the dedup hash.
+    """
+    from genesis.db.crud import observations
+    from genesis.perception.writer import ResultWriter
+
+    writer = ResultWriter()
+    output1 = MicroOutput(
+        tags=["user_engagement_spike", "strategic_reflection_overdue"],
+        salience=0.7,
+        anomaly=True,
+        summary="User session patterns show an unusual spike.",
+        signals_examined=21,
+    )
+    output2 = MicroOutput(
+        tags=["cross_signal_analysis", "awareness_cycle"],
+        salience=0.7,
+        anomaly=True,
+        summary="The awareness cycle shows a potential imbalance.",
+        signals_examined=21,
+    )
+    tick = _make_tick()
+    await writer.write(output1, Depth.MICRO, tick, db=db)
+    await writer.write(output2, Depth.MICRO, tick, db=db)
+
+    obs = await observations.query(db, source="reflection")
+    assert len(obs) == 1, f"Expected 1 (tag variation should dedup), got {len(obs)}"

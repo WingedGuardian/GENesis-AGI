@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 import aiosqlite
 
 from genesis.awareness.types import Depth, TickResult
-from genesis.db.crud import cognitive_state, observations, predictions
+from genesis.db.crud import cognitive_state, observations, predictions, signal_weights
 from genesis.identity.loader import IdentityLoader
 from genesis.memory.user_model import UserModelEvolver
 from genesis.perception.types import LIGHT_FOCUS_ROTATION, PromptContext
@@ -142,7 +142,25 @@ class ContextAssembler:
         # Micro: no identity (cheap model overwhelmed by SOUL.md — just task instruction).
         # Light+: full identity block (SOUL.md + USER.md + STEERING.md).
         identity = "" if depth == Depth.MICRO else self._identity.identity_block()
-        signals_text = self._format_signals(tick)
+
+        # Micro: exclude signals registered in signal_weights but NOT scoped
+        # to Micro via feeds_depths.  This prevents the LLM from seeing (and
+        # flagging as anomalous) signals like user_goal_staleness that don't
+        # belong at this depth.  Unregistered signals pass through (safe for
+        # tests and future signal collectors not yet in signal_weights).
+        excluded_signals: set[str] | None = None
+        if depth == Depth.MICRO:
+            try:
+                all_rows = await signal_weights.list_all(db)
+                micro_rows = await signal_weights.list_by_depth(db, "Micro")
+                if all_rows:
+                    all_names = {r["signal_name"] for r in all_rows}
+                    micro_names = {r["signal_name"] for r in micro_rows}
+                    excluded_signals = all_names - micro_names or None
+            except Exception:
+                logger.debug("Could not load signal_weights for Micro filtering")
+
+        signals_text = self._format_signals(tick, excluded_signals=excluded_signals)
         tick_number = self._extract_tick_number(tick)
 
         user_profile = None
@@ -406,11 +424,17 @@ class ContextAssembler:
         )
         return header + "\n" + "\n".join(lines)
 
-    def _format_signals(self, tick: TickResult) -> str:
+    def _format_signals(
+        self,
+        tick: TickResult,
+        excluded_signals: set[str] | None = None,
+    ) -> str:
         staleness = tick.signal_staleness or {}
         tick_interval_min = 5  # awareness loop tick interval
         lines = []
         for s in tick.signals:
+            if excluded_signals is not None and s.name in excluded_signals:
+                continue
             line = f"{s.name}: {s.value} (source={s.source})"
             if s.normal_max is not None:
                 status = (

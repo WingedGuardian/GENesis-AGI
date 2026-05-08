@@ -259,3 +259,84 @@ async def test_light_focus_aware_context_stripping(db, identity_dir):
     assert ctx_anom.user_profile is None
     assert ctx_anom.user_model is None
     assert ctx_anom.memory_hits is not None
+
+
+async def test_micro_excludes_signals_not_scoped_to_micro(db, identity_dir):
+    """Micro context should exclude signals registered in signal_weights
+    but not scoped to Micro via feeds_depths."""
+    from genesis.identity.loader import IdentityLoader
+    from genesis.perception.context import ContextAssembler
+
+    # Seed a signal scoped only to Light (not Micro)
+    await db.execute(
+        "INSERT OR REPLACE INTO signal_weights "
+        "(signal_name, source_mcp, current_weight, initial_weight, feeds_depths) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("light_only_signal", "test", 0.5, 0.5, '["Light"]'),
+    )
+    await db.commit()
+
+    loader = IdentityLoader(identity_dir)
+    assembler = ContextAssembler(identity_loader=loader)
+    tick = TickResult(
+        tick_id="tick-1",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name="cpu_usage", value=0.3, source="system",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+            SignalReading(
+                name="light_only_signal", value=1.0, source="test",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+        ],
+        scores=[],
+        classified_depth=Depth.MICRO,
+        trigger_reason="test",
+    )
+
+    ctx = await assembler.assemble(Depth.MICRO, tick, db=db)
+
+    # cpu_usage is not in signal_weights at all → passes through
+    assert "cpu_usage" in ctx.signals_text
+    # light_only_signal is registered but NOT scoped to Micro → excluded
+    assert "light_only_signal" not in ctx.signals_text
+
+
+async def test_light_shows_all_signals_regardless_of_scope(db, identity_dir):
+    """Light context should show all signals — no depth filtering."""
+    from genesis.identity.loader import IdentityLoader
+    from genesis.perception.context import ContextAssembler
+
+    # Seed a signal scoped only to Micro (not Light)
+    await db.execute(
+        "INSERT OR REPLACE INTO signal_weights "
+        "(signal_name, source_mcp, current_weight, initial_weight, feeds_depths) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("micro_only_signal", "test", 0.5, 0.5, '["Micro"]'),
+    )
+    await db.commit()
+
+    loader = IdentityLoader(identity_dir)
+    assembler = ContextAssembler(identity_loader=loader)
+    tick = TickResult(
+        tick_id="tick-1",
+        timestamp="2026-03-05T10:00:00+00:00",
+        source="scheduled",
+        signals=[
+            SignalReading(
+                name="micro_only_signal", value=0.8, source="test",
+                collected_at="2026-03-05T10:00:00+00:00",
+            ),
+        ],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+
+    ctx = await assembler.assemble(Depth.LIGHT, tick, db=db)
+
+    # Light doesn't filter — all signals visible
+    assert "micro_only_signal" in ctx.signals_text
