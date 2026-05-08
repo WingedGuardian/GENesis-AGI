@@ -31,6 +31,8 @@ class TaskType(StrEnum):
     DB_MAINTENANCE = "db_maintenance"
     DEAD_LETTER_REPLAY = "dead_letter_replay"
     BACKUP_VERIFICATION = "backup_verification"
+    # J-9 paper eval infrastructure
+    J9_EVAL_BATCH = "j9_eval_batch"
 
 
 class ComputeTier(StrEnum):

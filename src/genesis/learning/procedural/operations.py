@@ -176,12 +176,20 @@ async def record_success(db: aiosqlite.Connection, procedure_id: str) -> bool:
     f = row["failure_count"]
     confidence = (s + 1) / (s + f + 2)
     now = datetime.now(UTC).isoformat()
-    return await procedural.update(
+    result = await procedural.update(
         db, procedure_id,
         success_count=s,
         confidence=confidence,
         last_used=now,
     )
+    # J-9 eval: log procedure outcome
+    if result:
+        from genesis.eval.j9_hooks import emit_procedure_outcome
+        await emit_procedure_outcome(
+            db, procedure_id=procedure_id, success=True,
+            confidence_after=confidence,
+        )
+    return result
 
 
 async def record_failure(
@@ -212,13 +220,21 @@ async def record_failure(
             "transient": transient,
         })
 
-    return await procedural.update(
+    result = await procedural.update(
         db, procedure_id,
         failure_count=f,
         failure_modes=modes,
         confidence=confidence,
         last_used=datetime.now(UTC).isoformat(),
     )
+    # J-9 eval: log procedure outcome
+    if result:
+        from genesis.eval.j9_hooks import emit_procedure_outcome
+        await emit_procedure_outcome(
+            db, procedure_id=procedure_id, success=False,
+            confidence_after=confidence,
+        )
+    return result
 
 
 async def record_workaround(

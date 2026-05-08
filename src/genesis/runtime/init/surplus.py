@@ -169,6 +169,19 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring ModelEvalExecutor", exc_info=True)
             await _degraded(rt, "ModelEvalExecutor")
 
+        # J-9 eval batch executor (daily memory relevance scoring)
+        try:
+            from genesis.eval.j9_batch import J9EvalBatchExecutor
+            j9_executor = J9EvalBatchExecutor(db=rt._db)
+            rt._surplus_scheduler.set_j9_eval_batch_executor(j9_executor)
+            logger.info("J9EvalBatchExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire J9EvalBatchExecutor", exc_info=True)
+            await _degraded(rt, "J9EvalBatchExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring J9EvalBatchExecutor", exc_info=True)
+            await _degraded(rt, "J9EvalBatchExecutor")
+
         try:
             from genesis.surplus.maintenance import (
                 BackupVerificationExecutor,
