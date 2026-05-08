@@ -210,7 +210,12 @@ class KnowledgeOrchestrator:
         content: ProcessedContent,
         purpose: list[str] | None,
     ) -> list[str]:
-        """Store knowledge units via the existing knowledge_ingest MCP internals."""
+        """Store knowledge units via the existing knowledge_ingest MCP internals.
+
+        Uses a batch SQLite transaction with Qdrant compensation on failure:
+        if anything fails mid-batch, SQLite is rolled back and any Qdrant
+        vectors written so far are deleted to prevent orphaned state.
+        """
         # Import the memory module to access the store + CRUD
         import genesis.mcp.memory_mcp as memory_mod
 
@@ -221,55 +226,86 @@ class KnowledgeOrchestrator:
         import uuid
         from datetime import UTC, datetime
 
+        from genesis.qdrant.collections import delete_point
+
         unit_ids: list[str] = []
+        qdrant_ids: list[str] = []  # Track for compensation on failure
         purpose_json = json.dumps(purpose) if purpose else None
         now_iso = datetime.now(UTC).isoformat()
         embedding_model = getattr(
             memory_mod._store._embeddings, "model_name", "unknown"
         )
 
-        for unit in units:
-            unit_id = str(uuid.uuid4())
+        try:
+            for unit in units:
+                unit_id = str(uuid.uuid4())
 
-            # Store to Qdrant via MemoryStore
-            qdrant_id = await memory_mod._store.store(
-                unit.body,
-                f"knowledge:{project_type}/{unit.domain}",
-                memory_type="knowledge",
-                collection="knowledge_base",
-                tags=unit.tags + [unit.domain, project_type],
-                confidence=unit.confidence,
-                auto_link=False,
-                source_pipeline="curated",
+                # Store to Qdrant via MemoryStore (non-transactional, immediate)
+                qdrant_id = await memory_mod._store.store(
+                    unit.body,
+                    f"knowledge:{project_type}/{unit.domain}",
+                    memory_type="knowledge",
+                    collection="knowledge_base",
+                    tags=unit.tags + [unit.domain, project_type],
+                    confidence=unit.confidence,
+                    auto_link=False,
+                    source_pipeline="curated",
+                )
+                qdrant_ids.append(qdrant_id)
+
+                # Store to SQLite via CRUD (_commit=False for batch transaction)
+                await memory_mod.knowledge.insert(
+                    memory_mod._db,
+                    id=unit_id,
+                    project_type=project_type,
+                    domain=unit.domain,
+                    source_doc=source,
+                    concept=unit.concept,
+                    body=unit.body,
+                    relationships=json.dumps(unit.relationships) if unit.relationships else None,
+                    caveats=json.dumps(unit.caveats) if unit.caveats else None,
+                    tags=json.dumps(unit.tags) if unit.tags else None,
+                    confidence=unit.confidence,
+                    ingested_at=now_iso,
+                    qdrant_id=qdrant_id,
+                    section_title=unit.section_title,
+                    source_date=unit.source_date,
+                    embedding_model=embedding_model,
+                    source_pipeline="curated",
+                    purpose=purpose_json,
+                    ingestion_source=source,
+                    _commit=False,
+                )
+
+                unit_ids.append(unit_id)
+
+            # Single commit for all units in the batch
+            await memory_mod._db.commit()
+
+        except Exception:
+            logger.error(
+                "Batch storage failed after %d/%d units from %s — rolling back",
+                len(unit_ids), len(units), source,
+                exc_info=True,
             )
+            # Roll back SQLite to release the write lock immediately
+            try:
+                await memory_mod._db.rollback()
+            except Exception:
+                logger.warning("SQLite rollback failed", exc_info=True)
 
-            # Store to SQLite via CRUD (_commit=False for batch transaction)
-            await memory_mod.knowledge.insert(
-                memory_mod._db,
-                id=unit_id,
-                project_type=project_type,
-                domain=unit.domain,
-                source_doc=source,
-                concept=unit.concept,
-                body=unit.body,
-                relationships=json.dumps(unit.relationships) if unit.relationships else None,
-                caveats=json.dumps(unit.caveats) if unit.caveats else None,
-                tags=json.dumps(unit.tags) if unit.tags else None,
-                confidence=unit.confidence,
-                ingested_at=now_iso,
-                qdrant_id=qdrant_id,
-                section_title=unit.section_title,
-                source_date=unit.source_date,
-                embedding_model=embedding_model,
-                source_pipeline="curated",
-                purpose=purpose_json,
-                ingestion_source=source,
-                _commit=False,
-            )
+            # Compensate: delete orphaned Qdrant vectors
+            for qid in qdrant_ids:
+                try:
+                    delete_point(
+                        memory_mod._store._qdrant,
+                        collection="knowledge_base",
+                        point_id=qid,
+                    )
+                except Exception:
+                    logger.warning("Qdrant compensation delete failed for %s", qid)
 
-            unit_ids.append(unit_id)
+            raise
 
-        # Single commit for all units in the batch
-        await memory_mod._db.commit()
         logger.info("Stored %d knowledge units from %s", len(unit_ids), source)
         return unit_ids
