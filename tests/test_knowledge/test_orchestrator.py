@@ -116,3 +116,55 @@ async def test_thin_extraction_quality_flag(tmp_path: Path):
         result = await orch.ingest_source(str(file), project_type="test")
         assert result.units_created == 1
         assert "thin_extraction" in result.quality_flags
+
+
+async def test_store_units_rollback_on_failure(tmp_path: Path):
+    """When _store_units fails mid-batch, SQLite is rolled back and Qdrant vectors are cleaned up."""
+    units = [
+        KnowledgeUnit(
+            domain="test", concept=f"concept_{i}", body=f"body {i}",
+            tags=["t"], confidence=0.9,
+        )
+        for i in range(3)
+    ]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+
+    # Mock the memory module internals that _store_units uses
+    mock_db = AsyncMock()
+    mock_store = MagicMock()
+    # store() succeeds for first 2 calls, then the 3rd SQLite insert fails
+    mock_store.store = AsyncMock(side_effect=["qid-0", "qid-1", "qid-2"])
+    mock_store._qdrant = MagicMock()
+    mock_store._embeddings = MagicMock(model_name="test-model")
+
+    mock_knowledge = MagicMock()
+    # SQLite insert succeeds twice, then raises on the 3rd
+    mock_knowledge.insert = AsyncMock(
+        side_effect=[None, None, Exception("DB locked")]
+    )
+
+    with patch("genesis.mcp.memory_mcp._require_init"), \
+         patch("genesis.mcp.memory_mcp._store", mock_store), \
+         patch("genesis.mcp.memory_mcp._db", mock_db), \
+         patch("genesis.mcp.memory_mcp.knowledge", mock_knowledge), \
+         patch("genesis.qdrant.collections.delete_point") as mock_delete_point:
+
+        file = tmp_path / "test.txt"
+        file.write_text("some content")
+
+        result = await orch.ingest_source(str(file), project_type="test")
+
+        # Storage failed — should return error result (S2 fix)
+        assert result.error is not None
+        assert "Storage failed" in result.error
+        assert result.units_created == 0
+
+        # SQLite should have been rolled back
+        mock_db.rollback.assert_awaited_once()
+        # commit should NOT have been called (failed before reaching it)
+        mock_db.commit.assert_not_awaited()
+
+        # All 3 Qdrant vectors should be compensation-deleted
+        assert mock_delete_point.call_count == 3
+        deleted_ids = [call.kwargs["point_id"] for call in mock_delete_point.call_args_list]
+        assert deleted_ids == ["qid-0", "qid-1", "qid-2"]

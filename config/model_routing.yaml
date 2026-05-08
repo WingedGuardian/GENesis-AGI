@@ -435,7 +435,7 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
-    - openrouter-haiku
+    # - openrouter-haiku  # credits exhausted 2026-05-08
     - mistral-large-free
     - groq-free
     - gemini-free
