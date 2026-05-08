@@ -121,7 +121,7 @@ _GIVING_UP_PATTERNS = re.compile(
     r"|(?:do it|handle it|run it|transfer it|copy it) (?:yourself|manually)"
     r"|(?:you|the user) (?:can |should |could )(?:do |handle |run |transfer |copy )"
     r"(?:it |this |that )?(?:yourself|manually|on your)"
-    r"|I (?:can't|cannot|am unable to|don't have) (?:access|permission|credentials|keys)"
+    r"|I (?:can't|cannot|am unable to|don't have) (?:access to|permission to|credentials for|keys for)"
     r"|(?:you'll|you will) have to (?:do |handle |run |transfer |copy )"
     r"|not (?:something I can|within my (?:ability|access|scope))"
     r"|outside (?:my|Genesis'?) (?:scope|ability|access)"
@@ -134,7 +134,10 @@ def _check_giving_up(assistant_message: str) -> None:
     """Nudge if the assistant appears to delegate a user-assigned task."""
     if not assistant_message:
         return
-    if not _GIVING_UP_PATTERNS.search(assistant_message):
+    # Giving-up phrases appear at the end of responses. Truncate to avoid
+    # running complex regex over 50KB+ assistant messages.
+    tail = assistant_message[-2000:] if len(assistant_message) > 2000 else assistant_message
+    if not _GIVING_UP_PATTERNS.search(tail):
         return
     print(
         "SELF-CHECK: Your last response may be delegating work back to the user. "

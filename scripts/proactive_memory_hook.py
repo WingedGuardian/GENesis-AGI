@@ -547,8 +547,10 @@ def _rrf_fusion(
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
     # Dynamic count: rank 0 always surfaces; rank 1-2 only if they meet
-    # a minimum RRF score threshold.  This prevents low-relevance noise
-    # from training the model to ignore the entire injection block.
+    # a minimum RRF score threshold.  At k=60, single-source rank 0 scores
+    # ~0.016 so 0.015 filters code-index-only results (0.5x weight = 0.008)
+    # and very weak multi-source hits.  Tune upward to ~0.025 if rank 2-3
+    # results are still noisy in practice.
     _MIN_RRF_SCORE_RANK2 = 0.015
     results = []
     for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS]):

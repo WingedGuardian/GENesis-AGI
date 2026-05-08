@@ -41,10 +41,23 @@ _IP_PATTERN = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 _HOSTNAME_PATTERN = re.compile(r"@([\w.\-]+)")
 
 REPO_DIR = Path(__file__).resolve().parent.parent.parent
+SRC_DIR = REPO_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
 _NETWORK_TOPOLOGY = (
     Path.home()
     / ".claude/projects/-home-ubuntu-genesis/memory/reference_network_topology.md"
 )
+
+
+def _genesis_db_path() -> Path:
+    """Resolve DB path via genesis.env (works in worktrees)."""
+    try:
+        import importlib
+        return importlib.import_module("genesis.env").genesis_db_path()
+    except Exception:
+        return REPO_DIR / "data" / "genesis.db"  # fallback
 
 
 def _is_auth_command(command: str) -> bool:
@@ -62,13 +75,14 @@ def _extract_targets(command: str) -> list[str]:
 
 def _search_reference_store(targets: list[str]) -> list[str]:
     """Query knowledge_units for reference entries matching targets."""
-    db_path = REPO_DIR / "data" / "genesis.db"
+    db_path = _genesis_db_path()
     if not db_path.exists():
         return []
 
     hints = []
     try:
         conn = sqlite3.connect(str(db_path), timeout=2)
+        conn.execute("PRAGMA query_only = ON")
         conn.row_factory = sqlite3.Row
         try:
             for target in targets:
