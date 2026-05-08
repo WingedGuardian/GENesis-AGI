@@ -194,6 +194,8 @@ class StandaloneAdapter:
             except Exception:
                 logger.warning("Failed to init failure detector for OpenClaw", exc_info=True)
 
+            # OpenClaw callers set model/effort per-request via the completions API.
+            # Channel-level defaults (channels.yaml) are intentionally not applied here.
             conversation_loop = ConversationLoop(
                 db=rt.db,
                 invoker=rt.cc_invoker,
@@ -337,7 +339,8 @@ class StandaloneAdapter:
         wiring for forum topic routing (reflection, outreach, awareness).
         """
         try:
-            from genesis.channels.bridge import _load_bridge_config, _load_channel_defaults
+            from genesis.channels.bridge import _load_bridge_config
+            from genesis.channels.config import load_channel_defaults
 
             config = _load_bridge_config()
             if config is None:
@@ -358,7 +361,7 @@ class StandaloneAdapter:
                 logger.warning("Failed to init failure detector", exc_info=True)
 
             rt = self._runtime
-            default_model, default_effort = _load_channel_defaults()
+            default_model, default_effort = load_channel_defaults()
 
             conversation_loop = ConversationLoop(
                 db=rt.db,
