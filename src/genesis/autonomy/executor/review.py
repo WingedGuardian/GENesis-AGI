@@ -143,13 +143,14 @@ class TaskReviewer:
 
     async def _review_plan_via_invoker(self, prompt: str) -> str | None:
         """Run plan review via CC invoker (Opus). Returns text or None."""
-        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+        from genesis.cc.types import CCInvocation, CCModel, EffortLevel, background_session_dir
 
         invocation = CCInvocation(
             prompt=prompt,
             model=CCModel.OPUS,
             effort=EffortLevel.HIGH,
             timeout_s=600,
+            working_dir=background_session_dir(),
             skip_permissions=True,
         )
         output = await self._invoker.run(invocation)
@@ -374,14 +375,14 @@ class TaskReviewer:
         prompt = self._build_active_verify_prompt(deliverable, requirements)
 
         try:
-            from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+            from genesis.cc.types import CCInvocation, CCModel, EffortLevel, background_session_dir
 
             invocation = CCInvocation(
                 prompt=prompt,
                 model=CCModel.SONNET,
                 effort=EffortLevel.HIGH,
                 skip_permissions=True,
-                working_dir=str(worktree_path) if worktree_path else None,
+                working_dir=str(worktree_path) if worktree_path else background_session_dir(),
             )
             output = await self._invoker.run(invocation)
             if output.is_error:
