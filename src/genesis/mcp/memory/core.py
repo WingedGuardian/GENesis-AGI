@@ -49,7 +49,7 @@ async def memory_recall(
     wing: str | None = None,
     room: str | None = None,
     include_graph: bool = True,
-    expand_query_terms: bool = False,
+    expand_query_terms: bool = True,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -62,7 +62,7 @@ async def memory_recall(
         include_graph: If False, skip graph traversal (saves ~500ms per call).
         expand_query_terms: If True, expand the FTS5 query via tag co-occurrence
             analysis (~500ms first call, ~10ms cached). Broadens recall for
-            ambiguous queries. Default off — opt in when standard search misses.
+            ambiguous queries. Default on — catches poor query formulation.
             Note: does not apply to the drift_recall fallback path (if wired).
     """
     memory_mod = _memory_mod()

@@ -5,12 +5,13 @@ Searches the memory system for memories relevant to the user's current
 message and injects them as context. Uses tiered retrieval:
 1. FTS5 keyword search (always, ~5ms) — covers both episodic and knowledge
 2. Qdrant vector search on episodic_memory (~400-500ms, falls back gracefully)
-3. RRF fusion across both sources
+3. Qdrant vector search on knowledge_base (filtered to intentional ingestions, parallel)
+4. RRF fusion across all sources
 
 After the routing fix, ALL internal memory lives in episodic_memory.
-knowledge_base is reserved for external domain data from modules.
+knowledge_base holds external domain data + intentionally ingested content.
 
-Budget: <1.5s total. FTS5-only if Ollama unavailable or slow.
+Budget: <2.0s total. FTS5-only if embedding unavailable or slow.
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}
