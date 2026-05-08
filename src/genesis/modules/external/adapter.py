@@ -196,6 +196,9 @@ class ExternalProgramAdapter:
             available = list(ops.keys())
             return {"error": f"Unknown operation '{operation_name}'", "available": available}
 
+        if not self._enabled:
+            return {"error": f"Module '{self.name}' is disabled"}
+
         if not self._healthy:
             return {"error": f"Module '{self.name}' is not healthy"}
 
