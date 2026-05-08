@@ -50,6 +50,8 @@ EXPECTED_TABLES = [
     "memory_metadata",
     "credential_access_log",
     "session_heartbeats",
+    "eval_events",
+    "eval_snapshots",
 ]
 
 
