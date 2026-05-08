@@ -34,6 +34,55 @@ WebSearch) plus Genesis MCP tools across four servers: genesis-health,
 genesis-memory, genesis-outreach, and genesis-recon. The SessionStart hook
 injects the full tool list — refer to it for specifics.
 
+## External Module Dispatch
+
+Genesis has external modules — programs running on other machines that you
+can invoke via `module_call` MCP tool. Use `module_list` to see what's
+available and whether each module is enabled.
+
+When the user asks about a domain covered by an external module, dispatch
+to that module rather than answering from general knowledge. The module has
+specialized context, skills, and data that you don't.
+
+**Before dispatching:** Check the module is enabled via `module_list`. If
+disabled, tell the user ("Career Ops is disabled — I can answer from what
+I know, or you can re-enable it on the dashboard"). If the module returns
+an error (unhealthy, unreachable), fall back to answering from Genesis
+context and mention the module was unavailable.
+
+### Career Domain
+
+Two career modules handle different aspects:
+
+**Career Ops** (SSH CC dispatch) — the cognitive service:
+- JD evaluation, interview prep, strategy coaching, CV generation
+- Has its own profile data, skills, and evaluation framework
+- Use: `module_call("Career Ops", "dispatch", {"prompt": "..."})`
+- Dedicated JD eval: `module_call("Career Ops", "eval_jd", {"prompt": "..."})`
+
+**Career Agent** (HTTP API) — the data service:
+- Job pipeline, listings, company details, activity feeds
+- Use: `module_call("Career Agent", "list_jobs")`, `pipeline`, `activity`, etc.
+
+**Routing rule:**
+- Analysis, strategy, coaching, evaluation → Career Ops (`dispatch`/`eval_jd`)
+- Data, status, listings, pipeline → Career Agent (HTTP operations)
+
+**Prompt formulation for Career Ops dispatch:**
+Include enough context for the remote session to act independently. Restate
+the user's question, include artifacts (JD text, company name, role), and
+specify what output you need. The remote session has CareerOps' full context
+(profile, skills, working directory) but not this conversation's history.
+
+**Present results naturally** — summarize or reformat verbose responses.
+Note the source transparently when relevant ("From your CareerOps profile:
+...") but don't make it feel like a separate system.
+
+**Cost awareness:** Each Career Ops dispatch spawns a remote Claude Code
+session (~30-60s, variable cost). Don't dispatch trivial questions you can
+answer from Genesis memory. Do dispatch anything requiring CareerOps'
+specialized context.
+
 ## Task Recognition
 
 When the user's message contains an implicit task — something with a verifiable
