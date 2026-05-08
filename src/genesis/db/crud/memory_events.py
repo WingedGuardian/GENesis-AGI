@@ -13,13 +13,18 @@ async def insert(
     memory_id: str,
     subject: str,
     verb: str,
-    object: str | None = None,
+    object_: str | None = None,
     event_date: str | None = None,
     event_date_end: str | None = None,
     confidence: float = 0.5,
     source_session_id: str | None = None,
+    _commit: bool = True,
 ) -> str:
-    """Insert a memory event. Returns the event ID."""
+    """Insert a memory event. Returns the event ID.
+
+    Set ``_commit=False`` when called inside a batch loop where the caller
+    manages transaction boundaries (e.g., extraction_job).
+    """
     event_id = str(uuid.uuid4())
     await db.execute(
         "INSERT INTO memory_events "
@@ -27,11 +32,12 @@ async def insert(
         "confidence, source_session_id) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
-            event_id, memory_id, subject, verb, object,
+            event_id, memory_id, subject, verb, object_,
             event_date, event_date_end, confidence, source_session_id,
         ),
     )
-    await db.commit()
+    if _commit:
+        await db.commit()
     return event_id
 
 

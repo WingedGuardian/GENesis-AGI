@@ -214,10 +214,11 @@ async def run_extraction_cycle(
                                 memory_id=memory_id,
                                 subject=extraction.event_subject or "unknown",
                                 verb=extraction.event_verb,
-                                object=extraction.event_object,
+                                object_=extraction.event_object,
                                 event_date=extraction.temporal,
                                 confidence=extraction.confidence,
                                 source_session_id=cc_session_id,
+                                _commit=False,
                             )
                         except Exception:
                             logger.warning(

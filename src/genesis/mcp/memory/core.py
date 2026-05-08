@@ -51,6 +51,7 @@ async def memory_recall(
     include_graph: bool = True,
     expand_query_terms: bool = True,
     mode: str = "auto",
+    time_range: str | None = None,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -69,6 +70,10 @@ async def memory_recall(
             "standard" = hybrid only, no drift fallback. "drift" = skip
             standard recall, use 3-phase drift retrieval directly. Drift
             mode ignores wing/room filters (discovers clusters dynamically).
+        time_range: Explicit date range filter as "YYYY-MM-DD/YYYY-MM-DD".
+            Queries the SVO event calendar and boosts temporally matching
+            memories in RRF fusion. Automatic temporal detection also runs
+            on queries with temporal language (e.g., "what happened last week").
     """
     import time as _time
 
@@ -78,6 +83,21 @@ async def memory_recall(
     assert memory_mod._retriever is not None and memory_mod._db is not None
 
     pipeline_used = mode  # track which pipeline actually ran
+
+    # Explicit time_range: query event calendar and merge IDs into results
+    event_boost_ids: set[str] = set()
+    if time_range:
+        try:
+            parts = time_range.split("/", 1)
+            if len(parts) == 2:
+                from genesis.db.crud import memory_events
+                event_boost_ids = set(
+                    await memory_events.get_memory_ids_in_range(
+                        memory_mod._db, parts[0], parts[1], limit=limit * 3,
+                    )
+                )
+        except Exception:
+            logger.warning("time_range event query failed", exc_info=True)
 
     if mode == "drift":
         # Direct DRIFT invocation — skip standard recall entirely
@@ -132,6 +152,35 @@ async def memory_recall(
                     pipeline_used = "auto_drift"
             except Exception:
                 logger.warning("drift_recall fallback failed", exc_info=True)
+
+    # Boost event-calendar matches from explicit time_range
+    if event_boost_ids:
+        from genesis.db.crud import memory as memory_crud
+        from genesis.memory.types import RetrievalResult
+
+        result_ids = {r.memory_id for r in results}
+        missing = event_boost_ids - result_ids
+        for mid in list(missing)[:limit]:
+            try:
+                row = await memory_crud.get_by_id(memory_mod._db, mid)
+                if row:
+                    results.append(RetrievalResult(
+                        memory_id=mid,
+                        content=row.get("content", ""),
+                        source=row.get("source_type", ""),
+                        memory_type=row.get("collection", ""),
+                        score=0.01,
+                        vector_rank=None,
+                        fts_rank=None,
+                        activation_score=0.0,
+                        payload=row,
+                        source_pipeline="event_calendar",
+                    ))
+            except Exception:
+                logger.warning(
+                    "Failed to fetch event-calendar memory %s", mid,
+                    exc_info=True,
+                )
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
     try:
