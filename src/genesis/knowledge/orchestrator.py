@@ -12,7 +12,7 @@ import typing
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from genesis.knowledge.distillation import DistillationPipeline
+from genesis.knowledge.distillation import _MIN_EXTRACTION_RATIO, DistillationPipeline
 from genesis.knowledge.manifest import ManifestManager
 from genesis.knowledge.processors.base import ProcessedContent
 from genesis.knowledge.processors.registry import ContentProcessorRegistry
@@ -148,6 +148,11 @@ class KnowledgeOrchestrator:
         low_conf = [u for u in units if u.confidence < 0.5]
         if low_conf:
             quality_flags.append(f"{len(low_conf)}_low_confidence_units")
+
+        # Flag thin extraction (output much smaller than input)
+        ratio = self._distillation._last_extraction_ratio
+        if ratio < _MIN_EXTRACTION_RATIO and units:
+            quality_flags.append("thin_extraction")
 
         return IngestResult(
             source=source,

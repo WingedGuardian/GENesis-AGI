@@ -98,3 +98,21 @@ async def test_batch_ingest(tmp_path: Path):
     results = await orch.ingest_batch(str(tmp_path), project_type="test")
     # Should process a.txt and b.md but skip c.xyz
     assert len(results) == 2
+
+
+async def test_thin_extraction_quality_flag(tmp_path: Path):
+    """Thin extraction should produce a quality flag."""
+    units = [KnowledgeUnit(concept="Thin", body="Short.", domain="test")]
+    orch = _make_orchestrator(tmp_path, mock_distill_result=units)
+
+    # Simulate a low extraction ratio on the distillation pipeline
+    orch._distillation._last_extraction_ratio = 0.02  # 2% — below 10% floor
+
+    with patch("genesis.knowledge.orchestrator.KnowledgeOrchestrator._store_units",
+               new_callable=AsyncMock, return_value=["unit-1"]):
+        file = tmp_path / "big_doc.txt"
+        file.write_text("A" * 10000)  # Large input
+
+        result = await orch.ingest_source(str(file), project_type="test")
+        assert result.units_created == 1
+        assert "thin_extraction" in result.quality_flags

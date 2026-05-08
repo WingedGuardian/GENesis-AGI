@@ -428,11 +428,13 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
+    - claude-haiku
     - mistral-large-free
     - groq-free
     - gemini-free
     - cerebras-qwen
     - openrouter-free
+    default_paid: true
     retry_profile: background
     description: "Knowledge pipeline — distill raw content into structured knowledge units"
   41_resume_review_pass1:
