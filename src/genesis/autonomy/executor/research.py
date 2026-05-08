@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from genesis.autonomy.executor.types import ResearchResult
-from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel
+from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, background_session_dir
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,7 @@ class DeepResearcherImpl:
             append_system_prompt=True,
             mcp_config=mcp_config,
             timeout_s=1800,  # 30 min max for research
+            working_dir=background_session_dir(),
             skip_permissions=True,
             disallowed_tools=[
                 "Bash", "Edit", "Write", "NotebookEdit",

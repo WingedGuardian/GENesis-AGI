@@ -905,7 +905,13 @@ class SentinelDispatcher:
 
     async def _dispatch_cc_session(self, request: SentinelRequest) -> SentinelResult:
         """Dispatch the actual CC background session."""
-        from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType
+        from genesis.cc.types import (
+            CCInvocation,
+            CCModel,
+            EffortLevel,
+            SessionType,
+            background_session_dir,
+        )
 
         # Assemble diagnostic context
         health_snapshot = None
@@ -965,6 +971,7 @@ class SentinelDispatcher:
                 append_system_prompt=True,
                 output_format="text",
                 mcp_config=mcp_path,
+                working_dir=background_session_dir(),
             )
 
             output = await self._invoker.run(invocation)

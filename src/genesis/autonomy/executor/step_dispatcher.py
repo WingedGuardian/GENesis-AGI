@@ -124,7 +124,7 @@ class StepDispatcher:
         All V3 steps use CC sessions. Multi-model router dispatch
         for research/analysis steps is deferred to V4.
         """
-        from genesis.cc.types import CCInvocation, CCModel, EffortLevel
+        from genesis.cc.types import CCInvocation, CCModel, EffortLevel, background_session_dir
 
         step_idx = step["idx"]
         step_type_str = step.get("type", "code")
@@ -150,6 +150,8 @@ class StepDispatcher:
         working_dir: str | None = None
         if worktree_path and step_type == StepType.CODE:
             working_dir = str(worktree_path)
+        else:
+            working_dir = background_session_dir()
 
         # Effort: HIGH for code/verification, MEDIUM otherwise
         effort = (
