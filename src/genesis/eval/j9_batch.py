@@ -27,6 +27,23 @@ logger = logging.getLogger(__name__)
 # Model for relevance judgments — cheap and fast
 _JUDGE_MODEL = "claude-haiku-4-5-20251001"
 
+def _text_overlap(memory_text: str, reference_text: str, min_phrases: int = 2) -> bool:
+    """Check if memory content appears in reference text via trigram overlap.
+
+    Extracts 3-word phrases from memory_text and checks if at least
+    min_phrases appear in reference_text. This is a cheap proxy for
+    "was this memory used?" without LLM judgment.
+    """
+    words = memory_text.split()
+    if len(words) < 3:
+        # Short memory: check if the whole thing appears
+        return memory_text.strip() in reference_text
+
+    trigrams = [" ".join(words[i:i + 3]) for i in range(len(words) - 2)]
+    matches = sum(1 for t in trigrams if t in reference_text)
+    return matches >= min_phrases
+
+
 _RELEVANCE_PROMPT = """\
 You are judging whether a recalled memory is relevant to a query.
 
@@ -106,7 +123,14 @@ class J9EvalBatchExecutor:
                 else:
                     errors += 1
 
-        content = f"J9 eval batch: scored {scored} memory-query pairs ({errors} errors)"
+        # Pass 2: recall_used — check if recalled memories were referenced
+        # in session-extracted content (text overlap, no LLM needed)
+        used_count = await self._compute_recall_used(since, recall_events)
+
+        content = (
+            f"J9 eval batch: scored {scored} memory-query pairs "
+            f"({errors} errors), {used_count} recall_used events"
+        )
         return ExecutorResult(
             success=True,
             content=content,
@@ -118,6 +142,81 @@ class J9EvalBatchExecutor:
                 "confidence": 0.8 if errors == 0 else 0.6,
             }],
         )
+
+    async def _compute_recall_used(
+        self, since: str, recall_events: list[dict],
+    ) -> int:
+        """Check if recalled memories were referenced in session-extracted content.
+
+        Uses text overlap (trigram similarity) between recalled memory content
+        and memories extracted from the same session. No LLM calls needed.
+        """
+        if self._db is None:
+            return 0
+
+        # Group recall events by session
+        by_session: dict[str, list[dict]] = {}
+        for ev in recall_events:
+            sid = ev.get("session_id")
+            if sid:
+                by_session.setdefault(sid, []).append(ev)
+
+        used_count = 0
+        for session_id, events in by_session.items():
+            # Get memories extracted FROM this session (content created by the session)
+            try:
+                cursor = await self._db.execute(
+                    """SELECT content FROM memory_fts
+                       WHERE memory_id IN (
+                           SELECT memory_id FROM memory_metadata
+                           WHERE created_at >= ? LIMIT 100
+                       )""",
+                    (since,),
+                )
+                session_content = " ".join(
+                    (row[0] if isinstance(row, tuple) else row["content"])
+                    for row in await cursor.fetchall()
+                )
+            except Exception:
+                continue
+
+            if not session_content:
+                continue
+
+            session_lower = session_content.lower()
+
+            # Check each recalled memory against session content
+            for ev in events:
+                memory_ids = ev.get("metrics", {}).get("memory_ids", [])
+                for mid in memory_ids[:5]:
+                    mem_content = await self._get_memory_content(mid)
+                    if not mem_content:
+                        continue
+
+                    # Trigram overlap: extract 3-word phrases from memory,
+                    # check if any appear in session content
+                    used = _text_overlap(mem_content.lower(), session_lower)
+
+                    try:
+                        await j9_eval.insert_event(
+                            self._db,
+                            dimension="memory",
+                            event_type="recall_used",
+                            subject_id=mid,
+                            session_id=session_id,
+                            metrics={
+                                "recall_event_id": ev["id"],
+                                "memory_id": mid,
+                                "used": used,
+                                "method": "trigram_overlap",
+                            },
+                        )
+                        if used:
+                            used_count += 1
+                    except Exception:
+                        logger.debug("Failed to emit recall_used for %s", mid)
+
+        return used_count
 
     async def _get_memory_content(self, memory_id: str) -> str | None:
         """Fetch memory content from Qdrant payload or FTS5."""
