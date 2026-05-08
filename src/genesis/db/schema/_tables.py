@@ -919,6 +919,36 @@ TABLES = {
             dispatched_at   TEXT
         )
     """,
+    "eval_events": """
+        CREATE TABLE IF NOT EXISTS eval_events (
+            id           TEXT PRIMARY KEY,
+            timestamp    TEXT NOT NULL,
+            dimension    TEXT NOT NULL
+                         CHECK (dimension IN (
+                             'memory', 'ego', 'procedure', 'cognitive', 'system'
+                         )),
+            event_type   TEXT NOT NULL,
+            subject_id   TEXT,
+            session_id   TEXT,
+            metrics_json TEXT NOT NULL,
+            created_at   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
+    "eval_snapshots": """
+        CREATE TABLE IF NOT EXISTS eval_snapshots (
+            id           TEXT PRIMARY KEY,
+            period_start TEXT NOT NULL,
+            period_end   TEXT NOT NULL,
+            period_type  TEXT NOT NULL
+                         CHECK (period_type IN ('daily', 'weekly')),
+            dimension    TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            sample_count INTEGER NOT NULL,
+            created_at   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1103,6 +1133,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_file_mod_ts ON file_modifications(timestamp)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
+    # J-9 eval infrastructure
+    "CREATE INDEX IF NOT EXISTS idx_eval_events_dimension ON eval_events(dimension, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_events_session ON eval_events(session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period ON eval_snapshots(dimension, period_end)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
