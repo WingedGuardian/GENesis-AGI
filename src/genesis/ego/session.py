@@ -335,6 +335,11 @@ class EgoSession:
                     resolved_follow_ups, cycle.id,
                 )
 
+            # 10c. Process knowledge notepad updates (user ego only)
+            knowledge_updates = parsed.get("knowledge_updates", [])
+            if knowledge_updates and self._source_tag == "user_ego_cycle":
+                await self._apply_knowledge_updates(knowledge_updates)
+
             # 11. Store focus summary for reflection injection
             if focus:
                 await ego_crud.set_state(
@@ -620,6 +625,87 @@ class EgoSession:
                 cycle_id, len(escalations),
             )
 
+    # -- Knowledge notepad --------------------------------------------------
+
+    _NOTEPAD_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_NOTEPAD.md"
+    _NOTEPAD_MARKER = "# Ego Notepad"
+
+    async def _apply_knowledge_updates(
+        self,
+        updates: list[dict],
+    ) -> None:
+        """Apply incremental updates to EGO_NOTEPAD.md.
+
+        Each update: {section, action (add|update|remove), content, replaces?}
+        """
+        try:
+            if self._NOTEPAD_PATH.exists():
+                text = self._NOTEPAD_PATH.read_text()
+            else:
+                # Seed from example template
+                example = self._NOTEPAD_PATH.with_suffix(".md.example")
+                text = example.read_text() if example.exists() else ""
+
+            if not text.strip():
+                logger.warning("Ego notepad is empty — skipping updates")
+                return
+
+            sections = _parse_notepad_sections(text)
+            today = datetime.now(UTC).strftime("%Y-%m-%d")
+
+            applied = 0
+            for u in updates:
+                section_name = u["section"]
+                action = u["action"]
+                # Sanitize: strip newlines (break markdown list), cap length
+                content = u["content"].replace("\n", " ").strip()[:500]
+
+                if section_name not in sections:
+                    logger.warning(
+                        "Ego notepad: unknown section %r — skipping",
+                        section_name,
+                    )
+                    continue
+
+                entries = sections[section_name]["entries"]
+                cap = sections[section_name]["cap"]
+
+                if action == "add":
+                    entries.append(f"- [{today}] {content}")
+                    # Enforce cap — trim oldest
+                    if cap and len(entries) > cap:
+                        entries[:] = entries[-cap:]
+                    applied += 1
+
+                elif action == "update":
+                    replaces = u.get("replaces", "")
+                    if not replaces:
+                        continue
+                    for i, entry in enumerate(entries):
+                        if replaces in entry:
+                            entries[i] = f"- [{today}] {content}"
+                            applied += 1
+                            break
+
+                elif action == "remove":
+                    for i, entry in enumerate(entries):
+                        if content in entry:
+                            entries.pop(i)
+                            applied += 1
+                            break
+
+            if applied == 0:
+                return
+
+            # Rebuild file
+            result = _rebuild_notepad(sections, today)
+            self._NOTEPAD_PATH.write_text(result)
+            logger.info(
+                "Ego notepad: applied %d/%d updates", applied, len(updates),
+            )
+        except Exception:
+            logger.error("Failed to apply ego notepad updates", exc_info=True)
+
     async def _check_budget(self) -> bool:
         """True if daily ego thinking spend is under the budget cap."""
         try:
@@ -650,6 +736,7 @@ class EgoSession:
 
 
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
+_VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 
 
 def _validate_output(data: dict) -> dict | None:
@@ -678,4 +765,100 @@ def _validate_output(data: dict) -> dict | None:
             p["confidence"] = float(p.get("confidence", 0.0))
         except (ValueError, TypeError):
             p["confidence"] = 0.0
+
+    # Sanitize knowledge_updates — filter malformed entries.
+    if "knowledge_updates" in data:
+        raw = data["knowledge_updates"]
+        if not isinstance(raw, list):
+            data["knowledge_updates"] = []
+        else:
+            data["knowledge_updates"] = [
+                u for u in raw
+                if isinstance(u, dict)
+                and isinstance(u.get("section"), str)
+                and u.get("action") in _VALID_NOTEPAD_ACTIONS
+                and isinstance(u.get("content"), str)
+            ]
+
     return data
+
+
+# -- Notepad parsing helpers -----------------------------------------------
+
+_CAP_PATTERN = re.compile(r"_\(max (\d+) items?\)_")
+
+# Ordered sections for the ego notepad — defines output order.
+_NOTEPAD_SECTIONS = [
+    "Active Projects & Priorities",
+    "Interests & Expertise",
+    "Interaction Patterns",
+    "Proposal Context Journal",
+    "Open Questions",
+]
+
+
+def _parse_notepad_sections(text: str) -> dict[str, dict]:
+    """Parse EGO_NOTEPAD.md into sections.
+
+    Returns {section_name: {"cap": int|None, "entries": [str]}}
+    preserving the header block (everything before the first ## section).
+    """
+    sections: dict[str, dict] = {}
+    current_section: str | None = None
+    header_lines: list[str] = []
+
+    for line in text.splitlines():
+        if line.startswith("## "):
+            current_section = line[3:].strip()
+            sections[current_section] = {"cap": None, "entries": []}
+        elif current_section is None:
+            header_lines.append(line)
+        elif current_section in sections:
+            cap_match = _CAP_PATTERN.search(line)
+            if cap_match:
+                sections[current_section]["cap"] = int(cap_match.group(1))
+            elif line.startswith("- "):
+                sections[current_section]["entries"].append(line)
+            # Skip empty lines and other non-entry content
+
+    # Store header for rebuild
+    sections["__header__"] = {"cap": None, "entries": header_lines}
+    return sections
+
+
+def _rebuild_notepad(sections: dict[str, dict], today: str) -> str:
+    """Rebuild EGO_NOTEPAD.md from parsed sections."""
+    lines: list[str] = []
+
+    # Header — update timestamp
+    for line in sections.get("__header__", {}).get("entries", []):
+        if "Last updated:" in line:
+            lines.append(f"> Last updated: {today}")
+        else:
+            lines.append(line)
+    lines.append("")
+
+    # Sections in defined order, then any extras
+    seen = {"__header__"}
+    for name in _NOTEPAD_SECTIONS:
+        if name in sections:
+            _emit_section(lines, name, sections[name])
+            seen.add(name)
+    for name, data in sections.items():
+        if name not in seen:
+            _emit_section(lines, name, data)
+
+    return "\n".join(lines) + "\n"
+
+
+def _emit_section(lines: list[str], name: str, data: dict) -> None:
+    """Emit a single section into the output lines."""
+    lines.append(f"## {name}")
+    cap = data.get("cap")
+    if cap:
+        lines.append(f"_(max {cap} items)_")
+    entries = data.get("entries", [])
+    if entries:
+        lines.append("")
+        lines.extend(entries)
+    lines.append("")
