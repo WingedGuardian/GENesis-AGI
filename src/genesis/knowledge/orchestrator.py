@@ -130,10 +130,19 @@ class KnowledgeOrchestrator:
             )
 
         # 7. Store each unit
-        unit_ids = await self._store_units(
-            units, project_type=project_type, source=source,
-            content=content, purpose=purpose,
-        )
+        try:
+            unit_ids = await self._store_units(
+                units, project_type=project_type, source=source,
+                content=content, purpose=purpose,
+            )
+        except Exception as exc:
+            logger.error("Storage failed for %s: %s", source, exc)
+            return IngestResult(
+                source=source,
+                source_type=content.source_type,
+                units_created=0,
+                error=f"Storage failed: {exc}",
+            )
 
         # 8. Update manifest
         self._manifest.add_source(
@@ -284,8 +293,8 @@ class KnowledgeOrchestrator:
 
         except Exception:
             logger.error(
-                "Batch storage failed after %d/%d units from %s — rolling back",
-                len(unit_ids), len(units), source,
+                "Batch storage failed after %d/%d units (%d qdrant vectors) from %s — rolling back",
+                len(unit_ids), len(units), len(qdrant_ids), source,
                 exc_info=True,
             )
             # Roll back SQLite to release the write lock immediately
