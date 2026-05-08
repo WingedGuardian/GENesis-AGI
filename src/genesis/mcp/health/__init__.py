@@ -62,6 +62,7 @@ from genesis.mcp.health import db_schema as _db_schema  # noqa: E402
 from genesis.mcp.health import direct_session_tools as _direct_session_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
+from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
 from genesis.mcp.health import provider as _provider  # noqa: E402

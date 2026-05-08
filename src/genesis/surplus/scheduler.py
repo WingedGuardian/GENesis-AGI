@@ -85,6 +85,7 @@ class SurplusScheduler:
         self._code_index_executor: SurplusExecutor | None = None
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
         self._model_eval_executor: SurplusExecutor | None = None
+        self._j9_eval_batch_executor: SurplusExecutor | None = None
         self._disk_cleanup_executor: SurplusExecutor | None = None
         self._backup_verification_executor: SurplusExecutor | None = None
         self._dead_letter_replay_executor: SurplusExecutor | None = None
@@ -125,6 +126,10 @@ class SurplusScheduler:
     def set_model_eval_executor(self, executor: SurplusExecutor) -> None:
         """Set a dedicated executor for MODEL_EVAL tasks."""
         self._model_eval_executor = executor
+
+    def set_j9_eval_batch_executor(self, executor: SurplusExecutor) -> None:
+        """Set executor for J9_EVAL_BATCH tasks (daily memory relevance scoring)."""
+        self._j9_eval_batch_executor = executor
 
     def set_maintenance_executors(
         self,
@@ -616,6 +621,8 @@ class SurplusScheduler:
             executor = self._dead_letter_replay_executor
         elif task.task_type == _TT.DB_MAINTENANCE and self._db_maintenance_executor is not None:
             executor = self._db_maintenance_executor
+        elif task.task_type == _TT.J9_EVAL_BATCH and self._j9_eval_batch_executor is not None:
+            executor = self._j9_eval_batch_executor
 
         try:
             result = await executor.execute(task)

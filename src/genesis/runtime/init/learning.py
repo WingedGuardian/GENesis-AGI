@@ -703,6 +703,26 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        # J-9 eval weekly aggregation (Sundays 5am — after skill evolution)
+        async def _run_j9_eval_aggregation():
+            try:
+                from genesis.eval.j9_aggregator import run_weekly_aggregation
+                results = await run_weekly_aggregation(rt._db)
+                dims_computed = len(results)
+                logger.info("J9 weekly aggregation: %d dimensions computed", dims_computed)
+                rt.record_job_success("j9_eval_aggregation")
+            except Exception as exc:
+                rt.record_job_failure("j9_eval_aggregation", str(exc))
+                logger.exception("J9 weekly aggregation failed")
+
+        rt._learning_scheduler.add_job(
+            _run_j9_eval_aggregation,
+            CronTrigger(day_of_week="sun", hour=5, minute=0),
+            id="j9_eval_aggregation",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         rt._learning_scheduler.start()
         logger.info("Genesis learning scheduler started")
 
