@@ -12,7 +12,9 @@ _TIMEOUT = 3.0
 
 
 class GenesisMemoryRecall(Extension):
-    async def execute(self, loop_data: LoopData = LoopData(), **kwargs):
+    async def execute(self, loop_data: LoopData | None = None, **kwargs):
+        if loop_data is None:
+            loop_data = LoopData()
         try:
             from genesis.runtime import GenesisRuntime
 
