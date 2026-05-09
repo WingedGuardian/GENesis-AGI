@@ -138,9 +138,11 @@ async def test_store_units_rollback_on_failure(tmp_path: Path):
     mock_store._embeddings = MagicMock(model_name="test-model")
 
     mock_knowledge = MagicMock()
-    # SQLite insert succeeds twice, then raises on the 3rd
-    mock_knowledge.insert = AsyncMock(
-        side_effect=[None, None, Exception("DB locked")]
+    # find_by_unique_key returns None (no existing unit) for all calls
+    mock_knowledge.find_by_unique_key = AsyncMock(return_value=None)
+    # SQLite upsert succeeds twice, then raises on the 3rd
+    mock_knowledge.upsert = AsyncMock(
+        side_effect=[("uid-0", True), ("uid-1", True), Exception("DB locked")]
     )
 
     with patch("genesis.mcp.memory_mcp._require_init"), \
