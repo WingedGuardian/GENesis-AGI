@@ -285,7 +285,8 @@ async def list_recent(
     """List memories ordered by created_at descending (newest first)."""
     sql = (
         "SELECT f.memory_id, f.content, f.source_type, f.collection, "
-        "       m.created_at, m.confidence, m.embedding_status "
+        "       m.created_at, m.confidence, m.embedding_status, "
+        "       m.valid_at, m.invalid_at "
         "FROM memory_metadata m "
         "JOIN memory_fts f ON f.memory_id = m.memory_id "
     )
@@ -306,6 +307,8 @@ async def list_recent(
             "created_at": r[4],
             "confidence": r[5],
             "embedding_status": r[6],
+            "valid_at": r[7],
+            "invalid_at": r[8],
         }
         for r in rows
     ]

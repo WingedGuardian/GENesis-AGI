@@ -57,7 +57,13 @@ async def graph_db(tmp_path):
         )
     await db.commit()
 
+    # Ensure fresh NetworkX cache per test
+    invalidate_graph_cache()
+
     yield db
+
+    # Clean up cache so subsequent test files don't see stale state
+    invalidate_graph_cache()
     await db.close()
 
 

@@ -276,7 +276,10 @@ async def centrality_scores(
     if G.number_of_nodes() == 0:
         return []
 
-    scores = nx.betweenness_centrality(G)
+    # Use approximate betweenness for large graphs to avoid blocking
+    n_nodes = G.number_of_nodes()
+    k = min(200, n_nodes) if n_nodes > 200 else None
+    scores = nx.betweenness_centrality(G, k=k)
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return ranked[:top_n]
 
