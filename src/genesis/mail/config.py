@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-
 from genesis.mail.types import MailConfig
 
 logger = logging.getLogger(__name__)
