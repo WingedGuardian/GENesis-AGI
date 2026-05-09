@@ -7,7 +7,7 @@ from enum import StrEnum
 
 
 class SearchBackend(StrEnum):
-    SEARXNG = "searxng"
+    TINYFISH = "tinyfish"
     BRAVE = "brave"
 
 
@@ -17,7 +17,7 @@ class SearchResult:
 
     title: str
     url: str
-    snippet: str  # SearXNG "content" / Brave "description"
+    snippet: str  # Tinyfish "snippet" / Brave "description"
     backend: SearchBackend
     score: float = 0.0
 
@@ -28,7 +28,7 @@ class SearchResponse:
 
     query: str
     results: list[SearchResult] = field(default_factory=list)
-    backend_used: SearchBackend = SearchBackend.SEARXNG
+    backend_used: SearchBackend = SearchBackend.TINYFISH
     fallback_used: bool = False
     error: str | None = None
 

@@ -1,6 +1,6 @@
 """ToolProvider adapter wrapping genesis.web.WebSearcher.
 
-Instead of duplicating SearXNG/Brave logic, we wrap the existing
+Instead of duplicating Tinyfish/Brave logic, we wrap the existing
 genesis.web infrastructure as a single SearchProvider that the
 ProviderRegistry and ResearchOrchestrator can use.
 """
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 class WebSearchAdapter:
     """Wraps genesis.web.WebSearcher as a ToolProvider.
 
-    SearXNG primary + Brave fallback is handled internally by WebSearcher.
+    Tinyfish primary + Brave fallback is handled internally by WebSearcher.
     """
 
     name = "web_search"
@@ -33,7 +33,7 @@ class WebSearchAdapter:
         content_types=("web_page", "search_query"),
         categories=(ProviderCategory.SEARCH,),
         cost_tier=CostTier.FREE,
-        description="Web search via SearXNG (primary) + Brave (fallback)",
+        description="Web search via Tinyfish (primary) + Brave (fallback)",
     )
 
     def __init__(self, searcher=None) -> None:

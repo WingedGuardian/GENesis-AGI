@@ -22,7 +22,7 @@ class Collector(Protocol):
 
 
 class WebSearchCollector:
-    """Collects from SearXNG/Brave via genesis.web."""
+    """Collects from Tinyfish/Brave via genesis.web."""
 
     name = "web_search"
 

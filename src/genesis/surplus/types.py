@@ -17,6 +17,8 @@ class TaskType(StrEnum):
     GAP_CLUSTERING = "gap_clustering"
     SELF_UNBLOCK = "self_unblock"
     ANTICIPATORY_RESEARCH = "anticipatory_research"
+    # Pipeline intermediate step (anticipatory_research pipeline)
+    RESEARCH_QUERY_GEN = "research_query_gen"
     PROMPT_EFFECTIVENESS_REVIEW = "prompt_effectiveness_review"
     # Pipeline intermediate steps (prompt_effectiveness pipeline)
     PROMPT_REVIEW_CATALOG = "prompt_review_catalog"

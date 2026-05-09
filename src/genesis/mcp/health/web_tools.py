@@ -1,6 +1,6 @@
 """Web intelligence MCP tools — external world discoverability.
 
-Exposes Genesis's web infrastructure (Scrapling, Crawl4AI, SearXNG, Brave,
+Exposes Genesis's web infrastructure (Scrapling, Crawl4AI, Tinyfish, Brave,
 Tavily, Exa, Perplexity) as MCP tools accessible from all session types.
 
 Smart fallback chains — callers say what they want, the tool figures out how.
@@ -165,8 +165,8 @@ async def _impl_web_search(
     max_results = min(max(1, max_results), 20)
     start = time.monotonic()
 
-    if backend in ("auto", "searxng", "brave"):
-        # Use WebSearcher (SearXNG primary, Brave fallback)
+    if backend in ("auto", "tinyfish", "searxng", "brave"):
+        # Use WebSearcher (Tinyfish primary, Brave fallback)
         searcher = _get_searcher()
         response = await searcher.search(query, max_results=max_results)
         latency = (time.monotonic() - start) * 1000
@@ -272,7 +272,7 @@ async def _impl_web_search(
             return {"query": query, "error": f"Perplexity unavailable: {exc}", "backend_used": "perplexity"}
 
     else:
-        return {"error": f"Unknown backend '{backend}'. Use: auto, searxng, brave, tavily, exa, perplexity"}
+        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, brave, tavily, exa, perplexity"}
 
 
 @mcp.tool()
@@ -316,12 +316,12 @@ async def web_search(
 ) -> dict:
     """Search the web and return structured results.
 
-    Smart fallback chain: SearXNG (self-hosted, unlimited) → Brave (API).
+    Smart fallback chain: Tinyfish (free, cloud) → Brave (API).
     Paid backends (tavily, exa, perplexity) available via explicit backend param.
 
     Args:
-        query: Search query string. Supports site: filters with SearXNG.
-        backend: "auto" (SearXNG→Brave), "searxng", "brave", "tavily"
+        query: Search query string.
+        backend: "auto" (Tinyfish→Brave), "tinyfish", "brave", "tavily"
                  (AI-optimized), "exa" (semantic), or "perplexity" (synthesized).
         max_results: Maximum results (default 10, max 20).
 
@@ -329,9 +329,8 @@ async def web_search(
     backend_used, fallback_used, answer (for tavily/perplexity), error, latency_ms.
 
     Use this instead of CC WebSearch for:
-    - site: filters and structured JSON (SearXNG)
+    - Structured JSON results
     - Background sessions (no Bash available)
-    - Bulk queries (SearXNG is unlimited, self-hosted)
     - Agent pipelines needing structured data
 
     Use CC WebSearch for quick general lookups in foreground sessions.

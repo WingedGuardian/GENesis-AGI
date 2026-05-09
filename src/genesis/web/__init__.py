@@ -34,7 +34,7 @@ def _get_fetcher() -> WebFetcher:
 
 
 async def search(query: str, *, max_results: int | None = None) -> SearchResponse:
-    """Search the web (SearXNG primary, Brave fallback)."""
+    """Search the web (Tinyfish primary, Brave fallback)."""
     return await _get_searcher().search(query, max_results=max_results)
 
 

@@ -403,6 +403,7 @@ class SurplusScheduler:
                     )
             # prompt_effectiveness runs as a 3-step pipeline.
             await self.schedule_pipeline("prompt_effectiveness")
+            await self.schedule_pipeline("anticipatory_research")
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_success("schedule_analytical")
