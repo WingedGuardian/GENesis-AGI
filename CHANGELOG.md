@@ -7,6 +7,66 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b7] - 2026-05-09
+
+Ego gets two new self-awareness features, references move into the
+episodic graph, and Opus 4.7's xhigh effort tier becomes a first-class
+option.
+
+### Added
+
+- **Ego causal intervention journal** (#284) --- every proposal now
+  tracks its lifecycle (proposed → approved/rejected → executed →
+  outcome) in a queryable journal. Ego can correlate decisions with
+  outcomes to learn from past judgments.
+- **Ego self-model capability map** (#288) --- Genesis maintains a
+  live capability inventory aggregated from MCP tools, channels,
+  modules, and memory wings. Ego references this when proposing
+  actions to avoid suggesting things it can't do.
+- **Email outbound channel** (#289) --- Genesis can now send email
+  via the configured outbound provider. Third outreach lane alongside
+  Telegram and dashboard.
+- **GitHub star tracking** (#289) --- recon source captures
+  GENesis-AGI repo stargazer activity. Surfaces in morning reports.
+- **xhigh effort tier** (#297) --- Claude Code 2.1.111's xhigh tier
+  for Opus 4.7 is now recognized everywhere Genesis hands off effort
+  level (CC invoker, Telegram `/effort`, `session_set_effort` MCP,
+  dashboard). Defaults remain at `high`; xhigh is opt-in.
+- **Morning report observations** (#285) --- recent unresolved
+  observations are surfaced alongside the usual morning digest, so
+  operators see what Genesis is paying attention to.
+- **Follow-up retention cleanup** (#293) --- completed and failed
+  follow-ups older than 30 days are now purged daily at 02:30 UTC.
+  Pinned items are preserved.
+
+### Changed
+
+- **Reference storage migrates to episodic memory** (#296) --- 52
+  reference vectors move from `knowledge_base` to `episodic_memory`
+  via SQLite migration 0013 + Qdrant init-time migration (idempotent).
+  References now surface naturally via all memory recall paths.
+  `reference_lookup` continues to work; only the storage collection
+  changed.
+- **Disk alert threshold** (#295) --- `health_alerts` now fires
+  WARNING at <15% free disk (was CRITICAL-only at <10%). The 10–15%
+  gap is no longer a blind spot.
+
+### Fixed
+
+- **Ego self-reinforcing holdback loop** (#283) --- ego could spiral
+  into withdrawing its own proposals based on its own prior
+  decisions. The holdback heuristic now considers proposal age and
+  user signal correctly.
+- **Heartbeat cleanup not wired** (#281) --- subsystem heartbeats
+  weren't being aged out, leaving stale records in the dashboard.
+- **Surplus task double-enqueue** (#281) --- `active_by_type` check
+  now matches the dispatch loop's filter, so scheduled surplus jobs
+  don't double-enqueue.
+- **Outreach metric mislabels** (#289) --- corrected mislabeled
+  outreach counters in the dashboard.
+
+---
+
 ## [v3.0b6] - 2026-05-09
 
 Memory retrieval gets faster graph traversal, explicit drift control,
