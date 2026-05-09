@@ -479,6 +479,7 @@ class CCReflectionBridge:
                 source_tag="weekly_assessment",
                 skill_tags=["self-assessment"],
             )
+            _set_obs_session(sess["id"])
         except Exception:
             logger.exception("Failed to create assessment session")
             return ReflectionResult(success=False, reason="Session creation failed")
@@ -554,6 +555,7 @@ class CCReflectionBridge:
                 source_tag="quality_calibration",
                 skill_tags=["strategic-reflection"],
             )
+            _set_obs_session(sess["id"])
         except Exception:
             logger.exception("Failed to create calibration session")
             return ReflectionResult(success=False, reason="Session creation failed")

@@ -147,8 +147,8 @@ class GenesisEventBus:
                     "message": message,
                     "details": details or None,
                     "session_id": (
-                        details.get("session_id")
-                        or _get_context_session_id()
+                        sid if (sid := details.get("session_id")) is not None
+                        else _get_context_session_id()
                     ) if details else _get_context_session_id(),
                 })
             except asyncio.QueueFull:

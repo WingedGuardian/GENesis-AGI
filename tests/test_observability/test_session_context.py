@@ -68,6 +68,28 @@ class TestAsyncPropagation:
             set_session_id(None)
 
 
+    @pytest.mark.asyncio
+    async def test_sibling_tasks_are_isolated(self):
+        """Setting session_id in one task must not affect a sibling task."""
+        results: dict[str, str | None] = {}
+
+        async def task_a():
+            set_session_id("task-a")
+            await asyncio.sleep(0.01)
+            results["a"] = get_session_id()
+
+        async def task_b():
+            await asyncio.sleep(0.01)
+            results["b"] = get_session_id()
+
+        await asyncio.gather(
+            asyncio.create_task(task_a()),
+            asyncio.create_task(task_b()),
+        )
+        assert results["a"] == "task-a"
+        assert results["b"] is None
+
+
 class TestEmitIntegration:
     @pytest.mark.asyncio
     async def test_emit_uses_contextvar_when_no_explicit_session_id(self):
