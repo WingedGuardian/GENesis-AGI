@@ -1139,14 +1139,11 @@ async def test_memory_recall_drift_fallback_fires_on_sparse_results():
         call_kwargs = mock_retriever.recall.call_args[1]
         assert call_kwargs["expand_query_terms"] is True
     finally:
-        mod._store = old_store
-        mod._db = old_db
-        mod._retriever = old_retriever
-        mod._qdrant = old_qdrant
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
 
 
-async def test_memory_recall_expand_query_terms_defaults_false():
-    """By default, expand_query_terms is False (no expansion)."""
+async def test_memory_recall_expand_query_terms_defaults_true():
+    """By default, expand_query_terms is True (broadens recall)."""
     import genesis.mcp.memory_mcp as mod
 
     mock_retriever = AsyncMock()
@@ -1156,18 +1153,20 @@ async def test_memory_recall_expand_query_terms_defaults_false():
         _make_retrieval_result(mid="c"),
     ]
 
-    old_store, old_db, old_retriever, old_qdrant = (
-        mod._store, mod._db, mod._retriever, mod._qdrant,
-    )
-        with patch.object(drift_mod, "drift_recall",
-                          new_callable=AsyncMock, return_value=drift_results):
-            tools = await _get_tools()
-            results = await tools["memory_recall"].fn(
-                query="test query", limit=10, compact=True,
-            )
-            # Should get drift results (3) instead of sparse (1)
-            assert len(results) == 3
-            assert all(r["source_pipeline"] == "drift" for r in results)
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="test query", limit=10, compact=True,
+        )
+
+        call_kwargs = mock_retriever.recall.call_args[1]
+        assert call_kwargs["expand_query_terms"] is True
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
 
@@ -1203,20 +1202,19 @@ async def test_memory_recall_no_drift_when_results_sufficient():
             include_graph=False,
         )
 
-        call_kwargs = mock_retriever.recall.call_args[1]
-        assert call_kwargs["expand_query_terms"] is False
-    finally:
-        mod._store = old_store
-        mod._db = old_db
-        mod._retriever = old_retriever
-        mod._qdrant = old_qdrant
+        tools = await _get_tools()
+        results = await tools["memory_recall"].fn(
+            query="test query", limit=10, compact=True,
+        )
+        assert len(results) == 3
+
+        # Drift should NOT be called when results are sufficient (>= 3)
         with patch.object(drift_mod, "drift_recall",
                           new_callable=AsyncMock) as mock_drift:
-            tools = await _get_tools()
-            results = await tools["memory_recall"].fn(
+            results2 = await tools["memory_recall"].fn(
                 query="test query", limit=10, compact=True,
             )
-            assert len(results) == 3
+            assert len(results2) == 3
             mock_drift.assert_not_called()
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
