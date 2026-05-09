@@ -18,6 +18,19 @@ def test_slash_effort_high():
     assert r.cleaned_text == "can you help?"
 
 
+def test_slash_effort_xhigh():
+    """Opus 4.7 xhigh tier (CC 2.1.111+) must parse correctly."""
+    r = parser.parse("/effort xhigh investigate this thoroughly")
+    assert r.effort_override == EffortLevel.XHIGH
+    assert r.cleaned_text == "investigate this thoroughly"
+
+
+def test_slash_effort_max():
+    r = parser.parse("/effort max push hard")
+    assert r.effort_override == EffortLevel.MAX
+    assert r.cleaned_text == "push hard"
+
+
 def test_slash_resume():
     r = parser.parse("/resume")
     assert r.resume_requested is True

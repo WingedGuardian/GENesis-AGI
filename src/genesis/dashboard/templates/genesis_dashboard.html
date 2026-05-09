@@ -1363,7 +1363,7 @@
           response_dir: 'Subdirectory pattern where responses are written (excluded from scanning)',
           check_interval_seconds: 'How often (in seconds) to scan the inbox directory for new files',
           batch_size: 'Maximum files to process per scan cycle (1\u201310)',
-          effort: 'Processing depth: low (fast), medium (balanced), or high (thorough)',
+          effort: 'Processing depth: low (fast), medium (balanced), high (thorough), xhigh (Opus 4.7 only), or max',
           timeout_s: 'Max seconds per inbox item processing before timeout',
           // Outreach
           start: 'Quiet hours start \u2014 no outreach before this time (e.g., 22:00)',
@@ -6137,7 +6137,7 @@
                   </div>
                   <select style="margin-left: auto; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                           @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({default_effort: $event.target.value}) })">
-                    <!-- MAX intentionally excluded per user decision -->
+                    <!-- MAX and XHIGH intentionally excluded per user decision (defaults stay at high; xhigh is Opus 4.7 only and reachable via session_set_effort) -->
                     <template x-for="e in ['low', 'medium', 'high']" :key="e">
                       <option :value="e" x-text="e.charAt(0).toUpperCase() + e.slice(1)"
                               :selected="e === ($store.genesisDashboard.egoStatus?.default_effort || 'high')"></option>
