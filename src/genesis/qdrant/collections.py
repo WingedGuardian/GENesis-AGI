@@ -1,8 +1,8 @@
 """Qdrant collection management and vector operations for Genesis v3.
 
 Collections:
-  - episodic_memory: Active memory (episodic + semantic, filtered by memory_type)
-  - knowledge_base: GROUNDWORK — created empty for post-v3 knowledge pipeline
+  - episodic_memory: Active memory (episodic + semantic + references, filtered by memory_type)
+  - knowledge_base: External domain knowledge (ingested docs, web content)
 
 Vector dimensions: 1024 (qwen3-embedding:0.6b-fp16 via Ollama)
 Distance metric: Cosine

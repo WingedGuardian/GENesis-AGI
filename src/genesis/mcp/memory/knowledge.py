@@ -125,6 +125,8 @@ async def _ingest_knowledge_unit(
     tags_json: str | None = None,
     purpose: list[str] | None = None,
     ingestion_source: str | None = None,
+    collection: str = "knowledge_base",
+    memory_type: str = "knowledge",
 ) -> str:
     """MCP-side wrapper around :func:`ingest_knowledge_unit`.
 
@@ -154,6 +156,8 @@ async def _ingest_knowledge_unit(
         tags_json=tags_json,
         purpose=purpose,
         ingestion_source=ingestion_source,
+        collection=collection,
+        memory_type=memory_type,
     )
 
 
@@ -241,11 +245,11 @@ async def knowledge_status(
 # pointers, arbitrary "unique facts the user will need again") lives in
 # knowledge_units with project_type="reference" and domain="reference.{kind}".
 #
-# Semantic search and proactive injection already work end-to-end for these
-# entries via the existing knowledge_recall / memory_proactive paths — adding
-# reference_store is just a thin wrapper that normalizes the body shape and
-# forces memory_class="fact" so references avoid the 0.7x auto-classification
-# penalty designed for generic "see also" pointers.
+# References live in episodic_memory (migrated from knowledge_base) so they
+# surface naturally via memory_recall, reference_lookup, and the proactive hook.
+# reference_store is a thin wrapper that normalizes the body shape and forces
+# memory_class="fact" so references avoid the 0.7x auto-classification penalty
+# designed for generic "see also" pointers.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -394,6 +398,8 @@ async def reference_store(
         memory_class="fact",  # bypass 0.7x auto-reference penalty
         concept=identifier,
         tags_json=tags_json,
+        collection="episodic_memory",
+        memory_type="episodic",
     )
     await _refresh_mirror_safe()
     return unit_id
@@ -442,10 +448,11 @@ async def reference_lookup(
     """Hybrid retrieve reference entries matching a query.
 
     Combines two paths, same pattern as ``knowledge_recall``:
-    1. Vector search via ``HybridRetriever.recall(source="knowledge")`` over
-       the ``knowledge_base`` Qdrant collection — catches semantic matches
+    1. Vector search via ``HybridRetriever.recall(source="episodic")`` over
+       the ``episodic_memory`` Qdrant collection — catches semantic matches
        ("that forum for Ohio State fans" → "ScarletAndRage forum login")
-       that keyword search misses.
+       that keyword search misses. References live in episodic_memory
+       alongside other personal data.
     2. FTS5 keyword search over ``knowledge_fts`` — catches exact token
        matches and structured identifiers.
 
@@ -479,14 +486,15 @@ async def reference_lookup(
         )
     domain_filter: str | None = f"reference.{kind}" if kind else None
 
-    # 1. Vector path — semantic retrieval via HybridRetriever over knowledge_base.
+    # 1. Vector path — semantic retrieval via HybridRetriever over episodic_memory.
+    # References live in episodic_memory (migrated from knowledge_base).
     # Pull extra candidates so the post-filter to project_type=reference
     # doesn't leave us short of the requested limit.
     vector_limit = max(limit * 3, 10)
     vector_hits: list[dict] = []
     try:
         vector_results = await memory_mod._retriever.recall(
-            query, source="knowledge", limit=vector_limit,
+            query, source="episodic", limit=vector_limit,
         )
         for r in vector_results:
             vector_hits.append({
