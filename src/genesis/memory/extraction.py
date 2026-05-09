@@ -281,4 +281,5 @@ def extractions_to_store_kwargs(
         "source_line_range": source_line_range,
         "extraction_timestamp": now_iso,
         "source_pipeline": "harvest",
+        "valid_at": extraction.temporal,
     }

@@ -199,16 +199,43 @@ async def create_metadata(
     memory_class: str = "fact",
     wing: str | None = None,
     room: str | None = None,
+    valid_at: str | None = None,
+    invalid_at: str | None = None,
 ) -> str:
-    """Insert a row into memory_metadata. Returns memory_id."""
+    """Insert a row into memory_metadata. Returns memory_id.
+
+    ``valid_at`` records when the fact became true in the real world
+    (bi-temporal modeling). Defaults to ``created_at`` if not provided.
+    ``invalid_at`` records when the fact stopped being true (NULL = still valid).
+    """
+    resolved_valid_at = valid_at or created_at
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
-        "(memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room),
+        "(memory_id, created_at, collection, confidence, embedding_status, "
+        "memory_class, wing, room, valid_at, invalid_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (memory_id, created_at, collection, confidence, embedding_status,
+         memory_class, wing, room, resolved_valid_at, invalid_at),
     )
     await db.commit()
     return memory_id
+
+
+async def invalidate_memory(
+    db: aiosqlite.Connection,
+    memory_id: str,
+    invalid_at: str,
+) -> bool:
+    """Mark a memory as no longer valid (bi-temporal invalidation).
+
+    Returns True if the memory was found and updated.
+    """
+    cursor = await db.execute(
+        "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
+        (invalid_at, memory_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
