@@ -26,7 +26,7 @@ class ResearchSignal:
     """A piece of information flowing through the pipeline."""
 
     id: str
-    source: str  # e.g., "searxng", "polymarket_api", "reddit"
+    source: str  # e.g., "tinyfish", "polymarket_api", "reddit"
     profile_name: str  # which research profile generated this
     content: str  # the actual data
     url: str | None = None

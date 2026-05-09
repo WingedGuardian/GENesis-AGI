@@ -44,7 +44,7 @@ class WebSearcher:
         # Try Tinyfish (free, cloud, reliable)
         try:
             return await self._search_tinyfish(query, limit)
-        except Exception as exc:
+        except (TimeoutError, OSError, RuntimeError, json.JSONDecodeError, ValueError) as exc:
             logger.warning("Tinyfish search failed (%s), falling back to Brave", exc)
             if self._event_bus:
                 await self._event_bus.emit(
@@ -80,9 +80,14 @@ class WebSearcher:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=self._timeout_s,
-        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._timeout_s,
+            )
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
         if proc.returncode != 0:
             raise RuntimeError(
                 f"tinyfish exited {proc.returncode}: {stderr.decode()[:200]}"

@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, patch
 
-from genesis.surplus.executor import _parse_search_queries, _fetch_search_results
-from genesis.surplus.pipelines import PIPELINES
-from genesis.surplus.types import TaskType, ComputeTier
 from genesis.surplus.brainstorm import _SESSION_TYPE_MAP
-from genesis.web.types import SearchResponse, SearchResult, SearchBackend
-
+from genesis.surplus.executor import _fetch_search_results, _parse_search_queries
+from genesis.surplus.pipelines import PIPELINES
+from genesis.surplus.types import ComputeTier, TaskType
+from genesis.web.types import SearchBackend, SearchResponse, SearchResult
 
 # ── _parse_search_queries ───────────────────────────────────────────
 
@@ -64,12 +64,10 @@ class TestFetchSearchResults:
             backend_used=SearchBackend.BRAVE,
         )
 
-        with patch(
-            "genesis.web.search.WebSearcher",
-        ) as MockSearcher:
-            instance = MockSearcher.return_value
-            instance.search = AsyncMock(return_value=mock_response)
+        mock_searcher = MagicMock()
+        mock_searcher.search = AsyncMock(return_value=mock_response)
 
+        with patch("genesis.web._get_searcher", return_value=mock_searcher):
             output = await _fetch_search_results(["test query"])
 
         assert "test query" in output
@@ -85,12 +83,10 @@ class TestFetchSearchResults:
             error="Backend timeout",
         )
 
-        with patch(
-            "genesis.web.search.WebSearcher",
-        ) as MockSearcher:
-            instance = MockSearcher.return_value
-            instance.search = AsyncMock(return_value=mock_response)
+        mock_searcher = MagicMock()
+        mock_searcher.search = AsyncMock(return_value=mock_response)
 
+        with patch("genesis.web._get_searcher", return_value=mock_searcher):
             output = await _fetch_search_results(["bad query"])
 
         assert "Search failed: Backend timeout" in output
@@ -102,12 +98,10 @@ class TestFetchSearchResults:
             results=[],
         )
 
-        with patch(
-            "genesis.web.search.WebSearcher",
-        ) as MockSearcher:
-            instance = MockSearcher.return_value
-            instance.search = AsyncMock(return_value=mock_response)
+        mock_searcher = MagicMock()
+        mock_searcher.search = AsyncMock(return_value=mock_response)
 
+        with patch("genesis.web._get_searcher", return_value=mock_searcher):
             output = await _fetch_search_results(["obscure query"])
 
         assert "(No results)" in output

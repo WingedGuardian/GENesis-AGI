@@ -50,9 +50,9 @@ def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
 
 async def _fetch_search_results(queries: list[str]) -> str:
     """Fetch web search results for parsed queries via WebSearcher."""
-    from genesis.web.search import WebSearcher
+    from genesis.web import _get_searcher
 
-    searcher = WebSearcher(max_results=5)
+    searcher = _get_searcher()
     parts: list[str] = []
     for i, query in enumerate(queries, 1):
         try:
