@@ -7,6 +7,41 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b6] - 2026-05-09
+
+Memory retrieval gets faster graph traversal, explicit drift control,
+and better observability.
+
+### Added
+
+- **NetworkX graph engine** (#279) --- in-memory graph over 43K+ memory
+  links replaces recursive SQL queries. Enables centrality scoring and
+  shortest-path queries. Falls back to SQL if NetworkX is unavailable.
+- **DRIFT retrieval mode** (#279) --- `memory_recall` gains a `mode`
+  parameter: `"auto"` (default, unchanged behavior), `"standard"`
+  (no drift fallback), `"drift"` (direct 3-phase retrieval).
+- **Recall instrumentation** (#279) --- every `memory_recall` call now
+  logs which pipeline was used (standard, drift, auto→drift) for
+  retrieval quality analysis.
+
+### Fixed
+
+- **Knowledge re-ingestion creates duplicates** (#279) --- the
+  orchestrator now uses idempotent upsert with stale Qdrant cleanup
+  instead of raw insert. Re-ingesting a URL no longer creates orphaned
+  vectors.
+- **DB resilience** (#273) --- awareness tick survives transient SQLite
+  connection failures with automatic recovery and alert deduplication.
+
+### Changed
+
+- **Dashboard call site badges** (#278) --- parallelization indicator
+  shows which call sites run concurrently.
+- **Routing updates** (#274, #277) --- DeepSeek V4 Flash added, GLM 5.1
+  renamed, call site descriptions added to routing config.
+
+---
+
 ## [v3.0b5] - 2026-05-07
 
 Sentinel gets smarter, ego learns its boundaries, and a cascade of
