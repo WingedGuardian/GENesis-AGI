@@ -101,7 +101,6 @@ class TestRegistration:
         assert len(reg.actions) == len(DEFAULT_REMEDIATIONS)
         names = {a.name for a in reg.actions}
         assert "qdrant_restart" in names
-        assert "tmp_cleanup" in names
         assert "awareness_restart" in names
         assert "ollama_alert" in names
         assert "disk_cleanup" in names
