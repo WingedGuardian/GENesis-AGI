@@ -106,7 +106,8 @@ async def test_brainstorm_check_schedules_sessions(db):
     sched, compute = _make_scheduler(db, idle=True)
     with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
         await sched.brainstorm_check()
-    assert await sched._queue.pending_count() == 2
+    # Brainstorm (3): user + self + self_unblock
+    assert await sched._queue.pending_count() == 3
 
 
 async def test_start_and_stop(db):
@@ -118,10 +119,10 @@ async def test_start_and_stop(db):
     assert sched._scheduler.get_job("surplus_brainstorm_check") is not None
     assert sched._scheduler.get_job("surplus_dispatch") is not None
     assert sched._scheduler.get_job("schedule_code_audit") is not None
-    # Brainstorm (2) + code audit (1) + code index (1)
+    # Brainstorm (3) + code audit (1) + code index (1)
     # + maintenance (4) + analytical (1: gap_clustering)
-    # + pipeline (1: prompt_effectiveness step 1) = 10
-    assert await sched._queue.pending_count() == 10
+    # + pipeline (2: prompt_effectiveness + anticipatory_research step 1) = 12
+    assert await sched._queue.pending_count() == 12
     # Stop should not raise
     await sched.stop()
 
@@ -133,10 +134,10 @@ async def test_start_without_code_audits(db):
     assert sched._scheduler.running is True
     # Code audit job should NOT be registered
     assert sched._scheduler.get_job("schedule_code_audit") is None
-    # Brainstorm (2) + code index (1)
+    # Brainstorm (3) + code index (1)
     # + maintenance (4) + analytical (1: gap_clustering)
-    # + pipeline (1: prompt_effectiveness step 1) = 9
-    assert await sched._queue.pending_count() == 9
+    # + pipeline (2: prompt_effectiveness + anticipatory_research step 1) = 11
+    assert await sched._queue.pending_count() == 11
     await sched.stop()
 
 
