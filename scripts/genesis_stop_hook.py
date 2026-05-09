@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: detect resume signals + flag unreviewed code changes.
+"""Stop hook: detect resume signals, giving-up patterns, and unreviewed code.
 
 Runs when Claude finishes responding (via .claude/settings.json Stop hook).
 
@@ -7,7 +7,11 @@ Runs when Claude finishes responding (via .claude/settings.json Stop hook).
    to return to this session later ("let's revisit", "park this", etc.).
    If detected, writes ~/.genesis/last_resume_signal.json.
 
-2. Checks for unreviewed code changes. If found, outputs a reminder that
+2. Checks the assistant's last message for giving-up patterns — phrases that
+   delegate work back to the user instead of exhausting available tools.
+   If detected, outputs a nudge for the next turn.
+
+3. Checks for unreviewed code changes. If found, outputs a reminder that
    gets injected into context for the next turn.
 
 Reads hook input from stdin as JSON:
@@ -81,6 +85,15 @@ def main() -> None:
         except (json.JSONDecodeError, OSError):
             pass
 
+    # Check for giving-up patterns in the assistant's response.
+    # This runs regardless of whether user messages exist — it only
+    # needs the assistant's last message from hook input.
+    assistant_msg = hook_input.get("last_assistant_message", "")
+    _check_giving_up(assistant_msg)
+
+    # Check for unreviewed code changes
+    _check_review_state()
+
     if not last_user_msg:
         return
 
@@ -98,8 +111,41 @@ def main() -> None:
         except OSError:
             pass
 
-    # Check for unreviewed code changes
-    _check_review_state()
+
+# Patterns that suggest the assistant is giving up / delegating work back
+# to the user.  Tight scope to avoid false positives on legitimate
+# delegation ("you'll need to approve the PR" is proper, not giving up).
+_GIVING_UP_PATTERNS = re.compile(
+    r"(?:"
+    r"you(?:'ll| will) need to (?:do |handle |run |transfer |copy |move )"
+    r"|(?:do it|handle it|run it|transfer it|copy it) (?:yourself|manually)"
+    r"|(?:you|the user) (?:can |should |could )(?:do |handle |run |transfer |copy )"
+    r"(?:it |this |that )?(?:yourself|manually|on your)"
+    r"|I (?:can't|cannot|am unable to|don't have) (?:access to|permission to|credentials for|keys for)"
+    r"|(?:you'll|you will) have to (?:do |handle |run |transfer |copy )"
+    r"|not (?:something I can|within my (?:ability|access|scope))"
+    r"|outside (?:my|Genesis'?) (?:scope|ability|access)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _check_giving_up(assistant_message: str) -> None:
+    """Nudge if the assistant appears to delegate a user-assigned task."""
+    if not assistant_message:
+        return
+    # Giving-up phrases appear at the end of responses. Truncate to avoid
+    # running complex regex over 50KB+ assistant messages.
+    tail = assistant_message[-2000:] if len(assistant_message) > 2000 else assistant_message
+    if not _GIVING_UP_PATTERNS.search(tail):
+        return
+    print(
+        "SELF-CHECK: Your last response may be delegating work back to the user. "
+        "Before giving up, verify: (1) Did you check reference_lookup and "
+        "reference_network_topology.md? (2) Did you read proactive memory "
+        "injections? (3) Did you try all available tools and credentials? "
+        "Genesis way: exhaust all options before escalating to the user."
+    )
 
 
 def _check_review_state() -> None:

@@ -568,7 +568,21 @@ def _rrf_fusion(
                 content_map[mid] = r
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
+
+    # Dynamic count: rank 0 always surfaces; rank 1-2 only if they meet
+    # a minimum RRF score threshold.  At k=60, single-source rank 0 scores
+    # ~0.016 so 0.015 filters code-index-only results (0.5x weight = 0.008)
+    # and very weak multi-source hits.  Tune upward to ~0.025 if rank 2-3
+    # results are still noisy in practice.
+    _MIN_RRF_SCORE_RANK2 = 0.015
+    results = []
+    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS]):
+        if mid not in content_map:
+            continue
+        if i > 0 and score < _MIN_RRF_SCORE_RANK2:
+            break  # Remaining results are even lower — stop
+        results.append(content_map[mid])
+    return results
 
 
 def _format_age(iso_str: str) -> str:
@@ -935,11 +949,12 @@ async def _run(prompt: str, session_id: str = "") -> None:
     keywords = _extract_keywords(prompt)
 
     # ── Session intent trail (runs on every message, even short ones) ─
+    # Buffer these — memories print first (more actionable), then metadata.
+    _deferred_lines: list[str] = []
     try:
         trail_line = _update_and_format_trail(session_id, keywords, prompt)
         if trail_line:
-            print(trail_line)
-            sys.stdout.flush()
+            _deferred_lines.append(trail_line)
     except Exception:
         pass  # Intent trail must never block the hook
 
@@ -947,8 +962,7 @@ async def _run(prompt: str, session_id: str = "") -> None:
     try:
         activity = _extract_genesis_summary(session_id)
         if activity:
-            print(f"[Recent activity] {activity}")
-            sys.stdout.flush()
+            _deferred_lines.append(f"[Recent activity] {activity}")
     except Exception:
         pass  # Never block
 
@@ -1038,6 +1052,13 @@ async def _run(prompt: str, session_id: str = "") -> None:
         if output:
             print(output)
             sys.stdout.flush()
+
+    # Print deferred metadata AFTER memory results (memories are more
+    # actionable and should appear first in the injection block).
+    for line in _deferred_lines:
+        print(line)
+    if _deferred_lines:
+        sys.stdout.flush()
 
     # Post-output: increment retrieved_count (fire-and-forget, after flush)
     if fused:

@@ -136,7 +136,7 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); BG=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r \".run_in_background // false\" 2>/dev/null); if [ \"$BG\" = \"true\" ] && echo \"$CMD\" | grep -qF \"|\"; then echo \"BLOCKED: Piped commands with run_in_background produce empty output.\" >&2; echo \"Run without pipes, or run in foreground.\" >&2; exit 2; fi; if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac'"
+                        "command": "bash -c 'CMD=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r .command 2>/dev/null); BG=$(echo \"$CLAUDE_TOOL_INPUT\" | jq -r \".run_in_background // false\" 2>/dev/null); if [ \"$BG\" = \"true\" ] && echo \"$CMD\" | grep -qF \"|\"; then echo \"BLOCKED: Piped commands with run_in_background produce empty output.\" >&2; echo \"Run without pipes, or run in foreground.\" >&2; exit 2; fi; if echo \"$CMD\" | grep -qE \"pip install.*((-e|--editable) +[^ ]*worktree)\"; then echo \"BLOCKED: pip install -e to a worktree redirects the ENTIRE system genesis imports.\" >&2; echo \"This crashes the live bridge. Use PYTHONPATH instead:\" >&2; echo \"  PYTHONPATH=/path/to/worktree/src pytest tests/\" >&2; exit 2; fi; case \"$CMD\" in *\"git push\"*\"--force\"*|*\"git push\"*\"-f\"*) echo \"BLOCKED: Force push not allowed. Use a PR.\" >&2; exit 2;; *\"git reset --hard\"*) echo \"BLOCKED: git reset --hard destroys uncommitted work. Use git stash or ask the user.\" >&2; exit 2;; *\"git clean -f\"*|*\"git clean -fd\"*) echo \"BLOCKED: git clean removes untracked files permanently. Ask the user first.\" >&2; exit 2;; *\"nohup\"*\"run_ui\"*|*\"nohup\"*\"bridge\"*|*\"nohup\"*\"genesis\"*) echo \"BLOCKED: AZ and bridge must run via systemd, not nohup.\" >&2; echo \"Use: systemctl --user restart genesis-az\" >&2; echo \"  or: systemctl --user restart genesis-bridge\" >&2; exit 2;; *\"git worktree remove\"*\"--force\"*|*\"git worktree remove\"*\"-f \"*) echo \"BLOCKED: git worktree remove --force destroys uncommitted work.\" >&2; echo \"Use git worktree remove (without --force) instead.\" >&2; exit 2;; esac; if echo \"$CMD\" | grep -qE \"sqlite3.*genesis\\.db\"; then echo \"WARNING: Direct sqlite3 access to genesis.db detected. Use MCP tools (db_schema, health_status) or genesis.db.crud modules instead. Raw SQL risks write contention and bypasses WAL safety. Proceed only if read-only query.\" >&2; fi'"
                     }
                 ]
             },
@@ -157,6 +157,16 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/protected_paths_guard.py",
                         "timeout": 2000
+                    }
+                ]
+            },
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/credential_surface_hook.py",
+                        "timeout": 500
                     }
                 ]
             },
