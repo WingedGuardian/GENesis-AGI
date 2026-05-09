@@ -251,7 +251,8 @@ async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
     """Get a single memory by ID, joining FTS5 content with metadata."""
     cursor = await db.execute(
         "SELECT f.memory_id, f.content, f.source_type, f.tags, f.collection, "
-        "       m.created_at, m.confidence, m.embedding_status "
+        "       m.created_at, m.confidence, m.embedding_status, "
+        "       m.valid_at, m.invalid_at "
         "FROM memory_fts f "
         "LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id "
         "WHERE f.memory_id = ?",
@@ -269,6 +270,8 @@ async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
         "created_at": row[5],
         "confidence": row[6],
         "embedding_status": row[7],
+        "valid_at": row[8],
+        "invalid_at": row[9],
     }
 
 

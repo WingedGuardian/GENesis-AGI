@@ -308,6 +308,9 @@ class MemoryStore:
         results["links_deleted"] = await memory_links_crud.delete_by_memory(
             self._db, memory_id=memory_id,
         )
+        if results["links_deleted"]:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
 
         # 5. Cascade: pending_embeddings
         results["pending_deleted"] = await pending_embeddings.delete_by_memory(

@@ -49,7 +49,7 @@ class TraversalResult:
 
 # ─── NetworkX cache ───────────────────────────────────────────────────────────
 
-_nx_graph: nx.DiGraph | None = None  # type: ignore[name-defined]
+_nx_graph: object | None = None  # nx.DiGraph when _NX_AVAILABLE
 _nx_dirty: bool = True
 
 
@@ -63,7 +63,7 @@ def invalidate_graph_cache() -> None:
     _nx_dirty = True
 
 
-async def _ensure_graph(db: aiosqlite.Connection) -> nx.DiGraph:  # type: ignore[name-defined]
+async def _ensure_graph(db: aiosqlite.Connection) -> object:
     """Lazy-load the graph from memory_links, rebuild if dirty."""
     global _nx_graph, _nx_dirty
 
@@ -100,7 +100,7 @@ async def _ensure_graph(db: aiosqlite.Connection) -> nx.DiGraph:  # type: ignore
 
 
 def _bfs_with_strength(
-    G: nx.DiGraph,  # type: ignore[name-defined]
+    G: object,  # nx.DiGraph
     root_id: str,
     *,
     max_depth: int,
@@ -305,7 +305,7 @@ async def shortest_path(
 
 
 def _cluster_nx(
-    G: nx.DiGraph,  # type: ignore[name-defined]
+    G: object,  # nx.DiGraph
     root_id: str,
     max_depth: int,
     min_strength: float,

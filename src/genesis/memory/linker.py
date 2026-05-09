@@ -71,8 +71,6 @@ class MemoryLinker:
                 strength=score,
                 created_at=now,
             )
-            from genesis.memory.graph import invalidate_graph_cache
-            invalidate_graph_cache()
 
             links.append(
                 LinkRecord(
@@ -84,6 +82,9 @@ class MemoryLinker:
                 )
             )
 
+        if links:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
         return links
 
     async def count_links(self, memory_id: str) -> int:
@@ -148,8 +149,6 @@ class MemoryLinker:
                     strength=0.7,
                     created_at=now,
                 )
-                from genesis.memory.graph import invalidate_graph_cache
-                invalidate_graph_cache()
                 links.append(
                     LinkRecord(
                         source_id=memory_id,
@@ -167,6 +166,9 @@ class MemoryLinker:
                     exc_info=True,
                 )
 
+        if links:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
         return links
 
     async def _find_entity_by_name(self, entity_name: str) -> str | None:
