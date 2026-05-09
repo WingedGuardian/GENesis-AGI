@@ -84,6 +84,7 @@ async def _try_tinyfish_fetch(url: str, max_chars: int) -> dict | None:
                 "error": None,
                 "latency_ms": round(item.get("latency_ms", 0), 1),
             }
+        logger.debug("TinyFish returned empty results for %s", url)
     except Exception as exc:
         logger.debug("TinyFish fetch failed for %s: %s", url, exc)
     return None
@@ -105,7 +106,7 @@ async def _try_tinyfish_search(query: str, max_results: int) -> dict | None:
                 "title": r.get("title", ""),
                 "url": r.get("url", ""),
                 "snippet": r.get("snippet", ""),
-                "score": 1.0 - (r.get("position", 1) - 1) * 0.1,
+                "score": max(0.0, 1.0 - (r.get("position", 1) - 1) * 0.1),
             }
             for r in raw_results
         ]
@@ -532,6 +533,23 @@ async def web_agent(
 
     if not os.environ.get("API_KEY_TINYFISH"):
         return {"error": "web_agent requires API_KEY_TINYFISH"}
+
+    # Budget check before execution — agent calls cost $0.015/step
+    try:
+        import aiosqlite
+
+        from genesis.env import genesis_db_path
+        from genesis.routing.cost_tracker import CostTracker
+
+        async with aiosqlite.connect(genesis_db_path()) as db:
+            tracker = CostTracker(db)
+            status = await tracker.check_budget()
+            if hasattr(status, "value"):
+                status = status.value
+            if status == "EXCEEDED":
+                return {"error": "Daily budget exceeded. web_agent costs ~$0.015/step."}
+    except Exception as exc:
+        logger.debug("Budget check skipped: %s", exc)
 
     start = time.monotonic()
     try:
