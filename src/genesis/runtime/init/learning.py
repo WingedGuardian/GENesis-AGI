@@ -489,12 +489,16 @@ async def init(rt: GenesisRuntime) -> None:
                 return
             try:
                 from genesis.db.crud.cc_sessions import reap_stale
+                from genesis.db.crud.session_heartbeats import cleanup_stale
 
                 cutoff = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
                 reaped = await reap_stale(rt._db, older_than=cutoff)
+                cleaned = await cleanup_stale(rt._db)
                 rt.record_job_success("session_reaper")
                 if reaped:
                     logger.info("Session reaper: marked %d stale sessions as completed", reaped)
+                if cleaned:
+                    logger.info("Session reaper: cleaned %d stale heartbeats", cleaned)
             except Exception as exc:
                 rt.record_job_failure("session_reaper", str(exc))
                 logger.exception("Session reaper failed")
