@@ -18,7 +18,6 @@ mail_monitor:
   max_retries: 5
   imap_timeout_s: 60
   max_emails_per_run: 100
-  timezone: "UTC"
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
         f.write(yaml_content)
@@ -29,7 +28,6 @@ mail_monitor:
     assert cfg.cron_expression == "0 6 * * 1"
     assert cfg.batch_size == 5
     assert cfg.model == "opus"
-    assert cfg.timezone == "UTC"
 
 
 def test_load_defaults_on_empty():
