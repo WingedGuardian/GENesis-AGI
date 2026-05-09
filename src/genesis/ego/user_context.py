@@ -844,6 +844,7 @@ class UserEgoContextBuilder:
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
             '  "follow_ups": ["NEW open thread (not already tracked)"],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
+            '  "communication_decision": "send_digest|urgent_notify|stay_quiet",\n'
             '  "morning_report": "only if this is a morning trigger"\n'
             "}\n"
             "```\n\n"
