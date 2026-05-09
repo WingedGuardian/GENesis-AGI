@@ -56,6 +56,7 @@ class EgoContextBuilder:
         sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
         sections.append(await self._proposal_history_section())
+        sections.append(await self._intervention_history_section())
         sections.append(await self._user_corrections_section())
         sections.append(await self._output_contract_section())
 
@@ -368,6 +369,39 @@ class EgoContextBuilder:
             )
 
         lines.append("")
+        return "\n".join(lines)
+
+    async def _intervention_history_section(self) -> str:
+        """Recent intervention outcomes — what happened after proposals resolved."""
+        lines = ["## Intervention History (7d)\n"]
+
+        try:
+            from genesis.db.crud import intervention_journal as journal_crud
+
+            resolved = await journal_crud.recent_resolved(self._db, days=7, limit=10)
+            pending = await journal_crud.unresolved_count(self._db)
+        except Exception:
+            lines.append("*No intervention data available.*\n")
+            return "\n".join(lines)
+
+        if not resolved and not pending:
+            lines.append("*No interventions recorded yet.*\n")
+            return "\n".join(lines)
+
+        if resolved:
+            lines.append("| Action | Expected | Outcome | Status |")
+            lines.append("|--------|----------|---------|--------|")
+            for entry in resolved:
+                action = entry["action_type"]
+                expected = (entry["expected_outcome"] or "—")[:60].replace("\n", " ").replace("|", "/")
+                actual = (entry["actual_outcome"] or "—")[:60].replace("\n", " ").replace("|", "/")
+                status = entry["outcome_status"]
+                lines.append(f"| {action} | {expected} | {actual} | {status} |")
+            lines.append("")
+
+        if pending:
+            lines.append(f"*{pending} proposals pending resolution.*\n")
+
         return "\n".join(lines)
 
     async def _user_corrections_section(self) -> str:
