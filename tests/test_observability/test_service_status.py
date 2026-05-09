@@ -11,7 +11,6 @@ import pytest
 from genesis.observability.service_status import (
     _load_watchdog_state,
     collect_service_status,
-    collect_tmpfs_usage,
     compute_uptime_seconds,
     parse_systemd_timestamp,
     probe_qdrant_collections,
@@ -121,14 +120,6 @@ class TestCollectServiceStatus:
             result = collect_service_status()
         assert result["watchdog"]["in_backoff"] is True
         assert result["watchdog"]["consecutive_failures"] == 2
-
-
-class TestCollectTmpfsUsage:
-    def test_returns_free_pct(self):
-        result = collect_tmpfs_usage()
-        assert "free_pct" in result
-        assert isinstance(result["free_pct"], float)
-        assert 0 <= result["free_pct"] <= 100
 
 
 class TestProbeQdrantCollections:

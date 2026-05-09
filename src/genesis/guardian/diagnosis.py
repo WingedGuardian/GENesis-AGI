@@ -174,8 +174,8 @@ can cause catastrophic damage:
   to the worktree path and crashes the bridge.
 - **Always validate pgid > 1 before `os.killpg()`** — `int(AsyncMock().pid)`
   returns 1 in Python 3.12. Sending a signal to pgid 1 kills ALL processes.
-- **/tmp inside the container is a 512MB tmpfs** — filling it kills CC's shell
-  across ALL sessions. Use `~/tmp/` for transient files.
+- **/tmp shares the root filesystem** — avoid accumulating large temp files.
+  Use `~/tmp/` for transient files.
 - **Never kill the genesis-server process directly** — always use
   `systemctl --user restart genesis-server`. Direct kills leave the lock file.
 - **Server management is systemd only** — never use `nohup` or bare
@@ -205,7 +205,7 @@ Run these via Bash:
 - `incus exec {container_name} -- su - ubuntu -c "journalctl --user -n 200 --no-pager"` — Read recent logs
 - `incus exec {container_name} -- su - ubuntu -c "cat /sys/fs/cgroup/memory.current"` — Check memory
 - `incus exec {container_name} -- su - ubuntu -c "df -h"` — Check disk
-- `incus exec {container_name} -- su - ubuntu -c "df -h /tmp"` — Check /tmp (512MB tmpfs)
+- `incus exec {container_name} -- su - ubuntu -c "df -h /tmp"` — Check /tmp usage
 - `incus exec {container_name} -- su - ubuntu -c "ps aux --sort=-%mem | head -20"` — Top processes
 - `incus exec {container_name} -- su - ubuntu -c "cd ~/genesis && git log --oneline -5"` — Recent commits
 - `incus exec {container_name} -- su - ubuntu -c "cd ~/genesis && git diff --stat"` — Uncommitted changes

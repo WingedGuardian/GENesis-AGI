@@ -265,7 +265,7 @@ genesis-watchdog.timer (systemd, 60s)
 ```
 Awareness tick fires
   → Run health probes: probe_db(), probe_qdrant(), probe_ollama(), probe_scheduler()
-  → Run filesystem probes: probe_tmp(), probe_disk()
+  → Run filesystem probes: probe_disk()
   → StatusFileWriter.write()              # Existing: updates status.json
   → RemediationRegistry.check_and_remediate(probe_results)
     → For each registered action:
@@ -284,28 +284,6 @@ Awareness tick fires
 ### 4.4 New Health Probes
 
 Two new probes to be added to `src/genesis/observability/health.py`:
-
-**`probe_tmp()`** — Filesystem probe for `/tmp` (512M tmpfs).
-
-```python
-async def probe_tmp(
-    path: str = "/tmp",
-    threshold_pct: float = 80.0,
-    *,
-    clock=None,
-) -> ProbeResult:
-    """Probe /tmp filesystem usage via os.statvfs()."""
-    stat = os.statvfs(path)
-    used_pct = (1 - stat.f_bavail / stat.f_blocks) * 100
-    status = ProbeStatus.HEALTHY if used_pct < threshold_pct else ProbeStatus.DEGRADED
-    return ProbeResult(
-        name="tmp_fs",
-        status=status,
-        latency_ms=0.0,
-        message=f"{used_pct:.0f}% used",
-        details={"used_pct": round(used_pct, 1), "path": path},
-    )
-```
 
 **`probe_disk()`** — Root filesystem probe.
 

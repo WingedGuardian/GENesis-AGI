@@ -31,7 +31,6 @@ class OutreachConfig:
     engagement_timeout_hours: int
     engagement_poll_minutes: int
     immediate_escalation_alerts: tuple[str, ...] = (
-        "infra:tmpfs_low",
         "infra:disk_low",
         "infra:container_memory_high",
         "cc:quota_exhausted",
@@ -61,7 +60,6 @@ _DEFAULTS = OutreachConfig(
     engagement_timeout_hours=24,
     engagement_poll_minutes=60,
     immediate_escalation_alerts=(
-        "infra:tmpfs_low",
         "infra:disk_low",
         "infra:container_memory_high",
         "cc:quota_exhausted",

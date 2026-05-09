@@ -31,7 +31,7 @@ data and signal history. DO NOT stop at that data — investigate:
 - `incus exec genesis -- su - ubuntu -c "journalctl --user -n 200 --no-pager"` — Read logs
 - `incus exec genesis -- su - ubuntu -c "ps aux --sort=-%mem | head -20"` — Top processes
 - `incus exec genesis -- su - ubuntu -c "df -h"` — Disk usage
-- `incus exec genesis -- su - ubuntu -c "df -h /tmp"` — /tmp usage (512MB tmpfs)
+- `incus exec genesis -- su - ubuntu -c "df -h /tmp"` — /tmp usage (on root filesystem)
 - `incus exec genesis -- su - ubuntu -c "cat /sys/fs/cgroup/memory.current"` — Memory
 - `incus exec genesis -- su - ubuntu -c "cd ~/genesis && git log --oneline -5"` — Recent commits
 - `incus info genesis` — Container status

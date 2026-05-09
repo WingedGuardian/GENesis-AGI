@@ -59,7 +59,6 @@ health_alerts:
   # NOTE: service:bridge_down is intentionally absent — if the bridge is dead,
   # the Telegram adapter is also dead, so the alert can never be delivered.
   immediate_escalation:
-    - "infra:tmpfs_low"
     - "infra:disk_low"
     - "infra:container_memory_high"
     - "cc:quota_exhausted"

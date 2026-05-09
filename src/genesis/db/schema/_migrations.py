@@ -1041,6 +1041,13 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN memory_basis TEXT DEFAULT ''",
         "ego_proposals.memory_basis")
 
+    # Ego proposals: fix CHECK constraint to include 'tabled'/'withdrawn'.
+    # Migration 0007 was bypassed because the column additions above ran first,
+    # causing 0007's idempotency check (``if 'rank' in cols``) to skip the
+    # table rebuild.  This defensive path ensures the constraint is correct
+    # even if the versioned migration (0012) hasn't run yet.
+    await _migrate_ego_proposals_status_check(db)
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.
@@ -1096,6 +1103,87 @@ async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
         with contextlib.suppress(Exception):
             await db.execute("DROP TABLE IF EXISTS cognitive_state_new")
         logger.error("cognitive_state CHECK constraint migration failed", exc_info=True)
+
+
+async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
+    """Rebuild ego_proposals if CHECK constraint lacks 'tabled'/'withdrawn'.
+
+    SQLite doesn't support ALTER CHECK — must rebuild the table.
+    Idempotent: skips if the constraint already includes the new statuses.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='ego_proposals'"
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return  # Table doesn't exist yet (fresh install)
+        ddl = row[0] or ""
+        if "'tabled'" in ddl and "'withdrawn'" in ddl:
+            return  # Already up to date
+
+        await db.execute("DROP TABLE IF EXISTS ego_proposals_rebuild")
+        await db.execute("""
+            CREATE TABLE ego_proposals_rebuild (
+                id              TEXT PRIMARY KEY,
+                action_type     TEXT NOT NULL,
+                action_category TEXT NOT NULL DEFAULT '',
+                content         TEXT NOT NULL,
+                rationale       TEXT NOT NULL DEFAULT '',
+                confidence      REAL NOT NULL DEFAULT 0.0,
+                urgency         TEXT NOT NULL DEFAULT 'normal'
+                    CHECK (urgency IN ('low', 'normal', 'high', 'critical')),
+                alternatives    TEXT NOT NULL DEFAULT '',
+                status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'rejected',
+                                      'expired', 'executed', 'failed',
+                                      'tabled', 'withdrawn')),
+                user_response   TEXT,
+                cycle_id        TEXT,
+                batch_id        TEXT,
+                created_at      TEXT NOT NULL,
+                resolved_at     TEXT,
+                expires_at      TEXT,
+                rank            INTEGER,
+                execution_plan  TEXT,
+                recurring       INTEGER DEFAULT 0,
+                memory_basis    TEXT DEFAULT ''
+            )
+        """)
+        await db.execute("""
+            INSERT INTO ego_proposals_rebuild
+                (id, action_type, action_category, content, rationale,
+                 confidence, urgency, alternatives, status, user_response,
+                 cycle_id, batch_id, created_at, resolved_at, expires_at,
+                 rank, execution_plan, recurring, memory_basis)
+            SELECT
+                id, action_type, action_category, content, rationale,
+                confidence, urgency, alternatives, status, user_response,
+                cycle_id, batch_id, created_at, resolved_at, expires_at,
+                rank, execution_plan, recurring, memory_basis
+            FROM ego_proposals
+        """)
+        await db.execute("DROP TABLE ego_proposals")
+        await db.execute(
+            "ALTER TABLE ego_proposals_rebuild RENAME TO ego_proposals"
+        )
+        # Recreate indexes
+        for idx_sql in [
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_status ON ego_proposals(status)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_created ON ego_proposals(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_cycle ON ego_proposals(cycle_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_category ON ego_proposals(action_category, status)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
+        ]:
+            await db.execute(idx_sql)
+        await db.commit()
+        logger.info("ego_proposals table rebuilt with 'tabled'/'withdrawn' statuses")
+    except Exception:
+        with contextlib.suppress(Exception):
+            await db.execute("DROP TABLE IF EXISTS ego_proposals_rebuild")
+        logger.error("ego_proposals CHECK constraint migration failed", exc_info=True)
 
 
 async def _migrate_backfill_memory_metadata(db: aiosqlite.Connection) -> None:

@@ -356,19 +356,6 @@ DEFAULT_REMEDIATIONS: list[RemediationAction] = [
         max_attempts=3,
     ),
     RemediationAction(
-        name="tmp_cleanup",
-        probe_name="tmp_usage",
-        condition="/tmp usage exceeds 80%",
-        command=[
-            "bash", "-c",
-            'find /tmp -maxdepth 1 -type f \\( -name "claude-*" -o -name ".claude-*" \\) -mmin +60 -delete',
-        ],
-        governance_level=2,
-        reversible=True,
-        cooldown_s=600,
-        max_attempts=5,
-    ),
-    RemediationAction(
         name="awareness_restart",
         probe_name="awareness_tick",
         condition="Awareness loop heartbeat stale >15min",
