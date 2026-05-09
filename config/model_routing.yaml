@@ -448,12 +448,12 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
-    - openrouter-deepseek-v4-flash
     - cerebras-qwen
     - groq-free
     - gemini-free
     - mistral-large-free
     - openrouter-free
+    - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: background
     description: "Knowledge pipeline — distill raw content into structured knowledge units"
