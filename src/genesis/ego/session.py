@@ -256,6 +256,14 @@ class EgoSession:
         # 6. Parse output
         parsed = self._parse_output(output.text)
 
+        # 6b. If focus was sanitized, try previous legitimate focus as fallback
+        if parsed and parsed.get("_focus_violation"):
+            prev = await ego_crud.get_state(
+                self._db, self._focus_summary_key,
+            )
+            if prev and not _BEHAVIORAL_FOCUS_RE.search(prev):
+                parsed["focus_summary"] = prev
+
         # 7. Store cycle
         focus = parsed.get("focus_summary", "") if parsed else ""
         proposals_json = json.dumps(parsed.get("proposals", [])) if parsed else "[]"
@@ -862,18 +870,34 @@ _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 # beneath the prompt guardrails in EGO_SESSION.md.
 _BEHAVIORAL_FOCUS_RE = re.compile(
     r"(?i)"
-    r"(?:holding\s+back|stepping\s+back|standing\s+down|lying\s+low"
+    # Self-referential behavioral states (ego is the implicit subject)
+    r"(?:^holding\s+back"                                 # "Holding back — ..."
+    r"|^stepping\s+back"                                  # "Stepping back while ..."
+    r"|^standing\s+down"                                  # "Standing down until ..."
+    r"|^lying\s+low"                                      # "Lying low during ..."
+    r"|^staying\s+(?:out|quiet)"                          # "Staying quiet while ..."
+    r"|^backing\s+off"                                    # "Backing off — proposals ignored"
+    # Waiting/pausing with user-referencing context
     r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
     r"(?:user|jay|he|she|them|they|surface|engage|return)"
-    r"|pausing\s+(?:proactive|proposal|work|activity)"
-    r"|quiet\s+mode|(?:^|\W)dormant(?:\W|$)|(?:^|\W)fallow(?:\W|$)"
-    r"|hibernat(?:e|ing)|no\s+proposals?\s+(?:until|for\s+now)"
+    r"|^pausing\s+(?:proactive|proposal|work|activity)"
+    # Explicit dormancy keywords (only when self-describing)
+    r"|(?:going|entering|in|self-)\s*dormant"
+    r"|(?:going|entering|in)\s+fallow"
+    r"|^hibernating"
+    # Proposal suppression
+    r"|no\s+proposals?\s+(?:until|for\s+now)"
     r"|until\s+\w+\s+surfaces?"
-    r"|letting\s+.*breathe|giving\s+.*space"
-    r"|staying\s+(?:out|quiet)|backing\s+off"
-    r"|not\s+(?:proposing|intervening|acting)"
-    r"|observing\s+(?:only|quietly)|passive\s+(?:mode|watch)"
-    r"|minimal\s+engagement|reduced\s+activity)"
+    # Self-suppression with user context
+    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
+    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
+    # Explicit non-action
+    r"|^not\s+(?:proposing|intervening|acting)"
+    r"|^observing\s+(?:only|quietly)"
+    r"|^passive\s+(?:mode|watch)"
+    r"|^minimal\s+engagement"
+    r"|^reduced\s+activity"
+    r"|quiet\s+mode)"
 )
 
 

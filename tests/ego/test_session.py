@@ -599,6 +599,13 @@ class TestFocusSanitization:
         "memory pipeline performance audit",
         "waiting for API rate limit to reset",
         "observing provider latency patterns across regions",
+        # Reviewer edge cases: technical phrases that happen to contain
+        # behavioral keywords but in non-behavioral context
+        "investigating a dormant service restart",
+        "giving database space for vacuum",
+        "letting the CI pipeline breathe between runs",
+        "analyzing why users are not proposing changes",
+        "reviewing the fallow period scheduler code",
     ])
     def test_legitimate_focus_accepted(self, focus):
         sanitized, violated = _sanitize_focus_summary(focus)
@@ -616,6 +623,31 @@ class TestFocusSanitization:
         sanitized, violated = _sanitize_focus_summary("Holding back")
         assert violated is True
         assert sanitized == "general system awareness"
+
+    @pytest.mark.parametrize("focus", [
+        # These are legitimate English but start with behavioral verbs
+        # where the ego is the implicit subject.  Accepted as known false
+        # positives — the prompt is the primary defense, and these are
+        # extremely unlikely as real ego focus summaries.
+        "stepping back to understand the architecture",
+        "backing off retry rate for API calls",
+        "hibernating containers need restart",
+        "reduced activity in logs after midnight",
+        "observing only errors from the health check",
+        "minimal engagement metrics for outreach post",
+        "passive mode detection in firewall rules",
+        "not acting on stale alerts yet",
+    ])
+    def test_known_false_positives(self, focus):
+        """Edge cases: behavioral verb at start, but non-behavioral intent.
+
+        Accepted as false positives because:
+        1. The ego is prompted to use topical phrasing, not behavioral verbs
+        2. The consequence is a fallback to previous focus, not data loss
+        3. Violations are logged as observations for pattern review
+        """
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is True  # Known false positive
 
     def test_validate_output_sanitizes_focus(self):
         """_validate_output catches behavioral focus and sets violation flags."""

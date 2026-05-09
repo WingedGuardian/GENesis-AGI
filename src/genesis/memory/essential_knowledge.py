@@ -198,18 +198,30 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
 # from memory → ego).  Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
 _BEHAVIORAL_FOCUS_RE = re.compile(
     r"(?i)"
-    r"(?:holding\s+back|stepping\s+back|standing\s+down|lying\s+low"
+    # Self-referential behavioral states (ego is the implicit subject).
+    # Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
+    r"(?:^holding\s+back"
+    r"|^stepping\s+back"
+    r"|^standing\s+down"
+    r"|^lying\s+low"
+    r"|^staying\s+(?:out|quiet)"
+    r"|^backing\s+off"
     r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
     r"(?:user|jay|he|she|them|they|surface|engage|return)"
-    r"|pausing\s+(?:proactive|proposal|work|activity)"
-    r"|quiet\s+mode|(?:^|\W)dormant(?:\W|$)|(?:^|\W)fallow(?:\W|$)"
-    r"|hibernat(?:e|ing)|no\s+proposals?\s+(?:until|for\s+now)"
+    r"|^pausing\s+(?:proactive|proposal|work|activity)"
+    r"|(?:going|entering|in|self-)\s*dormant"
+    r"|(?:going|entering|in)\s+fallow"
+    r"|^hibernating"
+    r"|no\s+proposals?\s+(?:until|for\s+now)"
     r"|until\s+\w+\s+surfaces?"
-    r"|letting\s+.*breathe|giving\s+.*space"
-    r"|staying\s+(?:out|quiet)|backing\s+off"
-    r"|not\s+(?:proposing|intervening|acting)"
-    r"|observing\s+(?:only|quietly)|passive\s+(?:mode|watch)"
-    r"|minimal\s+engagement|reduced\s+activity)"
+    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
+    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
+    r"|^not\s+(?:proposing|intervening|acting)"
+    r"|^observing\s+(?:only|quietly)"
+    r"|^passive\s+(?:mode|watch)"
+    r"|^minimal\s+engagement"
+    r"|^reduced\s+activity"
+    r"|quiet\s+mode)"
 )
 
 
