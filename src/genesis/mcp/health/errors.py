@@ -276,7 +276,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
     disk = snap.get("infrastructure", {}).get("disk", {})
     free_pct = disk.get("free_pct")
-    if free_pct is not None and free_pct < 10:
+    if free_pct is not None and free_pct < 15:
         alert_id = "infra:disk_low"
         alerts.append({
             "id": alert_id,
