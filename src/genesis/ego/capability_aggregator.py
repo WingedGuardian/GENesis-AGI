@@ -161,7 +161,6 @@ class _DomainAccumulator:
 
         weighted_sum = sum(rate * n for _, rate, n in self.signals)
         confidence = round(weighted_sum / total_weight, 3)
-        total_samples = sum(n for _, _, n in self.signals)
 
         # Build evidence summary
         parts = []
@@ -172,7 +171,7 @@ class _DomainAccumulator:
         return {
             "domain": self.domain,
             "confidence": confidence,
-            "sample_size": total_samples,
+            "sample_size": total_weight,
             "trend": "stable",  # trend requires historical data; start with stable
             "evidence": evidence,
         }
