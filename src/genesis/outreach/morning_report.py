@@ -506,6 +506,9 @@ class MorningReportGenerator:
             content = obs["content"][:200].replace("\n", " ")
             lines.append(f"- {badge} **{prio}**: {content}")
 
+        # Mark surfaced during assembly (before delivery confirmation).
+        # Trade-off: if delivery fails, these observations won't re-surface.
+        # Acceptable for v1 — the dashboard can always show them.
         ids = [obs["id"] for obs in observations]
         now = datetime.now(UTC).isoformat()
         await mark_surfaced(self._db, ids, now)

@@ -455,6 +455,8 @@ async def get_unsurfaced(
     Results are ordered by priority weight (critical > high > medium)
     then by creation time descending (newest first).
     """
+    if not priority_filter:
+        return []
     prio_placeholders = ",".join("?" for _ in priority_filter)
     sql = (
         "SELECT id, source, type, category, content, priority, created_at "
@@ -473,7 +475,7 @@ async def get_unsurfaced(
         "   WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
         "   WHEN 'medium' THEN 2 ELSE 3 END, "
         " created_at DESC "
-        f"LIMIT {limit}"
+        f" LIMIT {limit}"
     )
     cursor = await db.execute(sql, params)
     rows = await cursor.fetchall()
