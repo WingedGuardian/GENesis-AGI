@@ -66,4 +66,4 @@ async def up(db: aiosqlite.Connection) -> None:
         "ON eval_snapshots(dimension, period_end)"
     )
 
-    await db.commit()
+    # Runner manages the transaction — do not call db.commit() here.
