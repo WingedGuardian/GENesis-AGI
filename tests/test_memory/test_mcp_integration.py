@@ -98,7 +98,7 @@ async def test_memory_recall_delegates(mock_deps, tools):
     assert results[0]["memory_id"] == "m1"
     memory_mcp._retriever.recall.assert_awaited_once_with(
         "query", source="both", limit=5, min_activation=0.0,
-        wing=None, room=None,
+        wing=None, room=None, expand_query_terms=True,
     )
 
 

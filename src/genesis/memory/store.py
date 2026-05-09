@@ -87,6 +87,7 @@ class MemoryStore:
         wing: str | None = None,
         room: str | None = None,
         force_fts5_only: bool = False,
+        valid_at: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -233,6 +234,7 @@ class MemoryStore:
             memory_class=resolved_class,
             wing=wing,
             room=room,
+            valid_at=valid_at,
         )
 
         if not embedding_ok:
@@ -306,6 +308,9 @@ class MemoryStore:
         results["links_deleted"] = await memory_links_crud.delete_by_memory(
             self._db, memory_id=memory_id,
         )
+        if results["links_deleted"]:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
 
         # 5. Cascade: pending_embeddings
         results["pending_deleted"] = await pending_embeddings.delete_by_memory(

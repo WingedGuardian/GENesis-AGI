@@ -199,16 +199,43 @@ async def create_metadata(
     memory_class: str = "fact",
     wing: str | None = None,
     room: str | None = None,
+    valid_at: str | None = None,
+    invalid_at: str | None = None,
 ) -> str:
-    """Insert a row into memory_metadata. Returns memory_id."""
+    """Insert a row into memory_metadata. Returns memory_id.
+
+    ``valid_at`` records when the fact became true in the real world
+    (bi-temporal modeling). Defaults to ``created_at`` if not provided.
+    ``invalid_at`` records when the fact stopped being true (NULL = still valid).
+    """
+    resolved_valid_at = valid_at or created_at
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
-        "(memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (memory_id, created_at, collection, confidence, embedding_status, memory_class, wing, room),
+        "(memory_id, created_at, collection, confidence, embedding_status, "
+        "memory_class, wing, room, valid_at, invalid_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (memory_id, created_at, collection, confidence, embedding_status,
+         memory_class, wing, room, resolved_valid_at, invalid_at),
     )
     await db.commit()
     return memory_id
+
+
+async def invalidate_memory(
+    db: aiosqlite.Connection,
+    memory_id: str,
+    invalid_at: str,
+) -> bool:
+    """Mark a memory as no longer valid (bi-temporal invalidation).
+
+    Returns True if the memory was found and updated.
+    """
+    cursor = await db.execute(
+        "UPDATE memory_metadata SET invalid_at = ? WHERE memory_id = ?",
+        (invalid_at, memory_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:
@@ -224,7 +251,8 @@ async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
     """Get a single memory by ID, joining FTS5 content with metadata."""
     cursor = await db.execute(
         "SELECT f.memory_id, f.content, f.source_type, f.tags, f.collection, "
-        "       m.created_at, m.confidence, m.embedding_status "
+        "       m.created_at, m.confidence, m.embedding_status, "
+        "       m.valid_at, m.invalid_at "
         "FROM memory_fts f "
         "LEFT JOIN memory_metadata m ON f.memory_id = m.memory_id "
         "WHERE f.memory_id = ?",
@@ -242,6 +270,8 @@ async def get_by_id(db: aiosqlite.Connection, memory_id: str) -> dict | None:
         "created_at": row[5],
         "confidence": row[6],
         "embedding_status": row[7],
+        "valid_at": row[8],
+        "invalid_at": row[9],
     }
 
 
@@ -255,7 +285,8 @@ async def list_recent(
     """List memories ordered by created_at descending (newest first)."""
     sql = (
         "SELECT f.memory_id, f.content, f.source_type, f.collection, "
-        "       m.created_at, m.confidence, m.embedding_status "
+        "       m.created_at, m.confidence, m.embedding_status, "
+        "       m.valid_at, m.invalid_at "
         "FROM memory_metadata m "
         "JOIN memory_fts f ON f.memory_id = m.memory_id "
     )
@@ -276,6 +307,8 @@ async def list_recent(
             "created_at": r[4],
             "confidence": r[5],
             "embedding_status": r[6],
+            "valid_at": r[7],
+            "invalid_at": r[8],
         }
         for r in rows
     ]

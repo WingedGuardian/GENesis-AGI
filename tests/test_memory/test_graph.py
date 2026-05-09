@@ -6,8 +6,11 @@ import aiosqlite
 import pytest
 
 from genesis.memory.graph import (
+    centrality_scores,
     find_connected_by_type,
     get_cluster,
+    invalidate_graph_cache,
+    shortest_path,
     traverse,
 )
 
@@ -54,7 +57,13 @@ async def graph_db(tmp_path):
         )
     await db.commit()
 
+    # Ensure fresh NetworkX cache per test
+    invalidate_graph_cache()
+
     yield db
+
+    # Clean up cache so subsequent test files don't see stale state
+    invalidate_graph_cache()
     await db.close()
 
 
@@ -156,3 +165,88 @@ class TestGetCluster:
     async def test_isolated_node(self, graph_db):
         cluster = await get_cluster(graph_db, "Z_isolated")
         assert cluster == []
+
+
+class TestNetworkXCache:
+    """Tests for the NetworkX cache lifecycle."""
+
+    @pytest.mark.asyncio
+    async def test_cache_invalidation_triggers_rebuild(self, graph_db):
+        """After invalidation, next query should still return correct results."""
+        result1 = await traverse(graph_db, "A", max_depth=1)
+        ids1 = {n.memory_id for n in result1.nodes}
+
+        # Invalidate and re-query
+        invalidate_graph_cache()
+        result2 = await traverse(graph_db, "A", max_depth=1)
+        ids2 = {n.memory_id for n in result2.nodes}
+
+        assert ids1 == ids2 == {"B", "D"}
+
+    @pytest.mark.asyncio
+    async def test_cache_reflects_new_links(self, graph_db):
+        """After adding a link and invalidating, the new link should appear."""
+        result_before = await traverse(graph_db, "F", max_depth=1)
+        assert result_before.nodes == []
+
+        # Add a new link from F
+        await graph_db.execute(
+            "INSERT INTO memory_links VALUES ('F', 'A', 'related_to', 0.9, '2026-03-23')",
+        )
+        await graph_db.commit()
+        invalidate_graph_cache()
+
+        result_after = await traverse(graph_db, "F", max_depth=1)
+        ids = {n.memory_id for n in result_after.nodes}
+        assert "A" in ids
+
+
+class TestCentrality:
+    """Tests for betweenness centrality scoring."""
+
+    @pytest.mark.asyncio
+    async def test_centrality_returns_scores(self, graph_db):
+        # Ensure cache is built
+        invalidate_graph_cache()
+        scores = await centrality_scores(graph_db, top_n=5)
+        assert len(scores) > 0
+        # Scores are (memory_id, float) tuples
+        assert all(isinstance(s[0], str) and isinstance(s[1], float) for s in scores)
+
+    @pytest.mark.asyncio
+    async def test_centrality_bridge_node_ranks_high(self, graph_db):
+        """B is a bridge between A→C and A→E paths — should rank high."""
+        invalidate_graph_cache()
+        scores = await centrality_scores(graph_db, top_n=10)
+        score_by_id = dict(scores)
+        # B connects to C and E — should have non-zero centrality
+        assert score_by_id.get("B", 0.0) > 0.0
+
+
+class TestShortestPath:
+    """Tests for shortest path finding."""
+
+    @pytest.mark.asyncio
+    async def test_direct_path(self, graph_db):
+        invalidate_graph_cache()
+        path = await shortest_path(graph_db, "A", "B")
+        assert path == ["A", "B"]
+
+    @pytest.mark.asyncio
+    async def test_multi_hop_path(self, graph_db):
+        invalidate_graph_cache()
+        path = await shortest_path(graph_db, "A", "C")
+        assert path == ["A", "B", "C"]
+
+    @pytest.mark.asyncio
+    async def test_no_path(self, graph_db):
+        invalidate_graph_cache()
+        # F has no outgoing edges, can't reach A
+        path = await shortest_path(graph_db, "F", "A")
+        assert path is None
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_node(self, graph_db):
+        invalidate_graph_cache()
+        path = await shortest_path(graph_db, "Z_nonexistent", "A")
+        assert path is None
