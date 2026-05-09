@@ -13,6 +13,7 @@ Output stored at ~/.genesis/essential_knowledge.md
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -192,15 +193,60 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         return []
 
 
+# Behavioral focus patterns — ego should describe a topic, not a behavioral
+# state.  Duplicated from ego.session (deliberate: avoids cross-layer import
+# from memory → ego).  Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
+_BEHAVIORAL_FOCUS_RE = re.compile(
+    r"(?i)"
+    # Self-referential behavioral states (ego is the implicit subject).
+    # Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
+    r"(?:^holding\s+back"
+    r"|^stepping\s+back"
+    r"|^standing\s+down"
+    r"|^lying\s+low"
+    r"|^staying\s+(?:out|quiet)"
+    r"|^backing\s+off"
+    r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
+    r"(?:user|jay|he|she|them|they|surface|engage|return)"
+    r"|^pausing\s+(?:proactive|proposal|work|activity)"
+    r"|(?:going|entering|in|self-)\s*dormant"
+    r"|(?:going|entering|in)\s+fallow"
+    r"|^hibernating"
+    r"|no\s+proposals?\s+(?:until|for\s+now)"
+    r"|until\s+\w+\s+surfaces?"
+    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
+    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
+    r"|^not\s+(?:proposing|intervening|acting)"
+    r"|^observing\s+(?:only|quietly)"
+    r"|^passive\s+(?:mode|watch)"
+    r"|^minimal\s+engagement"
+    r"|^reduced\s+activity"
+    r"|quiet\s+mode)"
+)
+
+
 async def _ego_focus(db: aiosqlite.Connection) -> str | None:
-    """Read ego focus summary from ego_state KV table."""
+    """Read ego focus summary from ego_state KV table.
+
+    Validates that the focus describes a topic, not a behavioral state.
+    Behavioral self-assignments (e.g., 'holding back') are omitted to
+    prevent propagation to foreground sessions via essential_knowledge.
+    """
     try:
         cursor = await db.execute(
             "SELECT value FROM ego_state WHERE key = 'ego_focus_summary'"
         )
         row = await cursor.fetchone()
         if row and row[0]:
-            return row[0][:200]
+            focus = row[0][:200]
+            if _BEHAVIORAL_FOCUS_RE.search(focus):
+                logger.warning(
+                    "Ego focus contains behavioral self-assignment, "
+                    "omitting from essential knowledge: %s",
+                    focus[:80],
+                )
+                return None
+            return focus
         return None
     except Exception:
         return None

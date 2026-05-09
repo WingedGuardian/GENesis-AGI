@@ -387,6 +387,10 @@ async def test_reference_store_full_roundtrip():
             # Verify memory_class="fact" was forced to avoid 0.7x penalty
             store_kwargs = mock_store.store.call_args[1]
             assert store_kwargs["memory_class"] == "fact"
+
+            # Verify reference routes to episodic_memory, not knowledge_base
+            assert store_kwargs["collection"] == "episodic_memory"
+            assert store_kwargs["memory_type"] == "episodic"
         finally:
             mod._store, mod._db, mod._retriever, mod._qdrant = old
 
@@ -1088,9 +1092,27 @@ async def test_memory_recall_passes_expand_query_terms_true():
     mock_retriever = AsyncMock()
     mock_retriever.recall.return_value = [_make_retrieval_result()]
 
-    old_store, old_db, old_retriever, old_qdrant = (
-        mod._store, mod._db, mod._retriever, mod._qdrant,
-    )
+    old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+    try:
+        mod._store = MagicMock()
+        mod._db = MagicMock()
+        mod._retriever = mock_retriever
+        mod._qdrant = MagicMock()
+
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(
+            query="configure routing",
+            expand_query_terms=True,
+            include_graph=False,
+        )
+
+        mock_retriever.recall.assert_called_once()
+        call_kwargs = mock_retriever.recall.call_args[1]
+        assert call_kwargs["expand_query_terms"] is True
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
 # ─── drift_recall fallback tests ────────────────────────────────────────────
 
 
@@ -1128,37 +1150,6 @@ async def test_memory_recall_drift_fallback_fires_on_sparse_results():
         mod._retriever = mock_retriever
         mod._qdrant = MagicMock()
 
-        tools = await _get_tools()
-        await tools["memory_recall"].fn(
-            query="configure routing",
-            expand_query_terms=True,
-            include_graph=False,
-        )
-
-        mock_retriever.recall.assert_called_once()
-        call_kwargs = mock_retriever.recall.call_args[1]
-        assert call_kwargs["expand_query_terms"] is True
-    finally:
-        mod._store = old_store
-        mod._db = old_db
-        mod._retriever = old_retriever
-        mod._qdrant = old_qdrant
-
-
-async def test_memory_recall_expand_query_terms_defaults_false():
-    """By default, expand_query_terms is False (no expansion)."""
-    import genesis.mcp.memory_mcp as mod
-
-    mock_retriever = AsyncMock()
-    mock_retriever.recall.return_value = [
-        _make_retrieval_result(),
-        _make_retrieval_result(mid="b"),
-        _make_retrieval_result(mid="c"),
-    ]
-
-    old_store, old_db, old_retriever, old_qdrant = (
-        mod._store, mod._db, mod._retriever, mod._qdrant,
-    )
         with patch.object(drift_mod, "drift_recall",
                           new_callable=AsyncMock, return_value=drift_results):
             tools = await _get_tools()
@@ -1197,19 +1188,6 @@ async def test_memory_recall_no_drift_when_results_sufficient():
         mod._retriever = mock_retriever
         mod._qdrant = MagicMock()
 
-        tools = await _get_tools()
-        await tools["memory_recall"].fn(
-            query="test query",
-            include_graph=False,
-        )
-
-        call_kwargs = mock_retriever.recall.call_args[1]
-        assert call_kwargs["expand_query_terms"] is False
-    finally:
-        mod._store = old_store
-        mod._db = old_db
-        mod._retriever = old_retriever
-        mod._qdrant = old_qdrant
         with patch.object(drift_mod, "drift_recall",
                           new_callable=AsyncMock) as mock_drift:
             tools = await _get_tools()
