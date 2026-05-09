@@ -11,7 +11,7 @@ def test_fresh_memory_half_confidence():
     result = compute_activation(
         confidence=1.0, created_at=NOW, retrieved_count=0, link_count=0, now=NOW,
     )
-    assert result.final_score == pytest.approx(0.5, abs=0.01)
+    assert result.final_score == pytest.approx(0.6, abs=0.01)
     assert result.recency_factor == pytest.approx(1.0, abs=0.001)
 
 
@@ -29,8 +29,8 @@ def test_high_retrieved_count():
         confidence=1.0, created_at=NOW, retrieved_count=20, link_count=0, now=NOW,
     )
     assert result.access_frequency == pytest.approx(1.0, abs=0.01)
-    # 0.5 + 0.3*1.0 + 0.2*0.0 = 0.8
-    assert result.final_score == pytest.approx(0.8, abs=0.01)
+    # 0.6 + 0.25*1.0 + 0.15*0.0 = 0.85
+    assert result.final_score == pytest.approx(0.85, abs=0.01)
 
 
 def test_high_link_count():
@@ -38,8 +38,8 @@ def test_high_link_count():
         confidence=1.0, created_at=NOW, retrieved_count=0, link_count=10, now=NOW,
     )
     assert result.connectivity_factor == pytest.approx(1.0, abs=0.01)
-    # 0.5 + 0.3*0.0 + 0.2*1.0 = 0.7
-    assert result.final_score == pytest.approx(0.7, abs=0.01)
+    # 0.6 + 0.25*0.0 + 0.15*1.0 = 0.75
+    assert result.final_score == pytest.approx(0.75, abs=0.01)
 
 
 def test_custom_half_life():
@@ -74,5 +74,5 @@ def test_combined_high_scores():
     result = compute_activation(
         confidence=1.0, created_at=NOW, retrieved_count=20, link_count=10, now=NOW,
     )
-    # 1.0 * 1.0 * (0.5 + 0.3 + 0.2) = 1.0
+    # 1.0 * 1.0 * (0.6 + 0.25 + 0.15) = 1.0
     assert result.final_score == pytest.approx(1.0, abs=0.01)

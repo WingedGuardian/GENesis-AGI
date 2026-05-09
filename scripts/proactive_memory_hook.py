@@ -5,12 +5,13 @@ Searches the memory system for memories relevant to the user's current
 message and injects them as context. Uses tiered retrieval:
 1. FTS5 keyword search (always, ~5ms) — covers both episodic and knowledge
 2. Qdrant vector search on episodic_memory (~400-500ms, falls back gracefully)
-3. RRF fusion across both sources
+3. Qdrant vector search on knowledge_base (filtered to intentional ingestions, parallel)
+4. RRF fusion across all sources
 
 After the routing fix, ALL internal memory lives in episodic_memory.
-knowledge_base is reserved for external domain data from modules.
+knowledge_base holds external domain data + intentionally ingested content.
 
-Budget: <1.5s total. FTS5-only if Ollama unavailable or slow.
+Budget: <2.0s total. FTS5-only if embedding unavailable or slow.
 
 Reads hook input from stdin as JSON:
   {"session_id": "...", "prompt": "...", ...}
@@ -446,12 +447,19 @@ async def _embed_text(text: str) -> list[float] | None:
     return None
 
 
-async def _search_qdrant(vector: list[float], wing_filter: str | None = None) -> list[dict]:
-    """Search episodic_memory for similar memories.
+async def _search_qdrant(
+    vector: list[float],
+    wing_filter: str | None = None,
+    collection: str = _QDRANT_COLLECTION,
+    extra_filter: dict | None = None,
+) -> list[dict]:
+    """Search a Qdrant collection for similar memories.
 
     Args:
         vector: Embedding vector to search with.
         wing_filter: Optional wing to filter results (e.g., "memory", "routing").
+        collection: Qdrant collection to search (default: episodic_memory).
+        extra_filter: Optional additional Qdrant filter conditions (merged with wing_filter).
     """
     try:
         import httpx
@@ -460,14 +468,17 @@ async def _search_qdrant(vector: list[float], wing_filter: str | None = None) ->
             "limit": _MAX_RESULTS * 2,
             "with_payload": True,
         }
+        must_conditions: list[dict] = []
         if wing_filter:
-            body["filter"] = {
-                "must": [{"key": "wing", "match": {"value": wing_filter}}]
-            }
+            must_conditions.append({"key": "wing", "match": {"value": wing_filter}})
+        if extra_filter:
+            must_conditions.extend(extra_filter.get("must", []))
+        if must_conditions:
+            body["filter"] = {"must": must_conditions}
 
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.post(
-                f"{_QDRANT_URL}/collections/{_QDRANT_COLLECTION}/points/search",
+                f"{_QDRANT_URL}/collections/{collection}/points/search",
                 json=body,
             )
             if resp.status_code == 200:
@@ -486,7 +497,7 @@ async def _search_qdrant(vector: list[float], wing_filter: str | None = None) ->
                     })
                 return results
     except Exception as exc:
-        print(f"Qdrant search error: {exc}", file=sys.stderr)
+        print(f"Qdrant search error ({collection}): {exc}", file=sys.stderr)
     return []
 
 
@@ -495,12 +506,15 @@ def _rrf_fusion(
     vector_results: list[dict],
     wing_results: list[dict] | None = None,
     code_results: list[dict] | None = None,
+    knowledge_results: list[dict] | None = None,
     k: int = 60,
 ) -> list[dict]:
-    """Reciprocal Rank Fusion of FTS5, vector, wing-filtered, and code index results.
+    """Reciprocal Rank Fusion of FTS5, vector, wing-filtered, knowledge, and code results.
 
     Wing-filtered results get a 1.5x bonus to prioritize domain-relevant
     content without exclusively filtering (cross-domain results still surface).
+    Knowledge base results get 1.0x weight (same as primary — payload filter
+    already ensures only intentionally ingested content is included).
     Code index results get a 0.5x weight (supplementary, not primary).
     """
     scores: dict[str, float] = {}
@@ -543,6 +557,15 @@ def _rrf_fusion(
             if mid not in content_map:
                 content_map[mid] = r
 
+    # Knowledge base results — intentionally ingested content (1.0x weight)
+    if knowledge_results:
+        for rank, r in enumerate(knowledge_results):
+            mid = r.get("memory_id", "")
+            if not mid:
+                continue
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+            if mid not in content_map:
+                content_map[mid] = r
 
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     return [content_map[mid] for mid, _ in ranked[:_MAX_RESULTS] if mid in content_map]
@@ -743,7 +766,7 @@ def _record_detail(
         "total_latency_ms": total_latency_ms,
         "fts_only_fallback": fts_only_fallback,
         "heartbeat_ms": round(heartbeat_ms, 1),
-        "budget_exceeded": total_latency_ms > 1650,
+        "budget_exceeded": total_latency_ms > 2000,
     }
     try:
         _METRICS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -966,30 +989,48 @@ async def _run(prompt: str, session_id: str = "") -> None:
     # Vector search (async, may timeout)
     vector_results: list[dict] = []
     wing_results: list[dict] = []
+    knowledge_results: list[dict] = []
     embed_latency_ms: float | None = None
     embed_start = time.monotonic()
     vector = await _embed_text(prompt)
     embed_latency_ms = (time.monotonic() - embed_start) * 1000
     if vector:
+        # Knowledge base: only surface intentionally ingested content
+        # (user-requested ingestions, not noisy pipeline output)
+        _knowledge_filter = {
+            "must": [
+                {"key": "source_pipeline", "match": {"any": [
+                    "extraction_job", "knowledge_ingest", "knowledge_ingest_source",
+                    "reference_store",
+                ]}},
+            ],
+        }
         if active_wing:
-            # Run both searches in parallel to stay within budget
-            vector_results, wing_results = await asyncio.gather(
+            # Run all searches in parallel to stay within budget
+            vector_results, wing_results, knowledge_results = await asyncio.gather(
                 _search_qdrant(vector),
                 _search_qdrant(vector, wing_filter=active_wing),
+                _search_qdrant(vector, collection="knowledge_base",
+                               extra_filter=_knowledge_filter),
             )
         else:
-            vector_results = await _search_qdrant(vector)
+            vector_results, knowledge_results = await asyncio.gather(
+                _search_qdrant(vector),
+                _search_qdrant(vector, collection="knowledge_base",
+                               extra_filter=_knowledge_filter),
+            )
 
     fts_only_fallback = len(vector_results) == 0 and len(fts_results) > 0
 
-    # Fuse results (with wing boost and code index if available)
+    # Fuse results (with wing boost, code index, and knowledge base)
     fused: list[dict] = []
     fused_count = 0
-    if fts_results or vector_results or wing_results or code_results:
+    if fts_results or vector_results or wing_results or code_results or knowledge_results:
         fused = _rrf_fusion(
             fts_results, vector_results,
             wing_results=wing_results,
             code_results=code_results or None,
+            knowledge_results=knowledge_results or None,
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
         fused_count = len(fused)
