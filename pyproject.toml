@@ -25,6 +25,7 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
+    "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
 ]
 
 [project.optional-dependencies]
