@@ -162,6 +162,7 @@ class ReconGatherer:
             logger.warning("Non-integer star count for %s: %s", repo, raw)
             return None
 
+        name = project.get("name", repo)
         content_hash = _stars_hash(repo, count)
 
         if await observations.exists_by_hash(
@@ -170,10 +171,8 @@ class ReconGatherer:
             return None  # Count unchanged
 
         # Get previous count for delta
-        prev_count = await self._get_previous_star_count(repo)
+        prev_count = await self._get_previous_star_count(name)
         delta = count - prev_count if prev_count is not None else None
-
-        name = project.get("name", repo)
         delta_str = f" ({'+' if delta > 0 else ''}{delta} since last check)" if delta is not None else ""
         content = f"{name}: {count} stars{delta_str}"
 
@@ -190,19 +189,21 @@ class ReconGatherer:
             content_hash=content_hash,
         )
 
-        detail = f"{name}: {count} stars{delta_str}"
-        logger.info("Star count recorded: %s", detail)
-        return detail
+        logger.info("Star count recorded: %s", content)
+        return content
 
-    async def _get_previous_star_count(self, repo: str) -> int | None:
-        """Get the most recent star count for a repo from observations."""
+    async def _get_previous_star_count(self, name: str) -> int | None:
+        """Get the most recent star count for a project from observations.
+
+        Content format: "Name: 30 stars (+5 since last check)"
+        """
         try:
             cursor = await self._db.execute(
                 "SELECT content FROM observations "
                 "WHERE source = 'recon' AND category = 'github_stars' "
                 "AND content LIKE ? "
                 "ORDER BY created_at DESC LIMIT 1",
-                (f"%{repo.split('/')[-1]}%",),
+                (f"{name}: %",),
             )
             row = await cursor.fetchone()
             if not row:
@@ -213,8 +214,8 @@ class ReconGatherer:
             parts = text.split(" stars")[0].rsplit(": ", 1)
             if len(parts) == 2:
                 return int(parts[1])
-        except (ValueError, IndexError, Exception):
-            pass
+        except Exception:
+            logger.debug("Could not parse previous star count for %s", name, exc_info=True)
         return None
 
     async def _check_releases(self, project: dict) -> int:

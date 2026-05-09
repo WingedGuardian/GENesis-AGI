@@ -26,7 +26,7 @@ class TestEmailAdapter:
         assert caps["markdown"] is False
         assert caps["buttons"] is False
         assert caps["voice"] is False
-        assert caps["documents"] is True
+        assert caps["documents"] is False
         assert caps["max_length"] == 50_000
 
     @pytest.mark.anyio

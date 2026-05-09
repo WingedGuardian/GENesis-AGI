@@ -494,12 +494,15 @@ class SurplusScheduler:
                     "Recon gather found %d new release(s): %s",
                     result.new_findings, "; ".join(result.details),
                 )
-            star_result = await self._recon_gatherer.gather_stars()
-            if star_result.new_findings > 0:
-                logger.info(
-                    "Star gather found %d change(s): %s",
-                    star_result.new_findings, "; ".join(star_result.details),
-                )
+            try:
+                star_result = await self._recon_gatherer.gather_stars()
+                if star_result.new_findings > 0:
+                    logger.info(
+                        "Star gather found %d change(s): %s",
+                        star_result.new_findings, "; ".join(star_result.details),
+                    )
+            except Exception:
+                logger.exception("Star gather failed (releases unaffected)")
             if self._event_bus:
                 await self._event_bus.emit(
                     Subsystem.RECON, Severity.DEBUG,

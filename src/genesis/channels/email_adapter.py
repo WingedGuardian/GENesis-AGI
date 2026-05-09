@@ -89,7 +89,7 @@ class EmailAdapter(ChannelAdapter):
             "buttons": False,
             "reactions": False,
             "voice": False,
-            "documents": True,
+            "documents": False,
             "max_length": 50_000,
         }
 
