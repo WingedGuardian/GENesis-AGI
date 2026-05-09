@@ -6,6 +6,7 @@ distillation -> knowledge units -> storage (SQLite + Qdrant).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import typing
@@ -45,6 +46,7 @@ class KnowledgeOrchestrator:
         self._registry = registry
         self._distillation = distillation
         self._manifest = manifest
+        self._store_lock = asyncio.Lock()
 
     async def ingest_source(
         self,
@@ -131,10 +133,11 @@ class KnowledgeOrchestrator:
 
         # 7. Store each unit
         try:
-            unit_ids = await self._store_units(
-                units, project_type=project_type, source=source,
-                content=content, purpose=purpose,
-            )
+            async with self._store_lock:
+                unit_ids = await self._store_units(
+                    units, project_type=project_type, source=source,
+                    content=content, purpose=purpose,
+                )
         except Exception as exc:
             logger.error("Storage failed for %s: %s", source, exc)
             return IngestResult(

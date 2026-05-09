@@ -325,7 +325,7 @@ class DistillationPipeline:
         ]
 
         try:
-            result = await self._router.route_call(_CALL_SITE, messages)
+            result = await self._router.route_call(_CALL_SITE, messages, chain_offset=chunk_index)
             if not result.success or not result.content:
                 logger.warning("Distillation LLM call failed for chunk: %s",
                                result.error or "empty response")
