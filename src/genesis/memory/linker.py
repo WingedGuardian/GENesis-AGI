@@ -71,6 +71,8 @@ class MemoryLinker:
                 strength=score,
                 created_at=now,
             )
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
 
             links.append(
                 LinkRecord(
@@ -146,6 +148,8 @@ class MemoryLinker:
                     strength=0.7,
                     created_at=now,
                 )
+                from genesis.memory.graph import invalidate_graph_cache
+                invalidate_graph_cache()
                 links.append(
                     LinkRecord(
                         source_id=memory_id,
