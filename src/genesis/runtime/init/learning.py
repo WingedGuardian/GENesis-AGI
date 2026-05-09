@@ -511,6 +511,28 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _refresh_capability_map() -> None:
+            if rt._db is None:
+                return
+            try:
+                from genesis.ego.capability_aggregator import refresh_capability_map
+
+                count = await refresh_capability_map(rt._db)
+                rt.record_job_success("capability_map_refresh")
+                if count:
+                    logger.info("Capability map refreshed: %d domains", count)
+            except Exception as exc:
+                rt.record_job_failure("capability_map_refresh", str(exc))
+                logger.exception("Capability map refresh failed")
+
+        rt._learning_scheduler.add_job(
+            _refresh_capability_map,
+            CronTrigger(hour="4,16", minute=15),
+            id="capability_map_refresh",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _reap_activity_log() -> None:
             if rt._activity_tracker is None:
                 return

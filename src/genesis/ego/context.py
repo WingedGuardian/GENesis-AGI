@@ -57,6 +57,7 @@ class EgoContextBuilder:
         sections.append(await self._cost_section())
         sections.append(await self._proposal_history_section())
         sections.append(await self._intervention_history_section())
+        sections.append(await self._self_model_section())
         sections.append(await self._user_corrections_section())
         sections.append(await self._output_contract_section())
 
@@ -418,6 +419,33 @@ class EgoContextBuilder:
         if pending:
             lines.append(f"*{pending} proposals pending resolution.*\n")
 
+        return "\n".join(lines)
+
+    async def _self_model_section(self) -> str:
+        """Capability self-portrait — what the ego is good/bad at."""
+        lines = ["## Self-Model\n"]
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+            entries = await cap_crud.get_all(self._db)
+        except Exception:
+            lines.append("*No capability data available yet.*\n")
+            return "\n".join(lines)
+
+        if not entries:
+            lines.append("*Capability map is empty — run aggregation to populate.*\n")
+            return "\n".join(lines)
+
+        lines.append("| Domain | Confidence | Trend | Evidence |")
+        lines.append("|--------|-----------|-------|----------|")
+        for entry in entries[:15]:  # cap at 15 rows
+            domain = entry["domain"]
+            conf = f"{entry['confidence']:.0%}"
+            trend = entry.get("trend", "stable")
+            evidence = (entry.get("evidence_summary") or "—")[:80].replace("|", "/")
+            lines.append(f"| {domain} | {conf} | {trend} | {evidence} |")
+
+        lines.append("")
         return "\n".join(lines)
 
     async def _user_corrections_section(self) -> str:

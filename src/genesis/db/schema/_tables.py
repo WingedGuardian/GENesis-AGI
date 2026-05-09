@@ -797,6 +797,19 @@ TABLES = {
             resolved_at     TEXT
         )
     """,
+    # ── Capability Map ─────────────────────────────────────────────────────
+    "capability_map": """
+        CREATE TABLE IF NOT EXISTS capability_map (
+            id              TEXT PRIMARY KEY,
+            domain          TEXT NOT NULL UNIQUE,         -- e.g. 'investigate', 'outreach'
+            confidence      REAL NOT NULL DEFAULT 0.0,    -- 0.0-1.0 composite score
+            sample_size     INTEGER NOT NULL DEFAULT 0,   -- data points aggregated
+            trend           TEXT DEFAULT 'stable'
+                CHECK (trend IN ('improving', 'stable', 'declining')),
+            evidence_summary TEXT,                        -- brief rationale
+            updated_at      TEXT NOT NULL
+        )
+    """,
     # ── Behavioral Immune System (BIS) ───────────────────────────────────────
     # GROUNDWORK(bis): Tables for graduated behavioral correction.
     # See docs/plans/2026-03-27-behavioral-immune-system-design.md
@@ -1144,6 +1157,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_proposal ON intervention_journal(proposal_id)",
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_created ON intervention_journal(created_at)",
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_source ON intervention_journal(ego_source)",
+    # capability map
+    "CREATE INDEX IF NOT EXISTS idx_capability_map_confidence ON capability_map(confidence DESC)",
     # behavioral immune system (BIS)
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_theme ON behavioral_corrections(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_created ON behavioral_corrections(created_at)",
