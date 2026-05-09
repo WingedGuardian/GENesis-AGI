@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -91,7 +91,7 @@ async def recent_resolved(
     limit: int = 10,
 ) -> list[dict]:
     """Return recently resolved entries for ego context display."""
-    cutoff = (datetime.now(UTC) - __import__("datetime").timedelta(days=days)).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     cur = await db.execute(
         """SELECT action_type, action_summary, expected_outcome,
                   actual_outcome, outcome_status, user_response,

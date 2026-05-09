@@ -612,6 +612,12 @@ class EgoSession:
                         status="failed",
                         user_response="dispatch failed",
                     )
+                except Exception:
+                    logger.error(
+                        "Failed to mark proposal %s as failed",
+                        proposal_id, exc_info=True,
+                    )
+                try:
                     from genesis.db.crud import intervention_journal as journal_crud
                     await journal_crud.resolve(
                         self._db, proposal_id,
@@ -619,10 +625,7 @@ class EgoSession:
                         actual_outcome="Dispatch failed",
                     )
                 except Exception:
-                    logger.error(
-                        "Failed to mark proposal %s as failed",
-                        proposal_id, exc_info=True,
-                    )
+                    logger.warning("Journal resolve failed for %s", proposal_id)
 
     async def _process_escalations(
         self,

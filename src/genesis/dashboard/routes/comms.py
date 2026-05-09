@@ -194,6 +194,6 @@ async def comms_resolve_proposal(proposal_id: str):
             user_response=user_response or None,
         )
     except Exception:
-        pass  # Non-critical
+        logger.warning("Journal resolve failed for proposal %s", proposal_id)
 
     return jsonify({"id": proposal_id, "status": status})

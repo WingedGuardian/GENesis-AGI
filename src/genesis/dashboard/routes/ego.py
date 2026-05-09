@@ -228,7 +228,8 @@ async def ego_proposal_resolve(proposal_id: str):
             user_response=user_response or None,
         )
     except Exception:
-        pass  # Non-critical
+        import logging
+        logging.getLogger(__name__).warning("Journal resolve failed for %s", proposal_id)
 
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
