@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
+from genesis.observability.session_context import get_session_id as _get_context_session_id
 from genesis.observability.types import GenesisEvent, Severity, Subsystem
 
 logger = logging.getLogger(__name__)
@@ -145,7 +146,10 @@ class GenesisEventBus:
                     "event_type": event_type,
                     "message": message,
                     "details": details or None,
-                    "session_id": details.get("session_id") if details else None,
+                    "session_id": (
+                        sid if (sid := details.get("session_id")) is not None
+                        else _get_context_session_id()
+                    ) if details else _get_context_session_id(),
                 })
             except asyncio.QueueFull:
                 logger.warning("Event write queue full — dropping event: %s/%s", event_type, message[:80])

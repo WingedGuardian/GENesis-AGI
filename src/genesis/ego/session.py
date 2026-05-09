@@ -28,6 +28,7 @@ from genesis.cc.types import (
 )
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import CYCLE_TYPE_DEFAULTS, CycleType, EgoConfig, EgoCycle
+from genesis.observability.session_context import set_session_id as _set_obs_session
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -230,6 +231,7 @@ class EgoSession:
                     source_tag=self._source_tag,
                 )
                 session_id = sess["id"]
+                _set_obs_session(session_id)
             except Exception:
                 logger.error("Failed to create ego background session", exc_info=True)
                 return None

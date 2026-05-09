@@ -32,6 +32,7 @@ from genesis.cc.reflection_bridge._prompts import (
 from genesis.cc.types import CCInvocation, CCModel, EffortLevel, SessionType, background_session_dir
 from genesis.db.crud import cc_sessions as cc_sessions_crud
 from genesis.observability.call_site_recorder import record_last_run
+from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.perception.types import ReflectionResult
 
 if TYPE_CHECKING:
@@ -301,6 +302,7 @@ class CCReflectionBridge:
                     dispatch_mode="cli",
                 )
                 session_id = sess["id"]
+                _set_obs_session(session_id)
             except Exception:
                 logger.exception("Failed to create background session for %s", depth.value)
                 return ReflectionResult(success=False, reason="Session creation failed")
@@ -477,6 +479,7 @@ class CCReflectionBridge:
                 source_tag="weekly_assessment",
                 skill_tags=["self-assessment"],
             )
+            _set_obs_session(sess["id"])
         except Exception:
             logger.exception("Failed to create assessment session")
             return ReflectionResult(success=False, reason="Session creation failed")
@@ -552,6 +555,7 @@ class CCReflectionBridge:
                 source_tag="quality_calibration",
                 skill_tags=["strategic-reflection"],
             )
+            _set_obs_session(sess["id"])
         except Exception:
             logger.exception("Failed to create calibration session")
             return ReflectionResult(success=False, reason="Session creation failed")
