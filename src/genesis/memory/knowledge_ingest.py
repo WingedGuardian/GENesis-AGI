@@ -42,6 +42,8 @@ async def ingest_knowledge_unit(
     force_fts5_only: bool = False,
     purpose: list[str] | None = None,
     ingestion_source: str | None = None,
+    collection: str = "knowledge_base",
+    memory_type: str = "knowledge",
 ) -> str:
     """Ingest or upsert a knowledge unit, returning the stable unit_id.
 
@@ -82,8 +84,8 @@ async def ingest_knowledge_unit(
     qdrant_memory_id = await store.store(
         content,
         f"knowledge:{project}/{domain}",
-        memory_type="knowledge",
-        collection="knowledge_base",
+        memory_type=memory_type,
+        collection=collection,
         tags=[domain, project, authority],
         confidence=0.85,
         auto_link=False,
