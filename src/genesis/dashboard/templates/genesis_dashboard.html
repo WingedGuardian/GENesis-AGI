@@ -4530,6 +4530,9 @@
                     <template x-if="$store.genesisDashboard.routingConfig.call_sites[siteId].retry_profile">
                       <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(255,255,255,0.07); color:var(--color-text-secondary);" x-text="$store.genesisDashboard.routingConfig.call_sites[siteId].retry_profile"></span>
                     </template>
+                    <template x-if="site.parallelized">
+                      <span style="font-size:0.65rem; padding:0.08rem 0.32rem; border-radius:3px; background:rgba(156,39,176,0.16); color:#9c27ac;">parallelized</span>
+                    </template>
                   </div>
                 </template>
                 <template x-if="site.chain_health">

@@ -303,6 +303,13 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "On outreach failure",
         "model_tier": "slm",
     },
+    "40_knowledge_distillation": {
+        "description": "Distills ingested knowledge sources into atomic units. Parallelized across provider chain via chain_offset.",
+        "category": "processing",
+        "frequency": "Per ingestion",
+        "model_tier": "slm",
+        "parallelized": True,
+    },
     "autonomous_executor_reasoning": {
         "description": "Non-tooling reasoning for autonomous executor steps (research/analysis/synthesis). API-first via AutonomousDispatchRouter.",
         "category": "reasoning",
