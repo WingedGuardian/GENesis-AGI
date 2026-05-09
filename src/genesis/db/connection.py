@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -66,7 +66,7 @@ class SerializedConnection:
         self,
         conn: aiosqlite.Connection,
         *,
-        reconnect_fn: Callable[[], aiosqlite.Connection] | None = None,
+        reconnect_fn: Callable[[], Awaitable[aiosqlite.Connection]] | None = None,
     ) -> None:
         object.__setattr__(self, "_conn", conn)
         object.__setattr__(self, "_lock", asyncio.Lock())

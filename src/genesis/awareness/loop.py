@@ -664,7 +664,8 @@ class AwarenessLoop:
             # SQLite WAL checkpoint — prevent unbounded WAL growth from
             # external scripts or concurrent writers. PASSIVE is non-blocking.
             # (SQLite-specific; remove when migrating to PostgreSQL.)
-            _sqlite_wal_checkpoint(self._db)
+            if result is not None and result.db_available:
+                _sqlite_wal_checkpoint(self._db)
 
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from

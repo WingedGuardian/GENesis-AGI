@@ -186,12 +186,6 @@ class Router:
         if chain_offset:
             n = chain_offset % len(chain)
             chain = chain[n:] + chain[:n]
-        if not chain:
-            return RoutingResult(
-                success=False,
-                call_site_id=call_site_id,
-                error="No providers available in chain after filtering",
-            )
 
         # 4. Check budget once (shared across providers)
         budget_status = BudgetStatus.UNDER_LIMIT
