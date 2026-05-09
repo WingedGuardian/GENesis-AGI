@@ -107,6 +107,13 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  openrouter-deepseek-v4-flash:
+    type: openrouter
+    model: deepseek/deepseek-v4-flash
+    profile: deepseek-v4-flash
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
   openrouter-gpt55:
     type: openrouter
     model: openai/gpt-5.5
@@ -126,6 +133,8 @@ providers:
     model: deepseek-chat
     profile: deepseek-v3
     free: false
+    # Deprecated: use openrouter-deepseek-v4 or v4-flash instead
+    enabled: false
     open_duration_s: 120
   openai-gpt5:
     type: openai
@@ -163,9 +172,9 @@ providers:
     profile: claude-opus-4.6
     free: false
     open_duration_s: 120
-  glm5:
+  glm51:
     type: zenmux
-    model: z-ai/glm-5.1-turbo
+    model: z-ai/glm-5.1
     profile: glm-5.1
     base_url: https://zenmux.ai/api/v1
     free: false
@@ -281,7 +290,7 @@ call_sites:
     - openrouter-free
   10_cognitive_state:
     chain:
-    - glm5
+    - glm51
     - claude-sonnet
     default_paid: true
   11_user_model_synthesis:
@@ -322,6 +331,7 @@ call_sites:
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
+    description: "Task executor Gate 2 — cross-vendor quality review of deliverables"
   18_meta_prompting:
     chain:
     - openrouter-free
@@ -332,6 +342,7 @@ call_sites:
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
+    description: "Task executor Gate 3 — devil's advocate challenge of deliverables"
   21_session_observer:
     chain:
     - mistral-large-free
@@ -346,19 +357,21 @@ call_sites:
     - groq-free
   27_pre_execution_assessment:
     chain:
+    - glm51
     - minimax-m25
-    - deepseek-chat
-    - glm5
+    - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: user_facing
+    description: "Task executor — sanity-check proposed execution plans before committing resources"
   28_observation_sweep:
     chain:
     - minimax-m25
-    - deepseek-chat
-    - glm5
+    - openrouter-deepseek-v4-flash
+    - glm51
     - groq-free
     - gemini-free
     default_paid: true
+    description: "Observation pipeline — batch classification and sweep (currently disabled)"
   29_retrospective_triage:
     chain:
     - groq-free
@@ -372,13 +385,13 @@ call_sites:
     retry_profile: background
   31_outcome_classification:
     chain:
-    - glm5
+    - glm51
     - mistral-large-free
     default_paid: true
     never_pays: false
   32_delta_assessment:
     chain:
-    - glm5
+    - glm51
     - mistral-large-free
     default_paid: true
     never_pays: false
@@ -435,11 +448,11 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
-    # - openrouter-haiku  # credits exhausted 2026-05-08
-    - mistral-large-free
+    - openrouter-deepseek-v4-flash
+    - cerebras-qwen
     - groq-free
     - gemini-free
-    - cerebras-qwen
+    - mistral-large-free
     - openrouter-free
     default_paid: true
     retry_profile: background
