@@ -361,7 +361,7 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             f"got '{section['model']}'"
         )
 
-    valid_efforts = {"low", "medium", "high", "max"}
+    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
     if "effort" in section and section["effort"] not in valid_efforts:
         errors.append(
             f"inbox_monitor.effort must be one of {sorted(valid_efforts)}, "
@@ -519,7 +519,7 @@ def _validate_channels(changes: dict) -> list[str]:
     errors: list[str] = []
     valid_top_keys = {"telegram"}
     valid_models = {"opus", "sonnet", "haiku"}
-    valid_efforts = {"low", "medium", "high", "max"}
+    valid_efforts = {"low", "medium", "high", "xhigh", "max"}
 
     for key in changes:
         if key not in valid_top_keys:
