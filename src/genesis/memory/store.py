@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 _COLLECTION_MAP = {
     "episodic": "episodic_memory",
-    "knowledge": "episodic_memory",  # Internal knowledge lives with episodic
+    "knowledge": "knowledge_base",  # External knowledge → knowledge_base
 }
 
 
@@ -92,9 +92,8 @@ class MemoryStore:
 
         Args:
             collection: Explicit Qdrant collection override. If provided, bypasses
-                ``_COLLECTION_MAP`` lookup. Used by ``knowledge_ingest`` and pipeline
-                orchestrator to route domain data to ``knowledge_base`` while the
-                default map routes all internal knowledge to ``episodic_memory``.
+                ``_COLLECTION_MAP`` lookup. Default routing: ``episodic`` types →
+                ``episodic_memory``, ``knowledge`` types → ``knowledge_base``.
         """
         # Dedup: skip if exact content already stored (any collection)
         try:
