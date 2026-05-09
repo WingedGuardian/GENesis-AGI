@@ -150,6 +150,7 @@ class Router:
         *,
         budget_override: bool = False,
         suppress_dead_letter: bool = False,
+        chain_offset: int = 0,
         **kwargs,
     ) -> RoutingResult:
         """Route a call through the provider chain for the given call site."""
@@ -174,7 +175,7 @@ class Router:
         if policy is None:
             policy = self.config.retry_profiles["default"]
 
-        # 3. Filter chain
+        # 3. Filter chain (and rotate for parallelization)
         chain = self._filter_chain(site)
         if not chain:
             return RoutingResult(
@@ -182,6 +183,9 @@ class Router:
                 call_site_id=call_site_id,
                 error="No providers available in chain after filtering",
             )
+        if chain_offset:
+            n = chain_offset % len(chain)
+            chain = chain[n:] + chain[:n]
 
         # 4. Check budget once (shared across providers)
         budget_status = BudgetStatus.UNDER_LIMIT

@@ -41,6 +41,11 @@ class OutreachScheduler:
         self._curve_computer = curve_computer
         self._event_bus = event_bus
         self._scheduler: AsyncIOScheduler | None = None
+        # In-memory alert dedup — DB-independent fallback.
+        # When DB is locked, the outreach_history dedup query fails silently
+        # (returns empty set), causing repeated alerts. This dict survives
+        # across health check cycles as a reliable dedup layer.
+        self._alert_last_sent: dict[str, float] = {}  # alert_id → monotonic time
 
     @property
     def is_running(self) -> bool:
@@ -235,10 +240,10 @@ class OutreachScheduler:
         report, awareness signals). Multiple alerts are batched into one message.
         """
         try:
+            import time
             from datetime import datetime
 
             from genesis.outreach.health_outreach import HealthOutreachBridge
-
             escalation_ids = frozenset(
                 self._config.immediate_escalation_alerts
             )
@@ -248,6 +253,28 @@ class OutreachScheduler:
             if not requests:
                 await self._record_job_result("health_check")
                 return
+
+            # In-memory dedup — filter out alerts sent recently.
+            # This is the primary dedup layer; the DB query in
+            # HealthOutreachBridge is the secondary (cross-restart) layer.
+            from genesis.outreach.health_outreach import _DEDUP_HOURS
+            dedup_window_s = _DEDUP_HOURS * 3600
+            now_mono = time.monotonic()
+            deduped = []
+            for req in requests:
+                aid = req.source_id or ""
+                last = self._alert_last_sent.get(aid)
+                if last is not None and (now_mono - last) < dedup_window_s:
+                    continue
+                deduped.append(req)
+            if not deduped:
+                logger.info(
+                    "Health outreach: %d alert(s) suppressed by in-memory dedup",
+                    len(requests),
+                )
+                await self._record_job_result("health_check")
+                return
+            requests = deduped
 
             # Batch all immediate alerts into one Telegram message
             lines = ["\u26a0\ufe0f INFRASTRUCTURE ALERT", ""]
@@ -284,6 +311,11 @@ class OutreachScheduler:
                 "Health outreach (batched %d alert(s)): %s",
                 len(requests), result.status.value,
             )
+            # Record send time in memory — regardless of whether DB
+            # write succeeded. This prevents re-send on next cycle.
+            for req in requests:
+                if req.source_id:
+                    self._alert_last_sent[req.source_id] = now_mono
             await self._record_job_result("health_check")
         except Exception as exc:
             logger.exception("Health check outreach job failed")

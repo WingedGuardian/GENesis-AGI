@@ -38,6 +38,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _sqlite_wal_checkpoint(db) -> None:
+    """Attempt a non-blocking WAL checkpoint. SQLite-specific."""
+    try:
+        import sqlite3
+        # Access the raw connection for synchronous PRAGMA
+        if hasattr(db, '_conn') and hasattr(db._conn, '_conn'):
+            raw = db._conn._conn
+            if isinstance(raw, sqlite3.Connection):
+                raw.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except Exception:
+        pass  # Best-effort; failure is harmless
+
+
 # Maps circuit-breaker degradation levels to resilience cloud axis states.
 _DEGRADATION_TO_CLOUD: dict[DegradationLevel, CloudStatus] = {
     DegradationLevel.NORMAL: CloudStatus.NORMAL,
@@ -63,106 +77,171 @@ async def perform_tick(
     """Execute one awareness tick. Testable without the scheduler."""
     now = datetime.now(UTC).isoformat()
     tick_id = str(uuid.uuid4())
-    escalation_source: str | None = None
 
-    # 1. Collect signals
+    # 1. Collect signals (DB-independent — always succeeds)
     signals = await collect_all(collectors)
 
-    # 2. Score urgency per depth
-    scores = await compute_scores(db, signals, now=now)
-
-    # 3. Classify depth
-    bypass = source == "critical_bypass"
-    decision = await classify_depth(db, scores, bypass_ceiling=bypass)
-
-    classified_depth = decision.depth if decision else None
-    trigger_reason = decision.reason if decision else reason
-
-    # 3b. Check for pending light→deep escalation
+    # 2-5. DB-dependent operations — wrapped for fault tolerance.
+    # If the DB is locked/unavailable, the tick still "succeeds" as degraded:
+    # signals are collected, _last_tick_at updates, but scoring/classification
+    # are skipped and the resilience memory axis is set to DOWN.
+    scores: list = []
+    decision = None
+    classified_depth = None
+    trigger_reason = reason
+    escalation_source: str | None = None
     escalation_pending_id: str | None = None
-    if cc_reflection_bridge is not None:
-        try:
-            # Fix 3A: expire stale escalations (>8h) before checking
-            _STALE_ESCALATION_HOURS = 8
-            all_pending = await observations.query(
-                db, type="light_escalation_pending", resolved=False, limit=10,
-            )
-            for stale in all_pending:
-                stale_created = stale.get("created_at", "")
-                try:
-                    stale_age = (
-                        datetime.now(UTC) - datetime.fromisoformat(stale_created)
-                    ).total_seconds() / 3600
-                except (ValueError, TypeError):
-                    stale_age = 999
-                if stale_age >= _STALE_ESCALATION_HOURS:
-                    await observations.resolve(
-                        db, stale["id"],
-                        resolved_at=now,
-                        resolution_notes=f"Expired (age {stale_age:.1f}h > {_STALE_ESCALATION_HOURS}h TTL)",
-                    )
-                    logger.info("Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age)
+    db_available = True
 
-            # Re-query after cleanup
-            pending_escalations = await observations.query(
-                db, type="light_escalation_pending", resolved=False, limit=1,
-            )
-            if pending_escalations:
-                esc_created = pending_escalations[0].get("created_at", "")
-                try:
-                    esc_age_hours = (
-                        datetime.now(UTC) - datetime.fromisoformat(esc_created)
-                    ).total_seconds() / 3600
-                except (ValueError, TypeError):
-                    esc_age_hours = 999  # treat unparseable as expired
+    try:
+        # 2. Score urgency per depth
+        scores = await compute_scores(db, signals, now=now)
 
-                if esc_age_hours < _STALE_ESCALATION_HOURS:
-                    # Fix 2A: daily escalation budget (max 2 per 24h)
-                    _ESCALATION_BUDGET_PER_DAY = 2
-                    resolved_recent = await observations.query(
-                        db, type="light_escalation_resolved", limit=20,
-                    )
-                    resolved_24h_count = 0
-                    resolved_2h_count = 0
-                    for r in resolved_recent:
-                        r_created = r.get("created_at", "")
-                        try:
-                            r_age = (
-                                datetime.now(UTC) - datetime.fromisoformat(r_created)
-                            ).total_seconds() / 3600
-                            if r_age < 2:
-                                resolved_2h_count += 1
-                            if r_age < 24:
-                                resolved_24h_count += 1
-                        except (ValueError, TypeError):
-                            pass
+        # 3. Classify depth
+        bypass = source == "critical_bypass"
+        decision = await classify_depth(db, scores, bypass_ceiling=bypass)
 
-                    # Check emergency bypass — critical signals override budget
-                    esc_content = pending_escalations[0].get("content", "").lower()
-                    is_emergency = any(kw in esc_content for kw in (
-                        "critical_failure", "data_loss", "security_breach",
-                        "all providers", "container memory critical",
-                    ))
+        classified_depth = decision.depth if decision else None
+        trigger_reason = decision.reason if decision else reason
 
-                    if resolved_2h_count >= 1 and not is_emergency:
-                        logger.info("Light escalation cooldown active (2h), skipping")
-                    elif resolved_24h_count >= _ESCALATION_BUDGET_PER_DAY and not is_emergency:
-                        logger.info(
-                            "Escalation budget exhausted (%d/%d in 24h), skipping",
-                            resolved_24h_count, _ESCALATION_BUDGET_PER_DAY,
+        # 3b. Check for pending light->deep escalation
+        if cc_reflection_bridge is not None:
+            try:
+                # Fix 3A: expire stale escalations (>8h) before checking
+                _STALE_ESCALATION_HOURS = 8
+                all_pending = await observations.query(
+                    db, type="light_escalation_pending", resolved=False, limit=10,
+                )
+                for stale in all_pending:
+                    stale_created = stale.get("created_at", "")
+                    try:
+                        stale_age = (
+                            datetime.now(UTC) - datetime.fromisoformat(stale_created)
+                        ).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        stale_age = 999
+                    if stale_age >= _STALE_ESCALATION_HOURS:
+                        await observations.resolve(
+                            db, stale["id"],
+                            resolved_at=now,
+                            resolution_notes=f"Expired (age {stale_age:.1f}h > {_STALE_ESCALATION_HOURS}h TTL)",
                         )
-                    else:
-                        if is_emergency:
-                            logger.warning("Emergency escalation bypassing budget: %s", esc_content[:100])
-                        classified_depth = Depth.DEEP
-                        escalation_source = "light_escalation"
-                        trigger_reason = f"light escalation: {pending_escalations[0].get('content', 'unknown')}"
-                        logger.info("Forcing DEEP reflection due to light escalation")
+                        logger.info("Auto-resolved stale escalation %s (%.1fh old)", stale["id"], stale_age)
 
-                        # Fix 3B: defer resolution until after successful dispatch
-                        escalation_pending_id = pending_escalations[0]["id"]
-        except Exception:
-            logger.warning("Failed to check light escalation state", exc_info=True)
+                # Re-query after cleanup
+                pending_escalations = await observations.query(
+                    db, type="light_escalation_pending", resolved=False, limit=1,
+                )
+                if pending_escalations:
+                    esc_created = pending_escalations[0].get("created_at", "")
+                    try:
+                        esc_age_hours = (
+                            datetime.now(UTC) - datetime.fromisoformat(esc_created)
+                        ).total_seconds() / 3600
+                    except (ValueError, TypeError):
+                        esc_age_hours = 999  # treat unparseable as expired
+
+                    if esc_age_hours < _STALE_ESCALATION_HOURS:
+                        # Fix 2A: daily escalation budget (max 2 per 24h)
+                        _ESCALATION_BUDGET_PER_DAY = 2
+                        resolved_recent = await observations.query(
+                            db, type="light_escalation_resolved", limit=20,
+                        )
+                        resolved_24h_count = 0
+                        resolved_2h_count = 0
+                        for r in resolved_recent:
+                            r_created = r.get("created_at", "")
+                            try:
+                                r_age = (
+                                    datetime.now(UTC) - datetime.fromisoformat(r_created)
+                                ).total_seconds() / 3600
+                                if r_age < 2:
+                                    resolved_2h_count += 1
+                                if r_age < 24:
+                                    resolved_24h_count += 1
+                            except (ValueError, TypeError):
+                                pass
+
+                        # Check emergency bypass -- critical signals override budget
+                        esc_content = pending_escalations[0].get("content", "").lower()
+                        is_emergency = any(kw in esc_content for kw in (
+                            "critical_failure", "data_loss", "security_breach",
+                            "all providers", "container memory critical",
+                        ))
+
+                        if resolved_2h_count >= 1 and not is_emergency:
+                            logger.info("Light escalation cooldown active (2h), skipping")
+                        elif resolved_24h_count >= _ESCALATION_BUDGET_PER_DAY and not is_emergency:
+                            logger.info(
+                                "Escalation budget exhausted (%d/%d in 24h), skipping",
+                                resolved_24h_count, _ESCALATION_BUDGET_PER_DAY,
+                            )
+                        else:
+                            if is_emergency:
+                                logger.warning("Emergency escalation bypassing budget: %s", esc_content[:100])
+                            classified_depth = Depth.DEEP
+                            escalation_source = "light_escalation"
+                            trigger_reason = f"light escalation: {pending_escalations[0].get('content', 'unknown')}"
+                            logger.info("Forcing DEEP reflection due to light escalation")
+
+                            # Fix 3B: defer resolution until after successful dispatch
+                            escalation_pending_id = pending_escalations[0]["id"]
+            except Exception:
+                logger.warning("Failed to check light escalation state", exc_info=True)
+
+        # 4. Store tick result
+        await awareness_ticks.create(
+            db,
+            id=tick_id,
+            source=source,
+            signals_json=json.dumps([
+                {"name": s.name, "value": s.value, "source": s.source,
+                 "collected_at": s.collected_at}
+                for s in signals
+            ]),
+            scores_json=json.dumps([
+                {"depth": s.depth.value, "raw_score": s.raw_score,
+                 "time_multiplier": s.time_multiplier, "final_score": s.final_score,
+                 "threshold": s.threshold, "triggered": s.triggered}
+                for s in scores
+            ]),
+            classified_depth=classified_depth.value if classified_depth else None,
+            trigger_reason=trigger_reason,
+            created_at=now,
+        )
+
+        # 5. If triggered, also create an observation (with content-hash dedup)
+        if decision is not None:
+            obs_content = json.dumps({
+                "tick_id": tick_id,
+                "depth": classified_depth.value,
+                "reason": trigger_reason,
+                "scores": {s.depth.value: s.final_score for s in scores},
+            }, sort_keys=True)
+            content_hash = hashlib.sha256(obs_content.encode()).hexdigest()
+            is_dup = await observations.exists_by_hash(
+                db, source="awareness_loop", content_hash=content_hash, unresolved_only=True,
+            )
+            if not is_dup:
+                obs_id = str(uuid.uuid4())
+                await observations.create(
+                    db,
+                    id=obs_id,
+                    source="awareness_loop",
+                    type="awareness_tick",
+                    content=obs_content,
+                    priority="high" if classified_depth in (Depth.DEEP, Depth.STRATEGIC) else "medium",
+                    created_at=now,
+                    content_hash=content_hash,
+                    skip_if_duplicate=True,
+                )
+
+    except Exception as db_exc:
+        db_available = False
+        logger.warning(
+            "Tick DB operations failed — degraded tick (signals collected, "
+            "scoring/persistence skipped): %s", db_exc,
+        )
 
     result = TickResult(
         tick_id=tick_id,
@@ -172,57 +251,11 @@ async def perform_tick(
         scores=scores,
         classified_depth=classified_depth,
         trigger_reason=trigger_reason,
-        escalation_source=escalation_source,
-        escalation_pending_id=escalation_pending_id,
+        escalation_source=escalation_source if db_available else None,
+        escalation_pending_id=escalation_pending_id if db_available else None,
         signal_staleness=get_staleness_context(),
+        db_available=db_available,
     )
-
-    # 4. Store tick result
-    await awareness_ticks.create(
-        db,
-        id=tick_id,
-        source=source,
-        signals_json=json.dumps([
-            {"name": s.name, "value": s.value, "source": s.source,
-             "collected_at": s.collected_at}
-            for s in signals
-        ]),
-        scores_json=json.dumps([
-            {"depth": s.depth.value, "raw_score": s.raw_score,
-             "time_multiplier": s.time_multiplier, "final_score": s.final_score,
-             "threshold": s.threshold, "triggered": s.triggered}
-            for s in scores
-        ]),
-        classified_depth=classified_depth.value if classified_depth else None,
-        trigger_reason=trigger_reason,
-        created_at=now,
-    )
-
-    # 5. If triggered, also create an observation (with content-hash dedup)
-    if decision is not None:
-        obs_content = json.dumps({
-            "tick_id": tick_id,
-            "depth": classified_depth.value,
-            "reason": trigger_reason,
-            "scores": {s.depth.value: s.final_score for s in scores},
-        }, sort_keys=True)
-        content_hash = hashlib.sha256(obs_content.encode()).hexdigest()
-        is_dup = await observations.exists_by_hash(
-            db, source="awareness_loop", content_hash=content_hash, unresolved_only=True,
-        )
-        if not is_dup:
-            obs_id = str(uuid.uuid4())
-            await observations.create(
-                db,
-                id=obs_id,
-                source="awareness_loop",
-                type="awareness_tick",
-                content=obs_content,
-                priority="high" if classified_depth in (Depth.DEEP, Depth.STRATEGIC) else "medium",
-                created_at=now,
-                content_hash=content_hash,
-                skip_if_duplicate=True,
-            )
 
     if not dispatch_reflection:
         return result
@@ -525,29 +558,13 @@ class AwarenessLoop:
                     deferred_queue=self._deferred_queue,
                     dispatch_reflection=False,
                 )
-                self._tick_count += 1
-                self._last_tick_at = datetime.now(UTC).isoformat()
-                self._last_tick_result = result
-                if result.classified_depth:
-                    logger.info(
-                        "Tick triggered %s: %s",
-                        result.classified_depth.value, result.trigger_reason,
-                    )
-                # Heartbeat — lets health MCP detect silent death
-                if self._event_bus:
-                    await self._event_bus.emit(
-                        Subsystem.AWARENESS, Severity.DEBUG,
-                        "heartbeat", "awareness_loop tick completed",
-                    )
-                try:
-                    from genesis.runtime import GenesisRuntime
-                    GenesisRuntime.instance().record_job_success("awareness_tick")
-                except Exception:
-                    pass  # Runtime may not be available in tests
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("Awareness tick failed")
+                # perform_tick itself shouldn't raise (it has internal
+                # try/except for DB ops), but guard against unexpected
+                # failures in signal collection or other non-DB code.
+                logger.exception("Awareness tick failed unexpectedly")
                 if self._event_bus:
                     await self._event_bus.emit(
                         Subsystem.AWARENESS, Severity.ERROR,
@@ -559,6 +576,53 @@ class AwarenessLoop:
                     GenesisRuntime.instance().record_job_failure("awareness_tick", str(exc))
                 except Exception:
                     pass
+                # Even on unexpected failure, don't leave _last_tick_at stale
+                self._last_tick_at = datetime.now(UTC).isoformat()
+
+            if result is not None:
+                # Always update tick tracking — even degraded ticks count
+                # as "alive" to prevent false overdue alerts.
+                self._tick_count += 1
+                self._last_tick_at = datetime.now(UTC).isoformat()
+                self._last_tick_result = result
+
+                if result.classified_depth:
+                    logger.info(
+                        "Tick triggered %s: %s",
+                        result.classified_depth.value, result.trigger_reason,
+                    )
+
+                if not result.db_available:
+                    logger.warning(
+                        "Tick %d completed DEGRADED (DB unavailable)",
+                        self._tick_count,
+                    )
+
+                # Heartbeat — lets health MCP detect silent death
+                if self._event_bus:
+                    await self._event_bus.emit(
+                        Subsystem.AWARENESS, Severity.DEBUG,
+                        "heartbeat",
+                        "awareness_loop tick completed"
+                        + (" (degraded)" if not result.db_available else ""),
+                    )
+                try:
+                    from genesis.runtime import GenesisRuntime
+                    if result.db_available:
+                        GenesisRuntime.instance().record_job_success("awareness_tick")
+                    else:
+                        GenesisRuntime.instance().record_job_failure(
+                            "awareness_tick", "DB unavailable (degraded tick)")
+                except Exception:
+                    pass  # Runtime may not be available in tests
+
+            # Update resilience memory axis based on DB availability
+            if self._resilience_state_machine and result is not None:
+                from genesis.resilience.state import MemoryStatus
+                if result.db_available:
+                    self._resilience_state_machine.update_memory(MemoryStatus.NORMAL)
+                else:
+                    self._resilience_state_machine.update_memory(MemoryStatus.DOWN)
 
             # Update resilience cloud axis from circuit breaker state
             if self._resilience_state_machine and self._circuit_breakers:
@@ -596,6 +660,12 @@ class AwarenessLoop:
                         self._resilience_state_machine.update_tmp_pressure(tmp_status)
                 except Exception:
                     logger.debug("tmp_pressure axis update failed", exc_info=True)
+
+            # SQLite WAL checkpoint — prevent unbounded WAL growth from
+            # external scripts or concurrent writers. PASSIVE is non-blocking.
+            # (SQLite-specific; remove when migrating to PostgreSQL.)
+            if result is not None and result.db_available:
+                _sqlite_wal_checkpoint(self._db)
 
             # Status file writes are handled by a dedicated loop in
             # runtime/init/memory.py (status-writer-loop). Decoupled from
