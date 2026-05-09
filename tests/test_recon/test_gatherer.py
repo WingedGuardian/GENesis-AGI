@@ -11,7 +11,7 @@ import pytest
 
 from genesis.db import schema
 from genesis.db.crud import observations
-from genesis.recon.gatherer import GatherResult, ReconGatherer, _release_hash
+from genesis.recon.gatherer import GatherResult, ReconGatherer, _release_hash, _stars_hash
 
 # ── fixtures ────────────────────────────────────────────────────────────────
 
@@ -396,3 +396,146 @@ class TestBodyTruncation:
         assert "... (truncated)" in content
         # Content should be bounded — body was 2000 chars, truncated to ~1000
         assert len(content) < 1500
+
+
+# ── star tracking tests ──────────────────────────────────────────────────────
+
+_STAR_WATCHLIST = [
+    {
+        "name": "GENesis-AGI",
+        "repo": "WingedGuardian/GENesis-AGI",
+        "track": ["stars"],
+        "priority": "high",
+    },
+    {
+        "name": "NoStars",
+        "repo": "example/no-stars",
+        "track": ["releases"],
+        "priority": "low",
+    },
+]
+
+
+class TestStarsHash:
+    def test_deterministic(self):
+        h1 = _stars_hash("WingedGuardian/GENesis-AGI", 30)
+        h2 = _stars_hash("WingedGuardian/GENesis-AGI", 30)
+        assert h1 == h2
+
+    def test_different_for_different_counts(self):
+        h1 = _stars_hash("WingedGuardian/GENesis-AGI", 30)
+        h2 = _stars_hash("WingedGuardian/GENesis-AGI", 31)
+        assert h1 != h2
+
+    def test_length(self):
+        h = _stars_hash("WingedGuardian/GENesis-AGI", 30)
+        assert len(h) == 16
+
+
+class TestGatherStars:
+    @pytest.mark.asyncio
+    async def test_stores_star_count(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="30"),
+        ):
+            result = await gatherer.gather_stars()
+
+        assert result.checked == 1  # Only GENesis-AGI tracks stars
+        assert result.new_findings == 1
+        assert result.errors == 0
+
+        rows = await observations.query(
+            db, source="recon", type="finding", category="github_stars"
+        )
+        assert len(rows) == 1
+        assert "30 stars" in rows[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_dedup_same_count(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="30"),
+        ):
+            r1 = await gatherer.gather_stars()
+            r2 = await gatherer.gather_stars()
+
+        assert r1.new_findings == 1
+        assert r2.new_findings == 0  # Same count, deduped
+
+    @pytest.mark.asyncio
+    async def test_records_delta(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="30"),
+        ):
+            await gatherer.gather_stars()
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="35"),
+        ):
+            result = await gatherer.gather_stars()
+
+        assert result.new_findings == 1
+        rows = await observations.query(
+            db, source="recon", type="finding", category="github_stars"
+        )
+        assert len(rows) == 2
+        latest = sorted(rows, key=lambda r: r["created_at"])[-1]
+        assert "+5" in latest["content"]
+
+    @pytest.mark.asyncio
+    async def test_filters_by_track(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="30"),
+        ):
+            result = await gatherer.gather_stars()
+
+        # NoStars project should be skipped (only tracks releases)
+        assert result.checked == 1
+
+    @pytest.mark.asyncio
+    async def test_handles_empty_response(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value=""),
+        ):
+            result = await gatherer.gather_stars()
+
+        assert result.checked == 1
+        assert result.new_findings == 0
+
+    @pytest.mark.asyncio
+    async def test_handles_non_integer(self, db):
+        gatherer = ReconGatherer(db)
+
+        with (
+            patch.object(ReconGatherer, "_load_watchlist", return_value=_STAR_WATCHLIST),
+            patch.object(ReconGatherer, "_run_gh", return_value="not a number"),
+        ):
+            result = await gatherer.gather_stars()
+
+        assert result.new_findings == 0
+
+    @pytest.mark.asyncio
+    async def test_no_star_projects(self, db):
+        gatherer = ReconGatherer(db)
+        no_stars = [p for p in _STAR_WATCHLIST if "stars" not in p.get("track", [])]
+
+        with patch.object(ReconGatherer, "_load_watchlist", return_value=no_stars):
+            result = await gatherer.gather_stars()
+
+        assert result.checked == 0
+        assert "No projects track stars" in result.details

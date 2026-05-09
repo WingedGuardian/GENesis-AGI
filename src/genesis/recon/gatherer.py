@@ -1,4 +1,4 @@
-"""ReconGatherer — checks watchlist projects for new GitHub releases via gh CLI."""
+"""ReconGatherer — checks watchlist projects for GitHub releases and stars via gh CLI."""
 
 from __future__ import annotations
 
@@ -38,6 +38,11 @@ class GatherResult:
 def _release_hash(repo: str, tag_name: str) -> str:
     """Deterministic content hash for a release — used for dedup."""
     return hashlib.sha256(f"{repo}:{tag_name}".encode()).hexdigest()[:16]
+
+
+def _stars_hash(repo: str, count: int) -> str:
+    """Deterministic content hash for a star count — deduplicates unchanged counts."""
+    return hashlib.sha256(f"{repo}:stars:{count}".encode()).hexdigest()[:16]
 
 
 class ReconGatherer:
@@ -97,6 +102,120 @@ class ReconGatherer:
             result.errors,
         )
         return result
+
+    async def gather_stars(self) -> GatherResult:
+        """Check star counts for watchlist projects. Store changes as findings."""
+        projects = self._load_watchlist()
+        star_projects = [
+            p for p in projects if "stars" in p.get("track", [])
+        ]
+
+        if not star_projects:
+            return GatherResult(details=["No projects track stars"])
+
+        checked = 0
+        new_total = 0
+        errors = 0
+        details: list[str] = []
+
+        for project in star_projects:
+            try:
+                stored = await self._check_stars(project)
+                checked += 1
+                if stored:
+                    new_total += 1
+                    details.append(stored)
+            except Exception:
+                errors += 1
+                details.append(f"{project['name']}: error checking stars")
+                logger.error(
+                    "Failed to check stars for %s",
+                    project.get("name", "unknown"),
+                    exc_info=True,
+                )
+
+        result = GatherResult(
+            checked=checked, new_findings=new_total,
+            errors=errors, details=details,
+        )
+        logger.info(
+            "Star gather: checked=%d, new=%d, errors=%d",
+            result.checked, result.new_findings, result.errors,
+        )
+        return result
+
+    async def _check_stars(self, project: dict) -> str | None:
+        """Check a single project's star count. Returns detail string if changed."""
+        repo = project.get("repo", "")
+        if not repo:
+            return None
+
+        raw = await self._run_gh(
+            "gh", "api", f"repos/{repo}", "--jq", ".stargazers_count",
+        )
+        if not raw:
+            return None
+
+        try:
+            count = int(raw)
+        except ValueError:
+            logger.warning("Non-integer star count for %s: %s", repo, raw)
+            return None
+
+        content_hash = _stars_hash(repo, count)
+
+        if await observations.exists_by_hash(
+            self._db, source="recon", content_hash=content_hash
+        ):
+            return None  # Count unchanged
+
+        # Get previous count for delta
+        prev_count = await self._get_previous_star_count(repo)
+        delta = count - prev_count if prev_count is not None else None
+
+        name = project.get("name", repo)
+        delta_str = f" ({'+' if delta > 0 else ''}{delta} since last check)" if delta is not None else ""
+        content = f"{name}: {count} stars{delta_str}"
+
+        now = datetime.now(UTC).isoformat()
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="recon",
+            type="finding",
+            category="github_stars",
+            content=content,
+            priority=project.get("priority", "medium"),
+            created_at=now,
+            content_hash=content_hash,
+        )
+
+        detail = f"{name}: {count} stars{delta_str}"
+        logger.info("Star count recorded: %s", detail)
+        return detail
+
+    async def _get_previous_star_count(self, repo: str) -> int | None:
+        """Get the most recent star count for a repo from observations."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT content FROM observations "
+                "WHERE source = 'recon' AND category = 'github_stars' "
+                "AND content LIKE ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (f"%{repo.split('/')[-1]}%",),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            # Content format: "Name: 30 stars (+5 since last check)"
+            text = row[0] if isinstance(row, tuple) else row["content"]
+            # Extract the number before " stars"
+            parts = text.split(" stars")[0].rsplit(": ", 1)
+            if len(parts) == 2:
+                return int(parts[1])
+        except (ValueError, IndexError, Exception):
+            pass
+        return None
 
     async def _check_releases(self, project: dict) -> int:
         """Check a single project for new releases. Returns count of new findings."""
