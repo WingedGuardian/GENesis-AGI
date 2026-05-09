@@ -31,6 +31,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# User-recency tiers: (elapsed_threshold, max_interval_minutes).
+# When the user hasn't had a foreground session in a while, the ego
+# naturally winds down — through the cadence system, not self-suppression.
+_RECENCY_TIERS: list[tuple[timedelta | None, int]] = [
+    (timedelta(hours=24), 240),    # <24h:   current max (~6x/day)
+    (timedelta(days=3),   480),    # 1-3d:   ~3x/day
+    (timedelta(days=7),   1440),   # 3-7d:   ~1x/day
+    (timedelta(days=14),  2880),   # 7-14d:  every other day
+    (None,                4320),   # 14+d:   every 3 days
+]
+
 
 class EgoCadenceManager:
     """Manages when the ego runs.
@@ -201,7 +212,7 @@ class EgoCadenceManager:
                 return
 
             self._record_success()
-            self._update_interval(had_proposals=bool(proposals))
+            await self._update_interval(had_proposals=bool(proposals))
 
     async def _on_morning_report(self) -> None:
         """Cron trigger handler. Morning report cycle (skips idle check)."""
@@ -228,7 +239,7 @@ class EgoCadenceManager:
 
             self._record_success()
             # Morning report always resets interval to base
-            self._update_interval(had_proposals=True)
+            await self._update_interval(had_proposals=True)
 
     # -- Gate logic --------------------------------------------------------
 
@@ -323,29 +334,71 @@ class EgoCadenceManager:
 
     # -- Adaptive interval -------------------------------------------------
 
-    def _update_interval(self, *, had_proposals: bool) -> None:
-        """Adjust cycle interval based on productivity.
+    async def _recency_max_interval(self) -> int:
+        """Dynamic max_interval based on last foreground session.
+
+        Returns a ceiling that adapts to how recently the user was active.
+        Falls back to the static config max if no foreground data is
+        available.
+        """
+        try:
+            cursor = await self._db.execute(
+                "SELECT last_activity_at FROM cc_sessions "
+                "WHERE source_tag = 'foreground' "
+                "AND status IN ('active', 'completed', 'checkpointed') "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+            )
+            row = await cursor.fetchone()
+        except Exception:
+            return self._config.max_interval_minutes
+
+        if not row or not row[0]:
+            return self._config.max_interval_minutes
+
+        try:
+            last_active = datetime.fromisoformat(row[0])
+            if last_active.tzinfo is None:
+                last_active = last_active.replace(tzinfo=UTC)
+        except (ValueError, TypeError):
+            return self._config.max_interval_minutes
+
+        elapsed = datetime.now(UTC) - last_active
+
+        for threshold, max_mins in _RECENCY_TIERS:
+            if threshold is None or elapsed < threshold:
+                return max_mins
+
+        return self._config.max_interval_minutes
+
+    async def _update_interval(self, *, had_proposals: bool) -> None:
+        """Adjust cycle interval based on productivity and user recency.
 
         - Idle cycle (no proposals): multiply by backoff_multiplier
         - Productive cycle: reset to base cadence_minutes
-        - Never exceed max_interval_minutes
+        - Max interval adapts to user recency (longer absence → higher cap)
         """
+        recency_max = await self._recency_max_interval()
+
         if had_proposals:
             new_interval = self._config.cadence_minutes
         else:
             new_interval = min(
                 int(self._current_interval * self._config.backoff_multiplier),
-                self._config.max_interval_minutes,
+                recency_max,
             )
 
         if new_interval != self._current_interval:
+            old_interval = self._current_interval
             self._current_interval = new_interval
             try:
                 self._scheduler.reschedule_job(
                     "ego_cycle",
                     trigger=IntervalTrigger(minutes=new_interval),
                 )
-                logger.info("Ego interval adjusted to %d minutes", new_interval)
+                logger.info(
+                    "Ego interval adjusted: %dm → %dm (recency_max=%dm)",
+                    old_interval, new_interval, recency_max,
+                )
             except Exception:
                 logger.warning(
                     "Failed to reschedule ego interval", exc_info=True,
