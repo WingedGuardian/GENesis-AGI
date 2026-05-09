@@ -122,9 +122,9 @@ def test_load_full_yaml(monkeypatch):
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
     # lmstudio-30b, github-o3mini, openrouter-deepseek-r1 disabled → 27 enabled providers
-    # (30 total - 3 disabled; added openrouter-deepseek-v4, openrouter-gpt55 for
+    # (32 total - 4 disabled; added openrouter-deepseek-v4, openrouter-gpt55 for
     # executor review gates)
-    assert len(cfg.providers) == 27
+    assert len(cfg.providers) == 28
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers
@@ -145,7 +145,7 @@ def test_load_full_yaml(monkeypatch):
     # lmstudio-30b filtered out, only mistral-large-free remains
     assert cfg.call_sites["30_triage_calibration"].chain == ["mistral-large-free"]
     assert cfg.call_sites["31_outcome_classification"].chain == [
-        "glm5", "mistral-large-free",
+        "glm51", "mistral-large-free",
     ]
 
     # mistral-large-free provider (consolidated from mistral-free + mistral-large)
