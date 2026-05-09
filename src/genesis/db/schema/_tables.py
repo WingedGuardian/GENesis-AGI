@@ -949,6 +949,21 @@ TABLES = {
                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """,
+    "memory_events": """
+        CREATE TABLE IF NOT EXISTS memory_events (
+            id                TEXT PRIMARY KEY,
+            memory_id         TEXT NOT NULL,
+            subject           TEXT NOT NULL,
+            verb              TEXT NOT NULL,
+            object            TEXT,
+            event_date        TEXT,
+            event_date_end    TEXT,
+            confidence        REAL NOT NULL DEFAULT 0.5,
+            source_session_id TEXT,
+            created_at        TEXT NOT NULL
+                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1138,6 +1153,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_eval_events_session ON eval_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period ON eval_snapshots(dimension, period_end)",
+    # SVO event calendar
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_date ON memory_events(event_date)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_subject ON memory_events(subject)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_verb ON memory_events(verb)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

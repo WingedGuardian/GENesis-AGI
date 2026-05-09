@@ -36,6 +36,16 @@ For each extraction, provide:
     categorized_as, related_to, succeeded_by, preceded_by
 - temporal: Date or time reference if mentioned (ISO format preferred)
 
+For each extraction that has a temporal reference AND describes a concrete
+action (something that happened, was decided, or will happen), additionally
+provide an "event" object with:
+- subject: who/what performed the action (e.g., "maintainer", "Genesis", "user")
+- verb: what happened, past tense (e.g., "closed", "deferred", "evaluated")
+- object: what was affected (e.g., "PR #773", "fact-checker rework")
+
+Only include the event object when there is both a clear temporal reference
+AND a concrete action with a subject and verb. Not all extractions are events.
+
 Focus on DURABLE KNOWLEDGE — facts, decisions, and insights that will be
 valuable weeks or months from now. Target 3-8 high-quality extractions per
 segment. Quality over quantity.
@@ -72,7 +82,8 @@ Respond with a JSON object inside backticks containing:
         {"from": "Agentmail", "to": "Genesis outreach", "type": "evaluated_for"},
         {"from": "Agentmail", "to": "P-3", "type": "categorized_as"}
       ],
-      "temporal": "2026-03-17"
+      "temporal": "2026-03-17",
+      "event": {"subject": "Genesis", "verb": "evaluated", "object": "Agentmail"}
     }
   ],
   "session_keywords": ["agentmail", "email", "outreach", "evaluation"],
@@ -108,6 +119,10 @@ class Extraction:
     entities: list[str] = field(default_factory=list)
     relationships: list[dict] = field(default_factory=list)
     temporal: str | None = None
+    # SVO event fields (populated when extraction describes a concrete action)
+    event_subject: str | None = None
+    event_verb: str | None = None
+    event_object: str | None = None
 
 
 @dataclass
@@ -235,6 +250,16 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
         if temporal is not None:
             temporal = str(temporal)
 
+        # Parse optional SVO event fields
+        event_subject = None
+        event_verb = None
+        event_object = None
+        event = item.get("event")
+        if isinstance(event, dict):
+            event_subject = str(event["subject"]) if event.get("subject") else None
+            event_verb = str(event["verb"]) if event.get("verb") else None
+            event_object = str(event["object"]) if event.get("object") else None
+
         extractions.append(Extraction(
             content=content,
             extraction_type=ext_type,
@@ -242,6 +267,9 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
             entities=entities,
             relationships=valid_rels,
             temporal=temporal,
+            event_subject=event_subject,
+            event_verb=event_verb,
+            event_object=event_object,
         ))
 
     return ParsedResponse(
