@@ -346,6 +346,34 @@ class EgoSession:
                     self._db, key=self._focus_summary_key, value=focus,
                 )
 
+            # 11b. Record violation if focus was behavioral self-assignment
+            if parsed.get("_focus_violation"):
+                import uuid
+
+                from genesis.db.crud import observations as obs_crud
+
+                try:
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_session",
+                        type="ego_focus_violation",
+                        content=(
+                            f"Ego attempted behavioral self-assignment in "
+                            f"focus_summary. Original: "
+                            f"{parsed.get('_original_focus', 'unknown')[:200]}. "
+                            f"Sanitized to: {focus}"
+                        ),
+                        priority="medium",
+                        created_at=datetime.now(UTC).isoformat(),
+                        category="system_health",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record focus violation observation",
+                        exc_info=True,
+                    )
+
             # 12. Process escalations (Genesis ego → observations for user ego)
             escalations = parsed.get("escalations", [])
             if isinstance(escalations, list) and escalations:
@@ -826,6 +854,52 @@ class EgoSession:
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 
+# -- Behavioral focus detection --------------------------------------------
+#
+# focus_summary must describe a TOPIC the ego is thinking about, never a
+# BEHAVIORAL state (holding back, waiting, pausing, etc.).  This regex
+# catches known self-suppression patterns.  It is the safety-net layer
+# beneath the prompt guardrails in EGO_SESSION.md.
+_BEHAVIORAL_FOCUS_RE = re.compile(
+    r"(?i)"
+    r"(?:holding\s+back|stepping\s+back|standing\s+down|lying\s+low"
+    r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
+    r"(?:user|jay|he|she|them|they|surface|engage|return)"
+    r"|pausing\s+(?:proactive|proposal|work|activity)"
+    r"|quiet\s+mode|(?:^|\W)dormant(?:\W|$)|(?:^|\W)fallow(?:\W|$)"
+    r"|hibernat(?:e|ing)|no\s+proposals?\s+(?:until|for\s+now)"
+    r"|until\s+\w+\s+surfaces?"
+    r"|letting\s+.*breathe|giving\s+.*space"
+    r"|staying\s+(?:out|quiet)|backing\s+off"
+    r"|not\s+(?:proposing|intervening|acting)"
+    r"|observing\s+(?:only|quietly)|passive\s+(?:mode|watch)"
+    r"|minimal\s+engagement|reduced\s+activity)"
+)
+
+
+def _sanitize_focus_summary(
+    focus: str,
+    *,
+    previous_focus: str | None = None,
+) -> tuple[str, bool]:
+    """Validate focus_summary describes a TOPIC, not a BEHAVIOR.
+
+    Returns (sanitized_focus, was_violated).
+    If the focus is behavioral, returns the previous legitimate focus
+    or a generic fallback, plus was_violated=True.
+    """
+    if _BEHAVIORAL_FOCUS_RE.search(focus):
+        fallback = previous_focus or "general system awareness"
+        logger.warning(
+            "Ego focus_summary contains behavioral self-assignment: %r — "
+            "replacing with %r",
+            focus[:120],
+            fallback,
+        )
+        return fallback, True
+    return focus, False
+
+
 _INTERACT_TYPES = frozenset({"outreach", "dispatch"})
 _RESEARCH_TYPES = frozenset({"investigate"})
 
@@ -855,6 +929,14 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("follow_ups"), list):
         logger.warning("Ego output missing or invalid 'follow_ups' field")
         return None
+
+    # Sanitize focus_summary — must describe a TOPIC, not a BEHAVIOR.
+    sanitized, violated = _sanitize_focus_summary(data["focus_summary"])
+    if violated:
+        data["_original_focus"] = data["focus_summary"]
+        data["focus_summary"] = sanitized
+        data["_focus_violation"] = True
+
     # Sanitize individual proposals to prevent DB constraint violations.
     for p in data["proposals"]:
         if not isinstance(p, dict):
@@ -891,8 +973,6 @@ _CAP_PATTERN = re.compile(r"_\(max (\d+) items?\)_")
 _NOTEPAD_SECTIONS = [
     "Active Projects & Priorities",
     "Interests & Expertise",
-    "Interaction Patterns",
-    "Proposal Context Journal",
     "Open Questions",
 ]
 

@@ -12,7 +12,7 @@ from genesis.cc.types import CCOutput
 from genesis.db.crud import ego as ego_crud
 from genesis.db.schema import TABLES
 from genesis.ego.dispatch import EgoDispatcher
-from genesis.ego.session import EgoSession
+from genesis.ego.session import EgoSession, _sanitize_focus_summary
 from genesis.ego.types import CycleType, EgoConfig
 
 # ---------------------------------------------------------------------------
@@ -545,3 +545,83 @@ class TestOutputParsing:
         result = EgoSession._parse_output(raw)
         assert result is not None
         assert result["proposals"] == []
+
+
+# ---------------------------------------------------------------------------
+# Focus summary sanitization tests
+# ---------------------------------------------------------------------------
+
+
+class TestFocusSanitization:
+    """Tests for behavioral focus_summary detection and sanitization."""
+
+    @pytest.mark.parametrize("focus", [
+        "Holding back — Jay is sprinting on job applications",
+        "Holding back — user is busy",
+        "Stepping back while user is busy",
+        "Lying low during sprint",
+        "Waiting for user to surface",
+        "Waiting for Jay to engage with proposals",
+        "Waiting for them to return",
+        "Pausing proactive work until things settle",
+        "Pausing proposal generation",
+        "Quiet mode — no proposals for now",
+        "No proposals until he finishes applications",
+        "No proposal for now",
+        "Staying quiet while user focuses",
+        "Staying out of the way",
+        "Observing only — reduced activity",
+        "Observing quietly this cycle",
+        "Passive mode — watching only",
+        "Minimal engagement this cycle",
+        "Reduced activity during user sprint",
+        "Not proposing anything while user is busy",
+        "Not acting until signals improve",
+        "Backing off — proposals ignored",
+        "Until Jay surfaces again",
+        "Letting things breathe for now",
+        "Giving the user space this cycle",
+        "Hibernating until user returns",
+    ])
+    def test_behavioral_focus_rejected(self, focus):
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is True
+        assert sanitized == "general system awareness"
+
+    @pytest.mark.parametrize("focus", [
+        "investigating backlog growth",
+        "monitoring provider health after outage",
+        "evaluating job application tracking design",
+        "reviewing cost trends for the past week",
+        "general system health monitoring",
+        "analyzing user feedback on morning reports",
+        "tracking Anthropic API availability",
+        "memory pipeline performance audit",
+        "waiting for API rate limit to reset",
+        "observing provider latency patterns across regions",
+    ])
+    def test_legitimate_focus_accepted(self, focus):
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is False
+        assert sanitized == focus
+
+    def test_previous_focus_used_as_fallback(self):
+        sanitized, violated = _sanitize_focus_summary(
+            "Holding back", previous_focus="monitoring API costs"
+        )
+        assert violated is True
+        assert sanitized == "monitoring API costs"
+
+    def test_default_fallback_when_no_previous(self):
+        sanitized, violated = _sanitize_focus_summary("Holding back")
+        assert violated is True
+        assert sanitized == "general system awareness"
+
+    def test_validate_output_sanitizes_focus(self):
+        """_validate_output catches behavioral focus and sets violation flags."""
+        raw = _valid_output(focus="Holding back — user is busy")
+        result = EgoSession._parse_output(raw)
+        assert result is not None
+        assert result["focus_summary"] == "general system awareness"
+        assert result.get("_focus_violation") is True
+        assert "Holding back" in result.get("_original_focus", "")
