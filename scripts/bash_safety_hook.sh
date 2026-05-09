@@ -50,7 +50,7 @@ if echo "$CMD" | grep -qE "^gh pr merge|[;&|] *gh pr merge"; then
         _mergeable=$(gh pr view "$_pr_num" $_repo_flag --json mergeable --jq '.mergeable' 2>/dev/null)
         if [ "$_mergeable" = "UNKNOWN" ]; then
             echo "BLOCKED: PR #$_pr_num mergeable status is UNKNOWN." >&2
-            echo "GitHub hasn't finished conflict analysis. Wait ~30s and retry." >&2
+            echo "GitHub hasn't finished conflict analysis. Wait until mergeable status is known before retrying." >&2
             exit 2
         fi
         if [ "$_mergeable" = "CONFLICTING" ]; then
