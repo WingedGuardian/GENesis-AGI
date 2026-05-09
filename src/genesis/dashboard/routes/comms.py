@@ -185,4 +185,15 @@ async def comms_resolve_proposal(proposal_id: str):
     if not ok:
         return jsonify({"error": "Proposal not found or already resolved"}), 404
 
+    try:
+        from genesis.db.crud import intervention_journal as journal_crud
+        await journal_crud.resolve(
+            rt.db, proposal_id,
+            outcome_status=status,
+            actual_outcome=f"Dashboard: user {status}",
+            user_response=user_response or None,
+        )
+    except Exception:
+        logger.warning("Journal resolve failed for proposal %s", proposal_id)
+
     return jsonify({"id": proposal_id, "status": status})

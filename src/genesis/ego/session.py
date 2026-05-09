@@ -311,6 +311,13 @@ class EgoSession:
                         ok = await ego_crud.table_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s tabled by ego", pid)
+                            try:
+                                from genesis.db.crud import intervention_journal as journal_crud
+                                await journal_crud.resolve(
+                                    self._db, pid, outcome_status="tabled",
+                                )
+                            except Exception:
+                                pass
 
             withdrawn_ids = parsed.get("withdrawn", [])
             if isinstance(withdrawn_ids, list):
@@ -319,6 +326,13 @@ class EgoSession:
                         ok = await ego_crud.withdraw_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s withdrawn by ego", pid)
+                            try:
+                                from genesis.db.crud import intervention_journal as journal_crud
+                                await journal_crud.resolve(
+                                    self._db, pid, outcome_status="withdrawn",
+                                )
+                            except Exception:
+                                pass
 
             # 9c. Process execution briefs (ego-as-executor)
             execution_briefs = parsed.get("execution_briefs", [])
@@ -471,6 +485,25 @@ class EgoSession:
                 batch_id, len(ids),
             )
 
+            # Record intervention journal entries (fire-and-forget)
+            try:
+                from genesis.db.crud import intervention_journal as journal_crud
+                now = datetime.now(UTC).isoformat()
+                for pid, prop in zip(ids, proposals, strict=False):
+                    await journal_crud.create(
+                        self._db,
+                        ego_source=self._source_tag,
+                        proposal_id=pid,
+                        cycle_id=cycle_id,
+                        action_type=prop.get("action_type", "unknown"),
+                        action_summary=prop.get("content", "")[:500],
+                        expected_outcome=prop.get("rationale", ""),
+                        confidence=prop.get("confidence", 0.0),
+                        created_at=now,
+                    )
+            except Exception:
+                logger.warning("Failed to create intervention journal entries", exc_info=True)
+
             # Structural validation — annotates digest, doesn't block
             validation_issues = await self._proposals.validate_batch(proposals)
             if validation_issues:
@@ -557,6 +590,15 @@ class EgoSession:
                     status="executed",
                     user_response=f"session:{session_id}",
                 )
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+                    await journal_crud.resolve(
+                        self._db, proposal_id,
+                        outcome_status="executed",
+                        actual_outcome=f"Dispatched as session:{session_id}",
+                    )
+                except Exception:
+                    logger.warning("Journal resolve failed for %s", proposal_id)
                 logger.info(
                     "Dispatched proposal %s → session %s",
                     proposal_id, session_id,
@@ -577,6 +619,15 @@ class EgoSession:
                         "Failed to mark proposal %s as failed",
                         proposal_id, exc_info=True,
                     )
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+                    await journal_crud.resolve(
+                        self._db, proposal_id,
+                        outcome_status="failed",
+                        actual_outcome="Dispatch failed",
+                    )
+                except Exception:
+                    logger.warning("Journal resolve failed for %s", proposal_id)
 
     async def _process_escalations(
         self,
