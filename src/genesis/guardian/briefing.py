@@ -264,7 +264,7 @@ def _build_default_briefing() -> BriefingContent:
             "Awareness loop ticks every 5 minutes — heartbeat canary is tied to it.",
             "Python venv at ~/genesis/.venv. Config at ~/genesis/config/.",
             "Database at ~/genesis/data/genesis.db (SQLite, 60+ tables).",
-            "/tmp is 512MB tmpfs — fills up under heavy logging or temp file use.",
+            "/tmp shares the root filesystem — avoid large temp file accumulation.",
             "Cgroup memory limit is 24GiB. OOM kills target heaviest process.",
         ],
     )

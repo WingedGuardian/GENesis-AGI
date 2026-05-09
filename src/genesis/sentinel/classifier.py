@@ -42,7 +42,6 @@ _TIER1_PATTERNS = {
 _TIER2_PATTERNS = {
     "memory:critical",
     "disk:critical",
-    "tmpfs:critical",
     "embedding:unreachable",
     "qdrant:unreachable",
     "qdrant:collections_missing",

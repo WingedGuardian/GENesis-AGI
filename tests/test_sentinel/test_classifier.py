@@ -79,7 +79,6 @@ class TestClassifyAlerts:
             "guardian:heartbeat_stale",             # Tier 1 (Part 8)
             "awareness:tick_overdue",               # Tier 1 (explicit — defense mechanism)
             "infra:disk_low",                       # Tier 2 (via blanket)
-            "infra:tmpfs_low",                      # Tier 2 (via blanket)
             "infra:container_memory_high",          # Tier 2 (via blanket)
             "infra:qdrant_collections_missing",     # Tier 2 (via blanket)
             "provider:embedding_failing",           # Tier 2 (via blanket)
