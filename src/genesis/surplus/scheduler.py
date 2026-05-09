@@ -303,8 +303,8 @@ class SurplusScheduler:
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
-            pending = await self._queue.pending_by_type(TaskType.CODE_AUDIT)
-            if pending == 0:
+            active = await self._queue.active_by_type(TaskType.CODE_AUDIT)
+            if active == 0:
                 await self._queue.enqueue(
                     TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
                 )
@@ -326,8 +326,8 @@ class SurplusScheduler:
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
-            pending = await self._queue.pending_by_type(TaskType.CODE_INDEX)
-            if pending == 0:
+            active = await self._queue.active_by_type(TaskType.CODE_INDEX)
+            if active == 0:
                 await self._queue.enqueue(
                     TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.6, "competence"
                 )
@@ -345,7 +345,7 @@ class SurplusScheduler:
                 pass
 
     async def schedule_maintenance(self) -> None:
-        """Enqueue mechanical infrastructure maintenance tasks if none pending."""
+        """Enqueue mechanical infrastructure maintenance tasks if none active."""
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
@@ -357,8 +357,8 @@ class SurplusScheduler:
                 (TaskType.DB_MAINTENANCE, 0.3, "competence"),
             ]
             for task_type, priority, drive in maintenance_tasks:
-                pending = await self._queue.pending_by_type(task_type)
-                if pending == 0:
+                active = await self._queue.active_by_type(task_type)
+                if active == 0:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
@@ -382,7 +382,7 @@ class SurplusScheduler:
                 pass
 
     async def schedule_analytical(self) -> None:
-        """Enqueue LLM-based analytical tasks if none pending.
+        """Enqueue LLM-based analytical tasks if none active.
 
         These run on a separate (longer) cadence than mechanical maintenance
         because their inputs change slowly and their free-tier model output
@@ -396,8 +396,8 @@ class SurplusScheduler:
                 # anticipatory_research returns as a pipeline — see pipelines.py.
             ]
             for task_type, priority, drive in analytical_tasks:
-                pending = await self._queue.pending_by_type(task_type)
-                if pending == 0:
+                active = await self._queue.active_by_type(task_type)
+                if active == 0:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
