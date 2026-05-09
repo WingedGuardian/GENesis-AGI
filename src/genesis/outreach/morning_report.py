@@ -173,6 +173,14 @@ class MorningReportGenerator:
             logger.warning("Morning report: critical issues check failed", exc_info=True)
             sections.append(f"## Critical Issues\nFailed to query health alerts: {exc}")
 
+        # 8. What I Noticed (unsurfaced observations worth user attention)
+        try:
+            noticed = await self._get_observation_insights()
+            if noticed:
+                sections.append(f"## What I Noticed\n{noticed}")
+        except Exception:
+            logger.warning("Morning report: observation insights unavailable", exc_info=True)
+
         return "\n\n".join(sections)
 
     async def _emit_warning(self, section: str, message: str) -> None:
@@ -464,5 +472,44 @@ class MorningReportGenerator:
         lines = [f"- {total} messages sent in last 7 days."]
         if pending:
             lines.append(f"- {pending} awaiting engagement signal.")
+
+        return "\n".join(lines)
+
+    async def _get_observation_insights(self) -> str | None:
+        """Surface unsurfaced observations that deserve user attention.
+
+        Returns None if no unsurfaced observations exist. Marks delivered
+        observations as surfaced to prevent re-delivery.
+        """
+        from datetime import UTC, datetime
+
+        from genesis.db.crud.observations import (
+            get_unsurfaced,
+            increment_retrieved_batch,
+            mark_influenced_batch,
+            mark_surfaced,
+        )
+
+        observations = await get_unsurfaced(
+            self._db,
+            priority_filter=("critical", "high", "medium"),
+            exclude_types=_INTERNAL_OBS_TYPES,
+            limit=10,
+        )
+        if not observations:
+            return None
+
+        lines = []
+        for obs in observations:
+            prio = obs["priority"]
+            badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
+            content = obs["content"][:200].replace("\n", " ")
+            lines.append(f"- {badge} **{prio}**: {content}")
+
+        ids = [obs["id"] for obs in observations]
+        now = datetime.now(UTC).isoformat()
+        await mark_surfaced(self._db, ids, now)
+        await increment_retrieved_batch(self._db, ids)
+        await mark_influenced_batch(self._db, ids)
 
         return "\n".join(lines)

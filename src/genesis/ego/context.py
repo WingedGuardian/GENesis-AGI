@@ -255,6 +255,22 @@ class EgoContextBuilder:
                 f"{short}"
             )
 
+        # Surfacing awareness: how many observations await morning report delivery
+        try:
+            from genesis.db.crud.observations import unsurfaced_counts_by_priority
+            counts = await unsurfaced_counts_by_priority(self._db)
+            if counts:
+                total = sum(counts.values())
+                breakdown = ", ".join(
+                    f"{c} {p}" for p, c in sorted(
+                        counts.items(),
+                        key=lambda x: {"critical": 0, "high": 1, "medium": 2}.get(x[0], 3),
+                    ) if c > 0
+                )
+                lines.append(f"*Unsurfaced: {total} observations ({breakdown}) awaiting morning report.*\n")
+        except Exception:
+            pass  # surfaced_at column may not exist yet
+
         lines.append("")
         return "\n".join(lines)
 

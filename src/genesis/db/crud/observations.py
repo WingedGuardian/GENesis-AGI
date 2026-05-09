@@ -438,3 +438,72 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM observations WHERE id = ?", (id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+# -- Surfacing ----------------------------------------------------------------
+
+
+async def get_unsurfaced(
+    db: aiosqlite.Connection,
+    *,
+    priority_filter: tuple[str, ...] = ("critical", "high", "medium"),
+    exclude_types: tuple[str, ...] = (),
+    limit: int = 10,
+) -> list[dict]:
+    """Return unsurfaced, unresolved observations for user delivery.
+
+    Results are ordered by priority weight (critical > high > medium)
+    then by creation time descending (newest first).
+    """
+    prio_placeholders = ",".join("?" for _ in priority_filter)
+    sql = (
+        "SELECT id, source, type, category, content, priority, created_at "
+        "FROM observations "
+        f"WHERE surfaced_at IS NULL AND resolved = 0 AND priority IN ({prio_placeholders})"
+    )
+    params: list = list(priority_filter)
+
+    if exclude_types:
+        type_placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({type_placeholders})"
+        params.extend(exclude_types)
+
+    sql += (
+        " ORDER BY CASE priority "
+        "   WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+        "   WHEN 'medium' THEN 2 ELSE 3 END, "
+        " created_at DESC "
+        f"LIMIT {limit}"
+    )
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, r, strict=False)) for r in rows]
+
+
+async def mark_surfaced(
+    db: aiosqlite.Connection,
+    ids: list[str],
+    surfaced_at: str,
+) -> int:
+    """Mark observations as surfaced. Returns count updated."""
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    cursor = await db.execute(
+        f"UPDATE observations SET surfaced_at = ? WHERE id IN ({placeholders})",
+        [surfaced_at, *ids],
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def unsurfaced_counts_by_priority(db: aiosqlite.Connection) -> dict[str, int]:
+    """Count unsurfaced, unresolved observations grouped by priority."""
+    cursor = await db.execute(
+        "SELECT priority, COUNT(*) FROM observations "
+        "WHERE surfaced_at IS NULL AND resolved = 0 "
+        "GROUP BY priority"
+    )
+    rows = await cursor.fetchall()
+    return {row[0]: row[1] for row in rows}
