@@ -23,7 +23,7 @@ things, and what trips developers up repeatedly.
 | `skills/` | 20+ internal skills (evaluate, research, osint, forecasting, etc.) | ACTIVE |
 | `ego/` | Ego sessions (user ego + genesis ego), adaptive cadence, proposals, dispatch | **ACTIVE** |
 | `providers/` | Provider registry (web search, STT, TTS, embeddings, health) | ACTIVE |
-| `research/` | Web search + URL fetch via SearXNG+Brave, Gemini YouTube routing | ACTIVE |
+| `research/` | Web search + URL fetch via Tinyfish+Brave, Gemini YouTube routing | ACTIVE |
 | `mail/` | Gmail monitor (weekly poll), two-layer triage (Gemini + CC) | ACTIVE |
 | `inbox/` | Inbox scanner (~inbox/), markdown evaluation, CC dispatch | ACTIVE |
 | `channels/` | Message delivery adapters (Telegram, OpenClaw) | ACTIVE |

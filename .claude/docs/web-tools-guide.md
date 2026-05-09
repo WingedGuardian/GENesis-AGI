@@ -10,7 +10,7 @@ These are the PRIMARY tools. Use them by default in all contexts.
 | Need | Tool | Notes |
 |------|------|-------|
 | Fetch URL content | `web_fetch(url)` | Anti-bot, JS fallback, structured output |
-| Search the web | `web_search(query)` | SearXNG unlimited, structured results |
+| Search the web | `web_search(query)` | Tinyfish unlimited, structured results |
 | AI-summarized fetch | CC `WebFetch` | Foreground only — when you need AI summary |
 | Quick general lookup | CC `WebSearch` | Foreground only — simple questions |
 | JS-heavy SPA | `web_fetch(url, backend="crawl4ai")` | Playwright rendering |
@@ -27,13 +27,13 @@ Browser for interaction. ATS APIs for job listings.
 | Tool | Context | Use when... | Free tier |
 |------|---------|-------------|-----------|
 | **CC WebSearch** | CC sessions | Quick reliable search, general queries | Included |
-| **SearXNG** (`localhost:55510`) | Both | Structured JSON, `site:` filters, bulk queries | Unlimited (self-hosted) |
+| **Tinyfish** (`localhost:55510`) | Both | Structured JSON, `site:` filters, bulk queries | Unlimited (self-hosted) |
 | **Tavily** (API) | Both | AI-optimized results for agent pipelines | 1,000/month |
 | **Exa** (API) | Both | Neural/semantic search, conceptual discovery | 1,000/month |
 | **Perplexity** (API) | Both | Synthesized answers with citations | None (paid only) |
-| **Brave** (API) | Genesis runtime | Auto-fallback when SearXNG fails | ~1,000/month |
+| **Brave** (API) | Genesis runtime | Auto-fallback when Tinyfish fails | ~1,000/month |
 
-**CC sessions default:** CC `WebSearch` for general lookups. SearXNG via
+**CC sessions default:** CC `WebSearch` for general lookups. Tinyfish via
 Bash for structured JSON / `site:` filtering. Tavily for AI-optimized
 agent search (free tier). Exa for semantic/conceptual discovery. Perplexity
 when synthesis from multiple sources justifies the cost.
@@ -75,8 +75,8 @@ not on these platforms.
 - `src/genesis/providers/exa_adapter.py` — ExaAdapter
 - `src/genesis/providers/crawl4ai_adapter.py` — Crawl4AIAdapter
 - `src/genesis/providers/cloudflare_crawl.py` — CloudflareCrawlAdapter
-- `src/genesis/research/web_adapter.py` — WebSearchAdapter (SearXNG+Brave)
+- `src/genesis/research/web_adapter.py` — WebSearchAdapter (Tinyfish+Brave)
 - `src/genesis/research/perplexity.py` — PerplexityAdapter
 - `src/genesis/web/fetch.py` — WebFetcher (Scrapling+httpx)
-- `src/genesis/web/search.py` — WebSearcher (SearXNG client)
+- `src/genesis/web/search.py` — WebSearcher (Tinyfish client)
 - `src/genesis/providers/registry.py` — ProviderRegistry
