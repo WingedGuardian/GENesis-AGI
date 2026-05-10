@@ -225,7 +225,7 @@ class ActionClassifier:
                             v,
                             k,
                         )
-            self._approval_timeouts = parsed
+            self._approval_timeouts.update(parsed)
         elif timeouts is not None:
             logger.warning("approval_timeouts is not a mapping — using defaults")
 

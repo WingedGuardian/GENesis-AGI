@@ -10,7 +10,7 @@ from genesis.mcp.health import mcp  # noqa: E402
 logger = logging.getLogger(__name__)
 
 _VALID_MODELS = {"sonnet", "opus", "haiku"}
-_VALID_EFFORTS = {"low", "medium", "high", "max"}
+_VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 
 
 async def _impl_session_set_model(session_id: str, model: str) -> dict:
@@ -85,7 +85,7 @@ async def session_set_effort(session_id: str, effort: str) -> dict:
 
     Call this when the user asks to change thinking effort, e.g. 'use high
     thinking', 'think harder', 'low effort', 'max effort'. Valid levels:
-    low, medium, high, max. Pass the Session ID from your system configuration.
+    low, medium, high, xhigh, max. Pass the Session ID from your system configuration.
     The change takes effect on the next response.
     """
     return await _impl_session_set_effort(session_id, effort)

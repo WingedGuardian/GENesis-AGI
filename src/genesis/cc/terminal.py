@@ -16,7 +16,7 @@ from genesis.runtime import GenesisRuntime
 
 _BANNER = """\
 Genesis Terminal — type your message, press Enter.
-Commands: /model <sonnet|opus|haiku>, /effort <low|medium|high>
+Commands: /model <sonnet|opus|haiku>, /effort <low|medium|high|xhigh|max>
 Type 'exit' or 'quit' to leave. Ctrl+D or Ctrl+C also works.
 """
 

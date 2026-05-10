@@ -275,6 +275,28 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _follow_up_retention_sweep() -> None:
+            try:
+                from genesis.db.crud import follow_ups
+
+                count = await follow_ups.purge_completed(rt._db)
+                rt.record_job_success("follow_up_retention_sweep")
+                if count:
+                    logger.info(
+                        "Follow-up retention sweep: purged %d old records", count,
+                    )
+            except Exception as exc:
+                rt.record_job_failure("follow_up_retention_sweep", str(exc))
+                logger.exception("Follow-up retention sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _follow_up_retention_sweep,
+            CronTrigger(hour=2, minute=30),
+            id="follow_up_retention_sweep",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _run_recovery() -> None:
             if rt._recovery_orchestrator is not None:
                 try:
