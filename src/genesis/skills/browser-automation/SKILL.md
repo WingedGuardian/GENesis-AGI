@@ -20,7 +20,7 @@ Genesis has four layers of browser interaction. Choose the lightest layer
 that can accomplish the task. **Token cost increases with each layer.**
 
 ### Layer 1: Web Fetch (read-only, public data — zero browser tokens)
-- Tools: `WebFetch`, Firecrawl, `genesis.web` (Tinyfish + Brave)
+- Tools: `WebFetch`, Firecrawl, `genesis.web` (SearXNG + Brave)
 - Use for: public information retrieval, search, reading articles
 - No authentication, no interaction, no JavaScript rendering
 - Fastest and cheapest option

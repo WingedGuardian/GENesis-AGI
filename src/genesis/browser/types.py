@@ -21,7 +21,7 @@ class BrowserLayer(StrEnum):
 
     FETCH = "fetch"
     """Layer 1: API-like web fetch. Read-only, no authentication, no interaction.
-    Uses WebFetch, Firecrawl, or genesis.web (Tinyfish + Brave)."""
+    Uses WebFetch, Firecrawl, or genesis.web (SearXNG + Brave)."""
 
     MANAGED = "managed"
     """Layer 2: Genesis browser tools with persistent profile. Agent's own logins.

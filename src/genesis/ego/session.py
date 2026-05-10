@@ -305,7 +305,7 @@ class EgoSession:
         # 9. Process proposals
         if parsed:
             proposals = parsed.get("proposals", [])
-            comm_decision = parsed.get("communication_decision", "stay_quiet")
+            comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
                 await self._process_proposals(
                     proposals, cycle.id, communication_decision=comm_decision,

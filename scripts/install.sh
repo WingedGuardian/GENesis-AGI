@@ -598,11 +598,11 @@ done
 # Code intelligence tools (optional — enhance Claude Code sessions)
 echo "    Installing code intelligence tools..."
 
-if ! command -v codebase-memory-mcp &>/dev/null; then
-    curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui 2>/dev/null \
-        && echo "    + codebase-memory-mcp installed" \
-        || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
-fi
+# Always re-runs the upstream installer: it is idempotent and pulls the latest
+# release, so existing installs are upgraded in place.
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui 2>/dev/null \
+    && echo "    + codebase-memory-mcp installed/upgraded" \
+    || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
 
 if _node_version_ok; then
     if ! command -v gitnexus &>/dev/null; then
@@ -616,10 +616,16 @@ if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
-if command -v uv &>/dev/null && ! command -v serena &>/dev/null; then
-    uv tool install serena-agent 2>/dev/null \
-        && echo "    + Serena installed" \
-        || echo "    NOTE: Serena unavailable (optional)"
+if command -v uv &>/dev/null; then
+    if ! command -v serena &>/dev/null; then
+        uv tool install serena-agent 2>/dev/null \
+            && echo "    + Serena installed" \
+            || echo "    NOTE: Serena unavailable (optional)"
+    else
+        uv tool upgrade serena-agent 2>/dev/null \
+            && echo "    + Serena upgraded" \
+            || echo "    NOTE: Serena upgrade skipped (already current or failed)"
+    fi
 fi
 
 # Python venv — prefer python3.12 for venv creation

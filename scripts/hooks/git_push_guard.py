@@ -73,6 +73,26 @@ def _get_push_remote_and_branch(cmd: str) -> tuple[str | None, str | None]:
     return None, None
 
 
+def _extract_pr_number(cmd: str) -> str | None:
+    """Extract PR number from a gh pr merge command."""
+    import re
+
+    match = re.search(r"gh pr merge\s+(\d+)", cmd)
+    return match.group(1) if match else None
+
+
+def _check_mergeable(pr_num: str) -> str | None:
+    """Query GitHub for PR mergeable status. Returns MERGEABLE/UNKNOWN/CONFLICTING or None."""
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", pr_num, "--json", "mergeable", "--jq", ".mergeable"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None  # Fail-open
+
+
 def main() -> int:
     try:
         raw = os.environ.get("CLAUDE_TOOL_INPUT", "")
@@ -125,17 +145,41 @@ def main() -> int:
             )
             return 2
 
-        # ── gh pr merge without --admin ────────────────────────────
-        if "gh pr merge" in cmd and "--admin" not in cmd:
-            print(
-                "BLOCKED: gh pr merge without --admin is not allowed.",
-                file=sys.stderr,
-            )
-            print(
-                "Use: gh pr merge --squash --admin",
-                file=sys.stderr,
-            )
-            return 2
+        # ── gh pr merge ────────────────────────────────────────────
+        if "gh pr merge" in cmd:
+            if "--admin" not in cmd:
+                print(
+                    "BLOCKED: gh pr merge without --admin is not allowed.",
+                    file=sys.stderr,
+                )
+                print(
+                    "Use: gh pr merge --squash --admin",
+                    file=sys.stderr,
+                )
+                return 2
+
+            # Check mergeable status before allowing merge
+            pr_num = _extract_pr_number(cmd)
+            if pr_num:
+                mergeable = _check_mergeable(pr_num)
+                if mergeable == "UNKNOWN":
+                    print(
+                        f"BLOCKED: PR #{pr_num} mergeable status is UNKNOWN.",
+                        file=sys.stderr,
+                    )
+                    print(
+                        "GitHub hasn't finished conflict analysis. "
+                        "Wait and retry.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if mergeable == "CONFLICTING":
+                    print(
+                        f"BLOCKED: PR #{pr_num} has merge conflicts. "
+                        "Resolve before merging.",
+                        file=sys.stderr,
+                    )
+                    return 2
 
     except (json.JSONDecodeError, KeyError):
         pass  # Fail-open on parse errors

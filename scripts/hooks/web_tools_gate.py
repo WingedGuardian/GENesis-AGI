@@ -48,7 +48,7 @@ def main() -> int:
             "(Scrapling TLS impersonation), JS rendering (Crawl4AI), and work in ALL "
             "session types including background. Consider using them instead.\n"
             "- web_fetch(url) — structured content with smart fallback chain\n"
-            "- web_search(query) — Tinyfish (unlimited) with Brave/Tavily/Exa/Perplexity options\n"
+            "- web_search(query) — SearXNG (unlimited) with Brave/Tavily/Exa/Perplexity options\n"
             "CC WebFetch is best when you specifically need an AI-processed summary."
         )
         print(json.dumps({"additionalContext": nudge}))

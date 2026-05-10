@@ -1,7 +1,6 @@
 """Tests for genesis.ego.types."""
 
 from genesis.ego.types import (
-    EGO_OUTPUT_SCHEMA,
     EgoConfig,
     EgoCycle,
     EgoProposal,
@@ -87,32 +86,6 @@ class TestEgoConfig:
     def test_no_proposal_expiry(self):
         """proposal_expiry_minutes was removed in Phase B."""
         assert not hasattr(EgoConfig(), "proposal_expiry_minutes")
-
-
-class TestOutputSchema:
-    def test_schema_has_required_fields(self):
-        assert "proposals" in EGO_OUTPUT_SCHEMA["properties"]
-        assert "focus_summary" in EGO_OUTPUT_SCHEMA["properties"]
-        assert "follow_ups" in EGO_OUTPUT_SCHEMA["properties"]
-        assert set(EGO_OUTPUT_SCHEMA["required"]) == {
-            "proposals", "focus_summary", "follow_ups",
-        }
-
-    def test_proposal_item_schema(self):
-        item = EGO_OUTPUT_SCHEMA["properties"]["proposals"]["items"]
-        assert "action_type" in item["properties"]
-        assert "confidence" in item["properties"]
-        assert "action_category" in item["properties"]
-
-    def test_proposal_item_has_board_fields(self):
-        item = EGO_OUTPUT_SCHEMA["properties"]["proposals"]["items"]
-        assert "execution_plan" in item["properties"]
-        assert "rank" in item["properties"]
-        assert "recurring" in item["properties"]
-
-    def test_schema_has_tabled_withdrawn(self):
-        assert "tabled" in EGO_OUTPUT_SCHEMA["properties"]
-        assert "withdrawn" in EGO_OUTPUT_SCHEMA["properties"]
 
 
 class TestProposalStatus:

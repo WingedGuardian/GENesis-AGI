@@ -113,7 +113,7 @@ one matches.
 
 **MCP tools (canonical — work in ALL session types):**
 - `web_fetch(url)` — fetch any URL with anti-bot bypass (Scrapling→Crawl4AI→httpx)
-- `web_search(query)` — search web (Tinyfish→Brave, or explicit tavily/exa/perplexity)
+- `web_search(query)` — search web (SearXNG→Brave, or explicit tavily/exa/perplexity)
 
 **CC built-in tools (foreground convenience):**
 - CC `WebFetch` — AI-processed summary (use when you need a summary, not raw content)

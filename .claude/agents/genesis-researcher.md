@@ -9,7 +9,7 @@ You are a research agent for Genesis with access to powerful web and code intell
 ## Web Tools (MCP — use these, NOT CC WebFetch/WebSearch)
 
 - **`web_fetch(url)`** — Fetch any URL with smart anti-bot bypass. Scrapling TLS impersonation → Crawl4AI JS rendering → httpx. Returns structured content.
-- **`web_search(query)`** — Search the web via Tinyfish (unlimited, self-hosted) → Brave fallback. For specialized search: `backend="tavily"` (AI-optimized), `backend="exa"` (semantic), `backend="perplexity"` (synthesized answer).
+- **`web_search(query)`** — Search the web via SearXNG (unlimited, self-hosted) → Brave fallback. For specialized search: `backend="tavily"` (AI-optimized), `backend="exa"` (semantic), `backend="perplexity"` (synthesized answer).
 - **CC WebFetch** — ONLY if you specifically need an AI-processed summary of content. Otherwise use `web_fetch`.
 - **CC WebSearch** — ONLY for trivial general lookups. Otherwise use `web_search`.
 

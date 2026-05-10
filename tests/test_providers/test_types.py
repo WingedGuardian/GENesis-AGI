@@ -73,7 +73,7 @@ class TestProviderResult:
 class TestProviderInfo:
     def test_snapshot(self):
         cap = ProviderCapability(description="search engine")
-        info = ProviderInfo(name="web_search", capability=cap)
-        assert info.name == "web_search"
+        info = ProviderInfo(name="searxng", capability=cap)
+        assert info.name == "searxng"
         assert info.status == ProviderStatus.AVAILABLE
         assert info.invocation_count == 0

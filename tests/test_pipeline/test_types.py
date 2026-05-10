@@ -41,12 +41,12 @@ class TestResearchSignal:
     def test_creation_with_defaults(self):
         s = ResearchSignal(
             id="sig-1",
-            source="tinyfish",
+            source="searxng",
             profile_name="crypto",
             content="Bitcoin hits $100k",
         )
         assert s.id == "sig-1"
-        assert s.source == "tinyfish"
+        assert s.source == "searxng"
         assert s.profile_name == "crypto"
         assert s.content == "Bitcoin hits $100k"
         assert s.url is None

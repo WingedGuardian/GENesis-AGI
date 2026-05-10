@@ -5,7 +5,7 @@ from genesis.research.types import ResearchResult, SearchResult
 
 class TestSearchResult:
     def test_frozen(self):
-        r = SearchResult(title="T", url="http://x", snippet="S", source="tinyfish")
+        r = SearchResult(title="T", url="http://x", snippet="S", source="searxng")
         assert r.title == "T"
         assert r.score == 0.0
 

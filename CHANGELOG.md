@@ -7,6 +7,21 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **MCP code-intelligence tools auto-upgrade on install/bootstrap**
+  --- `scripts/bootstrap.sh` and `scripts/install.sh` now re-run the
+  codebase-memory-mcp installer unconditionally (it is idempotent and
+  pulls the latest release) and call `uv tool upgrade serena-agent`
+  when Serena is already present. Existing installs get the latest
+  versions on the next bootstrap; fresh installs are unchanged.
+  GitNexus is unaffected (deliberately pinned to a prerelease
+  channel).
+
+---
+
 ## [v3.0b7] - 2026-05-09
 
 Ego gets two new self-awareness features, references move into the

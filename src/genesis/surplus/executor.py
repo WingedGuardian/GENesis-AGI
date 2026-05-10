@@ -49,13 +49,41 @@ def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
 
 
 async def _fetch_search_results(queries: list[str]) -> str:
-    """Fetch web search results for parsed queries via WebSearcher."""
-    from genesis.web import _get_searcher
+    """Fetch web search results for parsed queries.
 
-    searcher = _get_searcher()
+    Prefers TinyFish (free, fast, no quota) when API_KEY_TINYFISH is set;
+    falls back to genesis.web.WebSearcher (Brave) otherwise.
+    """
+    import os
+
+    use_tinyfish = bool(os.environ.get("API_KEY_TINYFISH"))
+
     parts: list[str] = []
     for i, query in enumerate(queries, 1):
+        if use_tinyfish:
+            try:
+                from genesis.providers import tinyfish_client
+
+                response = await tinyfish_client.search(query)
+                results = response.get("results", []) or []
+                if not results:
+                    parts.append(f"### Query {i}: {query}\n(No results)")
+                    continue
+                parts.append(f"### Query {i}: {query}")
+                for r in results[:5]:
+                    title = r.get("title", "")
+                    url = r.get("url", "")
+                    snippet = (r.get("snippet") or "")[:300]
+                    parts.append(f"- **{title}**\n  URL: {url}\n  {snippet}")
+                continue
+            except Exception as exc:
+                logger.debug("TinyFish search failed for %r, falling back: %s", query, exc)
+
+        # Fallback path — WebSearcher (Brave/SearXNG)
         try:
+            from genesis.web import _get_searcher
+
+            searcher = _get_searcher()
             response = await searcher.search(query, max_results=5)
             if response.error:
                 parts.append(f"### Query {i}: {query}\n(Search failed: {response.error})")

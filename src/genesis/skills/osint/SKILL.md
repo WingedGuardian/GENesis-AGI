@@ -66,7 +66,7 @@ Build 10-20 search queries tailored to target type:
 ### Phase 3: Collection Sweep
 
 For each query:
-1. Search (Tinyfish / web search)
+1. Search (SearXNG / web search)
 2. Fetch top 3-5 results
 3. Extract structured data: names, dates, numbers, relationships
 4. Tag each data point with: source URL, timestamp, confidence, relevance

@@ -138,28 +138,28 @@ class TestWebSearch:
         assert "required" in result["error"]
 
     @pytest.mark.asyncio
-    async def test_auto_uses_tinyfish(self):
+    async def test_auto_uses_searxng(self):
         mock_response = SearchResponse(
             query="test query",
             results=[
-                SearchResult(title="Result 1", url="https://r1.com", snippet="Snippet 1", backend=SearchBackend.TINYFISH),
-                SearchResult(title="Result 2", url="https://r2.com", snippet="Snippet 2", backend=SearchBackend.TINYFISH),
+                SearchResult(title="Result 1", url="https://r1.com", snippet="Snippet 1", backend=SearchBackend.SEARXNG),
+                SearchResult(title="Result 2", url="https://r2.com", snippet="Snippet 2", backend=SearchBackend.SEARXNG),
             ],
-            backend_used=SearchBackend.TINYFISH,
+            backend_used=SearchBackend.SEARXNG,
         )
         with patch("genesis.mcp.health.web_tools._get_searcher") as mock:
             mock.return_value.search = AsyncMock(return_value=mock_response)
             result = await _impl_web_search("test query", "auto", 10)
 
         assert result["query"] == "test query"
-        assert result["backend_used"] == "tinyfish"
+        assert result["backend_used"] == "searxng"
         assert len(result["results"]) == 2
         assert result["results"][0]["title"] == "Result 1"
         assert result["error"] is None
 
     @pytest.mark.asyncio
     async def test_max_results_capped_at_20(self):
-        mock_response = SearchResponse(query="q", results=[], backend_used=SearchBackend.TINYFISH)
+        mock_response = SearchResponse(query="q", results=[], backend_used=SearchBackend.SEARXNG)
         with patch("genesis.mcp.health.web_tools._get_searcher") as mock:
             mock.return_value.search = AsyncMock(return_value=mock_response)
             await _impl_web_search("q", "auto", 100)

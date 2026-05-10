@@ -27,9 +27,9 @@ class TestWebSearchAdapter:
         mock_searcher.search.return_value = SearchResponse(
             query="test",
             results=[
-                WebSearchResult(title="A", url="http://a.com", snippet="snip", backend=SearchBackend.TINYFISH),
+                WebSearchResult(title="A", url="http://a.com", snippet="snip", backend=SearchBackend.SEARXNG),
             ],
-            backend_used=SearchBackend.TINYFISH,
+            backend_used=SearchBackend.SEARXNG,
         )
 
         adapter = WebSearchAdapter(searcher=mock_searcher)
@@ -38,7 +38,7 @@ class TestWebSearchAdapter:
         mock_searcher.search.assert_called_once_with("test", max_results=5)
         assert len(results) == 1
         assert results[0].title == "A"
-        assert results[0].source == "tinyfish"
+        assert results[0].source == "searxng"
 
     @pytest.mark.asyncio
     async def test_invoke(self):
@@ -70,7 +70,7 @@ class TestWebSearchAdapter:
         mock_searcher = AsyncMock()
         mock_searcher.search.return_value = SearchResponse(
             query="test",
-            results=[WebSearchResult(title="X", url="http://x", snippet="", backend=SearchBackend.TINYFISH)],
+            results=[WebSearchResult(title="X", url="http://x", snippet="", backend=SearchBackend.SEARXNG)],
         )
         adapter = WebSearchAdapter(searcher=mock_searcher)
         status = await adapter.check_health()

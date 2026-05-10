@@ -1,7 +1,6 @@
-"""Tests for genesis.web.search — WebSearcher with Tinyfish/Brave fallback."""
+"""Tests for genesis.web.search — WebSearcher with SearXNG/Brave fallback."""
 
-import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -18,14 +17,12 @@ def _ok_response(data: dict) -> MagicMock:
     return resp
 
 
-TINYFISH_RESPONSE = json.dumps({
-    "query": "test",
+SEARXNG_RESPONSE = {
     "results": [
-        {"position": 1, "title": "Result 1", "url": "https://a.com", "snippet": "Snippet 1", "site_name": "a.com"},
-        {"position": 2, "title": "Result 2", "url": "https://b.com", "snippet": "Snippet 2", "site_name": "b.com"},
+        {"title": "Result 1", "url": "https://a.com", "content": "Snippet 1", "score": 0.9},
+        {"title": "Result 2", "url": "https://b.com", "content": "Snippet 2", "score": 0.5},
     ],
-    "total_results": 2,
-}).encode()
+}
 
 BRAVE_RESPONSE = {
     "web": {
@@ -38,38 +35,31 @@ BRAVE_RESPONSE = {
 
 @pytest.fixture
 def searcher():
-    return WebSearcher(brave_url="http://test-brave/search")
-
-
-def _mock_tinyfish(stdout: bytes, returncode: int = 0, stderr: bytes = b""):
-    """Create a mock async subprocess for tinyfish CLI."""
-    proc = AsyncMock()
-    proc.returncode = returncode
-    proc.communicate = AsyncMock(return_value=(stdout, stderr))
-    return proc
+    return WebSearcher(searxng_url="http://test:55510/search", brave_url="http://test-brave/search")
 
 
 @pytest.mark.asyncio
-async def test_tinyfish_success(searcher: WebSearcher):
-    proc = _mock_tinyfish(TINYFISH_RESPONSE)
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        resp = await searcher.search("test")
+async def test_searxng_success(searcher: WebSearcher):
+    searcher._client.post = AsyncMock(return_value=_ok_response(SEARXNG_RESPONSE))
+    resp = await searcher.search("test")
     assert len(resp.results) == 2
     assert "Snippet 1" in resp.results[0].snippet
-    assert resp.results[0].score == 1.0
-    assert resp.backend_used == SearchBackend.TINYFISH
+    assert resp.results[0].score == 0.9
+    assert resp.backend_used == SearchBackend.SEARXNG
     assert not resp.fallback_used
 
 
 @pytest.mark.asyncio
-async def test_tinyfish_failure_falls_back_to_brave(searcher: WebSearcher, monkeypatch):
+async def test_searxng_failure_falls_back_to_brave(searcher: WebSearcher, monkeypatch):
     monkeypatch.setenv("API_KEY_BRAVE", "test-key")
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"auth error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
-        resp = await searcher.search("test")
+    async def side_effect(*args, **kwargs):
+        raise httpx.ConnectError("connection refused")
 
+    searcher._client.post = AsyncMock(side_effect=side_effect)
+    searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
+
+    resp = await searcher.search("test")
     assert resp.backend_used == SearchBackend.BRAVE
     assert resp.fallback_used is True
     assert len(resp.results) == 1
@@ -79,12 +69,10 @@ async def test_tinyfish_failure_falls_back_to_brave(searcher: WebSearcher, monke
 @pytest.mark.asyncio
 async def test_both_backends_fail(searcher: WebSearcher, monkeypatch):
     monkeypatch.setenv("API_KEY_BRAVE", "test-key")
+    searcher._client.post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    searcher._client.get = AsyncMock(side_effect=httpx.ConnectError("also down"))
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        searcher._client.get = AsyncMock(side_effect=httpx.ConnectError("also down"))
-        resp = await searcher.search("test")
-
+    resp = await searcher.search("test")
     assert resp.error is not None
     assert resp.results == []
 
@@ -92,57 +80,46 @@ async def test_both_backends_fail(searcher: WebSearcher, monkeypatch):
 @pytest.mark.asyncio
 async def test_brave_no_api_key(searcher: WebSearcher, monkeypatch):
     monkeypatch.delenv("API_KEY_BRAVE", raising=False)
+    searcher._client.post = AsyncMock(side_effect=httpx.ConnectError("down"))
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        resp = await searcher.search("test")
-
+    resp = await searcher.search("test")
     assert resp.error is not None
     assert "unavailable" in resp.error.lower()
 
 
 @pytest.mark.asyncio
 async def test_max_results_limits_output(searcher: WebSearcher):
-    results = [
-        {"position": i, "title": f"R{i}", "url": f"https://{i}.com", "snippet": f"S{i}"}
-        for i in range(20)
-    ]
-    big_response = json.dumps({
-        "query": "test", "results": results, "total_results": 20,
-    }).encode()
-    proc = _mock_tinyfish(big_response)
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        resp = await searcher.search("test", max_results=5)
+    big = {"results": [{"title": f"R{i}", "url": f"https://{i}.com", "content": f"S{i}"}
+                        for i in range(20)]}
+    searcher._client.post = AsyncMock(return_value=_ok_response(big))
+
+    resp = await searcher.search("test", max_results=5)
     assert len(resp.results) == 5
 
 
 @pytest.mark.asyncio
 async def test_brave_count_capped_at_20(searcher: WebSearcher, monkeypatch):
     monkeypatch.setenv("API_KEY_BRAVE", "test-key")
+    searcher._client.post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
-        await searcher.search("test", max_results=50)
-
+    await searcher.search("test", max_results=50)
     call_kwargs = searcher._client.get.call_args
     assert call_kwargs.kwargs["params"]["count"] == 20
 
 
 @pytest.mark.asyncio
-async def test_event_bus_on_tinyfish_failure(searcher: WebSearcher, monkeypatch):
+async def test_event_bus_on_searxng_failure(searcher: WebSearcher, monkeypatch):
     monkeypatch.setenv("API_KEY_BRAVE", "test-key")
     bus = AsyncMock()
     searcher._event_bus = bus
+    searcher._client.post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        searcher._client.get = AsyncMock(return_value=_ok_response(BRAVE_RESPONSE))
-        await searcher.search("test")
-
+    await searcher.search("test")
     bus.emit.assert_called_once()
     args = bus.emit.call_args[0]
-    assert args[2] == "search.tinyfish_failed"
+    assert args[2] == "search.searxng_failed"
 
 
 @pytest.mark.asyncio
@@ -150,12 +127,10 @@ async def test_event_bus_on_all_failure(searcher: WebSearcher, monkeypatch):
     monkeypatch.setenv("API_KEY_BRAVE", "test-key")
     bus = AsyncMock()
     searcher._event_bus = bus
+    searcher._client.post = AsyncMock(side_effect=httpx.ConnectError("down"))
+    searcher._client.get = AsyncMock(side_effect=httpx.ConnectError("also down"))
 
-    proc = _mock_tinyfish(b"", returncode=1, stderr=b"error")
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        searcher._client.get = AsyncMock(side_effect=httpx.ConnectError("also down"))
-        await searcher.search("test")
-
+    await searcher.search("test")
     assert bus.emit.call_count == 2
     last_args = bus.emit.call_args_list[-1][0]
     assert last_args[2] == "search.all_failed"
@@ -163,9 +138,7 @@ async def test_event_bus_on_all_failure(searcher: WebSearcher, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_empty_results(searcher: WebSearcher):
-    empty = json.dumps({"query": "test", "results": [], "total_results": 0}).encode()
-    proc = _mock_tinyfish(empty)
-    with patch("genesis.web.search.asyncio.create_subprocess_exec", return_value=proc):
-        resp = await searcher.search("test")
+    searcher._client.post = AsyncMock(return_value=_ok_response({"results": []}))
+    resp = await searcher.search("test")
     assert resp.results == []
     assert resp.error is None

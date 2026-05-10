@@ -12,7 +12,7 @@ class SearchResult:
     title: str
     url: str
     snippet: str
-    source: str  # provider name (e.g. "tinyfish", "brave", "perplexity")
+    source: str  # provider name (e.g. "searxng", "brave", "perplexity")
     score: float = 0.0
 
 
