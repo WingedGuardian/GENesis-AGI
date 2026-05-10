@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b3"
+version = "3.0.0b7"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite",
@@ -25,6 +25,7 @@ dependencies = [
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
+    "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
 ]
 
 [project.optional-dependencies]

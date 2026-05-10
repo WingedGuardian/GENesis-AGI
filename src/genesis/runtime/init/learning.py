@@ -275,6 +275,28 @@ async def init(rt: GenesisRuntime) -> None:
             misfire_grace_time=3600,
         )
 
+        async def _follow_up_retention_sweep() -> None:
+            try:
+                from genesis.db.crud import follow_ups
+
+                count = await follow_ups.purge_completed(rt._db)
+                rt.record_job_success("follow_up_retention_sweep")
+                if count:
+                    logger.info(
+                        "Follow-up retention sweep: purged %d old records", count,
+                    )
+            except Exception as exc:
+                rt.record_job_failure("follow_up_retention_sweep", str(exc))
+                logger.exception("Follow-up retention sweep failed")
+
+        rt._learning_scheduler.add_job(
+            _follow_up_retention_sweep,
+            CronTrigger(hour=2, minute=30),
+            id="follow_up_retention_sweep",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
         async def _run_recovery() -> None:
             if rt._recovery_orchestrator is not None:
                 try:
@@ -489,12 +511,16 @@ async def init(rt: GenesisRuntime) -> None:
                 return
             try:
                 from genesis.db.crud.cc_sessions import reap_stale
+                from genesis.db.crud.session_heartbeats import cleanup_stale
 
                 cutoff = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
                 reaped = await reap_stale(rt._db, older_than=cutoff)
+                cleaned = await cleanup_stale(rt._db)
                 rt.record_job_success("session_reaper")
                 if reaped:
                     logger.info("Session reaper: marked %d stale sessions as completed", reaped)
+                if cleaned:
+                    logger.info("Session reaper: cleaned %d stale heartbeats", cleaned)
             except Exception as exc:
                 rt.record_job_failure("session_reaper", str(exc))
                 logger.exception("Session reaper failed")
@@ -503,6 +529,28 @@ async def init(rt: GenesisRuntime) -> None:
             _reap_stale_sessions,
             CronTrigger(hour="1,7,13,19", minute=30),
             id="session_reaper",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+
+        async def _refresh_capability_map() -> None:
+            if rt._db is None:
+                return
+            try:
+                from genesis.ego.capability_aggregator import refresh_capability_map
+
+                count = await refresh_capability_map(rt._db)
+                rt.record_job_success("capability_map_refresh")
+                if count:
+                    logger.info("Capability map refreshed: %d domains", count)
+            except Exception as exc:
+                rt.record_job_failure("capability_map_refresh", str(exc))
+                logger.exception("Capability map refresh failed")
+
+        rt._learning_scheduler.add_job(
+            _refresh_capability_map,
+            CronTrigger(hour="4,16", minute=15),
+            id="capability_map_refresh",
             max_instances=1,
             misfire_grace_time=3600,
         )

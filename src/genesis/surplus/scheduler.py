@@ -56,6 +56,7 @@ class SurplusScheduler:
         analytical_hours: int = 24,
         follow_up_dispatch_minutes: int | None = None,
         memory_extraction_hours: int = 2,
+        j9_eval_batch_hours: int = 24,
         clock=None,
         event_bus: GenesisEventBus | None = None,
         enable_code_audits: bool = True,
@@ -80,6 +81,7 @@ class SurplusScheduler:
         self._analytical_hours = analytical_hours
         self._follow_up_dispatch_minutes = follow_up_dispatch_minutes or dispatch_interval_minutes
         self._memory_extraction_hours = memory_extraction_hours
+        self._j9_eval_batch_hours = j9_eval_batch_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
         self._code_index_executor: SurplusExecutor | None = None
@@ -235,6 +237,14 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=300,
             )
+        if self._j9_eval_batch_hours > 0:
+            self._scheduler.add_job(
+                self.schedule_j9_eval_batch,
+                IntervalTrigger(hours=self._j9_eval_batch_hours),
+                id="schedule_j9_eval_batch",
+                max_instances=1,
+                misfire_grace_time=300,
+            )
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
@@ -253,6 +263,8 @@ class SurplusScheduler:
         await self.schedule_code_index()
         await self.run_recon_gather()
         await self.schedule_maintenance()
+        if self._j9_eval_batch_hours > 0:
+            await self.schedule_j9_eval_batch()
         if self._analytical_hours > 0:
             await self.schedule_analytical()
         logger.info(
@@ -303,8 +315,8 @@ class SurplusScheduler:
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
-            pending = await self._queue.pending_by_type(TaskType.CODE_AUDIT)
-            if pending == 0:
+            active = await self._queue.active_by_type(TaskType.CODE_AUDIT)
+            if active == 0:
                 await self._queue.enqueue(
                     TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
                 )
@@ -326,8 +338,8 @@ class SurplusScheduler:
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
-            pending = await self._queue.pending_by_type(TaskType.CODE_INDEX)
-            if pending == 0:
+            active = await self._queue.active_by_type(TaskType.CODE_INDEX)
+            if active == 0:
                 await self._queue.enqueue(
                     TaskType.CODE_INDEX, ComputeTier.LOCAL_30B, 0.6, "competence"
                 )
@@ -344,8 +356,31 @@ class SurplusScheduler:
             except Exception:
                 pass
 
+    async def schedule_j9_eval_batch(self) -> None:
+        """Enqueue a J9 eval batch task if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            active = await self._queue.active_by_type(TaskType.J9_EVAL_BATCH)
+            if active == 0:
+                await self._queue.enqueue(
+                    TaskType.J9_EVAL_BATCH, ComputeTier.FREE_API, 0.3, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_j9_eval_batch")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("J9 eval batch scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_j9_eval_batch", str(exc))
+            except Exception:
+                pass
+
     async def schedule_maintenance(self) -> None:
-        """Enqueue mechanical infrastructure maintenance tasks if none pending."""
+        """Enqueue mechanical infrastructure maintenance tasks if none active."""
         try:
             from genesis.surplus.types import ComputeTier, TaskType
 
@@ -357,8 +392,8 @@ class SurplusScheduler:
                 (TaskType.DB_MAINTENANCE, 0.3, "competence"),
             ]
             for task_type, priority, drive in maintenance_tasks:
-                pending = await self._queue.pending_by_type(task_type)
-                if pending == 0:
+                active = await self._queue.active_by_type(task_type)
+                if active == 0:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
@@ -382,7 +417,7 @@ class SurplusScheduler:
                 pass
 
     async def schedule_analytical(self) -> None:
-        """Enqueue LLM-based analytical tasks if none pending.
+        """Enqueue LLM-based analytical tasks if none active.
 
         These run on a separate (longer) cadence than mechanical maintenance
         because their inputs change slowly and their free-tier model output
@@ -396,8 +431,8 @@ class SurplusScheduler:
                 # anticipatory_research returns as a pipeline — see pipelines.py.
             ]
             for task_type, priority, drive in analytical_tasks:
-                pending = await self._queue.pending_by_type(task_type)
-                if pending == 0:
+                active = await self._queue.active_by_type(task_type)
+                if active == 0:
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
@@ -479,7 +514,7 @@ class SurplusScheduler:
                 pass
 
     async def run_recon_gather(self) -> None:
-        """Check watchlist projects for new GitHub releases."""
+        """Check watchlist projects for new GitHub releases and star counts."""
         if self._recon_gatherer is None:
             try:
                 from genesis.runtime import GenesisRuntime
@@ -494,6 +529,15 @@ class SurplusScheduler:
                     "Recon gather found %d new release(s): %s",
                     result.new_findings, "; ".join(result.details),
                 )
+            try:
+                star_result = await self._recon_gatherer.gather_stars()
+                if star_result.new_findings > 0:
+                    logger.info(
+                        "Star gather found %d change(s): %s",
+                        star_result.new_findings, "; ".join(star_result.details),
+                    )
+            except Exception:
+                logger.exception("Star gather failed (releases unaffected)")
             if self._event_bus:
                 await self._event_bus.emit(
                     Subsystem.RECON, Severity.DEBUG,

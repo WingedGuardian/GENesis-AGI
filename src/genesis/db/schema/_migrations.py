@@ -95,6 +95,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE observations ADD COLUMN content_hash TEXT",
         "observations.content_hash")
 
+    # Observation surfacing: track when observations are delivered to user
+    await _try_alter(db,
+        "ALTER TABLE observations ADD COLUMN surfaced_at TEXT",
+        "observations.surfaced_at")
+
     # Procedure activation: tier + tool trigger for layered procedure surfacing
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN activation_tier TEXT NOT NULL DEFAULT 'L4'",

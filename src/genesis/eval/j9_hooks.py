@@ -26,22 +26,32 @@ async def emit_recall_fired(
     latency_ms: float,
     source: str,
     session_id: str | None = None,
+    mode: str | None = None,
+    pipeline_used: str | None = None,
+    intent_category: str | None = None,
 ) -> None:
     """Log a memory recall() invocation as an eval event."""
     try:
+        metrics: dict = {
+            "query": query[:500],
+            "result_count": result_count,
+            "top_scores": top_scores[:10],
+            "memory_ids": memory_ids[:10],
+            "latency_ms": round(latency_ms, 1),
+            "source": source,
+        }
+        if mode:
+            metrics["mode"] = mode
+        if pipeline_used:
+            metrics["pipeline_used"] = pipeline_used
+        if intent_category:
+            metrics["intent_category"] = intent_category
         await j9_eval.insert_event(
             db,
             dimension="memory",
             event_type="recall_fired",
             session_id=session_id,
-            metrics={
-                "query": query[:500],
-                "result_count": result_count,
-                "top_scores": top_scores[:10],
-                "memory_ids": memory_ids[:10],
-                "latency_ms": round(latency_ms, 1),
-                "source": source,
-            },
+            metrics=metrics,
         )
     except Exception:
         logger.debug("eval: failed to emit recall_fired", exc_info=True)

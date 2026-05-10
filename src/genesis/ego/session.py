@@ -28,6 +28,7 @@ from genesis.cc.types import (
 )
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import CYCLE_TYPE_DEFAULTS, CycleType, EgoConfig, EgoCycle
+from genesis.observability.session_context import set_session_id as _set_obs_session
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -230,6 +231,7 @@ class EgoSession:
                     source_tag=self._source_tag,
                 )
                 session_id = sess["id"]
+                _set_obs_session(session_id)
             except Exception:
                 logger.error("Failed to create ego background session", exc_info=True)
                 return None
@@ -255,6 +257,14 @@ class EgoSession:
 
         # 6. Parse output
         parsed = self._parse_output(output.text)
+
+        # 6b. If focus was sanitized, try previous legitimate focus as fallback
+        if parsed and parsed.get("_focus_violation"):
+            prev = await ego_crud.get_state(
+                self._db, self._focus_summary_key,
+            )
+            if prev and not _BEHAVIORAL_FOCUS_RE.search(prev):
+                parsed["focus_summary"] = prev
 
         # 7. Store cycle
         focus = parsed.get("focus_summary", "") if parsed else ""
@@ -309,6 +319,13 @@ class EgoSession:
                         ok = await ego_crud.table_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s tabled by ego", pid)
+                            try:
+                                from genesis.db.crud import intervention_journal as journal_crud
+                                await journal_crud.resolve(
+                                    self._db, pid, outcome_status="tabled",
+                                )
+                            except Exception:
+                                pass
 
             withdrawn_ids = parsed.get("withdrawn", [])
             if isinstance(withdrawn_ids, list):
@@ -317,6 +334,13 @@ class EgoSession:
                         ok = await ego_crud.withdraw_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s withdrawn by ego", pid)
+                            try:
+                                from genesis.db.crud import intervention_journal as journal_crud
+                                await journal_crud.resolve(
+                                    self._db, pid, outcome_status="withdrawn",
+                                )
+                            except Exception:
+                                pass
 
             # 9c. Process execution briefs (ego-as-executor)
             execution_briefs = parsed.get("execution_briefs", [])
@@ -345,6 +369,34 @@ class EgoSession:
                 await ego_crud.set_state(
                     self._db, key=self._focus_summary_key, value=focus,
                 )
+
+            # 11b. Record violation if focus was behavioral self-assignment
+            if parsed.get("_focus_violation"):
+                import uuid
+
+                from genesis.db.crud import observations as obs_crud
+
+                try:
+                    await obs_crud.create(
+                        self._db,
+                        id=str(uuid.uuid4()),
+                        source="ego_session",
+                        type="ego_focus_violation",
+                        content=(
+                            f"Ego attempted behavioral self-assignment in "
+                            f"focus_summary. Original: "
+                            f"{parsed.get('_original_focus', 'unknown')[:200]}. "
+                            f"Sanitized to: {focus}"
+                        ),
+                        priority="medium",
+                        created_at=datetime.now(UTC).isoformat(),
+                        category="system_health",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record focus violation observation",
+                        exc_info=True,
+                    )
 
             # 12. Process escalations (Genesis ego → observations for user ego)
             escalations = parsed.get("escalations", [])
@@ -469,6 +521,25 @@ class EgoSession:
                 batch_id, len(ids),
             )
 
+            # Record intervention journal entries (fire-and-forget)
+            try:
+                from genesis.db.crud import intervention_journal as journal_crud
+                now = datetime.now(UTC).isoformat()
+                for pid, prop in zip(ids, proposals, strict=False):
+                    await journal_crud.create(
+                        self._db,
+                        ego_source=self._source_tag,
+                        proposal_id=pid,
+                        cycle_id=cycle_id,
+                        action_type=prop.get("action_type", "unknown"),
+                        action_summary=prop.get("content", "")[:500],
+                        expected_outcome=prop.get("rationale", ""),
+                        confidence=prop.get("confidence", 0.0),
+                        created_at=now,
+                    )
+            except Exception:
+                logger.warning("Failed to create intervention journal entries", exc_info=True)
+
             # Structural validation — annotates digest, doesn't block
             validation_issues = await self._proposals.validate_batch(proposals)
             if validation_issues:
@@ -555,6 +626,15 @@ class EgoSession:
                     status="executed",
                     user_response=f"session:{session_id}",
                 )
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+                    await journal_crud.resolve(
+                        self._db, proposal_id,
+                        outcome_status="executed",
+                        actual_outcome=f"Dispatched as session:{session_id}",
+                    )
+                except Exception:
+                    logger.warning("Journal resolve failed for %s", proposal_id)
                 logger.info(
                     "Dispatched proposal %s → session %s",
                     proposal_id, session_id,
@@ -575,6 +655,15 @@ class EgoSession:
                         "Failed to mark proposal %s as failed",
                         proposal_id, exc_info=True,
                     )
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+                    await journal_crud.resolve(
+                        self._db, proposal_id,
+                        outcome_status="failed",
+                        actual_outcome="Dispatch failed",
+                    )
+                except Exception:
+                    logger.warning("Journal resolve failed for %s", proposal_id)
 
     async def _process_escalations(
         self,
@@ -826,6 +915,68 @@ class EgoSession:
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 
+# -- Behavioral focus detection --------------------------------------------
+#
+# focus_summary must describe a TOPIC the ego is thinking about, never a
+# BEHAVIORAL state (holding back, waiting, pausing, etc.).  This regex
+# catches known self-suppression patterns.  It is the safety-net layer
+# beneath the prompt guardrails in EGO_SESSION.md.
+_BEHAVIORAL_FOCUS_RE = re.compile(
+    r"(?i)"
+    # Self-referential behavioral states (ego is the implicit subject)
+    r"(?:^holding\s+back"                                 # "Holding back — ..."
+    r"|^stepping\s+back"                                  # "Stepping back while ..."
+    r"|^standing\s+down"                                  # "Standing down until ..."
+    r"|^lying\s+low"                                      # "Lying low during ..."
+    r"|^staying\s+(?:out|quiet)"                          # "Staying quiet while ..."
+    r"|^backing\s+off"                                    # "Backing off — proposals ignored"
+    # Waiting/pausing with user-referencing context
+    r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
+    r"(?:user|jay|he|she|them|they|surface|engage|return)"
+    r"|^pausing\s+(?:proactive|proposal|work|activity)"
+    # Explicit dormancy keywords (only when self-describing)
+    r"|(?:going|entering|in|self-)\s*dormant"
+    r"|(?:going|entering|in)\s+fallow"
+    r"|^hibernating"
+    # Proposal suppression
+    r"|no\s+proposals?\s+(?:until|for\s+now)"
+    r"|until\s+\w+\s+surfaces?"
+    # Self-suppression with user context
+    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
+    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
+    # Explicit non-action
+    r"|^not\s+(?:proposing|intervening|acting)"
+    r"|^observing\s+(?:only|quietly)"
+    r"|^passive\s+(?:mode|watch)"
+    r"|^minimal\s+engagement"
+    r"|^reduced\s+activity"
+    r"|quiet\s+mode)"
+)
+
+
+def _sanitize_focus_summary(
+    focus: str,
+    *,
+    previous_focus: str | None = None,
+) -> tuple[str, bool]:
+    """Validate focus_summary describes a TOPIC, not a BEHAVIOR.
+
+    Returns (sanitized_focus, was_violated).
+    If the focus is behavioral, returns the previous legitimate focus
+    or a generic fallback, plus was_violated=True.
+    """
+    if _BEHAVIORAL_FOCUS_RE.search(focus):
+        fallback = previous_focus or "general system awareness"
+        logger.warning(
+            "Ego focus_summary contains behavioral self-assignment: %r — "
+            "replacing with %r",
+            focus[:120],
+            fallback,
+        )
+        return fallback, True
+    return focus, False
+
+
 _INTERACT_TYPES = frozenset({"outreach", "dispatch"})
 _RESEARCH_TYPES = frozenset({"investigate"})
 
@@ -855,6 +1006,14 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("follow_ups"), list):
         logger.warning("Ego output missing or invalid 'follow_ups' field")
         return None
+
+    # Sanitize focus_summary — must describe a TOPIC, not a BEHAVIOR.
+    sanitized, violated = _sanitize_focus_summary(data["focus_summary"])
+    if violated:
+        data["_original_focus"] = data["focus_summary"]
+        data["focus_summary"] = sanitized
+        data["_focus_violation"] = True
+
     # Sanitize individual proposals to prevent DB constraint violations.
     for p in data["proposals"]:
         if not isinstance(p, dict):
@@ -891,8 +1050,6 @@ _CAP_PATTERN = re.compile(r"_\(max (\d+) items?\)_")
 _NOTEPAD_SECTIONS = [
     "Active Projects & Priorities",
     "Interests & Expertise",
-    "Interaction Patterns",
-    "Proposal Context Journal",
     "Open Questions",
 ]
 

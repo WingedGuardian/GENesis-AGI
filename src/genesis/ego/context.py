@@ -56,6 +56,8 @@ class EgoContextBuilder:
         sections.append(await self._follow_ups_section())
         sections.append(await self._cost_section())
         sections.append(await self._proposal_history_section())
+        sections.append(await self._intervention_history_section())
+        sections.append(await self._self_model_section())
         sections.append(await self._user_corrections_section())
         sections.append(await self._output_contract_section())
 
@@ -255,6 +257,22 @@ class EgoContextBuilder:
                 f"{short}"
             )
 
+        # Surfacing awareness: how many observations await morning report delivery
+        try:
+            from genesis.db.crud.observations import unsurfaced_counts_by_priority
+            counts = await unsurfaced_counts_by_priority(self._db)
+            if counts:
+                total = sum(counts.values())
+                breakdown = ", ".join(
+                    f"{c} {p}" for p, c in sorted(
+                        counts.items(),
+                        key=lambda x: {"critical": 0, "high": 1, "medium": 2}.get(x[0], 3),
+                    ) if c > 0
+                )
+                lines.append(f"*Unsurfaced: {total} observations ({breakdown}) awaiting morning report.*\n")
+        except Exception:
+            pass  # surfaced_at column may not exist yet
+
         lines.append("")
         return "\n".join(lines)
 
@@ -366,6 +384,66 @@ class EgoContextBuilder:
             lines.append(
                 f"| {action_type} | {category} | {status} | {resp} |"
             )
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _intervention_history_section(self) -> str:
+        """Recent intervention outcomes — what happened after proposals resolved."""
+        lines = ["## Intervention History (7d)\n"]
+
+        try:
+            from genesis.db.crud import intervention_journal as journal_crud
+
+            resolved = await journal_crud.recent_resolved(self._db, days=7, limit=10)
+            pending = await journal_crud.unresolved_count(self._db)
+        except Exception:
+            lines.append("*No intervention data available.*\n")
+            return "\n".join(lines)
+
+        if not resolved and not pending:
+            lines.append("*No interventions recorded yet.*\n")
+            return "\n".join(lines)
+
+        if resolved:
+            lines.append("| Action | Expected | Outcome | Status |")
+            lines.append("|--------|----------|---------|--------|")
+            for entry in resolved:
+                action = entry["action_type"]
+                expected = (entry["expected_outcome"] or "—")[:60].replace("\n", " ").replace("|", "/")
+                actual = (entry["actual_outcome"] or "—")[:60].replace("\n", " ").replace("|", "/")
+                status = entry["outcome_status"]
+                lines.append(f"| {action} | {expected} | {actual} | {status} |")
+            lines.append("")
+
+        if pending:
+            lines.append(f"*{pending} proposals pending resolution.*\n")
+
+        return "\n".join(lines)
+
+    async def _self_model_section(self) -> str:
+        """Capability self-portrait — what the ego is good/bad at."""
+        lines = ["## Self-Model\n"]
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+            entries = await cap_crud.get_all(self._db)
+        except Exception:
+            lines.append("*No capability data available yet.*\n")
+            return "\n".join(lines)
+
+        if not entries:
+            lines.append("*Capability map is empty — run aggregation to populate.*\n")
+            return "\n".join(lines)
+
+        lines.append("| Domain | Confidence | Trend | Evidence |")
+        lines.append("|--------|-----------|-------|----------|")
+        for entry in entries[:15]:  # cap at 15 rows
+            domain = entry["domain"]
+            conf = f"{entry['confidence']:.0%}"
+            trend = entry.get("trend", "stable")
+            evidence = (entry.get("evidence_summary") or "—")[:80].replace("|", "/")
+            lines.append(f"| {domain} | {conf} | {trend} | {evidence} |")
 
         lines.append("")
         return "\n".join(lines)

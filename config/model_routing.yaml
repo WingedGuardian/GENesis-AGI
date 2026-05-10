@@ -283,11 +283,11 @@ call_sites:
     default_paid: true
   9_fact_extraction:
     chain:
-    - mistral-large-free
     - groq-free
     - gemini-free
     - cerebras-qwen
-    - openrouter-free
+    - mistral-large-free
+    - openrouter-deepseek-v4-flash
   10_cognitive_state:
     chain:
     - glm51
