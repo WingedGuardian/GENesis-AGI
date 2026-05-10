@@ -232,7 +232,6 @@ providers:
 call_sites:
   2_triage:
     chain:
-    - ollama-3b
     - mistral-small-free
     - groq-free
     - openrouter-free
@@ -352,7 +351,6 @@ call_sites:
     retry_profile: background
   22_tagging:
     chain:
-    - ollama-3b
     - mistral-small-free
     - groq-free
   27_pre_execution_assessment:
