@@ -605,10 +605,17 @@ curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/i
     || echo "    NOTE: codebase-memory-mcp unavailable (optional)"
 
 if _node_version_ok; then
+    # Pinned to ~1.6 (>=1.6.0 <1.7.0). Re-evaluate before bumping past
+    # 1.7 — earlier 1.7 prereleases had FTS read-blocking issues that
+    # need to be verified fixed.
     if ! command -v gitnexus &>/dev/null; then
-        npm install -g gitnexus@latest 2>/dev/null \
+        npm install -g 'gitnexus@~1.6' 2>/dev/null \
             && echo "    + GitNexus installed ($(gitnexus --version 2>/dev/null))" \
             || echo "    NOTE: GitNexus unavailable (optional)"
+    else
+        npm install -g 'gitnexus@~1.6' 2>/dev/null \
+            && echo "    + GitNexus upgraded ($(gitnexus --version 2>/dev/null))" \
+            || echo "    NOTE: GitNexus upgrade skipped (already current or failed)"
     fi
 fi
 
