@@ -166,8 +166,9 @@ class FollowUpDispatcher:
         # follow-ups arrive via structured routing (recon pipeline) above.
         if "benchmark" in content or "eval" in content:
             return TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
-        # DEACTIVATED: anticipatory_research has no web search — route to
-        # brainstorm_self until redesigned as CC session task.
+        # anticipatory_research now runs as a scheduled pipeline with web search.
+        # Follow-ups with "research" keyword still route to brainstorm_self for
+        # quick ideation; actual research runs on the analytical schedule.
         if "research" in content:
             return TaskType.BRAINSTORM_SELF, ComputeTier.FREE_API, {"source": "follow_up", "follow_up_id": fu["id"]}
         if "brainstorm" in content:

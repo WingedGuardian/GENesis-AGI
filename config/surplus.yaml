@@ -14,7 +14,7 @@ jobs:
   code_index_hours: 4
   recon_gather_hours: 84       # ~3.5 days
   maintenance_hours: 6
-  analytical_hours: 0             # DISABLED — gap_clustering + prompt_effectiveness are self-referential (0 = off)
+  analytical_hours: 12
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
   j9_eval_batch_hours: 24

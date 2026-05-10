@@ -76,9 +76,10 @@ class TestFullPipeline:
 
         with patch.object(compute, "_ping_lmstudio", new_callable=AsyncMock, return_value=False):
             await scheduler.brainstorm_check()
-            assert await queue.pending_count() == 2
+            assert await queue.pending_count() == 3  # user + self + self_unblock
 
-            # Dispatch both tasks
+            # Dispatch all three tasks
+            await scheduler.dispatch_once()
             await scheduler.dispatch_once()
             await scheduler.dispatch_once()
             assert await queue.pending_count() == 0

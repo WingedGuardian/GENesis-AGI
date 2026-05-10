@@ -29,6 +29,7 @@ _SESSION_TYPE_MAP = {
     TaskType.BRAINSTORM_SELF: "upgrade_self",
     TaskType.CODE_AUDIT: "code_audit",
     TaskType.INFRASTRUCTURE_MONITOR: "infra_monitor",
+    TaskType.SELF_UNBLOCK: "self_unblock",
 }
 
 
@@ -55,6 +56,7 @@ class BrainstormRunner:
         for task_type, drive in [
             (TaskType.BRAINSTORM_USER, "cooperation"),
             (TaskType.BRAINSTORM_SELF, "competence"),
+            (TaskType.SELF_UNBLOCK, "competence"),
         ]:
             session_type = _SESSION_TYPE_MAP[task_type]
 

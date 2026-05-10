@@ -33,6 +33,71 @@ _LOW_INFO_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+_QUERY_LINE_RE = re.compile(r"^(?:\d+[.)]\s*|[-*]\s*)")
+
+
+def _parse_search_queries(llm_output: str, max_queries: int = 5) -> list[str]:
+    """Parse search queries from numbered/bulleted LLM output."""
+    queries: list[str] = []
+    for line in llm_output.strip().splitlines():
+        line = _QUERY_LINE_RE.sub("", line).strip()
+        if line and len(line) > 5:
+            queries.append(line)
+            if len(queries) >= max_queries:
+                break
+    return queries
+
+
+async def _fetch_search_results(queries: list[str]) -> str:
+    """Fetch web search results for parsed queries.
+
+    Prefers TinyFish (free, fast, no quota) when API_KEY_TINYFISH is set;
+    falls back to genesis.web.WebSearcher (Brave) otherwise.
+    """
+    import os
+
+    use_tinyfish = bool(os.environ.get("API_KEY_TINYFISH"))
+
+    parts: list[str] = []
+    for i, query in enumerate(queries, 1):
+        if use_tinyfish:
+            try:
+                from genesis.providers import tinyfish_client
+
+                response = await tinyfish_client.search(query)
+                results = response.get("results", []) or []
+                if not results:
+                    parts.append(f"### Query {i}: {query}\n(No results)")
+                    continue
+                parts.append(f"### Query {i}: {query}")
+                for r in results[:5]:
+                    title = r.get("title", "")
+                    url = r.get("url", "")
+                    snippet = (r.get("snippet") or "")[:300]
+                    parts.append(f"- **{title}**\n  URL: {url}\n  {snippet}")
+                continue
+            except Exception as exc:
+                logger.debug("TinyFish search failed for %r, falling back: %s", query, exc)
+
+        # Fallback path — WebSearcher (Brave/SearXNG)
+        try:
+            from genesis.web import _get_searcher
+
+            searcher = _get_searcher()
+            response = await searcher.search(query, max_results=5)
+            if response.error:
+                parts.append(f"### Query {i}: {query}\n(Search failed: {response.error})")
+                continue
+            if not response.results:
+                parts.append(f"### Query {i}: {query}\n(No results)")
+                continue
+            parts.append(f"### Query {i}: {query}")
+            for r in response.results:
+                parts.append(f"- **{r.title}**\n  URL: {r.url}\n  {r.snippet[:300]}")
+        except Exception as exc:
+            parts.append(f"### Query {i}: {query}\n(Error: {exc})")
+    return "\n\n".join(parts)
+
 
 class StubExecutor:
     """Stub executor — generates structured placeholders.
@@ -151,14 +216,34 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "actions.  Focus on the highest-leverage intervention.\n\n"
         "Respond in plain text (2-4 sentences)."
     ),
-    TaskType.ANTICIPATORY_RESEARCH: (
-        "You are doing anticipatory research for an autonomous AI.\n\n"
+    TaskType.RESEARCH_QUERY_GEN: (
+        "You are generating web search queries for an autonomous AI's "
+        "research pipeline.\n\n"
         "{context}\n\n"
         "## Task\n"
-        "Based on recent activity patterns, identify topics or capabilities "
-        "that the user or system will likely need soon.  Suggest specific "
-        "research directions.\n\n"
-        "Respond in plain text with numbered suggestions."
+        "Based on the context above, generate 3-5 specific web search queries "
+        "that would help fill knowledge gaps or answer open questions.\n\n"
+        "Rules:\n"
+        "- Each query should be a concrete search engine query (not a topic)\n"
+        "- Focus on gaps where web research would add real value\n"
+        "- Avoid queries about the system itself — focus on external knowledge\n\n"
+        "Respond with ONLY the queries, one per line, numbered:\n"
+        "1. first query\n"
+        "2. second query\n"
+        "..."
+    ),
+    TaskType.ANTICIPATORY_RESEARCH: (
+        "You are synthesizing web research findings for an autonomous AI.\n\n"
+        "{context}\n\n"
+        "## Task\n"
+        "Synthesize the search results above into 1-3 actionable findings.\n\n"
+        "For each finding:\n"
+        "- State the insight clearly\n"
+        "- Cite the source URL(s)\n"
+        "- Explain why this matters for the user or system\n\n"
+        "If no useful search results were found, state that clearly and "
+        "suggest better search queries for next time.\n\n"
+        "Respond in plain text with numbered findings."
     ),
     TaskType.PROMPT_REVIEW_CATALOG: (
         "You are cataloging LLM call site activity for an autonomous AI.\n\n"
@@ -287,7 +372,7 @@ class SurplusLLMExecutor:
         context = await self._gather_context(task)
 
         # Inject previous pipeline step output into context if present
-        if task.payload:
+        if task.payload and task.task_type != TaskType.ANTICIPATORY_RESEARCH:
             try:
                 payload_data = json.loads(task.payload)
                 prev = payload_data.get("previous_output")
@@ -416,6 +501,25 @@ class SurplusLLMExecutor:
                 )
                 parts.append("(Surplus output data unavailable)")
             # Fall through to also gather standard observations below
+
+        # Research pipeline step 2: fetch web results from step 1 queries
+        if task.task_type == TaskType.ANTICIPATORY_RESEARCH and task.payload:
+            try:
+                payload_data = json.loads(task.payload)
+                prev_output = payload_data.get("previous_output", "")
+                if prev_output:
+                    queries = _parse_search_queries(prev_output)
+                    if queries:
+                        search_results = await _fetch_search_results(queries)
+                        if search_results:
+                            parts.append("## Web Search Results")
+                            parts.append(search_results)
+                        else:
+                            parts.append("## Web Search Results\n(No results found)")
+            except Exception:
+                logger.warning("Research web fetch failed", exc_info=True)
+                parts.append("(Web search unavailable)")
+            # Fall through to also gather standard observations
 
         # For analytical tasks: recent observations + basic stats
         try:

@@ -75,6 +75,26 @@ PIPELINES: dict[str, PipelineDefinition] = {
             "evaluate gaps and recommend improvements"
         ),
     ),
+    "anticipatory_research": PipelineDefinition(
+        name="anticipatory_research",
+        steps=(
+            PipelineStep(
+                task_type=TaskType.RESEARCH_QUERY_GEN,
+                compute_tier=ComputeTier.FREE_API,
+                priority=0.3,
+            ),
+            PipelineStep(
+                task_type=TaskType.ANTICIPATORY_RESEARCH,
+                compute_tier=ComputeTier.FREE_API,
+                priority=0.4,
+            ),
+        ),
+        drive_alignment="curiosity",
+        description=(
+            "Two-step anticipatory research: generate search queries "
+            "from context, then fetch web results and synthesize findings"
+        ),
+    ),
 }
 
 

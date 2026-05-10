@@ -30,10 +30,10 @@ def runner(db, queue):
     return BrainstormRunner(db, queue, clock=_fixed_clock())
 
 
-async def test_schedules_two_sessions(runner, queue):
-    """schedule_daily_brainstorms enqueues exactly 2 tasks."""
+async def test_schedules_three_sessions(runner, queue):
+    """schedule_daily_brainstorms enqueues 3 tasks (user, self, self_unblock)."""
     await runner.schedule_daily_brainstorms()
-    assert await queue.pending_count() == 2
+    assert await queue.pending_count() == 3
 
 
 async def test_idempotent_scheduling(db, queue):
@@ -135,4 +135,4 @@ async def test_new_day_allows_new_sessions(db, queue):
     runner2 = BrainstormRunner(db, queue2, clock=day2_clock)
     await runner2.schedule_daily_brainstorms()
 
-    assert await queue2.pending_count() == 2
+    assert await queue2.pending_count() == 3  # user + self + self_unblock
