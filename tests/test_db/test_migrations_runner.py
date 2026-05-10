@@ -447,3 +447,32 @@ class TestStatus:
         status_after = await runner.status()
         assert status_after["pending_count"] == 0
         assert status_after["applied_count"] >= 1
+
+
+class TestSerializedConnectionCompat:
+    """The runtime path passes a SerializedConnection (not raw aiosqlite),
+    so the runner and its proxy must work through that wrapper."""
+
+    @pytest.mark.asyncio
+    async def test_run_pending_through_serialized_connection(
+        self, tmp_path,
+    ) -> None:
+        from genesis.db.connection import SerializedConnection
+
+        db_path = tmp_path / "serialized.db"
+        async with aiosqlite.connect(str(db_path)) as raw_conn:
+            await raw_conn.execute("PRAGMA journal_mode=WAL")
+            wrapped = SerializedConnection(raw_conn)
+
+            runner = MigrationRunner(wrapped)
+            results = await runner.run_pending()
+
+            assert len(results) >= 1, "expected at least one migration to apply"
+            assert all(r.success for r in results), (
+                f"migration failed via SerializedConnection: "
+                f"{[r.error for r in results if not r.success]}"
+            )
+
+            # Re-run is a no-op (idempotence holds through the wrapper)
+            second = await runner.run_pending()
+            assert second == []
