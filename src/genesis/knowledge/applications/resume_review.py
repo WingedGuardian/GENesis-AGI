@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
+# 41_resume_review_pass1 — structural analysis pass (no knowledge augmentation).
+# 42_resume_review_pass2 — knowledge-augmented critique pass.
 _PASS1_CALL_SITE = "41_resume_review_pass1"
 _PASS2_CALL_SITE = "42_resume_review_pass2"
 

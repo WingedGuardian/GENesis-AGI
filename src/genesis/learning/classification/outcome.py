@@ -16,6 +16,8 @@ class _Router(Protocol):
     ) -> Any: ...
 
 
+# 31_outcome_classification — per-outcome success/partial/failure classification.
+# Feeds the learning pipeline and the executor retrospective. See _call_site_meta.py.
 _CALL_SITE = "31_outcome_classification"
 
 

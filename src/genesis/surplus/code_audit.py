@@ -199,6 +199,8 @@ class CodeAuditExecutor:
         messages.append({"role": "user", "content": prompt})
 
         try:
+            # 36_code_auditor — surplus codebase audit (idle-time). Reviews for
+            # bugs and improvement opportunities. See _call_site_meta.py.
             result = await self._router.route_call("36_code_auditor", messages)
         except Exception:
             logger.error("Router call failed for code audit", exc_info=True)

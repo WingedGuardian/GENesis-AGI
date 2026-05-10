@@ -35,6 +35,8 @@ class FreshEyesReview:
         prompt = _REVIEW_PROMPT.format(draft=draft, topic=topic)
         try:
             messages = [{"role": "user", "content": prompt}]
+            # 23_fresh_eyes_review — outreach pre-send cross-vendor review (free chain).
+            # Distinct from 17_fresh_eyes_review which is the executor's Gate 2 (paid).
             result = await self._router.route_call("23_fresh_eyes_review", messages)
             if not result.success or not result.content:
                 raise ValueError(f"Review call failed: {result.error}")

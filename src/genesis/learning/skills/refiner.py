@@ -14,7 +14,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Call site 33: skill_refiner
+# 33_skill_refiner — proposes improvements to learned skills.
+# Shared with: (a) learning/skills/applicator.py:167 (second caller), and
+# (b) bookmark_enrichment via the alias mapping in router.py:405.
 _CALL_SITE = "33_skill_refiner"
 
 

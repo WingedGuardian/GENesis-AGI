@@ -55,8 +55,8 @@ not implemented in the quick-wins pass. Also captures related deferred decisions
 
 **Decision**: Deferred to V4.
 
-Infrastructure is ready (call site `22_tagging` exists in `model_routing.yaml`,
-`ollama-3b` chain configured). Zero consumers — no code currently calls the
+Infrastructure is ready (call site `22_tagging` exists in `model_routing.yaml`
+with a free-API chain configured). Zero consumers — no code currently calls the
 tagging call site. Wire when memory consolidation pipeline (V4) activates and
 needs tag-based retrieval.
 

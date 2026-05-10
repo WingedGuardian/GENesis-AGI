@@ -78,6 +78,10 @@ async def init(rt: GenesisRuntime) -> None:
         # ================================================================
         # USER EGO (CEO) — proactive user value
         # ================================================================
+        # NOTE: "8_user_ego_compaction" is an OBSERVABILITY LABEL only — passed
+        # to cost/event tracking, NOT to route_call(). The matching routing call
+        # site is "8_ego_compaction" (in model_routing.yaml). The "8_*" namespace
+        # is documented in observability/_call_site_meta.py master cross-reference.
         user_ego_compaction = CompactionEngine(
             db=rt._db,
             router=rt._router,
@@ -149,6 +153,8 @@ async def init(rt: GenesisRuntime) -> None:
             ego_dispatch_budget_usd=1.0,
         )
 
+        # NOTE: "8_genesis_ego_compaction" is an OBSERVABILITY LABEL only
+        # (same as 8_user_ego_compaction above). Routing call site is "8_ego_compaction".
         genesis_ego_compaction = CompactionEngine(
             db=rt._db,
             router=rt._router,

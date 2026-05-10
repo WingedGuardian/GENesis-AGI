@@ -22,6 +22,7 @@ class _Router(Protocol):
     ) -> Any: ...
 
 
+# 32_delta_assessment — daily delta classification between cognitive-state snapshots.
 _CALL_SITE = "32_delta_assessment"
 
 

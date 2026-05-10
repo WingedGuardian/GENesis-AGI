@@ -300,6 +300,8 @@ async def process_pending_observations(
         prompt = OBSERVER_PROMPT.replace("{observations_text}", obs_text)
 
         try:
+            # 21_session_observer — session-observer-driven memory writes.
+            # Routes via the free chain for opportunistic context capture.
             response = await router.route_call(
                 call_site_id="21_session_observer",
                 messages=[{"role": "user", "content": prompt}],

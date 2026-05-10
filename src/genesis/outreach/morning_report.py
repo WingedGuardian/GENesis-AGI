@@ -94,6 +94,7 @@ class MorningReportGenerator:
                 max_length=None,
                 system_prompt=system_prompt,
             ),
+            # 13_morning_report — daily morning report generation. Free-chain.
             call_site_id="13_morning_report",
         )
 

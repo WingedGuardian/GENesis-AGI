@@ -181,7 +181,7 @@ model selection (e.g., "Sonnet high thinking" vs just "Sonnet").
 
 | # | Call Site | Runtime | Model + Effort |
 |---|----------|---------|---------------|
-| 2 | Triage | AZ (API) | ollama-3b / free API |
+| 2 | Triage | AZ (API) | Free API |
 | 3 | Micro reflection | AZ (API) | Free API / LM Studio 30B |
 | 4 | Light reflection | CC background | Haiku, low effort (moved from API to CC pipeline 2026-03-22) |
 | 5 | Deep reflection | CC background | Sonnet, high thinking |
@@ -201,7 +201,7 @@ model selection (e.g., "Sonnet high thinking" vs just "Sonnet").
 | 19 | Outreach draft | AZ (API) | Free API |
 | 20 | Adversarial counterargument | AZ (API) | Grok 4 / Kimi 2.5 / GPT-5.2 (cross-vendor) |
 | 21 | Embeddings | AZ (API) | ollama-embedding |
-| 22 | Tagging | AZ (API) | ollama-3b / free API |
+| 22 | Tagging | AZ (API) | Free API |
 | 27 | Pre-execution assessment | CC foreground | Absorbed into CC system prompt reasoning |
 | 28 | Observation sweep | CC background | Sonnet, high thinking |
 

@@ -93,6 +93,9 @@ class TriageCalibrator:
             observations=obs_text, current_calibration=current_calibration
         )
 
+        # 30_triage_calibration — DAILY calibration of the 29_retrospective_triage classifier.
+        # Regenerates TRIAGE_CALIBRATION.md few-shot rules. Does NOT classify
+        # interactions itself. See _call_site_meta.py for the triage-family map.
         result = await self._router.route_call(
             "30_triage_calibration",
             [{"role": "user", "content": prompt}],

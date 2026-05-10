@@ -21,6 +21,9 @@ from genesis.autonomy.executor.types import ExecutionTrace, StepResult
 
 logger = logging.getLogger(__name__)
 
+# 43_task_retrospective — executor's post-execution retrospective (the LIVE one).
+# Distinct from 7_task_retrospective which was a duplicate (removed from YAML
+# 2026-05-10 when this site was confirmed as the live caller).
 _CALL_SITE = "43_task_retrospective"
 
 _RETROSPECTIVE_PROMPT_PATH = (

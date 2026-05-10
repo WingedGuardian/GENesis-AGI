@@ -18,6 +18,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 38_procedure_extraction — extracts reusable procedures from interaction outcomes.
+# Currently in the learning-pipeline-only path (partially wired per _call_site_meta.py).
 _CALL_SITE = "38_procedure_extraction"
 
 _PROMPT_TEMPLATE = """\
