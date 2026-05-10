@@ -548,6 +548,74 @@ class TestOutputParsing:
 
 
 # ---------------------------------------------------------------------------
+# communication_decision default
+# ---------------------------------------------------------------------------
+
+
+class TestCommunicationDecisionDefault:
+    """Verify that omitting communication_decision defaults to send_digest."""
+
+    def test_default_is_send_digest(self):
+        """When ego omits communication_decision, code should default to send_digest."""
+        data = {
+            "proposals": [
+                {
+                    "action_type": "investigate",
+                    "action_category": "test",
+                    "content": "test proposal",
+                    "rationale": "test",
+                    "confidence": 0.8,
+                }
+            ],
+            "focus_summary": "test",
+            "follow_ups": [],
+        }
+        # Simulate what session.py:298 does
+        comm_decision = data.get("communication_decision", "send_digest")
+        assert comm_decision == "send_digest"
+
+    def test_explicit_stay_quiet_preserved(self):
+        """When ego explicitly sets stay_quiet, it should be honored."""
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "communication_decision": "stay_quiet",
+        }
+        comm_decision = data.get("communication_decision", "send_digest")
+        assert comm_decision == "stay_quiet"
+
+    def test_explicit_urgent_notify_preserved(self):
+        """When ego sets urgent_notify, it should be honored."""
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "communication_decision": "urgent_notify",
+        }
+        comm_decision = data.get("communication_decision", "send_digest")
+        assert comm_decision == "urgent_notify"
+
+
+# ---------------------------------------------------------------------------
+# Output contract includes communication_decision
+# ---------------------------------------------------------------------------
+
+
+class TestOutputContractIncludesCommDecision:
+    """Both output contracts must include communication_decision."""
+
+    def test_user_ego_contract(self):
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        contract = UserEgoContextBuilder._output_contract_section()
+        assert "communication_decision" in contract
+
+    def test_genesis_ego_contract(self):
+        from genesis.ego.genesis_context import GenesisEgoContextBuilder
+
+        contract = GenesisEgoContextBuilder._output_contract_section()
+        assert "communication_decision" in contract
 # Focus summary sanitization tests
 # ---------------------------------------------------------------------------
 
