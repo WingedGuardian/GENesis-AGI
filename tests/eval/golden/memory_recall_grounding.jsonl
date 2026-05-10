@@ -1,0 +1,24 @@
+# Golden set for the memory_recall_grounding rubric.
+#
+# One case per line. Lines starting with "#" and blank lines are
+# skipped. Each case has the shape:
+#
+#   {"id": "<unique id>",
+#    "actual": "<the recalled memory text>",
+#    "expected": "<reference label, e.g. 'relevant' or 'not_relevant'>",
+#    "user_passed": <true if you'd judge this memory as relevant for
+#                    the query, false otherwise>,
+#    "scorer_config": {"rubric_name": "memory_recall_grounding",
+#                      "query": "<the original query the user asked>"}}
+#
+# Aim for 30-50 hand-graded cases before running calibration. Mix:
+#   - clear-positives: query and memory line up tightly
+#   - clear-negatives: memory is off-topic or boilerplate
+#   - borderline-positives: tangentially relevant but useful
+#   - borderline-negatives: keyword overlap but no real grounding
+#   - distractors: contains the query keywords but answers a
+#     different question
+#
+# The user grades these by hand — the judge gets calibrated against
+# YOUR judgment, so consistency in the grading is what makes the
+# rubric trustworthy.

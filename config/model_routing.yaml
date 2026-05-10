@@ -532,6 +532,16 @@ call_sites:
     default_paid: true
     description: "Contribution pipeline \u2014 evaluates whether a code change is\
       \ already fixed upstream"
+  judge:
+    chain:
+    - openrouter-deepseek-v4
+    default_paid: true
+    retry_profile: background
+    dispatch: api
+    description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
+      \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
+      \ Single-model chain by design: if the judge model is unavailable,\
+      \ fail loudly rather than silently swap models and corrupt calibration."
 retry:
   default:
     max_retries: 3
