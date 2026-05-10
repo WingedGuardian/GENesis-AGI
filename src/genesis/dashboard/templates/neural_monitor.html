@@ -191,6 +191,17 @@ body {
 .badge-normal { background: #166534; color: #4ade80; }
 .badge-warning { background: #854d0e; color: #ffe600; }
 .badge-critical { background: #991b1b; color: #ef4444; }
+.badge-info { background: #1e3a8a; color: #93c5fd; }
+.badge-disabled { background: #374151; color: #9ca3af; }
+.detail-status-reason { margin-bottom: 8px; }
+.see-also-list { display: flex; flex-direction: column; gap: 4px; }
+.see-also-item {
+    cursor: pointer; color: #60a5fa; font-size: 12px;
+    padding: 4px 8px; border-radius: 3px;
+    background: rgba(96, 165, 250, 0.08);
+    transition: background 0.15s;
+}
+.see-also-item:hover { background: rgba(96, 165, 250, 0.18); text-decoration: underline; }
 
 /* Section rows (reused in ops strip, enrichment, detail panel) */
 .section-row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
@@ -847,6 +858,37 @@ function showDetail(item) {
     catBadge.style.color = CAT_COLORS[meta.category] || '#6b7280';
     content.appendChild(catBadge);
 
+    // Status-reason badge — clarifies WHY a site is wired/idle/disabled.
+    // Maps from machine-readable status_reason (set in _call_site_meta.py).
+    const statusReason = item.data.status_reason;
+    if (statusReason) {
+        const REASON_LABELS = {
+            WIRED: 'WIRED',
+            WIRED_DIFFERENT_MECHANISM: 'WIRED — DIFFERENT MECHANISM',
+            PARTIALLY_WIRED: 'PARTIALLY WIRED',
+            V4_PLACEHOLDER: 'V4 PLACEHOLDER',
+            DEPRECATED_REMOVED: 'DEPRECATED — REMOVED',
+            SUPERSEDED: 'SUPERSEDED',
+            TEMP_DISABLED: 'TEMPORARILY DISABLED',
+            REPLACED_BY_AWARENESS_LOOP: 'REPLACED BY AWARENESS LOOP',
+        };
+        const REASON_CLASS = {
+            WIRED: 'badge-normal',
+            WIRED_DIFFERENT_MECHANISM: 'badge-normal',
+            PARTIALLY_WIRED: 'badge',
+            V4_PLACEHOLDER: 'badge-info',
+            DEPRECATED_REMOVED: 'badge-disabled',
+            SUPERSEDED: 'badge-disabled',
+            TEMP_DISABLED: 'badge-warning',
+            REPLACED_BY_AWARENESS_LOOP: 'badge-disabled',
+        };
+        const reasonWrap = el('div', 'detail-status-reason');
+        const reasonBadge = el('span', 'badge ' + (REASON_CLASS[statusReason] || 'badge'),
+                               REASON_LABELS[statusReason] || statusReason);
+        reasonWrap.appendChild(reasonBadge);
+        content.appendChild(reasonWrap);
+    }
+
     // Description — prefer backend data over static SITE_META
     const descText = item.data.description || meta.desc;
     if (descText) {
@@ -1035,6 +1077,29 @@ function showDetail(item) {
         }
     } else {
         content.appendChild(sectionRow('Last Run', 'No runs recorded'));
+    }
+
+    // See Also — cross-references to sibling call sites in the same vocabulary
+    // family (triage, fresh_eyes_review, task_retrospective, ego_compaction).
+    // Click to switch the detail panel to the sibling's view.
+    const seeAlso = item.data.see_also;
+    if (seeAlso && Array.isArray(seeAlso) && seeAlso.length > 0) {
+        const seeAlsoSection = el('div', 'detail-section');
+        seeAlsoSection.appendChild(el('h4', null, 'See Also'));
+        const list = el('div', 'see-also-list');
+        seeAlso.forEach(sid => {
+            const linkItem = el('div', 'see-also-item', sid);
+            linkItem.addEventListener('click', () => {
+                // Fetch fresh health data and re-show detail for the sibling.
+                fetch('/api/genesis/health').then(r => r.json()).then(h => {
+                    const siteData = (h.call_sites && h.call_sites[sid]) || {};
+                    showDetail({ id: sid, status: siteData.status || 'unknown', data: siteData });
+                }).catch(() => {});
+            });
+            list.appendChild(linkItem);
+        });
+        seeAlsoSection.appendChild(list);
+        content.appendChild(seeAlsoSection);
     }
 
     // Switch side panel to detail view
