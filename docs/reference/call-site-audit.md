@@ -3,6 +3,17 @@
 Comprehensive audit of all 44 neural monitor call sites. Verified against
 live code traces, routing config, and last_run database records.
 
+**2026-05-10 update:** Routing-config cleanup pass.
+- Removed `2_triage` from YAML (awareness loop's `classify_depth()` superseded it; meta entry retained as historical reference).
+- Removed `7_task_retrospective` from YAML — confirmed duplicate; the executor went live with `43_task_retrospective` and `7_*` was forgotten.
+- Removed `"2_triage"` from `routing/degradation.py:_L3_KEEP` (dead reference after YAML delete).
+- Added clarifying comment blocks above `10_cognitive_state`, `18_meta_prompting`, `22_tagging`, `28_observation_sweep`, `37_infrastructure_monitor` in YAML.
+- `37_infrastructure_monitor` recommendation changed from "wire" to "temp disabled pending rework" — commit ff2198c (2026-05-03) deliberately disabled it; rework requires higher-tier providers + tighter prompts.
+- `10_cognitive_state` status clarified: this YAML entry is V4 placeholder; cognitive state IS actively maintained today via direct DB writes (awareness/loop.py, cc/reflection_bridge*.py), not this call site.
+- Cleaned up ghost reference: removed "Supersedes 15_triage_calibration" from `30_triage_calibration` meta description. `15_triage_calibration` exists nowhere in the live code.
+- Added `status_reason` + `see_also` metadata fields to confusable-family entries; neural monitor renders these as a colored badge + cross-reference section.
+- Added master cross-reference docstring to `_call_site_meta.py` documenting the four confusable families (triage, fresh_eyes_review, task_retrospective, ego_compaction) and ~25 cross-reference comments at call-site reference points.
+
 **2026-04-09 update:** Call site `11_user_model_synthesis` was originally
 marked wired (commit eb5c350, 2026-04-06) when the surrounding pipeline
 got wired, but the actual `router.route_call()` invocation was missing —
@@ -75,10 +86,10 @@ Shown as gray "Disabled" in the neural monitor.
 
 ### Superseded (2)
 
-| Site | Superseded By | Recommendation |
-|------|--------------|----------------|
-| `2_triage` | Awareness loop built-in classification | **Remove** from routing config |
-| `15_triage_calibration` | `30_triage_calibration` (Phase 6, Mar 9) | **Remove** from routing config |
+| Site | Superseded By | Status |
+|------|--------------|--------|
+| `2_triage` | Awareness loop's `classify_depth()` (deterministic threshold math, no LLM) | **REMOVED FROM YAML 2026-05-10** |
+| `15_triage_calibration` | `30_triage_calibration` | Ghost ID — was never in `_call_site_meta.py` or current YAML; meta description reference cleaned 2026-05-10 |
 
 ### Routing Bypass (0)
 
@@ -96,20 +107,20 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
 | `7_ego_cycle` | Ego cycle CLI reasoning | **Active** — persistent session with --resume |
-| `7_task_retrospective` | Task outcome root-cause analysis | **Keep** — wire when executor goes live |
+| `7_task_retrospective` | Task outcome root-cause analysis | **REMOVED FROM YAML 2026-05-10** — duplicate; executor went live with `43_task_retrospective` (`autonomy/executor/trace.py:24`). Meta entry retained as historical. |
 | `autonomous_executor_reasoning` | Executor non-tooling reasoning | **Keep** — wire when executor goes live |
 
 ### Never Wired — Planned Features (8)
 
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
-| `10_cognitive_state` | Cognitive state summary regeneration | **Keep** for V4 |
-| `17_fresh_eyes_review` | Executor cross-vendor review | **Keep** — distinct from 23_fresh_eyes |
+| `10_cognitive_state` | LLM regeneration of cognitive state narrative | **Keep for V4** — note: cognitive state is *actively* maintained today via direct DB writes (`awareness/loop.py`, `cc/reflection_bridge*.py`); this YAML entry reserves the chain for the future LLM-summary feature, not the live mechanism |
+| `17_fresh_eyes_review` | Executor cross-vendor review (Gate 2, paid) | **Active** — distinct from 23_fresh_eyes (outreach, free) |
 | `18_meta_prompting` | Pre-reflection prompt engineering | **Keep** for V4 adaptive prompting |
 | `22_tagging` | Entity extraction / metadata tagging | **Keep** for V4 knowledge graph |
-| `28_observation_sweep` | Environment change scanning | **Review** — awareness loop may make this redundant |
+| `28_observation_sweep` | Environment change scanning | **Functionally replaced by awareness loop** signal collection (`awareness/loop.py:perform_tick`). Kept in YAML with comment; can remove on next sweep. |
 | `34_research_synthesis` | Multi-source research synthesis | **Keep** for V4 autonomous research |
-| `37_infrastructure_monitor` | Surplus infrastructure monitoring | **Wire** to surplus scheduler |
+| `37_infrastructure_monitor` | Surplus infrastructure monitoring | **TEMPORARILY DISABLED** (commit ff2198c, 2026-05-03). Sentinel infra (`src/genesis/sentinel/monitor.py`) intact. Disabled because free-model output quality was too low for surplus dispatch. Rework pending: needs higher-tier providers + tighter prompts. |
 
 ### Never Wired — Routing Duplicates (3)
 
@@ -126,13 +137,13 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 | `17_fresh_eyes_review` vs `23_fresh_eyes_review` | 17 = autonomy executor (cross-vendor, paid). 23 = outreach message review (free). Different domains. |
 | `29_retrospective_triage` vs `30_triage_calibration` | 29 = re-evaluate past decisions (learning). 30 = update calibration rules. Both active. |
 
-## Cleanup Recommendations (Separate Task)
+## Cleanup Recommendations
 
-1. **Remove** `2_triage` and `15_triage_calibration` from routing config
-2. ~~**Review** `8_memory_consolidation` — remove if consolidation doesn't need LLM~~ **DONE 2026-04-11**: renamed to `8_ego_compaction`, verified as a real LLM call site via EgoCompactor.
-3. **Wire** `37_infrastructure_monitor` to surplus scheduler
-4. **Review** `28_observation_sweep` — awareness loop may fully replace it
-5. **Review** `contingency_deep_reflection` — may be redundant
-6. **Review** `19_outreach_draft` — may be redundant with 35_content_draft
-
-These are documentation-only recommendations. No code changes in this PR.
+1. ~~**Remove** `2_triage` from routing config~~ **DONE 2026-05-10** (also removed from `routing/degradation.py:_L3_KEEP`).
+2. `15_triage_calibration` — ghost ID; meta description reference cleaned 2026-05-10. Nothing else to do.
+3. ~~**Review** `8_memory_consolidation` — remove if consolidation doesn't need LLM~~ **DONE 2026-04-11**: renamed to `8_ego_compaction`, verified as a real LLM call site via EgoCompactor.
+4. ~~**Wire** `37_infrastructure_monitor` to surplus scheduler~~ **REVISED 2026-05-10**: temp disabled in commit ff2198c (2026-05-03); rework pending higher-tier providers + tighter prompts.
+5. ~~**Review** `28_observation_sweep` — awareness loop may fully replace it~~ **CONFIRMED 2026-05-10**: functionally replaced; kept in YAML with clarifying comment.
+6. **Review** `contingency_deep_reflection` — may be redundant
+7. **Review** `19_outreach_draft` — may be redundant with 35_content_draft
+8. **2026-05-10**: removed `7_task_retrospective` from YAML (duplicate; live one is `43_task_retrospective`).
