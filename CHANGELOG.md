@@ -7,6 +7,39 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **LLM-as-judge eval primitive** --- new `LLMJudgeScorer`
+  (`ScorerType.LLM_JUDGE`), versioned `Rubric` registry, and a
+  calibration job that grades a rubric against a hand-graded golden
+  set and refuses to promote it below 80% agreement. The judge runs
+  through a new `judge` call site in `config/model_routing.yaml`
+  (DeepSeek V4 Pro via OpenRouter), so cost, fallback, and circuit
+  breakers come for free. First rubric:
+  `memory_recall_grounding`. The primitive is the foundation for
+  follow-on CRAG retrieval grading and ego eval-drift work; nothing
+  in the live runtime calls it yet, so this update is plumbing only
+  for now.
+
+### Changed
+
+- **`judge` call site is in the L2 / tmp-pressure-high skip lists**
+  --- when Genesis is degraded or disk-pressured, judge calls back
+  off automatically, in line with the existing rules for non-critical
+  background work.
+
+### Migrations
+
+- **0014_eval_results_metadata** --- adds a `metadata_json` TEXT
+  column to `eval_results` so structured judge output (rubric name +
+  version, judge model, score, rationale) can be queried without
+  re-parsing `scorer_detail`. Idempotent; applies automatically on
+  first server start after the upgrade.
+
+---
+
 ## [v3.0b8] - 2026-05-09
 
 A late-day batch focused on web intelligence, ego self-regulation, and

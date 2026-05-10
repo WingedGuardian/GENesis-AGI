@@ -130,12 +130,16 @@ def test_load_full_yaml(monkeypatch):
     assert "openrouter-deepseek-r1" not in cfg.providers
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
-    assert len(cfg.call_sites) == 44
+    assert len(cfg.call_sites) == 45
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True
     assert cfg.call_sites["36_code_auditor"].never_pays is False
     assert cfg.call_sites["37_infrastructure_monitor"].default_paid is True
+    # judge: LLM-as-judge eval primitive — single-model chain, paid-by-default
+    assert cfg.call_sites["judge"].chain == ["openrouter-deepseek-v4"]
+    assert cfg.call_sites["judge"].default_paid is True
+    assert cfg.call_sites["judge"].dispatch == "api"
 
     # Phase 6 learning call sites
     assert cfg.call_sites["29_retrospective_triage"].chain == [

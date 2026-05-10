@@ -62,6 +62,10 @@ docs/actions/user/*.md
 data/genesis.db
 data/genesis.sql
 *.jsonl
+# Golden sets for the eval-judge calibration framework MUST be in the
+# repo — every install needs them to calibrate rubrics. Allow .jsonl
+# files under tests/eval/golden/ explicitly.
+!tests/eval/golden/*.jsonl
 .config/
 .claude/settings.local.json
 .claude/scheduled_tasks.lock

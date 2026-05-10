@@ -12,6 +12,7 @@ class ScorerType(StrEnum):
     SET_OVERLAP = "set_overlap"
     JSON_VALIDITY = "json_validity"
     SLOP_DETECTION = "slop_detection"
+    LLM_JUDGE = "llm_judge"
 
 
 class EvalTrigger(StrEnum):
