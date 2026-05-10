@@ -926,13 +926,25 @@ function showDetail(item) {
                 ul.style.cssText = 'margin:4px 0 0 0;padding-left:18px;';
                 missing.forEach(c => {
                     const li = el('li', null);
-                    li.innerHTML = '<code style="color:#fde68a">' + c.missing_env_var + '</code>'
-                        + ' — ' + (c.provider || '') + ' (' + (c.type || '') + ')';
+                    const code = el('code', null, c.missing_env_var || '');
+                    code.style.color = '#fde68a';
+                    li.appendChild(code);
+                    li.appendChild(document.createTextNode(
+                        ' — ' + (c.provider || '') + ' (' + (c.type || '') + ')',
+                    ));
                     ul.appendChild(li);
                 });
                 list.appendChild(ul);
-                const note = el('div', null,
-                    'Genesis also accepts <code>&lt;TYPE&gt;_API_KEY</code> or <code>&lt;TYPE&gt;_API_TOKEN</code> if your install uses a different convention.');
+                const note = el('div', null);
+                note.appendChild(document.createTextNode('Genesis also accepts '));
+                const alt1 = el('code', null, '<TYPE>_API_KEY');
+                note.appendChild(alt1);
+                note.appendChild(document.createTextNode(' or '));
+                const alt2 = el('code', null, '<TYPE>_API_TOKEN');
+                note.appendChild(alt2);
+                note.appendChild(document.createTextNode(
+                    ' if your install uses a different convention.',
+                ));
                 note.style.cssText = 'margin-top:6px;color:#a8a29e;font-size:10px;';
                 list.appendChild(note);
                 banner.appendChild(list);

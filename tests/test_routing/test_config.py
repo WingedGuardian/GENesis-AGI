@@ -315,6 +315,50 @@ call_sites:
     assert cfg.call_sites["site"].chain == ["keyless", "keyed"]
 
 
+def test_mixed_disabled_and_keyless_chain():
+    """A chain mixing `enabled: false` (filtered out) + keyless (kept as
+    down) must keep the chain reference for the keyless provider while
+    dropping the explicitly-disabled one. This is the only regression
+    path where the two filters could interact incorrectly.
+    """
+    from unittest.mock import patch
+
+    def _has_key(cfg):
+        return cfg.provider_type == "ollama"
+
+    with patch(
+        "genesis.observability.snapshots.api_keys.has_api_key",
+        side_effect=_has_key,
+    ):
+        cfg = load_config_from_string("""\
+providers:
+  off:
+    type: anthropic
+    model: m
+    free: false
+    enabled: false
+  keyless:
+    type: zenmux
+    model: m
+    free: false
+  keyed:
+    type: ollama
+    model: m
+    free: true
+call_sites:
+  s:
+    chain: [off, keyless, keyed]
+""", check_api_keys=True)
+
+    # `off` is removed from cfg.providers (explicit enabled:false)
+    assert "off" not in cfg.providers
+    # keyless stays registered with has_api_key=False
+    assert cfg.providers["keyless"].has_api_key is False
+    assert cfg.providers["keyed"].has_api_key is True
+    # Chain has `off` filtered out, keyless preserved
+    assert cfg.call_sites["s"].chain == ["keyless", "keyed"]
+
+
 def test_keyless_chain_preserves_site():
     """When a site's whole chain is keyless, the site stays visible —
     no silent drop. The snapshot will mark it 'disabled' so the user
