@@ -72,7 +72,7 @@ class TestFetchSearchResults:
 
         assert "test query" in output
         assert "Test Title" in output
-        assert "https://example.com" in output
+        assert f"URL: {mock_result.url}" in output
         assert "A short snippet" in output
 
     @pytest.mark.asyncio
