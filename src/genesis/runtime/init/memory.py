@@ -11,6 +11,9 @@ from genesis.util.tasks import tracked_task
 _STATUS_WRITE_INTERVAL_S = 60
 
 if TYPE_CHECKING:
+    import aiosqlite
+    from qdrant_client import QdrantClient
+
     from genesis.runtime._core import GenesisRuntime
 
 logger = logging.getLogger("genesis.runtime")
@@ -57,6 +60,11 @@ async def init(rt: GenesisRuntime) -> None:
         from genesis.qdrant.collections import ensure_collections
         ensure_collections(qdrant)
         logger.info("Qdrant collections ensured")
+
+        # One-time migration: move reference vectors from knowledge_base
+        # to episodic_memory. References are personal data (credentials,
+        # URLs, IPs) that belong alongside episodic memories.
+        await _migrate_reference_vectors(qdrant, rt._db)
 
         # Split embedding chains: storage (Ollama first) vs recall (cloud first).
         # Both share the same L2 diskcache — cache keys are text-based, not
@@ -202,3 +210,86 @@ async def init(rt: GenesisRuntime) -> None:
         )
         from genesis.runtime._degradation import record_init_degradation
         await record_init_degradation(rt._db, rt._event_bus, "memory", "MemoryStore", str(exc), severity="error")
+
+
+async def _migrate_reference_vectors(
+    qdrant: QdrantClient, db: aiosqlite.Connection,
+) -> None:
+    """One-time migration: move reference vectors from knowledge_base → episodic_memory.
+
+    Looks up reference qdrant_ids from knowledge_units, checks which ones
+    still live in knowledge_base, and moves them to episodic_memory.
+
+    Idempotent: skips entries already in episodic_memory. Safe to run on
+    fresh installs (no references in knowledge_base → no-op).
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT qdrant_id FROM knowledge_units "
+            "WHERE project_type = 'reference' AND qdrant_id IS NOT NULL"
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+
+        ref_ids = [r[0] for r in rows]
+
+        # Check which IDs still exist in knowledge_base
+        kb_points = qdrant.retrieve(
+            collection_name="knowledge_base",
+            ids=ref_ids,
+            with_payload=True,
+            with_vectors=True,
+        )
+        if not kb_points:
+            logger.debug("Reference vector migration: nothing to migrate")
+            return
+
+        # Check which are already in episodic_memory (idempotency)
+        existing_ep = qdrant.retrieve(
+            collection_name="episodic_memory",
+            ids=[str(p.id) for p in kb_points],
+            with_payload=False,
+            with_vectors=False,
+        )
+        existing_ep_ids = {str(p.id) for p in existing_ep}
+
+        to_migrate = [p for p in kb_points if str(p.id) not in existing_ep_ids]
+        if not to_migrate:
+            logger.debug("Reference vector migration: all already in episodic_memory")
+            return
+
+        # Upsert into episodic_memory with updated payload
+        from qdrant_client.models import PointStruct
+
+        points_to_upsert = []
+        for p in to_migrate:
+            payload = dict(p.payload) if p.payload else {}
+            payload["memory_type"] = "episodic"
+            points_to_upsert.append(
+                PointStruct(id=str(p.id), vector=p.vector, payload=payload)
+            )
+
+        qdrant.upsert(
+            collection_name="episodic_memory",
+            points=points_to_upsert,
+        )
+
+        # Delete from knowledge_base
+        from qdrant_client.models import PointIdsList
+
+        qdrant.delete(
+            collection_name="knowledge_base",
+            points_selector=PointIdsList(points=[str(p.id) for p in to_migrate]),
+        )
+
+        logger.info(
+            "Reference vector migration: moved %d points from "
+            "knowledge_base → episodic_memory",
+            len(to_migrate),
+        )
+    except Exception:
+        logger.warning(
+            "Reference vector migration failed — will retry on next restart",
+            exc_info=True,
+        )

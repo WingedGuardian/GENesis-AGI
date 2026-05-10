@@ -17,6 +17,7 @@ jobs:
   analytical_hours: 12
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
+  j9_eval_batch_hours: 24
 
 task_defaults:
   code_audit:                { priority: 0.5, drive: competence,   tier: free_api }
@@ -29,3 +30,4 @@ task_defaults:
   gap_clustering:            { priority: 0.4, drive: competence,   tier: free_api }
   anticipatory_research:     { priority: 0.3, drive: curiosity,    tier: free_api }
   prompt_effectiveness:      { priority: 0.3, drive: competence,   tier: free_api }
+  j9_eval_batch:             { priority: 0.3, drive: competence,   tier: free_api }

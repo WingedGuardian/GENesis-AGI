@@ -20,7 +20,7 @@ async def outreach_stats(db: aiosqlite.Connection | None) -> dict:
             """SELECT
                 COUNT(*) as total,
                 COUNT(delivered_at) as delivered,
-                COUNT(opened_at) as opened,
+                SUM(CASE WHEN engagement_signal = 'user_reply' THEN 1 ELSE 0 END) as responded,
                 SUM(CASE WHEN engagement_outcome IN ('useful', 'engaged') THEN 1 ELSE 0 END) as engaged
             FROM outreach_history
             WHERE created_at >= datetime('now', '-7 days')
@@ -29,14 +29,14 @@ async def outreach_stats(db: aiosqlite.Connection | None) -> dict:
         row = await cursor.fetchone()
         total = row["total"] if row else 0
         delivered = row["delivered"] if row else 0
-        opened = row["opened"] if row else 0
+        responded = row["responded"] if row else 0
         engaged = row["engaged"] if row else 0
 
         return {
             "window": "7d",
             "total": total,
             "delivery_rate": round(delivered / total, 3) if total > 0 else None,
-            "open_rate": round(opened / delivered, 3) if delivered > 0 else None,
+            "response_rate": round(responded / delivered, 3) if delivered > 0 else None,
             "engagement_rate": round(engaged / delivered, 3) if delivered > 0 else None,
         }
     except Exception:

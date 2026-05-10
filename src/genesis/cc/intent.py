@@ -15,7 +15,7 @@ from genesis.cc.types import CCModel, EffortLevel, IntentResult
 
 class IntentParser:
     _SLASH_MODEL = re.compile(r"/model\s+(sonnet|opus|haiku)", re.IGNORECASE)
-    _SLASH_EFFORT = re.compile(r"/effort\s+(low|medium|high|max)", re.IGNORECASE)
+    _SLASH_EFFORT = re.compile(r"/effort\s+(low|medium|high|xhigh|max)", re.IGNORECASE)
     _SLASH_RESUME = re.compile(r"/resume(?:\s+(\S+))?", re.IGNORECASE)
     _SLASH_TASK = re.compile(r"/task(?:\s+(.*))?", re.IGNORECASE)
 

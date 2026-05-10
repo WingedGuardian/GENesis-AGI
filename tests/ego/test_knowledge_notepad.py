@@ -127,10 +127,16 @@ class TestRebuildNotepad:
         result = _rebuild_notepad(sections, "2026-05-07")
         pos_projects = result.index("Active Projects")
         pos_interests = result.index("Interests & Expertise")
-        pos_patterns = result.index("Interaction Patterns")
-        pos_journal = result.index("Proposal Context Journal")
         pos_questions = result.index("Open Questions")
-        assert pos_projects < pos_interests < pos_patterns < pos_journal < pos_questions
+        assert pos_projects < pos_interests < pos_questions
+        # Removed sections (Interaction Patterns, Proposal Context Journal)
+        # are treated as extras and appended after defined sections.
+        if "Interaction Patterns" in result:
+            pos_patterns = result.index("Interaction Patterns")
+            assert pos_patterns > pos_questions
+        if "Proposal Context Journal" in result:
+            pos_journal = result.index("Proposal Context Journal")
+            assert pos_journal > pos_questions
 
 
 # -- _apply_knowledge_updates (integration via EgoSession) -------------------

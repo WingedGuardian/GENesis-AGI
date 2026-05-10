@@ -51,6 +51,23 @@ async def init(rt: GenesisRuntime) -> None:
             if tg_users:
                 recipients["telegram"] = tg_users.split(",")[0].strip()
 
+        # Wire email adapter if Gmail credentials exist
+        gmail_addr = os.environ.get("GENESIS_GMAIL_ADDRESS")
+        gmail_pass = os.environ.get("GENESIS_GMAIL_APP_PASSWORD")
+        if gmail_addr and gmail_pass:
+            from genesis.channels.email_adapter import EmailAdapter
+
+            channels["email"] = EmailAdapter(
+                smtp_host="smtp.gmail.com",
+                smtp_port=465,
+                username=gmail_addr,
+                password=gmail_pass,
+                from_address=gmail_addr,
+            )
+            if "email" not in recipients:
+                recipients["email"] = gmail_addr
+            logger.info("Email channel adapter registered (from: %s)", gmail_addr)
+
         rt._outreach_pipeline = _Pipeline(
             governance=governance,
             drafter=drafter,

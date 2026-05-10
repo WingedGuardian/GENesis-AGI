@@ -12,7 +12,7 @@ from genesis.cc.types import CCOutput
 from genesis.db.crud import ego as ego_crud
 from genesis.db.schema import TABLES
 from genesis.ego.dispatch import EgoDispatcher
-from genesis.ego.session import EgoSession
+from genesis.ego.session import EgoSession, _sanitize_focus_summary
 from genesis.ego.types import CycleType, EgoConfig
 
 # ---------------------------------------------------------------------------
@@ -545,3 +545,115 @@ class TestOutputParsing:
         result = EgoSession._parse_output(raw)
         assert result is not None
         assert result["proposals"] == []
+
+
+# ---------------------------------------------------------------------------
+# Focus summary sanitization tests
+# ---------------------------------------------------------------------------
+
+
+class TestFocusSanitization:
+    """Tests for behavioral focus_summary detection and sanitization."""
+
+    @pytest.mark.parametrize("focus", [
+        "Holding back — Jay is sprinting on job applications",
+        "Holding back — user is busy",
+        "Stepping back while user is busy",
+        "Lying low during sprint",
+        "Waiting for user to surface",
+        "Waiting for Jay to engage with proposals",
+        "Waiting for them to return",
+        "Pausing proactive work until things settle",
+        "Pausing proposal generation",
+        "Quiet mode — no proposals for now",
+        "No proposals until he finishes applications",
+        "No proposal for now",
+        "Staying quiet while user focuses",
+        "Staying out of the way",
+        "Observing only — reduced activity",
+        "Observing quietly this cycle",
+        "Passive mode — watching only",
+        "Minimal engagement this cycle",
+        "Reduced activity during user sprint",
+        "Not proposing anything while user is busy",
+        "Not acting until signals improve",
+        "Backing off — proposals ignored",
+        "Until Jay surfaces again",
+        "Letting things breathe for now",
+        "Giving the user space this cycle",
+        "Hibernating until user returns",
+    ])
+    def test_behavioral_focus_rejected(self, focus):
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is True
+        assert sanitized == "general system awareness"
+
+    @pytest.mark.parametrize("focus", [
+        "investigating backlog growth",
+        "monitoring provider health after outage",
+        "evaluating job application tracking design",
+        "reviewing cost trends for the past week",
+        "general system health monitoring",
+        "analyzing user feedback on morning reports",
+        "tracking Anthropic API availability",
+        "memory pipeline performance audit",
+        "waiting for API rate limit to reset",
+        "observing provider latency patterns across regions",
+        # Reviewer edge cases: technical phrases that happen to contain
+        # behavioral keywords but in non-behavioral context
+        "investigating a dormant service restart",
+        "giving database space for vacuum",
+        "letting the CI pipeline breathe between runs",
+        "analyzing why users are not proposing changes",
+        "reviewing the fallow period scheduler code",
+    ])
+    def test_legitimate_focus_accepted(self, focus):
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is False
+        assert sanitized == focus
+
+    def test_previous_focus_used_as_fallback(self):
+        sanitized, violated = _sanitize_focus_summary(
+            "Holding back", previous_focus="monitoring API costs"
+        )
+        assert violated is True
+        assert sanitized == "monitoring API costs"
+
+    def test_default_fallback_when_no_previous(self):
+        sanitized, violated = _sanitize_focus_summary("Holding back")
+        assert violated is True
+        assert sanitized == "general system awareness"
+
+    @pytest.mark.parametrize("focus", [
+        # These are legitimate English but start with behavioral verbs
+        # where the ego is the implicit subject.  Accepted as known false
+        # positives — the prompt is the primary defense, and these are
+        # extremely unlikely as real ego focus summaries.
+        "stepping back to understand the architecture",
+        "backing off retry rate for API calls",
+        "hibernating containers need restart",
+        "reduced activity in logs after midnight",
+        "observing only errors from the health check",
+        "minimal engagement metrics for outreach post",
+        "passive mode detection in firewall rules",
+        "not acting on stale alerts yet",
+    ])
+    def test_known_false_positives(self, focus):
+        """Edge cases: behavioral verb at start, but non-behavioral intent.
+
+        Accepted as false positives because:
+        1. The ego is prompted to use topical phrasing, not behavioral verbs
+        2. The consequence is a fallback to previous focus, not data loss
+        3. Violations are logged as observations for pattern review
+        """
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is True  # Known false positive
+
+    def test_validate_output_sanitizes_focus(self):
+        """_validate_output catches behavioral focus and sets violation flags."""
+        raw = _valid_output(focus="Holding back — user is busy")
+        result = EgoSession._parse_output(raw)
+        assert result is not None
+        assert result["focus_summary"] == "general system awareness"
+        assert result.get("_focus_violation") is True
+        assert "Holding back" in result.get("_original_focus", "")

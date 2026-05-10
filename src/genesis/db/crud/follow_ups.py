@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -227,3 +227,25 @@ async def get_recent(
         (limit,),
     )
     return [dict(row) for row in await cursor.fetchall()]
+
+
+async def purge_completed(
+    db: aiosqlite.Connection,
+    *,
+    max_age_days: int = 30,
+) -> int:
+    """Delete completed/failed follow-ups older than *max_age_days*.
+
+    Pinned follow-ups are always preserved regardless of age.
+    Returns the number of records deleted.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=max_age_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM follow_ups "
+        "WHERE status IN ('completed', 'failed') "
+        "AND pinned = 0 "
+        "AND completed_at IS NOT NULL AND completed_at < ?",
+        (cutoff,),
+    )
+    await db.commit()
+    return cursor.rowcount
