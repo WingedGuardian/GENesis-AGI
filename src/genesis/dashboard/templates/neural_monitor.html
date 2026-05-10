@@ -871,7 +871,7 @@ function showDetail(item) {
             SUPERSEDED: 'SUPERSEDED',
             TEMP_DISABLED: 'TEMPORARILY DISABLED',
             REPLACED_BY_AWARENESS_LOOP: 'REPLACED BY AWARENESS LOOP',
-            NO_API_KEYS: 'NO API KEY CONFIGURED',
+            NO_API_KEYS: 'NO API KEY CONFIGURED',  // pragma: allowlist secret
         };
         const REASON_CLASS = {
             WIRED: 'badge-normal',
@@ -882,7 +882,7 @@ function showDetail(item) {
             SUPERSEDED: 'badge-disabled',
             TEMP_DISABLED: 'badge-warning',
             REPLACED_BY_AWARENESS_LOOP: 'badge-disabled',
-            NO_API_KEYS: 'badge-critical',
+            NO_API_KEYS: 'badge-critical',  // pragma: allowlist secret
         };
         const reasonWrap = el('div', 'detail-status-reason');
         const reasonBadge = el('span', 'badge ' + (REASON_CLASS[statusReason] || 'badge'),
