@@ -353,6 +353,7 @@ call_sites:
     chain:
     - mistral-small-free
     - groq-free
+    - openrouter-free
   27_pre_execution_assessment:
     chain:
     - glm51
