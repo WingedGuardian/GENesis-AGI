@@ -77,6 +77,15 @@ def init(rt: GenesisRuntime) -> None:
         except ImportError:
             pass  # crawl4ai not installed — skip silently
 
+        if os.environ.get("API_KEY_TINYFISH"):
+            from genesis.providers.tinyfish_agent import TinyFishAgentAdapter
+            from genesis.providers.tinyfish_fetch import TinyFishFetchAdapter
+            from genesis.providers.tinyfish_search import TinyFishSearchAdapter
+
+            rt._provider_registry.register(TinyFishSearchAdapter())
+            rt._provider_registry.register(TinyFishFetchAdapter())
+            rt._provider_registry.register(TinyFishAgentAdapter())
+
         if os.environ.get("API_KEY_PERPLEXITY"):
             from genesis.research.perplexity import PerplexityAdapter
 
