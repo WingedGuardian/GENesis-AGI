@@ -7,12 +7,20 @@ from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class CapabilityModule(Protocol):
-    """A pluggable external capability for Genesis.
+    """A pluggable capability for Genesis.
 
-    Modules are external domain capabilities (crypto trading, prediction markets,
-    prospecting, etc.) that leverage Genesis's cognitive services without modifying
-    core. They are "hands, not brain" — they can be plugged in and unplugged
-    without affecting Genesis identity, reflection, or learning.
+    Modules are pluggable capabilities that operate on a domain. The domain is
+    typically external (crypto trading, prediction markets, prospecting, etc.),
+    but the same plug-and-unplug contract also covers components whose target
+    of inspection is Genesis itself — auditors, monitors, and other observers
+    that don't participate in Genesis's cognitive operations.
+
+    The unifying property is "hands, not brain" — modules can be plugged in
+    and unplugged without affecting Genesis identity, reflection, or learning.
+    A module may *observe* Genesis's state, but it does not *think with* it:
+    no memory writes, no reflection contribution, no ego role. Components that
+    participate in Genesis's cognitive operations belong elsewhere (memory,
+    reflection, ego, sentinel) — not in modules.
 
     ## Implementing a Native Module
 
