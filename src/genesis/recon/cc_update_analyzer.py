@@ -218,6 +218,8 @@ class CCUpdateAnalyzer:
         messages = [{"role": "user", "content": prompt}]
 
         try:
+            # cc_update_analysis — analyzes CC version changelogs for impact on
+            # Genesis hooks/integrations. Non-numeric ID by intent.
             result = await self._router.route_call("cc_update_analysis", messages)
             if result.success and result.content:
                 return json.loads(result.content)

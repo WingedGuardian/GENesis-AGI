@@ -47,6 +47,8 @@ _FALLBACK_MODELS = [
     ("gemini/gemini-2.0-flash", "GEMINI_API_KEY"),
 ]
 
+# contribution_gate — gates community contribution submissions (Phase 6 pipeline).
+# Non-numeric ID by intent (predates the numeric scheme).
 _CALL_SITE_ID = "contribution_gate"
 
 # Copied VERBATIM from scripts/spike_version_gate_calibrate.py after

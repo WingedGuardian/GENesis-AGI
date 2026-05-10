@@ -20,7 +20,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Call site for the infrastructure monitor — uses free models
+# 37_infrastructure_monitor — TEMPORARILY DISABLED in commit ff2198c (2026-05-03).
+# Sentinel infrastructure here remains in place; output quality from free-model
+# providers was too low for surplus dispatch. Rework pending: higher-tier providers
+# and tighter prompts before re-enable.
 CALL_SITE_ID = "37_infrastructure_monitor"
 
 

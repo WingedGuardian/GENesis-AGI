@@ -163,6 +163,8 @@ class SkillApplicator:
         )
 
         try:
+            # 33_skill_refiner — second caller of this site (besides skills/refiner.py:18).
+            # Also aliased by bookmark_enrichment via router.py:405.
             result = await router.route_call(  # type: ignore[union-attr]
                 call_site_id="33_skill_refiner",
                 messages=[{"role": "user", "content": prompt}],

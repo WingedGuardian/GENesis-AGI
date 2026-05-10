@@ -12,8 +12,10 @@ if TYPE_CHECKING:
 # L2 (Reduced) skips these call sites
 _L2_SKIP = {"12_surplus_brainstorm", "13_morning_report", "judge"}
 
-# L3 (Essential) only keeps these call sites
-_L3_KEEP = {"2_triage", "3_micro_reflection", "21_embeddings", "22_tagging"}
+# L3 (Essential) only keeps these call sites.
+# Note: "2_triage" removed from this set 2026-05-10 alongside its removal from
+# config/model_routing.yaml (the awareness loop's classify_depth replaced it).
+_L3_KEEP = {"3_micro_reflection", "21_embeddings", "22_tagging"}
 
 # Tmp pressure skip lists — separate from cloud degradation because disk
 # pressure requires different shedding than provider outages.

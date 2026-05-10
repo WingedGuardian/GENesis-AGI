@@ -16,6 +16,8 @@ from genesis.knowledge.processors.base import ProcessedContent
 
 logger = logging.getLogger(__name__)
 
+# 40_knowledge_distillation — distills ingested sources into atomic units.
+# Parallelized across the provider chain via chain_offset.
 _CALL_SITE = "40_knowledge_distillation"
 
 # Max characters per chunk sent to the LLM for distillation.

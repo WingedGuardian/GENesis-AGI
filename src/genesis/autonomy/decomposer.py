@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# 27_pre_execution_assessment — sanity-checks proposed task execution plans.
+# Also used in autonomy/executor/review.py:30 (_CALL_SITE_PLAN).
 _CALL_SITE = "27_pre_execution_assessment"
 
 _VALID_STEP_TYPES = frozenset({

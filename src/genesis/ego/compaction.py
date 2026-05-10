@@ -51,6 +51,10 @@ class CompactionEngine:
         # with existing runtime init code.
         router: object | None = None,
         window_size: int = 10,
+        # 8_ego_compaction — THE routing call site for ego rolling-summary compaction.
+        # Distinct from the observability-only labels 8_user_ego_compaction /
+        # 8_genesis_ego_compaction passed from runtime/init/ego.py (those are
+        # cost/event tags, NOT routing IDs). See _call_site_meta.py master map.
         call_site_id: str = "8_ego_compaction",
     ) -> None:
         self._db = db

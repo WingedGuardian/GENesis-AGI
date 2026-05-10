@@ -412,6 +412,8 @@ class OutreachPipeline:
         if not self._deferred_queue:
             return
         try:
+            # "outreach_fallback" — deferred-queue work tag (not in model_routing.yaml).
+            # No own routing chain; used for cost/event tracking only.
             await self._deferred_queue.enqueue(
                 work_type="outreach_delivery",
                 call_site_id="outreach_fallback",

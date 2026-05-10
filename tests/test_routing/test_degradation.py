@@ -23,8 +23,9 @@ class TestShouldSkipCallSite:
     def test_l3_skips_deep_reflection(self):
         assert should_skip_call_site("5_deep_reflection", DegradationLevel.ESSENTIAL)
 
-    def test_l3_allows_triage_and_micro(self):
-        assert not should_skip_call_site("2_triage", DegradationLevel.ESSENTIAL)
+    def test_l3_keeps_essentials(self):
+        # 2_triage was previously in this list; removed 2026-05-10 when the
+        # call site was deleted from the YAML and _L3_KEEP set.
         assert not should_skip_call_site("3_micro_reflection", DegradationLevel.ESSENTIAL)
         assert not should_skip_call_site("21_embeddings", DegradationLevel.ESSENTIAL)
         assert not should_skip_call_site("22_tagging", DegradationLevel.ESSENTIAL)

@@ -130,7 +130,11 @@ def test_load_full_yaml(monkeypatch):
     assert "openrouter-deepseek-r1" not in cfg.providers
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
-    assert len(cfg.call_sites) == 45
+    # 2026-05-10: 44 → 43 after net change (judge added by #304, 2_triage +
+    # 7_task_retrospective removed by this PR).
+    assert len(cfg.call_sites) == 43
+    assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
+    assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
     assert "background" in cfg.retry_profiles
     assert cfg.call_sites["12_surplus_brainstorm"].never_pays is True
     assert cfg.call_sites["5_deep_reflection"].default_paid is True

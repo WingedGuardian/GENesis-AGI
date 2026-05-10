@@ -230,11 +230,6 @@ providers:
     enabled: ${GENESIS_ENABLE_LM_STUDIO:-false}
     open_duration_s: 120
 call_sites:
-  2_triage:
-    chain:
-    - mistral-small-free
-    - groq-free
-    - openrouter-free
   3_micro_reflection:
     chain:
     - mistral-small-free
@@ -271,10 +266,6 @@ call_sites:
     retry_profile: background
     dispatch: cli
     cc_model: Opus
-  7_task_retrospective:
-    chain:
-    - openrouter-free
-    default_paid: true
   8_ego_compaction:
     chain:
     - claude-haiku
@@ -287,6 +278,9 @@ call_sites:
     - cerebras-qwen
     - mistral-large-free
     - openrouter-deepseek-v4-flash
+  # V4 placeholder: cognitive state IS actively maintained today, but via direct
+  # DB writes (awareness/loop.py, cc/reflection_bridge*.py), NOT this call site.
+  # This entry reserves a routing chain for the future LLM-summary regeneration feature.
   10_cognitive_state:
     chain:
     - glm51
@@ -331,6 +325,8 @@ call_sites:
     - openrouter-qwen36plus
     default_paid: true
     description: "Task executor Gate 2 — cross-vendor quality review of deliverables"
+  # V4 placeholder: pre-reflection prompt engineering. Never wired. Reserved for
+  # future adaptive-prompting work; remove if V4 design drops the feature.
   18_meta_prompting:
     chain:
     - openrouter-free
@@ -349,6 +345,8 @@ call_sites:
     - gemini-free
     - openrouter-free
     retry_profile: background
+  # V4 placeholder: entity extraction / metadata tagging for the knowledge graph.
+  # No live consumers today; chain is prep for future memory-consolidation pipeline.
   22_tagging:
     chain:
     - mistral-small-free
@@ -362,6 +360,8 @@ call_sites:
     default_paid: true
     retry_profile: user_facing
     description: "Task executor — sanity-check proposed execution plans before committing resources"
+  # Functionally replaced by awareness loop's signal collection
+  # (awareness/loop.py:perform_tick). Kept as historical; no live consumers.
   28_observation_sweep:
     chain:
     - minimax-m25
@@ -437,6 +437,10 @@ call_sites:
     - openrouter-mimo
     description: "Surplus code review \u2014 evaluate codebase for bugs and quality\
       \ issues"
+  # Temporarily disabled in commit ff2198c (2026-05-03) \u2014 output quality from free
+  # models was too low for the surplus pipeline. Sentinel infrastructure
+  # (src/genesis/sentinel/monitor.py) remains in place. Rework pending: needs
+  # higher-tier providers and tighter prompts before re-enable.
   37_infrastructure_monitor:
     chain:
     - groq-free
