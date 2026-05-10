@@ -7,18 +7,58 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
-## [Unreleased]
+## [v3.0b8] - 2026-05-09
+
+A late-day batch focused on web intelligence, ego self-regulation, and
+operational hygiene. TinyFish becomes a first-class web-tools backend,
+ego learns to back off when the user is absent, and the surplus surface
+gains an autonomous research pipeline.
+
+### Added
+
+- **TinyFish web tools provider** (#292) --- new `web_search`,
+  `web_fetch`, and `web_agent` adapters under `genesis.providers`.
+  TinyFish is the new primary in `web_search` / `web_fetch` auto chains
+  (gated on `API_KEY_TINYFISH`), with SearXNG / Brave / Scrapling /
+  Crawl4AI retained as fallbacks. `web_fetch` gains a `urls` parameter
+  for parallel multi-URL retrieval (1--10 URLs).
+- **Anticipatory research pipeline** (#291) --- 2-step pipeline
+  generating search queries from observation context and synthesizing
+  TinyFish-fetched results with source URLs, scheduled every 12h via
+  the analytical lane.
+- **`SELF_UNBLOCK` brainstorm category** (#291) --- third daily
+  brainstorm alongside `BRAINSTORM_USER` and `BRAINSTORM_SELF`,
+  focused on identifying internal blockers Genesis can clear without
+  user input.
+- **User-recency cadence tiers for ego** (#287) --- ego's max
+  cycle interval now adapts to time-since-last-foreground-session
+  (5 tiers from 240m at <24h to 4320m at >14d). Adaptive backoff still
+  operates within each tier; only the ceiling moves.
 
 ### Changed
 
+- **Ego output contracts now include `communication_decision`** (#286)
+  --- both user and Genesis ego JSON contracts now expose the
+  `send_digest` / `stay_quiet` / `urgent_notify` field that was
+  previously described in narrative only. The default flips from
+  `stay_quiet` to `send_digest`, so proposals are no longer silently
+  swallowed when the field is omitted.
 - **MCP code-intelligence tools auto-upgrade on install/bootstrap**
-  --- `scripts/bootstrap.sh` and `scripts/install.sh` now re-run the
-  codebase-memory-mcp installer unconditionally (it is idempotent and
-  pulls the latest release) and call `uv tool upgrade serena-agent`
-  when Serena is already present. Existing installs get the latest
-  versions on the next bootstrap; fresh installs are unchanged.
-  GitNexus is unaffected (deliberately pinned to a prerelease
-  channel).
+  (#299) --- `scripts/bootstrap.sh` and `scripts/install.sh` now re-run
+  the codebase-memory-mcp installer unconditionally (idempotent, pulls
+  latest) and call `uv tool upgrade serena-agent` when Serena is
+  already present. Existing installs get the latest versions on the
+  next bootstrap; fresh installs are unchanged. GitNexus is
+  intentionally left on its prerelease channel.
+
+### Fixed
+
+- **Mergeable check actually fires now** (#290) --- the
+  UNKNOWN/CONFLICTING block from PR #270 lived in
+  `bash_safety_hook.sh`, which was never wired into `settings.json`.
+  Moved the check into the actually-deployed `git_push_guard.py`, so
+  `gh pr merge` now hard-blocks on UNKNOWN or CONFLICTING mergeable
+  status.
 
 ---
 
