@@ -150,6 +150,84 @@ async def test_skips_open_breaker(sample_config, breakers, cost_tracker, degrada
 
 
 @pytest.mark.asyncio
+async def test_skips_keyless_provider(
+    sample_providers, breakers, cost_tracker, degradation,
+):
+    """A provider with has_api_key=False must be skipped without ever
+    calling the delegate — same effect as a tripped breaker, but driven
+    by config rather than runtime state. No CB trip, no failure record.
+    """
+    import dataclasses
+
+    from genesis.routing.types import CallSiteConfig, RetryPolicy, RoutingConfig
+
+    # Mark free-1 as keyless
+    providers = dict(sample_providers)
+    providers["free-1"] = dataclasses.replace(providers["free-1"], has_api_key=False)
+
+    config = RoutingConfig(
+        providers=providers,
+        call_sites={
+            "test_keyless": CallSiteConfig(id="test_keyless", chain=["free-1", "free-2"]),
+        },
+        retry_profiles={"default": RetryPolicy(max_retries=1, base_delay_ms=10, jitter_pct=0.0)},
+    )
+
+    delegate = MockDelegate()
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("test_keyless", [{"role": "user", "content": "hi"}])
+
+    # Successful routing — free-2 handled it
+    assert result.success is True
+    assert result.provider_used == "free-2"
+    # free-1 must never have been called
+    assert all(c["provider"] != "free-1" for c in delegate.calls)
+    # free-1's CB must NOT have tripped — we never tried, never failed
+    assert breakers.get("free-1").consecutive_failures == 0
+    assert breakers.get("free-1").trip_count == 0
+
+
+@pytest.mark.asyncio
+async def test_all_keyless_chain_returns_exhausted(
+    sample_providers, breakers, cost_tracker, degradation,
+):
+    """If every provider in the chain is keyless, routing fails with the
+    standard exhausted-chain error — no LiteLLM calls, no CB trips.
+    """
+    import dataclasses
+
+    from genesis.routing.types import CallSiteConfig, RetryPolicy, RoutingConfig
+
+    providers = {
+        name: dataclasses.replace(cfg, has_api_key=False)
+        for name, cfg in sample_providers.items()
+    }
+    config = RoutingConfig(
+        providers=providers,
+        call_sites={
+            "all_keyless": CallSiteConfig(id="all_keyless", chain=["free-1", "free-2"]),
+        },
+        retry_profiles={"default": RetryPolicy(max_retries=1, base_delay_ms=10, jitter_pct=0.0)},
+    )
+    delegate = MockDelegate()
+    router = Router(
+        config=config, breakers=breakers, cost_tracker=cost_tracker,
+        degradation=degradation, delegate=delegate,
+    )
+    result = await router.route_call("all_keyless", [{"role": "user", "content": "hi"}])
+
+    assert result.success is False
+    # No CB trips on any provider
+    for name in providers:
+        assert breakers.get(name).trip_count == 0
+    # Delegate was never called
+    assert len(delegate.calls) == 0
+
+
+@pytest.mark.asyncio
 async def test_degradation_skips_call_site(sample_config, breakers, cost_tracker, degradation):
     """At L2 degradation, surplus call sites are skipped."""
     degradation.update(DegradationLevel.REDUCED)

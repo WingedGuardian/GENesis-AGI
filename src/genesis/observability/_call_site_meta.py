@@ -14,8 +14,13 @@ Fields:
   model_tier:     What class of model this needs (embedding/slm/mid/frontier/cc)
   status_reason:  Machine-readable status (WIRED, WIRED_DIFFERENT_MECHANISM,
                   PARTIALLY_WIRED, V4_PLACEHOLDER, DEPRECATED_REMOVED,
-                  SUPERSEDED, TEMP_DISABLED, REPLACED_BY_AWARENESS_LOOP).
+                  SUPERSEDED, TEMP_DISABLED, REPLACED_BY_AWARENESS_LOOP,
+                  NO_API_KEYS [runtime overlay, install-specific]).
                   Renders as a colored badge in the neural monitor.
+                  NO_API_KEYS is set at snapshot time by call_sites.py
+                  when every provider in a site's chain has has_api_key=False;
+                  intrinsic statuses defined in _CALL_SITE_META take
+                  precedence (setdefault).
   see_also:       Sibling call-site IDs to cross-reference. Populated for
                   confusable-vocabulary families. Rendered as clickable
                   links in the neural monitor detail panel.

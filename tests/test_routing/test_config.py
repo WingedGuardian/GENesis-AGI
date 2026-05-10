@@ -264,6 +264,87 @@ call_sites:
 
 
 # ---------------------------------------------------------------------------
+# Keyless providers stay registered as down (2026-05-10).
+# ---------------------------------------------------------------------------
+
+
+def test_keyless_provider_stays_registered_as_down(monkeypatch):
+    """A provider whose API key env var is unset must stay in cfg.providers
+    with has_api_key=False, NOT get filtered out at load time. The call
+    site that references it must also remain visible in cfg.call_sites
+    with its full chain intact.
+
+    This is the normal install state for partial API-key configuration —
+    the router treats keyless providers as down (same as a tripped CB),
+    and the snapshot surfaces them on the neural monitor so the user can
+    see what they need to add to enable the call site.
+    """
+    # Override the conftest autouse patch that forces has_api_key=True.
+    # We want the real check to run so we can verify the load-time
+    # marking. Local types (ollama) bypass the env check entirely.
+    from unittest.mock import patch
+
+    def _real_has_api_key(cfg):
+        return cfg.provider_type in {"ollama", "lmstudio"}
+
+    with patch(
+        "genesis.observability.snapshots.api_keys.has_api_key",
+        side_effect=_real_has_api_key,
+    ):
+        cfg = load_config_from_string("""\
+providers:
+  keyless:
+    type: anthropic
+    model: claude-haiku
+    free: false
+  keyed:
+    type: ollama
+    model: qwen2.5:3b
+    free: true
+call_sites:
+  site:
+    chain: [keyless, keyed]
+""", check_api_keys=True)
+
+    assert "keyless" in cfg.providers
+    assert cfg.providers["keyless"].has_api_key is False
+    # Local providers always have keys
+    assert cfg.providers["keyed"].has_api_key is True
+    # Call site stays visible with full chain
+    assert "site" in cfg.call_sites
+    assert cfg.call_sites["site"].chain == ["keyless", "keyed"]
+
+
+def test_keyless_chain_preserves_site():
+    """When a site's whole chain is keyless, the site stays visible —
+    no silent drop. The snapshot will mark it 'disabled' so the user
+    knows it's not running, but it's reachable in the dashboard.
+    """
+    from unittest.mock import patch
+
+    # All providers come back as keyless
+    with patch("genesis.observability.snapshots.api_keys.has_api_key", return_value=False):
+        cfg = load_config_from_string("""\
+providers:
+  p1:
+    type: anthropic
+    model: claude-sonnet
+    free: false
+  p2:
+    type: zenmux
+    model: glm-4.5
+    free: false
+call_sites:
+  only_keyless:
+    chain: [p1, p2]
+""", check_api_keys=True)
+
+    assert "only_keyless" in cfg.call_sites
+    assert cfg.call_sites["only_keyless"].chain == ["p1", "p2"]
+    assert all(not cfg.providers[p].has_api_key for p in ["p1", "p2"])
+
+
+# ---------------------------------------------------------------------------
 # F1: ``dispatch`` field parsing on CallSiteConfig.
 # ---------------------------------------------------------------------------
 

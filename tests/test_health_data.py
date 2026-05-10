@@ -394,6 +394,123 @@ class TestDisabledChainSemantics:
         assert chain[0]["probe_status"] == "not_configured"
         assert chain[0]["probe_reason"] == "no_api_key"
 
+    @pytest.mark.asyncio
+    async def test_keyless_provider_surfaces_in_chain_health(self):
+        """Load-time has_api_key=False must surface as has_api_key field +
+        missing_env_var in the chain entry. Works WITHOUT probe data
+        (cold start, no probe has run yet).
+        """
+        import dataclasses
+
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {
+            "claude-sonnet": dataclasses.replace(
+                _make_provider("claude-sonnet"),
+                provider_type="anthropic",
+                has_api_key=False,
+            ),
+        }
+        config = _make_config(providers, {
+            "test_site": CallSiteConfig(id="test_site", chain=["claude-sonnet"]),
+        })
+        breakers = _mock_registry({
+            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+        })
+        # No probe_results — cold-start condition
+        result = await call_sites(
+            db=None, routing_config=config, breakers=breakers,
+            probe_results=None,
+        )
+        chain = result["test_site"]["chain_health"]
+        assert chain[0]["has_api_key"] is False
+        assert chain[0]["missing_env_var"] == "API_KEY_ANTHROPIC"
+
+    @pytest.mark.asyncio
+    async def test_keyless_chain_cascades_to_disabled_no_probes(self):
+        """Cold-start (no probe data) with all-keyless chain → site status
+        cascades to 'disabled' with status_reason='NO_API_KEYS'.
+
+        Uses a synthetic site ID NOT in _CALL_SITE_META so meta overlay
+        doesn't interfere — sites with wired=False in meta are forced to
+        'idle' before the unified chain walk runs, which is correct
+        behavior for groundwork sites but masks the no-keys cascade.
+        """
+        import dataclasses
+
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {
+            "p_zenmux": dataclasses.replace(
+                _make_provider("p_zenmux"), provider_type="zenmux", has_api_key=False,
+            ),
+            "p_anthropic": dataclasses.replace(
+                _make_provider("p_anthropic"), provider_type="anthropic", has_api_key=False,
+            ),
+        }
+        config = _make_config(providers, {
+            "active_site_with_no_keys": CallSiteConfig(
+                id="active_site_with_no_keys", chain=["p_zenmux", "p_anthropic"],
+            ),
+        })
+        breakers = _mock_registry({
+            "p_zenmux": _mock_breaker(ProviderState.CLOSED),
+            "p_anthropic": _mock_breaker(ProviderState.CLOSED),
+        })
+        result = await call_sites(
+            db=None, routing_config=config, breakers=breakers,
+            probe_results=None,
+        )
+        site = result["active_site_with_no_keys"]
+        assert site["status"] == "disabled"
+        assert site["disabled_reason"] == "no_api_keys_configured"
+        assert site["status_reason"] == "NO_API_KEYS"
+        # Both chain entries must surface their missing env var
+        env_vars = {c["missing_env_var"] for c in site["chain_health"]}
+        assert env_vars == {"API_KEY_ZENMUX", "API_KEY_ANTHROPIC"}
+
+    @pytest.mark.asyncio
+    async def test_intrinsic_status_reason_wins_over_no_api_keys(self):
+        """If _CALL_SITE_META declares an intrinsic status_reason (e.g.,
+        V4_PLACEHOLDER), the NO_API_KEYS runtime overlay must NOT
+        clobber it. Intrinsic state takes precedence — V4_PLACEHOLDER
+        means the site isn't supposed to fire yet regardless of keys.
+        """
+        import dataclasses
+        from unittest.mock import patch
+
+        from genesis.observability.snapshots.call_sites import call_sites
+
+        providers = {
+            "claude-sonnet": dataclasses.replace(
+                _make_provider("claude-sonnet"),
+                provider_type="anthropic", has_api_key=False,
+            ),
+        }
+        config = _make_config(providers, {
+            "future_site": CallSiteConfig(
+                id="future_site", chain=["claude-sonnet"],
+            ),
+        })
+        breakers = _mock_registry({
+            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+        })
+        # Inject intrinsic meta entry. wired=True so idle override
+        # doesn't short-circuit the chain walk before NO_API_KEYS would
+        # be considered.
+        meta_override = {
+            "future_site": {"status_reason": "V4_PLACEHOLDER", "wired": True},
+        }
+        with patch(
+            "genesis.observability.snapshots.call_sites._CALL_SITE_META",
+            meta_override,
+        ):
+            result = await call_sites(
+                db=None, routing_config=config, breakers=breakers,
+                probe_results=None,
+            )
+        assert result["future_site"]["status_reason"] == "V4_PLACEHOLDER"
+
 
 class TestCallSiteTripCount:
     """Verify trip_count is exposed in chain_health entries."""
