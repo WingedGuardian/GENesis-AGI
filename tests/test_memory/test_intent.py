@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from genesis.memory.intent import (
+    _INTENT_TO_SOURCE,
     QueryIntent,
     TagCooccurrenceIndex,
     _tokenize_query,
@@ -10,6 +11,65 @@ from genesis.memory.intent import (
     compute_intent_affinity,
     rank_by_intent,
 )
+
+
+class TestRecommendedSource:
+    """recommended_source field on QueryIntent — used by recall() to
+    decide which collection to query when no explicit source is passed."""
+
+    def test_episodic_routed_intents(self):
+        # WHY/WHEN/WHERE/STATUS should all route to episodic — these are
+        # internal lookups (past reasoning, timelines, current state).
+        for q, expected_cat in [
+            ("why did we choose X?", "WHY"),
+            ("when did the migration run?", "WHEN"),
+            ("where is the runtime config?", "WHERE"),
+            ("status of the cc_relay rollout", "STATUS"),
+        ]:
+            intent = classify_intent(q)
+            assert intent.category == expected_cat
+            assert intent.recommended_source == "episodic", (
+                f"Expected episodic for {expected_cat}, got "
+                f"{intent.recommended_source!r}"
+            )
+
+    def test_both_routed_intents(self):
+        # WHAT/HOW/GENERAL should default to both — either pool could
+        # ground them, let RRF + activation decide.
+        for q in [
+            "what is the extraction pipeline?",
+            "how do I run the bridge?",
+            "the brainstorm queue",  # GENERAL
+        ]:
+            intent = classify_intent(q)
+            assert intent.recommended_source == "both", (
+                f"Expected both for {q!r}, got "
+                f"{intent.recommended_source!r}"
+            )
+
+    def test_empty_query_falls_back_to_both(self):
+        intent = classify_intent("")
+        assert intent.category == "GENERAL"
+        assert intent.recommended_source == "both"
+
+    def test_intent_to_source_covers_all_categories(self):
+        # Guard against adding a new intent category without wiring its
+        # recommended_source. Every category in QueryIntent's docstring
+        # must have an entry in _INTENT_TO_SOURCE.
+        for cat in ["WHAT", "WHY", "HOW", "WHEN", "WHERE", "STATUS", "GENERAL"]:
+            assert cat in _INTENT_TO_SOURCE, (
+                f"Category {cat!r} missing from _INTENT_TO_SOURCE — every "
+                f"intent category must have a recommended_source mapping."
+            )
+            assert _INTENT_TO_SOURCE[cat] in ("episodic", "knowledge", "both")
+
+    def test_query_intent_default_source_is_both(self):
+        # Tests/external callers that construct QueryIntent without
+        # passing recommended_source get the safe baseline of 'both'.
+        intent = QueryIntent(
+            category="GENERAL", confidence=0.0, matched_pattern="",
+        )
+        assert intent.recommended_source == "both"
 
 # ---------------------------------------------------------------------------
 # Intent classification

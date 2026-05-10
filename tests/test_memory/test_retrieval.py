@@ -177,6 +177,140 @@ async def test_recall_both_sources(mock_qdrant, mock_crud, mock_links, _):
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
+async def test_fts5_collection_filter_matches_source_episodic(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """FTS5 must filter to the source collection when source is single
+    — regression guard for the bug where collection=None was hardcoded
+    and knowledge_base entries leaked into episodic recall."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="episodic", limit=5)
+
+    mock_crud.search_ranked.assert_called_once()
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] == "episodic_memory"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_fts5_collection_filter_matches_source_knowledge(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="knowledge", limit=5)
+
+    mock_crud.search_ranked.assert_called_once()
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_fts5_collection_filter_both_searches_all(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """When source='both', FTS5 still searches everything (None) — RRF
+    fuses the union with Qdrant's two-collection result."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("test", source="both", limit=5)
+
+    mock_crud.search_ranked.assert_called_once()
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] is None
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="why decided x")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_source_none_routes_by_intent_episodic(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """When source=None (default), WHY queries route to episodic only."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    # WHY intent → recommended_source = 'episodic'
+    await retriever.recall("why did we decide x?", limit=5)
+
+    assert mock_qdrant.search.call_count == 1
+    assert mock_qdrant.search.call_args.kwargs["collection"] == "episodic_memory"
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] == "episodic_memory"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="what is x")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_source_none_routes_by_intent_both(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """WHAT queries route to both via intent default."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("what is the cc_relay?", limit=5)
+
+    # Both collections searched in Qdrant; FTS5 collection=None
+    assert mock_qdrant.search.call_count == 2
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] is None
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="general query")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_explicit_source_overrides_intent(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """Caller passing source='knowledge' on a WHY query gets knowledge,
+    not the WHY-recommended episodic. Explicit beats inferred."""
+    retriever, _, _, _ = _build_retriever()
+
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    # WHY intent would route episodic, but caller forces knowledge
+    await retriever.recall("why did we decide x?", source="knowledge", limit=5)
+
+    assert mock_qdrant.search.call_count == 1
+    assert mock_qdrant.search.call_args.kwargs["collection"] == "knowledge_base"
+    assert mock_crud.search_ranked.call_args.kwargs["collection"] == "knowledge_base"
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
 async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
