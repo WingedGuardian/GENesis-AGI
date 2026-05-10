@@ -291,6 +291,17 @@ class ProposalWorkflow:
                     confidence=prop.get("confidence"),
                     action_type=prop.get("action_type"),
                 )
+                # Intervention journal: record resolution
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+                    await journal_crud.resolve(
+                        self._db, prop["id"],
+                        outcome_status=status,
+                        actual_outcome=f"User {status}" + (f": {reason}" if reason else ""),
+                        user_response=reason,
+                    )
+                except Exception:
+                    logger.warning("Failed to update intervention journal for %s", prop["id"])
                 # Auto-store correction memory on rejection with reason
                 if (
                     status == ProposalStatus.REJECTED

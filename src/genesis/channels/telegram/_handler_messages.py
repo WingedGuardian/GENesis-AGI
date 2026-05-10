@@ -145,7 +145,8 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
                 )
                 if session:
                     model = (session.get("model") or "sonnet").title()
-                    effort = session.get("effort") or "medium"
+                    effort_raw = session.get("effort") or "medium"
+                    effort = "xHigh" if effort_raw == "xhigh" else effort_raw.title()
                     prefix = f"[{model} / {effort}]"
         except Exception:
             log.debug("Could not resolve model/effort prefix", exc_info=True)

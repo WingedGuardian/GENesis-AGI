@@ -36,6 +36,7 @@ from genesis.cc.types import (
     StreamEvent,
     background_session_dir,
 )
+from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -255,6 +256,7 @@ class DirectSessionRunner:
         session_id: str,
     ) -> DirectSessionResult:
         """Execute a single CC session. Called inside tracked_task."""
+        _set_obs_session(session_id)
         telemetry: list[dict] = []
         start = time.monotonic()
 

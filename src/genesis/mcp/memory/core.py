@@ -50,6 +50,8 @@ async def memory_recall(
     room: str | None = None,
     include_graph: bool = True,
     expand_query_terms: bool = True,
+    mode: str = "auto",
+    time_range: str | None = None,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -64,50 +66,138 @@ async def memory_recall(
             analysis (~500ms first call, ~10ms cached). Broadens recall for
             ambiguous queries. Default on — catches poor query formulation.
             Note: does not apply to the drift_recall fallback path (if wired).
+        mode: Retrieval mode. "auto" = standard + drift fallback (default).
+            "standard" = hybrid only, no drift fallback. "drift" = skip
+            standard recall, use 3-phase drift retrieval directly. Drift
+            mode ignores wing/room filters (discovers clusters dynamically).
+        time_range: Explicit date range filter as "YYYY-MM-DD/YYYY-MM-DD".
+            Queries the SVO event calendar and boosts temporally matching
+            memories in RRF fusion. Automatic temporal detection also runs
+            on queries with temporal language (e.g., "what happened last week").
     """
+    import time as _time
+
+    _t0 = _time.monotonic()
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
-    results = await memory_mod._retriever.recall(
-        query, source=source, limit=limit, min_activation=min_activation,
-        wing=wing, room=room, expand_query_terms=expand_query_terms,
-    )
 
-    # Drift fallback: when standard recall returns sparse results, try the
-    # 3-phase drift retrieval (global scan → cluster drill-down → weighted RRF)
-    # which handles complex/ambiguous queries better.
-    # Skip when wing/room filters are set — drift discovers clusters dynamically
-    # and would silently violate the caller's filter constraints.
-    if (
-        len(results) < min(3, limit)
-        and limit >= 3
-        and not wing
-        and not room
-    ):
+    pipeline_used = mode  # track which pipeline actually ran
+
+    # Explicit time_range: query event calendar and merge IDs into results
+    event_boost_ids: set[str] = set()
+    if time_range:
         try:
-            from genesis.memory.drift import drift_recall
-
-            drift_results = await drift_recall(
-                query,
-                db=memory_mod._db,
-                qdrant_client=memory_mod._qdrant,
-                embedding_provider=memory_mod._retriever._embeddings,
-                source=source,
-                limit=limit,
-                min_activation=min_activation,
-            )
-            if len(drift_results) > len(results):
-                logger.info(
-                    "drift_recall fallback: standard=%d → drift=%d results"
-                    " (query=%r)",
-                    len(results), len(drift_results), query[:80],
+            parts = time_range.split("/", 1)
+            if len(parts) == 2:
+                from genesis.db.crud import memory_events
+                event_boost_ids = set(
+                    await memory_events.get_memory_ids_in_range(
+                        memory_mod._db, parts[0], parts[1], limit=limit * 3,
+                    )
                 )
-                results = drift_results
-                # Track drift results as retrieved — HybridRetriever.recall()
-                # handles this internally, but drift_recall does not.
-                _increment_retrieved(memory_mod._qdrant, drift_results)
         except Exception:
-            logger.warning("drift_recall fallback failed", exc_info=True)
+            logger.warning("time_range event query failed", exc_info=True)
+
+    if mode == "drift":
+        # Direct DRIFT invocation — skip standard recall entirely
+        from genesis.memory.drift import drift_recall
+
+        results = await drift_recall(
+            query,
+            db=memory_mod._db,
+            qdrant_client=memory_mod._qdrant,
+            embedding_provider=memory_mod._retriever._embeddings,
+            source=source,
+            limit=limit,
+            min_activation=min_activation,
+        )
+        _increment_retrieved(memory_mod._qdrant, results)
+    else:
+        results = await memory_mod._retriever.recall(
+            query, source=source, limit=limit, min_activation=min_activation,
+            wing=wing, room=room, expand_query_terms=expand_query_terms,
+        )
+        pipeline_used = "standard"
+
+        # Drift fallback (mode="auto" only): when standard recall returns
+        # sparse results, try drift retrieval automatically.
+        if (
+            mode == "auto"
+            and len(results) < min(3, limit)
+            and limit >= 3
+            and not wing
+            and not room
+        ):
+            try:
+                from genesis.memory.drift import drift_recall
+
+                drift_results = await drift_recall(
+                    query,
+                    db=memory_mod._db,
+                    qdrant_client=memory_mod._qdrant,
+                    embedding_provider=memory_mod._retriever._embeddings,
+                    source=source,
+                    limit=limit,
+                    min_activation=min_activation,
+                )
+                if len(drift_results) > len(results):
+                    logger.info(
+                        "drift_recall fallback: standard=%d → drift=%d results"
+                        " (query=%r)",
+                        len(results), len(drift_results), query[:80],
+                    )
+                    results = drift_results
+                    _increment_retrieved(memory_mod._qdrant, drift_results)
+                    pipeline_used = "auto_drift"
+            except Exception:
+                logger.warning("drift_recall fallback failed", exc_info=True)
+
+    # Boost event-calendar matches from explicit time_range
+    if event_boost_ids:
+        from genesis.db.crud import memory as memory_crud
+        from genesis.memory.types import RetrievalResult
+
+        result_ids = {r.memory_id for r in results}
+        missing = event_boost_ids - result_ids
+        for mid in list(missing)[:limit]:
+            try:
+                row = await memory_crud.get_by_id(memory_mod._db, mid)
+                if row:
+                    results.append(RetrievalResult(
+                        memory_id=mid,
+                        content=row.get("content", ""),
+                        source=row.get("source_type", ""),
+                        memory_type=row.get("collection", ""),
+                        score=0.01,
+                        vector_rank=None,
+                        fts_rank=None,
+                        activation_score=0.0,
+                        payload=row,
+                        source_pipeline="event_calendar",
+                    ))
+            except Exception:
+                logger.warning(
+                    "Failed to fetch event-calendar memory %s", mid,
+                    exc_info=True,
+                )
+
+    # MCP-layer instrumentation: emit with mode and pipeline attribution
+    try:
+        from genesis.eval.j9_hooks import emit_recall_fired
+        await emit_recall_fired(
+            memory_mod._db,
+            query=query,
+            result_count=len(results),
+            top_scores=[r.score for r in results[:5]],
+            memory_ids=[r.memory_id for r in results[:10]],
+            latency_ms=(_time.monotonic() - _t0) * 1000,
+            source=source,
+            mode=mode,
+            pipeline_used=pipeline_used,
+        )
+    except Exception:
+        pass  # instrumentation must never break recall
 
     if compact:
         return [

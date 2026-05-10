@@ -2010,7 +2010,7 @@ function updateSubsystemGrid(data) {
             const o = data.outreach_stats || {};
             if (o.total !== undefined) { enrichment.appendChild(sectionRow('Sent (7d)', String(o.total))); hasEnrichment = true; }
             if (o.delivery_rate != null) { enrichment.appendChild(sectionRow('Delivery', Math.round(o.delivery_rate * 100) + '%')); hasEnrichment = true; }
-            if (o.open_rate != null) { enrichment.appendChild(sectionRow('Open Rate', Math.round(o.open_rate * 100) + '%')); hasEnrichment = true; }
+            if (o.response_rate != null) { enrichment.appendChild(sectionRow('Response Rate', Math.round(o.response_rate * 100) + '%')); hasEnrichment = true; }
         }
         if (key === 'contingency') {
             const cc = data.cc_sessions || {};

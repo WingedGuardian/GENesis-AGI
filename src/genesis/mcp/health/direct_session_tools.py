@@ -80,7 +80,7 @@ async def _impl_direct_session_run(
     try:
         EffortLevel(effort_lower)
     except ValueError:
-        return {"error": f"Invalid effort '{effort}'. Must be one of: low, medium, high, max"}
+        return {"error": f"Invalid effort '{effort}'. Must be one of: low, medium, high, xhigh, max"}
 
     try:
         from genesis.db.crud import direct_session_queue as dsq
@@ -289,7 +289,7 @@ async def direct_session_run(
         prompt: The full instructions for the background session
         profile: Safety profile (observe, interact, research)
         model: LLM model (sonnet, opus, haiku)
-        effort: Effort level (low, medium, high, max)
+        effort: Effort level (low, medium, high, xhigh, max)
         timeout_minutes: Max runtime in minutes (default 15, max 60)
         notify: Send Telegram notification on completion/failure
     """

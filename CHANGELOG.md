@@ -7,6 +7,101 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b7] - 2026-05-09
+
+Ego gets two new self-awareness features, references move into the
+episodic graph, and Opus 4.7's xhigh effort tier becomes a first-class
+option.
+
+### Added
+
+- **Ego causal intervention journal** (#284) --- every proposal now
+  tracks its lifecycle (proposed → approved/rejected → executed →
+  outcome) in a queryable journal. Ego can correlate decisions with
+  outcomes to learn from past judgments.
+- **Ego self-model capability map** (#288) --- Genesis maintains a
+  live capability inventory aggregated from MCP tools, channels,
+  modules, and memory wings. Ego references this when proposing
+  actions to avoid suggesting things it can't do.
+- **Email outbound channel** (#289) --- Genesis can now send email
+  via the configured outbound provider. Third outreach lane alongside
+  Telegram and dashboard.
+- **GitHub star tracking** (#289) --- recon source captures
+  GENesis-AGI repo stargazer activity. Surfaces in morning reports.
+- **xhigh effort tier** (#297) --- Claude Code 2.1.111's xhigh tier
+  for Opus 4.7 is now recognized everywhere Genesis hands off effort
+  level (CC invoker, Telegram `/effort`, `session_set_effort` MCP,
+  dashboard). Defaults remain at `high`; xhigh is opt-in.
+- **Morning report observations** (#285) --- recent unresolved
+  observations are surfaced alongside the usual morning digest, so
+  operators see what Genesis is paying attention to.
+- **Follow-up retention cleanup** (#293) --- completed and failed
+  follow-ups older than 30 days are now purged daily at 02:30 UTC.
+  Pinned items are preserved.
+
+### Changed
+
+- **Reference storage migrates to episodic memory** (#296) --- 52
+  reference vectors move from `knowledge_base` to `episodic_memory`
+  via SQLite migration 0013 + Qdrant init-time migration (idempotent).
+  References now surface naturally via all memory recall paths.
+  `reference_lookup` continues to work; only the storage collection
+  changed.
+- **Disk alert threshold** (#295) --- `health_alerts` now fires
+  WARNING at <15% free disk (was CRITICAL-only at <10%). The 10–15%
+  gap is no longer a blind spot.
+
+### Fixed
+
+- **Ego self-reinforcing holdback loop** (#283) --- ego could spiral
+  into withdrawing its own proposals based on its own prior
+  decisions. The holdback heuristic now considers proposal age and
+  user signal correctly.
+- **Heartbeat cleanup not wired** (#281) --- subsystem heartbeats
+  weren't being aged out, leaving stale records in the dashboard.
+- **Surplus task double-enqueue** (#281) --- `active_by_type` check
+  now matches the dispatch loop's filter, so scheduled surplus jobs
+  don't double-enqueue.
+- **Outreach metric mislabels** (#289) --- corrected mislabeled
+  outreach counters in the dashboard.
+
+---
+
+## [v3.0b6] - 2026-05-09
+
+Memory retrieval gets faster graph traversal, explicit drift control,
+and better observability.
+
+### Added
+
+- **NetworkX graph engine** (#279) --- in-memory graph over 43K+ memory
+  links replaces recursive SQL queries. Enables centrality scoring and
+  shortest-path queries. Falls back to SQL if NetworkX is unavailable.
+- **DRIFT retrieval mode** (#279) --- `memory_recall` gains a `mode`
+  parameter: `"auto"` (default, unchanged behavior), `"standard"`
+  (no drift fallback), `"drift"` (direct 3-phase retrieval).
+- **Recall instrumentation** (#279) --- every `memory_recall` call now
+  logs which pipeline was used (standard, drift, auto→drift) for
+  retrieval quality analysis.
+
+### Fixed
+
+- **Knowledge re-ingestion creates duplicates** (#279) --- the
+  orchestrator now uses idempotent upsert with stale Qdrant cleanup
+  instead of raw insert. Re-ingesting a URL no longer creates orphaned
+  vectors.
+- **DB resilience** (#273) --- awareness tick survives transient SQLite
+  connection failures with automatic recovery and alert deduplication.
+
+### Changed
+
+- **Dashboard call site badges** (#278) --- parallelization indicator
+  shows which call sites run concurrently.
+- **Routing updates** (#274, #277) --- DeepSeek V4 Flash added, GLM 5.1
+  renamed, call site descriptions added to routing config.
+
+---
+
 ## [v3.0b5] - 2026-05-07
 
 Sentinel gets smarter, ego learns its boundaries, and a cascade of

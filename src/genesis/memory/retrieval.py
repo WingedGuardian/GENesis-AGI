@@ -19,6 +19,13 @@ from genesis.qdrant import collections as qdrant_ops
 
 logger = logging.getLogger(__name__)
 
+
+def _has_temporal_markers(query: str) -> bool:
+    """Quick check for temporal language in a query."""
+    from genesis.memory.temporal import has_temporal_markers
+    return has_temporal_markers(query)
+
+
 _SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
     "episodic": ["episodic_memory"],
     "knowledge": ["knowledge_base"],
@@ -115,6 +122,21 @@ class HybridRetriever:
         # 2b. Classify query intent (for RRF bias in step 7)
         intent = classify_intent(query)
 
+        # 2d. Event-calendar search (temporal queries)
+        event_memory_ids: list[str] = []
+        if intent.category == "WHEN" or _has_temporal_markers(query):
+            try:
+                from genesis.memory.temporal import parse_temporal_reference
+                time_range = parse_temporal_reference(query)
+                if time_range:
+                    from genesis.db.crud import memory_events
+                    event_memory_ids = await memory_events.get_memory_ids_in_range(
+                        self._db, time_range[0], time_range[1],
+                        limit=candidate_limit,
+                    )
+            except Exception:
+                logger.warning("Event-calendar search failed", exc_info=True)
+
         # 2c. Expand query via tag co-occurrence (opt-in, expensive index rebuild)
         fts_query = query
         if expand_query_terms:
@@ -145,7 +167,7 @@ class HybridRetriever:
                 fts_by_id[mid] = row
 
         # 4. Union of all candidate memory_ids
-        all_ids = set(qdrant_by_id) | set(fts_by_id)
+        all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
         if not all_ids:
             return []
 
@@ -222,6 +244,8 @@ class HybridRetriever:
             ranked_lists = [fts_ranked, activation_ranked]
         if intent_ranked:
             ranked_lists.append(intent_ranked)
+        if event_memory_ids:
+            ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
 
         # 8. Filter by min_activation

@@ -777,6 +777,39 @@ TABLES = {
             updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
+    # ── Intervention Journal ────────────────────────────────────────────────
+    "intervention_journal": """
+        CREATE TABLE IF NOT EXISTS intervention_journal (
+            id              TEXT PRIMARY KEY,
+            ego_source      TEXT NOT NULL,               -- 'user_ego_cycle' or 'genesis_ego_cycle'
+            proposal_id     TEXT,                        -- FK to ego_proposals.id
+            cycle_id        TEXT,                        -- FK to ego_cycles.id
+            action_type     TEXT NOT NULL,               -- from proposal.action_type
+            action_summary  TEXT NOT NULL,               -- from proposal.content (truncated)
+            expected_outcome TEXT NOT NULL DEFAULT '',   -- from proposal.rationale
+            actual_outcome  TEXT,                        -- filled on resolution
+            outcome_status  TEXT NOT NULL DEFAULT 'pending'
+                CHECK (outcome_status IN ('pending', 'approved', 'rejected',
+                       'executed', 'failed', 'tabled', 'withdrawn', 'expired')),
+            user_response   TEXT,                        -- user feedback on resolve
+            confidence      REAL DEFAULT 0.0,            -- from proposal.confidence
+            created_at      TEXT NOT NULL,
+            resolved_at     TEXT
+        )
+    """,
+    # ── Capability Map ─────────────────────────────────────────────────────
+    "capability_map": """
+        CREATE TABLE IF NOT EXISTS capability_map (
+            id              TEXT PRIMARY KEY,
+            domain          TEXT NOT NULL UNIQUE,         -- e.g. 'investigate', 'outreach'
+            confidence      REAL NOT NULL DEFAULT 0.0,    -- 0.0-1.0 composite score
+            sample_size     INTEGER NOT NULL DEFAULT 0,   -- data points aggregated
+            trend           TEXT DEFAULT 'stable'
+                CHECK (trend IN ('improving', 'stable', 'declining')),
+            evidence_summary TEXT,                        -- brief rationale
+            updated_at      TEXT NOT NULL
+        )
+    """,
     # ── Behavioral Immune System (BIS) ───────────────────────────────────────
     # GROUNDWORK(bis): Tables for graduated behavioral correction.
     # See docs/plans/2026-03-27-behavioral-immune-system-design.md
@@ -949,6 +982,21 @@ TABLES = {
                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """,
+    "memory_events": """
+        CREATE TABLE IF NOT EXISTS memory_events (
+            id                TEXT PRIMARY KEY,
+            memory_id         TEXT NOT NULL,
+            subject           TEXT NOT NULL,
+            verb              TEXT NOT NULL,
+            object            TEXT,
+            event_date        TEXT,
+            event_date_end    TEXT,
+            confidence        REAL NOT NULL DEFAULT 0.5,
+            source_session_id TEXT,
+            created_at        TEXT NOT NULL
+                              DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1007,6 +1055,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_observations_person ON observations(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_observations_content_hash ON observations(source, content_hash)",
     "CREATE INDEX IF NOT EXISTS idx_observations_type_source_created ON observations(type, source, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_observations_surfaced ON observations(surfaced_at)",
     "CREATE INDEX IF NOT EXISTS idx_outreach_person ON outreach_history(person_id)",
     "CREATE INDEX IF NOT EXISTS idx_autonomy_person ON autonomy_state(person_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_autonomy_category ON autonomy_state(category)",
@@ -1103,6 +1152,13 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
+    # intervention journal
+    "CREATE INDEX IF NOT EXISTS idx_intervention_journal_status ON intervention_journal(outcome_status)",
+    "CREATE INDEX IF NOT EXISTS idx_intervention_journal_proposal ON intervention_journal(proposal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_intervention_journal_created ON intervention_journal(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_intervention_journal_source ON intervention_journal(ego_source)",
+    # capability map
+    "CREATE INDEX IF NOT EXISTS idx_capability_map_confidence ON capability_map(confidence DESC)",
     # behavioral immune system (BIS)
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_theme ON behavioral_corrections(theme_id)",
     "CREATE INDEX IF NOT EXISTS idx_bis_corrections_created ON behavioral_corrections(created_at)",
@@ -1138,6 +1194,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_eval_events_session ON eval_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period ON eval_snapshots(dimension, period_end)",
+    # SVO event calendar
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_date ON memory_events(event_date)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_subject ON memory_events(subject)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_events_verb ON memory_events(verb)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

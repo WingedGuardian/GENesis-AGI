@@ -138,6 +138,7 @@ async def upsert(
     source_pipeline: str | None = None,
     purpose: str | None = None,
     ingestion_source: str | None = None,
+    _commit: bool = True,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
 
@@ -223,7 +224,8 @@ async def upsert(
         (actual_id, concept, body, tags or "", domain, project_type),
     )
 
-    await db.commit()
+    if _commit:
+        await db.commit()
     return actual_id, inserted
 
 

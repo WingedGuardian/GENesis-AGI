@@ -61,13 +61,6 @@ But what I can tell you is this: Genesis is far closer to AGI than anything else
 
 ---
 
-Day 1 — a strong generalist with full cognitive infrastructure.
-Day 30 — a personalized specialist in every domain you've touched.
-Day 90 — anticipating needs you haven't articulated yet.
-Day 180 — evolving its own architecture to serve you better.
-
----
-
 ## Genesis in 30 seconds
 
 Personal AI does what you tell it. Personal AGI does what you *need*.
@@ -89,6 +82,11 @@ With personal AI, you are the intelligence directing the tool. With personal AGI
 - **Closed-loop learning** — outcome classification, causal attribution, procedure extraction. Laplace-smoothed confidence, not vibes.
 - **Background cognition** — thinks, researches, audits, and communicates on free-tier compute while you sleep.
 - **Earned autonomy** — trust granted per action category through demonstrated competence. The system gets measurably better at its job, and it can show you the receipts.
+
+Day 1 — a strong generalist with full cognitive infrastructure.
+Day 30 — a personalized specialist in every domain you've touched.
+Day 90 — anticipating needs you haven't articulated yet.
+Day 180 — evolving its own architecture to serve you better.
 
 [**Get started →**](#getting-started)
 

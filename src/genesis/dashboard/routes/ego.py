@@ -219,6 +219,18 @@ async def ego_proposal_resolve(proposal_id: str):
     if not updated:
         return jsonify({"ok": False, "error": "proposal not found or not pending"}), 404
 
+    try:
+        from genesis.db.crud import intervention_journal as journal_crud
+        await journal_crud.resolve(
+            rt._db, proposal_id,
+            outcome_status=status,
+            actual_outcome=f"Dashboard: user {status}",
+            user_response=user_response or None,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Journal resolve failed for %s", proposal_id)
+
     return jsonify({"ok": True, "id": proposal_id, "status": status})
 
 

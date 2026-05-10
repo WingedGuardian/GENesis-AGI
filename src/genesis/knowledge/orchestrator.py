@@ -250,7 +250,15 @@ class KnowledgeOrchestrator:
 
         try:
             for unit in units:
-                unit_id = str(uuid.uuid4())
+                # Check for existing unit (idempotent re-ingestion)
+                existing = await memory_mod.knowledge.find_by_unique_key(
+                    memory_mod._db,
+                    project_type=project_type,
+                    domain=unit.domain,
+                    concept=unit.concept,
+                )
+                unit_id = existing["id"] if existing else str(uuid.uuid4())
+                old_qdrant_id = existing.get("qdrant_id") if existing else None
 
                 # Store to Qdrant via MemoryStore (non-transactional, immediate)
                 qdrant_id = await memory_mod._store.store(
@@ -265,8 +273,22 @@ class KnowledgeOrchestrator:
                 )
                 qdrant_ids.append(qdrant_id)
 
-                # Store to SQLite via CRUD (_commit=False for batch transaction)
-                await memory_mod.knowledge.insert(
+                # Clean up stale Qdrant point if re-ingesting
+                if old_qdrant_id and old_qdrant_id != qdrant_id:
+                    try:
+                        delete_point(
+                            memory_mod._store._qdrant,
+                            collection="knowledge_base",
+                            point_id=old_qdrant_id,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "Failed to clean up stale Qdrant point %s",
+                            old_qdrant_id,
+                        )
+
+                # Upsert to SQLite (_commit=False for batch transaction)
+                actual_id, _inserted = await memory_mod.knowledge.upsert(
                     memory_mod._db,
                     id=unit_id,
                     project_type=project_type,
@@ -289,7 +311,7 @@ class KnowledgeOrchestrator:
                     _commit=False,
                 )
 
-                unit_ids.append(unit_id)
+                unit_ids.append(actual_id)
 
             # Single commit for all units in the batch
             await memory_mod._db.commit()
