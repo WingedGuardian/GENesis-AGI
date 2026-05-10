@@ -305,11 +305,11 @@ echo
 echo "--- Installing code intelligence tools ---"
 
 # codebase-memory-mcp (code graph — 66 languages)
-if ! command -v codebase-memory-mcp &>/dev/null; then
-    echo "  codebase-memory-mcp not found — installing..."
-    curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui \
-        || echo "  WARNING: codebase-memory-mcp install failed (non-critical)"
-fi
+# Always re-runs the upstream installer: it is idempotent and pulls the latest
+# release, so existing installs are upgraded in place.
+echo "  codebase-memory-mcp: installing/upgrading..."
+curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui \
+    || echo "  WARNING: codebase-memory-mcp install/upgrade failed (non-critical)"
 if command -v codebase-memory-mcp &>/dev/null; then
     echo "  codebase-memory-mcp: $(codebase-memory-mcp --version 2>/dev/null || echo 'installed')"
 fi
@@ -332,9 +332,14 @@ if ! command -v uv &>/dev/null; then
         || echo "  WARNING: uv install failed (non-critical)"
     export PATH="$HOME/.local/bin:$PATH"
 fi
-if command -v uv &>/dev/null && ! command -v serena &>/dev/null; then
-    echo "  Serena not found — installing..."
-    uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+if command -v uv &>/dev/null; then
+    if ! command -v serena &>/dev/null; then
+        echo "  Serena not found — installing..."
+        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+    else
+        echo "  Serena: upgrading..."
+        uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"
+    fi
 fi
 if command -v serena &>/dev/null; then
     echo "  Serena: $(serena --version 2>/dev/null || echo 'installed')"
