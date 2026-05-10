@@ -361,3 +361,39 @@ async def test_proposal_list_pending(db):
     pending = await evolution_proposals.list_pending(db)
     assert len(pending) == 1
     assert pending[0]["proposal_type"] == "a"
+
+
+async def test_proposal_list_pending_filters(db):
+    """`since` and `proposal_type` filters narrow the pending list."""
+    pid_a = await evolution_proposals.create(
+        db, proposal_type="alpha", current_content="x",
+        proposed_change="y", rationale="z",
+    )
+    pid_b = await evolution_proposals.create(
+        db, proposal_type="beta", current_content="x",
+        proposed_change="y", rationale="z",
+    )
+
+    # proposal_type filter
+    alphas = await evolution_proposals.list_pending(db, proposal_type="alpha")
+    assert len(alphas) == 1
+    assert alphas[0]["id"] == pid_a
+
+    betas = await evolution_proposals.list_pending(db, proposal_type="beta")
+    assert len(betas) == 1
+    assert betas[0]["id"] == pid_b
+
+    # since filter — far-future timestamp filters everything out
+    none = await evolution_proposals.list_pending(db, since="9999-01-01T00:00:00+00:00")
+    assert none == []
+
+    # since filter — far-past returns all pending
+    all_pending = await evolution_proposals.list_pending(db, since="1970-01-01T00:00:00+00:00")
+    assert len(all_pending) == 2
+
+    # combined filters
+    only_alpha = await evolution_proposals.list_pending(
+        db, since="1970-01-01T00:00:00+00:00", proposal_type="alpha",
+    )
+    assert len(only_alpha) == 1
+    assert only_alpha[0]["id"] == pid_a

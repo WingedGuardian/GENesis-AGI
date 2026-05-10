@@ -63,14 +63,26 @@ async def list_pending(
     db: aiosqlite.Connection,
     *,
     limit: int = 10,
+    since: str | None = None,
+    proposal_type: str | None = None,
 ) -> list[dict]:
-    """List pending proposals, newest first."""
-    cursor = await db.execute(
-        """SELECT * FROM evolution_proposals
-           WHERE status = 'pending'
-           ORDER BY created_at DESC LIMIT ?""",
-        (limit,),
-    )
+    """List pending proposals, newest first.
+
+    Optional filters (both backward-compatible — None = no filter):
+    - ``since``: ISO-8601 timestamp; only proposals created at or after.
+    - ``proposal_type``: restrict to a single proposal_type value.
+    """
+    sql = "SELECT * FROM evolution_proposals WHERE status = 'pending'"
+    params: list = []
+    if since is not None:
+        sql += " AND created_at >= ?"
+        params.append(since)
+    if proposal_type is not None:
+        sql += " AND proposal_type = ?"
+        params.append(proposal_type)
+    sql += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cursor = await db.execute(sql, params)
     rows = await cursor.fetchall()
     columns = [desc[0] for desc in cursor.description]
     return [dict(zip(columns, row, strict=False)) for row in rows]
