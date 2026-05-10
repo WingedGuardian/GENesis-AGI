@@ -18,14 +18,29 @@ from __future__ import annotations
 from genesis.eval.rubrics import Rubric, register_rubric
 
 _PROMPT = """\
-You are grading whether a recalled memory grounds the answer to a query.
+You are grading the *topical relevance* of a recalled memory to a query.
+You are NOT grading the memory's truthfulness, its overall quality, its
+freshness, or whether it should exist — only whether it is topically
+related enough to the query that a downstream consumer (a human or
+another LLM) COULD draw on it while responding.
 
-A memory grounds an answer when it provides on-topic, useful information
-that a downstream consumer could weave into their response — facts,
-context, relevant background, prior decisions. A memory does NOT ground
-an answer when it is off-topic, redundant with what the query already
-states, generic boilerplate, or merely shares keywords without
-substantive overlap.
+Three rules, applied in order:
+
+1. **Topic overlap is the bar, not keyword overlap.** A memory that
+   shares the query's topic counts as relevant even if the wording
+   differs. A memory that shares only surface keywords (same noun, same
+   tool name) without addressing the query's actual subject is NOT
+   relevant.
+
+2. **You do not assess truth.** If the memory makes a claim that is
+   wrong, biased, outdated, or self-contradictory, that does NOT make
+   it irrelevant. A wrong-but-on-topic memory still scores as relevant.
+   Memory hygiene is a separate concern handled elsewhere.
+
+3. **Procedural / investigation / decision memories count as relevant**
+   if they record activity or reasoning about the query's topic. They
+   do not need to *answer* the query to be relevant; they need to
+   provide on-topic context.
 
 Query the user asked:
 {query}
@@ -33,12 +48,13 @@ Query the user asked:
 Memory that was recalled:
 {actual}
 
-User's hand-graded label (for reference only — your job is to judge the
-memory against the query, not to agree with the label):
+Reference label (FYI only — describes the memory's recall position and
+collection; do not let this bias your judgment):
 {expected}
 
-Score the memory's grounding from 0.0 (irrelevant / unhelpful) to 1.0
-(directly grounds the answer). Brief rationale required.
+Score the topical relevance from 0.0 (off-topic / unrelated) through
+0.5 (tangential but on-topic) to 1.0 (directly on-topic, clearly
+related). Brief rationale required.
 
 Respond with ONLY a JSON object, no markdown fences, no prose:
 {{"score": <float 0.0-1.0>, "rationale": "<one sentence>"}}"""
@@ -46,10 +62,13 @@ Respond with ONLY a JSON object, no markdown fences, no prose:
 
 MEMORY_RECALL_GROUNDING = Rubric(
     name="memory_recall_grounding",
-    version="1.0.0",
+    version="1.1.0",
     description=(
-        "Grades whether a recalled memory grounds the answer to a query. "
-        "Foundation rubric for Phase 2 CRAG borderline grading."
+        "Grades topical relevance of a recalled memory to a query. "
+        "Foundation rubric for Phase 2 CRAG borderline grading. "
+        "v1.1.0: tightened to relevance-only after 1.0.0 calibration "
+        "exposed user grading on truth+usefulness while the rubric only "
+        "asked about relevance."
     ),
     prompt_template=_PROMPT,
     pass_threshold=0.6,
