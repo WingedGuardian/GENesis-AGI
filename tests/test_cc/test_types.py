@@ -21,6 +21,14 @@ def test_enums_have_expected_values():
     assert MessageType.QUESTION == "question"
     assert CCModel.OPUS == "opus"
     assert EffortLevel.HIGH == "high"
+    assert EffortLevel.XHIGH == "xhigh"
+    assert EffortLevel.MAX == "max"
+
+
+def test_effort_level_xhigh_constructible_from_string():
+    """Round-trip: 'xhigh' string -> enum -> 'xhigh' string."""
+    assert EffortLevel("xhigh") is EffortLevel.XHIGH
+    assert str(EffortLevel.XHIGH) == "xhigh"
 
 
 def test_cc_invocation_defaults():

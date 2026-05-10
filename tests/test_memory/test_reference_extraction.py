@@ -378,3 +378,27 @@ async def test_ingest_never_raises(db_with_schema):
         "SELECT COUNT(*) FROM knowledge_units WHERE project_type = 'reference'"
     )
     assert (await cursor.fetchone())[0] == 0
+
+
+# ─── Reference routing: episodic_memory ──────────────────────────────────────
+
+
+async def test_ingest_reference_routes_to_episodic(db_with_schema, mock_store):
+    """Reference entries are stored in episodic_memory, not knowledge_base."""
+    ext = Extraction(
+        content="ACME_API_KEY=gsk_abc123defghijklmnopqrstuvwxyz1234567890 for production",
+        extraction_type="entity",
+        confidence=0.9,
+        entities=["Acme"],
+    )
+    unit_id = await ingest_reference_from_extraction(
+        ext, store=mock_store, db=db_with_schema,
+        source_session_id="test-routing",
+    )
+    assert unit_id is not None
+
+    # Verify store.store was called with episodic routing
+    mock_store.store.assert_called_once()
+    call_kwargs = mock_store.store.call_args
+    assert call_kwargs[1]["collection"] == "episodic_memory"
+    assert call_kwargs[1]["memory_type"] == "episodic"

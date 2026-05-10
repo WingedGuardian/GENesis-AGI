@@ -27,7 +27,7 @@ async def cmd_start(ctx: HandlerContext, update: Update, context: ContextTypes.D
         "/stop — stop current generation\n"
         "/status — show current session info\n"
         "/model sonnet|opus|haiku — switch model\n"
-        "/effort low|medium|high — change thinking effort\n"
+        "/effort low|medium|high|xhigh|max — change thinking effort\n"
         "/pause [on|off] — pause/resume all background activity\n"
         f"{tts_line}"
     )
@@ -115,7 +115,7 @@ async def cmd_effort(ctx: HandlerContext, update: Update, context: ContextTypes.
         return
 
     if not context.args:
-        await update.message.reply_text("Usage: /effort low|medium|high|max")
+        await update.message.reply_text("Usage: /effort low|medium|high|xhigh|max")
         return
 
     effort_str = context.args[0].lower().strip()
@@ -123,11 +123,12 @@ async def cmd_effort(ctx: HandlerContext, update: Update, context: ContextTypes.
         "low": EffortLevel.LOW,
         "medium": EffortLevel.MEDIUM,
         "high": EffortLevel.HIGH,
+        "xhigh": EffortLevel.XHIGH,
         "max": EffortLevel.MAX,
     }
     if effort_str not in effort_map:
         await update.message.reply_text(
-            f"Unknown effort '{effort_str}'. Use: low, medium, high, max"
+            f"Unknown effort '{effort_str}'. Use: low, medium, high, xhigh, max"
         )
         return
 

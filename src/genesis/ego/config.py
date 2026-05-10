@@ -122,7 +122,7 @@ def validate_ego_config(changes: dict) -> list[str]:
         v = changes["morning_report_minute"]
         if not isinstance(v, int) or not (0 <= v <= 59):
             errors.append("morning_report_minute must be 0-59")
-    _VALID_EFFORTS = {"low", "medium", "high", "max"}
+    _VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
     if "default_effort" in changes and changes["default_effort"] not in _VALID_EFFORTS:
         errors.append(f"default_effort must be one of {_VALID_EFFORTS}")
     if "morning_report_effort" in changes and changes["morning_report_effort"] not in _VALID_EFFORTS:

@@ -496,6 +496,8 @@ async def ingest_reference_from_extraction(
             concept=identifier,
             tags_json=tags_json,
             force_fts5_only=force_fts5_only,
+            collection="episodic_memory",
+            memory_type="episodic",
         )
     except Exception:
         logger.warning(
