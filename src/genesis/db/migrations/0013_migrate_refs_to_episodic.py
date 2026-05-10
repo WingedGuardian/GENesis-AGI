@@ -45,5 +45,3 @@ async def up(db: aiosqlite.Connection) -> None:
           )
         """
     )
-
-    await db.commit()
