@@ -108,6 +108,7 @@ class PipelineOrchestrator:
                         tags=signal.tags + [f"tier:{signal.tier.name}", f"profile:{profile.name}"],
                         confidence=signal.relevance_score * 0.7,
                         source_pipeline="recon",
+                        source_subsystem="triage",
                     )
                 except Exception:
                     logger.warning("Failed to store signal %s", signal.id, exc_info=True)

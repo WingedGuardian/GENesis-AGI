@@ -77,11 +77,23 @@ def search(
     source_type: str | None = None,
     wing: str | None = None,
     room: str | None = None,
+    exclude_subsystems: list[str] | None = None,
+    include_only_subsystems: list[str] | None = None,
 ) -> list[dict]:
-    """Search by vector similarity with optional payload filters."""
+    """Search by vector similarity with optional payload filters.
+
+    ``exclude_subsystems`` and ``include_only_subsystems`` operate on
+    the ``source_subsystem`` payload key. Excludes use ``must_not`` —
+    points missing the key (legacy data without the tag) are preserved.
+    Includes use ``must`` — only points whose key matches are returned.
+    """
     conditions: list = []
-    if source_type or wing or room:
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
+    must_not_conditions: list = []
+    if (
+        source_type or wing or room
+        or exclude_subsystems or include_only_subsystems
+    ):
+        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
         if source_type:
             conditions.append(
@@ -95,7 +107,28 @@ def search(
             conditions.append(
                 FieldCondition(key="room", match=MatchValue(value=room))
             )
-    query_filter = Filter(must=conditions) if conditions else None
+        if include_only_subsystems:
+            conditions.append(
+                FieldCondition(
+                    key="source_subsystem",
+                    match=MatchAny(any=list(include_only_subsystems)),
+                )
+            )
+        if exclude_subsystems:
+            must_not_conditions.append(
+                FieldCondition(
+                    key="source_subsystem",
+                    match=MatchAny(any=list(exclude_subsystems)),
+                )
+            )
+    query_filter = None
+    if conditions or must_not_conditions:
+        from qdrant_client.models import Filter
+
+        query_filter = Filter(
+            must=conditions or None,
+            must_not=must_not_conditions or None,
+        )
     results = client.query_points(
         collection_name=collection,
         query=query_vector,

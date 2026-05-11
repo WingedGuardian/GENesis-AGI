@@ -88,6 +88,7 @@ class MemoryStore:
         room: str | None = None,
         force_fts5_only: bool = False,
         valid_at: str | None = None,
+        source_subsystem: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -184,6 +185,8 @@ class MemoryStore:
                         payload["extraction_timestamp"] = extraction_timestamp
                     if source_pipeline:
                         payload["source_pipeline"] = source_pipeline
+                    if source_subsystem:
+                        payload["source_subsystem"] = source_subsystem
 
                     upsert_point(
                         self._qdrant,
@@ -235,6 +238,7 @@ class MemoryStore:
             wing=wing,
             room=room,
             valid_at=valid_at,
+            source_subsystem=source_subsystem,
         )
 
         if not embedding_ok:
@@ -259,6 +263,7 @@ class MemoryStore:
                 ),
                 extraction_timestamp=extraction_timestamp,
                 source_pipeline=source_pipeline,
+                source_subsystem=source_subsystem,
             )
             if self._event_bus:
                 await self._event_bus.emit(

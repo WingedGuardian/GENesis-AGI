@@ -453,3 +453,103 @@ async def test_recall_general_intent_no_bias(mock_qdrant, mock_crud, mock_links,
     assert len(results) > 0
     assert results[0].query_intent == "GENERAL"
     assert results[0].intent_confidence == 0.0
+
+
+# --- Subsystem filter threading (Phase 1.5b) ---
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_default_excludes_subsystems(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """Default recall must pass exclude=[ego,triage,reflection] to both stores."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("what is x", limit=5)
+
+    q_kwargs = mock_qdrant.search.call_args.kwargs
+    assert q_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection"]
+    assert q_kwargs["include_only_subsystems"] is None
+    f_kwargs = mock_crud.search_ranked.call_args.kwargs
+    assert f_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection"]
+    assert f_kwargs["include_only_subsystems"] is None
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_include_subsystem_true_no_filter(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("what is x", limit=5, include_subsystem=True)
+
+    q_kwargs = mock_qdrant.search.call_args.kwargs
+    assert q_kwargs["exclude_subsystems"] is None
+    assert q_kwargs["include_only_subsystems"] is None
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_include_subsystem_list_keeps_ego(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """include_subsystem=['ego'] should still exclude triage+reflection."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("x", limit=5, include_subsystem=["ego"])
+
+    q_kwargs = mock_qdrant.search.call_args.kwargs
+    assert q_kwargs["exclude_subsystems"] == ["triage", "reflection"]
+    assert q_kwargs["include_only_subsystems"] is None
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_recall_only_subsystem_inverts_filter(
+    mock_qdrant, mock_crud, mock_links, _,
+):
+    """only_subsystem='ego' should produce include_only=['ego']."""
+    retriever, _, _, _ = _build_retriever()
+    mock_qdrant.search.return_value = []
+    mock_crud.search_ranked = AsyncMock(return_value=[])
+    mock_links.count_links = AsyncMock(return_value=0)
+
+    await retriever.recall("x", limit=5, only_subsystem="ego")
+
+    q_kwargs = mock_qdrant.search.call_args.kwargs
+    assert q_kwargs["exclude_subsystems"] is None
+    assert q_kwargs["include_only_subsystems"] == ["ego"]
+
+
+@pytest.mark.asyncio
+async def test_recall_mutually_exclusive_params() -> None:
+    """Passing both include_subsystem and only_subsystem must raise."""
+    retriever, _, _, _ = _build_retriever()
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        await retriever.recall(
+            "x", limit=5,
+            include_subsystem=["ego"], only_subsystem="triage",
+        )

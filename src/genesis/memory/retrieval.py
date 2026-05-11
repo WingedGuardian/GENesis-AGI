@@ -32,6 +32,78 @@ _SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
     "both": ["episodic_memory", "knowledge_base"],
 }
 
+# Subsystems that tag their own memory writes via ``source_subsystem``.
+# Foreground recall excludes these by default so automated decisional
+# content (ego corrections, triage signals, reflection observations)
+# doesn't pollute user-facing answers. Surplus is intentionally absent —
+# its direct-session profile blocks memory writes entirely.
+_KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection")
+
+
+def _resolve_subsystem_filter(
+    include_subsystem: bool | list[str],
+    only_subsystem: str | list[str] | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Translate the public two-param API into filter primitives.
+
+    Returns ``(exclude_subsystems, include_only_subsystems)``:
+
+    - ``exclude_subsystems`` — drop rows whose ``source_subsystem``
+      matches; NULL (user-sourced) always passes.
+    - ``include_only_subsystems`` — keep ONLY rows whose
+      ``source_subsystem`` matches; NULL is excluded.
+
+    The two primitives are mutually exclusive. ``include_subsystem``
+    and ``only_subsystem`` are themselves mutually exclusive — raises
+    ``ValueError`` if both are non-default.
+
+    Empty containers (e.g. ``only_subsystem=[]``) raise ``ValueError``
+    rather than silently disabling the filter. The intended "no
+    subsystem opt-ins" is the default ``include_subsystem=False``.
+
+    Resolution table:
+        include_subsystem=False (default) → exclude all known subsystems
+        include_subsystem=True            → no filter
+        include_subsystem=["ego"]         → user content + ego
+        only_subsystem="ego"              → ego writes only
+    """
+    if only_subsystem is not None and include_subsystem is not False:
+        msg = (
+            "include_subsystem and only_subsystem are mutually exclusive; "
+            "pass at most one"
+        )
+        raise ValueError(msg)
+
+    if only_subsystem is not None:
+        if isinstance(only_subsystem, str):
+            if not only_subsystem:
+                msg = "only_subsystem must be a non-empty string or list"
+                raise ValueError(msg)
+            names = [only_subsystem]
+        else:
+            names = list(only_subsystem)
+            if not names:
+                msg = "only_subsystem must be a non-empty string or list"
+                raise ValueError(msg)
+        return (None, names)
+
+    if include_subsystem is True:
+        return (None, None)
+
+    if include_subsystem is False:
+        return (list(_KNOWN_SUBSYSTEMS), None)
+
+    # list form — include_subsystem=["ego"] means user content + ego
+    if not include_subsystem:
+        msg = (
+            "include_subsystem list must be non-empty; "
+            "pass False (default) to exclude all subsystems"
+        )
+        raise ValueError(msg)
+    keep = set(include_subsystem)
+    exclude = [s for s in _KNOWN_SUBSYSTEMS if s not in keep]
+    return (exclude, None)
+
 
 def _rrf_fuse(
     ranked_lists: list[list[str]],
@@ -70,6 +142,8 @@ class HybridRetriever:
         expand_query_terms: bool = True,
         wing: str | None = None,
         room: str | None = None,
+        include_subsystem: bool | list[str] = False,
+        only_subsystem: str | list[str] | None = None,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -84,8 +158,25 @@ class HybridRetriever:
 
             Callers that want to force ``both`` regardless of intent
             should pass ``source='both'`` explicitly.
+
+        Subsystem filtering (mutually exclusive):
+            - ``include_subsystem=False`` (default): exclude all
+              automated-subsystem writes (ego/triage/reflection) —
+              user-facing queries see user content only.
+            - ``include_subsystem=True``: no filter — return everything.
+            - ``include_subsystem=["ego"]``: user content + named
+              subsystems (additive mode).
+            - ``only_subsystem="ego"``: return ONLY rows from the named
+              subsystem(s) — user content excluded. Used by ego's own
+              self-recall path.
         """
         _t0 = time.monotonic()
+
+        # Resolve subsystem-filter API → primitives shared with drift_recall
+        # and the underlying Qdrant + FTS5 calls.
+        exclude_subsystems, include_only_subsystems = _resolve_subsystem_filter(
+            include_subsystem, only_subsystem,
+        )
 
         # Classify intent up-front — used for both source-selection
         # (when source is None) and RRF bias (always, downstream).
@@ -127,6 +218,8 @@ class HybridRetriever:
                         limit=candidate_limit,
                         wing=wing,
                         room=room,
+                        exclude_subsystems=exclude_subsystems,
+                        include_only_subsystems=include_only_subsystems,
                     )
                 for hit in hits:
                     hit["_collection"] = coll
@@ -181,6 +274,8 @@ class HybridRetriever:
             collection=fts_collection,
             limit=candidate_limit,
             boolean=fts_is_boolean,
+            exclude_subsystems=exclude_subsystems,
+            include_only_subsystems=include_only_subsystems,
         )
 
         fts_by_id: dict[str, dict] = {}

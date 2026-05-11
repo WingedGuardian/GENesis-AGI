@@ -23,6 +23,22 @@ _SKIP_EMBED_TYPES: frozenset[str] = frozenset({
     "version_current",       # written via raw SQL in cc_version.py; listed for completeness
 })
 
+# Map ObservationWriter `source` values to a subsystem tag. Subsystem-only:
+# user-sourced sources (user_reply, direct_message, auto_memory_harvest,
+# cc_debrief) intentionally absent so they keep source_subsystem=NULL and
+# remain in foreground recall by default. Unknown sources also stay NULL —
+# new sources must be explicitly classified before being filtered.
+_SUBSYSTEM_FROM_SOURCE: dict[str, str] = {
+    "stability_monitor":   "reflection",
+    "deep_reflection":     "reflection",
+    "light_reflection":    "reflection",
+    "micro_reflection":    "reflection",
+    "quality_calibration": "reflection",
+    "weekly_assessment":   "reflection",
+    "surplus_promotion":   "reflection",
+    "retrospective":       "reflection",
+}
+
 if TYPE_CHECKING:
     import aiosqlite
 
@@ -38,6 +54,7 @@ class _MemoryStore(Protocol):
         confidence: float = ...,
         auto_link: bool = ...,
         source_pipeline: str | None = ...,
+        source_subsystem: str | None = ...,
     ) -> str: ...
 
 
@@ -115,6 +132,7 @@ class ObservationWriter:
             return obs_id
 
         if self._memory_store is not None and type not in _SKIP_EMBED_TYPES:
+            subsystem = _SUBSYSTEM_FROM_SOURCE.get(source)
             try:
                 await self._memory_store.store(
                     content,
@@ -123,6 +141,7 @@ class ObservationWriter:
                     tags=[type, f"obs:{obs_id}"],
                     confidence=0.6,
                     source_pipeline=source,
+                    source_subsystem=subsystem,
                 )
             except Exception:
                 logger.warning("memory store write failed for observation %s", obs_id, exc_info=True)

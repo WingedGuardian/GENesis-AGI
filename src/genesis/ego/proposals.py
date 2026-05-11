@@ -339,6 +339,7 @@ class ProposalWorkflow:
                 tags=tags,
                 wing="autonomy",
                 room="ego_corrections",
+                source_subsystem="ego",
             )
             logger.info(
                 "Stored ego correction for rejected proposal %s",

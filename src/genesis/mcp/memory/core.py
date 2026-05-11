@@ -52,6 +52,8 @@ async def memory_recall(
     expand_query_terms: bool = True,
     mode: str = "auto",
     time_range: str | None = None,
+    include_subsystem: bool | list[str] = False,
+    only_subsystem: str | list[str] | None = None,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -78,6 +80,14 @@ async def memory_recall(
             Queries the SVO event calendar and boosts temporally matching
             memories in RRF fusion. Automatic temporal detection also runs
             on queries with temporal language (e.g., "what happened last week").
+        include_subsystem: Subsystem-filter additive mode. ``False`` (default)
+            excludes automated-subsystem writes (ego corrections, triage
+            signals, reflection observations). ``True`` returns everything.
+            A list (e.g. ``["ego"]``) augments user content with the named
+            subsystems. Mutually exclusive with ``only_subsystem``.
+        only_subsystem: Subsystem-filter replace mode. Return ONLY rows
+            tagged with the named subsystem(s); user content excluded.
+            Used by ego's own self-recall path.
     """
     import time as _time
 
@@ -124,12 +134,16 @@ async def memory_recall(
             source=source,
             limit=limit,
             min_activation=min_activation,
+            include_subsystem=include_subsystem,
+            only_subsystem=only_subsystem,
         )
         _increment_retrieved(memory_mod._qdrant, results)
     else:
         results = await memory_mod._retriever.recall(
             query, source=source, limit=limit, min_activation=min_activation,
             wing=wing, room=room, expand_query_terms=expand_query_terms,
+            include_subsystem=include_subsystem,
+            only_subsystem=only_subsystem,
         )
         pipeline_used = "standard"
 
@@ -153,6 +167,8 @@ async def memory_recall(
                     source=source,
                     limit=limit,
                     min_activation=min_activation,
+                    include_subsystem=include_subsystem,
+                    only_subsystem=only_subsystem,
                 )
                 if len(drift_results) > len(results):
                     logger.info(
