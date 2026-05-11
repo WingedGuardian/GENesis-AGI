@@ -26,7 +26,7 @@ def test_first_party_rubrics_are_registered():
     """Importing the package auto-registers built-in rubrics."""
     rubric = get_rubric("memory_recall_grounding")
     assert rubric.name == "memory_recall_grounding"
-    assert rubric.version == "1.0.0"
+    assert rubric.version == "1.1.0"
     assert "{actual}" in rubric.prompt_template
     assert "{query}" in rubric.prompt_template
     assert "query" in rubric.extra_placeholders
