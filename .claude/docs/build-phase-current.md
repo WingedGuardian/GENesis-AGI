@@ -11,7 +11,7 @@
 - **Config**: YAML loader (`config/outreach.yaml`) with quiet hours, channel prefs, thresholds, rate limits, morning report timing, engagement timeout
 - **GovernanceGate**: Deterministic (no LLM) pre-send checks — salience threshold, quiet hours, dedup (24h), daily rate limit, surplus quota. Blockers/alerts bypass all checks. Morning reports only check dedup.
 - **OutreachPipeline**: governance → fresh-eyes (surplus only) → draft → format → deliver → record. Failed deliveries deferred to DeferredWorkQueue.
-- **FreshEyesReview**: Cross-model validation for surplus outreach (call site 23_fresh_eyes_review). Score 1-5, approved if >= 3.0.
+- **FreshEyesReview**: Cross-model validation for surplus outreach (call site `23_outreach_review`, renamed from `23_fresh_eyes_review` 2026-05-10). Score 1-5, approved if >= 3.0.
 - **MorningReportGenerator**: Assembles HealthDataService snapshot + cognitive state + pending items + engagement summary, drafts via ContentDrafter.
 - **EngagementTracker**: Timeout detection (marks as 'ignored' after N hours), reply recording via delivery_id lookup.
 - **OutreachScheduler**: APScheduler with 4 jobs — morning report (daily at configured time), surplus outreach (daily 10:00), engagement poll (hourly), calibration reconciliation (daily).

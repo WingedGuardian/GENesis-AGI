@@ -55,6 +55,16 @@ async def up(db: aiosqlite.Connection) -> None:
         if not await cursor.fetchone():
             continue
         for old_id, new_id in _RENAMES:
+            # `call_site_last_run` uses call_site_id as PRIMARY KEY. If a row
+            # already exists for the new ID (e.g., partial rename retry, or a
+            # call_site_id collision from manual DB editing), a naive UPDATE
+            # would fail with a PK conflict. Delete the old row in that case
+            # -- the new-ID row is the authoritative one going forward.
+            await db.execute(
+                f"DELETE FROM {table} WHERE call_site_id = ?"
+                f"  AND EXISTS (SELECT 1 FROM {table} WHERE call_site_id = ?)",
+                (old_id, new_id),
+            )
             await db.execute(
                 f"UPDATE {table} SET call_site_id = ? WHERE call_site_id = ?",
                 (new_id, old_id),

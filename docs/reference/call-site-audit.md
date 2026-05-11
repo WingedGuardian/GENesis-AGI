@@ -128,7 +128,7 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
 | `10_cognitive_state` | LLM regeneration of cognitive state narrative | **Keep for V4** — note: cognitive state is *actively* maintained today via direct DB writes (`awareness/loop.py`, `cc/reflection_bridge*.py`); this YAML entry reserves the chain for the future LLM-summary feature, not the live mechanism |
-| `17_executor_review` | Executor cross-vendor review (Gate 2, paid) | **Active** — distinct from 23_fresh_eyes (outreach, free) |
+| `17_executor_review` | Executor cross-vendor review (Gate 2, paid) | **Active** — distinct from `23_outreach_review` (outreach pre-send, free) |
 | `18_meta_prompting` | Pre-reflection prompt engineering | **Keep** for V4 adaptive prompting |
 | `22_tagging` | Entity extraction / metadata tagging | **Keep** for V4 knowledge graph |
 | `28_observation_sweep` | Environment change scanning | **Functionally replaced by awareness loop** signal collection (`awareness/loop.py:perform_tick`). Kept in YAML with comment; can remove on next sweep. |

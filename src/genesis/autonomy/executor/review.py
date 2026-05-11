@@ -565,16 +565,16 @@ class TaskReviewer:
         deliverable: str,
         requirements: str,
     ) -> str:
-        is_fresh = call_site == _CALL_SITE_EXECUTOR_REVIEW
+        is_executor_review = call_site == _CALL_SITE_EXECUTOR_REVIEW
         role = (
             "an independent reviewer"
-            if is_fresh
+            if is_executor_review
             else "an adversarial critic trying to find flaws"
         )
         instruction = (
             "Review for correctness, completeness, and quality. "
             "Flag any issues you find."
-            if is_fresh
+            if is_executor_review
             else "Try hard to find flaws, gaps, edge cases, and "
                  "potential failures. Be thorough and skeptical."
         )
