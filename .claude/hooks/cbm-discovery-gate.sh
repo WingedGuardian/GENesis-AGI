@@ -6,29 +6,15 @@
 # docs, and non-code files.
 #
 # NEVER blocks (always exit 0). Uses additionalContext for soft tips.
-# Nudges once per session via sentinel file.
+# Fires every time a non-skipped code-file Read/Grep/Glob happens —
+# no session-once suppression, since the nudge has value on each
+# code-discovery action. Configs, docs, and plans are skipped by the
+# path/extension filter below.
 #
 # Replaces the global ~/.claude/hooks/cbm-code-discovery-gate which
 # hard-blocked (exit 2) every Read/Grep call regardless of file type.
 
 set -u
-
-# ── Session-once gate ──────────────────────────────────────────────────
-# CC spawns each hook as a new bash process, so $$ and $PPID differ per
-# invocation. Use $CLAUDE_SESSION_ID (set by CC) when available, else
-# fall back to a project-dir + date hash for once-per-day-per-project.
-if [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
-    GATE_KEY="$CLAUDE_SESSION_ID"
-else
-    GATE_KEY="$(echo "${PWD:-unknown}-$(date +%Y%m%d)" | md5sum | cut -c1-16)"
-fi
-GATE="/tmp/cbm-discovery-gate-${GATE_KEY}"
-if [[ -f "$GATE" ]]; then
-    exit 0  # already nudged this session
-fi
-
-# Clean up old gate files (>1 day)
-find /tmp -maxdepth 1 -name 'cbm-discovery-gate-*' -mtime +1 -delete 2>/dev/null || true
 
 # ── Parse stdin to determine the target file ───────────────────────────
 INPUT=$(cat)
@@ -60,10 +46,6 @@ if [[ -n "$FILE_PATH" ]]; then
             ;;
     esac
 fi
-
-# If Grep with no path (searching whole repo), or Read on a code file,
-# or Glob searching for code patterns — nudge once.
-touch "$GATE"
 
 # Emit soft tip via additionalContext (never blocks)
 cat << 'TIPJSON'
