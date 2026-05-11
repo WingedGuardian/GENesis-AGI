@@ -42,7 +42,7 @@ def _increment_retrieved(qdrant, results) -> None:
 @mcp.tool()
 async def memory_recall(
     query: str,
-    source: str = "both",
+    source: str | None = None,
     limit: int = 10,
     min_activation: float = 0.0,
     compact: bool = False,
@@ -56,6 +56,10 @@ async def memory_recall(
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
     Args:
+        source: 'episodic' | 'knowledge' | 'both' | None. When None
+            (default), classify_intent() routes the query to the best
+            pool: WHY/WHEN/WHERE/STATUS → episodic; WHAT/HOW/GENERAL
+            → both. Pass an explicit value to force a specific pool.
         compact: If True, return lightweight previews only (memory_id, preview,
             score, wing, room, memory_class, source). Use memory_expand to
             fetch full content for specific IDs. Saves tokens and ~500ms.
@@ -81,6 +85,15 @@ async def memory_recall(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
+
+    # Resolve source=None to the intent-recommended pool here, before
+    # dispatching to retriever or drift_recall. Both consumers expect a
+    # concrete string; HybridRetriever.recall accepts None but the drift
+    # path uses dict.get(source, [...]) which would silently return the
+    # default branch for None.
+    if source is None:
+        from genesis.memory.intent import classify_intent
+        source = classify_intent(query).recommended_source
 
     pipeline_used = mode  # track which pipeline actually ran
 

@@ -64,15 +64,35 @@ class HybridRetriever:
         self,
         query: str,
         *,
-        source: str = "both",
+        source: str | None = None,
         limit: int = 10,
         min_activation: float = 0.0,
         expand_query_terms: bool = True,
         wing: str | None = None,
         room: str | None = None,
     ) -> list[RetrievalResult]:
-        """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF."""
+        """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
+
+        Source selection:
+            - ``source=None`` (default): classify the query's intent and
+              use ``intent.recommended_source``. WHY/WHEN/WHERE/STATUS
+              route to episodic; WHAT/HOW/GENERAL route to ``both`` and
+              let RRF + activation sort the candidates.
+            - ``source='episodic' | 'knowledge' | 'both'``: explicit
+              override; intent inference is skipped for the source
+              decision but still informs RRF biasing.
+
+            Callers that want to force ``both`` regardless of intent
+            should pass ``source='both'`` explicitly.
+        """
         _t0 = time.monotonic()
+
+        # Classify intent up-front — used for both source-selection
+        # (when source is None) and RRF bias (always, downstream).
+        intent = classify_intent(query)
+
+        if source is None:
+            source = intent.recommended_source
         if source not in _SOURCE_TO_COLLECTIONS:
             msg = f"source must be one of {list(_SOURCE_TO_COLLECTIONS)}, got {source!r}"
             raise ValueError(msg)
@@ -119,10 +139,9 @@ class HybridRetriever:
                 if mid not in qdrant_by_id:
                     qdrant_by_id[mid] = hit
 
-        # 2b. Classify query intent (for RRF bias in step 7)
-        intent = classify_intent(query)
-
-        # 2d. Event-calendar search (temporal queries)
+        # 2b. Event-calendar search (temporal queries)
+        # (Intent classified at the top of recall(); reused below for
+        # RRF bias in step 7 and for the temporal-marker check here.)
         event_memory_ids: list[str] = []
         if intent.category == "WHEN" or _has_temporal_markers(query):
             try:
@@ -148,14 +167,18 @@ class HybridRetriever:
                 logger.warning("Query expansion failed, using original", exc_info=True)
 
         # 3. FTS5 text search (using expanded query)
-        # Search all of memory_fts (no collection filter) so that references
-        # and knowledge entries surface even when source="episodic". The RRF
-        # fusion handles ranking across collections.
+        # FTS5 respects the caller's source choice — searching the wrong
+        # pool here is how knowledge_base entries flood episodic recall
+        # results purely by candidate volume. When source="both" we pass
+        # None so FTS5 sees every row; for a single-collection source we
+        # filter at the SQL level so the candidate set matches Qdrant's
+        # filtered search and RRF fuses comparable lists.
         fts_is_boolean = fts_query != query  # expansion produced boolean syntax
+        fts_collection = collections[0] if len(collections) == 1 else None
         fts_results = await memory_crud.search_ranked(
             self._db,
             query=fts_query,
-            collection=None,
+            collection=fts_collection,
             limit=candidate_limit,
             boolean=fts_is_boolean,
         )

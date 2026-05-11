@@ -30,6 +30,29 @@ class QueryIntent:
     category: str  # WHAT, WHY, HOW, WHEN, WHERE, STATUS, GENERAL
     confidence: float  # 0.0-1.0
     matched_pattern: str  # pattern that triggered (debug/logging)
+    # 'episodic' | 'knowledge' | 'both'. Defaults to 'both' so existing
+    # tests / call sites that construct QueryIntent without specifying
+    # source continue to work; classify_intent() sets it explicitly per
+    # category via _INTENT_TO_SOURCE.
+    recommended_source: str = "both"
+
+
+# Map intent categories to the recall source that's most likely to ground
+# the query. Internal lookups (WHY/WHEN/WHERE/STATUS) almost always live
+# in episodic memory — past decisions, timelines, current state. WHAT and
+# HOW can go either way: "what is X" might be a knowledge_base entry,
+# but "what did we decide about X" is episodic. We default WHAT/HOW to
+# "both" rather than guess wrong, and let RRF + activation sort it out.
+# GENERAL queries have no signal — keep "both".
+_INTENT_TO_SOURCE: dict[str, str] = {
+    "WHY": "episodic",
+    "WHEN": "episodic",
+    "WHERE": "episodic",
+    "STATUS": "episodic",
+    "WHAT": "both",
+    "HOW": "both",
+    "GENERAL": "both",
+}
 
 
 @dataclass(frozen=True)
@@ -108,11 +131,18 @@ INTENT_PROFILES: dict[str, IntentProfile] = {
 def classify_intent(query: str) -> QueryIntent:
     """Classify query intent using compiled regex patterns.
 
-    Returns GENERAL with confidence 0.0 if no pattern matches.
+    Returns GENERAL with confidence 0.0 if no pattern matches. The
+    ``recommended_source`` field is derived from the category via
+    ``_INTENT_TO_SOURCE`` — callers that defer to intent (passing
+    ``source=None`` to ``HybridRetriever.recall``) use this to route
+    the query toward the right pool.
     """
     cleaned = query.strip()
     if not cleaned:
-        return QueryIntent(category="GENERAL", confidence=0.0, matched_pattern="")
+        return QueryIntent(
+            category="GENERAL", confidence=0.0, matched_pattern="",
+            recommended_source=_INTENT_TO_SOURCE["GENERAL"],
+        )
 
     for category, pattern, confidence in _INTENT_PATTERNS:
         match = pattern.search(cleaned)
@@ -121,9 +151,13 @@ def classify_intent(query: str) -> QueryIntent:
                 category=category,
                 confidence=confidence,
                 matched_pattern=match.group(0),
+                recommended_source=_INTENT_TO_SOURCE[category],
             )
 
-    return QueryIntent(category="GENERAL", confidence=0.0, matched_pattern="")
+    return QueryIntent(
+        category="GENERAL", confidence=0.0, matched_pattern="",
+        recommended_source=_INTENT_TO_SOURCE["GENERAL"],
+    )
 
 
 def compute_intent_affinity(
