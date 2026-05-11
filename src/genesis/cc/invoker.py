@@ -134,19 +134,28 @@ class CCInvoker:
             proc.send_signal(signal.SIGINT)
 
     @staticmethod
-    def _classify_error(stderr_text: str) -> CCError:
-        """Classify stderr text into a typed CC exception."""
-        lower = stderr_text.lower()
+    def _classify_error(stderr_text: str, stdout_text: str = "") -> CCError:
+        """Classify CC output into a typed CC exception.
+
+        Checks both stderr and stdout — when CC runs in streaming-JSON
+        mode the rate-limit / quota signal often appears in stdout
+        (inside the JSON stream's error event) while stderr is empty.
+        Limiting classification to stderr would mis-categorize those as
+        generic CCProcessError and skip downstream retry branches that
+        key off the typed exception.
+        """
+        combined = f"{stderr_text}\n{stdout_text}"
+        lower = combined.lower()
         # Session expiry
         if ("session" in lower and ("not found" in lower or "expired" in lower)):
-            return CCSessionError(stderr_text)
+            return CCSessionError(stderr_text or stdout_text)
         # Hard quota exhaustion (usage limit hit for hours — distinct from 429)
         _QUOTA_PATTERNS = (
             "usage limit", "quota exceeded", "limit reached",
             "usage cap", "spending limit", "token limit exceeded",
         )
         if any(p in lower for p in _QUOTA_PATTERNS):
-            return CCQuotaExhaustedError(stderr_text)
+            return CCQuotaExhaustedError(stderr_text or stdout_text)
         # Transient rate limit (429, recovers in minutes)
         # CC CLI says "You've hit your limit · resets Xpm" — not "rate limit"
         _RATE_LIMIT_PATTERNS = (
@@ -154,25 +163,26 @@ class CCInvoker:
             "hit your limit", "hit the limit",
         )
         if any(p in lower for p in _RATE_LIMIT_PATTERNS):
-            return CCRateLimitError(stderr_text)
+            return CCRateLimitError(stderr_text or stdout_text)
         # MCP server error
+        source = stderr_text or stdout_text
         if "mcp" in lower or "mcp server" in lower:
             # Try to extract server name
             server_name = None
             for marker in ("server '", 'server "', "server: "):
-                idx = lower.find(marker)
+                idx = source.lower().find(marker)
                 if idx >= 0:
                     start = idx + len(marker)
-                    end = stderr_text.find(
+                    end = source.find(
                         "'" if marker.endswith("'") else ('"' if marker.endswith('"') else " "),
                         start,
                     )
                     if end > start:
-                        server_name = stderr_text[start:end]
+                        server_name = source[start:end]
                     break
-            return CCMCPError(stderr_text, server_name=server_name)
+            return CCMCPError(source, server_name=server_name)
         # Generic process error
-        return CCProcessError(stderr_text)
+        return CCProcessError(source)
 
     async def _notify_status_change(self, error: CCError | None) -> None:
         """Notify callback about CC status changes.
@@ -295,11 +305,14 @@ class CCInvoker:
         )
         if proc.returncode != 0:
             stderr_text = stderr.decode(errors="replace").strip()
+            stdout_text = stdout.decode(errors="replace").strip()
             logger.error(
-                "CC subprocess failed (exit=%s): %s",
-                proc.returncode, stderr_text[:500] or "(no stderr)",
+                "CC subprocess failed (exit=%s): stderr=%s stdout=%s",
+                proc.returncode,
+                stderr_text[:500] or "(no stderr)",
+                stdout_text[:500] or "(no stdout)",
             )
-            err = self._classify_error(stderr_text)
+            err = self._classify_error(stderr_text, stdout_text)
             await self._notify_status_change(err)
             raise err
 

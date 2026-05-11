@@ -590,6 +590,40 @@ def test_classify_error_rate_limit_not_quota(invoker):
     assert not isinstance(err, CCQuotaExhaustedError)
 
 
+def test_classify_error_rate_limit_from_stdout(invoker):
+    """Rate-limit signal can appear in stdout (streaming-JSON mode) while
+    stderr is empty. Classifier must check both. Observed in practice: CC
+    exit=1, empty stderr, rate-limit text only on stdout — previously
+    misclassified as CCProcessError and skipped retry path.
+    """
+    from genesis.cc.exceptions import CCRateLimitError
+
+    err = invoker._classify_error(
+        "",
+        stdout_text='{"type": "error", "error": "You\'ve hit your limit · resets 8pm"}',
+    )
+    assert isinstance(err, CCRateLimitError)
+
+
+def test_classify_error_falls_back_to_stderr_when_stdout_empty(invoker):
+    """Backward compatibility: single-arg classifier (stderr only) still works."""
+    from genesis.cc.exceptions import CCRateLimitError
+
+    err = invoker._classify_error("hit your limit")
+    assert isinstance(err, CCRateLimitError)
+
+
+def test_classify_error_quota_from_stdout(invoker):
+    """Quota exhaustion in stdout should also be classified correctly."""
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+
+    err = invoker._classify_error(
+        "",
+        stdout_text="usage limit exceeded for this billing period",
+    )
+    assert isinstance(err, CCQuotaExhaustedError)
+
+
 @pytest.mark.asyncio
 async def test_status_callback_on_quota_exhaustion():
     """Quota exhaustion triggers UNAVAILABLE status callback."""
