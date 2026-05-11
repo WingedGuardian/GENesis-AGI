@@ -152,38 +152,48 @@ async def search_ranked(
     boolean: bool = False,
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
+    as_of: str | None = None,
 ) -> list[dict]:
     """FTS5 search returning rank scores for RRF fusion.
 
-    ``exclude_subsystems`` / ``include_only_subsystems`` add a LEFT JOIN
-    with ``memory_metadata`` to filter on ``source_subsystem``. Excludes
-    preserve NULL (user-sourced) rows; includes drop them.
+    ``exclude_subsystems`` / ``include_only_subsystems`` filter on
+    ``memory_metadata.source_subsystem``. Excludes preserve NULL
+    (user-sourced) rows; includes drop them.
+
+    The bitemporal ``invalid_at`` filter is ALWAYS applied — rows past
+    their expiry never surface in recall. ``as_of`` defaults to
+    ``datetime.now(UTC).isoformat()``. NULL ``invalid_at`` (= valid
+    forever) always passes.
     """
     escaped = _prepare_fts5(query, boolean=boolean)
     if not escaped:
         return []
 
-    needs_join = bool(exclude_subsystems or include_only_subsystems)
-    select_clause = (
+    if as_of is None:
+        from datetime import UTC
+        from datetime import datetime as _dt
+        as_of = _dt.now(UTC).isoformat()
+
+    # The JOIN with memory_metadata is now always required for invalid_at
+    # filtering. Keeping the column-qualified SELECT format consistent.
+    sql = (
         "SELECT memory_fts.memory_id, memory_fts.content, "
-        "memory_fts.source_type, memory_fts.collection, memory_fts.rank"
-        if needs_join
-        else "SELECT memory_id, content, source_type, collection, rank"
-    )
-    from_clause = (
+        "memory_fts.source_type, memory_fts.collection, memory_fts.rank "
         "FROM memory_fts LEFT JOIN memory_metadata "
-        "ON memory_fts.memory_id = memory_metadata.memory_id"
-        if needs_join
-        else "FROM memory_fts"
+        "ON memory_fts.memory_id = memory_metadata.memory_id "
+        "WHERE memory_fts MATCH ?"
     )
-    sql = f"{select_clause} {from_clause} WHERE memory_fts MATCH ?"
     params: list = [escaped]
     if collection:
-        sql += (
-            " AND memory_fts.collection = ?"
-            if needs_join else " AND collection = ?"
-        )
+        sql += " AND memory_fts.collection = ?"
         params.append(collection)
+    # Always-on bitemporal filter: NULL invalid_at = valid forever; otherwise
+    # the fact must still be valid at as_of.
+    sql += (
+        " AND (memory_metadata.invalid_at IS NULL "
+        "OR memory_metadata.invalid_at > ?)"
+    )
+    params.append(as_of)
     if exclude_subsystems:
         placeholders = ",".join("?" * len(exclude_subsystems))
         sql += (
