@@ -85,6 +85,10 @@ async def _principle_is_novel(
     try:
         from genesis.db.crud.procedural import list_by_task_type
 
+        # list_by_task_type defaults to limit=50, ordered by confidence DESC.
+        # The default cap is load-bearing here — it bounds the per-extraction
+        # cost at 50 embedding lookups (cached) + 50 cosines. If the cap
+        # changes, revisit the latency budget for this hot path.
         existing = await list_by_task_type(db, task_type)
     except Exception:
         logger.warning(

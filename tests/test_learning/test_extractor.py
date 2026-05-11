@@ -8,12 +8,24 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from genesis.learning.procedural import extractor as extractor_mod
 from genesis.learning.procedural.extractor import (
     NOVELTY_THRESHOLD,
     _cosine_similarity,
     extract_procedure,
 )
 from genesis.learning.procedural.operations import store_procedure
+
+
+@pytest.fixture(autouse=True)
+def _reset_embedding_provider_singleton():
+    """Reset the module-level embedder cache between tests so state from one
+    test (or a real EmbeddingProvider built on first use) can't leak into the
+    next.
+    """
+    extractor_mod._EMBEDDING_PROVIDER = None
+    yield
+    extractor_mod._EMBEDDING_PROVIDER = None
 
 
 @dataclass
