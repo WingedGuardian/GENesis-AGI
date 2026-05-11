@@ -2,17 +2,40 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict as _asdict
 
 from genesis.learning.procedural.matcher import find_best_match, find_relevant
 
 from ..memory import mcp
 
+logger = logging.getLogger(__name__)
+
 
 def _memory_mod():
     import genesis.mcp.memory_mcp as memory_mod
 
     return memory_mod
+
+
+async def _embed_principle_for_hook(principle: str) -> bytes | None:
+    """Best-effort: compute principle embedding for the proactive procedure
+    hook. Returns None on any failure — the hook simply skips rows without
+    an embedding rather than failing the whole store.
+    """
+    try:
+        from genesis.learning.procedural.embedding import pack_embedding
+        from genesis.memory.embeddings import EmbeddingProvider
+
+        embedder = EmbeddingProvider()
+        vec = await embedder.embed(principle)
+        return pack_embedding(vec)
+    except Exception:
+        logger.warning(
+            "procedure_store: principle embedding failed, storing without it",
+            exc_info=True,
+        )
+        return None
 
 
 @mcp.tool()
@@ -34,6 +57,10 @@ async def procedure_store(
     successes/failures via `record_success`/`record_failure` continue to
     update the row via Laplace smoothing.
 
+    Computes a principle embedding for the proactive procedure hook. If the
+    embedding stack is unavailable, the procedure stores without it and the
+    hook skips that row.
+
     The auto-extraction path (`learning.procedural.extractor`) keeps its
     speculative=1 / success_count=0 / confidence=0.0 / L4 defaults — those
     procedures are LLM-hypothesized and must earn trust.
@@ -42,6 +69,8 @@ async def procedure_store(
     memory_mod._require_init()
     assert memory_mod._db is not None
     from genesis.learning.procedural.operations import store_procedure_checked
+
+    principle_blob = await _embed_principle_for_hook(principle)
 
     result = await store_procedure_checked(
         memory_mod._db,
@@ -56,6 +85,7 @@ async def procedure_store(
         success_count=1,
         confidence=2 / 3,
         source={"type": "explicit_teach"},
+        principle_embedding=principle_blob,
     )
 
     response = result.procedure_id

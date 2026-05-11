@@ -392,6 +392,23 @@ class ExecutionTracer:
 
         from genesis.learning.procedural.operations import store_procedure
 
+        # Best-effort principle embedding for the proactive procedure hook.
+        # Stored as NULL if the embedding stack is unavailable — the hook
+        # simply skips rows without an embedding.
+        principle_blob: bytes | None = None
+        try:
+            from genesis.learning.procedural.embedding import pack_embedding
+            from genesis.memory.embeddings import EmbeddingProvider
+
+            embedder = EmbeddingProvider()
+            vec = await embedder.embed(proc_data["principle"])
+            principle_blob = pack_embedding(vec)
+        except Exception:
+            logger.debug(
+                "Retrospective: principle embedding failed; storing without",
+                exc_info=True,
+            )
+
         proc_id = await store_procedure(
             self._db,
             task_type=proc_data["task_type"],
@@ -401,6 +418,7 @@ class ExecutionTracer:
             context_tags=proc_data["context_tags"],
             activation_tier="L4",
             speculative=1,
+            principle_embedding=principle_blob,
         )
 
         trace.procedural_extractions.append(proc_id)

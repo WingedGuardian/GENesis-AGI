@@ -76,10 +76,18 @@ def test_cosine_similarity_basic():
 
 @pytest.mark.asyncio
 async def test_extract_stores_when_table_empty(db):
-    """No existing procedures => stores regardless of embedder."""
+    """No existing procedures => stores; embeds the new principle once.
+
+    The new principle is embedded so it can be packed into the
+    `principle_embedding` BLOB for the proactive procedure hook. No
+    existing-principle comparisons fire when the table is empty for this
+    task_type.
+    """
     payload = _valid_payload()
     router = _router_returning(payload)
-    embedder = _embedder({})  # No principles needed; table is empty
+    embedder = _embedder({
+        "always verify before deploy": [1.0, 0.0, 0.0],
+    })
 
     proc_id = await extract_procedure(
         db,
@@ -89,8 +97,10 @@ async def test_extract_stores_when_table_empty(db):
         embedding_provider=embedder,
     )
     assert proc_id is not None
-    # Embedder shouldn't be called when the same-task_type list is empty.
-    embedder.embed.assert_not_called()
+    # Embed is called exactly once — for the new principle. The dim-mismatch
+    # in the test vector triggers a graceful "stored without embedding" path
+    # (logged), but the procedure still lands in the DB.
+    assert embedder.embed.await_count == 1
 
 
 @pytest.mark.asyncio

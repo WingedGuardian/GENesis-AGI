@@ -33,7 +33,8 @@ TABLES = {
             activation_tier   TEXT NOT NULL DEFAULT 'L4',  -- L1/L2/L3/L4 promotion tier
             tool_trigger      TEXT,                        -- JSON array of tool names for L1 matching
             source            TEXT,                        -- JSON: {type, session_id?, observation_id?, triage_outcome?}
-            promotion_history TEXT                         -- JSON array: [{from_tier, to_tier, at, reason}]
+            promotion_history TEXT,                        -- JSON array: [{from_tier, to_tier, at, reason}]
+            principle_embedding BLOB                       -- qwen3-embedding(1024 float32) of `principle`, little-endian; read by proactive procedure hook
         )
     """,
     "observations": """

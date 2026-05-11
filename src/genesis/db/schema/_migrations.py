@@ -994,6 +994,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE procedural_memory ADD COLUMN promotion_history TEXT",
         "procedural_memory.promotion_history")
 
+    # Proactive procedure hook: BLOB of the principle embedding (qwen3-embedding
+    # 1024 floats packed as little-endian float32 = 4096 bytes). Read at hook
+    # fire time to compute cosine similarity vs the prompt embedding without
+    # re-embedding stored principles. Forward-only — existing rows stay NULL
+    # until re-extracted; the hook skips NULL rows.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN principle_embedding BLOB",
+        "procedural_memory.principle_embedding")
+
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.
     await _migrate_cognitive_state_check(db)

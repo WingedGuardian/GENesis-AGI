@@ -39,6 +39,7 @@ async def store_procedure(
     success_count: int = 0,
     confidence: float = 0.0,
     source: dict | None = None,
+    principle_embedding: bytes | None = None,
 ) -> str:
     """Create a new procedure and return its ID.
 
@@ -47,6 +48,10 @@ async def store_procedure(
     user-driven `procedure_store` MCP writes — should pass non-default
     values to seed the procedure as already-trusted (speculative=0,
     success_count>=1, confidence via Laplace).
+
+    `principle_embedding` is the packed BLOB returned by
+    `procedural.embedding.pack_embedding`. Optional — when None, the
+    proactive procedure hook skips this row.
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
@@ -65,6 +70,7 @@ async def store_procedure(
         success_count=success_count,
         confidence=confidence,
         source=json.dumps(source) if source else None,
+        principle_embedding=principle_embedding,
     )
     return proc_id
 
@@ -83,6 +89,7 @@ async def store_procedure_checked(
     success_count: int = 1,
     confidence: float = 2 / 3,
     source: dict | None = None,
+    principle_embedding: bytes | None = None,
 ) -> StoreResult:
     """Store a procedure with conflict detection.
 
@@ -154,6 +161,7 @@ async def store_procedure_checked(
         success_count=success_count,
         confidence=confidence,
         source=source,
+        principle_embedding=principle_embedding,
     )
 
     if warnings:

@@ -410,6 +410,57 @@ def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
         return []
 
 
+_PROCEDURE_SURFACE_THRESHOLD = 0.7  # Cosine threshold for the procedure hook.
+# "Recommend a procedure" carries higher risk of being a false positive than
+# "recommend a memory" (procedures are workflow assertions), so use a stricter
+# cosine cutoff. Top-1 only: most prompts have no relevant procedure.
+
+
+def _search_procedures(
+    db_path: Path, prompt_vector: list[float],
+) -> tuple[str, str, str] | None:
+    """Return (procedure_id, task_type, principle_snippet) if a procedure's
+    principle embedding clears the cosine threshold, else None.
+
+    Best-effort: catches every failure mode and returns None so the parent
+    hook (memory recall) is never blocked by this addition.
+    """
+    try:
+        from genesis.learning.procedural.embedding import (
+            cosine_similarity,
+            unpack_embedding,
+        )
+
+        conn = sqlite3.connect(str(db_path), timeout=2)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT id, task_type, principle, principle_embedding "
+                "FROM procedural_memory "
+                "WHERE deprecated = 0 AND quarantined = 0 "
+                "AND principle_embedding IS NOT NULL "
+                "ORDER BY confidence DESC LIMIT 100"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        best: tuple[float, str, str, str] | None = None
+        for row in rows:
+            existing_vec = unpack_embedding(row["principle_embedding"])
+            if existing_vec is None:
+                continue
+            sim = cosine_similarity(prompt_vector, existing_vec)
+            if best is None or sim > best[0]:
+                best = (sim, row["id"], row["task_type"] or "", row["principle"] or "")
+
+        if best is None or best[0] < _PROCEDURE_SURFACE_THRESHOLD:
+            return None
+        _sim, proc_id, task_type, principle = best
+        return proc_id, task_type, principle[:200]
+    except Exception:
+        return None  # Never block the memory hook
+
+
 async def _embed_text(text: str) -> list[float] | None:
     """Get embedding from the configured backend chain (cloud-first).
 
@@ -1087,6 +1138,20 @@ async def _run(prompt: str, session_id: str = "") -> None:
         if output:
             print(output)
             sys.stdout.flush()
+
+    # Procedure surfacing — reuses the already-computed prompt embedding
+    # so there's no extra cloud call. Top-1 only, cosine >= 0.7. Wrapped in
+    # a broad try/except so a bad procedure read can't crash the memory hook.
+    if vector:
+        try:
+            proc = _search_procedures(_DB_PATH, vector)
+            if proc is not None:
+                proc_id, task_type, principle = proc
+                tag = f"Procedure | {task_type} | id:{proc_id[:8]}" if task_type else f"Procedure | id:{proc_id[:8]}"
+                print(f"[{tag}] {principle}")
+                sys.stdout.flush()
+        except Exception as proc_exc:
+            print(f"Procedure surfacing skipped: {proc_exc}", file=sys.stderr)
 
     # Print deferred metadata AFTER memory results (memories are more
     # actionable and should appear first in the injection block).
