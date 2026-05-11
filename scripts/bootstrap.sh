@@ -315,10 +315,16 @@ if command -v codebase-memory-mcp &>/dev/null; then
 fi
 
 # GitNexus (blast radius, impact analysis, execution flows)
+# Exact pin to 1.6.4 — only ship versions we've actually verified.
+# Bumping to 1.6.5+ or 1.7+ is an explicit decision in a follow-up PR
+# (1.7 prereleases had FTS read-blocking issues that need re-verification).
 if _node_version_ok; then
     if ! command -v gitnexus &>/dev/null; then
         echo "  GitNexus not found — installing..."
-        npm install -g gitnexus@latest 2>/dev/null || echo "  WARNING: GitNexus install failed (non-critical)"
+        npm install -g gitnexus@1.6.4 2>/dev/null || echo "  WARNING: GitNexus install failed (non-critical)"
+    else
+        echo "  GitNexus: ensuring pin..."
+        npm install -g gitnexus@1.6.4 2>/dev/null || echo "  WARNING: GitNexus upgrade failed (non-critical)"
     fi
     if command -v gitnexus &>/dev/null; then
         echo "  GitNexus: $(gitnexus --version 2>/dev/null)"
