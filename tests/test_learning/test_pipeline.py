@@ -370,3 +370,88 @@ class TestSteeringRuleExtraction:
         )
         await pipeline(FakeCCOutput(), "don't ever do that", "telegram")
         loader.add_steering_rule.assert_called_once()
+
+
+class TestSuccessExtractionChannelGate:
+    """SUCCESS-path procedure extraction must only fire on autonomous channels.
+
+    Foreground sessions store procedures opportunistically via the
+    `procedure_store` MCP — they should NOT trigger auto-extraction on every
+    successful task, which would flood the table.
+    """
+
+    @pytest.mark.asyncio
+    async def test_success_on_autonomous_channel_triggers_extraction(self, db, monkeypatch):
+        """SUCCESS on 'surplus' (autonomous) should call extract_procedure."""
+        called = {"n": 0}
+
+        async def fake_extract(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(
+            "genesis.learning.pipeline.extract_procedure", fake_extract,
+        )
+        router = MagicMock()
+        router.route_call = AsyncMock()
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.SUCCESS),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=MagicMock(write=AsyncMock(return_value="o")),
+            router=router,
+        )
+        await pipeline(FakeCCOutput(), "q", "surplus")
+        assert called["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_success_on_foreground_channel_skips_extraction(self, db, monkeypatch):
+        """SUCCESS on 'terminal' (foreground) must NOT call extract_procedure."""
+        called = {"n": 0}
+
+        async def fake_extract(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(
+            "genesis.learning.pipeline.extract_procedure", fake_extract,
+        )
+        router = MagicMock()
+        router.route_call = AsyncMock()
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.SUCCESS),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=MagicMock(write=AsyncMock(return_value="o")),
+            router=router,
+        )
+        await pipeline(FakeCCOutput(), "q", "terminal")
+        assert called["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_approach_failure_extracts_regardless_of_channel(self, db, monkeypatch):
+        """APPROACH_FAILURE extraction is channel-agnostic (pre-existing
+        behavior — failures are rare enough to always capture)."""
+        called = {"n": 0}
+
+        async def fake_extract(*_args, **_kwargs):
+            called["n"] += 1
+            return None
+
+        monkeypatch.setattr(
+            "genesis.learning.pipeline.extract_procedure", fake_extract,
+        )
+        router = MagicMock()
+        router.route_call = AsyncMock()
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=_make_outcome_classifier(OutcomeClass.APPROACH_FAILURE),
+            delta_assessor=_make_delta_assessor(),
+            observation_writer=MagicMock(write=AsyncMock(return_value="o")),
+            router=router,
+        )
+        await pipeline(FakeCCOutput(), "q", "terminal")
+        assert called["n"] == 1
