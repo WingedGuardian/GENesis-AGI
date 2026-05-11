@@ -361,25 +361,39 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
 
 
 def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
-    """Search memory_fts using FTS5 with OR-joined keywords."""
+    """Search memory_fts using FTS5 with OR-joined keywords.
+
+    Excludes automated-subsystem writes (ego/triage/reflection) via a
+    LEFT JOIN with memory_metadata. NULL source_subsystem (user-sourced
+    + legacy pre-1.5b rows) is preserved.
+    """
     if not keywords:
         return []
 
     fts_query = " OR ".join('"' + _escape_fts5(k) + '"' for k in keywords)
+    placeholders = ",".join("?" * len(_PROACTIVE_EXCLUDED_SUBSYSTEMS))
 
     try:
         conn = sqlite3.connect(str(db_path), timeout=2)
         try:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                """
-                SELECT memory_id, content, source_type, collection, rank
+                f"""
+                SELECT memory_fts.memory_id, memory_fts.content,
+                       memory_fts.source_type, memory_fts.collection,
+                       memory_fts.rank
                 FROM memory_fts
+                LEFT JOIN memory_metadata
+                  ON memory_fts.memory_id = memory_metadata.memory_id
                 WHERE memory_fts MATCH ?
+                  AND (memory_metadata.source_subsystem IS NULL
+                       OR memory_metadata.source_subsystem
+                           NOT IN ({placeholders}))
                 ORDER BY rank
                 LIMIT ?
-                """,
-                (fts_query, _MAX_RESULTS * 2),
+                """,  # noqa: S608 -- placeholders bound separately
+                (fts_query, *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
+                 _MAX_RESULTS * 2),
             )
             rows = [dict(row) for row in cursor.fetchall()]
             # Require minimum keyword overlap for multi-keyword queries
@@ -447,6 +461,14 @@ async def _embed_text(text: str) -> list[float] | None:
     return None
 
 
+# Subsystems whose memory writes are excluded from the UserPromptSubmit
+# proactive injection by default. Mirror genesis.memory.retrieval._KNOWN_SUBSYSTEMS
+# — this hook runs in a separate subprocess and can't import the package
+# without slowing the prompt path. Update both lists together if either
+# changes.
+_PROACTIVE_EXCLUDED_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection")
+
+
 async def _search_qdrant(
     vector: list[float],
     wing_filter: str | None = None,
@@ -460,6 +482,10 @@ async def _search_qdrant(
         wing_filter: Optional wing to filter results (e.g., "memory", "routing").
         collection: Qdrant collection to search (default: episodic_memory).
         extra_filter: Optional additional Qdrant filter conditions (merged with wing_filter).
+
+    Automatically excludes automated-subsystem writes (ego, triage,
+    reflection) via a ``must_not`` payload filter so subsystem
+    decisional content doesn't leak into the CC prompt context.
     """
     try:
         import httpx
@@ -473,8 +499,17 @@ async def _search_qdrant(
             must_conditions.append({"key": "wing", "match": {"value": wing_filter}})
         if extra_filter:
             must_conditions.extend(extra_filter.get("must", []))
+        filter_block: dict = {}
         if must_conditions:
-            body["filter"] = {"must": must_conditions}
+            filter_block["must"] = must_conditions
+        # Default exclusion of subsystem writes. ``must_not`` against a
+        # missing payload key preserves the point — legacy rows without
+        # ``source_subsystem`` continue to surface.
+        filter_block["must_not"] = [{
+            "key": "source_subsystem",
+            "match": {"any": list(_PROACTIVE_EXCLUDED_SUBSYSTEMS)},
+        }]
+        body["filter"] = filter_block
 
         async with httpx.AsyncClient(timeout=2.0) as client:
             resp = await client.post(

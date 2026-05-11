@@ -150,19 +150,53 @@ async def search_ranked(
     collection: str | None = None,
     limit: int = 30,
     boolean: bool = False,
+    exclude_subsystems: list[str] | None = None,
+    include_only_subsystems: list[str] | None = None,
 ) -> list[dict]:
-    """FTS5 search returning rank scores for RRF fusion."""
+    """FTS5 search returning rank scores for RRF fusion.
+
+    ``exclude_subsystems`` / ``include_only_subsystems`` add a LEFT JOIN
+    with ``memory_metadata`` to filter on ``source_subsystem``. Excludes
+    preserve NULL (user-sourced) rows; includes drop them.
+    """
     escaped = _prepare_fts5(query, boolean=boolean)
     if not escaped:
         return []
-    sql = (
-        "SELECT memory_id, content, source_type, collection, rank "
-        "FROM memory_fts WHERE memory_fts MATCH ?"
+
+    needs_join = bool(exclude_subsystems or include_only_subsystems)
+    select_clause = (
+        "SELECT memory_fts.memory_id, memory_fts.content, "
+        "memory_fts.source_type, memory_fts.collection, memory_fts.rank"
+        if needs_join
+        else "SELECT memory_id, content, source_type, collection, rank"
     )
+    from_clause = (
+        "FROM memory_fts LEFT JOIN memory_metadata "
+        "ON memory_fts.memory_id = memory_metadata.memory_id"
+        if needs_join
+        else "FROM memory_fts"
+    )
+    sql = f"{select_clause} {from_clause} WHERE memory_fts MATCH ?"
     params: list = [escaped]
     if collection:
-        sql += " AND collection = ?"
+        sql += (
+            " AND memory_fts.collection = ?"
+            if needs_join else " AND collection = ?"
+        )
         params.append(collection)
+    if exclude_subsystems:
+        placeholders = ",".join("?" * len(exclude_subsystems))
+        sql += (
+            f" AND (memory_metadata.source_subsystem IS NULL "
+            f"OR memory_metadata.source_subsystem NOT IN ({placeholders}))"
+        )
+        params.extend(exclude_subsystems)
+    elif include_only_subsystems:
+        placeholders = ",".join("?" * len(include_only_subsystems))
+        sql += (
+            f" AND memory_metadata.source_subsystem IN ({placeholders})"
+        )
+        params.extend(include_only_subsystems)
     sql += " ORDER BY rank LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)
@@ -201,21 +235,26 @@ async def create_metadata(
     room: str | None = None,
     valid_at: str | None = None,
     invalid_at: str | None = None,
+    source_subsystem: str | None = None,
 ) -> str:
     """Insert a row into memory_metadata. Returns memory_id.
 
     ``valid_at`` records when the fact became true in the real world
     (bi-temporal modeling). Defaults to ``created_at`` if not provided.
     ``invalid_at`` records when the fact stopped being true (NULL = still valid).
+    ``source_subsystem`` tags writes from automated subsystems (ego,
+    triage, reflection) so foreground recall can default-filter them.
+    NULL = user-sourced.
     """
     resolved_valid_at = valid_at or created_at
     await db.execute(
         "INSERT OR IGNORE INTO memory_metadata "
         "(memory_id, created_at, collection, confidence, embedding_status, "
-        "memory_class, wing, room, valid_at, invalid_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "memory_class, wing, room, valid_at, invalid_at, source_subsystem) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (memory_id, created_at, collection, confidence, embedding_status,
-         memory_class, wing, room, resolved_valid_at, invalid_at),
+         memory_class, wing, room, resolved_valid_at, invalid_at,
+         source_subsystem),
     )
     await db.commit()
     return memory_id

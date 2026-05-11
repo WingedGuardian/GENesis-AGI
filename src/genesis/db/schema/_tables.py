@@ -498,7 +498,8 @@ TABLES = {
             transcript_path     TEXT,
             source_line_range   TEXT,
             extraction_timestamp TEXT,
-            source_pipeline     TEXT
+            source_pipeline     TEXT,
+            source_subsystem    TEXT
         )
     """,
     "predictions": """
@@ -861,7 +862,8 @@ TABLES = {
             wing             TEXT,
             room             TEXT,
             valid_at         TEXT,
-            invalid_at       TEXT
+            invalid_at       TEXT,
+            source_subsystem TEXT
         )
     """,
     "code_modules": """

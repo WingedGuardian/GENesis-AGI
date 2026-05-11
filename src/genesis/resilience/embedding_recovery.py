@@ -75,6 +75,7 @@ class EmbeddingRecoveryWorker:
                 for prov_key in (
                     "source_session_id", "transcript_path",
                     "extraction_timestamp", "source_pipeline",
+                    "source_subsystem",
                 ):
                     val = item.get(prov_key)
                     if val:

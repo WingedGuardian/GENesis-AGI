@@ -11,6 +11,23 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Foreground recall excludes automated-subsystem content by
+  default.** Memory writes from ego corrections, triage signals, and
+  reflection observations are now tagged with a new
+  `source_subsystem` column. By default, `memory_recall` MCP, the
+  internal `HybridRetriever.recall()`, drift recall, and the
+  UserPromptSubmit proactive-memory hook all filter these rows out
+  so they don't pollute user-facing answers with the system's own
+  decisional commentary. Two new opt-in parameters expose the tagged
+  content: `include_subsystem` augments the default set
+  (`include_subsystem=True` returns everything;
+  `include_subsystem=["ego"]` adds ego writes alongside user
+  content), and `only_subsystem` flips into subsystem-only mode
+  (`only_subsystem="ego"` returns just ego corrections, for ego's
+  own self-recall). Migration 0016 backfills `reflection` for
+  existing rows tagged with `reflection_observation` /
+  `reflection_summary` in FTS5. Other subsystems are tagged
+  forward-only on new writes.
 - **LLM-as-judge eval primitive** --- new `LLMJudgeScorer`
   (`ScorerType.LLM_JUDGE`), versioned `Rubric` registry, and a
   calibration job that grades a rubric against a hand-graded golden

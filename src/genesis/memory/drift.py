@@ -72,6 +72,8 @@ async def _global_primer(
     embedding_provider: EmbeddingProvider,
     source_collections: list[str],
     global_limit: int = 20,
+    exclude_subsystems: list[str] | None = None,
+    include_only_subsystems: list[str] | None = None,
 ) -> tuple[list[str], str | None, str | None]:
     """Phase 1: Broad scan to identify relevant wing/room clusters.
 
@@ -80,7 +82,9 @@ async def _global_primer(
     """
     # FTS5 broad search — no wing/room filter, cast a wide net
     fts_results = await memory_crud.search_ranked(
-        db, query=query, limit=global_limit
+        db, query=query, limit=global_limit,
+        exclude_subsystems=exclude_subsystems,
+        include_only_subsystems=include_only_subsystems,
     )
     fts_ids = [r["memory_id"] for r in fts_results]
 
@@ -94,6 +98,8 @@ async def _global_primer(
                 collection=collection,
                 query_vector=query_vector,
                 limit=global_limit,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
             )
             vector_ids.extend(hit["id"] for hit in hits)
     except (EmbeddingUnavailableError, Exception) as e:
@@ -161,6 +167,8 @@ async def _local_drilldown(
     room: str | None,
     global_ids: list[str],
     local_limit: int = 15,
+    exclude_subsystems: list[str] | None = None,
+    include_only_subsystems: list[str] | None = None,
 ) -> list[str]:
     """Phase 2: Focused search within the identified cluster.
 
@@ -174,7 +182,9 @@ async def _local_drilldown(
     if wing:
         # FTS5 can filter by tags field which contains wing info
         fts_results = await memory_crud.search_ranked(
-            db, query=fts_query, collection="episodic_memory", limit=local_limit
+            db, query=fts_query, collection="episodic_memory", limit=local_limit,
+            exclude_subsystems=exclude_subsystems,
+            include_only_subsystems=include_only_subsystems,
         )
         # Filter results by wing in post-processing (FTS5 doesn't support wing filter)
         fts_ids = [r["memory_id"] for r in fts_results]
@@ -201,6 +211,8 @@ async def _local_drilldown(
                 limit=local_limit,
                 wing=wing,
                 room=room,
+                exclude_subsystems=exclude_subsystems,
+                include_only_subsystems=include_only_subsystems,
             )
             local_ids.extend(hit["id"] for hit in hits)
     except (EmbeddingUnavailableError, Exception) as e:
@@ -232,6 +244,8 @@ async def drift_recall(
     source: str = "both",
     limit: int = 10,
     min_activation: float = 0.0,
+    include_subsystem: bool | list[str] = False,
+    only_subsystem: str | list[str] | None = None,
 ) -> list[RetrievalResult]:
     """DRIFT multi-mode retrieval: global primer → local drill-down → combine.
 
@@ -243,13 +257,27 @@ async def drift_recall(
         source: Which collections to search ("episodic", "knowledge", "both").
         limit: Maximum results to return.
         min_activation: Minimum activation score threshold.
+        include_subsystem: Subsystem-filter additive mode. ``False`` (default)
+            excludes ego/triage/reflection writes; ``True`` returns
+            everything; a list adds named subsystems alongside user
+            content. Mutually exclusive with ``only_subsystem``.
+        only_subsystem: Subsystem-filter replace mode. Return ONLY rows
+            tagged with the named subsystem(s); user content excluded.
+            Used by ego's own self-recall.
 
     Returns:
         List of RetrievalResult objects, ranked by combined DRIFT score.
     """
-    from genesis.memory.retrieval import _SOURCE_TO_COLLECTIONS
+    from genesis.memory.retrieval import (
+        _SOURCE_TO_COLLECTIONS,
+        _resolve_subsystem_filter,
+    )
 
     source_collections = _SOURCE_TO_COLLECTIONS.get(source, ["episodic_memory"])
+
+    exclude_subsystems, include_only_subsystems = _resolve_subsystem_filter(
+        include_subsystem, only_subsystem,
+    )
 
     # Classify query intent for metadata enrichment
     intent = classify_intent(query)
@@ -261,6 +289,8 @@ async def drift_recall(
         qdrant_client=qdrant_client,
         embedding_provider=embedding_provider,
         source_collections=source_collections,
+        exclude_subsystems=exclude_subsystems,
+        include_only_subsystems=include_only_subsystems,
     )
 
     if not global_ids:
@@ -277,6 +307,8 @@ async def drift_recall(
         wing=best_wing,
         room=best_room,
         global_ids=global_ids,
+        exclude_subsystems=exclude_subsystems,
+        include_only_subsystems=include_only_subsystems,
     )
 
     # Phase 3: Combine — weighted RRF fusion

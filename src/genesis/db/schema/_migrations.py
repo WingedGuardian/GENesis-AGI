@@ -715,6 +715,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             f"ALTER TABLE pending_embeddings ADD COLUMN {col} {col_type}",
             f"pending_embeddings.{col}")
 
+    # Subsystem source tagging (Phase 1.5b): distinguish automated-subsystem
+    # writes (ego/triage/reflection) from user-sourced memories so foreground
+    # recall can default-filter the former. NULL = user-sourced.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN source_subsystem TEXT",
+        "memory_metadata.source_subsystem")
+    await _try_alter(db,
+        "ALTER TABLE pending_embeddings ADD COLUMN source_subsystem TEXT",
+        "pending_embeddings.source_subsystem")
+
     # Memory rebalance: resolve expired observations whose TTL has passed
     # but weren't caught by the 24h scheduler (e.g., runtime was down).
     # Idempotent — UPDATE WHERE is a no-op once resolved.

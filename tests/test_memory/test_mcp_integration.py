@@ -99,6 +99,7 @@ async def test_memory_recall_delegates(mock_deps, tools):
     memory_mcp._retriever.recall.assert_awaited_once_with(
         "query", source="both", limit=5, min_activation=0.0,
         wing=None, room=None, expand_query_terms=True,
+        include_subsystem=False, only_subsystem=None,
     )
 
 
