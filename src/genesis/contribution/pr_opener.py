@@ -446,8 +446,14 @@ def _prepare_and_push_branch(
             capture_output=True, text=True,
             cwd=str(wt_dir), timeout=30, check=False,
         )
+        if ls_proc.returncode != 0:
+            # Auth failure, network blip, DNS, rate limit. Surface
+            # cleanly instead of falling through to an empty lease
+            # that would then produce a confusing "stale info" error
+            # on the push if the branch happens to exist.
+            return False, f"ls-remote failed: {ls_proc.stderr.strip()}"
         expected_sha = ""
-        if ls_proc.returncode == 0 and ls_proc.stdout.strip():
+        if ls_proc.stdout.strip():
             expected_sha = ls_proc.stdout.split()[0]
         lease_arg = f"--force-with-lease=refs/heads/{branch}:{expected_sha}"
         proc = subprocess.run(
