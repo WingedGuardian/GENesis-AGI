@@ -862,6 +862,7 @@ more than an aggressive question asked five times in a week.
 - `observation_query` — Query by type/priority/source
 - `observation_resolve` — Mark resolved with notes
 - `evolution_propose` — Write identity evolution proposal (for SOUL.md / identity file changes)
+- `evolution_propose_review` — Transition a proposal out of pending (approved / rejected / withdrawn)
 
 **Knowledge base tools (post-v3 feature, groundwork laid in v3):**
 - `knowledge_recall` — Hybrid search scoped by project/domain, authority-tagged results
