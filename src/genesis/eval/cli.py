@@ -202,6 +202,7 @@ async def _cmd_benchmark(args: argparse.Namespace) -> int:
         providers = [
             name for name, cfg in sorted(config.providers.items())
             if getattr(cfg, "enabled", True)  # skip explicitly disabled
+            and getattr(cfg, "has_api_key", True)  # skip keyless — eval would 401
             and (args.include_paid or cfg.is_free)
         ]
 

@@ -101,6 +101,17 @@ async def call_sites(
             if pcfg:
                 entry["type"] = pcfg.provider_type
                 entry["model"] = pcfg.model_id
+                # Surface "no API key" as a first-class chain entry state so
+                # the dashboard can render a dimmed chip with a tooltip
+                # naming the env var that would enable it. has_api_key is a
+                # load-time check; works on cold start before any probe
+                # has run. Probes (provider_health.py) overlay the same
+                # state via probe_status="not_configured" once they execute.
+                if not pcfg.has_api_key:
+                    entry["has_api_key"] = False
+                    entry["missing_env_var"] = (
+                        f"API_KEY_{pcfg.provider_type.upper()}"
+                    )
             chain_health.append(entry)
 
             if state not in (ProviderState.OPEN, ProviderState.HALF_OPEN):
@@ -283,6 +294,11 @@ async def call_sites(
             # deployment-time config state, NOT an infrastructure alert.
             site_data["status"] = "disabled"
             site_data["disabled_reason"] = "no_api_keys_configured"
+            # Machine-readable status for the neural monitor badge.
+            # Preserve any pre-existing status_reason from _CALL_SITE_META
+            # (e.g., V4_PLACEHOLDER) — that's intrinsic to the call site,
+            # NO_API_KEYS is a runtime overlay specific to this install.
+            site_data.setdefault("status_reason", "NO_API_KEYS")
             continue
 
         prev_status = site_data.get("status")
@@ -316,6 +332,12 @@ def _provider_health(entry: dict) -> str:
     it crashed. Callers should filter disabled providers out of routing
     decisions rather than treating them as failures.
     """
+    # Load-time has_api_key check (set by config loader). Works on cold
+    # start before any probe runs. Probe overlay (probe_status) catches
+    # the same case once probes execute — having both gives belt-and-
+    # suspenders coverage.
+    if entry.get("has_api_key") is False:
+        return "disabled"
     # Probe says "no API key" — provider is disabled by config, not broken
     ps = entry.get("probe_status")
     if ps == "not_configured":

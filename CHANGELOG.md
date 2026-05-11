@@ -30,6 +30,24 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   off automatically, in line with the existing rules for non-critical
   background work.
 
+### Fixed
+
+- **Call sites with no API key stay visible on the dashboard.**
+  Previously, a call site whose entire provider chain had no API key
+  configured was silently dropped from `cfg.call_sites` at startup,
+  making it invisible everywhere (dashboard, routing API, health
+  snapshot). On a partially-configured install (some keys set, some
+  empty) you couldn't tell which call sites were unreachable or what
+  you needed to add. Keyless providers now stay registered with
+  `has_api_key=False`; the router skips them at routing time exactly
+  the way it skips a tripped circuit breaker, and the neural monitor
+  shows the call site with a red **NO API KEY CONFIGURED** badge plus
+  a banner naming the env vars (`API_KEY_<TYPE>`) that would enable
+  it. Partial API-key configuration is the normal install state, not
+  a bug --- it should be discoverable. Sentinel does not alert on
+  these sites (existing filter for `wired:False`/`disabled`/no
+  `last_run_at` covers it).
+
 ### Migrations
 
 - **0014_eval_results_metadata** --- adds a `metadata_json` TEXT

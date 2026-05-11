@@ -3,6 +3,12 @@
 Comprehensive audit of all 44 neural monitor call sites. Verified against
 live code traces, routing config, and last_run database records.
 
+**2026-05-10 update:** Silent-drop fix for keyless call sites.
+- Partial API-key configuration is now treated as a first-class normal state, not a load-time filter condition. Previously, the config loader auto-disabled any provider whose API key env var was unset/empty AND filtered those providers out of every chain. Sites whose entire chain was keyless were dropped from `cfg.call_sites` entirely — invisible everywhere downstream (neural monitor, routing API, health snapshot). On a partially-configured install (the normal install state), this masked which sites were unreachable and what env vars would unblock them.
+- New behaviour: keyless providers stay registered in `cfg.providers` with `has_api_key=False`. The router skips them in chain walk the same way it skips a tripped breaker — no LiteLLM call, no failure record, no CB trip. The snapshot surfaces `has_api_key=False` + `missing_env_var` on each chain entry; when every entry in a chain is keyless, the site cascades to `status="disabled"` with `status_reason="NO_API_KEYS"`, rendered as a red badge in the neural monitor with a banner naming the env vars (`API_KEY_<TYPE>`) that would enable it.
+- `ProviderConfig` gains a `has_api_key: bool = True` field, set at parse time. The `_provider_health()` snapshot helper returns `"disabled"` for `has_api_key=False` (defense-in-depth alongside the existing `probe_status="not_configured"` path that fires once probes have run).
+- Sentinel does NOT alert on `NO_API_KEYS` sites — the existing Tier 1 filter for `wired:False / disabled / no last_run` covers it.
+
 **2026-05-10 update:** Routing-config cleanup pass.
 - Removed `2_triage` from YAML (awareness loop's `classify_depth()` superseded it; meta entry retained as historical reference).
 - Removed `7_task_retrospective` from YAML — confirmed duplicate; the executor went live with `43_task_retrospective` and `7_*` was forgotten.

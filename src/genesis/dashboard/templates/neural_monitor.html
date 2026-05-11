@@ -871,6 +871,7 @@ function showDetail(item) {
             SUPERSEDED: 'SUPERSEDED',
             TEMP_DISABLED: 'TEMPORARILY DISABLED',
             REPLACED_BY_AWARENESS_LOOP: 'REPLACED BY AWARENESS LOOP',
+            NO_API_KEYS: 'NO API KEY CONFIGURED',  // pragma: allowlist secret
         };
         const REASON_CLASS = {
             WIRED: 'badge-normal',
@@ -881,6 +882,7 @@ function showDetail(item) {
             SUPERSEDED: 'badge-disabled',
             TEMP_DISABLED: 'badge-warning',
             REPLACED_BY_AWARENESS_LOOP: 'badge-disabled',
+            NO_API_KEYS: 'badge-critical',  // pragma: allowlist secret
         };
         const reasonWrap = el('div', 'detail-status-reason');
         const reasonBadge = el('span', 'badge ' + (REASON_CLASS[statusReason] || 'badge'),
@@ -907,11 +909,49 @@ function showDetail(item) {
         banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
         content.appendChild(banner);
     } else if (item.status === 'disabled') {
-        const reason = item.data.disabled_reason === 'no_api_keys_configured'
-            ? 'No API key configured for any provider in this chain. This is a deployment-time config state, not an outage. Add the relevant API keys to secrets.env to enable.'
-            : 'This call site is disabled.';
-        const banner = el('div', null, reason);
-        banner.style.cssText = 'background:rgba(136,136,136,0.15);color:#888;padding:6px 10px;border-radius:4px;font-size:11px;margin:8px 0;';
+        const banner = el('div', null);
+        banner.style.cssText = 'background:rgba(153,27,27,0.15);color:#fca5a5;padding:8px 10px;border-radius:4px;font-size:11px;margin:8px 0;line-height:1.5;';
+        if (item.data.disabled_reason === 'no_api_keys_configured') {
+            const intro = el('div', null,
+                'No API key configured for any provider in this chain. This is a deployment-time config state, not an outage — partial API-key configuration is the normal install state.');
+            banner.appendChild(intro);
+            // Enumerate missing env vars from chain_health
+            const chain = item.data.chain_health || [];
+            const missing = chain.filter(c => c.missing_env_var);
+            if (missing.length > 0) {
+                const list = el('div', null);
+                list.style.cssText = 'margin-top:6px;';
+                list.appendChild(el('div', null, 'Configure one of these in secrets.env to enable:'));
+                const ul = el('ul', null);
+                ul.style.cssText = 'margin:4px 0 0 0;padding-left:18px;';
+                missing.forEach(c => {
+                    const li = el('li', null);
+                    const code = el('code', null, c.missing_env_var || '');
+                    code.style.color = '#fde68a';
+                    li.appendChild(code);
+                    li.appendChild(document.createTextNode(
+                        ' — ' + (c.provider || '') + ' (' + (c.type || '') + ')',
+                    ));
+                    ul.appendChild(li);
+                });
+                list.appendChild(ul);
+                const note = el('div', null);
+                note.appendChild(document.createTextNode('Genesis also accepts '));
+                const alt1 = el('code', null, '<TYPE>_API_KEY');
+                note.appendChild(alt1);
+                note.appendChild(document.createTextNode(' or '));
+                const alt2 = el('code', null, '<TYPE>_API_TOKEN');
+                note.appendChild(alt2);
+                note.appendChild(document.createTextNode(
+                    ' if your install uses a different convention.',
+                ));
+                note.style.cssText = 'margin-top:6px;color:#a8a29e;font-size:10px;';
+                list.appendChild(note);
+                banner.appendChild(list);
+            }
+        } else {
+            banner.textContent = 'This call site is disabled.';
+        }
         content.appendChild(banner);
     }
     // Warning/failure details

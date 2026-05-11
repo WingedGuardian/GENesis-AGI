@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import logging
 import os
 import re
@@ -218,13 +219,19 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             profile=p.get("profile"),
         )
 
-        # Auto-disable providers with no API key configured.  Local
-        # providers (ollama, lmstudio) don't need keys.
+        # Keyless providers stay registered with has_api_key=False. The
+        # router treats them as down (same code path as a tripped
+        # breaker), and the snapshot surfaces them as "disabled" so the
+        # dashboard can show "NO API KEY CONFIGURED". Partial API-key
+        # configuration is the normal install state, not an error — call
+        # sites whose chain depends on keyless providers stay visible so
+        # users can see what they need to enable.
         if check_api_keys and not has_api_key(cfg):
-            disabled_providers.add(name)
-            disabled_provider_types[name] = cfg.provider_type
-            logger.info("Provider '%s' disabled: no API key configured", name)
-            continue
+            cfg = dataclasses.replace(cfg, has_api_key=False)
+            logger.info(
+                "Provider '%s' has no API key configured — staying registered as down",
+                name,
+            )
 
         providers[name] = cfg
 
@@ -232,7 +239,11 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
     call_sites: dict[str, CallSiteConfig] = {}
     for name, cs in (raw.get("call_sites") or {}).items():
         chain = cs["chain"]
-        # Filter out disabled providers from chain
+        # Chains stay intact — keyless providers are NOT filtered. The
+        # router skips them at routing time (treats them as down).
+        # disabled_providers is still filtered (explicit `enabled: false`
+        # in YAML is a deliberate user choice; chains referencing those
+        # providers would fail validation otherwise).
         chain = [p for p in chain if p not in disabled_providers]
         dispatch = _normalize_dispatch(cs.get("dispatch"), call_site_name=name)
 
@@ -241,7 +252,8 @@ def _parse(raw: dict, *, check_api_keys: bool = True) -> RoutingConfig:
             # spawn CC sessions directly.  An empty chain is valid for them.
             if dispatch != "cli":
                 logger.warning(
-                    "Call site '%s' has no enabled providers — all were disabled", name,
+                    "Call site '%s' has empty chain after `enabled: false` filter — dropping",
+                    name,
                 )
                 continue
             logger.info(

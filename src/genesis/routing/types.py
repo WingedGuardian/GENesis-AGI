@@ -47,6 +47,12 @@ class ProviderConfig:
     keep_alive: str | int | None = None
     enabled: bool = True
     profile: str | None = None
+    # False when no API key env var is configured for this provider.
+    # Set by the config loader at parse time. Router treats False as
+    # down-by-config (skip in chain walk, no LiteLLM call, no CB trip),
+    # mirroring the behaviour for a tripped breaker. Snapshot surfaces
+    # this so partially-configured installs see the state on the dashboard.
+    has_api_key: bool = True
 
 
 @dataclass(frozen=True)

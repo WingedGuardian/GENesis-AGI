@@ -97,6 +97,13 @@ async def run_eval(
         )
 
     provider_cfg = config.providers[provider_name]
+    if not provider_cfg.has_api_key:
+        raise ValueError(
+            f"provider '{provider_name}' has no API key configured — "
+            f"set API_KEY_{provider_cfg.provider_type.upper()} (or "
+            f"{provider_cfg.provider_type.upper()}_API_KEY / "
+            f"{provider_cfg.provider_type.upper()}_API_TOKEN) in secrets.env"
+        )
     delegate = LiteLLMDelegate(config)
 
     # Set up rate gate if provider has an RPM limit

@@ -199,6 +199,14 @@ class Router:
         for provider_name in chain:
             provider_cfg = self.config.providers[provider_name]
 
+            # Skip providers with no API key — treat as down-by-config.
+            # Same effect as a tripped CB: no LiteLLM call, no failure
+            # record, no CB trip. Partial API-key configuration is the
+            # normal install state on freshly-installed systems.
+            if not provider_cfg.has_api_key:
+                failed_providers.append(provider_name)
+                continue
+
             # Skip if circuit breaker is open
             cb = self.breakers.get(provider_name)
             if not cb.is_available():
