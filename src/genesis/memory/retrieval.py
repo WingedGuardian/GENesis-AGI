@@ -139,11 +139,9 @@ class HybridRetriever:
                 if mid not in qdrant_by_id:
                     qdrant_by_id[mid] = hit
 
-        # 2b. (Intent was classified up-front for source selection;
-        #     it's reused here for RRF bias in step 7 + event-calendar
-        #     temporal filtering below.)
-
-        # 2d. Event-calendar search (temporal queries)
+        # 2b. Event-calendar search (temporal queries)
+        # (Intent classified at the top of recall(); reused below for
+        # RRF bias in step 7 and for the temporal-marker check here.)
         event_memory_ids: list[str] = []
         if intent.category == "WHEN" or _has_temporal_markers(query):
             try:

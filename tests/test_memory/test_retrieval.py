@@ -311,6 +311,18 @@ async def test_explicit_source_overrides_intent(
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")
 @patch("genesis.memory.retrieval.qdrant_ops")
+async def test_unknown_source_raises(mock_qdrant, mock_crud, mock_links, _):
+    """Unknown source string still rejected after the source=None handling."""
+    retriever, _, _, _ = _build_retriever()
+    with pytest.raises(ValueError, match="source must be one of"):
+        await retriever.recall("anything", source="bogus", limit=5)
+
+
+@pytest.mark.asyncio
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
 async def test_recall_min_activation_filters(mock_qdrant, mock_crud, mock_links, _):
     retriever, _, _, _ = _build_retriever()
 
