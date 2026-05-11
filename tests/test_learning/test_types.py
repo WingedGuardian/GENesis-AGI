@@ -25,7 +25,17 @@ from genesis.learning.types import (
 def test_outcome_class_values():
     assert OutcomeClass.SUCCESS == "success"
     assert OutcomeClass.WORKAROUND_SUCCESS == "workaround_success"
+    assert OutcomeClass.CLASSIFICATION_FAILED == "classification_failed"
+    # 5 real outcomes + 1 error sentinel = 6
     assert len(OutcomeClass) == 6
+    real_outcomes = {
+        OutcomeClass.SUCCESS,
+        OutcomeClass.APPROACH_FAILURE,
+        OutcomeClass.CAPABILITY_GAP,
+        OutcomeClass.EXTERNAL_BLOCKER,
+        OutcomeClass.WORKAROUND_SUCCESS,
+    }
+    assert OutcomeClass.CLASSIFICATION_FAILED not in real_outcomes
 
 
 def test_triage_depth_ordering():
