@@ -319,12 +319,12 @@ call_sites:
     default_paid: true
     dispatch: cli
     cc_model: Sonnet
-  17_fresh_eyes_review:
+  17_executor_review:
     chain:
     - openrouter-deepseek-v4
     - openrouter-qwen36plus
     default_paid: true
-    description: "Task executor Gate 2 — cross-vendor quality review of deliverables"
+    description: "Task executor Gate 2 — cross-vendor quality review of deliverables. Renamed from 17_fresh_eyes_review 2026-05-10 (disambiguates from outreach pre-send check at 23_outreach_review)."
   # V4 placeholder: pre-reflection prompt engineering. Never wired. Reserved for
   # future adaptive-prompting work; remove if V4 design drops the feature.
   18_meta_prompting:
@@ -425,11 +425,12 @@ call_sites:
     - mistral-large-free
     - openrouter-free
     description: Draft content for various platforms
-  23_fresh_eyes_review:
+  23_outreach_review:
     chain:
     - gemini-free
     - groq-free
     - mistral-large-free
+    description: "Outreach pre-send cross-vendor review (free chain). Renamed from 23_fresh_eyes_review 2026-05-10 (disambiguates from executor Gate 2 at 17_executor_review)."
   36_code_auditor:
     chain:
     - kimi-k2.5
@@ -519,14 +520,16 @@ call_sites:
     - gemini-free
     default_paid: true
     description: Analyze CC version changes for impact on Genesis
-  email_triage:
+  outreach_email_triage:
     chain:
     - gemini-free
     - mistral-small-free
     - groq-free
     never_pays: true
-    description: "Email triage \u2014 Gemini-primary light filter for weekly email\
-      \ batch"
+    description: "Outreach email triage \u2014 Gemini-primary light filter for weekly\
+      \ email batch. Renamed from email_triage 2026-05-10 (disambiguates triage\
+      \ namespace; this is the outreach-domain triage, distinct from\
+      \ 29_retrospective_triage and 30_triage_calibration in the learning domain)."
   contribution_gate:
     chain:
     - claude-haiku

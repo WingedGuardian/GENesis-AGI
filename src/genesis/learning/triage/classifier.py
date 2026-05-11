@@ -46,7 +46,7 @@ class TriageClassifier:
 
         # 29_retrospective_triage — THE LIVE triage classifier (per-outcome depth).
         # NOT 2_triage (removed 2026-05-10), 30_triage_calibration (calibration rules),
-        # or email_triage (outreach domain). See _call_site_meta.py for the family map.
+        # or outreach_email_triage (outreach domain). See _call_site_meta.py for the family map.
         result = await self._router.route_call("29_retrospective_triage", messages)
 
         if not result.success or not result.content:

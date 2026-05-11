@@ -3,6 +3,13 @@
 Comprehensive audit of all 44 neural monitor call sites. Verified against
 live code traces, routing config, and last_run database records.
 
+**2026-05-10 update:** Tier 3 — confusable call-site IDs renamed.
+- `17_fresh_eyes_review` → `17_executor_review` (executor Gate 2).
+- `23_fresh_eyes_review` → `23_outreach_review` (outreach pre-send check).
+- `email_triage` → `outreach_email_triage` (disambiguates the triage namespace).
+- DB rows in `call_site_last_run` and `deferred_work_queue` are renamed by migration `0015_rename_confusable_call_sites`. `cost_events.metadata` historical entries are intentionally left as-written (audit log fidelity).
+- The old IDs survive only as `Renamed from …` annotations in `_call_site_meta.py` and this doc. Historical planning docs under `docs/plans/2026-03-*` reference the old names by design (snapshots in time).
+
 **2026-05-10 update:** Silent-drop fix for keyless call sites.
 - Partial API-key configuration is now treated as a first-class normal state, not a load-time filter condition. Previously, the config loader auto-disabled any provider whose API key env var was unset/empty AND filtered those providers out of every chain. Sites whose entire chain was keyless were dropped from `cfg.call_sites` entirely — invisible everywhere downstream (neural monitor, routing API, health snapshot). On a partially-configured install (the normal install state), this masked which sites were unreachable and what env vars would unblock them.
 - New behaviour: keyless providers stay registered in `cfg.providers` with `has_api_key=False`. The router skips them in chain walk the same way it skips a tripped breaker — no LiteLLM call, no failure record, no CB trip. The snapshot surfaces `has_api_key=False` + `missing_env_var` on each chain entry; when every entry in a chain is keyless, the site cascades to `status="disabled"` with `status_reason="NO_API_KEYS"`, rendered as a red badge in the neural monitor with a banner naming the env vars (`API_KEY_<TYPE>`) that would enable it.
@@ -62,7 +69,7 @@ runtime path.
 | `14_weekly_self_assessment` | Self-evaluation (CC/Sonnet) | Weekly |
 | `16_quality_calibration` | Output quality audit (CC/Sonnet) | Weekly |
 | `21_embeddings` | 1024-dim vectors for Qdrant | On memory write |
-| `23_fresh_eyes_review` | Outreach message cross-vendor review | Per outreach |
+| `23_outreach_review` | Outreach message cross-vendor review | Per outreach |
 | `29_retrospective_triage` | Re-evaluate past triage after outcome | Per outcome |
 | `30_triage_calibration` | Update triage rules (supersedes 15) | Weekly |
 | `31_outcome_classification` | Classify task outcomes for learning | Per outcome |
@@ -70,7 +77,7 @@ runtime path.
 | `35_content_draft` | Draft content for platforms | On demand |
 | `36_code_auditor` | Surplus codebase review | Idle time |
 | `cc_update_analysis` | Analyze CC version changes | On CC update |
-| `email_triage` | Weekly email batch filter | Per email batch |
+| `outreach_email_triage` | Weekly email batch filter | Per email batch |
 
 ## Partially Wired (5) — Code Exists, Not Yet Triggered
 
@@ -121,7 +128,7 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 | Site | Intended Purpose | Recommendation |
 |------|-----------------|----------------|
 | `10_cognitive_state` | LLM regeneration of cognitive state narrative | **Keep for V4** — note: cognitive state is *actively* maintained today via direct DB writes (`awareness/loop.py`, `cc/reflection_bridge*.py`); this YAML entry reserves the chain for the future LLM-summary feature, not the live mechanism |
-| `17_fresh_eyes_review` | Executor cross-vendor review (Gate 2, paid) | **Active** — distinct from 23_fresh_eyes (outreach, free) |
+| `17_executor_review` | Executor cross-vendor review (Gate 2, paid) | **Active** — distinct from `23_outreach_review` (outreach pre-send, free) |
 | `18_meta_prompting` | Pre-reflection prompt engineering | **Keep** for V4 adaptive prompting |
 | `22_tagging` | Entity extraction / metadata tagging | **Keep** for V4 knowledge graph |
 | `28_observation_sweep` | Environment change scanning | **Functionally replaced by awareness loop** signal collection (`awareness/loop.py:perform_tick`). Kept in YAML with comment; can remove on next sweep. |
@@ -140,7 +147,7 @@ ego-internal rolling-summary compaction — NOT Genesis-wide memory consolidatio
 
 | Pair | Distinction |
 |------|------------|
-| `17_fresh_eyes_review` vs `23_fresh_eyes_review` | 17 = autonomy executor (cross-vendor, paid). 23 = outreach message review (free). Different domains. |
+| `17_executor_review` vs `23_outreach_review` | 17 = autonomy executor (cross-vendor, paid). 23 = outreach message review (free). Different domains. |
 | `29_retrospective_triage` vs `30_triage_calibration` | 29 = re-evaluate past decisions (learning). 30 = update calibration rules. Both active. |
 
 ## Cleanup Recommendations

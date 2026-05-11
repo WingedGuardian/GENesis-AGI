@@ -410,10 +410,11 @@ class Router:
 
     # Map purpose strings to specific call sites.
     # Aliases: bookmark_enrichment routes through the 33_skill_refiner chain
-    # (no own chain in model_routing.yaml); email_triage is the canonical ID.
+    # (no own chain in model_routing.yaml); outreach_email_triage is the
+    # canonical ID (renamed from email_triage 2026-05-10).
     _PURPOSE_SITES: dict[str, str] = {
         "bookmark_enrichment": "33_skill_refiner",
-        "email_triage": "email_triage",
+        "outreach_email_triage": "outreach_email_triage",
     }
 
     async def route(

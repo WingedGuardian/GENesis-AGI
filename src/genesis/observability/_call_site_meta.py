@@ -28,10 +28,17 @@ Fields:
 # ─────────────────────────────────────────────────────────────────────────
 # CONFUSABLE-VOCABULARY MASTER CROSS-REFERENCE
 # ─────────────────────────────────────────────────────────────────────────
-# Multiple call sites share overloaded words ("triage", "task_retrospective",
-# "fresh_eyes_review", "ego_compaction"). The original numbering scheme
-# implied uniqueness — it doesn't. Below is the authoritative map. When
-# editing or grepping for these IDs, check here FIRST.
+# Multiple call sites share or shared overloaded words ("triage",
+# "task_retrospective", "fresh_eyes_review", "ego_compaction"). The
+# original numbering scheme implied uniqueness — it didn't.
+#
+# 2026-05-10 rename pass disambiguated the worst offenders:
+#   17_fresh_eyes_review  → 17_executor_review
+#   23_fresh_eyes_review  → 23_outreach_review
+#   email_triage          → outreach_email_triage
+#
+# Below is the authoritative map. When editing or grepping for these
+# IDs, check here FIRST.
 #
 # ── "triage" family (4 sites — only 3 wired) ────────────────────────────
 #
@@ -58,11 +65,13 @@ Fields:
 #   or in the live YAML.)
 #   Live caller: learning/triage/calibration.py:97
 #
-# email_triage [LIVE — separate domain]
+# outreach_email_triage [LIVE — separate domain]
 #   Weekly: light filter for the email batch, classifying by relevance and
 #   urgency to decide which deserve outreach attention. Different domain
 #   entirely (outreach, not learning); operates on emails, not interaction
 #   summaries. Gemini-primary free-only chain.
+#   Renamed from `email_triage` 2026-05-10 to disambiguate the triage
+#   namespace and lead with the outreach domain.
 #
 # ── "task_retrospective" family (2 sites — only 1 wired) ────────────────
 #
@@ -78,21 +87,27 @@ Fields:
 #   structured retrospective data feeding learning + ego context.
 #   Live caller: autonomy/executor/trace.py:24 (_CALL_SITE constant) and :202
 #
-# ── "fresh_eyes_review" family (2 sites — both live, different domains) ─
+# ── executor/outreach review pair (2 sites — both live, different domains) ─
 #
-# 17_fresh_eyes_review [LIVE — executor Gate 2, cross-vendor PAID]
+# Renamed 2026-05-10 from the `fresh_eyes_review` family (where both sites
+# shared the same descriptor). The ID now leads with the domain.
+#
+# 17_executor_review [LIVE — executor Gate 2, cross-vendor PAID]
 #   Per executor task verification: cross-vendor second-opinion review of
 #   task deliverables. Part of a 3-gate pipeline: (1) programmatic checks,
 #   (2) this site, (3) 20_adversarial_counterargument. Cross-vendor by
 #   design (different model family than the task author). PAID chain
 #   (DeepSeek V4 Pro + Qwen 3.6+ via OpenRouter).
-#   Live caller: autonomy/executor/review.py:31 (_CALL_SITE_FRESH constant)
+#   Live caller: autonomy/executor/review.py:37
+#                (_CALL_SITE_EXECUTOR_REVIEW constant)
+#   Renamed from: 17_fresh_eyes_review (2026-05-10)
 #
-# 23_fresh_eyes_review [LIVE — outreach pre-send check, FREE]
+# 23_outreach_review [LIVE — outreach pre-send check, FREE]
 #   Per outreach message draft: scores 1-5 ("would user appreciate this?").
 #   If score >= min_score (default 3.0), approved for send. Different
-#   question, different cost profile.
-#   Live caller: outreach/fresh_eyes.py:38
+#   question, different cost profile from 17_executor_review.
+#   Live caller: outreach/fresh_eyes.py:40
+#   Renamed from: 23_fresh_eyes_review (2026-05-10)
 #
 # ── "ego_compaction" namespace (1 routing site + 2 observability labels) ─
 #
@@ -216,21 +231,21 @@ _CALL_SITE_META: dict[str, dict] = {
         "cost_policy": "Cloud embedding API",
         "model_tier": "embedding",
     },
-    "23_fresh_eyes_review": {
-        "description": "Cross-vendor review of outreach messages before sending. Free chain (Gemini/Groq/Mistral). Scores 1-5; approves if >= min_score. Distinct from 17_fresh_eyes_review which is the executor's Gate 2 (paid chain).",
+    "23_outreach_review": {
+        "description": "Cross-vendor review of outreach messages before sending. Free chain (Gemini/Groq/Mistral). Scores 1-5; approves if >= min_score. Distinct from 17_executor_review which is the executor's Gate 2 (paid chain). Renamed from 23_fresh_eyes_review 2026-05-10.",
         "category": "assessment",
         "frequency": "Per outreach message",
         "model_tier": "slm",
         "status_reason": "WIRED",
-        "see_also": ["17_fresh_eyes_review"],
+        "see_also": ["17_executor_review"],
     },
     "29_retrospective_triage": {
-        "description": "THE LIVE triage classifier. Per interaction outcome, classifies an InteractionSummary into TriageDepth (0=SKIP through 4=FULL_PLUS_WORKAROUND). Output drives the learning pipeline depth. NOT to be confused with 2_triage (removed), 30_triage_calibration (calibration), or email_triage (outreach domain).",
+        "description": "THE LIVE triage classifier. Per interaction outcome, classifies an InteractionSummary into TriageDepth (0=SKIP through 4=FULL_PLUS_WORKAROUND). Output drives the learning pipeline depth. NOT to be confused with 2_triage (removed), 30_triage_calibration (calibration), or outreach_email_triage (outreach domain).",
         "category": "classification",
         "frequency": "Per outcome",
         "model_tier": "slm",
         "status_reason": "WIRED",
-        "see_also": ["2_triage", "30_triage_calibration", "email_triage"],
+        "see_also": ["2_triage", "30_triage_calibration", "outreach_email_triage"],
     },
     "30_triage_calibration": {
         "description": "Daily calibration of the 29_retrospective_triage classifier — reviews recent outputs for under/over-classification, regenerates TRIAGE_CALIBRATION.md few-shot examples and rules. Does NOT classify interactions itself; it tunes the classifier.",
@@ -238,7 +253,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "Weekly",
         "model_tier": "mid",
         "status_reason": "WIRED",
-        "see_also": ["2_triage", "29_retrospective_triage", "email_triage"],
+        "see_also": ["2_triage", "29_retrospective_triage", "outreach_email_triage"],
     },
     "31_outcome_classification": {
         "description": "Classifies task outcomes (success/partial/failure) for the learning and retrospective pipeline.",
@@ -276,8 +291,8 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "On CC update detection",
         "model_tier": "slm",
     },
-    "email_triage": {
-        "description": "Gemini-primary light filter for weekly email batch. Classifies emails by relevance and urgency. Outreach domain — distinct from the learning-pipeline triage sites (29_retrospective_triage, 30_triage_calibration).",
+    "outreach_email_triage": {
+        "description": "Gemini-primary light filter for weekly email batch. Classifies emails by relevance and urgency. Outreach domain — distinct from the learning-pipeline triage sites (29_retrospective_triage, 30_triage_calibration). Renamed from email_triage 2026-05-10 (disambiguates the triage namespace).",
         "category": "classification",
         "frequency": "Per email batch",
         "cost_policy": "Free only (never pays)",
@@ -340,7 +355,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
         "wired": False,
         "status_reason": "DEPRECATED_REMOVED",
-        "see_also": ["29_retrospective_triage", "30_triage_calibration", "email_triage"],
+        "see_also": ["29_retrospective_triage", "30_triage_calibration", "outreach_email_triage"],
     },
     "7_ego_cycle": {
         "description": "Persistent ego session — CLI-only dispatch with --resume continuity and MCP tool access.",
@@ -369,14 +384,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
         "status_reason": "WIRED_DIFFERENT_MECHANISM",
     },
-    "17_fresh_eyes_review": {
-        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: DeepSeek V4 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_fresh_eyes_review which is the outreach pre-send check (free chain).",
+    "17_executor_review": {
+        "description": "Cross-vendor quality review of executor deliverables (Gate 2 of the 3-gate executor verification pipeline). PAID chain: DeepSeek V4 Pro primary, Qwen 3.6+ fallback via OpenRouter. Distinct from 23_outreach_review which is the outreach pre-send check (free chain). Renamed from 17_fresh_eyes_review 2026-05-10.",
         "category": "assessment",
         "frequency": "Per task verification",
         "model_tier": "frontier",
         "wired": True,
         "status_reason": "WIRED",
-        "see_also": ["23_fresh_eyes_review"],
+        "see_also": ["23_outreach_review"],
     },
     "18_meta_prompting": {
         "description": "V4 placeholder. Pre-reflection prompt engineering. Never wired; reserved for future adaptive-prompting work. Remove from YAML if V4 design drops the feature.",
