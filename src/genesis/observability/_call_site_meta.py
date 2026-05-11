@@ -329,10 +329,10 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
     },
     "38_procedure_extraction": {
-        "description": "Extracts reusable procedures from successful interaction patterns. Part of the learning pipeline.",
+        "description": "Extracts reusable procedures from interaction outcomes (success path + failures). Part of the learning pipeline.",
         "category": "content",
         "frequency": "On demand",
-        "model_tier": "slm",
+        "model_tier": "mid",
     },
     "contingency_foreground": {
         "description": "API-based foreground conversation fallback when CC is rate-limited or unavailable.",

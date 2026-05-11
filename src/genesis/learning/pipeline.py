@@ -86,7 +86,15 @@ def build_triage_pipeline(
         delta = None
         if triage.depth >= TriageDepth.WORTH_THINKING:
             outcome = await outcome_classifier.classify(summary)
-            delta = await delta_assessor.assess(summary)
+            if outcome == OutcomeClass.CLASSIFICATION_FAILED:
+                logger.warning(
+                    "Outcome classification failed for session %s; "
+                    "skipping downstream learning (delta, attribution, extraction).",
+                    summary.session_id or "unknown",
+                )
+                outcome = None
+            else:
+                delta = await delta_assessor.assess(summary)
 
             # Log prediction for calibration (fire-and-forget)
             if outcome and runtime is not None:

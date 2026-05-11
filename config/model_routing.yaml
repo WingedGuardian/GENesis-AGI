@@ -407,9 +407,10 @@ call_sites:
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
+    - cerebras-qwen
+    - openrouter-deepseek-v4
     - groq-free
-    - mistral-large-free
-    - gemini-free
+    default_paid: true
     description: Extract reusable procedures from interaction outcomes
   43_task_retrospective:
     chain:
