@@ -17,7 +17,7 @@ async def test_all_tools_registered():
         "memory_recall", "memory_store", "memory_extract", "memory_proactive",
         "memory_core_facts", "memory_stats",
         "observation_write", "observation_query", "observation_resolve",
-        "evolution_propose",
+        "evolution_propose", "evolution_propose_review",
         "conversation_history",
         "knowledge_recall", "knowledge_ingest", "knowledge_status",
         "reference_store", "reference_lookup", "reference_delete",
@@ -942,6 +942,92 @@ async def test_evolution_propose_stores_pending():
             call_kwargs = mock_evo.create.call_args[1]
             assert call_kwargs["proposal_type"] == "soul_update"
             assert call_kwargs["rationale"] == "clarity"
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+
+
+# ─── evolution_propose_review tests ────────────────────────────────────────
+
+
+async def test_evolution_propose_review_requires_init():
+    tools = await _get_tools()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        await tools["evolution_propose_review"].fn(
+            proposal_id="abc", status="approved"
+        )
+
+
+async def test_evolution_propose_review_rejects_invalid_status():
+    """Invalid status returns error dict without touching the DB."""
+    import genesis.mcp.memory_mcp as mod
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = AsyncMock()
+        mod._db = AsyncMock()
+        mod._retriever = AsyncMock()
+        with patch("genesis.mcp.memory_mcp.evolution_proposals") as mock_evo:
+            tools = await _get_tools()
+            result = await tools["evolution_propose_review"].fn(
+                proposal_id="any", status="bogus"
+            )
+            assert "error" in result
+            assert "bogus" in result["error"]
+            mock_evo.update_status.assert_not_called()
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+
+
+async def test_evolution_propose_review_missing_proposal():
+    """Returns error when proposal_id doesn't exist."""
+    import genesis.mcp.memory_mcp as mod
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = AsyncMock()
+        mod._db = AsyncMock()
+        mod._retriever = AsyncMock()
+        with patch("genesis.mcp.memory_mcp.evolution_proposals") as mock_evo:
+            mock_evo.update_status = AsyncMock(return_value=False)
+            tools = await _get_tools()
+            result = await tools["evolution_propose_review"].fn(
+                proposal_id="missing-id", status="rejected"
+            )
+            assert "error" in result
+            assert "not found" in result["error"]
+            mock_evo.get.assert_not_called()
+    finally:
+        mod._store = old_store
+        mod._db = old_db
+        mod._retriever = old_retriever
+
+
+async def test_evolution_propose_review_updates_and_returns_row():
+    """Happy path: status transitions and updated row returned."""
+    import genesis.mcp.memory_mcp as mod
+
+    old_store, old_db, old_retriever = mod._store, mod._db, mod._retriever
+    try:
+        mod._store = AsyncMock()
+        mod._db = AsyncMock()
+        mod._retriever = AsyncMock()
+        with patch("genesis.mcp.memory_mcp.evolution_proposals") as mock_evo:
+            mock_evo.update_status = AsyncMock(return_value=True)
+            mock_evo.get = AsyncMock(return_value={
+                "id": "p-1", "status": "approved", "reviewed_at": "2026-05-10T21:00:00+00:00",
+            })
+            tools = await _get_tools()
+            result = await tools["evolution_propose_review"].fn(
+                proposal_id="p-1", status="approved"
+            )
+            assert result["id"] == "p-1"
+            assert result["status"] == "approved"
+            mock_evo.update_status.assert_called_once_with(mod._db, "p-1", "approved")
+            mock_evo.get.assert_called_once_with(mod._db, "p-1")
     finally:
         mod._store = old_store
         mod._db = old_db
