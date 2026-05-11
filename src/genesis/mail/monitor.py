@@ -257,7 +257,7 @@ class MailMonitor:
         """Run Gemini Flash paralegal. Returns (relevant, low_signal)."""
         prompt = self._build_paralegal_prompt(emails)
 
-        response = await self._router.route(prompt, purpose="email_triage")
+        response = await self._router.route(prompt, purpose="outreach_email_triage")
 
         briefs = self._parse_briefs(response, len(emails))
 

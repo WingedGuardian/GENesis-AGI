@@ -253,7 +253,7 @@ def build_triage_pipeline(
 
             # 29_retrospective_triage — observability record for the triage classifier call.
             # Same call site as classifier.py:47 (the LIVE triage). NOT 2_triage (removed),
-            # NOT 30_triage_calibration (rules update), NOT email_triage (outreach).
+            # NOT 30_triage_calibration (rules update), NOT outreach_email_triage (outreach).
             await record_last_run(
                 db,
                 call_site_id="29_retrospective_triage",

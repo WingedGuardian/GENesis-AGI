@@ -29,11 +29,12 @@ logger = logging.getLogger(__name__)
 
 # 27_pre_execution_assessment — sanity-checks executor plans before commit.
 #   Also used in autonomy/decomposer.py:23.
-# 17_fresh_eyes_review — executor Gate 2 (cross-vendor PAID review).
-#   Distinct from 23_fresh_eyes_review which is outreach's pre-send check (free).
+# 17_executor_review — executor Gate 2 (cross-vendor PAID review).
+#   Distinct from 23_outreach_review which is outreach's pre-send check (free).
+#   Renamed from 17_fresh_eyes_review 2026-05-10.
 # 20_adversarial_counterargument — executor Gate 3 (devil's-advocate challenge).
 _CALL_SITE_PLAN = "27_pre_execution_assessment"
-_CALL_SITE_FRESH = "17_fresh_eyes_review"
+_CALL_SITE_EXECUTOR_REVIEW = "17_executor_review"
 _CALL_SITE_ADVERSARIAL = "20_adversarial_counterargument"
 _MAX_RETRIES = 2
 
@@ -203,7 +204,7 @@ class TaskReviewer:
 
         # Gate 2 -- fresh-eyes review (API, enriched deliverable)
         fresh_eyes = await self._llm_review(
-            _CALL_SITE_FRESH, deliverable, requirements,
+            _CALL_SITE_EXECUTOR_REVIEW, deliverable, requirements,
         )
 
         # Gate 3 -- adversarial verification (tool-capable chain)
@@ -564,7 +565,7 @@ class TaskReviewer:
         deliverable: str,
         requirements: str,
     ) -> str:
-        is_fresh = call_site == _CALL_SITE_FRESH
+        is_fresh = call_site == _CALL_SITE_EXECUTOR_REVIEW
         role = (
             "an independent reviewer"
             if is_fresh

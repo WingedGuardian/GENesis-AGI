@@ -165,7 +165,7 @@ class TestVerifyDeliverable:
         calls = router.route_call.call_args_list
         for call in calls:
             site = call[0][0]
-            assert site not in ("17_fresh_eyes_review", "20_adversarial_counterargument")
+            assert site not in ("17_executor_review", "20_adversarial_counterargument")
 
     async def test_fails_programmatic_short_code(self) -> None:
         reviewer = TaskReviewer(router=_make_router("ignored"))
@@ -193,7 +193,7 @@ class TestVerifyDeliverable:
 
     async def test_fails_fresh_eyes(self) -> None:
         responses = {
-            "17_fresh_eyes_review": (True, json.dumps({"verdict": "fail", "issues": ["bad"]})),
+            "17_executor_review": (True, json.dumps({"verdict": "fail", "issues": ["bad"]})),
             "20_adversarial_counterargument": (True, json.dumps({"verdict": "pass"})),
         }
         reviewer = TaskReviewer(router=_make_multi_router(responses))
@@ -206,7 +206,7 @@ class TestVerifyDeliverable:
 
     async def test_fails_adversarial(self) -> None:
         responses = {
-            "17_fresh_eyes_review": (True, json.dumps({"verdict": "pass"})),
+            "17_executor_review": (True, json.dumps({"verdict": "pass"})),
             "20_adversarial_counterargument": (True, json.dumps({"verdict": "fail", "issues": ["flaw"]})),
         }
         reviewer = TaskReviewer(router=_make_multi_router(responses))
@@ -220,7 +220,7 @@ class TestVerifyDeliverable:
     async def test_amendment5_both_fail_skip_warning(self) -> None:
         """Amendment #5: both routing fail -> deliver with warning."""
         responses = {
-            "17_fresh_eyes_review": (False, None),
+            "17_executor_review": (False, None),
             "20_adversarial_counterargument": (False, None),
         }
         reviewer = TaskReviewer(router=_make_multi_router(responses))
@@ -235,7 +235,7 @@ class TestVerifyDeliverable:
 
     async def test_one_routing_fails_other_succeeds(self) -> None:
         responses = {
-            "17_fresh_eyes_review": (False, None),
+            "17_executor_review": (False, None),
             "20_adversarial_counterargument": (True, json.dumps({"verdict": "pass"})),
         }
         reviewer = TaskReviewer(router=_make_multi_router(responses))

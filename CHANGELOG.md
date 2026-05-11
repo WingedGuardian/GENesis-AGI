@@ -29,6 +29,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   --- when Genesis is degraded or disk-pressured, judge calls back
   off automatically, in line with the existing rules for non-critical
   background work.
+- **Confusable call-site IDs renamed.** Three IDs previously shared
+  overloaded descriptors that made the routing config ambiguous in
+  the neural monitor and source code:
+  `17_fresh_eyes_review` → `17_executor_review` (executor Gate 2),
+  `23_fresh_eyes_review` → `23_outreach_review` (outreach pre-send),
+  `email_triage` → `outreach_email_triage`. If you reference these
+  IDs in custom routing config, an eval CLI invocation, or a dashboard
+  bookmark, update to the new names. Migration `0015_rename_confusable_call_sites`
+  renames existing rows in `call_site_last_run` and `deferred_work_queue`
+  at server start; historical `cost_events.metadata` entries are left
+  as-written.
 
 ### Fixed
 

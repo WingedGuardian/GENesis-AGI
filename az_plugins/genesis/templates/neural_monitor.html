@@ -411,9 +411,9 @@ const SITE_META = {
         name: 'Quality Cal', desc: 'Audit recent outputs for quality regression',
         category: 'calibration', frequency: 'Weekly', costPolicy: 'CC background (Opus)',
     },
-    '17_fresh_eyes_review': {
-        name: 'Fresh Eyes', desc: 'Cross-vendor review of reasoning',
-        category: 'assessment', frequency: 'Per major decision', costPolicy: 'Paid (cross-vendor)',
+    '17_executor_review': {
+        name: 'Executor Review', desc: 'Cross-vendor review of executor deliverables (Gate 2)',
+        category: 'assessment', frequency: 'Per task verification', costPolicy: 'Paid (cross-vendor)',
     },
     '18_meta_prompting': {
         name: 'Meta Prompt', desc: 'Determine what expensive models should think about',
@@ -435,9 +435,9 @@ const SITE_META = {
         name: 'Tagging', desc: 'Entity extraction and metadata tagging',
         category: 'classification', frequency: 'Per input', costPolicy: 'Free primary',
     },
-    '23_fresh_eyes_review': {
-        name: 'Fresh Eyes 2', desc: 'Additional cross-vendor review of code decisions',
-        category: 'assessment', frequency: 'Per decision', costPolicy: 'Free primary',
+    '23_outreach_review': {
+        name: 'Outreach Review', desc: 'Outreach message pre-send cross-vendor review (free chain)',
+        category: 'assessment', frequency: 'Per outreach message', costPolicy: 'Free primary',
     },
     '27_pre_execution_assessment': {
         name: 'Pre-Exec', desc: 'Sanity check before task execution',
@@ -492,9 +492,9 @@ const RING_ASSIGNMENT = {
         '32_delta_assessment',
     ],
     periphery: [
-        '12_surplus_brainstorm', '13_morning_report', '17_fresh_eyes_review',
+        '12_surplus_brainstorm', '13_morning_report', '17_executor_review',
         '19_outreach_draft', '20_adversarial_counterargument', '21_embeddings',
-        '22_tagging', '23_fresh_eyes_review', '29_retrospective_triage',
+        '22_tagging', '23_outreach_review', '29_retrospective_triage',
         '33_skill_refiner', '34_research_synthesis', '35_content_draft',
     ],
 };
