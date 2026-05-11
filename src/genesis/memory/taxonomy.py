@@ -196,19 +196,17 @@ _KEYWORD_MAP: dict[str, tuple[str, str]] = {
     "approval gate": ("autonomy", "approval"),
     "protected path": ("autonomy", "protected_paths"),
     "adversarial review": ("autonomy", "adversarial_review"),
-    # dev_workflow wing (git ops, CI, PRs, worktrees, merges)
+    # dev_workflow wing (PRs, worktrees, CI, code review tooling). Kept
+    # narrow on purpose: bare "git commit"/"git push" etc. appear too often
+    # in operational memories (autonomy, infrastructure) and would steal
+    # those classifications via the earliest-position rule. The terms below
+    # are dev-workflow-specific.
     "pull request": ("dev_workflow", "pull_request"),
     "worktree": ("dev_workflow", "worktree"),
-    "merge conflict": ("dev_workflow", "git"),
-    "git commit": ("dev_workflow", "git"),
-    "git push": ("dev_workflow", "git"),
-    "git rebase": ("dev_workflow", "git"),
-    "git branch": ("dev_workflow", "git"),
     "github actions": ("dev_workflow", "ci"),
     "code review": ("dev_workflow", "review"),
     "ruff check": ("dev_workflow", "ci"),
     "greptile": ("dev_workflow", "review"),
-    "codex": ("dev_workflow", "review"),
     "ultrareview": ("dev_workflow", "review"),
     # research wing (external content, system reading, paper notes)
     "vllm": ("research", "external_systems"),
@@ -219,17 +217,20 @@ _KEYWORD_MAP: dict[str, tuple[str, str]] = {
     "research paper": ("research", "papers"),
     "arxiv": ("research", "papers"),
     "api documentation": ("research", "api_docs"),
-    # integrations wing (third-party providers, APIs we wire into)
+    # integrations wing (specific third-party services the user is wiring
+    # into projects). Deliberately omits "openai api" / "anthropic api"
+    # because those phrases overlap heavily with Genesis-internal routing
+    # provider discussions — those memories should stay in `routing`.
     "minimax": ("integrations", "providers"),
     "abacus ai": ("integrations", "providers"),
     "litellm": ("integrations", "providers"),
     "openrouter": ("integrations", "providers"),
-    "anthropic api": ("integrations", "providers"),
-    "openai api": ("integrations", "providers"),
     "conway": ("integrations", "third_party_apis"),
     "composio": ("integrations", "third_party_apis"),
-    # career wing (job search, profile, applications)
-    "resume": ("career", "applications"),
+    # career wing. "resume" intentionally omitted as a content keyword —
+    # it collides with "resume the session", "resume crawling", etc. —
+    # career classifications via this word should come through the
+    # `resume` tag instead (handled in _TAG_WING_MAP below).
     "cv revision": ("career", "applications"),
     "profile.yml": ("career", "profile"),
     "job application": ("career", "applications"),
