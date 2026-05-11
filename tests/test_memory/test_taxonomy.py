@@ -1,11 +1,73 @@
 """Tests for memory taxonomy classifier."""
 
+import pytest
+
 from genesis.memory.taxonomy import (
     ROOMS,
     WINGS,
     classify,
     detect_wing_from_prompt,
 )
+
+
+class TestUserWorkWings:
+    """The 4 user-work wings added 2026-05-11. Verify classification works
+    for the cluster categories that previously polluted general/uncategorized.
+    """
+
+    @pytest.mark.parametrize(
+        ("content", "expected_wing"),
+        [
+            # dev_workflow
+            ("Opened a pull request to upstream", "dev_workflow"),
+            ("Cleaning up the worktree after merge", "dev_workflow"),
+            ("GitHub Actions failing on macOS runner", "dev_workflow"),
+            ("Ran ruff check and fixed lint issues", "dev_workflow"),
+            ("Greptile review surfaced two findings", "dev_workflow"),
+            # research
+            ("Reading the vLLM paper on continuous batching", "research"),
+            ("Latent Space newsletter on AI engineering", "research"),
+            ("Skimmed the latest agent zero release notes", "research"),
+            ("Honcho session memory benchmark", "research"),
+            # integrations
+            ("Wiring MiniMax video API into the pipeline", "integrations"),
+            ("Abacus AI training run failed", "integrations"),
+            ("Switched to LiteLLM for fallback routing", "integrations"),
+            # career
+            ("Tweaked profile.yml for the new role", "career"),
+            ("Drafted job application cover letter", "career"),
+            ("CareerOps pipeline broken on the conduit", "career"),
+        ],
+    )
+    def test_new_wing_classification(self, content: str, expected_wing: str):
+        result = classify(content)
+        assert result.wing == expected_wing, (
+            f"Expected {expected_wing!r} for {content!r}, got {result.wing!r}/{result.room!r}"
+        )
+
+    def test_new_wings_registered(self):
+        for wing in ("dev_workflow", "research", "integrations", "career"):
+            assert wing in WINGS, f"{wing} missing from WINGS frozenset"
+            assert wing in ROOMS, f"{wing} missing from ROOMS dict"
+            assert ROOMS[wing], f"{wing} has empty room list"
+
+    def test_provider_tag_still_routes_to_routing(self):
+        """Regression guard: adding the integrations wing must not steal the
+        'provider' tag from the routing wing — Genesis-internal model
+        providers should still route to `routing`.
+        """
+        result = classify(
+            "config tweak", tags=["provider", "deepinfra"], source_pipeline="",
+        )
+        assert result.wing == "routing"
+
+    def test_detect_wing_dev_workflow_from_prompt(self):
+        wing = detect_wing_from_prompt("I'm working on a pull request review")
+        assert wing == "dev_workflow"
+
+    def test_detect_wing_career_from_prompt(self):
+        wing = detect_wing_from_prompt("Update my CareerOps profile and ATS integration")
+        assert wing == "career"
 
 
 class TestClassify:
