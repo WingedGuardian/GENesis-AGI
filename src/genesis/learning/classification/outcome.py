@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
 from typing import Any, Protocol
 
 from genesis.learning.types import InteractionSummary, OutcomeClass
+
+logger = logging.getLogger(__name__)
 
 
 class _Router(Protocol):
@@ -47,13 +50,21 @@ class OutcomeClassifier:
             "Classify the following interaction into exactly one outcome class.",
             "",
             "## Outcome Classes",
-            "- success: task completed as requested",
+            "- success: ALL requested goals were achieved",
             "- approach_failure: wrong approach used, could have done better",
             "- capability_gap: Genesis lacks the ability to complete the task."
             " REQUIRES exhaustion evidence — must have tried alternatives and failed.",
             "- external_blocker: an external system prevented completion."
             " REQUIRES exhaustion evidence — must have tried alternatives and failed.",
             "- workaround_success: primary approach failed but an alternative worked",
+            "",
+            "## Goal Validation",
+            "Before classifying, explicitly identify:",
+            "1. What specific outcomes did the user request? (list each discrete goal)",
+            "2. Which goals were achieved? Which were NOT achieved?",
+            "3. If ANY requested goal was not achieved, the outcome CANNOT be 'success'.",
+            "   Partial completion (e.g. 3/4 URLs fetched) → 'approach_failure' or",
+            "   'workaround_success', never 'success'.",
             "",
         ]
 
@@ -70,7 +81,12 @@ class OutcomeClassifier:
             f"User: {summary.user_text}",
             f"Response: {summary.response_text}",
             "",
-            'Respond with JSON: {"outcome": "<class_name>", "rationale": "<brief reason>"}',
+            "Respond with JSON:",
+            '{"goals_identified": ["goal1", "goal2"],'
+            ' "goals_achieved": ["goal1"],'
+            ' "goals_failed": ["goal2"],'
+            ' "outcome": "<class_name>",'
+            ' "rationale": "<brief reason>"}',
         ])
 
         return "\n".join(parts)
@@ -89,6 +105,19 @@ class OutcomeClassifier:
 
         if data is not None:
             outcome_str = str(data.get("outcome", "")).lower().strip()
+
+            # Hard gate: if the LLM identified failed goals but still
+            # classified as "success", override.  Partial completion is
+            # approach_failure, never success.
+            goals_failed = data.get("goals_failed")
+            if goals_failed and outcome_str == "success":
+                logger.warning(
+                    "Outcome hard gate: %d goal(s) failed but classified "
+                    "as success — overriding to approach_failure",
+                    len(goals_failed),
+                )
+                return OutcomeClass.APPROACH_FAILURE
+
             with contextlib.suppress(ValueError):
                 return OutcomeClass(outcome_str)
 

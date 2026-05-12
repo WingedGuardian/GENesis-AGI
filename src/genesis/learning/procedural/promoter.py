@@ -4,7 +4,7 @@ Evaluates all active procedures for tier changes based on confidence and
 success/failure history. Runs as a scheduled background job (hourly).
 
 Promotion thresholds:
-  L4 → L3: success_count >= 3 AND confidence >= 0.65 AND speculative = 0
+  L4 → L3: success_count >= 3 AND confidence >= 0.65
   L3 → L2: success_count >= 5 AND confidence >= 0.75
   L2 → L1: success_count >= 8 AND confidence >= 0.85 AND tool_trigger set
 
@@ -53,7 +53,6 @@ def _compute_tier(row: dict) -> str:
     """
     s = row["success_count"]
     conf = row["confidence"]
-    spec = row.get("speculative", 1)
     has_trigger = bool(row.get("tool_trigger"))
     current = row.get("activation_tier") or "L4"
 
@@ -62,7 +61,7 @@ def _compute_tier(row: dict) -> str:
         qualified = "L1"
     elif s >= 5 and conf >= 0.75:
         qualified = "L2"
-    elif s >= 3 and conf >= 0.65 and spec == 0:
+    elif s >= 3 and conf >= 0.65:
         qualified = "L3"
 
     # Promote-only: never demote via metrics drift.
