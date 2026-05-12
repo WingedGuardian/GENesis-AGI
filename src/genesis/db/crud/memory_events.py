@@ -128,17 +128,11 @@ async def approaching_deadlines(
     days: int = 7,
     limit: int = 10,
 ) -> list[dict]:
-    """Query events approaching within N days (user-world only)."""
-    cursor = await db.execute(
-        "SELECT * FROM memory_events "
-        "WHERE event_date >= datetime('now') "
-        "AND event_date <= datetime('now', ?) "
-        "AND subject != 'Genesis' "
-        "AND subject != 'code review' "
-        "ORDER BY event_date ASC LIMIT ?",
-        (f"+{days} days", limit),
-    )
-    return [dict(r) for r in await cursor.fetchall()]
+    """Query events approaching within N days (user-world only).
+
+    Thin wrapper over upcoming_user_events with tighter defaults.
+    """
+    return await upcoming_user_events(db, days=days, limit=limit)
 
 
 async def get_memory_ids_in_range(

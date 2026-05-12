@@ -21,7 +21,8 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-# Observation categories that represent user-world signals
+# Observation categories that represent user-world signals.
+# Used by GenesisEgoContextBuilder to EXCLUDE these from its system-focused view.
 _USER_WORLD_CATEGORIES = frozenset({
     "email_recon", "inbox", "finding", "interest", "interests",
     "contribution", "user_model_delta",
@@ -391,55 +392,6 @@ class UserEgoContextBuilder:
             "\nThese show what the user is actively working on. "
             "Unfinished threads are opportunities to help.\n"
         )
-        return "\n".join(lines)
-
-    async def _user_world_observations_section(self) -> str:
-        """External signals — email, inbox, findings."""
-        lines = ["## User-World Signals (last 7 days, max 15)\n"]
-
-        try:
-            # Build category filter — match exact user-world categories
-            # plus composite relevance tags ending in :user or :both
-            placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
-            cursor = await self._db.execute(
-                f"SELECT source, type, category, content, priority, created_at "
-                f"FROM observations "
-                f"WHERE resolved = 0 "
-                f"AND (category IN ({placeholders}) "
-                f"     OR category LIKE '%:user' "
-                f"     OR category LIKE '%:both') "
-                f"AND created_at >= datetime('now', '-7 days') "
-                f"ORDER BY "
-                f"  CASE priority "
-                f"    WHEN 'critical' THEN 0 "
-                f"    WHEN 'high' THEN 1 "
-                f"    WHEN 'medium' THEN 2 "
-                f"    ELSE 3 "
-                f"  END, "
-                f"  created_at DESC "
-                f"LIMIT 15",
-                tuple(_USER_WORLD_CATEGORIES),
-            )
-            rows = await cursor.fetchall()
-        except Exception:
-            logger.error("Failed to query user-world observations", exc_info=True)
-            lines.append("*Could not query user-world observations.*\n")
-            return "\n".join(lines)
-
-        if not rows:
-            lines.append("*No user-world observations in last 7 days.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"**{len(rows)} signals** (sorted by priority):\n")
-        for source, obs_type, category, content, priority, _created_at in rows:
-            short = content[:200] + "..." if len(content) > 200 else content
-            short = short.replace("\n", " ")
-            cat_str = f"/{category}" if category else ""
-            lines.append(
-                f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
-            )
-
-        lines.append("")
         return "\n".join(lines)
 
     async def _backlog_summary_section(self) -> str:

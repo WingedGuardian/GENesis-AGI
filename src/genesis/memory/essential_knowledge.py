@@ -279,24 +279,18 @@ async def _upcoming_events(
 ) -> list[str]:
     """Get upcoming user-world events from the SVO event calendar.
 
-    Filters out system events (subject='Genesis') to focus on user-world
-    events like conferences, deadlines, and applications.
+    Reuses the memory_events CRUD for consistent filtering (excludes
+    system events, caps at N days).
     """
     try:
-        now_iso = datetime.now(UTC).isoformat()
-        cursor = await db.execute(
-            "SELECT subject, verb, object, event_date "
-            "FROM memory_events "
-            "WHERE event_date >= ? "
-            "AND subject != 'Genesis' "
-            "AND subject != 'code review' "
-            "ORDER BY event_date ASC LIMIT 10",
-            (now_iso,),
-        )
-        rows = await cursor.fetchall()
+        from genesis.db.crud import memory_events
+        rows = await memory_events.upcoming_user_events(db, days=days, limit=10)
         results = []
         for row in rows:
-            subj, verb, obj, date = row[0], row[1], row[2] or "", row[3]
+            subj = row.get("subject", "?")
+            verb = row.get("verb", "?")
+            obj = row.get("object") or ""
+            date = row.get("event_date") or ""
             date_short = date[:10] if date else "?"
             results.append(f"[{date_short}] {subj} {verb} {obj}".strip())
         return results
