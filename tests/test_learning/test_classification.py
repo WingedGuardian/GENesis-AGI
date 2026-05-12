@@ -103,13 +103,15 @@ class TestOutcomeClassifier:
     async def test_classify_fallback_on_failure(self):
         router = _mock_router("", success=False)
         result = await OutcomeClassifier(router).classify(_make_summary())
-        assert result == OutcomeClass.UNKNOWN
+        assert result == OutcomeClass.CLASSIFICATION_FAILED
 
     @pytest.mark.asyncio
     async def test_classify_fallback_on_bad_json(self):
         router = _mock_router("not json at all")
         result = await OutcomeClassifier(router).classify(_make_summary())
-        assert result == OutcomeClass.SUCCESS
+        # Parse failure is an error state, not silent SUCCESS — previously this
+        # asserted SUCCESS, which masked real classification failures.
+        assert result == OutcomeClass.CLASSIFICATION_FAILED
 
     @pytest.mark.asyncio
     async def test_classify_extracts_json_from_markdown(self):
@@ -124,8 +126,8 @@ class TestOutcomeClassifier:
         await c.classify(_make_summary())
         prompt = router.route_call.call_args[0][1][0]["content"]
         for cls in OutcomeClass:
-            if cls == OutcomeClass.UNKNOWN:
-                continue  # UNKNOWN is an internal sentinel, not a valid LLM classification
+            if cls == OutcomeClass.CLASSIFICATION_FAILED:
+                continue  # Internal sentinel, never returned by the LLM
             assert cls.value in prompt
 
     @pytest.mark.asyncio

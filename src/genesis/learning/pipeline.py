@@ -86,7 +86,20 @@ def build_triage_pipeline(
         delta = None
         if triage.depth >= TriageDepth.WORTH_THINKING:
             outcome = await outcome_classifier.classify(summary)
-            delta = await delta_assessor.assess(summary)
+            if outcome == OutcomeClass.CLASSIFICATION_FAILED:
+                # CLASSIFICATION_FAILED is an error sentinel, not a real
+                # outcome. The execution_traces.outcome_class CHECK constraint
+                # does not allow this value — by setting outcome to None here,
+                # all downstream guards short-circuit and nothing tries to
+                # serialize the sentinel to the DB.
+                logger.warning(
+                    "Outcome classification failed for session %s; "
+                    "skipping downstream learning (delta, attribution, extraction).",
+                    summary.session_id or "unknown",
+                )
+                outcome = None
+            else:
+                delta = await delta_assessor.assess(summary)
 
             # Log prediction for calibration (fire-and-forget)
             if outcome and runtime is not None:

@@ -133,6 +133,43 @@ class TestTriagePipeline:
         da.assess.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_classification_failed_skips_downstream(self, db):
+        """When the classifier returns CLASSIFICATION_FAILED, the pipeline must
+        skip delta assessment, attribution routing, autonomy adaptation, and
+        procedure extraction — but still run debrief parsing (which is
+        classification-independent).
+        """
+        oc = _make_outcome_classifier(OutcomeClass.CLASSIFICATION_FAILED)
+        da = _make_delta_assessor()
+        ow = MagicMock()
+        ow.write = AsyncMock(return_value="obs-1")
+        router = MagicMock()
+        router.route_call = AsyncMock()
+        pipeline = build_triage_pipeline(
+            db=db,
+            triage_classifier=_make_triage_classifier(TriageDepth.FULL_ANALYSIS),
+            outcome_classifier=oc,
+            delta_assessor=da,
+            observation_writer=ow,
+            router=router,
+        )
+        text_with_learnings = (
+            "response\n## Learnings\n- something\n- else"
+        )
+        await pipeline(FakeCCOutput(text=text_with_learnings), "q", "terminal")
+
+        oc.classify.assert_awaited_once()
+        # Delta assessment must NOT fire — classifier failed
+        da.assess.assert_not_awaited()
+        # Procedure extraction routes through router — must NOT fire
+        router.route_call.assert_not_awaited()
+        # Debrief parsing is independent — should still write learnings
+        learning_calls = [
+            c for c in ow.write.call_args_list if c[1].get("source") == "cc_debrief"
+        ]
+        assert len(learning_calls) == 2
+
+    @pytest.mark.asyncio
     async def test_writes_observation_at_full_analysis(self, db):
         """Pipeline writes observation at depth >= FULL_ANALYSIS."""
         ow = MagicMock()

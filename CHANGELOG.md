@@ -75,6 +75,15 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- **Procedure extraction routes to stronger models.** The
+  `38_procedure_extraction` call site chain is now
+  `cerebras-qwen` (Qwen 3 235B, free) →
+  `openrouter-deepseek-v4` (V4 Pro, paid) →
+  `groq-free` (Llama 3.3 70B). Mistral Large and Gemini Flash are
+  dropped — Mistral underperformed for this synthesis task and Gemini
+  Flash is too small. DeepSeek V4 Pro is enabled via `default_paid:
+  true`; at the realistic event-driven frequency of this call site,
+  the spend is negligible.
 - **`judge` call site is in the L2 / tmp-pressure-high skip lists**
   --- when Genesis is degraded or disk-pressured, judge calls back
   off automatically, in line with the existing rules for non-critical
@@ -93,6 +102,18 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Fixed
 
+- **Outcome classifier no longer silently claims SUCCESS on parse
+  failure.** When the LLM response was unparseable, the classifier
+  previously returned `OutcomeClass.SUCCESS`, which let bad runs
+  silently update autonomy weights and skip procedure extraction.
+  Failed classifications now return a dedicated `CLASSIFICATION_FAILED`
+  sentinel; the learning pipeline detects it after the classifier call
+  and skips downstream learning (delta assessment, attribution
+  routing, procedure extraction, steering rule capture) instead of
+  proceeding with phantom success. The sentinel renames the internal
+  `OutcomeClass.UNKNOWN` value to make its role as an error marker
+  explicit (it was never a real 6th outcome category, just a fallback
+  bucket).
 - **Call sites with no API key stay visible on the dashboard.**
   Previously, a call site whose entire provider chain had no API key
   configured was silently dropped from `cfg.call_sites` at startup,

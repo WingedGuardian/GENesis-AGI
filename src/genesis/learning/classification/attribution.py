@@ -109,7 +109,7 @@ async def route_learning_signals(
             actions["user_revised_scope"] = "tracked"
 
     # Create speculative claims for low-confidence patterns (hypothesis for later validation)
-    if delta.evidence and outcome not in (OutcomeClass.SUCCESS, OutcomeClass.UNKNOWN):
+    if delta.evidence and outcome not in (OutcomeClass.SUCCESS, OutcomeClass.CLASSIFICATION_FAILED):
         try:
             from datetime import timedelta
 

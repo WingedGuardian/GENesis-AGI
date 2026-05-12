@@ -18,7 +18,9 @@ class OutcomeClass(StrEnum):
     CAPABILITY_GAP = "capability_gap"
     EXTERNAL_BLOCKER = "external_blocker"
     WORKAROUND_SUCCESS = "workaround_success"
-    UNKNOWN = "unknown"
+    # Sentinel for classifier errors (router failure, parse failure). NOT a
+    # 6th outcome category — downstream pipeline treats this as a skip signal.
+    CLASSIFICATION_FAILED = "classification_failed"
 
 
 class TriageDepth(IntEnum):

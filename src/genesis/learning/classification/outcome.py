@@ -35,7 +35,7 @@ class OutcomeClassifier:
         result = await self._router.route_call(_CALL_SITE, messages)
 
         if not result.success or not result.content:
-            return OutcomeClass.UNKNOWN
+            return OutcomeClass.CLASSIFICATION_FAILED
 
         return self._parse_response(result.content)
 
@@ -92,4 +92,7 @@ class OutcomeClassifier:
             with contextlib.suppress(ValueError):
                 return OutcomeClass(outcome_str)
 
-        return OutcomeClass.SUCCESS
+        # Parse failed: response was non-empty but unusable. This is an error
+        # state, not a success — returning SUCCESS here previously caused silent
+        # false-positive autonomy updates and procedure-extraction skips.
+        return OutcomeClass.CLASSIFICATION_FAILED
