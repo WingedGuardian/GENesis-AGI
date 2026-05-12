@@ -88,6 +88,7 @@ class MemoryStore:
         room: str | None = None,
         force_fts5_only: bool = False,
         valid_at: str | None = None,
+        invalid_at: str | None = None,
         source_subsystem: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
@@ -120,6 +121,17 @@ class MemoryStore:
         if gate_msg:
             logger.info("Memory confidence gate: %s", gate_msg)
         if gated:
+            force_fts5_only = True
+
+        # Phase 1.5e: automated-subsystem writes (ego corrections, triage
+        # signals, reflection observations) bypass Qdrant entirely. They
+        # have no current vector-search consumer — default recall filters
+        # them out everywhere; explicit `only_subsystem` paths already work
+        # via FTS5 alone (verified on prod 2026-05-11). Skipping the embed
+        # also avoids queuing for retry — these writes are permanently
+        # FTS5+metadata only, not "embed when capacity returns."
+        is_subsystem_write = source_subsystem is not None
+        if is_subsystem_write:
             force_fts5_only = True
 
         memory_id = str(uuid.uuid4())
@@ -226,24 +238,34 @@ class MemoryStore:
             collection=resolved_collection,
         )
 
-        # Write companion metadata (timestamps, confidence, embedding status)
+        # Write companion metadata (timestamps, confidence, embedding status).
+        # Subsystem writes get embedding_status='fts5_only' to distinguish them
+        # from confidence-gated 'pending' rows that should be retried later.
+        if is_subsystem_write:
+            embed_status = "fts5_only"
+        elif embedding_ok:
+            embed_status = "embedded"
+        else:
+            embed_status = "pending"
         await memory_crud.create_metadata(
             self._db,
             memory_id=memory_id,
             created_at=now_iso,
             collection=resolved_collection,
             confidence=confidence,
-            embedding_status="embedded" if embedding_ok else "pending",
+            embedding_status=embed_status,
             memory_class=resolved_class,
             wing=wing,
             room=room,
             valid_at=valid_at,
+            invalid_at=invalid_at,
             source_subsystem=source_subsystem,
         )
 
-        if not embedding_ok:
+        if not embedding_ok and not is_subsystem_write:
             # Queue for later embedding — preserve provenance so the recovery
             # worker can reconstruct the full Qdrant payload.
+            # Subsystem writes are FTS5-only permanently, never queue.
             await pending_embeddings.create(
                 self._db,
                 id=str(uuid.uuid4()),
@@ -273,8 +295,10 @@ class MemoryStore:
                     f"Embedding unavailable, memory {memory_id} stored FTS5-only",
                     memory_id=memory_id,
                 )
-        elif auto_link and self._linker:
+        elif embedding_ok and auto_link and self._linker:
             await self._linker.auto_link(memory_id, vector, collection=resolved_collection)
+        # else: subsystem write — no pending_embeddings, no auto_link
+        # (vector wasn't computed; link graph isn't consumed for filtered content)
 
         return memory_id
 

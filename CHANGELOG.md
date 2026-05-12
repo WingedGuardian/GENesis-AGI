@@ -9,6 +9,39 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Automated-subsystem memory writes no longer get embedded into
+  Qdrant.** Ego corrections, triage signals, and reflection
+  observations now land in SQLite (`memory_metadata` + FTS5) only.
+  They were already filtered out of foreground recall by default
+  (see prior changelog entry); the only paths that surface them are
+  explicit opt-ins (`only_subsystem=...` or `include_subsystem=...`),
+  and those work via FTS5 keyword search — no Qdrant vector index
+  needed. This avoids paying ongoing embedding + storage cost for
+  capability that has no live consumer. New writes never touch
+  Qdrant; the included one-off script
+  `scripts/cleanup_subsystem_qdrant.py` (dry-run by default) cleans
+  legacy points from existing installs.
+
+### Fixed
+
+- **`memory_metadata.invalid_at` is now actually honored at recall
+  time.** The bitemporal "fact stopped being true at X" column was
+  schema-only since the v3.0a bitemporal migration — writes were
+  possible (`invalidate_memory()`) but recall never read the value.
+  Recall now always filters `invalid_at IS NULL OR invalid_at > now()`
+  across FTS5, Qdrant, and drift paths. Rows past their expiry no
+  longer surface. Backwards-compatible: every legacy row has NULL
+  `invalid_at`, which passes the filter unchanged.
+- **Observation TTL now applies to the dual-write memory copy.**
+  `ObservationWriter` propagates each observation's `expires_at` as
+  `invalid_at` on the linked `memory_metadata` row. Previously the
+  observation expired from the `observations` table (via the
+  scheduled `resolve_expired` sweep) but its embedded MemoryStore
+  copy persisted forever — silently leaking expired content into
+  recall under the few code paths that bypassed default filtering.
+
 ### Added
 
 - **Foreground recall excludes automated-subsystem content by

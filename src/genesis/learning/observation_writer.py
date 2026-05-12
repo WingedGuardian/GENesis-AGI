@@ -55,6 +55,7 @@ class _MemoryStore(Protocol):
         auto_link: bool = ...,
         source_pipeline: str | None = ...,
         source_subsystem: str | None = ...,
+        invalid_at: str | None = ...,
     ) -> str: ...
 
 
@@ -133,6 +134,11 @@ class ObservationWriter:
 
         if self._memory_store is not None and type not in _SKIP_EMBED_TYPES:
             subsystem = _SUBSYSTEM_FROM_SOURCE.get(source)
+            # Phase 1.5e: propagate the observation's TTL to the MemoryStore
+            # copy. When the observation expires (`resolve_expired()` sweep
+            # at runtime/init/learning.py), the dual-write memory row also
+            # drops out of recall via the always-on invalid_at filter.
+            # Without this, the memory row would persist forever.
             try:
                 await self._memory_store.store(
                     content,
@@ -142,6 +148,7 @@ class ObservationWriter:
                     confidence=0.6,
                     source_pipeline=source,
                     source_subsystem=subsystem,
+                    invalid_at=expires_at,
                 )
             except Exception:
                 logger.warning("memory store write failed for observation %s", obs_id, exc_info=True)

@@ -118,6 +118,36 @@ def _rrf_fuse(
     return scores
 
 
+async def _expired_candidate_ids(
+    db: aiosqlite.Connection,
+    candidate_ids: set[str],
+    *,
+    as_of: str | None = None,
+) -> set[str]:
+    """Return the subset of ``candidate_ids`` whose ``invalid_at <= as_of``.
+
+    Bitemporal post-filter for the Qdrant + event-calendar paths. The
+    FTS5 path filters in-SQL via ``search_ranked``; this batched lookup
+    catches candidates that entered the union from Qdrant vector search
+    or the event calendar (neither sees ``memory_metadata.invalid_at``).
+
+    NULL ``invalid_at`` is "valid forever" — never expired.
+    """
+    if not candidate_ids:
+        return set()
+    if as_of is None:
+        as_of = datetime.now(UTC).isoformat()
+    placeholders = ",".join("?" * len(candidate_ids))
+    sql = (
+        f"SELECT memory_id FROM memory_metadata "
+        f"WHERE memory_id IN ({placeholders}) "
+        f"AND invalid_at IS NOT NULL AND invalid_at <= ?"
+    )
+    cursor = await db.execute(sql, (*candidate_ids, as_of))
+    rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+
 class HybridRetriever:
     """Hybrid retrieval: Qdrant vectors + FTS5 text + activation scoring, fused via RRF."""
 
@@ -288,6 +318,30 @@ class HybridRetriever:
         all_ids = set(qdrant_by_id) | set(fts_by_id) | set(event_memory_ids)
         if not all_ids:
             return []
+
+        # 4b. Phase 1.5e: drop candidates past their bitemporal invalid_at.
+        # FTS5 already filtered (search_ranked has SQL WHERE on invalid_at);
+        # Qdrant and the event calendar don't see invalid_at, so a batched
+        # lookup here catches their candidates before we waste activation/
+        # link computation on expired rows.
+        # Wrapped in try/except: a DB failure here should degrade to
+        # "no expiry filter applied" rather than crash the entire recall.
+        try:
+            expired = await _expired_candidate_ids(self._db, all_ids)
+        except Exception:
+            logger.warning(
+                "invalid_at filter failed, returning unfiltered candidates",
+                exc_info=True,
+            )
+            expired = set()
+        if expired:
+            all_ids -= expired
+            for mid in expired:
+                qdrant_by_id.pop(mid, None)
+                fts_by_id.pop(mid, None)
+            event_memory_ids = [m for m in event_memory_ids if m not in expired]
+            if not all_ids:
+                return []
 
         # 5. Compute activation scores
         now_str = datetime.now(UTC).isoformat()

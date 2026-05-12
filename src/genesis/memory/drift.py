@@ -322,6 +322,25 @@ async def drift_recall(
 
     fused_scores = _rrf_fuse(ranked_lists)
 
+    # Phase 1.5e: drop candidates past their bitemporal invalid_at.
+    # Both _global_primer and _local_drilldown use search_ranked (which
+    # filters in-SQL) AND qdrant_ops.search (which doesn't see invalid_at),
+    # so vector candidates can still leak in. Batched lookup applies the
+    # same filter once over the fused set. Wrapped — DB failure here
+    # degrades to "no expiry filter" rather than crash drift recall.
+    from genesis.memory.retrieval import _expired_candidate_ids
+    try:
+        expired = await _expired_candidate_ids(db, set(fused_scores.keys()))
+    except Exception:
+        logger.warning(
+            "drift invalid_at filter failed, returning unfiltered",
+            exc_info=True,
+        )
+        expired = set()
+    if expired:
+        for mid in expired:
+            fused_scores.pop(mid, None)
+
     # Rank by fused score
     all_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)  # type: ignore[arg-type]
 
