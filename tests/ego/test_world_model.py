@@ -5,11 +5,11 @@ import json
 import pytest
 
 from genesis.db.crud import memory_events, user_contacts, user_goals
-from genesis.ego.world_snapshot import WorldSnapshot, build as build_snapshot
-from genesis.memory.contact_tracker import _is_likely_person, _find_best_contact_match
-from genesis.memory.goal_tracker import _detect_goal_signal
+from genesis.ego.world_snapshot import WorldSnapshot
+from genesis.ego.world_snapshot import build as build_snapshot
+from genesis.memory.contact_tracker import _find_best_contact_match, _is_likely_person
 from genesis.memory.extraction import Extraction
-
+from genesis.memory.goal_tracker import _detect_goal_signal
 
 # -- Goal CRUD tests --
 
