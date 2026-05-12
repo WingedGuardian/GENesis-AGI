@@ -1091,6 +1091,9 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # lack rows. Without backfill, the "recent" dashboard view is empty.
     await _migrate_backfill_memory_metadata(db)
 
+    # World model tables: user goals and contacts for ego world model.
+    await _migrate_world_model_tables(db)
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
@@ -1336,6 +1339,28 @@ async def _migrate_backfill_memory_metadata(db: aiosqlite.Connection) -> None:
         sum(1 for mid, _ in missing if mid not in qdrant_data and mid in pending_ts),
         sum(1 for mid, _ in missing if mid not in qdrant_data and mid not in pending_ts),
     )
+
+
+async def _migrate_world_model_tables(db: aiosqlite.Connection) -> None:
+    """Create user_goals and user_contacts tables for the ego world model.
+
+    Idempotent: CREATE TABLE IF NOT EXISTS.
+    """
+    from genesis.db.schema._tables import TABLE_DDL
+
+    for table_name in ("user_goals", "user_contacts"):
+        ddl = TABLE_DDL.get(table_name)
+        if ddl:
+            try:
+                await db.execute(ddl)
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "already exists" not in msg:
+                    logger.error(
+                        "Failed to create %s: %s", table_name, exc,
+                        exc_info=True,
+                    )
+    await db.commit()
 
 
 async def seed_data(db: aiosqlite.Connection) -> None:
