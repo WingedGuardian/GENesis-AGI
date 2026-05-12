@@ -23,11 +23,11 @@ approval_policy:
   irreversible: "propose"      # Ask user first (always, no exceptions in V3)
 
 # Approval timeout (seconds) per action type
-# Expired = rejected, never auto-approved.
-# null = wait forever (no timeout).
+# All human-action approvals wait forever (no timeout).
+# Timeouts on human-action approvals are effectively auto-rejections.
 approval_timeouts:
-  outreach: 3600         # 60 minutes
-  task_proposal: 86400   # 24 hours
+  outreach: null
+  task_proposal: null
   irreversible: null     # Wait forever
 
 # Regression policy

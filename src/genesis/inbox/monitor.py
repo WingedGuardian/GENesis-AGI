@@ -446,6 +446,26 @@ class InboxMonitor:
     # Phase 2: Detect new/modified files
     # =================================================================
 
+    async def _scan_and_dedup(
+        self, watch: Path, resumed_paths: set[str],
+    ) -> tuple[list[Path], list[Path]]:
+        """Scan for new/modified files and dedup against resumed paths."""
+        from genesis.db.crud import inbox_items
+
+        known = await inbox_items.get_all_known(
+            self._db, max_retries=self._config.max_retries,
+        )
+        new_files, modified_files = detect_changes(
+            watch, known, self._config.response_dir,
+            recursive=self._config.recursive,
+        )
+        if resumed_paths:
+            new_files = [f for f in new_files if str(f) not in resumed_paths]
+            modified_files = [
+                f for f in modified_files if str(f) not in resumed_paths
+            ]
+        return new_files, modified_files
+
     async def _phase_detect_changes(
         self,
         watch: Path,
@@ -453,12 +473,15 @@ class InboxMonitor:
     ) -> tuple[list[Path], list[Path]]:
         """Detect new and modified files in the inbox folder.
 
-        Returns ``(new_files, modified_files)``.  Skips detection
-        entirely if a call-site approval is pending.
+        Returns ``(new_files, modified_files)``.  When a call-site
+        approval is pending, still scans for new files.  If new content
+        arrives, cancels the stale approval so a fresh one reflecting
+        the updated inbox state can be created.
         """
         from genesis.db.crud import inbox_items
 
-        # Call-site gating pre-check: skip detection if approval pending.
+        # Call-site gating pre-check: check if approval is pending.
+        pending = None
         if self._autonomous_dispatcher is not None:
             try:
                 pending = await (
@@ -472,32 +495,67 @@ class InboxMonitor:
                     "proceeding without pre-check",
                     exc_info=True,
                 )
-                pending = None
-            if pending is not None:
+
+        if pending is not None:
+            # Approval pending — scan anyway to detect new content.
+            new_files, modified_files = await self._scan_and_dedup(
+                watch, resumed_paths,
+            )
+            if not new_files and not modified_files:
                 logger.info(
-                    "Inbox new/modified file detection skipped — "
-                    "call site blocked on approval %s",
+                    "Inbox detection skipped — approval %s pending, "
+                    "no new files",
                     pending.get("id"),
                 )
                 return [], []
 
-        known = await inbox_items.get_all_known(
-            self._db, max_retries=self._config.max_retries,
-        )
+            # New content while approval pending — cancel the stale
+            # approval so a fresh one with updated content is created.
+            pending_id = pending.get("id")
+            logger.info(
+                "New inbox files detected while approval %s pending — "
+                "cancelling stale approval to refresh",
+                pending_id,
+            )
+            try:
+                gate = self._autonomous_dispatcher.approval_gate
+                await gate.approval_manager.cancel(pending_id)
+            except Exception:
+                logger.warning(
+                    "Failed to cancel stale inbox approval %s; "
+                    "proceeding with new detection anyway",
+                    pending_id,
+                    exc_info=True,
+                )
 
-        new_files, modified_files = detect_changes(
-            watch, known, self._config.response_dir,
-            recursive=self._config.recursive,
-        )
+            # Invalidate inbox_items parked on the cancelled approval.
+            try:
+                awaiting = await inbox_items.get_awaiting_approval(self._db)
+                for row in awaiting:
+                    marker = str(row.get("error_message") or "")
+                    if marker == (
+                        f"{inbox_items.AWAITING_APPROVAL_PREFIX}{pending_id}"
+                    ):
+                        await inbox_items.update_status(
+                            self._db, str(row["id"]),
+                            status="failed",
+                            error_message=(
+                                f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}"
+                                "superseded by new inbox scan"
+                            ),
+                            processed_at=self._clock().isoformat(),
+                        )
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate parked inbox items for %s",
+                    pending_id,
+                    exc_info=True,
+                )
 
-        # Dedup resumed paths out of new/modified lists (TOCTOU guard).
-        if resumed_paths:
-            new_files = [f for f in new_files if str(f) not in resumed_paths]
-            modified_files = [
-                f for f in modified_files if str(f) not in resumed_paths
-            ]
+            return new_files, modified_files
 
-        return new_files, modified_files
+        # Normal path: no approval pending.
+        return await self._scan_and_dedup(watch, resumed_paths)
 
     # =================================================================
     # Phase 3: Create DB records for changed files

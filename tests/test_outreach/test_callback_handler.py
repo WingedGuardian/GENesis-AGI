@@ -130,6 +130,11 @@ def _make_gate_ctx(*, allowed_users=None, resolve_ok=True, batch_count=0):
     gate = MagicMock()
     gate.resolve_request = AsyncMock(return_value=resolve_ok)
     gate.approve_all_pending = AsyncMock(return_value=batch_count)
+    gate.get_request_subsystem = AsyncMock(return_value="test_subsystem")
+    # For Fix 2 status-aware labels when resolve_ok=False
+    approval_mgr = MagicMock()
+    approval_mgr.get_by_id = AsyncMock(return_value={"status": "approved"})
+    gate.approval_manager = approval_mgr
     ctx.autonomous_cli_gate = gate
     return ctx, gate
 
@@ -194,7 +199,7 @@ async def test_cli_approve_double_click_is_graceful():
     # Message edit still happens, with "Already resolved" marker
     update.callback_query.edit_message_text.assert_awaited_once()
     edit_text = update.callback_query.edit_message_text.call_args.kwargs["text"]
-    assert "Already resolved" in edit_text
+    assert "Already approved" in edit_text
 
 
 @pytest.mark.asyncio

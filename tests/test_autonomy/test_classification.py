@@ -63,11 +63,11 @@ class TestGetTimeout:
 
     def test_outreach_timeout(self) -> None:
         c = self._make_classifier()
-        assert c.get_timeout("outreach") == 3600
+        assert c.get_timeout("outreach") is None
 
     def test_task_proposal_timeout(self) -> None:
         c = self._make_classifier()
-        assert c.get_timeout("task_proposal") == 86400
+        assert c.get_timeout("task_proposal") is None
 
     def test_irreversible_timeout_none(self) -> None:
         c = self._make_classifier()
@@ -79,15 +79,15 @@ class TestGetTimeout:
 
     def test_autonomous_cli_fallback_timeout(self) -> None:
         c = self._make_classifier()
-        assert c.get_timeout("autonomous_cli_fallback") == 3600
+        assert c.get_timeout("autonomous_cli_fallback") is None
 
     def test_sentinel_dispatch_timeout(self) -> None:
         c = self._make_classifier()
-        assert c.get_timeout("sentinel_dispatch") == 7200
+        assert c.get_timeout("sentinel_dispatch") is None
 
     def test_sentinel_action_timeout(self) -> None:
         c = self._make_classifier()
-        assert c.get_timeout("sentinel_action") == 7200
+        assert c.get_timeout("sentinel_action") is None
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +121,7 @@ class TestConfigLoading:
         # Should still produce V3 defaults
         assert c.classify(ActionClass.REVERSIBLE, 1) is ApprovalDecision.ACT
         assert c.classify(ActionClass.COSTLY_REVERSIBLE, 1) is ApprovalDecision.PROPOSE
-        assert c.get_timeout("outreach") == 3600
+        assert c.get_timeout("outreach") is None
 
     def test_malformed_yaml_uses_defaults(self, tmp_path) -> None:
         cfg = tmp_path / "autonomy.yaml"
@@ -129,7 +129,7 @@ class TestConfigLoading:
         c = ActionClassifier(config_path=cfg, rules_path=tmp_path / "no_rules.yaml")
         # Falls back to V3 defaults
         assert c.classify(ActionClass.IRREVERSIBLE, 1) is ApprovalDecision.PROPOSE
-        assert c.get_timeout("task_proposal") == 86400
+        assert c.get_timeout("task_proposal") is None
 
 
 # ---------------------------------------------------------------------------

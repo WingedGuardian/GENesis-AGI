@@ -773,11 +773,75 @@ class SentinelDispatcher:
                     )
                 return await self._phase2_cc_and_actions(request, pattern=pattern)
             if policy_id == "sentinel_action":
-                # No re-verification here — actions are tied to a specific CC
-                # diagnosis, not to alarm state.  The CC session already ran
-                # and proposed actions; even if the original alarm cleared,
-                # the proposed fix may still be needed.
                 logger.info("Resuming sentinel actions after approval %s", request_id)
+
+                # Intelligent staleness guard: if original alarms cleared,
+                # check whether the system self-healed or the root cause
+                # shifted before executing potentially stale actions.
+                alarms_still_active = await self._re_verify_alarms(request)
+                if not alarms_still_active:
+                    try:
+                        from genesis.mcp.health_mcp import _impl_health_alerts
+                        current_alerts = await _impl_health_alerts(active_only=True)
+                    except Exception:
+                        logger.warning(
+                            "Cannot verify system health for stale sentinel "
+                            "action — proceeding with actions",
+                            exc_info=True,
+                        )
+                        current_alerts = None
+
+                    if current_alerts is not None and not current_alerts:
+                        # System healthy — self-healed, skip stale actions
+                        logger.info(
+                            "Sentinel actions cancelled — original alarms "
+                            "cleared and system is healthy (self-healed "
+                            "during action approval wait)",
+                        )
+                        self._state.clear_pending()
+                        self._state.transition(
+                            SentinelState.HEALTHY,
+                            reason="self-healed during action approval wait",
+                        )
+                        save_state(self._state)
+                        return SentinelResult(
+                            dispatched=False,
+                            reason=(
+                                "System self-healed — original alarms "
+                                "cleared, no current alerts"
+                            ),
+                        )
+                    elif current_alerts:
+                        # Different alarms — root cause shifted
+                        logger.warning(
+                            "Sentinel actions stale — original alarms "
+                            "cleared but new alerts present: %s. "
+                            "Cancelling stale actions, will re-investigate.",
+                            [
+                                a.get("alert_id", "?")
+                                if isinstance(a, dict) else getattr(a, "alert_id", "?")
+                                for a in current_alerts[:5]
+                            ],
+                        )
+                        self._state.clear_pending()
+                        self._state.transition(
+                            SentinelState.ALARM_DETECTED,
+                            reason=(
+                                "root cause shifted during action approval "
+                                "wait — re-investigating"
+                            ),
+                        )
+                        save_state(self._state)
+                        return SentinelResult(
+                            dispatched=False,
+                            reason=(
+                                "Root cause shifted — new alarms present, "
+                                "re-investigating"
+                            ),
+                        )
+                    # current_alerts is None (health check failed) — proceed
+                    # with actions (fail-open)
+
                 cc_result = _deserialize_result(self._state.pending_cc_result_json)
                 if cc_result is None:
                     logger.error("Sentinel resume: failed to deserialize CC result")

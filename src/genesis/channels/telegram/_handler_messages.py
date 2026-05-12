@@ -1039,7 +1039,23 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
                 "Failed to resolve cli_approve for request %s", key, exc_info=True,
             )
             return
-        label = "✅ Approved" if ok else "⚠️ Already resolved"
+        if ok:
+            label = "✅ Approved"
+        else:
+            # Look up actual status for a meaningful label
+            try:
+                _row = await ctx.autonomous_cli_gate.approval_manager.get_by_id(key)
+                _actual = _row.get("status") if _row else "unknown"
+            except Exception:
+                _actual = "unknown"
+            if _actual == "expired":
+                label = "⏰ Expired"
+            elif _actual == "approved":
+                label = "✅ Already approved"
+            elif _actual == "cancelled":
+                label = "🚫 Cancelled"
+            else:
+                label = f"⚠️ Already resolved ({_actual})"
         log.info("cli_approve %s → %s (user %s)", key, label, user.id)
         try:
             original = query.message.text_html or query.message.text or ""
@@ -1068,8 +1084,11 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
                 key, decision="approved",
                 resolved_by=f"telegram:batch:{user.id}",
             )
+            # Scope batch to same subsystem as the triggering request
+            _subsystem = await ctx.autonomous_cli_gate.get_request_subsystem(key)
             batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
                 resolved_by=f"telegram:batch:{user.id}",
+                subsystem=_subsystem,
             )
         except Exception:
             log.error(
@@ -1077,7 +1096,22 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             )
             return
         total = batch_count + (1 if triggered_ok else 0)
-        label = f"✅ Approved ({total} total)" if total else "⚠️ Already resolved"
+        if total:
+            label = f"✅ Approved ({total} total)"
+        else:
+            try:
+                _row = await ctx.autonomous_cli_gate.approval_manager.get_by_id(key)
+                _actual = _row.get("status") if _row else "unknown"
+            except Exception:
+                _actual = "unknown"
+            if _actual == "expired":
+                label = "⏰ Expired"
+            elif _actual == "approved":
+                label = "✅ Already approved"
+            elif _actual == "cancelled":
+                label = "🚫 Cancelled"
+            else:
+                label = f"⚠️ Already resolved ({_actual})"
         log.info(
             "cli_approve_all triggered by %s: triggered=%s batch=%d total=%d (user %s)",
             key, triggered_ok, batch_count, total, user.id,
