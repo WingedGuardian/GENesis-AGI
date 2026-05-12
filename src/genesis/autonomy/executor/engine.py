@@ -233,6 +233,48 @@ class CCSessionExecutor:
                     )
                     return False
 
+                # --- PRE-MORTEM (fail-open) ---
+                pm = await self._reviewer.pre_mortem(plan_content, description)
+                if pm is not None:
+                    from genesis.autonomy.executor.review import (
+                        _PM_BLOCK_THRESHOLD,
+                        _PM_MITIGATE_THRESHOLD,
+                    )
+
+                    if pm.confidence < _PM_BLOCK_THRESHOLD:
+                        modes = "; ".join(pm.failure_modes[:3])
+                        await self._persist_blocker(
+                            task_id,
+                            f"Pre-mortem confidence {pm.confidence}% "
+                            f"(threshold {_PM_BLOCK_THRESHOLD}%): {modes}",
+                            TaskPhase.REVIEWING,
+                        )
+                        return False
+
+                    if pm.confidence < _PM_MITIGATE_THRESHOLD and pm.mitigations:
+                        mitigation_text = "\n".join(
+                            f"- {m}" for m in pm.mitigations
+                        )
+                        plan_content = (
+                            f"{plan_content}\n\n"
+                            f"## Pre-Mortem Mitigations "
+                            f"(confidence: {pm.confidence}%)\n\n"
+                            f"{mitigation_text}\n"
+                        )
+                        logger.info(
+                            "Pre-mortem injected %d mitigations (conf=%d%%)",
+                            len(pm.mitigations), pm.confidence,
+                        )
+
+                    await self._set_output(
+                        task_id, "pre_mortem",
+                        json.dumps({
+                            "confidence": pm.confidence,
+                            "failure_modes": pm.failure_modes,
+                            "mitigations": pm.mitigations,
+                        }),
+                    )
+
                 # --- PLANNING ---
                 await self._transition(task_id, TaskPhase.PLANNING)
                 steps = await self._decomposer.decompose(

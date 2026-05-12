@@ -85,6 +85,7 @@ def mock_decomposer():
 def mock_reviewer():
     r = AsyncMock()
     r.review_plan = AsyncMock(return_value=ReviewResult(passed=True))
+    r.pre_mortem = AsyncMock(return_value=None)  # fail-open by default
     r.verify_deliverable = AsyncMock(return_value=VerifyResult(passed=True))
     return r
 

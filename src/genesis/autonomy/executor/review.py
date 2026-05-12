@@ -65,6 +65,16 @@ class ReviewResult:
 
 
 @dataclass(frozen=True)
+class PreMortemResult:
+    """Result of pre-mortem failure analysis."""
+
+    confidence: int  # 0-100
+    failure_modes: list[str] = field(default_factory=list)
+    invalid_assumptions: list[str] = field(default_factory=list)
+    mitigations: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class VerifyResult:
     """Result of post-execution adversarial verification."""
 
@@ -75,6 +85,20 @@ class VerifyResult:
     skipped_reason: str | None = None
     iteration: int = 0
 
+
+# ---------------------------------------------------------------------------
+# Pre-mortem thresholds (tunable)
+# ---------------------------------------------------------------------------
+
+# Below this confidence, pre-mortem blocks the task (flags for user).
+_PM_BLOCK_THRESHOLD = 50
+
+# Below this confidence (but above block), mitigations are injected into
+# plan context so the decomposer and step executors are aware of risks.
+_PM_MITIGATE_THRESHOLD = 70
+
+# 44_task_premortem — pre-mortem failure analysis before committing to execution.
+_CALL_SITE_PREMORTEM = "44_task_premortem"
 
 # ---------------------------------------------------------------------------
 # Reviewer
@@ -167,6 +191,76 @@ class TaskReviewer:
             )
             return None
         return output.text
+
+    # --- Pre-mortem analysis (between review and planning) ---------------
+
+    async def pre_mortem(
+        self,
+        plan_content: str,
+        task_description: str,
+    ) -> PreMortemResult | None:
+        """Pre-mortem failure analysis: assume the task fails, identify causes.
+
+        Returns ``PreMortemResult`` on success, ``None`` on LLM failure
+        (fail-open — don't block execution because analysis failed).
+        """
+        try:
+            template_path = Path(__file__).resolve().parent.parent.parent / "identity" / "TASK_PREMORTEM.md"
+            template = template_path.read_text(encoding="utf-8")
+        except OSError:
+            logger.warning("TASK_PREMORTEM.md not found, skipping pre-mortem")
+            return None
+
+        prompt = template.replace(
+            "{{plan_content}}", plan_content,
+        ).replace(
+            "{{task_description}}", task_description,
+        )
+
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            result = await self._router.route_call(
+                _CALL_SITE_PREMORTEM, messages,
+            )
+        except Exception:
+            logger.warning(
+                "Pre-mortem LLM call failed, proceeding without",
+                exc_info=True,
+            )
+            return None
+
+        if not result.success or not result.content:
+            logger.warning("Pre-mortem routing failed, proceeding without")
+            return None
+
+        return self._parse_pre_mortem(result.content)
+
+    def _parse_pre_mortem(self, raw: str) -> PreMortemResult | None:
+        """Parse pre-mortem JSON response."""
+        text = raw.strip()
+        # Try JSON block first
+        m = _JSON_BLOCK_RE.search(text)
+        if m:
+            text = m.group(1).strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Pre-mortem response not valid JSON: %.200s", raw,
+            )
+            return None
+
+        confidence = data.get("confidence")
+        if not isinstance(confidence, (int, float)):
+            logger.warning("Pre-mortem missing numeric confidence field")
+            return None
+
+        return PreMortemResult(
+            confidence=int(confidence),
+            failure_modes=data.get("failure_modes", []),
+            invalid_assumptions=data.get("invalid_assumptions", []),
+            mitigations=data.get("mitigations", []),
+        )
 
     # --- Deliverable verification (post-execution) ----------------------
 
