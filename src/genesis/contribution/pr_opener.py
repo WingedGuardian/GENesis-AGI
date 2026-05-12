@@ -433,9 +433,32 @@ def _prepare_and_push_branch(
         # (same install_id + same source_sha → same branch name) by
         # overwriting our own stale branch but refusing to stomp on
         # concurrent updates from another machine.
+        #
+        # We push to a URL (not a configured remote), so git has no
+        # remote-tracking ref to derive the lease's expected SHA from.
+        # On modern git, an implicit lease in that situation fails with
+        # "stale info" rather than falling back to no-protection. So we
+        # query the fork ourselves via `git ls-remote` and pass the
+        # explicit `=<ref>:<expected>` form. An empty `<expected>` is
+        # the canonical "ref must not exist on remote" lease.
+        ls_proc = subprocess.run(
+            ["git", "ls-remote", fork_url, f"refs/heads/{branch}"],
+            capture_output=True, text=True,
+            cwd=str(wt_dir), timeout=30, check=False,
+        )
+        if ls_proc.returncode != 0:
+            # Auth failure, network blip, DNS, rate limit. Surface
+            # cleanly instead of falling through to an empty lease
+            # that would then produce a confusing "stale info" error
+            # on the push if the branch happens to exist.
+            return False, f"ls-remote failed: {ls_proc.stderr.strip()}"
+        expected_sha = ""
+        if ls_proc.stdout.strip():
+            expected_sha = ls_proc.stdout.split()[0]
+        lease_arg = f"--force-with-lease=refs/heads/{branch}:{expected_sha}"
         proc = subprocess.run(
             [
-                "git", "push", "--force-with-lease",
+                "git", "push", lease_arg,
                 fork_url, f"HEAD:refs/heads/{branch}",
             ],
             capture_output=True, text=True,
