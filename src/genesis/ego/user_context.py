@@ -68,9 +68,10 @@ class UserEgoContextBuilder:
 
         sections.append(await self._user_model_section())
         sections.append(self._ego_notepad_section())
+        sections.append(await self._user_goals_section())
+        sections.append(await self._world_snapshot_section())
         sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
-        sections.append(await self._user_world_observations_section())
         sections.append(await self._backlog_summary_section())
         sections.append(await self._genesis_escalations_section())
         sections.append(await self._capabilities_section())
@@ -192,6 +193,59 @@ class UserEgoContextBuilder:
         except Exception:
             logger.warning("Failed to read ego notepad", exc_info=True)
             return ""
+
+    async def _user_goals_section(self) -> str:
+        """Active user goals — the bedrock of the world model."""
+        lines = ["## User Goals\n"]
+
+        try:
+            from genesis.db.crud import user_goals
+            goals = await user_goals.list_active(self._db, limit=10)
+        except Exception:
+            logger.debug("Failed to query user goals", exc_info=True)
+            lines.append("*Goal tracking not yet populated.*\n")
+            return "\n".join(lines)
+
+        if not goals:
+            lines.append(
+                "*No goals tracked yet. Goals will be detected from "
+                "conversations and stored automatically.*\n"
+            )
+            return "\n".join(lines)
+
+        for g in goals:
+            priority = g.get("priority", "medium")
+            title = g.get("title", "?")[:120]
+            category = g.get("category", "")
+            timeline = g.get("timeline") or ""
+            timeline_str = f" — {timeline}" if timeline else ""
+            conf = g.get("confidence", 0.5)
+            lines.append(
+                f"- [{priority.upper()}] **{title}** "
+                f"({category}{timeline_str}, conf={conf:.0%})"
+            )
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _world_snapshot_section(self) -> str:
+        """Synthesized view of the user's world — events, contacts, signals.
+
+        Replaces the raw user-world observations section with a structured
+        world snapshot that connects goals to events, contacts, and signals.
+        """
+        lines = ["## User's World\n"]
+
+        try:
+            from genesis.ego.world_snapshot import build as build_snapshot
+            snapshot = await build_snapshot(self._db)
+            rendered = snapshot.render()
+            lines.append(rendered)
+        except Exception:
+            logger.debug("Failed to build world snapshot", exc_info=True)
+            lines.append("*World snapshot not available.*\n")
+
+        return "\n".join(lines)
 
     # Signals that track user activity — used to filter awareness tick
     # signals for the user ego's activity pulse section.
