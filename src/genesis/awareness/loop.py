@@ -872,12 +872,22 @@ class AwarenessLoop:
 
         if self._cc_reflection_bridge is not None and depth in (Depth.LIGHT, Depth.DEEP, Depth.STRATEGIC):
             try:
-                await self._cc_reflection_bridge.reflect(
+                ref_result = await self._cc_reflection_bridge.reflect(
                     depth,
                     result,
                     db=db,
                     escalation_source=result.escalation_source if depth == Depth.DEEP else None,
                 )
+                # Mark tick as dispatched only when the bridge confirmed
+                # success.  Throttled / gate-blocked attempts (success=False)
+                # leave dispatched=0 so the floor/ceiling checks don't count
+                # them — preventing rate-limit cascades that block future
+                # reflections for 48h+.
+                if ref_result and ref_result.success:
+                    try:
+                        await awareness_ticks.mark_dispatched(db, tick_id)
+                    except Exception:
+                        logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
                 # Fix 3B: resolve escalation AFTER successful dispatch
                 if result.escalation_pending_id and depth == Depth.DEEP:
                     await self._resolve_escalation(result.escalation_pending_id, result.timestamp)

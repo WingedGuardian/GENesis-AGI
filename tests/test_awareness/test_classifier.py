@@ -51,6 +51,7 @@ async def test_ceiling_blocks_trigger(db):
             scores_json="[]",
             classified_depth="Micro",
             created_at=(now - timedelta(minutes=i * 5)).isoformat(),
+            dispatched=1,
         )
 
     scores = [
@@ -75,6 +76,7 @@ async def test_bypass_ceiling_on_critical(db):
             scores_json="[]",
             classified_depth="Micro",
             created_at=(now - timedelta(minutes=i * 5)).isoformat(),
+            dispatched=1,
         )
 
     scores = [
@@ -100,6 +102,7 @@ async def test_floor_blocks_too_soon(db):
         scores_json="[]",
         classified_depth="Light",
         created_at=(now - timedelta(minutes=5)).isoformat(),
+        dispatched=1,
     )
 
     scores = [
@@ -124,6 +127,7 @@ async def test_floor_allows_after_elapsed(db):
         scores_json="[]",
         classified_depth="Light",
         created_at=(now - timedelta(hours=4)).isoformat(),
+        dispatched=1,
     )
 
     scores = [
@@ -148,6 +152,7 @@ async def test_bypass_also_skips_floor(db):
         scores_json="[]",
         classified_depth="Micro",
         created_at=(now - timedelta(minutes=1)).isoformat(),
+        dispatched=1,
     )
 
     scores = [
@@ -157,5 +162,101 @@ async def test_bypass_also_skips_floor(db):
         _score(Depth.STRATEGIC, 0.1, 0.4, False),
     ]
     result = await classify_depth(db, scores, bypass_ceiling=True)
+    assert result is not None
+    assert result.depth == Depth.MICRO
+
+
+async def test_undispatched_tick_does_not_block_floor(db):
+    """A throttled/failed DEEP tick (dispatched=0) should NOT reset the floor.
+
+    This is the core bug fix: rate-limited DEEP ticks were resetting the 48h
+    floor timer, blocking subsequent DEEP reflections even though no reflection
+    actually ran.
+    """
+    now = datetime.now(UTC)
+    # Insert a recent DEEP tick that was NOT dispatched (throttled by rate limit)
+    await awareness_ticks.create(
+        db,
+        id="throttled-deep",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Deep",
+        created_at=(now - timedelta(minutes=5)).isoformat(),
+        dispatched=0,  # Throttled — never actually ran
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.3, 0.5, False),
+        _score(Depth.LIGHT, 0.4, 0.8, False),
+        _score(Depth.DEEP, 0.6, 0.45, True),    # triggered
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    # DEEP should NOT be blocked — the throttled tick doesn't count
+    result = await classify_depth(db, scores)
+    assert result is not None
+    assert result.depth == Depth.DEEP
+
+
+async def test_dispatched_tick_blocks_floor(db):
+    """A successfully dispatched DEEP tick SHOULD block the floor."""
+    now = datetime.now(UTC)
+    await awareness_ticks.create(
+        db,
+        id="dispatched-deep",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Deep",
+        created_at=(now - timedelta(minutes=5)).isoformat(),
+        dispatched=1,  # Successfully dispatched
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.3, 0.5, False),
+        _score(Depth.LIGHT, 0.4, 0.8, False),
+        _score(Depth.DEEP, 0.6, 0.45, True),    # triggered but within floor
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    # DEEP should be blocked — dispatched tick counts toward floor
+    result = await classify_depth(db, scores)
+    assert result is None
+
+
+async def test_undispatched_tick_does_not_block_ceiling(db):
+    """Throttled ticks should not count toward the ceiling."""
+    now = datetime.now(UTC)
+    # Insert 1 dispatched + 1 undispatched Micro tick.
+    # Ceiling for Micro is 2/hr — only dispatched ones count.
+    # Both ticks must be > 30 min old to pass the Micro floor (1800s).
+    await awareness_ticks.create(
+        db,
+        id="ceiling-dispatched",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Micro",
+        created_at=(now - timedelta(minutes=35)).isoformat(),
+        dispatched=1,
+    )
+    await awareness_ticks.create(
+        db,
+        id="ceiling-undispatched",
+        source="scheduled",
+        signals_json="[]",
+        scores_json="[]",
+        classified_depth="Micro",
+        created_at=(now - timedelta(minutes=33)).isoformat(),
+        dispatched=0,
+    )
+
+    scores = [
+        _score(Depth.MICRO, 0.6, 0.5, True),
+        _score(Depth.LIGHT, 0.4, 0.8, False),
+        _score(Depth.DEEP, 0.2, 0.55, False),
+        _score(Depth.STRATEGIC, 0.1, 0.4, False),
+    ]
+    # Only 1 dispatched tick — ceiling is 2, so Micro should pass
+    result = await classify_depth(db, scores)
     assert result is not None
     assert result.depth == Depth.MICRO

@@ -48,19 +48,25 @@ async def classify_depth(
         if not bypass_ceiling:
             cfg = thresholds[depth.value]
 
-            # Ceiling: max N reflections per window
+            # Ceiling: max N dispatched reflections per window.
+            # Only count ticks where a reflection was actually dispatched
+            # (not throttled/rate-limited) to prevent failed attempts
+            # from blocking future reflections.
             recent = await awareness_ticks.count_in_window(
                 db,
                 depth=depth.value,
                 window_seconds=cfg["ceiling_window_seconds"],
+                dispatched_only=True,
             )
             if recent >= cfg["ceiling_count"]:
                 continue  # At ceiling — try next lower depth
 
-            # Floor: minimum interval between reflections at this depth
+            # Floor: minimum interval between dispatched reflections.
             floor_s = cfg["floor_seconds"]
             if floor_s > 0:
-                last = await awareness_ticks.last_at_depth(db, depth.value)
+                last = await awareness_ticks.last_at_depth(
+                    db, depth.value, dispatched_only=True,
+                )
                 if last is not None:
                     last_dt = datetime.fromisoformat(last["created_at"])
                     elapsed = (datetime.now(UTC) - last_dt).total_seconds()

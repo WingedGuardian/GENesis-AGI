@@ -15,14 +15,15 @@ async def create(
     created_at: str,
     classified_depth: str | None = None,
     trigger_reason: str | None = None,
+    dispatched: int = 0,
 ) -> str:
     await db.execute(
         """INSERT INTO awareness_ticks
            (id, source, signals_json, scores_json, classified_depth,
-            trigger_reason, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            trigger_reason, created_at, dispatched)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, source, signals_json, scores_json, classified_depth,
-         trigger_reason, created_at),
+         trigger_reason, created_at, dispatched),
     )
     await db.commit()
     return id
@@ -58,29 +59,62 @@ async def query(
 
 
 async def count_in_window(
-    db: aiosqlite.Connection, *, depth: str, window_seconds: int
+    db: aiosqlite.Connection,
+    *,
+    depth: str,
+    window_seconds: int,
+    dispatched_only: bool = False,
 ) -> int:
-    """Count ticks at a given depth within the last window_seconds."""
-    cursor = await db.execute(
-        """SELECT COUNT(*) as cnt FROM awareness_ticks
-           WHERE classified_depth = ?
-           AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ?)""",
-        (depth, f"-{window_seconds} seconds"),
+    """Count ticks at a given depth within the last window_seconds.
+
+    When *dispatched_only* is True, only ticks where the reflection was
+    actually dispatched (not throttled/failed) are counted.
+    """
+    sql = (
+        "SELECT COUNT(*) as cnt FROM awareness_ticks "
+        "WHERE classified_depth = ? "
+        "AND created_at >= strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now', ?)"
     )
+    params: list = [depth, f"-{window_seconds} seconds"]
+    if dispatched_only:
+        sql += " AND dispatched = 1"
+    cursor = await db.execute(sql, params)
     row = await cursor.fetchone()
     return row["cnt"] if row else 0
 
 
-async def last_at_depth(db: aiosqlite.Connection, depth: str) -> dict | None:
-    """Get the most recent tick at a given depth."""
-    cursor = await db.execute(
-        """SELECT * FROM awareness_ticks
-           WHERE classified_depth = ?
-           ORDER BY created_at DESC LIMIT 1""",
-        (depth,),
+async def last_at_depth(
+    db: aiosqlite.Connection,
+    depth: str,
+    *,
+    dispatched_only: bool = False,
+) -> dict | None:
+    """Get the most recent tick at a given depth.
+
+    When *dispatched_only* is True, only ticks where the reflection was
+    actually dispatched (not throttled/failed) are returned.
+    """
+    sql = (
+        "SELECT * FROM awareness_ticks "
+        "WHERE classified_depth = ?"
     )
+    params: list = [depth]
+    if dispatched_only:
+        sql += " AND dispatched = 1"
+    sql += " ORDER BY created_at DESC LIMIT 1"
+    cursor = await db.execute(sql, params)
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def mark_dispatched(db: aiosqlite.Connection, tick_id: str) -> bool:
+    """Mark a tick as successfully dispatched (reflection ran)."""
+    cursor = await db.execute(
+        "UPDATE awareness_ticks SET dispatched = 1 WHERE id = ?",
+        (tick_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
 
 
 async def last_tick(db: aiosqlite.Connection) -> dict | None:
