@@ -1389,3 +1389,50 @@ async def test_memory_recall_no_drift_when_wing_specified():
             mock_drift.assert_not_called()
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_defaults_to_episodic():
+    """memory_recall with no explicit source should pass source='episodic' to retriever."""
+    import genesis.mcp.memory_mcp as mod
+
+    old = mod._store, mod._db, mod._retriever, mod._qdrant
+    mod._store = MagicMock()
+    mod._db = AsyncMock()
+    mod._retriever = AsyncMock()
+    mod._retriever.recall = AsyncMock(return_value=[])
+    mod._qdrant = MagicMock()
+
+    try:
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(query="what is my Salesforce experience")
+
+        # Verify retriever.recall was called with source="episodic" (not "both")
+        mod._retriever.recall.assert_called_once()
+        call_kwargs = mod._retriever.recall.call_args.kwargs
+        assert call_kwargs.get("source") == "episodic", (
+            f"Expected source='episodic', got source={call_kwargs.get('source')!r}"
+        )
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_memory_recall_explicit_both_still_works():
+    """Passing source='both' explicitly should override the episodic default."""
+    import genesis.mcp.memory_mcp as mod
+
+    old = mod._store, mod._db, mod._retriever, mod._qdrant
+    mod._store = MagicMock()
+    mod._db = AsyncMock()
+    mod._retriever = AsyncMock()
+    mod._retriever.recall = AsyncMock(return_value=[])
+    mod._qdrant = MagicMock()
+
+    try:
+        tools = await _get_tools()
+        await tools["memory_recall"].fn(query="test", source="both")
+
+        mod._retriever.recall.assert_called_once()
+        call_kwargs = mod._retriever.recall.call_args.kwargs
+        assert call_kwargs.get("source") == "both"
+    finally:
+        mod._store, mod._db, mod._retriever, mod._qdrant = old

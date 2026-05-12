@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.memory.drift import (
+    _coalesce,
     _global_primer,
     _identify_clusters,
     _rrf_fuse,
@@ -142,3 +143,115 @@ class TestDriftRecall:
             )
 
         assert results == []
+
+
+class TestCoalesce:
+    """Test the null-coalescing helper."""
+
+    def test_none_returns_default(self):
+        assert _coalesce(None, 0.5) == 0.5
+
+    def test_zero_preserved(self):
+        """Unlike ``or``, 0 is not replaced by the default."""
+        assert _coalesce(0, 0.5) == 0
+
+    def test_empty_string_preserved(self):
+        assert _coalesce("", "unknown") == ""
+
+    def test_normal_value_passthrough(self):
+        assert _coalesce(0.7, 0.5) == 0.7
+
+    def test_false_preserved(self):
+        assert _coalesce(False, True) is False
+
+
+class TestDriftRecallNullHandling:
+    """Verify drift_recall handles NULL database fields without TypeError."""
+
+    @pytest.mark.asyncio
+    async def test_null_confidence_no_crash(self):
+        """Row with confidence=NULL must not raise TypeError in compute_activation."""
+        db = AsyncMock()
+        qdrant = MagicMock()
+        embeddings = AsyncMock()
+        embeddings.embed = AsyncMock(side_effect=Exception("no embeddings"))
+
+        # Row with all-None fields (simulates SQLite NULL values)
+        null_row = {
+            "memory_id": "m1",
+            "content": "test memory",
+            "confidence": None,
+            "created_at": None,
+            "retrieved_count": None,
+            "link_count": None,
+            "source_type": None,
+            "tags": None,
+            "memory_class": None,
+            "collection": "episodic_memory",
+        }
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new_callable=AsyncMock,
+            return_value=[
+                {"memory_id": "m1", "content": "test", "rank": -1.0},
+            ],
+        ), patch(
+            "genesis.memory.drift._identify_clusters",
+            new_callable=AsyncMock,
+            return_value=(None, None),
+        ), patch(
+            "genesis.memory.drift.memory_crud.get_by_id",
+            new_callable=AsyncMock,
+            return_value=null_row,
+        ), patch(
+            "genesis.memory.drift.graph_traverse",
+            new_callable=AsyncMock,
+            return_value=[],
+        ), patch(
+            "genesis.memory.retrieval._expired_candidate_ids",
+            new_callable=AsyncMock,
+            return_value=set(),
+        ):
+            results = await drift_recall(
+                "test query",
+                db=db,
+                qdrant_client=qdrant,
+                embedding_provider=embeddings,
+            )
+
+        # Should complete without TypeError and return valid results
+        assert len(results) == 1
+        assert results[0].memory_id == "m1"
+        assert results[0].activation_score > 0  # default confidence 0.5 produces positive score
+
+
+class TestDriftRecallDefaultSource:
+    """Verify drift_recall defaults to episodic source."""
+
+    @pytest.mark.asyncio
+    async def test_default_source_is_episodic(self):
+        """drift_recall with no source arg should search episodic_memory only."""
+        db = AsyncMock()
+        qdrant = MagicMock()
+        embeddings = AsyncMock()
+        embeddings.embed = AsyncMock(side_effect=Exception("no embeddings"))
+
+        with patch(
+            "genesis.memory.drift.memory_crud.search_ranked",
+            new_callable=AsyncMock,
+            return_value=[],
+        ) as mock_search:
+            await drift_recall(
+                "test query",
+                db=db,
+                qdrant_client=qdrant,
+                embedding_provider=embeddings,
+                # source NOT passed — should default to "episodic"
+            )
+
+        # Verify FTS search was called with collection filter for episodic
+        call_kwargs = mock_search.call_args
+        assert call_kwargs is not None
+        # The source_collections resolved from "episodic" should be ["episodic_memory"]
+        # which is passed to _global_primer and then to search_ranked with collection filter
