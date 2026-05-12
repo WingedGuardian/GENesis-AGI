@@ -142,23 +142,11 @@ class EgoContextBuilder:
             if last_dispatch:
                 lines.append(f"- Last dispatch: {last_dispatch}")
 
-        # Conversation activity
-        convo = snap.get("conversation", {})
-        if convo:
-            lines.append("\n### User Activity")
-            age = convo.get("last_user_message_age_s")
-            if age is not None:
-                minutes = age / 60
-                if minutes < 60:
-                    lines.append(f"- Last user message: {minutes:.0f}min ago")
-                else:
-                    lines.append(
-                        f"- Last user message: {minutes / 60:.1f}h ago"
-                    )
-            lines.append(
-                f"- Recent user turns (24h): "
-                f"{convo.get('recent_user_turns', 0)}"
-            )
+        # User activity signals intentionally omitted — the cadence manager's
+        # idle gate handles timing.  Showing the ego raw user-activity metrics
+        # (last_user_message_age_s, recent_user_turns) triggers LLM deference
+        # bias and self-suppression.  The ego should focus outward on the
+        # system, not inward on the user's availability.
 
         lines.append("")
         return "\n".join(lines)

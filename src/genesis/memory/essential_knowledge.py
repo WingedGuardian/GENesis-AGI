@@ -198,30 +198,18 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
 # from memory → ego).  Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
 _BEHAVIORAL_FOCUS_RE = re.compile(
     r"(?i)"
-    # Self-referential behavioral states (ego is the implicit subject).
-    # Keep in sync with ego.session._BEHAVIORAL_FOCUS_RE.
-    r"(?:^holding\s+back"
-    r"|^stepping\s+back"
-    r"|^standing\s+down"
-    r"|^lying\s+low"
-    r"|^staying\s+(?:out|quiet)"
-    r"|^backing\s+off"
-    r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
-    r"(?:user|jay|he|she|them|they|surface|engage|return)"
-    r"|^pausing\s+(?:proactive|proposal|work|activity)"
-    r"|(?:going|entering|in|self-)\s*dormant"
-    r"|(?:going|entering|in)\s+fallow"
-    r"|^hibernating"
-    r"|no\s+proposals?\s+(?:until|for\s+now)"
-    r"|until\s+\w+\s+surfaces?"
-    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
-    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
-    r"|^not\s+(?:proposing|intervening|acting)"
+    # Any focus starting with a self-referential behavioral verb.
+    r"(?:^(?:holding|waiting|stepping|standing|lying|staying|backing|"
+    r"keeping|pausing|going|hibernating|letting|until|not)\s"
+    # Explicit non-action / dormancy phrasing
     r"|^observing\s+(?:only|quietly)"
     r"|^passive\s+(?:mode|watch)"
-    r"|^minimal\s+engagement"
-    r"|^reduced\s+activity"
-    r"|quiet\s+mode)"
+    r"|^minimal\s+(?:engagement|activity)"
+    r"|^reduced\s+(?:activity|engagement)"
+    r"|quiet\s+mode"
+    r"|(?:self-|going\s+|entering\s+)dormant"
+    r"|(?:going|entering)\s+fallow"
+    r"|no\s+proposals?\s+(?:until|for\s+now))"
 )
 
 
