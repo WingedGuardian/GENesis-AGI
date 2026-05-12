@@ -150,15 +150,19 @@ class TestEgoContextBuilder:
         assert "Composite state" in result
 
     @pytest.mark.asyncio
-    async def test_user_activity_section(self, db, mock_health_data, capabilities):
+    async def test_user_activity_removed(self, db, mock_health_data, capabilities):
+        """User Activity section deliberately removed from ego context.
+
+        The cadence manager's idle gate handles timing — showing raw
+        user-activity metrics triggers LLM deference bias. See PR #331.
+        """
         builder = EgoContextBuilder(
             db=db,
             health_data=mock_health_data,
             capabilities=capabilities,
         )
         result = await builder.build()
-        assert "User Activity" in result
-        assert "30min ago" in result or "30.0min ago" in result
+        assert "User Activity" not in result
 
     @pytest.mark.asyncio
     async def test_signals_section_with_data(self, db, mock_health_data, capabilities):

@@ -619,13 +619,18 @@ class UserEgoContextBuilder:
         return "\n".join(lines)
 
     async def _proposal_history_section(self) -> str:
-        """Recent proposal outcomes for self-calibration."""
+        """Recent proposal topics for duplicate avoidance.
+
+        Shows WHAT was proposed (to prevent re-proposing the same idea),
+        but NOT status/response — engagement metrics trigger LLM deference
+        bias and self-suppression.  Intervention history (separate section)
+        provides outcome learning for executed proposals.
+        """
         lines = ["## Recent Proposals (last 7 days)\n"]
 
         try:
             cursor = await self._db.execute(
-                "SELECT action_type, content, status, "
-                "user_response, created_at "
+                "SELECT action_type, content, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "ORDER BY created_at DESC "
@@ -640,24 +645,14 @@ class UserEgoContextBuilder:
             lines.append("*No proposals in last 7 days.*\n")
             return "\n".join(lines)
 
-        # Summary line for quick calibration
-        from collections import Counter
-        status_counts = Counter(r[2] for r in rows)
-        parts = [f"{status_counts[s]} {s}" for s in
-                 ("approved", "rejected", "executed", "pending", "failed",
-                  "expired", "tabled", "withdrawn")
-                 if status_counts.get(s)]
-        lines.append(f"**{len(rows)} proposals**: {', '.join(parts)}\n")
+        lines.append(f"**{len(rows)} proposals** in last 7 days:\n")
 
-        lines.append("| Action | Content | Status | Response |")
-        lines.append("|--------|---------|--------|----------|")
-        for action_type, content, status, response, _created in rows:
-            short = content[:80] + "..." if len(content) > 80 else content
+        lines.append("| Action | Topic |")
+        lines.append("|--------|-------|")
+        for action_type, content, _created in rows:
+            short = content[:100] + "..." if len(content) > 100 else content
             short = short.replace("\n", " ").replace("|", "/")
-            resp = (response or "\u2014")[:50]
-            lines.append(
-                f"| {action_type} | {short} | {status} | {resp} |"
-            )
+            lines.append(f"| {action_type} | {short} |")
 
         lines.append("")
         return "\n".join(lines)
@@ -844,7 +839,6 @@ class UserEgoContextBuilder:
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
             '  "follow_ups": ["NEW open thread (not already tracked)"],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
-            '  "communication_decision": "send_digest|urgent_notify|stay_quiet",\n'
             '  "morning_report": "only if this is a morning trigger"\n'
             "}\n"
             "```\n\n"

@@ -602,16 +602,17 @@ class TestCommunicationDecisionDefault:
 # ---------------------------------------------------------------------------
 
 
-class TestOutputContractIncludesCommDecision:
-    """Both output contracts must include communication_decision."""
+class TestOutputContractCommDecision:
+    """User ego must NOT include communication_decision (delivery is system-
+    controlled).  Genesis ego keeps it for noise reduction."""
 
-    def test_user_ego_contract(self):
+    def test_user_ego_contract_excludes_comm_decision(self):
         from genesis.ego.user_context import UserEgoContextBuilder
 
         contract = UserEgoContextBuilder._output_contract_section()
-        assert "communication_decision" in contract
+        assert "communication_decision" not in contract
 
-    def test_genesis_ego_contract(self):
+    def test_genesis_ego_contract_includes_comm_decision(self):
         from genesis.ego.genesis_context import GenesisEgoContextBuilder
 
         contract = GenesisEgoContextBuilder._output_contract_section()
@@ -626,11 +627,15 @@ class TestFocusSanitization:
     @pytest.mark.parametrize("focus", [
         "Holding back — Jay is sprinting on job applications",
         "Holding back — user is busy",
+        "Holding quiet — Jay in active build mode",
+        "Holding off on proposals this cycle",
+        "Holding still until the dust settles",
         "Stepping back while user is busy",
         "Lying low during sprint",
         "Waiting for user to surface",
         "Waiting for Jay to engage with proposals",
         "Waiting for them to return",
+        "Waiting for engagement to resume",
         "Pausing proactive work until things settle",
         "Pausing proposal generation",
         "Quiet mode — no proposals for now",
@@ -642,14 +647,20 @@ class TestFocusSanitization:
         "Observing quietly this cycle",
         "Passive mode — watching only",
         "Minimal engagement this cycle",
+        "Minimal activity during this period",
         "Reduced activity during user sprint",
+        "Reduced engagement this week",
         "Not proposing anything while user is busy",
         "Not acting until signals improve",
         "Backing off — proposals ignored",
-        "Until Jay surfaces again",
-        "Letting things breathe for now",
-        "Giving the user space this cycle",
+        "Keeping quiet while user is in session",
+        "Keeping low profile this cycle",
+        "Going dormant until next week",
         "Hibernating until user returns",
+        "Letting things breathe for now",
+        "Letting the situation settle before proposing",
+        "Until Jay surfaces again",
+        "Until engagement picks back up",
     ])
     def test_behavioral_focus_rejected(self, focus):
         sanitized, violated = _sanitize_focus_summary(focus)
@@ -665,13 +676,11 @@ class TestFocusSanitization:
         "analyzing user feedback on morning reports",
         "tracking Anthropic API availability",
         "memory pipeline performance audit",
-        "waiting for API rate limit to reset",
         "observing provider latency patterns across regions",
-        # Reviewer edge cases: technical phrases that happen to contain
-        # behavioral keywords but in non-behavioral context
+        # Technical phrases that happen to contain behavioral keywords
+        # but in non-behavioral context (verb not at start of string)
         "investigating a dormant service restart",
         "giving database space for vacuum",
-        "letting the CI pipeline breathe between runs",
         "analyzing why users are not proposing changes",
         "reviewing the fallow period scheduler code",
     ])
@@ -696,10 +705,17 @@ class TestFocusSanitization:
         # These are legitimate English but start with behavioral verbs
         # where the ego is the implicit subject.  Accepted as known false
         # positives — the prompt is the primary defense, and these are
-        # extremely unlikely as real ego focus summaries.
+        # extremely unlikely as real ego focus summaries.  A topic-first
+        # phrasing is always better (e.g., "API rate limit recovery" vs
+        # "waiting for API rate limit to reset").
         "stepping back to understand the architecture",
         "backing off retry rate for API calls",
         "hibernating containers need restart",
+        "waiting for API rate limit to reset",
+        "keeping track of deployment status",
+        "standing by for CI results",
+        "letting the CI pipeline breathe between runs",
+        "until we have more data on the latency spike",
         "reduced activity in logs after midnight",
         "observing only errors from the health check",
         "minimal engagement metrics for outreach post",
@@ -716,6 +732,41 @@ class TestFocusSanitization:
         """
         sanitized, violated = _sanitize_focus_summary(focus)
         assert violated is True  # Known false positive
+
+    # -- Engagement-suppression mid-text scanning --
+
+    @pytest.mark.parametrize("focus,expected_stripped", [
+        (
+            "CC upgrade proposal held pending for when engagement resumes",
+            "CC upgrade proposal",
+        ),
+        (
+            "infrastructure review; proposal deferred until user resurfaces",
+            "infrastructure review; proposal",
+        ),
+        (
+            "monitoring memory health; action tabled pending engagement",
+            "monitoring memory health; action",
+        ),
+    ])
+    def test_engagement_suppression_stripped(self, focus, expected_stripped):
+        """Mid-text engagement-suppression clauses are stripped, not the
+        entire focus replaced."""
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is True
+        assert sanitized == expected_stripped
+
+    @pytest.mark.parametrize("focus", [
+        # These contain words like "pending" or "deferred" in legitimate context
+        "investigating pending approval workflow",
+        "reviewing deferred work queue growth",
+        "monitoring tabled proposals for expiry",
+    ])
+    def test_engagement_suppression_false_positives_avoided(self, focus):
+        """Legitimate uses of 'pending', 'deferred', 'tabled' not caught."""
+        sanitized, violated = _sanitize_focus_summary(focus)
+        assert violated is False
+        assert sanitized == focus
 
     def test_validate_output_sanitizes_focus(self):
         """_validate_output catches behavioral focus and sets violation flags."""

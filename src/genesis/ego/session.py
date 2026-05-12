@@ -918,39 +918,41 @@ _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 # -- Behavioral focus detection --------------------------------------------
 #
 # focus_summary must describe a TOPIC the ego is thinking about, never a
-# BEHAVIORAL state (holding back, waiting, pausing, etc.).  This regex
-# catches known self-suppression patterns.  It is the safety-net layer
-# beneath the prompt guardrails in EGO_SESSION.md.
+# BEHAVIORAL state.  This is a broad structural safety net — it catches
+# any focus starting with a self-referential behavioral verb (holding,
+# waiting, stepping, etc.) regardless of what follows.  The primary fix
+# is removing the signals that trigger self-suppression (user activity
+# metrics, proposal engagement data, communication_decision lever).
+# This regex is the last line of defense.
+#
+# Keep in sync with essential_knowledge._BEHAVIORAL_FOCUS_RE.
 _BEHAVIORAL_FOCUS_RE = re.compile(
     r"(?i)"
-    # Self-referential behavioral states (ego is the implicit subject)
-    r"(?:^holding\s+back"                                 # "Holding back — ..."
-    r"|^stepping\s+back"                                  # "Stepping back while ..."
-    r"|^standing\s+down"                                  # "Standing down until ..."
-    r"|^lying\s+low"                                      # "Lying low during ..."
-    r"|^staying\s+(?:out|quiet)"                          # "Staying quiet while ..."
-    r"|^backing\s+off"                                    # "Backing off — proposals ignored"
-    # Waiting/pausing with user-referencing context
-    r"|waiting\s+(?:for|until)\s+(?:\w+\s+)*"
-    r"(?:user|jay|he|she|them|they|surface|engage|return)"
-    r"|^pausing\s+(?:proactive|proposal|work|activity)"
-    # Explicit dormancy keywords (only when self-describing)
-    r"|(?:going|entering|in|self-)\s*dormant"
-    r"|(?:going|entering|in)\s+fallow"
-    r"|^hibernating"
-    # Proposal suppression
-    r"|no\s+proposals?\s+(?:until|for\s+now)"
-    r"|until\s+\w+\s+surfaces?"
-    # Self-suppression with user context
-    r"|letting\s+(?:things|it|him|her|them|the\s+user)\s+breathe"
-    r"|giving\s+(?:the\s+user|him|her|them|jay)\s+space"
-    # Explicit non-action
-    r"|^not\s+(?:proposing|intervening|acting)"
+    # Any focus starting with a self-referential behavioral verb.
+    # These describe what the ego IS DOING, not a topic.
+    r"(?:^(?:holding|waiting|stepping|standing|lying|staying|backing|"
+    r"keeping|pausing|going|hibernating|letting|until|not)\s"
+    # Explicit non-action / dormancy phrasing
     r"|^observing\s+(?:only|quietly)"
     r"|^passive\s+(?:mode|watch)"
-    r"|^minimal\s+engagement"
-    r"|^reduced\s+activity"
-    r"|quiet\s+mode)"
+    r"|^minimal\s+(?:engagement|activity)"
+    r"|^reduced\s+(?:activity|engagement)"
+    r"|quiet\s+mode"
+    # Dormancy keywords anywhere
+    r"|(?:self-|going\s+|entering\s+)dormant"
+    r"|(?:going|entering)\s+fallow"
+    # Proposal suppression
+    r"|no\s+proposals?\s+(?:until|for\s+now))"
+)
+
+# Catches engagement-conditional language anywhere in focus text, e.g.
+# "CC upgrade proposal held pending for when engagement resumes."
+# This is separate from _BEHAVIORAL_FOCUS_RE because it matches mid-text
+# clauses, not just the beginning of the focus string.  Matches from
+# the trigger word through end of string (engagement clauses are tails).
+_ENGAGEMENT_SUPPRESSION_RE = re.compile(
+    r"(?i)\s*\b(?:held|deferred|delayed|postponed|tabled|shelved)\s+"
+    r"(?:pending|until|for\s+when)\b.*$"
 )
 
 
@@ -963,7 +965,9 @@ def _sanitize_focus_summary(
 
     Returns (sanitized_focus, was_violated).
     If the focus is behavioral, returns the previous legitimate focus
-    or a generic fallback, plus was_violated=True.
+    or a generic fallback, plus was_violated=True.  If engagement-
+    suppression language appears mid-text, that clause is stripped
+    rather than replacing the entire focus.
     """
     if _BEHAVIORAL_FOCUS_RE.search(focus):
         fallback = previous_focus or "general system awareness"
@@ -974,6 +978,19 @@ def _sanitize_focus_summary(
             fallback,
         )
         return fallback, True
+
+    # Strip engagement-conditional clauses from mid-text without
+    # replacing the entire focus (the topic portion may be valid).
+    cleaned = _ENGAGEMENT_SUPPRESSION_RE.sub("", focus).strip().rstrip(";,")
+    if cleaned != focus:
+        logger.warning(
+            "Ego focus_summary contains engagement-suppression clause: %r — "
+            "stripped to %r",
+            focus[:120],
+            cleaned[:120],
+        )
+        return cleaned or (previous_focus or "general system awareness"), True
+
     return focus, False
 
 

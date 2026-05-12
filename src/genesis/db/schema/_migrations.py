@@ -1072,6 +1072,20 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # even if the versioned migration (0012) hasn't run yet.
     await _migrate_ego_proposals_status_check(db)
 
+    # Awareness ticks: dispatched flag so floor/ceiling checks only count
+    # ticks where a reflection was actually dispatched (not throttled/failed).
+    await _try_alter(db,
+        "ALTER TABLE awareness_ticks ADD COLUMN dispatched INTEGER NOT NULL DEFAULT 0",
+        "awareness_ticks.dispatched")
+    # Backfill: treat all existing ticks as dispatched to preserve current
+    # floor behavior (prevents a burst of DEEP reflections on first deploy).
+    with contextlib.suppress(Exception):
+        await db.execute(
+            "UPDATE awareness_ticks SET dispatched = 1 "
+            "WHERE classified_depth IS NOT NULL AND dispatched = 0"
+        )
+        await db.commit()
+
     # Phase 1.5: backfill memory_metadata from Qdrant + pending_embeddings.
     # New memories write metadata at store time, but pre-existing memories
     # lack rows. Without backfill, the "recent" dashboard view is empty.

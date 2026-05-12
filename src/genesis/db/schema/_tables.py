@@ -307,7 +307,8 @@ TABLES = {
             scores_json      TEXT NOT NULL,
             classified_depth TEXT,
             trigger_reason   TEXT,
-            created_at       TEXT NOT NULL
+            created_at       TEXT NOT NULL,
+            dispatched       INTEGER NOT NULL DEFAULT 0
         )
     """,
     "depth_thresholds": """
