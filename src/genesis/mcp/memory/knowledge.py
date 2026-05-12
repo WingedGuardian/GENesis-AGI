@@ -116,8 +116,8 @@ async def knowledge_recall(
                 "source_pipeline": fts_row.get("source_pipeline"),
             })
 
-    boosted = _apply_authority_boost(merged)[:limit]
-    return [r for r in boosted if r.get("score", 0.0) >= min_score]
+    boosted = _apply_authority_boost(merged)
+    return [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
 
 
 async def _ingest_knowledge_unit(

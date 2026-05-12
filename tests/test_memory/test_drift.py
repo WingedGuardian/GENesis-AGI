@@ -238,10 +238,10 @@ class TestDriftRecallDefaultSource:
         embeddings.embed = AsyncMock(side_effect=Exception("no embeddings"))
 
         with patch(
-            "genesis.memory.drift.memory_crud.search_ranked",
+            "genesis.memory.drift._global_primer",
             new_callable=AsyncMock,
-            return_value=[],
-        ) as mock_search:
+            return_value=([], None, None),
+        ) as mock_primer:
             await drift_recall(
                 "test query",
                 db=db,
@@ -250,8 +250,9 @@ class TestDriftRecallDefaultSource:
                 # source NOT passed — should default to "episodic"
             )
 
-        # Verify FTS search was called with collection filter for episodic
-        call_kwargs = mock_search.call_args
-        assert call_kwargs is not None
-        # The source_collections resolved from "episodic" should be ["episodic_memory"]
-        # which is passed to _global_primer and then to search_ranked with collection filter
+        # Verify _global_primer was called with episodic-only collections
+        mock_primer.assert_called_once()
+        call_kwargs = mock_primer.call_args.kwargs
+        assert call_kwargs["source_collections"] == ["episodic_memory"], (
+            f"Expected ['episodic_memory'], got {call_kwargs['source_collections']!r}"
+        )
