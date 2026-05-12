@@ -25,6 +25,11 @@ logger = logging.getLogger(__name__)
 _PROMPT_DIR = Path(__file__).resolve().parent.parent / "identity"
 _SYSTEM_PROMPT_FILE = "INBOX_EVALUATE.md"
 
+# Max age before a pending inbox approval is considered abandoned.
+# Approvals with timeout_at=None wait indefinitely by design, but the
+# inbox monitor shouldn't block forever if the user never responds.
+_MAX_APPROVAL_STALENESS = timedelta(hours=4)
+
 _FALLBACK_SYSTEM_PROMPT = (
     "You are Genesis performing an inbox evaluation. "
     "Use the filename as your first classification signal — like an email subject line. "
@@ -495,6 +500,38 @@ class InboxMonitor:
                     "proceeding without pre-check",
                     exc_info=True,
                 )
+
+        if pending is not None:
+            # Staleness guard: auto-cancel approvals pending longer than
+            # _MAX_APPROVAL_STALENESS.  Without this, an approval with
+            # timeout_at=None blocks the inbox monitor indefinitely when
+            # the user never responds and no new files arrive.
+            created_str = pending.get("created_at", "")
+            if created_str:
+                try:
+                    created_dt = datetime.fromisoformat(created_str)
+                    age = self._clock() - created_dt
+                    if age > _MAX_APPROVAL_STALENESS:
+                        pending_id = pending.get("id")
+                        logger.info(
+                            "Cancelling stale inbox approval %s "
+                            "(%.1fh old, threshold %.1fh)",
+                            pending_id,
+                            age.total_seconds() / 3600,
+                            _MAX_APPROVAL_STALENESS.total_seconds() / 3600,
+                        )
+                        try:
+                            gate = self._autonomous_dispatcher.approval_gate
+                            await gate.approval_manager.cancel(pending_id)
+                        except Exception:
+                            logger.warning(
+                                "Failed to cancel stale approval %s",
+                                pending_id,
+                                exc_info=True,
+                            )
+                        pending = None  # Cleared — proceed normally
+                except (ValueError, TypeError):
+                    pass
 
         if pending is not None:
             # Approval pending — scan anyway to detect new content.

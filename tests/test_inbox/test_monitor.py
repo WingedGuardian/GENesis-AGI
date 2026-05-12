@@ -1030,10 +1030,9 @@ def _make_wired_dispatcher(
     async def _get_by_id(request_id: str):
         return approval_by_id.get(request_id)
 
-    async def _cancel(request_id: str):
-        return True
-
-    approval_manager = SimpleNamespace(get_by_id=_get_by_id, cancel=_cancel)
+    approval_manager = SimpleNamespace(
+        get_by_id=_get_by_id, cancel=AsyncMock(return_value=True),
+    )
     # Use the PUBLIC accessor names: the resume pass walks
     # dispatcher.approval_gate.approval_manager via public properties
     # so wrappers/test doubles that only mirror the public API still
@@ -1077,6 +1076,83 @@ async def test_precheck_skips_detection_when_site_blocked_no_new_files(
 
     # No dispatch happened
     monitor._autonomous_dispatcher.route.assert_not_called()
+    assert result.batches_dispatched == 0
+    mock_invoker.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_precheck_cancels_stale_approval_and_proceeds(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """When a pending inbox approval exceeds _MAX_APPROVAL_STALENESS,
+    the monitor auto-cancels it and proceeds with normal detection
+    instead of blocking indefinitely."""
+    from genesis.inbox.monitor import _MAX_APPROVAL_STALENESS
+
+    # Create an approval that's older than the staleness threshold
+    stale_created = (clock.now - _MAX_APPROVAL_STALENESS - timedelta(hours=1)).isoformat()
+    pending_site_row = {
+        "id": "req-stale",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": stale_created,
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    decision = AutonomousDispatchDecision(
+        mode="allowed", reason="auto-approved",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+    )
+
+    # Drop a file — should be detected because the stale approval is cancelled
+    (inbox_dir / "notes.md").write_text("content after stale approval")
+    result = await monitor.check_once()
+
+    # The stale approval was cancelled and dispatch proceeded
+    monitor._autonomous_dispatcher.approval_gate.approval_manager.cancel.assert_called_once_with(
+        "req-stale",
+    )
+    assert result.items_new == 1
+    assert result.batches_dispatched == 1
+
+
+@pytest.mark.asyncio
+async def test_precheck_does_not_cancel_fresh_approval(
+    monitor, inbox_dir, mock_invoker, db, clock,
+):
+    """A pending approval younger than _MAX_APPROVAL_STALENESS is NOT
+    cancelled — the monitor correctly blocks."""
+    from genesis.inbox.monitor import _MAX_APPROVAL_STALENESS
+
+    # Create an approval that's younger than the staleness threshold
+    fresh_created = (clock.now - _MAX_APPROVAL_STALENESS + timedelta(hours=1)).isoformat()
+    pending_site_row = {
+        "id": "req-fresh",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "created_at": fresh_created,
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-fresh",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+    )
+
+    # No new files — should block normally
+    result = await monitor.check_once()
+
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_called()
 
