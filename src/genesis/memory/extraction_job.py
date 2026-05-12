@@ -87,6 +87,8 @@ async def run_extraction_cycle(
         "entities_extracted": 0,
         "references_captured": 0,
         "zero_entity_chunks": 0,
+        "events_stored": 0,
+        "events_failed": 0,
         "errors": 0,
     }
 
@@ -220,7 +222,9 @@ async def run_extraction_cycle(
                                 source_session_id=cc_session_id,
                                 _commit=False,
                             )
+                            summary["events_stored"] += 1
                         except Exception:
+                            summary["events_failed"] += 1
                             logger.warning(
                                 "Failed to store SVO event for %s",
                                 memory_id, exc_info=True,

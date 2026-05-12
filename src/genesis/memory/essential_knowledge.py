@@ -68,6 +68,13 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         for decision in decisions[:5]:
             parts.append(f"- {decision}")
 
+    # Upcoming events: user-world events from the SVO calendar
+    upcoming = await _upcoming_events(db, days=30)
+    if upcoming:
+        parts.append("\n### Upcoming Events")
+        for evt in upcoming[:5]:
+            parts.append(f"- {evt}")
+
     # Wing index: which wings have content + top topics from actual data
     wing_stats = await _wing_stats(db)
     if wing_stats:
@@ -265,6 +272,37 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
     except Exception:
         return {}
 
+
+
+async def _upcoming_events(
+    db: aiosqlite.Connection, days: int = 30,
+) -> list[str]:
+    """Get upcoming user-world events from the SVO event calendar.
+
+    Filters out system events (subject='Genesis') to focus on user-world
+    events like conferences, deadlines, and applications.
+    """
+    try:
+        now_iso = datetime.now(UTC).isoformat()
+        cursor = await db.execute(
+            "SELECT subject, verb, object, event_date "
+            "FROM memory_events "
+            "WHERE event_date >= ? "
+            "AND subject != 'Genesis' "
+            "AND subject != 'code review' "
+            "ORDER BY event_date ASC LIMIT 10",
+            (now_iso,),
+        )
+        rows = await cursor.fetchall()
+        results = []
+        for row in rows:
+            subj, verb, obj, date = row[0], row[1], row[2] or "", row[3]
+            date_short = date[:10] if date else "?"
+            results.append(f"[{date_short}] {subj} {verb} {obj}".strip())
+        return results
+    except Exception:
+        logger.debug("Failed to query upcoming events", exc_info=True)
+        return []
 
 
 async def _wing_top_rooms(
