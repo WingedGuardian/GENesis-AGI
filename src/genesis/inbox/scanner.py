@@ -41,10 +41,19 @@ def scan_folder(
 
 
 def compute_hash(file_path: Path) -> str:
-    """Compute SHA-256 hex digest of file content."""
-    h = hashlib.sha256()
-    h.update(file_path.read_bytes())
-    return h.hexdigest()
+    """Compute SHA-256 of normalized content (whitespace/encoding-invariant).
+
+    Normalises before hashing so that sync-tool artefacts (BOM changes,
+    CRLF↔LF conversion, trailing-whitespace cleanup) do not trigger
+    spurious re-evaluations.
+    """
+    raw = file_path.read_bytes()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]  # strip UTF-8 BOM
+    text = raw.decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n")
+    normalized = "\n".join(line.rstrip() for line in text.split("\n"))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def read_content(file_path: Path, max_bytes: int = 50_000) -> str:

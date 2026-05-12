@@ -103,6 +103,13 @@ You MUST address every single one:
 
 ## Environment Constraints & Workarounds
 
+- **Before reporting ANY URL as unfetchable**, call `procedure_recall` (via the
+  genesis-memory MCP server) with the URL's domain or content type (e.g.,
+  "youtube transcript fetch", "linkedin video transcript", "paywalled article").
+  The procedure store contains proven workarounds with exact commands. You MUST
+  check procedures before giving up on a URL — reporting "cannot fetch" without
+  checking procedures is a failure.
+
 - **YouTube SSL errors**: This container cannot verify YouTube's SSL certificate
   chain. WebFetch will fail on all YouTube URLs with SSL errors. A PreToolUse
   hook blocks WebFetch for YouTube and provides instructions, but if you reach
@@ -123,6 +130,11 @@ You MUST address every single one:
   curl -sk <youtube_url>
   ```
   Extract `"title":"..."` and `"shortDescription":"..."` from the HTML JSON.
+
+- **You MUST attempt yt-dlp via Bash for ANY YouTube URL before reporting it
+  as unfetchable.** WebFetch will always fail on YouTube in this container.
+  That is expected. The real tool is yt-dlp. If you report a YouTube video
+  as unfetchable without running yt-dlp, you have failed the evaluation.
 
 - **NEVER tell the user to do something you haven't attempted yourself.**
   If WebFetch fails, try yt-dlp. If yt-dlp fails, try curl -k. Only after
