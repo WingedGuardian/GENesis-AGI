@@ -251,20 +251,26 @@ class CCSessionExecutor:
                         )
                         return False
 
-                    if pm.confidence < _PM_MITIGATE_THRESHOLD and pm.mitigations:
-                        mitigation_text = "\n".join(
-                            f"- {m}" for m in pm.mitigations
-                        )
-                        plan_content = (
-                            f"{plan_content}\n\n"
-                            f"## Pre-Mortem Mitigations "
-                            f"(confidence: {pm.confidence}%)\n\n"
-                            f"{mitigation_text}\n"
-                        )
-                        logger.info(
-                            "Pre-mortem injected %d mitigations (conf=%d%%)",
-                            len(pm.mitigations), pm.confidence,
-                        )
+                    if pm.confidence < _PM_MITIGATE_THRESHOLD:
+                        if pm.mitigations:
+                            mitigation_text = "\n".join(
+                                f"- {m}" for m in pm.mitigations
+                            )
+                            plan_content = (
+                                f"{plan_content}\n\n"
+                                f"## Pre-Mortem Mitigations "
+                                f"(confidence: {pm.confidence}%)\n\n"
+                                f"{mitigation_text}\n"
+                            )
+                            logger.info(
+                                "Pre-mortem injected %d mitigations (conf=%d%%)",
+                                len(pm.mitigations), pm.confidence,
+                            )
+                        else:
+                            logger.info(
+                                "Pre-mortem confidence %d%% (medium) but no mitigations provided",
+                                pm.confidence,
+                            )
 
                     await self._set_output(
                         task_id, "pre_mortem",

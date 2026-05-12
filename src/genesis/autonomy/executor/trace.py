@@ -549,10 +549,12 @@ class ExecutionTracer:
         reason = cal.get("reason", "")
         model_used = cal.get("model_used", "unknown")
         better = cal.get("better_choice", "")
+        step_idx = cal.get("step_idx")
         if not reason:
             return
 
-        content = f"Calibration (task {task_id[:8]}): used {model_used}"
+        step_label = f" step {step_idx}" if step_idx is not None else ""
+        content = f"Calibration (task {task_id[:8]}{step_label}): used {model_used}"
         if better:
             content += f", better choice was {better}"
         content += f". {reason}"

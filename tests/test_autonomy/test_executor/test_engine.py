@@ -11,7 +11,7 @@ import aiosqlite
 import pytest
 
 from genesis.autonomy.executor.engine import MAX_REVIEW_ITERATIONS, CCSessionExecutor
-from genesis.autonomy.executor.review import ReviewResult, VerifyResult
+from genesis.autonomy.executor.review import PreMortemResult, ReviewResult, VerifyResult
 from genesis.autonomy.executor.types import (
     StepResult,
     TaskPhase,
@@ -704,3 +704,72 @@ class TestHelpers:
         assert fixup["type"] == "code"
         assert "Fix the imports" in fixup["description"]
         assert "Missing error handling" in fixup["description"]
+
+
+# ---------------------------------------------------------------------------
+# Pre-mortem integration tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreMortemIntegration:
+    async def test_premortem_blocks_low_confidence(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        """Pre-mortem with confidence < 50 blocks the task."""
+        mock_reviewer.pre_mortem = AsyncMock(
+            return_value=PreMortemResult(
+                confidence=30,
+                failure_modes=["Fundamental approach is wrong"],
+                mitigations=["Rethink approach"],
+            ),
+        )
+        await _seed_task(db, plan_path=str(plan_file))
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "blocked"
+        blocker = json.loads(task.get("blockers") or "{}")
+        assert "Pre-mortem" in blocker.get("description", "")
+
+    async def test_premortem_injects_mitigations(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        """Pre-mortem with confidence 50-70 injects mitigations and proceeds."""
+        mock_reviewer.pre_mortem = AsyncMock(
+            return_value=PreMortemResult(
+                confidence=60,
+                failure_modes=["Possible edge case"],
+                mitigations=["Handle edge case X", "Add fallback for Y"],
+            ),
+        )
+        await _seed_task(db, plan_path=str(plan_file))
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
+        # Verify mitigations were stored in outputs
+        task = await task_states.get_by_id(db, "t-001")
+        outputs = json.loads(task.get("outputs", "{}"))
+        pm_data = json.loads(outputs.get("pre_mortem", "{}"))
+        assert pm_data["confidence"] == 60
+        assert len(pm_data["mitigations"]) == 2
+
+    async def test_premortem_high_confidence_proceeds(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+    ):
+        """Pre-mortem with confidence > 70 proceeds normally."""
+        mock_reviewer.pre_mortem = AsyncMock(
+            return_value=PreMortemResult(
+                confidence=85,
+                failure_modes=[],
+                mitigations=[],
+            ),
+        )
+        await _seed_task(db, plan_path=str(plan_file))
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
