@@ -95,7 +95,7 @@ async def main(apply: bool = False) -> None:
                 logger.warning("Pre-cleanup count failed for %s: %s", coll, exc)
 
         deleted_count = 0
-        for memory_id, collection, _invalid_at in rows:
+        for memory_id, _subsystem, collection, _invalid_at in rows:
             # Try the recorded collection first, then the other as a
             # defensive fallback (the collection column is mostly reliable
             # but historical inserts pre-#311 sometimes drifted).
