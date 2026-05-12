@@ -14,6 +14,7 @@ from genesis.sentinel.dispatcher import (
     _ESCALATE_AT_ATTEMPT,
     SentinelDispatcher,
     SentinelRequest,
+    SentinelResult,
     _extract_pattern,
 )
 from genesis.sentinel.state import SentinelState, SentinelStateData
@@ -672,3 +673,123 @@ class TestRejectionWindow:
 
         assert "memory:critical" in loaded.rejected_patterns
         assert loaded.rejected_patterns["memory:critical"] == expiry
+
+
+# ---------------------------------------------------------------------------
+# TestSentinelActionStalenessGuard — resume_from_approval for sentinel_action
+# ---------------------------------------------------------------------------
+
+
+def _setup_pending_action(dispatcher, *, request_id="req-action-1", alarm_id="test:alarm"):
+    """Set up dispatcher state as if waiting for sentinel_action approval."""
+    import json
+    request_data = {
+        "trigger_source": "fire_alarm",
+        "trigger_reason": "test alarm",
+        "tier": 2,
+        "alarms": [{"alert_id": alarm_id, "tier": 2, "severity": "critical", "message": "test alarm"}],
+        "context": {},
+    }
+    cc_result_data = {
+        "dispatched": True,
+        "session_id": "sess-1",
+        "diagnosis": "test diagnosis",
+        "actions_taken": [],
+        "proposed_actions": [{"command": "systemctl restart test", "description": "restart", "safe": True}],
+        "resolved": False,
+        "observation_id": "",
+        "reason": "",
+        "duration_s": 10.0,
+    }
+    dispatcher._state.pending_request_id = request_id
+    dispatcher._state.pending_policy_id = "sentinel_action"
+    dispatcher._state.pending_pattern = alarm_id
+    dispatcher._state.pending_request_json = json.dumps(request_data)
+    dispatcher._state.pending_cc_result_json = json.dumps(cc_result_data)
+    dispatcher._state.transition(
+        SentinelState.AWAITING_ACTION_APPROVAL,
+        reason="test setup",
+    )
+
+
+class TestSentinelActionStalenessGuard:
+    """Tests for the intelligent staleness guard on sentinel_action resume."""
+
+    @pytest.mark.asyncio
+    async def test_alarms_still_active_proceeds(self):
+        """When original alarms are still active, actions execute normally."""
+        d = _make_dispatcher()
+        _setup_pending_action(d)
+
+        mock_execute = AsyncMock(return_value=[])
+        with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=True), \
+             patch.object(d, "_execute_approved_actions", mock_execute), \
+             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)), \
+             patch("genesis.sentinel.dispatcher.save_state"):
+            result = await d.resume_from_approval("req-action-1", "approved")
+
+        assert result is not None
+        assert result.dispatched is True
+        mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_self_healed_skips_actions(self):
+        """When original alarms cleared and system is healthy, skip stale actions."""
+        d = _make_dispatcher()
+        _setup_pending_action(d)
+
+        with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=[]), \
+             patch("genesis.sentinel.dispatcher.save_state"):
+            result = await d.resume_from_approval("req-action-1", "approved")
+
+        assert result is not None
+        assert result.dispatched is False
+        assert "self-healed" in result.reason.lower()
+        assert d._state.state == SentinelState.HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_root_cause_shifted_reinvestigates(self):
+        """When original alarms cleared but new alerts exist, transition to ALARM_DETECTED."""
+        d = _make_dispatcher()
+        _setup_pending_action(d)
+
+        new_alerts = [{"alert_id": "different:alarm", "tier": 1}]
+
+        with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, return_value=new_alerts), \
+             patch("genesis.sentinel.dispatcher.save_state"):
+            result = await d.resume_from_approval("req-action-1", "approved")
+
+        assert result is not None
+        assert result.dispatched is False
+        assert "shifted" in result.reason.lower() or "re-investigating" in result.reason.lower()
+        assert d._state.state == SentinelState.INVESTIGATING
+
+    @pytest.mark.asyncio
+    async def test_health_check_fails_proceeds_failopen(self):
+        """When health check fails (can't verify), proceed with actions (fail-open)."""
+        d = _make_dispatcher()
+        _setup_pending_action(d)
+
+        mock_execute = AsyncMock(return_value=[])
+        with patch.object(d, "_re_verify_alarms", new_callable=AsyncMock, return_value=False), \
+             patch("genesis.mcp.health_mcp._impl_health_alerts", new_callable=AsyncMock, side_effect=Exception("health unavailable")), \
+             patch.object(d, "_execute_approved_actions", mock_execute), \
+             patch.object(d, "_finalize_dispatch", new_callable=AsyncMock, return_value=SentinelResult(dispatched=True)), \
+             patch("genesis.sentinel.dispatcher.save_state"):
+            result = await d.resume_from_approval("req-action-1", "approved")
+
+        assert result is not None
+        mock_execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_mismatched_request_id_skips(self):
+        """Resume with wrong request_id returns None (stale resume)."""
+        d = _make_dispatcher()
+        _setup_pending_action(d, request_id="req-action-1")
+
+        with patch("genesis.sentinel.dispatcher.save_state"):
+            result = await d.resume_from_approval("req-wrong-id", "approved")
+
+        assert result is None

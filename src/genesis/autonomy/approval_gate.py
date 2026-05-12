@@ -375,17 +375,25 @@ class AutonomousCliApprovalGate:
             return request_id
         return None
 
-    async def approve_all_pending(self, *, resolved_by: str) -> int:
+    async def approve_all_pending(
+        self, *, resolved_by: str, subsystem: str | None = None,
+    ) -> int:
         """Approve all pending CLI-fallback approval requests. Returns count.
 
-        Scoped to ``autonomous_cli_fallback`` action type only — does NOT
-        touch approval requests from other subsystems (ego, modules, etc.).
+        Scoped to ``autonomous_cli_fallback`` action type only.  When
+        *subsystem* is provided, further restricts to requests whose
+        context matches that subsystem (e.g. only inbox, only ego).
+        Pass ``None`` for the dashboard "approve everything" path.
         """
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
             if req.get("action_type") != "autonomous_cli_fallback":
                 continue
+            if subsystem is not None:
+                ctx = _json_loads(req.get("context"))
+                if ctx.get("subsystem") != subsystem:
+                    continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,
             )
@@ -399,6 +407,14 @@ class AutonomousCliApprovalGate:
         return await self._approval_manager.resolve(
             request_id, status=decision, resolved_by=resolved_by,
         )
+
+    async def get_request_subsystem(self, request_id: str) -> str | None:
+        """Return the subsystem from a request's context, or ``None``."""
+        row = await self._approval_manager.get_by_id(request_id)
+        if not row:
+            return None
+        context = _json_loads(row.get("context"))
+        return context.get("subsystem")
 
     async def _find_existing(
         self, approval_key: str,
@@ -647,9 +663,14 @@ class AutonomousCliApprovalGate:
                     "✅ Approve",
                     callback_data=f"cli_approve:{request_id}",
                 )]]
-                if pending_count >= 2:
+                if pending_count >= 1:
+                    btn_label = (
+                        f"Approve all {pending_count} pending"
+                        if pending_count > 1
+                        else "Approve all pending"
+                    )
                     rows.append([InlineKeyboardButton(
-                        f"✅✅ Approve all {pending_count} pending",
+                        f"✅✅ {btn_label}",
                         callback_data=f"cli_approve_all:{request_id}",
                     )])
                 keyboard = InlineKeyboardMarkup(rows)

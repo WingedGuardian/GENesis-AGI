@@ -987,6 +987,22 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
         await _handle_text_inner(ctx, msg, user, tid)
 
 
+async def _resolution_label(gate, request_id: str) -> str:
+    """Look up actual approval status to show a meaningful label."""
+    try:
+        row = await gate.approval_manager.get_by_id(request_id)
+        actual = row.get("status") if row else "unknown"
+    except Exception:
+        actual = "unknown"
+    if actual == "expired":
+        return "⏰ Expired"
+    if actual == "approved":
+        return "✅ Already approved"
+    if actual == "cancelled":
+        return "🚫 Cancelled"
+    return f"⚠️ Already resolved ({actual})"
+
+
 async def handle_callback_query(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle inline keyboard button presses (approval flows).
 
@@ -1039,7 +1055,10 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
                 "Failed to resolve cli_approve for request %s", key, exc_info=True,
             )
             return
-        label = "✅ Approved" if ok else "⚠️ Already resolved"
+        if ok:
+            label = "✅ Approved"
+        else:
+            label = await _resolution_label(ctx.autonomous_cli_gate, key)
         log.info("cli_approve %s → %s (user %s)", key, label, user.id)
         try:
             original = query.message.text_html or query.message.text or ""
@@ -1068,16 +1087,33 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
                 key, decision="approved",
                 resolved_by=f"telegram:batch:{user.id}",
             )
-            batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
-                resolved_by=f"telegram:batch:{user.id}",
-            )
+            # Scope batch to same subsystem as the triggering request.
+            # If subsystem lookup fails (request gone), skip batch to avoid
+            # accidentally approving all subsystems (the single approve
+            # above already resolved the triggering request).
+            _subsystem = await ctx.autonomous_cli_gate.get_request_subsystem(key)
+            if _subsystem is not None:
+                batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
+                    resolved_by=f"telegram:batch:{user.id}",
+                    subsystem=_subsystem,
+                )
+            else:
+                log.warning(
+                    "cli_approve_all: subsystem lookup failed for %s — "
+                    "skipping batch to avoid cross-subsystem approve",
+                    key,
+                )
+                batch_count = 0
         except Exception:
             log.error(
                 "Failed to resolve cli_approve_all for %s", key, exc_info=True,
             )
             return
         total = batch_count + (1 if triggered_ok else 0)
-        label = f"✅ Approved ({total} total)" if total else "⚠️ Already resolved"
+        if total:
+            label = f"✅ Approved ({total} total)"
+        else:
+            label = await _resolution_label(ctx.autonomous_cli_gate, key)
         log.info(
             "cli_approve_all triggered by %s: triggered=%s batch=%d total=%d (user %s)",
             key, triggered_ok, batch_count, total, user.id,

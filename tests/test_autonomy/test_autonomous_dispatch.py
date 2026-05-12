@@ -651,13 +651,17 @@ async def test_send_request_builds_batch_button_when_two_pending(
     assert len(runtime.pipeline.sent) == 2
     first_markup = runtime.pipeline.sent[0][2]
     second_markup = runtime.pipeline.sent[1][2]
-    # First send had pending_count=1 → single row only
-    assert len(first_markup.inline_keyboard) == 1
-    # Second send had pending_count=2 → two rows (single + batch)
+    # Both sends include batch button (always shown when pending_count >= 1)
+    assert len(first_markup.inline_keyboard) == 2
     assert len(second_markup.inline_keyboard) == 2
-    # The second row is the batch button with the "Approve all" callback prefix
-    batch_button = second_markup.inline_keyboard[1][0]
-    assert batch_button.callback_data.startswith("cli_approve_all:")
+    # First send: singular label ("Approve all pending")
+    first_batch = first_markup.inline_keyboard[1][0]
+    assert first_batch.callback_data.startswith("cli_approve_all:")
+    assert "Approve all pending" in first_batch.text
+    # Second send: plural label ("Approve all 2 pending")
+    second_batch = second_markup.inline_keyboard[1][0]
+    assert second_batch.callback_data.startswith("cli_approve_all:")
+    assert "Approve all 2 pending" in second_batch.text
 
 
 @pytest.mark.asyncio

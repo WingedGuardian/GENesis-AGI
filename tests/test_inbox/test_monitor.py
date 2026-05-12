@@ -1030,7 +1030,10 @@ def _make_wired_dispatcher(
     async def _get_by_id(request_id: str):
         return approval_by_id.get(request_id)
 
-    approval_manager = SimpleNamespace(get_by_id=_get_by_id)
+    async def _cancel(request_id: str):
+        return True
+
+    approval_manager = SimpleNamespace(get_by_id=_get_by_id, cancel=_cancel)
     # Use the PUBLIC accessor names: the resume pass walks
     # dispatcher.approval_gate.approval_manager via public properties
     # so wrappers/test doubles that only mirror the public API still
@@ -1046,13 +1049,11 @@ def _make_wired_dispatcher(
 
 
 @pytest.mark.asyncio
-async def test_precheck_skips_detection_when_site_blocked(
+async def test_precheck_skips_detection_when_site_blocked_no_new_files(
     monitor, inbox_dir, mock_invoker, db,
 ):
-    """When an inbox_evaluation approval is already pending, detection
-    of new files must be skipped entirely — no new inbox_items rows,
-    no new Telegram prompt, no dispatch calls for the new file."""
-    # Simulate a pending approval for the inbox call site
+    """When an inbox_evaluation approval is already pending and no new
+    files were added, detection still short-circuits — no dispatch."""
     pending_site_row = {
         "id": "req-already-pending",
         "status": "pending",
@@ -1071,21 +1072,56 @@ async def test_precheck_skips_detection_when_site_blocked(
         pending_sites=[pending_site_row],
     )
 
-    # Drop a NEW file — normally this would create a row and dispatch
-    (inbox_dir / "new-while-blocked.md").write_text("fresh content")
+    # No new files — just run check
     result = await monitor.check_once()
 
-    # No row was created for the new file — creation was skipped entirely
-    rows = [dict(r) for r in (await (await db.execute(
-        "SELECT * FROM inbox_items WHERE file_path LIKE '%new-while-blocked%'",
-    )).fetchall())]
-    assert len(rows) == 0, (
-        f"pre-check should have skipped row creation, got: {rows}"
-    )
-    # No dispatch happened (no resume items, detect_changes was skipped)
+    # No dispatch happened
     monitor._autonomous_dispatcher.route.assert_not_called()
     assert result.batches_dispatched == 0
     mock_invoker.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_precheck_refreshes_when_new_files_added_while_blocked(
+    monitor, inbox_dir, mock_invoker, db,
+):
+    """When an inbox_evaluation approval is pending but new files arrive,
+    the stale approval is cancelled and files are detected so a fresh
+    approval reflecting the current inbox state can be created."""
+    pending_site_row = {
+        "id": "req-already-pending",
+        "status": "pending",
+        "action_type": "autonomous_cli_fallback",
+        "_context": {
+            "subsystem": "inbox",
+            "policy_id": "inbox_evaluation",
+        },
+    }
+    # After the stale approval is cancelled, the dispatch will create
+    # a new approval request (blocked again with a new request id).
+    decision = AutonomousDispatchDecision(
+        mode="blocked", reason="approval requested",
+        approval_request_id="req-fresh",
+    )
+    monitor._autonomous_dispatcher = _make_wired_dispatcher(
+        decision=decision,
+        pending_sites=[pending_site_row],
+    )
+
+    # Drop a NEW file while approval is pending
+    (inbox_dir / "new-while-blocked.md").write_text("fresh content")
+    await monitor.check_once()
+
+    # The new file WAS detected and a row was created
+    rows = [dict(r) for r in (await (await db.execute(
+        "SELECT * FROM inbox_items WHERE file_path LIKE '%new-while-blocked%'",
+    )).fetchall())]
+    assert len(rows) == 1, (
+        f"new file should have been detected after stale approval cancel, "
+        f"got: {rows}"
+    )
+    # Dispatch was attempted (creating a fresh approval)
+    monitor._autonomous_dispatcher.route.assert_called_once()
 
 
 @pytest.mark.asyncio
