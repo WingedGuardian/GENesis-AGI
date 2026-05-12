@@ -44,6 +44,22 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Added
 
+- **Procedure auto-extraction now fires on SUCCESS outcomes from
+  autonomous channels.** Previously the triage pipeline only extracted
+  procedures from `APPROACH_FAILURE` and `WORKAROUND_SUCCESS` outcomes,
+  so the procedural_memory table grew only from rare failure patterns.
+  Successful autonomous task completions (`inbox`, `mail`, `reflection`,
+  `surplus` channels) now also drive extraction, giving the system a
+  baseline pattern for the next run of the same task type. Foreground
+  SUCCESS is intentionally NOT auto-extracted — foreground procedures
+  are user-initiated via the `procedure_store` MCP.
+- **Procedure novelty gate.** Auto-extracted procedures are now
+  compared against existing procedures of the same `task_type` via
+  cosine similarity of their `principle` embeddings. If the new
+  principle is ≥0.85 similar to an existing one, storage is skipped.
+  Prevents the table from filling with paraphrases of the same insight
+  as SUCCESS-path extraction broadens the trigger surface. Fail-open
+  when the embedding stack is unavailable.
 - **Foreground recall excludes automated-subsystem content by
   default.** Memory writes from ego corrections, triage signals, and
   reflection observations are now tagged with a new
@@ -114,6 +130,13 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   `OutcomeClass.UNKNOWN` value to make its role as an error marker
   explicit (it was never a real 6th outcome category, just a fallback
   bucket).
+- **Triage pipeline no longer crashes silently in procedure extraction.**
+  The procedure extraction block referenced `summary.output_text`, which
+  is not a field on `InteractionSummary` — the correct field is
+  `response_text`. The `AttributeError` was caught by the surrounding
+  exception handler, so the bug was invisible at runtime but blocked
+  every auto-extraction. Same fix applied to the behavioral correction
+  recorder (BIS).
 - **Call sites with no API key stay visible on the dashboard.**
   Previously, a call site whose entire provider chain had no API key
   configured was silently dropped from `cfg.call_sites` at startup,

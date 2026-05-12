@@ -342,6 +342,9 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Check procedures before multi-step tasks**: use `procedure_recall` if relevant.
   Applies when a task involves external services, has failed before, or
   requires multi-step tool use.
+- **Store procedures when you discover them.** When you find a non-obvious
+  reusable workflow (multi-step, hard-won, capability that took effort to
+  learn), call `procedure_store` immediately — don't defer.
 - **Never insert directly into `task_states`.** All task submissions MUST
   go through `task_submit` MCP after completing `/task` intake. Direct DB
   writes are rejected by a SQLite trigger that requires a valid intake

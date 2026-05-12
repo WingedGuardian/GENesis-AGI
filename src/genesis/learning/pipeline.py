@@ -22,6 +22,13 @@ from genesis.observability.types import Severity, Subsystem
 logger = logging.getLogger(__name__)
 
 
+# Channels driven by Genesis's autonomous subsystems rather than direct user
+# input. Used to gate behaviors that should fire only on autonomous activity
+# (e.g., aggressive SUCCESS-path procedure extraction) and to gate behaviors
+# that should fire only on foreground activity (e.g., STEERING.md auto-update).
+_AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
+
+
 def build_triage_pipeline(
     *,
     db: Any,
@@ -155,9 +162,21 @@ def build_triage_pipeline(
                     logger.error("Autonomy calibration failed (non-fatal)", exc_info=True)
 
         # 6.5. Procedure extraction (error-isolated — must not crash pipeline)
-        if outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS) and router is not None:
+        #
+        # Triggers by outcome:
+        #  - APPROACH_FAILURE: capture what went wrong, gated by novelty.
+        #  - WORKAROUND_SUCCESS: capture the workaround pattern, gated by novelty.
+        #  - SUCCESS on AUTONOMOUS channels: capture the working pattern so the
+        #    next autonomous run has a baseline. Gated by novelty so this doesn't
+        #    flood the table. Foreground SUCCESS is NOT auto-extracted — the
+        #    user/CC drives that via `procedure_store` calls.
+        is_autonomous = summary.channel in _AUTONOMOUS_CHANNELS
+        if router is not None and (
+            outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
+            or (outcome == OutcomeClass.SUCCESS and is_autonomous)
+        ):
             try:
-                summary_text = f"User: {summary.user_text}\nOutput: {summary.output_text[:500]}"
+                summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
                 await extract_procedure(
                     db,
                     summary_text=summary_text,
@@ -170,7 +189,6 @@ def build_triage_pipeline(
         # 6.6. STEERING.md auto-population from user corrections
         # Only extract from foreground user sessions — autonomous pipelines
         # (inbox, mail, reflection) must never write to identity files.
-        _AUTONOMOUS_CHANNELS = {"inbox", "mail", "reflection", "surplus"}
         if (
             outcome == OutcomeClass.APPROACH_FAILURE
             and identity_loader is not None
@@ -248,7 +266,7 @@ def build_triage_pipeline(
         if not user_text.strip():
             return
 
-        context = (summary.output_text or "")[:500]
+        context = (summary.response_text or "")[:500]
         await create_correction(
             db_conn,
             raw_user_text=user_text[:500],
