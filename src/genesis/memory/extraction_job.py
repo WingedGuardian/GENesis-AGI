@@ -89,6 +89,8 @@ async def run_extraction_cycle(
         "zero_entity_chunks": 0,
         "events_stored": 0,
         "events_failed": 0,
+        "goals_detected": 0,
+        "contacts_detected": 0,
         "errors": 0,
     }
 
@@ -241,6 +243,38 @@ async def run_extraction_cycle(
                                 "Failed to create typed links for %s",
                                 memory_id, exc_info=True,
                             )
+
+                    # Goal signal detection
+                    try:
+                        from genesis.memory.goal_tracker import (
+                            process_extraction as _track_goal,
+                        )
+                        if await _track_goal(
+                            db, extraction,
+                            source_session_id=cc_session_id,
+                        ):
+                            summary["goals_detected"] += 1
+                    except Exception:
+                        logger.debug(
+                            "Goal tracker failed for %s",
+                            memory_id, exc_info=True,
+                        )
+
+                    # Contact detection from person entities
+                    try:
+                        from genesis.memory.contact_tracker import (
+                            process_extraction as _track_contact,
+                        )
+                        n = await _track_contact(
+                            db, extraction,
+                            source_session_id=cc_session_id,
+                        )
+                        summary["contacts_detected"] += n
+                    except Exception:
+                        logger.debug(
+                            "Contact tracker failed for %s",
+                            memory_id, exc_info=True,
+                        )
                 except Exception:
                     summary["errors"] += 1
                     logger.error(
