@@ -285,14 +285,14 @@ async def extract_procedure(
     # per cooldown window to prevent flooding during extended outages.
     if fell_open:
         now = time.monotonic()
-        last = _fail_open_timestamps.get(data["task_type"], 0.0)
-        if now - last < _FAIL_OPEN_COOLDOWN_SECS:
+        task_type_key = data["task_type"]
+        if task_type_key in _fail_open_timestamps and now - _fail_open_timestamps[task_type_key] < _FAIL_OPEN_COOLDOWN_SECS:
             logger.warning(
                 "Fail-open rate limited for %s: cooldown active",
-                data["task_type"],
+                task_type_key,
             )
             return None
-        _fail_open_timestamps[data["task_type"]] = now
+        _fail_open_timestamps[task_type_key] = now
 
     # ── Cross-type contradiction check (FM2) ─────────────────────────────
     # After same-type novelty passes, check for trusted procedures with
