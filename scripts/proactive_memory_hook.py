@@ -595,6 +595,7 @@ async def _search_qdrant(
                         "memory_class": payload.get("memory_class", "fact"),
                         "_retrieved_count": payload.get("retrieved_count", 0),
                         "_wing": payload.get("wing"),
+                        "collection": collection,
                     })
                 return results
     except Exception as exc:
