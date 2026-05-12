@@ -60,6 +60,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   Prevents the table from filling with paraphrases of the same insight
   as SUCCESS-path extraction broadens the trigger surface. Fail-open
   when the embedding stack is unavailable.
+- **Proactive procedure recall hook.** Procedures now surface
+  automatically on every CC prompt — same UserPromptSubmit pathway as
+  the proactive memory hook. The hook reuses the prompt embedding the
+  memory hook already computes, compares it against `principle_embedding`
+  BLOBs stored on each procedure row, and emits a single
+  `[Procedure | task_type | id:xxx]` line when the top match's cosine
+  ≥ 0.7. Top-1 only — most prompts won't surface a procedure. New
+  `principle_embedding` column on `procedural_memory` (forward-only;
+  pre-existing rows store NULL and are skipped until they're
+  re-extracted or re-taught). Effectively replaces the manual
+  `procedure_recall`-before-multi-step-tasks reminder in CLAUDE.md.
 - **Foreground recall excludes automated-subsystem content by
   default.** Memory writes from ego corrections, triage signals, and
   reflection observations are now tagged with a new

@@ -339,9 +339,11 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
 - **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
   `test:`, `chore:`. Scope is optional: `feat(ego): add cadence manager`.
   Keep subject line under 72 characters. Dominant category wins if mixed.
-- **Check procedures before multi-step tasks**: use `procedure_recall` if relevant.
-  Applies when a task involves external services, has failed before, or
-  requires multi-step tool use.
+- **Procedure recall is automatic.** The proactive procedure hook surfaces
+  the single most relevant stored procedure (cosine ≥ 0.7) as a
+  `[Procedure | task_type | id:xxx]` tag on every prompt, when one applies.
+  No manual `procedure_recall` call needed for routine work — use it only
+  when you want broader matches or wider context.
 - **Store procedures when you discover them.** When you find a non-obvious
   reusable workflow (multi-step, hard-won, capability that took effort to
   learn), call `procedure_store` immediately — don't defer.

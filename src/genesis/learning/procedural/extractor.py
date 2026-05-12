@@ -72,15 +72,20 @@ async def _principle_is_novel(
     task_type: str,
     new_principle: str,
     embedder: EmbeddingProvider | None,
-) -> tuple[bool, float]:
-    """Return (is_novel, max_similarity_seen).
+) -> tuple[bool, float, list[float] | None]:
+    """Return (is_novel, max_similarity_seen, new_principle_vector).
+
+    `new_principle_vector` is the embedding of `new_principle` (or None if
+    the embedder is unavailable or embedding fails). Callers that want to
+    store the embedding alongside the procedure can reuse this vector
+    instead of re-embedding.
 
     Fail-open: if embedding fails or no embedder is configured, treat as
     novel so we don't silently drop extractions when the embedding stack is
     degraded.
     """
     if embedder is None:
-        return True, 0.0
+        return True, 0.0, None
 
     try:
         from genesis.db.crud.procedural import list_by_task_type
@@ -94,13 +99,21 @@ async def _principle_is_novel(
         logger.warning(
             "Procedure novelty lookup failed; allowing storage", exc_info=True,
         )
-        return True, 0.0
-
-    if not existing:
-        return True, 0.0
+        return True, 0.0, None
 
     try:
         new_emb = await embedder.embed(new_principle)
+    except Exception:
+        logger.warning(
+            "Failed to embed new principle; allowing storage without novelty check",
+            exc_info=True,
+        )
+        return True, 0.0, None
+
+    if not existing:
+        return True, 0.0, new_emb
+
+    try:
         max_sim = 0.0
         for row in existing:
             existing_principle = (
@@ -112,13 +125,13 @@ async def _principle_is_novel(
             sim = _cosine_similarity(new_emb, existing_emb)
             if sim > max_sim:
                 max_sim = sim
-        return max_sim < NOVELTY_THRESHOLD, max_sim
+        return max_sim < NOVELTY_THRESHOLD, max_sim, new_emb
     except Exception:
         logger.warning(
             "Embedding/cosine failed in novelty gate; allowing storage",
             exc_info=True,
         )
-        return True, 0.0
+        return True, 0.0, new_emb
 
 # 38_procedure_extraction — extracts reusable procedures from interaction outcomes.
 # Currently in the learning-pipeline-only path (partially wired per _call_site_meta.py).
@@ -214,7 +227,7 @@ async def extract_procedure(
     # Novelty gate: skip if a near-duplicate principle already exists for
     # this task_type. Fail-open when embeddings are unavailable.
     embedder = embedding_provider if embedding_provider is not None else _get_embedding_provider()
-    is_novel, max_sim = await _principle_is_novel(
+    is_novel, max_sim, principle_vec = await _principle_is_novel(
         db,
         task_type=data["task_type"],
         new_principle=data["principle"],
@@ -226,6 +239,20 @@ async def extract_procedure(
             data["task_type"], max_sim, NOVELTY_THRESHOLD,
         )
         return None
+
+    # Pack the principle embedding for the proactive procedure hook.
+    # NULL is acceptable — the hook skips rows without an embedding.
+    principle_blob: bytes | None = None
+    if principle_vec is not None:
+        try:
+            from genesis.learning.procedural.embedding import pack_embedding
+
+            principle_blob = pack_embedding(principle_vec)
+        except Exception:
+            logger.warning(
+                "Failed to pack principle embedding; storing without it",
+                exc_info=True,
+            )
 
     try:
         proc_id = await store_procedure(
@@ -239,6 +266,7 @@ async def extract_procedure(
             activation_tier="L4",
             speculative=1,
             source={"type": "auto_extracted", "triage_outcome": outcome},
+            principle_embedding=principle_blob,
         )
         logger.info("Extracted procedure %s: %s", proc_id, data["task_type"])
         return proc_id
