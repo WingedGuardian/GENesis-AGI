@@ -1346,10 +1346,10 @@ async def _migrate_world_model_tables(db: aiosqlite.Connection) -> None:
 
     Idempotent: CREATE TABLE IF NOT EXISTS.
     """
-    from genesis.db.schema._tables import TABLE_DDL
+    from genesis.db.schema._tables import TABLES
 
     for table_name in ("user_goals", "user_contacts"):
-        ddl = TABLE_DDL.get(table_name)
+        ddl = TABLES.get(table_name)
         if ddl:
             try:
                 await db.execute(ddl)
