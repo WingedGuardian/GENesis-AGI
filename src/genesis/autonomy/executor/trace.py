@@ -34,6 +34,9 @@ _RETROSPECTIVE_PROMPT_PATH = (
 _MAX_NEW_PROCEDURES = 3
 _MAX_PROCEDURE_UPDATES = 5
 _MAX_SKILL_OBSERVATIONS = 3
+_MAX_CALIBRATIONS = 2
+_MAX_OPTIMIZATIONS = 2
+_MAX_DRIFT = 2
 
 
 class _Router(Protocol):
@@ -369,6 +372,45 @@ class ExecutionTracer:
                         exc_info=True,
                     )
 
+        # 4. Capability calibrations
+        calibrations = data.get("capability_calibrations", [])
+        if isinstance(calibrations, list):
+            for cal in calibrations[:_MAX_CALIBRATIONS]:
+                if not isinstance(cal, dict):
+                    continue
+                try:
+                    await self._record_calibration(trace.task_id, cal)
+                except Exception:
+                    logger.warning(
+                        "Failed to record calibration", exc_info=True,
+                    )
+
+        # 5. Workflow optimizations
+        optimizations = data.get("workflow_optimizations", [])
+        if isinstance(optimizations, list):
+            for opt in optimizations[:_MAX_OPTIMIZATIONS]:
+                if not isinstance(opt, dict):
+                    continue
+                try:
+                    await self._record_optimization(trace.task_id, opt)
+                except Exception:
+                    logger.warning(
+                        "Failed to record optimization", exc_info=True,
+                    )
+
+        # 6. Context drift
+        drift_items = data.get("context_drift", [])
+        if isinstance(drift_items, list):
+            for drift in drift_items[:_MAX_DRIFT]:
+                if not isinstance(drift, dict):
+                    continue
+                try:
+                    await self._record_drift(trace.task_id, drift)
+                except Exception:
+                    logger.warning(
+                        "Failed to record context drift", exc_info=True,
+                    )
+
         proc_count = len(trace.procedural_extractions)
         if proc_count:
             logger.info(
@@ -498,6 +540,81 @@ class ExecutionTracer:
             confidence=0.5,
         )
         logger.info("Recorded skill observation for '%s'", skill_name)
+
+    async def _record_calibration(self, task_id: str, cal: dict) -> None:
+        """Record a capability calibration observation."""
+        if self._memory_store is None:
+            return
+
+        reason = cal.get("reason", "")
+        model_used = cal.get("model_used", "unknown")
+        better = cal.get("better_choice", "")
+        if not reason:
+            return
+
+        content = f"Calibration (task {task_id[:8]}): used {model_used}"
+        if better:
+            content += f", better choice was {better}"
+        content += f". {reason}"
+
+        await self._memory_store.store(
+            content=content,
+            source="task_retrospective",
+            memory_type="episodic",
+            tags=["learning:calibration", f"task:{task_id[:8]}"],
+            confidence=0.5,
+        )
+        logger.debug("Recorded calibration for task %s", task_id[:8])
+
+    async def _record_optimization(self, task_id: str, opt: dict) -> None:
+        """Record a workflow optimization observation."""
+        if self._memory_store is None:
+            return
+
+        optimization = opt.get("optimization", "")
+        if not optimization:
+            return
+
+        applies_to = opt.get("applies_to", "")
+        content = f"Workflow optimization (task {task_id[:8]}): {optimization}"
+        if applies_to:
+            content += f". Applies to: {applies_to}"
+
+        await self._memory_store.store(
+            content=content,
+            source="task_retrospective",
+            memory_type="episodic",
+            tags=["learning:workflow", f"task:{task_id[:8]}"],
+            confidence=0.5,
+        )
+        logger.debug("Recorded workflow optimization for task %s", task_id[:8])
+
+    async def _record_drift(self, task_id: str, drift: dict) -> None:
+        """Record a context drift observation."""
+        if self._memory_store is None:
+            return
+
+        assumption = drift.get("assumption", "")
+        reality = drift.get("reality", "")
+        if not assumption or not reality:
+            return
+
+        lesson = drift.get("lesson", "")
+        content = (
+            f"Context drift (task {task_id[:8]}): "
+            f"assumed '{assumption}' but reality was '{reality}'"
+        )
+        if lesson:
+            content += f". Lesson: {lesson}"
+
+        await self._memory_store.store(
+            content=content,
+            source="task_retrospective",
+            memory_type="episodic",
+            tags=["learning:drift", f"task:{task_id[:8]}"],
+            confidence=0.5,
+        )
+        logger.debug("Recorded context drift for task %s", task_id[:8])
 
     async def _record_retrospective_failure(
         self,
