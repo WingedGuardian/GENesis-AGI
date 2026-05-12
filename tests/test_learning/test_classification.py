@@ -138,6 +138,52 @@ class TestOutcomeClassifier:
         prompt = router.route_call.call_args[0][1][0]["content"]
         assert "retried 3 times" in prompt
 
+    @pytest.mark.asyncio
+    async def test_hard_gate_overrides_success_when_goals_failed(self):
+        """FM1: partial completion classified as success → forced to approach_failure."""
+        response = json.dumps({
+            "goals_identified": ["fetch URL A", "fetch URL B"],
+            "goals_achieved": ["fetch URL A"],
+            "goals_failed": ["fetch URL B"],
+            "outcome": "success",
+            "rationale": "mostly worked",
+        })
+        router = _mock_router(response)
+        result = await OutcomeClassifier(router).classify(_make_summary())
+        assert result == OutcomeClass.APPROACH_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_hard_gate_allows_success_when_no_goals_failed(self):
+        """FM1: all goals achieved → success is preserved."""
+        response = json.dumps({
+            "goals_identified": ["deploy widget"],
+            "goals_achieved": ["deploy widget"],
+            "goals_failed": [],
+            "outcome": "success",
+            "rationale": "all done",
+        })
+        router = _mock_router(response)
+        result = await OutcomeClassifier(router).classify(_make_summary())
+        assert result == OutcomeClass.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_hard_gate_ignores_missing_goals_fields(self):
+        """FM1: old-format response without goals fields still works."""
+        response = json.dumps({"outcome": "success", "rationale": "ok"})
+        router = _mock_router(response)
+        result = await OutcomeClassifier(router).classify(_make_summary())
+        assert result == OutcomeClass.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_prompt_includes_goal_validation_section(self):
+        """FM1: the prompt asks for structured goal validation."""
+        router = _mock_router(json.dumps({"outcome": "success"}))
+        c = OutcomeClassifier(router)
+        await c.classify(_make_summary())
+        prompt = router.route_call.call_args[0][1][0]["content"]
+        assert "Goal Validation" in prompt
+        assert "goals_failed" in prompt
+
 
 # ─── DeltaAssessor ───────────────────────────────────────────────────────────
 

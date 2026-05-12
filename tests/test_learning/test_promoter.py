@@ -130,14 +130,14 @@ def test_compute_tier_l1_with_drift_stays_at_l1():
     assert _compute_tier(row) == "L1"
 
 
-def test_compute_tier_speculative_procedure_blocked_from_l3():
-    """Speculative procedures cannot be auto-promoted to L3."""
+def test_compute_tier_speculative_procedure_can_promote_to_l3():
+    """Speculative procedures can promote to L3 if they meet thresholds."""
     row = {
         "success_count": 5, "confidence": 0.7, "speculative": 1,
         "tool_trigger": None, "activation_tier": "L4",
     }
-    # L3 requires speculative=0; L2 requires conf>=0.75; falls back to current.
-    assert _compute_tier(row) == "L4"
+    # speculative flag is provenance metadata, not a promotion gate.
+    assert _compute_tier(row) == "L3"
 
 
 # ─── _check_demotion ──────────────────────────────────────────────────────────
