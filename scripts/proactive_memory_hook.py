@@ -360,18 +360,31 @@ def _search_code_index(db_path: Path, keywords: list[str]) -> list[dict]:
         return []
 
 
-def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
+def _search_fts5(
+    db_path: Path,
+    keywords: list[str],
+    collection: str | None = None,
+) -> list[dict]:
     """Search memory_fts using FTS5 with OR-joined keywords.
 
     Excludes automated-subsystem writes (ego/triage/reflection) via a
     LEFT JOIN with memory_metadata. NULL source_subsystem (user-sourced
     + legacy pre-1.5b rows) is preserved.
+
+    ``collection``: if provided, restrict to this collection
+    (e.g. ``"episodic_memory"``). Default ``None`` searches all.
     """
     if not keywords:
         return []
 
     fts_query = " OR ".join('"' + _escape_fts5(k) + '"' for k in keywords)
     placeholders = ",".join("?" * len(_PROACTIVE_EXCLUDED_SUBSYSTEMS))
+
+    collection_clause = ""
+    collection_params: tuple = ()
+    if collection:
+        collection_clause = "AND memory_fts.collection = ?"
+        collection_params = (collection,)
 
     try:
         conn = sqlite3.connect(str(db_path), timeout=2)
@@ -386,13 +399,15 @@ def _search_fts5(db_path: Path, keywords: list[str]) -> list[dict]:
                 LEFT JOIN memory_metadata
                   ON memory_fts.memory_id = memory_metadata.memory_id
                 WHERE memory_fts MATCH ?
+                  {collection_clause}
                   AND (memory_metadata.source_subsystem IS NULL
                        OR memory_metadata.source_subsystem
                            NOT IN ({placeholders}))
                 ORDER BY rank
                 LIMIT ?
                 """,  # noqa: S608 -- placeholders bound separately
-                (fts_query, *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
+                (fts_query, *collection_params,
+                 *_PROACTIVE_EXCLUDED_SUBSYSTEMS,
                  _MAX_RESULTS * 2),
             )
             rows = [dict(row) for row in cursor.fetchall()]
@@ -659,7 +674,7 @@ def _enrich_with_metadata(results: list[dict]) -> None:
             conn.row_factory = sqlite3.Row
             placeholders = ",".join("?" for _ in ids)
             rows = conn.execute(
-                f"SELECT memory_id, created_at, wing FROM memory_metadata"  # noqa: S608
+                f"SELECT memory_id, created_at, wing, collection FROM memory_metadata"  # noqa: S608
                 f" WHERE memory_id IN ({placeholders})",
                 ids,
             ).fetchall()
@@ -670,6 +685,7 @@ def _enrich_with_metadata(results: list[dict]) -> None:
                     r.setdefault("_created_at", meta[mid].get("created_at"))
                     if not r.get("_wing"):
                         r["_wing"] = meta[mid].get("wing")
+                    r.setdefault("collection", meta[mid].get("collection"))
         finally:
             conn.close()
     except Exception:
@@ -711,8 +727,9 @@ def _format_results(results: list[dict]) -> str:
         age = _format_age(r.get("_created_at", ""))
         wing = r.get("_wing") or ""
 
-        parts = ["Memory"]
-        if age != "?":
+        is_kb = r.get("collection") == "knowledge_base"
+        parts = ["KB" if is_kb else "Memory"]
+        if age != "?" and not is_kb:
             parts.append(age)
         if wing and wing != "memory":
             parts.append(wing)
@@ -1029,8 +1046,8 @@ async def _run(prompt: str, session_id: str = "") -> None:
     except Exception:
         pass  # Taxonomy module failure must not block hook
 
-    # FTS5 search (synchronous, fast) — covers both episodic and knowledge
-    fts_results = _search_fts5(_DB_PATH, keywords)
+    # FTS5 search (synchronous, fast) — episodic only; KB comes via Qdrant
+    fts_results = _search_fts5(_DB_PATH, keywords, collection="episodic_memory")
 
     # Code index search (synchronous, fast) — structural code matches
     code_results = _search_code_index(_DB_PATH, keywords)
