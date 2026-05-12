@@ -307,9 +307,14 @@ class EgoSession:
             proposals = parsed.get("proposals", [])
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
-                await self._process_proposals(
-                    proposals, cycle.id, communication_decision=comm_decision,
-                )
+                # Light feasibility filter — only blocks clearly impossible
+                # proposals. The ego dreams freely; this filter catches
+                # proposals that reference nonexistent capabilities.
+                proposals = await self._filter_proposals(proposals)
+                if proposals:
+                    await self._process_proposals(
+                        proposals, cycle.id, communication_decision=comm_decision,
+                    )
 
             # 9b. Process tabled/withdrawn proposal IDs
             tabled_ids = parsed.get("tabled", [])
@@ -498,6 +503,33 @@ class EgoSession:
         return None
 
     # -- Helpers -----------------------------------------------------------
+
+    async def _filter_proposals(
+        self,
+        proposals: list[dict],
+    ) -> list[dict]:
+        """Light feasibility filter — only block clearly impossible proposals.
+
+        The ego proposes freely based on its world model ("dream first").
+        This filter catches proposals that reference capabilities Genesis
+        genuinely doesn't have. Questionable proposals pass through — the
+        user can reject them.
+
+        The ego NEVER sees filter results. No per-proposal feedback.
+        """
+        if not proposals:
+            return proposals
+
+        # Currently a pass-through: the architecture is in place for future
+        # capability-based filtering as the system matures. Starts fully
+        # permissive — better to let a questionable proposal through than
+        # suppress a creative one.
+        #
+        # Future filter criteria (when data supports it):
+        # - action_type references a capability domain that doesn't exist
+        # - content suggests a tool Genesis genuinely lacks
+        # - a known hard blocker (service down, API revoked)
+        return proposals
 
     async def _process_proposals(
         self,
