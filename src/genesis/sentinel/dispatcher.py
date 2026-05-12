@@ -825,7 +825,7 @@ class SentinelDispatcher:
                         )
                         self._state.clear_pending()
                         self._state.transition(
-                            SentinelState.ALARM_DETECTED,
+                            SentinelState.INVESTIGATING,
                             reason=(
                                 "root cause shifted during action approval "
                                 "wait — re-investigating"
