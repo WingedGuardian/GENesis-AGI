@@ -416,8 +416,9 @@ class ExecutionTracer:
             steps=proc_data["steps"],
             tools_used=proc_data["tools_used"],
             context_tags=proc_data["context_tags"],
-            activation_tier="L4",
+            activation_tier="L3",
             speculative=1,
+            confidence=0.5,
             principle_embedding=principle_blob,
         )
 
