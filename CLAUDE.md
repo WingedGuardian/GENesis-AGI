@@ -55,8 +55,8 @@ changes take effect on next CC session start.
 ```bash
 source ~/genesis/.venv/bin/activate               # Required for all Python work
 cd ~/genesis && ruff check .                      # Lint all Python
-cd ~/genesis && pytest -v                         # Run tests
-cd ~/genesis && ruff check . && pytest -v         # Both (do before committing)
+pytest tests/test_memory/test_drift.py -v         # Targeted tests (ALWAYS specify file)
+gh pr checks <PR-number>                          # CI results (replaces local full suite)
 curl -s http://localhost:6333/collections | jq .  # Verify Qdrant
 systemctl --user restart genesis-server           # Restart server (NEVER nohup)
 systemctl --user status genesis-server            # Verify server running
@@ -358,10 +358,11 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   lines, run the full command first, then read the output file.
 - **Targeted tests during development.** Run ONLY the relevant test
   file(s) for your changes (`pytest tests/test_mcp/test_browser_tools.py -v`).
-  Full `ruff check . && pytest -v` runs once at pre-commit, not during
-  iterative development. Never loop on a slow full suite    diagnose and
-  run the specific test. If a verification step takes >60s during
-  development, the scope is wrong.
+  NEVER run the full test suite locally — CI handles that on every push.
+  Check CI results via `gh pr checks` or `gh run view`. If a local
+  verification step takes >60s, the scope is wrong. Bare `pytest`
+  without a file path is banned — it wastes 10+ minutes, gets
+  backgrounded, and produces no value that CI doesn't already provide.
 - **Plan mode by default.** Enter plan mode for any task with 3+ steps or
   architectural decisions. Plan verification steps, not just build steps. If
   something goes sideways mid-execution — STOP and re-plan immediately. Don't

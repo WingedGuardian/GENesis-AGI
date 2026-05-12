@@ -45,6 +45,16 @@ from genesis.qdrant import collections as qdrant_ops
 
 logger = logging.getLogger(__name__)
 
+
+def _coalesce(value: object, default: object) -> object:
+    """Return *default* if *value* is ``None`` (null-coalescing for DB rows).
+
+    Unlike ``or``, this preserves valid falsy values such as ``0`` and ``""``
+    that SQLite rows may legitimately contain.
+    """
+    return default if value is None else value
+
+
 # Weights for combining global vs local results in final RRF
 _GLOBAL_WEIGHT = 0.3
 _LOCAL_WEIGHT = 0.7
@@ -241,7 +251,7 @@ async def drift_recall(
     db: aiosqlite.Connection,
     qdrant_client: QdrantClient,
     embedding_provider: EmbeddingProvider,
-    source: str = "both",
+    source: str = "episodic",
     limit: int = 10,
     min_activation: float = 0.0,
     include_subsystem: bool | list[str] = False,
@@ -357,16 +367,18 @@ async def drift_recall(
         if not row:
             continue
 
-        # Compute activation
+        # Compute activation — use _coalesce for NULL-safe defaults because
+        # dict.get() only applies the default for *missing* keys, not for
+        # keys present with None values (which SQLite rows may contain).
         activation = compute_activation(
-            confidence=row.get("confidence", 0.5),
-            created_at=row.get("created_at", now_iso),
-            retrieved_count=row.get("retrieved_count", 0),
-            link_count=row.get("link_count", 0),
-            source=row.get("source_type", "unknown"),
+            confidence=_coalesce(row.get("confidence"), 0.5),
+            created_at=_coalesce(row.get("created_at"), now_iso),
+            retrieved_count=_coalesce(row.get("retrieved_count"), 0),
+            link_count=_coalesce(row.get("link_count"), 0),
+            source=_coalesce(row.get("source_type"), "unknown"),
             tags=row.get("tags", "").split(",") if row.get("tags") else [],
             now=now_iso,
-            memory_class=row.get("memory_class", "fact"),
+            memory_class=_coalesce(row.get("memory_class"), "fact"),
         )
 
         if activation.final_score < min_activation:

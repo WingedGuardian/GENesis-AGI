@@ -58,10 +58,10 @@ async def memory_recall(
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
     Args:
-        source: 'episodic' | 'knowledge' | 'both' | None. When None
-            (default), classify_intent() routes the query to the best
-            pool: WHY/WHEN/WHERE/STATUS → episodic; WHAT/HOW/GENERAL
-            → both. Pass an explicit value to force a specific pool.
+        source: 'episodic' | 'knowledge' | 'both' | None. Defaults to
+            ``'episodic'`` — searches only conversational/personal memories.
+            Use ``knowledge_recall`` MCP tool for knowledge-base lookups,
+            or pass ``'both'`` / ``'knowledge'`` explicitly if needed.
         compact: If True, return lightweight previews only (memory_id, preview,
             score, wing, room, memory_class, source). Use memory_expand to
             fetch full content for specific IDs. Saves tokens and ~500ms.
@@ -96,14 +96,12 @@ async def memory_recall(
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
 
-    # Resolve source=None to the intent-recommended pool here, before
-    # dispatching to retriever or drift_recall. Both consumers expect a
-    # concrete string; HybridRetriever.recall accepts None but the drift
-    # path uses dict.get(source, [...]) which would silently return the
-    # default branch for None.
+    # Default to episodic-only. Knowledge base is opt-in via explicit
+    # source="knowledge"/"both" or the separate knowledge_recall tool.
+    # Intent classification is preserved in HybridRetriever.recall() for
+    # direct callers (proactive hook, dashboard, ego) — not removed.
     if source is None:
-        from genesis.memory.intent import classify_intent
-        source = classify_intent(query).recommended_source
+        source = "episodic"
 
     pipeline_used = mode  # track which pipeline actually ran
 

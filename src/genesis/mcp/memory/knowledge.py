@@ -59,9 +59,15 @@ async def knowledge_recall(
     query: str,
     project: str | None = None,
     domain: str | None = None,
-    limit: int = 10,
+    limit: int = 5,
+    min_score: float = 0.15,
 ) -> list[dict]:
-    """Hybrid search scoped by project/domain, authority-tagged."""
+    """Hybrid search scoped by project/domain, authority-tagged.
+
+    Returns fewer results than ``memory_recall`` by default (5 vs 10)
+    and applies a post-authority-boost relevance floor (``min_score``)
+    to suppress low-relevance noise from bulk-ingested content.
+    """
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._retriever is not None
@@ -110,7 +116,8 @@ async def knowledge_recall(
                 "source_pipeline": fts_row.get("source_pipeline"),
             })
 
-    return _apply_authority_boost(merged)[:limit]
+    boosted = _apply_authority_boost(merged)
+    return [r for r in boosted if r.get("score", 0.0) >= min_score][:limit]
 
 
 async def _ingest_knowledge_unit(
