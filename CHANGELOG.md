@@ -71,6 +71,17 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   pre-existing rows store NULL and are skipped until they're
   re-extracted or re-taught). Effectively replaces the manual
   `procedure_recall`-before-multi-step-tasks reminder in CLAUDE.md.
+- **Four user-work wings added to the memory taxonomy:** `dev_workflow`,
+  `research`, `integrations`, and `career`. Previously the taxonomy only
+  modelled Genesis-internal subsystems (memory, learning, routing,
+  infrastructure, channels, autonomy), so all user-domain memories
+  (git/PR/CI activity, paper reading, third-party API integrations,
+  career and job-search work) collapsed into `general/uncategorized`.
+  New keyword and tag rules route the obvious cases; the long tail
+  will still land in `general` until reclassified. The Genesis-internal
+  `provider` tag still routes to `routing`, not `integrations` —
+  user-work integrations come in via specific service names (minimax,
+  abacus, litellm, etc.).
 - **Foreground recall excludes automated-subsystem content by
   default.** Memory writes from ego corrections, triage signals, and
   reflection observations are now tagged with a new

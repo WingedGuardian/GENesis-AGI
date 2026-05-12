@@ -17,12 +17,20 @@ from dataclasses import dataclass
 # ---------------------------------------------------------------------------
 
 WINGS = frozenset({
+    # Genesis-internal subsystems
     "memory",
     "learning",
     "routing",
     "infrastructure",
     "channels",
     "autonomy",
+    # User-work domains (added 2026-05-11 from cluster analysis of the
+    # 1,964-row general/uncategorized pile). About what the user works on,
+    # not Genesis subsystem internals.
+    "dev_workflow",
+    "research",
+    "integrations",
+    "career",
     "general",
 })
 
@@ -50,6 +58,18 @@ ROOMS: dict[str, list[str]] = {
     "autonomy": [
         "tasks", "permissions", "approval", "protected_paths",
         "adversarial_review",
+    ],
+    "dev_workflow": [
+        "git", "ci", "pull_request", "review", "worktree",
+    ],
+    "research": [
+        "papers", "external_systems", "newsletters", "api_docs",
+    ],
+    "integrations": [
+        "providers", "third_party_apis", "tools", "models",
+    ],
+    "career": [
+        "applications", "profile", "research", "outreach",
     ],
     "general": ["uncategorized"],
 }
@@ -176,6 +196,48 @@ _KEYWORD_MAP: dict[str, tuple[str, str]] = {
     "approval gate": ("autonomy", "approval"),
     "protected path": ("autonomy", "protected_paths"),
     "adversarial review": ("autonomy", "adversarial_review"),
+    # dev_workflow wing (PRs, worktrees, CI, code review tooling). Kept
+    # narrow on purpose: bare "git commit"/"git push" etc. appear too often
+    # in operational memories (autonomy, infrastructure) and would steal
+    # those classifications via the earliest-position rule. The terms below
+    # are dev-workflow-specific.
+    "pull request": ("dev_workflow", "pull_request"),
+    "worktree": ("dev_workflow", "worktree"),
+    "github actions": ("dev_workflow", "ci"),
+    "code review": ("dev_workflow", "review"),
+    "ruff check": ("dev_workflow", "ci"),
+    "greptile": ("dev_workflow", "review"),
+    "ultrareview": ("dev_workflow", "review"),
+    # research wing (external content, system reading, paper notes)
+    "vllm": ("research", "external_systems"),
+    "honcho": ("research", "external_systems"),
+    "agent zero": ("research", "external_systems"),
+    "latent space": ("research", "newsletters"),
+    "newsletter": ("research", "newsletters"),
+    "research paper": ("research", "papers"),
+    "arxiv": ("research", "papers"),
+    "api documentation": ("research", "api_docs"),
+    # integrations wing (specific third-party services the user is wiring
+    # into projects). Deliberately omits "openai api" / "anthropic api"
+    # because those phrases overlap heavily with Genesis-internal routing
+    # provider discussions — those memories should stay in `routing`.
+    "minimax": ("integrations", "providers"),
+    "abacus ai": ("integrations", "providers"),
+    "litellm": ("integrations", "providers"),
+    "openrouter": ("integrations", "providers"),
+    "conway": ("integrations", "third_party_apis"),
+    "composio": ("integrations", "third_party_apis"),
+    # career wing. "resume" intentionally omitted as a content keyword —
+    # it collides with "resume the session", "resume crawling", etc. —
+    # career classifications via this word should come through the
+    # `resume` tag instead (handled in _TAG_WING_MAP below).
+    "cv revision": ("career", "applications"),
+    "profile.yml": ("career", "profile"),
+    "job application": ("career", "applications"),
+    "ats integration": ("career", "outreach"),
+    "recruiter": ("career", "outreach"),
+    "careerops": ("career", "applications"),
+    "jerbs": ("career", "applications"),
 }
 
 # ---------------------------------------------------------------------------
@@ -212,6 +274,28 @@ _TAG_WING_MAP: dict[str, str] = {
     "autonomy": "autonomy",
     "task": "autonomy",
     "permission": "autonomy",
+    # dev_workflow tag map
+    "git": "dev_workflow",
+    "worktree": "dev_workflow",
+    "pr": "dev_workflow",
+    "pull_request": "dev_workflow",
+    "ci": "dev_workflow",
+    "code_review": "dev_workflow",
+    # research tag map
+    "newsletter": "research",
+    "external_system": "research",
+    "research_paper": "research",
+    # integrations tag map. NOTE: "provider" deliberately stays mapped to
+    # "routing" above (Genesis-internal model providers). User-work
+    # integrations come in via keyword classification on specific service
+    # names (minimax, abacus, litellm, etc.).
+    "third_party_api": "integrations",
+    "integration": "integrations",
+    # career tag map
+    "career": "career",
+    "job_search": "career",
+    "resume": "career",
+    "ats": "career",
 }
 
 
