@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -773,3 +775,156 @@ class TestPreMortemIntegration:
         result = await engine.execute("t-001")
 
         assert result is True
+
+
+# ---------------------------------------------------------------------------
+# OBSERVING phase integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestObservingPhase:
+    async def test_fresh_task_passes_observing(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Fresh task passes OBSERVING without blocking."""
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+
+    async def test_stale_task_blocked_by_observing(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Task created >7 days ago is blocked at OBSERVING."""
+        from datetime import timedelta
+
+        old_date = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        await _seed_task(db, plan_path=plan_file)
+        await db.execute(
+            "UPDATE task_states SET created_at = ? WHERE task_id = ?",
+            (old_date, "t-001"),
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is False
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "blocked"
+        blocker = json.loads(task["blockers"])
+        assert "Observation blocked" in blocker["description"]
+        assert blocker["resume_phase"] == "observing"
+
+    async def test_observing_skipped_on_recovery(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Recovery path skips OBSERVING (resumes from executing)."""
+        await _seed_task(db, plan_path=plan_file, phase="executing")
+        # Add a completed step so recovery has something to work with
+        await task_steps.create_step(
+            db, task_id="t-001", step_idx=0, step_type="research",
+            description="Research",
+        )
+        await db.execute(
+            """UPDATE task_steps SET status = 'completed',
+               result_json = '{"result": "done", "artifacts": []}'
+               WHERE task_id = ? AND step_idx = ?""",
+            ("t-001", 0),
+        )
+        await db.commit()
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
+        # Review was never called (skipped by recovery)
+        mock_reviewer.review_plan.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Pre-planning blocker recovery (Option B fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPrePlanningBlockerRecovery:
+    async def test_blocked_at_observing_reruns_fresh_path(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Task blocked at OBSERVING (no steps) resumes via fresh path."""
+        # Seed as blocked (simulates a prior observation blocker)
+        await _seed_task(db, plan_path=plan_file, phase="blocked")
+        # No steps exist in the DB (blocked before PLANNING)
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        # Should re-run through OBSERVING -> REVIEWING -> PLANNING -> ...
+        assert result is True
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+        # Review was called (fresh path ran)
+        mock_reviewer.review_plan.assert_called_once()
+
+    async def test_blocked_at_reviewing_reruns_fresh_path(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Pre-existing fix: blocked at REVIEWING (no steps) also gets fresh path."""
+        await _seed_task(db, plan_path=plan_file, phase="blocked")
+
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+        result = await engine.execute("t-001")
+
+        assert result is True
+        mock_reviewer.review_plan.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Living plan audit trail
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestLivingPlan:
+    async def test_plan_file_gets_audit_sections(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Plan file should have audit sections after execution."""
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        await engine.execute("t-001")
+
+        content = Path(plan_file).read_text()
+        assert "## Audit: REVIEWING" in content
+        assert "## Audit: PLANNING" in content
+        assert "## Audit: COMPLETED" in content
+
+    async def test_plan_append_failopen(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Unwritable plan file does not block execution."""
+        import os
+
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        # Make plan file read-only
+        os.chmod(plan_file, 0o444)
+        try:
+            result = await engine.execute("t-001")
+            assert result is True
+        finally:
+            os.chmod(plan_file, 0o644)

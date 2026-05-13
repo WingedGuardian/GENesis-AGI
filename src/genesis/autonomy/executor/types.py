@@ -19,6 +19,7 @@ class TaskPhase(StrEnum):
     """Lifecycle phases for a background task."""
 
     PENDING = "pending"
+    OBSERVING = "observing"
     REVIEWING = "reviewing"
     PLANNING = "planning"
     EXECUTING = "executing"
@@ -38,7 +39,13 @@ class TaskPhase(StrEnum):
 # ---------------------------------------------------------------------------
 
 VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
-    TaskPhase.PENDING: {TaskPhase.REVIEWING, TaskPhase.FAILED, TaskPhase.CANCELLED},
+    TaskPhase.PENDING: {TaskPhase.OBSERVING, TaskPhase.FAILED, TaskPhase.CANCELLED},
+    TaskPhase.OBSERVING: {
+        TaskPhase.REVIEWING,
+        TaskPhase.BLOCKED,  # stale plan blocks for user review
+        TaskPhase.FAILED,
+        TaskPhase.CANCELLED,
+    },
     TaskPhase.REVIEWING: {
         TaskPhase.PLANNING,
         TaskPhase.BLOCKED,  # plan has gaps, need user input
@@ -84,6 +91,7 @@ VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
         TaskPhase.FAILED,  # retrospective itself fails (non-blocking)
     },
     TaskPhase.BLOCKED: {
+        TaskPhase.OBSERVING,  # resume from observation-phase blocker
         TaskPhase.REVIEWING,  # user responded to review-phase blocker
         TaskPhase.EXECUTING,  # user responded to mid-task blocker
         TaskPhase.VERIFYING,  # recovery resume after verify-phase blocker
