@@ -34,6 +34,18 @@ Analyze the trace and extract:
    a task revealed a reusable pattern and no matching skill exists, note
    that too.
 
+4. **Capability calibrations** --- for each step, was the right model or
+   approach used? Would a different routing have been faster, cheaper, or
+   more effective? Only note cases where calibration clearly matters.
+
+5. **Workflow optimizations** --- could any steps have been parallelized?
+   Were there unnecessary sequential dependencies? Only note actionable
+   improvements that would save meaningful time.
+
+6. **Context drift** --- did any assumptions from the plan change during
+   execution? What was stale by the time the executor reached that step?
+   Only note cases where drift actually impacted execution.
+
 ## Output Format
 
 Return ONLY a JSON object:
@@ -61,6 +73,29 @@ Return ONLY a JSON object:
     {
       "skill_name": "name from catalog",
       "observation": "what should be improved or added"
+    }
+  ],
+  "capability_calibrations": [
+    {
+      "step_idx": 1,
+      "model_used": "opus",
+      "better_choice": "sonnet",
+      "reason": "Simple code formatting task didn't need Opus-level reasoning"
+    }
+  ],
+  "workflow_optimizations": [
+    {
+      "optimization": "Steps 2 and 3 were independent and could run in parallel",
+      "estimated_savings": "50% of step 3 duration",
+      "applies_to": "tasks with independent code + test steps"
+    }
+  ],
+  "context_drift": [
+    {
+      "assumption": "API endpoint at /v2/users was stable",
+      "reality": "Endpoint was modified during execution",
+      "impact": "Step 4 failed, required workaround",
+      "lesson": "Check API stability for tasks spanning >2h"
     }
   ]
 }

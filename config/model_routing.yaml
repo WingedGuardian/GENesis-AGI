@@ -419,6 +419,13 @@ call_sites:
     - gemini-free
     default_paid: true
     description: Post-execution retrospective learning extraction
+  44_task_premortem:
+    chain:
+    - openrouter-deepseek-v4
+    - mistral-large-free
+    - gemini-free
+    default_paid: true
+    description: Pre-mortem failure analysis before committing to execution
   35_content_draft:
     chain:
     - gemini-free

@@ -525,3 +525,102 @@ class TestToolCapableReviewChain:
         reviewer = TaskReviewer(router=router, invoker=None)
         result = await reviewer._tool_capable_review("deliverable", "reqs")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Pre-mortem tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreMortem:
+    async def test_high_confidence_returns_result(self) -> None:
+        """Confidence > 70 returns PreMortemResult with all fields."""
+        body = json.dumps({
+            "failure_modes": ["API rate limit", "Schema change"],
+            "invalid_assumptions": ["API is stable"],
+            "mitigations": ["Add retry logic"],
+            "confidence": 85,
+        })
+        reviewer = TaskReviewer(router=_make_router(body))
+        result = await reviewer.pre_mortem("# Plan\nDo X", "Build API")
+
+        assert result is not None
+        assert result.confidence == 85
+        assert len(result.failure_modes) == 2
+        assert len(result.mitigations) == 1
+
+    async def test_low_confidence_returns_result(self) -> None:
+        """Confidence < 50 is returned (engine decides to block)."""
+        body = json.dumps({
+            "failure_modes": ["Fundamental approach wrong"],
+            "invalid_assumptions": ["Assumes non-existent API"],
+            "mitigations": ["Research API first"],
+            "confidence": 30,
+        })
+        reviewer = TaskReviewer(router=_make_router(body))
+        result = await reviewer.pre_mortem("# Bad plan", "Doomed task")
+
+        assert result is not None
+        assert result.confidence == 30
+
+    async def test_medium_confidence_includes_mitigations(self) -> None:
+        """Confidence 50-70 includes mitigations for injection."""
+        body = json.dumps({
+            "failure_modes": ["Partial coverage"],
+            "invalid_assumptions": [],
+            "mitigations": ["Add edge case handling", "Verify assumptions"],
+            "confidence": 60,
+        })
+        reviewer = TaskReviewer(router=_make_router(body))
+        result = await reviewer.pre_mortem("# Plan", "Build X")
+
+        assert result is not None
+        assert result.confidence == 60
+        assert len(result.mitigations) == 2
+
+    async def test_routing_failure_returns_none(self) -> None:
+        """Fail-open: routing failure -> None (don't block execution)."""
+        reviewer = TaskReviewer(router=_make_router(None, success=False))
+        result = await reviewer.pre_mortem("# Plan", "task")
+
+        assert result is None
+
+    async def test_routing_exception_returns_none(self) -> None:
+        """Fail-open: routing exception -> None."""
+        router = AsyncMock()
+        router.route_call = AsyncMock(side_effect=RuntimeError("network"))
+        reviewer = TaskReviewer(router=router)
+        result = await reviewer.pre_mortem("# Plan", "task")
+
+        assert result is None
+
+    async def test_invalid_json_returns_none(self) -> None:
+        """Unparseable response -> None (fail-open)."""
+        reviewer = TaskReviewer(router=_make_router("not json at all"))
+        result = await reviewer.pre_mortem("# Plan", "task")
+
+        assert result is None
+
+    async def test_missing_confidence_returns_none(self) -> None:
+        """JSON without numeric confidence field -> None."""
+        body = json.dumps({"failure_modes": ["x"], "confidence": "high"})
+        reviewer = TaskReviewer(router=_make_router(body))
+        result = await reviewer.pre_mortem("# Plan", "task")
+
+        assert result is None
+
+    async def test_json_in_markdown_block_parsed(self) -> None:
+        """JSON wrapped in markdown code fences is extracted."""
+        inner = json.dumps({
+            "failure_modes": ["risk"],
+            "invalid_assumptions": [],
+            "mitigations": [],
+            "confidence": 75,
+        })
+        body = f"```json\n{inner}\n```"
+        reviewer = TaskReviewer(router=_make_router(body))
+        result = await reviewer.pre_mortem("# Plan", "task")
+
+        assert result is not None
+        assert result.confidence == 75

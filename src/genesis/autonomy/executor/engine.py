@@ -1,8 +1,9 @@
 """Task executor engine -- state machine for autonomous task execution.
 
 Drives a task through its lifecycle:
-    PENDING -> REVIEWING -> PLANNING -> EXECUTING -> VERIFYING
-    -> SYNTHESIZING -> DELIVERING -> RETROSPECTIVE -> COMPLETED
+    PENDING -> OBSERVING -> REVIEWING -> PLANNING -> EXECUTING
+    -> VERIFYING -> SYNTHESIZING -> DELIVERING -> RETROSPECTIVE
+    -> COMPLETED
 
 Implements:
 - Amendment #1:  Blocker persistence (DB before notification)
@@ -10,7 +11,7 @@ Implements:
 - Amendment #7:  Worktree management for CODE steps
 - Amendment #10: Formal state transitions via validate_transition()
 - Amendment #13: Global pause check at each checkpoint
-- Recovery:      Phase resume — skip REVIEWING/PLANNING on recovery
+- Recovery:      Phase resume — skip OBSERVING/REVIEWING/PLANNING on recovery
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from genesis.autonomy.executor import dispatch as _dispatch
+from genesis.autonomy.executor import observe as _observe
 from genesis.autonomy.executor import worktree_mgr as _worktree
 from genesis.autonomy.executor.step_dispatcher import StepDispatcher
 from genesis.autonomy.executor.types import (
@@ -147,7 +149,7 @@ class CCSessionExecutor:
         if resuming:
             self._active_tasks[task_id] = TaskPhase(db_phase_str)
             logger.info(
-                "Task %s: resuming from %s phase (skipping review/plan)",
+                "Task %s: resuming from %s phase (skipping observe/review/plan)",
                 task_id, db_phase_str,
             )
         else:
@@ -177,6 +179,18 @@ class CCSessionExecutor:
                     for row in existing_rows
                 ]
 
+                if not steps:
+                    # Blocked before PLANNING — no steps exist.
+                    # Re-run from fresh path (covers both OBSERVING
+                    # and REVIEWING blockers).
+                    resuming = False
+                    self._active_tasks[task_id] = TaskPhase.PENDING
+                    logger.info(
+                        "Task %s: pre-planning blocker, re-running fresh path",
+                        task_id,
+                    )
+
+            if resuming:
                 # Reconstruct completed StepResults from persisted data
                 step_results: list[StepResult] = []
                 completed_indices: set[int] = set()
@@ -215,7 +229,36 @@ class CCSessionExecutor:
                     task_id, len(completed_indices), len(remaining_steps),
                 )
             else:
-                # Fresh path: REVIEWING -> PLANNING
+                # Fresh path: OBSERVING -> REVIEWING -> PLANNING
+
+                # --- OBSERVING ---
+                await self._transition(task_id, TaskPhase.OBSERVING)
+                all_tasks = await task_states.list_all_recent(
+                    self._db, limit=50,
+                )
+                obs = await _observe.observe(
+                    created_at=task.get("created_at", ""),
+                    repo_root=_REPO_ROOT,
+                    active_tasks=all_tasks,
+                    task_id=task_id,
+                )
+                if not obs.proceed:
+                    await self._persist_blocker(
+                        task_id,
+                        f"Observation blocked: {obs.block_reason}",
+                        TaskPhase.OBSERVING,
+                    )
+                    return False
+                if obs.annotations:
+                    ann_text = "\n".join(f"- {a}" for a in obs.annotations)
+                    plan_content = (
+                        f"{plan_content}\n\n"
+                        f"## Observation Warnings\n\n{ann_text}\n"
+                    )
+                    self._append_to_plan(
+                        plan_path, "OBSERVING", ann_text,
+                    )
+
                 # --- REVIEWING ---
                 await self._transition(task_id, TaskPhase.REVIEWING)
                 review = await self._reviewer.review_plan(
@@ -226,12 +269,76 @@ class CCSessionExecutor:
                     gap_text = (
                         "; ".join(review.gaps) if review.gaps else "unspecified"
                     )
+                    self._append_to_plan(
+                        plan_path, "REVIEWING",
+                        f"Plan review BLOCKED: {gap_text}",
+                    )
                     await self._persist_blocker(
                         task_id,
                         f"Plan review found gaps: {gap_text}",
                         TaskPhase.REVIEWING,
                     )
                     return False
+
+                self._append_to_plan(
+                    plan_path, "REVIEWING",
+                    f"Plan review passed. Recommendations: "
+                    f"{'; '.join(review.recommendations) if review.recommendations else 'none'}",
+                )
+
+                # --- PRE-MORTEM (fail-open) ---
+                pm = await self._reviewer.pre_mortem(plan_content, description)
+                if pm is not None:
+                    from genesis.autonomy.executor.review import (
+                        _PM_BLOCK_THRESHOLD,
+                        _PM_MITIGATE_THRESHOLD,
+                    )
+
+                    if pm.confidence < _PM_BLOCK_THRESHOLD:
+                        modes = "; ".join(pm.failure_modes[:3])
+                        await self._persist_blocker(
+                            task_id,
+                            f"Pre-mortem confidence {pm.confidence}% "
+                            f"(threshold {_PM_BLOCK_THRESHOLD}%): {modes}",
+                            TaskPhase.REVIEWING,
+                        )
+                        return False
+
+                    if pm.confidence < _PM_MITIGATE_THRESHOLD:
+                        if pm.mitigations:
+                            mitigation_text = "\n".join(
+                                f"- {m}" for m in pm.mitigations
+                            )
+                            plan_content = (
+                                f"{plan_content}\n\n"
+                                f"## Pre-Mortem Mitigations "
+                                f"(confidence: {pm.confidence}%)\n\n"
+                                f"{mitigation_text}\n"
+                            )
+                            logger.info(
+                                "Pre-mortem injected %d mitigations (conf=%d%%)",
+                                len(pm.mitigations), pm.confidence,
+                            )
+                        else:
+                            logger.info(
+                                "Pre-mortem confidence %d%% (medium) but no mitigations provided",
+                                pm.confidence,
+                            )
+
+                    await self._set_output(
+                        task_id, "pre_mortem",
+                        json.dumps({
+                            "confidence": pm.confidence,
+                            "failure_modes": pm.failure_modes,
+                            "mitigations": pm.mitigations,
+                        }),
+                    )
+                    self._append_to_plan(
+                        plan_path, "PRE-MORTEM",
+                        f"Confidence: {pm.confidence}%. "
+                        f"Failure modes: {len(pm.failure_modes)}. "
+                        f"Mitigations: {len(pm.mitigations)}.",
+                    )
 
                 # --- PLANNING ---
                 await self._transition(task_id, TaskPhase.PLANNING)
@@ -252,6 +359,12 @@ class CCSessionExecutor:
                 has_code = any(s.get("type") == "code" for s in steps)
                 if has_code:
                     await self._create_worktree(task_id)
+
+                self._append_to_plan(
+                    plan_path, "PLANNING",
+                    f"Decomposed into {len(steps)} steps: "
+                    + ", ".join(s.get("type", "?") for s in steps),
+                )
 
                 await self._notify(
                     task_id,
@@ -466,10 +579,19 @@ class CCSessionExecutor:
                     f"Review failed after {MAX_REVIEW_ITERATIONS} iterations.\n"
                     + "\n".join(feedback_parts)
                 )
+                self._append_to_plan(
+                    plan_path, "VERIFYING",
+                    f"BLOCKED after {MAX_REVIEW_ITERATIONS} iterations.",
+                )
                 await self._persist_blocker(
                     task_id, escalation, TaskPhase.VERIFYING,
                 )
                 return False
+
+            self._append_to_plan(
+                plan_path, "VERIFYING",
+                f"Verification passed (iteration {iteration}).",
+            )
 
             # --- SYNTHESIZING ---
             await self._transition(task_id, TaskPhase.SYNTHESIZING)
@@ -494,6 +616,10 @@ class CCSessionExecutor:
 
             # --- COMPLETED ---
             await self._transition(task_id, TaskPhase.COMPLETED)
+            self._append_to_plan(
+                plan_path, "COMPLETED",
+                f"Task completed. {len(step_results)} steps executed.",
+            )
             await self._notify(
                 task_id, f"Task completed: {description}", "alert",
             )
@@ -1046,6 +1172,41 @@ class CCSessionExecutor:
     _synthesize_deliverable = staticmethod(_dispatch.synthesize_deliverable)
     _dominant_step_type = staticmethod(_dispatch.dominant_step_type)
     _create_fixup_step = staticmethod(_dispatch.create_fixup_step)
+
+    @staticmethod
+    def _append_to_plan(plan_path: str, phase: str, content: str) -> None:
+        """Append a timestamped audit section to the plan file.
+
+        This is audit-only — the in-memory ``plan_content`` string is
+        the executor's working copy.  File appends are for human review
+        and post-mortem analysis.
+
+        Fail-open: errors are logged but never block execution.
+        Uses write-to-temp-then-rename for atomicity.
+        """
+        try:
+            path = Path(plan_path).expanduser()
+            if not path.exists():
+                return
+
+            timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
+            section = (
+                f"\n\n---\n"
+                f"## Audit: {phase} ({timestamp})\n\n"
+                f"{content}\n"
+            )
+
+            existing = path.read_text(encoding="utf-8")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(existing + section, encoding="utf-8")
+            tmp.rename(path)
+        except OSError:
+            logger.warning(
+                "Plan audit append failed (non-blocking)", exc_info=True,
+            )
+            # Clean up orphaned .tmp if write succeeded but rename failed
+            with contextlib.suppress(OSError):
+                Path(plan_path).expanduser().with_suffix(".tmp").unlink(missing_ok=True)
 
     async def _set_output(self, task_id: str, key: str, value: str) -> None:
         """JSON read-merge-write on the outputs column.

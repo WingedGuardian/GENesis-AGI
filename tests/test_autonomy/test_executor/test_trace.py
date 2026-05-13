@@ -169,7 +169,8 @@ class TestRetrospective:
         call_kwargs = mock_store.call_args
         # First positional arg is db
         assert call_kwargs.kwargs["task_type"] == "api-endpoint-creation"
-        assert call_kwargs.kwargs["activation_tier"] == "L4"
+        assert call_kwargs.kwargs["activation_tier"] == "L3"
+        assert call_kwargs.kwargs["confidence"] == 0.5
         assert call_kwargs.kwargs["speculative"] == 1
         assert "proc-new-123" in trace.procedural_extractions
 
@@ -360,3 +361,167 @@ class TestRetrospective:
                 break
         assert skill_call is not None
         assert "research" in skill_call.kwargs["tags"]
+
+
+# ---------------------------------------------------------------------------
+# Structured learning type tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestStructuredLearningTypes:
+    """Tests for capability calibrations, workflow optimizations, and context drift."""
+
+    def _make_tracer(self):
+        """Build a tracer with mock memory_store and router returning structured data."""
+        memory_store = AsyncMock()
+        memory_store.store = AsyncMock(return_value="mem-learn-001")
+        return memory_store
+
+    async def _run_retro(self, memory_store, retro_data):
+        """Run a retrospective with the given data and return the tracer."""
+        router = AsyncMock()
+        router.route_call = AsyncMock(
+            return_value=FakeRoutingResult(
+                success=True, content=json.dumps(retro_data),
+            ),
+        )
+        tracer = ExecutionTracer(
+            memory_store=memory_store, router=router, db=AsyncMock(),
+        )
+        trace = tracer.start_trace("t-learn", "user", "test task")
+        tracer.record_step(
+            trace,
+            StepResult(idx=0, status="completed", result="done", cost_usd=0.1),
+        )
+
+        with patch(
+            "genesis.learning.procedural.operations.store_procedure",
+            AsyncMock(return_value="proc-ignore"),
+        ):
+            await tracer.finalize(trace)
+        return tracer
+
+    async def test_calibration_stored(self) -> None:
+        """Capability calibration stored with correct tags."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            "capability_calibrations": [{
+                "step_idx": 0,
+                "model_used": "opus",
+                "better_choice": "sonnet",
+                "reason": "Simple formatting task",
+            }],
+        })
+
+        cal_call = None
+        for call in memory_store.store.call_args_list:
+            tags = call.kwargs.get("tags", [])
+            if "learning:calibration" in tags:
+                cal_call = call
+                break
+        assert cal_call is not None
+        assert "opus" in cal_call.kwargs["content"]
+        assert "sonnet" in cal_call.kwargs["content"]
+
+    async def test_optimization_stored(self) -> None:
+        """Workflow optimization stored with correct tags."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            "workflow_optimizations": [{
+                "optimization": "Steps 2 and 3 could run in parallel",
+                "estimated_savings": "50%",
+                "applies_to": "independent code + test steps",
+            }],
+        })
+
+        opt_call = None
+        for call in memory_store.store.call_args_list:
+            tags = call.kwargs.get("tags", [])
+            if "learning:workflow" in tags:
+                opt_call = call
+                break
+        assert opt_call is not None
+        assert "parallel" in opt_call.kwargs["content"]
+
+    async def test_drift_stored(self) -> None:
+        """Context drift stored with correct tags."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            "context_drift": [{
+                "assumption": "API was stable",
+                "reality": "API was deprecated",
+                "impact": "Step 4 failed",
+                "lesson": "Check API stability",
+            }],
+        })
+
+        drift_call = None
+        for call in memory_store.store.call_args_list:
+            tags = call.kwargs.get("tags", [])
+            if "learning:drift" in tags:
+                drift_call = call
+                break
+        assert drift_call is not None
+        assert "API was stable" in drift_call.kwargs["content"]
+        assert "deprecated" in drift_call.kwargs["content"]
+
+    async def test_caps_enforced(self) -> None:
+        """More than 2 entries per type are truncated."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            "capability_calibrations": [
+                {"step_idx": i, "model_used": "opus", "reason": f"reason {i}"}
+                for i in range(5)
+            ],
+        })
+
+        cal_count = sum(
+            1 for call in memory_store.store.call_args_list
+            if "learning:calibration" in call.kwargs.get("tags", [])
+        )
+        assert cal_count == 2  # max cap
+
+    async def test_missing_fields_skipped(self) -> None:
+        """Entries with missing required fields are silently skipped."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            "capability_calibrations": [{"step_idx": 0}],  # missing reason
+            "workflow_optimizations": [{}],  # missing optimization
+            "context_drift": [{"assumption": "x"}],  # missing reality
+        })
+
+        learning_calls = [
+            call for call in memory_store.store.call_args_list
+            if any(
+                t.startswith("learning:")
+                for t in call.kwargs.get("tags", [])
+            )
+        ]
+        assert len(learning_calls) == 0
+
+    async def test_backward_compatible(self) -> None:
+        """Old responses without new fields don't break."""
+        memory_store = self._make_tracer()
+        await self._run_retro(memory_store, {
+            "new_procedures": [],
+            "procedure_updates": [],
+            "skill_observations": [],
+            # No capability_calibrations, workflow_optimizations, context_drift
+        })
+        # Should not raise — .get() defaults to empty list
