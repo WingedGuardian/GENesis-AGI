@@ -385,6 +385,46 @@ async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def expire_stale_proposals(db: aiosqlite.Connection) -> int:
+    """Expire pending proposals past their expires_at.
+
+    Also expires corresponding intervention_journal entries to keep the
+    journal in sync (avoids orphaned 'pending' entries inflating ego context).
+
+    Returns count of expired proposals.
+    """
+    now = datetime.now(UTC).isoformat()
+    # Get IDs first so we can update journal too
+    cursor = await db.execute(
+        "SELECT id FROM ego_proposals "
+        "WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
+        (now,),
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return 0
+
+    ids = [r[0] for r in rows]
+    # Expire proposals
+    await db.execute(
+        "UPDATE ego_proposals SET status = 'expired', resolved_at = ? "
+        "WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at < ?",
+        (now, now),
+    )
+    # Expire matching journal entries
+    placeholders = ",".join("?" * len(ids))
+    await db.execute(
+        f"UPDATE intervention_journal SET outcome_status = 'expired', "
+        f"resolved_at = ? WHERE proposal_id IN ({placeholders}) "
+        f"AND outcome_status = 'pending'",
+        (now, *ids),
+    )
+    await db.commit()
+    if ids:
+        logger.info("Expired %d stale proposal(s)", len(ids))
+    return len(ids)
+
+
 async def get_batch_for_delivery(
     db: aiosqlite.Connection,
     delivery_id: str,

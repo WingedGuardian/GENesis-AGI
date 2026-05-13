@@ -109,10 +109,10 @@ class EgoCadenceManager:
                 max_instances=1,
                 misfire_grace_time=600,
             )
-        # Mechanical sweep: dispatch approved proposals every 30 min,
-        # independent of ego LLM cycles.
+        # Mechanical sweep: expire stale proposals then dispatch approved
+        # proposals every 30 min, independent of ego LLM cycles.
         self._scheduler.add_job(
-            self._session.sweep_approved_proposals,
+            self._sweep_with_expiry,
             IntervalTrigger(minutes=30),
             id="ego_sweep_approved",
             max_instances=1,
@@ -165,6 +165,21 @@ class EgoCadenceManager:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+    # -- Sweep helpers -----------------------------------------------------
+
+    async def _sweep_with_expiry(self) -> None:
+        """Expire stale proposals, then dispatch approved ones."""
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            expired = await ego_crud.expire_stale_proposals(self._session._db)
+            if expired:
+                logger.info("Pre-sweep expiry: %d proposal(s) expired", expired)
+        except Exception:
+            logger.warning("Pre-sweep expiry failed", exc_info=True)
+
+        await self._session.sweep_approved_proposals()
 
     # -- Tick handlers -----------------------------------------------------
 

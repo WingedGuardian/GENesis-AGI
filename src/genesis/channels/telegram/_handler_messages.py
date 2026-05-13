@@ -699,6 +699,22 @@ async def _try_bare_approval_resolution(
 
 
 
+def _trigger_immediate_sweep() -> None:
+    """Fire-and-forget sweep of approved proposals after user approval."""
+    try:
+        from genesis.runtime import GenesisRuntime
+        from genesis.util.tasks import tracked_task
+
+        rt = GenesisRuntime.instance()
+        if rt.ego_session is not None:
+            tracked_task(
+                rt.ego_session.sweep_approved_proposals(),
+                name="immediate_proposal_sweep",
+            )
+    except Exception:
+        pass  # Sweep will catch it on next 30-min interval
+
+
 async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -> bool:
     """Resolve a proposal batch from a quote-reply to an ego digest.
 
@@ -717,6 +733,28 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
         decisions = parse_proposal_decisions(msg.text)
         if not decisions:
             return False  # Unparseable — fall through to correction store
+
+        # Cross-batch resolution (sentinel -1): resolve all pending
+        if -1 in decisions:
+            status, reason = decisions[-1]
+            results = await ctx.proposal_workflow.resolve_all_pending_proposals(
+                status, reason,
+            )
+            approved = sum(1 for s in results.values() if s == "approved")
+            rejected = sum(1 for s in results.values() if s == "rejected")
+            parts = []
+            if approved:
+                parts.append(f"{approved} approved")
+            if rejected:
+                parts.append(f"{rejected} rejected")
+            summary = ", ".join(parts) or "no changes"
+            try:
+                await msg.reply_text(f"✅ Resolved: {summary}")
+            except Exception:
+                log.debug("Failed to send proposal resolution ack", exc_info=True)
+            if approved > 0:
+                _trigger_immediate_sweep()
+            return True
 
         # Handle "approve all" / "reject all" (sentinel key 0)
         if 0 in decisions:
@@ -750,6 +788,11 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
             await msg.reply_text(f"✅ Resolved: {summary}")
         except Exception:
             log.debug("Failed to send proposal resolution ack", exc_info=True)
+
+        # Trigger immediate sweep if any proposals were approved
+        if approved > 0:
+            _trigger_immediate_sweep()
+
         return True
     except Exception:
         log.warning("Proposal resolution failed", exc_info=True)
@@ -794,32 +837,44 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
     if not decisions:
         return False
 
-    # Find the most recent unresolved batch
+    # Resolve proposals
     try:
         from genesis.db.crud import ego as ego_crud
 
-        # Get most recent pending proposals to find their batch
-        pending = await ego_crud.list_pending_proposals(ctx.db)
-        if not pending:
-            return False
-        # All pending proposals share a batch_id
-        batch_id = pending[0].get("batch_id")
-        if not batch_id:
-            return False
-
-        # Handle "approve all" / "reject all" (sentinel key 0)
-        if 0 in decisions:
-            status, reason = decisions[0]
-            all_decisions = {
-                i + 1: (status, reason) for i in range(len(pending))
-            }
-            results = await ctx.proposal_workflow.resolve_proposals(
-                batch_id, all_decisions,
+        # Cross-batch resolution: sentinel -1 resolves ALL pending
+        if -1 in decisions:
+            status, reason = decisions[-1]
+            results = await ctx.proposal_workflow.resolve_all_pending_proposals(
+                status, reason,
             )
         else:
-            results = await ctx.proposal_workflow.resolve_proposals(
-                batch_id, decisions,
-            )
+            # Get most recent pending proposals to find their batch
+            pending = await ego_crud.list_pending_proposals(ctx.db)
+            if not pending:
+                return False
+            batch_id = pending[0].get("batch_id")
+            if not batch_id:
+                return False
+
+            # Handle "approve all" / "reject all" (sentinel key 0)
+            if 0 in decisions:
+                status, reason = decisions[0]
+                # Use full batch for correct 1-based indexing — resolve_proposal
+                # skips already-resolved proposals via WHERE status='pending'.
+                full_batch = await ego_crud.list_proposals_by_batch(
+                    ctx.db, batch_id,
+                )
+                all_decisions = {
+                    i + 1: (status, reason)
+                    for i in range(len(full_batch))
+                }
+                results = await ctx.proposal_workflow.resolve_proposals(
+                    batch_id, all_decisions,
+                )
+            else:
+                results = await ctx.proposal_workflow.resolve_proposals(
+                    batch_id, decisions,
+                )
 
         approved = sum(1 for s in results.values() if s == "approved")
         rejected = sum(1 for s in results.values() if s == "rejected")
@@ -833,6 +888,11 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
             await msg.reply_text(f"\u2705 Resolved: {summary}")
         except Exception:
             log.debug("Failed to send bare proposal resolution ack", exc_info=True)
+
+        # Trigger immediate sweep if any proposals were approved
+        if approved > 0:
+            _trigger_immediate_sweep()
+
         return True
     except Exception:
         log.warning("Bare proposal resolution failed", exc_info=True)

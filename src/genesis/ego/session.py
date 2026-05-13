@@ -11,6 +11,7 @@ Durable knowledge lives in the memory system (memory_store/recall).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -110,6 +111,7 @@ class EgoSession:
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
         self._source_tag = source_tag or "ego_cycle"
+        self._sweep_lock = asyncio.Lock()
         # Cache the static system prompt (read once, not every cycle)
         actual_prompt_path = prompt_path or _DEFAULT_PROMPT_PATH
         if actual_prompt_path.exists():
@@ -832,12 +834,17 @@ class EgoSession:
     async def sweep_approved_proposals(self) -> list[str]:
         """Mechanically dispatch approved proposals via DirectSessionRunner.
 
-        Called on a fixed 30-minute interval by EgoCadenceManager,
-        independent of ego LLM cycles. This ensures approved work gets
-        dispatched even when the ego is in stay_quiet mode.
+        Called on a fixed 30-minute interval by EgoCadenceManager AND
+        immediately after user approval via Telegram.  The sweep lock
+        prevents concurrent execution (double-dispatch guard).
 
         Returns list of dispatched proposal IDs.
         """
+        async with self._sweep_lock:
+            return await self._sweep_approved_inner()
+
+    async def _sweep_approved_inner(self) -> list[str]:
+        """Inner sweep logic — must be called under self._sweep_lock."""
         if self._direct_session_runner is None:
             return []
 
@@ -864,12 +871,7 @@ class EgoSession:
             except (KeyError, TypeError, ValueError):
                 continue
 
-            prompt = (
-                f"Execute this approved proposal:\n\n"
-                f"{prop['content']}\n\n"
-                f"Execution plan: {prop.get('execution_plan') or 'N/A'}\n\n"
-                f"Context: {prop.get('rationale') or ''}"
-            )
+            prompt = await self._build_dispatch_prompt(prop)
             profile = _infer_profile(prop.get("action_type", ""))
 
             try:
@@ -894,6 +896,8 @@ class EgoSession:
                         "Sweep dispatched proposal %s → session %s",
                         prop["id"], session_id,
                     )
+                    # Send execution notification to ego_proposals topic
+                    await self._notify_execution(prop, session_id)
             except Exception:
                 logger.error(
                     "Sweep failed to dispatch proposal %s",
@@ -914,6 +918,73 @@ class EgoSession:
         if dispatched:
             logger.info("Sweep dispatched %d approved proposal(s)", len(dispatched))
         return dispatched
+
+    async def _build_dispatch_prompt(self, prop: dict) -> str:
+        """Build enriched dispatch prompt with world model context."""
+        parts = [
+            f"Execute this approved proposal:\n\n{prop['content']}",
+            f"\nExecution plan: {prop.get('execution_plan') or 'N/A'}",
+            f"\nRationale: {prop.get('rationale') or ''}",
+        ]
+
+        # World model context — each section degrades independently
+        try:
+            from genesis.db.crud import user_goals
+            goals = await user_goals.list_active(self._db)
+            if goals:
+                goal_lines = [
+                    f"- {g['title']} ({g['category']}, {g['priority']})"
+                    for g in goals[:5]
+                ]
+                parts.append(
+                    "\n\nUser's active goals:\n" + "\n".join(goal_lines)
+                )
+        except Exception:
+            pass
+
+        try:
+            from genesis.db.crud import user_contacts
+            contacts = await user_contacts.recently_active(self._db, days=14)
+            if contacts:
+                contact_lines = [
+                    f"- {c['name']} ({c.get('relationship', 'contact')})"
+                    for c in contacts[:5]
+                ]
+                parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
+        except Exception:
+            pass
+
+        try:
+            from genesis.db.crud import memory_events
+            events = await memory_events.upcoming_user_events(self._db, days=14)
+            if events:
+                event_lines = [
+                    f"- {e['object']} ({e.get('event_date', 'TBD')})"
+                    for e in events[:5]
+                ]
+                parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
+        except Exception:
+            pass
+
+        return "\n".join(parts)
+
+    async def _notify_execution(self, prop: dict, session_id: str) -> None:
+        """Send structured notification to ego_proposals topic."""
+        try:
+            import html as html_mod
+
+            tm = self._proposals._topic_manager
+            if tm is None:
+                return
+            content = html_mod.escape(prop.get("content", "")[:200])
+            action = html_mod.escape(prop.get("action_type", "unknown"))
+            msg = (
+                f"<b>Dispatched</b> [{action}]: {content}\n"
+                f"<i>Session:</i> {session_id}"
+            )
+            await tm.send_to_category("ego_proposals", msg)
+        except Exception:
+            logger.debug("Failed to send execution notification", exc_info=True)
 
     async def _check_budget(self) -> bool:
         """True if daily ego thinking spend is under the budget cap."""

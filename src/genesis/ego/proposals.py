@@ -32,15 +32,30 @@ TOPIC_CATEGORY = "ego_proposals"
 
 _ESC = html.escape
 
+_URGENCY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
+_URGENCY_TAGS = {"critical": "[CRITICAL] ", "high": "[HIGH] "}
+
+
+def _sort_proposals(proposals: list[dict]) -> list[dict]:
+    """Sort proposals by urgency (critical first) then confidence (desc)."""
+    return sorted(proposals, key=lambda p: (
+        _URGENCY_ORDER.get(p.get("urgency", "normal"), 2),
+        -float(p.get("confidence", 0)),
+    ))
+
 
 def _format_digest(
     proposals: list[dict],
     batch_id: str,
 ) -> str:
-    """Format proposals as an HTML numbered digest for Telegram."""
+    """Format proposals as an HTML numbered digest for Telegram.
+
+    Proposals are sorted by urgency x confidence before numbering.
+    """
+    sorted_proposals = _sort_proposals(proposals)
     lines = [f"<b>Ego Proposals</b> \u2014 Batch {_ESC(batch_id[:8])}\n"]
 
-    for i, p in enumerate(proposals, 1):
+    for i, p in enumerate(sorted_proposals, 1):
         content = p.get("content", "")
         if len(content) > 800:
             content = content[:800] + "\u2026"
@@ -48,8 +63,10 @@ def _format_digest(
         if len(rationale) > 500:
             rationale = rationale[:500] + "\u2026"
 
+        urgency = p.get("urgency", "normal")
+        urgency_tag = _URGENCY_TAGS.get(urgency, "")
         lines.append(
-            f"<b>{i}.</b> <b>[{_ESC(p.get('action_type', '?'))}]</b> "
+            f"<b>{i}.</b> {_ESC(urgency_tag)}<b>[{_ESC(p.get('action_type', '?'))}]</b> "
             f"{_ESC(content)}"
         )
         if rationale:
@@ -60,7 +77,6 @@ def _format_digest(
                 memory_basis = memory_basis[:500] + "\u2026"
             lines.append(f"<i>{_ESC(memory_basis)}</i>")
         confidence = p.get("confidence", 0.0)
-        urgency = p.get("urgency", "normal")
         lines.append(
             f"<i>Confidence:</i> {confidence:.2f} | "
             f"<i>Urgency:</i> {urgency}"
@@ -71,7 +87,6 @@ def _format_digest(
                 alts = alts[:300] + "\u2026"
             lines.append(f"<i>Alternatives:</i> {_ESC(alts)}")
         lines.append("")
-
 
     return "\n".join(lines)
 
@@ -228,6 +243,19 @@ class ProposalWorkflow:
             warn_lines = "\n".join(f"  - {w}" for w in validation_warnings)
             digest_html = f"\u26a0\ufe0f <b>Validation:</b>\n{warn_lines}\n\n{digest_html}"
 
+        # Show pending count from other batches for visibility
+        try:
+            all_pending = await ego_crud.list_pending_proposals(self._db)
+            other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
+            if other_pending:
+                digest_html = (
+                    f"<i>{len(other_pending)} proposal(s) pending from previous "
+                    f"batches. Reply 'approve all pending' to resolve all.</i>\n\n"
+                    + digest_html
+                )
+        except Exception:
+            pass  # Non-critical; skip header on error
+
         delivery_id = await self._topic_manager.send_to_category(
             TOPIC_CATEGORY, digest_html,
         )
@@ -351,6 +379,51 @@ class ProposalWorkflow:
                 exc_info=True,
             )
 
+    # -- Cross-batch approval ------------------------------------------------
+
+    async def resolve_all_pending_proposals(
+        self,
+        status: str,
+        reason: str | None = None,
+    ) -> dict[str, str]:
+        """Resolve ALL pending proposals across all batches.
+
+        Loops per-batch to preserve intervention_journal, J-9 eval,
+        and correction memory lifecycle.  Returns {proposal_id: status}.
+
+        Uses full batch lists for correct 1-based indexing — resolve_proposals
+        indexes into list_proposals_by_batch (ALL proposals, not just pending).
+        """
+        pending = await ego_crud.list_pending_proposals(self._db)
+        if not pending:
+            return {}
+
+        # Group by batch_id
+        batch_ids: set[str] = set()
+        for p in pending:
+            bid = p.get("batch_id") or "unknown"
+            batch_ids.add(bid)
+
+        all_results: dict[str, str] = {}
+        for batch_id in batch_ids:
+            # Get full batch to find correct 1-based positions
+            full_batch = await ego_crud.list_proposals_by_batch(
+                self._db, batch_id,
+            )
+            # Create decisions for ALL positions — resolve_proposal's
+            # WHERE status='pending' clause skips already-resolved ones.
+            decisions = {
+                i + 1: (status, reason) for i in range(len(full_batch))
+            }
+            results = await self.resolve_proposals(batch_id, decisions)
+            all_results.update(results)
+
+        logger.info(
+            "Cross-batch resolve: %d proposals → %s across %d batch(es)",
+            len(all_results), status, len(batch_ids),
+        )
+        return all_results
+
     # -- Late-binding for memory store (wired in init/ego.py) ----------------
 
     def set_memory_store(self, store: MemoryStore) -> None:
@@ -389,9 +462,21 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
     """
     stripped = text.strip().lower()
 
-    # Bulk operations
+    # Cross-batch bulk operations (all pending across batches)
+    if stripped in (
+        "approve all pending", "approved all pending",
+        "accept all pending", "yes all pending",
+    ):
+        return {-1: ("approved", None)}  # -1 = sentinel for cross-batch
+    if stripped in (
+        "reject all pending", "rejected all pending",
+        "deny all pending", "no all pending",
+    ):
+        return {-1: ("rejected", None)}
+
+    # Batch-scoped bulk operations
     if stripped in ("approve all", "approved all", "accept all", "yes all", "go ahead"):
-        return {0: ("approved", None)}  # 0 = sentinel for "all"
+        return {0: ("approved", None)}  # 0 = sentinel for "all in batch"
     if stripped in ("reject all", "rejected all", "deny all", "no all"):
         return {0: ("rejected", None)}
 
