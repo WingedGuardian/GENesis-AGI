@@ -694,6 +694,7 @@ class SurplusScheduler:
                     )
             except Exception:
                 logger.debug("Autonomy correction signal failed (non-fatal)", exc_info=True)
+            await self._maybe_observe_failure(task, "executor_exception")
             return False
 
         if not result.success:
@@ -711,6 +712,7 @@ class SurplusScheduler:
                     )
             except Exception:
                 logger.debug("Autonomy correction signal failed (non-fatal)", exc_info=True)
+            await self._maybe_observe_failure(task, result.error or "unknown")
             return False
 
         # 6. Write to staging (with content-hash dedup + quality gate)
@@ -843,6 +845,36 @@ class SurplusScheduler:
 
         logger.info("Surplus task %s completed (staging=%s)", task.id, staging_id)
         return True
+
+    async def _maybe_observe_failure(self, task, reason: str) -> None:
+        """Create an observation if a task type has 3+ consecutive failures."""
+        try:
+            from genesis.db.crud import observations, surplus_tasks
+
+            count = await surplus_tasks.consecutive_failures(
+                self._db, str(task.task_type),
+            )
+            if count >= 3:
+                obs_id = f"surplus_failing_{task.task_type}"
+                await observations.upsert(
+                    self._db,
+                    id=obs_id,
+                    source="surplus_monitor",
+                    type="surplus_task_failing",
+                    content=(
+                        f"Surplus task {task.task_type} has failed "
+                        f"{count} consecutive times. Last reason: {reason}"
+                    ),
+                    priority="high",
+                    category="infrastructure",
+                    created_at=self._clock().isoformat(),
+                )
+                logger.warning(
+                    "Surplus task %s: %d consecutive failures, observation created",
+                    task.task_type, count,
+                )
+        except Exception:
+            logger.debug("Failed to create failure observation", exc_info=True)
 
     async def _dispatch_loop(self) -> None:
         """Scheduled dispatch callback."""

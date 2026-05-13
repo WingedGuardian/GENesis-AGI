@@ -312,6 +312,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "On provider recovery",
         "model_tier": "embedding",
     },
+    "contribution_gate": {
+        "description": "Evaluates whether a community code fix is already upstream before creating a PR. Part of the contribution pipeline.",
+        "category": "assessment",
+        "frequency": "Per landed fix commit (contribution pipeline)",
+        "cost_policy": "Free primary, paid fallback",
+        "model_tier": "slm",
+        "status_reason": "WIRED",
+    },
     # ── PARTIALLY WIRED: code exists, conditions haven't triggered yet ─
     "27_pre_execution_assessment": {
         "description": "Sanity-checks proposed task execution plans before committing resources. Opus via CC invoker, route_call fallback.",

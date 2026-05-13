@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -90,8 +91,8 @@ class TestDiskCleanup:
 
 class TestBackupVerification:
     @pytest.mark.asyncio
-    async def test_no_backup_dir(self, tmp_path, monkeypatch):
-        """Reports stale when backup dir doesn't exist."""
+    async def test_no_status_file(self, tmp_path, monkeypatch):
+        """Reports stale when backup_status.json doesn't exist."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         executor = BackupVerificationExecutor()
         result = await executor.execute(_make_task(TaskType.BACKUP_VERIFICATION))
@@ -99,35 +100,66 @@ class TestBackupVerification:
         assert result.insights[0]["backup_stale"] is True
 
     @pytest.mark.asyncio
-    async def test_fresh_marker(self, tmp_path, monkeypatch):
-        """Reports OK when backup marker is recent."""
+    async def test_fresh_backup(self, tmp_path, monkeypatch):
+        """Reports OK when backup_status.json shows recent success."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        backup_dir = tmp_path / ".genesis" / "backups"
-        backup_dir.mkdir(parents=True)
-        marker = backup_dir / "last_backup_at"
-        marker.write_text(datetime.now(UTC).isoformat())
+        genesis_dir = tmp_path / ".genesis"
+        genesis_dir.mkdir(parents=True)
+        status = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "success": True,
+            "duration_s": 120,
+            "sqlite_lines": 300000,
+            "qdrant_collections": 2,
+            "secrets_encrypted": True,
+        }
+        (genesis_dir / "backup_status.json").write_text(json.dumps(status))
 
         executor = BackupVerificationExecutor()
         result = await executor.execute(_make_task(TaskType.BACKUP_VERIFICATION))
         assert result.success is True
         assert result.insights[0]["backup_stale"] is False
         assert "OK" in result.content
+        assert "300,000" in result.content  # sqlite_lines formatted
 
     @pytest.mark.asyncio
-    async def test_stale_marker(self, tmp_path, monkeypatch):
+    async def test_stale_backup(self, tmp_path, monkeypatch):
         """Reports stale when backup is older than threshold."""
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        backup_dir = tmp_path / ".genesis" / "backups"
-        backup_dir.mkdir(parents=True)
-        marker = backup_dir / "last_backup_at"
+        genesis_dir = tmp_path / ".genesis"
+        genesis_dir.mkdir(parents=True)
         old_time = datetime.now(UTC) - timedelta(hours=48)
-        marker.write_text(old_time.isoformat())
+        status = {
+            "timestamp": old_time.isoformat(),
+            "success": True,
+            "duration_s": 120,
+        }
+        (genesis_dir / "backup_status.json").write_text(json.dumps(status))
 
         executor = BackupVerificationExecutor(max_age_hours=24)
         result = await executor.execute(_make_task(TaskType.BACKUP_VERIFICATION))
         assert result.success is True
         assert result.insights[0]["backup_stale"] is True
         assert "WARNING" in result.content
+
+    @pytest.mark.asyncio
+    async def test_failed_backup(self, tmp_path, monkeypatch):
+        """Reports stale when last backup failed."""
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        genesis_dir = tmp_path / ".genesis"
+        genesis_dir.mkdir(parents=True)
+        status = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "success": False,
+            "failure_reason": "qdrant dump failed",
+        }
+        (genesis_dir / "backup_status.json").write_text(json.dumps(status))
+
+        executor = BackupVerificationExecutor()
+        result = await executor.execute(_make_task(TaskType.BACKUP_VERIFICATION))
+        assert result.success is True
+        assert result.insights[0]["backup_stale"] is True
+        assert "FAILED" in result.content
 
 
 # ── DeadLetterReplayExecutor ─────────────────────────────────────────────

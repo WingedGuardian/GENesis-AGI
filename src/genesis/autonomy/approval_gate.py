@@ -454,6 +454,8 @@ class AutonomousCliApprovalGate:
                 status_str = str(row.get("status") or "")
                 if status_str == "rejected":
                     continue
+                if status_str in ("cancelled", "expired"):
+                    continue
                 if status_str == "approved" and row.get("consumed_at"):
                     continue
                 # Timeout guard: auto-expire pending requests past timeout_at.

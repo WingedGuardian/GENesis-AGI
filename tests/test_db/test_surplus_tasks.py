@@ -166,3 +166,32 @@ async def test_delete(db):
     assert await surplus_tasks.delete(db, "st-1") is True
     assert await surplus_tasks.get_by_id(db, "st-1") is None
     assert await surplus_tasks.delete(db, "st-1") is False
+
+
+@pytest.mark.asyncio
+async def test_consecutive_failures(db):
+    """Counts consecutive failed tasks, stopping at first non-failed."""
+    # Create tasks: completed, then 3 failed (newest first by created_at)
+    await surplus_tasks.create(
+        db, id="st-ok", task_type="backup_verification", compute_tier="slm",
+        priority=0.5, drive_alignment="preservation", created_at="2026-03-04T00:00:00Z",
+    )
+    await surplus_tasks.mark_running(db, "st-ok", started_at="2026-03-04T00:01:00Z")
+    await surplus_tasks.mark_completed(db, "st-ok", completed_at="2026-03-04T00:02:00Z")
+
+    for i in range(1, 4):
+        tid = f"st-fail-{i}"
+        await surplus_tasks.create(
+            db, id=tid, task_type="backup_verification", compute_tier="slm",
+            priority=0.5, drive_alignment="preservation",
+            created_at=f"2026-03-04T0{i}:00:00Z",
+        )
+        await surplus_tasks.mark_running(db, tid, started_at=f"2026-03-04T0{i}:01:00Z")
+        await surplus_tasks.mark_failed(db, tid, failure_reason="test failure")
+
+    count = await surplus_tasks.consecutive_failures(db, "backup_verification")
+    assert count == 3
+
+    # Different task type should return 0
+    count = await surplus_tasks.consecutive_failures(db, "brainstorm")
+    assert count == 0
