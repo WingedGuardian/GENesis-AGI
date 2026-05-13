@@ -132,7 +132,8 @@ def test_load_full_yaml(monkeypatch):
     # a few load-bearing ids rather than chasing the total on every edit.
     # 2026-05-10: 44 → 43 after net change (judge added by #304, 2_triage +
     # 7_task_retrospective removed by this PR).
-    assert len(cfg.call_sites) == 43
+    # 2026-05-12: 43 → 44 after 44_task_premortem added by #334.
+    assert len(cfg.call_sites) == 44
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
     assert "background" in cfg.retry_profiles
