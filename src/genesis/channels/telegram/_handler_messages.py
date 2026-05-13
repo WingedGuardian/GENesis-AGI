@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from pathlib import Path
@@ -811,18 +812,34 @@ async def _try_bare_approval_resolution(
     return True
 
 
+_SWEEP_GRACE_SECONDS = 300  # 5-minute grace period before dispatching
+
+
+async def _delayed_sweep() -> None:
+    """Wait 5 minutes then sweep — gives user time to change their mind."""
+    import asyncio
+
+    await asyncio.sleep(_SWEEP_GRACE_SECONDS)
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if rt.ego_session is not None:
+        await rt.ego_session.sweep_approved_proposals()
+
+
 def _trigger_immediate_sweep() -> None:
-    """Fire-and-forget sweep of approved proposals after user approval."""
+    """Schedule a sweep after a 5-minute grace period.
+
+    The grace window lets the user revoke approval before dispatch
+    starts.  The 30-min interval sweep remains as fallback.
+    """
     try:
-        from genesis.runtime import GenesisRuntime
         from genesis.util.tasks import tracked_task
 
-        rt = GenesisRuntime.instance()
-        if rt.ego_session is not None:
-            tracked_task(
-                rt.ego_session.sweep_approved_proposals(),
-                name="immediate_proposal_sweep",
-            )
+        tracked_task(
+            _delayed_sweep(),
+            name="delayed_proposal_sweep",
+        )
     except Exception:
         pass  # Sweep will catch it on next 30-min interval
 
@@ -949,6 +966,40 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
     decisions = parse_proposal_decisions(msg.text)
     if not decisions:
         return False
+
+    # Handle cancel/revoke (approved → rejected)
+    has_cancel = any(s == "cancelled" for s, _ in decisions.values())
+    if has_cancel:
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            pending = await ego_crud.list_pending_proposals(ctx.db)
+            # Find the most recent batch (could be pending or approved)
+            approved = await ego_crud.list_proposals(ctx.db, status="approved", limit=10)
+            if not approved:
+                with contextlib.suppress(Exception):
+                    await msg.reply_text("No approved proposals to cancel.")
+                return True
+
+            batch_id = approved[0].get("batch_id")
+            if 0 in decisions:
+                # "cancel all" — revoke all approved in this batch
+                revoked = await ctx.proposal_workflow.revoke_approved_proposals(batch_id)
+            else:
+                # "cancel N" — revoke specific indices
+                indices = [idx for idx, (s, _) in decisions.items() if s == "cancelled"]
+                revoked = await ctx.proposal_workflow.revoke_approved_proposals(
+                    batch_id,
+                    proposal_indices=indices,
+                )
+            try:
+                await msg.reply_text(f"\u2705 Cancelled: {revoked} proposal(s) revoked")
+            except Exception:
+                log.debug("Failed to send cancel ack", exc_info=True)
+            return True
+        except Exception:
+            log.warning("Proposal cancel failed", exc_info=True)
+            return False
 
     # Resolve proposals
     try:

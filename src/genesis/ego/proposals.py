@@ -435,6 +435,50 @@ class ProposalWorkflow:
         )
         return all_results
 
+    # -- Revoke (cancel approved proposals) -----------------------------------
+
+    async def revoke_approved_proposals(
+        self,
+        batch_id: str,
+        proposal_indices: list[int] | None = None,
+        reason: str | None = None,
+    ) -> int:
+        """Revoke approved proposals in a batch (approved → rejected).
+
+        If proposal_indices is None, revokes all approved in the batch.
+        Returns count of revoked proposals.
+        """
+        proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
+        revoked = 0
+        for i, prop in enumerate(proposals, 1):
+            if proposal_indices and i not in proposal_indices:
+                continue
+            if prop["status"] != "approved":
+                continue
+            ok = await ego_crud.revoke_proposal(
+                self._db,
+                prop["id"],
+                user_response=reason or "revoked by user",
+            )
+            if ok:
+                revoked += 1
+                # Update intervention journal
+                try:
+                    from genesis.db.crud import intervention_journal as journal_crud
+
+                    await journal_crud.resolve(
+                        self._db,
+                        prop["id"],
+                        outcome_status="rejected",
+                        actual_outcome="User revoked approval" + (f": {reason}" if reason else ""),
+                        user_response=reason,
+                    )
+                except Exception:
+                    logger.warning("Failed to update journal for revoked proposal %s", prop["id"])
+        if revoked:
+            logger.info("Revoked %d approved proposal(s) in batch %s", revoked, batch_id)
+        return revoked
+
     # -- Late-binding for memory store (wired in init/ego.py) ----------------
 
     def set_memory_store(self, store: MemoryStore) -> None:
@@ -448,6 +492,7 @@ class ProposalWorkflow:
 
 _APPROVE_WORDS = {"approve", "approved", "yes", "accept", "go", "ok", "okay"}
 _REJECT_WORDS = {"reject", "rejected", "no", "deny", "denied", "skip", "nope"}
+_CANCEL_WORDS = {"cancel", "cancelled", "revoke", "revoked", "stop", "undo"}
 
 # Pattern: "1 approve" or "approve 1" or "1 yes" or "reject 2: reason"
 _NUMBERED_PATTERN = re.compile(
@@ -489,6 +534,10 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
     ):
         return {-1: ("rejected", None)}
 
+    # Cancel/revoke (works on approved proposals during grace period)
+    if stripped in ("cancel all", "revoke all", "stop all", "undo all"):
+        return {0: ("cancelled", None)}  # 0 = sentinel, "cancelled" triggers revoke path
+
     # Batch-scoped bulk operations
     if stripped in ("approve all", "approved all", "accept all", "yes all", "go ahead"):
         return {0: ("approved", None)}  # 0 = sentinel for "all in batch"
@@ -529,6 +578,8 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
             decisions[idx] = ("approved", reason.strip() if reason else None)
         elif word in _REJECT_WORDS:
             decisions[idx] = ("rejected", reason.strip() if reason else None)
+        elif word in _CANCEL_WORDS:
+            decisions[idx] = ("cancelled", reason.strip() if reason else None)
         # Unknown word → skip this part (don't fail the whole parse)
 
     return decisions

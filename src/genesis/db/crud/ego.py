@@ -407,6 +407,26 @@ async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+async def revoke_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    user_response: str | None = None,
+) -> bool:
+    """Revoke an approved proposal (approved → rejected).
+
+    Used during the grace period between approval and dispatch.
+    Returns True if a row was updated.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'rejected', user_response = ?, "
+        "resolved_at = ? WHERE id = ? AND status = 'approved'",
+        (user_response or "revoked by user", datetime.now(UTC).isoformat(), id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def expire_stale_proposals(db: aiosqlite.Connection) -> int:
     """Expire pending proposals past their expires_at.
 

@@ -217,6 +217,82 @@ class TestCrossBatchApproval:
         assert results == {}
 
 
+class TestCancelRevoke:
+    def test_cancel_all_parser(self):
+        """'cancel all' returns sentinel 0 with 'cancelled' status."""
+        result = parse_proposal_decisions("cancel all")
+        assert 0 in result
+        assert result[0] == ("cancelled", None)
+
+    def test_cancel_numbered(self):
+        """'cancel 1' returns numbered entry with 'cancelled' status."""
+        result = parse_proposal_decisions("cancel 1")
+        assert result[1] == ("cancelled", None)
+
+    def test_revoke_word(self):
+        """'revoke 2' works as cancel."""
+        result = parse_proposal_decisions("revoke 2")
+        assert result[2] == ("cancelled", None)
+
+    @pytest.mark.asyncio
+    async def test_revoke_approved_proposal(self, db):
+        """revoke_proposal transitions approved -> rejected."""
+        await ego_crud.create_proposal(
+            db,
+            id="rev1",
+            action_type="dispatch",
+            content="Will be revoked",
+        )
+        await ego_crud.resolve_proposal(db, "rev1", status="approved")
+        ok = await ego_crud.revoke_proposal(db, "rev1")
+        assert ok
+        p = await ego_crud.get_proposal(db, "rev1")
+        assert p["status"] == "rejected"
+        assert p["user_response"] == "revoked by user"
+
+    @pytest.mark.asyncio
+    async def test_revoke_only_works_on_approved(self, db):
+        """revoke_proposal does nothing on pending proposals."""
+        await ego_crud.create_proposal(
+            db,
+            id="rev2",
+            action_type="investigate",
+            content="Still pending",
+        )
+        ok = await ego_crud.revoke_proposal(db, "rev2")
+        assert not ok
+        p = await ego_crud.get_proposal(db, "rev2")
+        assert p["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_revoke_via_workflow(self, db):
+        """ProposalWorkflow.revoke_approved_proposals revokes correct proposals."""
+        await ego_crud.create_proposal(
+            db,
+            id="rw1",
+            action_type="dispatch",
+            content="Approved proposal",
+            batch_id="rev_batch",
+        )
+        await ego_crud.create_proposal(
+            db,
+            id="rw2",
+            action_type="investigate",
+            content="Pending proposal",
+            batch_id="rev_batch",
+        )
+        await ego_crud.resolve_proposal(db, "rw1", status="approved")
+
+        workflow = ProposalWorkflow(db=db)
+        revoked = await workflow.revoke_approved_proposals("rev_batch")
+        assert revoked == 1
+
+        p1 = await ego_crud.get_proposal(db, "rw1")
+        p2 = await ego_crud.get_proposal(db, "rw2")
+        assert p1["status"] == "rejected"
+        assert p2["status"] == "pending"  # unchanged
+
+
 class TestPendingCountHeader:
     @pytest.mark.asyncio
     async def test_send_digest_shows_pending_count(self, db):
