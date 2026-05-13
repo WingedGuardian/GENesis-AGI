@@ -12,6 +12,7 @@ from genesis.sentinel.classifier import FireAlarm
 from genesis.sentinel.dispatcher import (
     _BACKOFF_SCHEDULE_S,
     _ESCALATE_AT_ATTEMPT,
+    _RESOLVED_COOLDOWN_S,
     SentinelDispatcher,
     SentinelRequest,
     SentinelResult,
@@ -388,6 +389,70 @@ class TestPatternResetOnResolve:
         # Pattern is recorded so next attempt hits backoff
         assert "memory:critical" in d._pattern_attempts
         assert len(d._pattern_attempts["memory:critical"]) == 1
+
+
+class TestResolvedCooldown:
+    """Verify that resolved patterns are blocked for _RESOLVED_COOLDOWN_S."""
+
+    @pytest.mark.asyncio
+    async def test_resolved_pattern_blocks_immediate_redispatch(self):
+        """After a pattern resolves, the same pattern is blocked by cooldown."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        alarm = FireAlarm(tier=2, alert_id="memory:critical", severity="CRITICAL", message="mem")
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            # First dispatch: resolves
+            r1 = await d.dispatch(SentinelRequest(
+                trigger_source="fire_alarm",
+                trigger_reason="Tier 2 alarm",
+                tier=2, alarms=[alarm],
+            ))
+        assert r1.dispatched and r1.resolved
+
+        # Cooldown recorded
+        assert "memory:critical" in d._resolved_cooldowns
+
+        with patch("genesis.sentinel.dispatcher.save_state"), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            # Second dispatch: same pattern, should be blocked by cooldown
+            r2 = await d.dispatch(SentinelRequest(
+                trigger_source="fire_alarm",
+                trigger_reason="Tier 2 alarm",
+                tier=2, alarms=[alarm],
+            ))
+        assert not r2.dispatched
+        assert "cooldown" in r2.reason.lower()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_expires_after_window(self):
+        """After the cooldown window, the pattern dispatches again."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        # Simulate a cooldown that already expired
+        d._resolved_cooldowns["memory:critical"] = time.monotonic() - (_RESOLVED_COOLDOWN_S + 1)
+
+        ready, reason = d._backoff_ready("memory:critical")
+        assert ready
+        # Expired cooldown should be cleaned up
+        assert "memory:critical" not in d._resolved_cooldowns
+
+    @pytest.mark.asyncio
+    async def test_cooldown_independent_per_pattern(self):
+        """Cooldown on one pattern doesn't block a different pattern."""
+        d = _make_dispatcher()
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        # memory:critical is in cooldown
+        d._resolved_cooldowns["memory:critical"] = time.monotonic()
+
+        # Different pattern should be unaffected
+        ready, reason = d._backoff_ready("disk:critical")
+        assert ready
 
 
 class TestEscalation:

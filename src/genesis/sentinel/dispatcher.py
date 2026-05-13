@@ -60,6 +60,13 @@ _ESCALATE_AT_ATTEMPT = len(_BACKOFF_SCHEDULE_S) + 1  # 5
 _ALARM_RING_SIZE = 3
 _ALARM_CONFIRMATION_COUNT = 2
 
+# Cooldown after a resolved dispatch. When a pattern resolves (including
+# "already resolved" no-action diagnoses), block re-dispatch for this
+# window. Prevents transient conditions that self-resolve from creating
+# infinite dispatch loops: alarm → dispatch → "already resolved" → clear
+# attempts → alarm recurs → dispatch again (every tick).
+_RESOLVED_COOLDOWN_S = 15 * 60  # 15 minutes
+
 
 def _serialize_request(request: SentinelRequest) -> str:
     """Serialize a SentinelRequest to JSON for state persistence."""
@@ -207,6 +214,13 @@ class SentinelDispatcher:
         # until the user intervenes. Value = iso timestamp of escalation.
         # Cleared on process restart or resolved dispatch of the same pattern.
         self._escalated_patterns: dict[str, str] = {}
+
+        # Resolved-pattern cooldown (in-memory; resets on restart).
+        # key = pattern string, value = monotonic timestamp of resolution.
+        # Prevents re-dispatch for _RESOLVED_COOLDOWN_S after a pattern
+        # resolves — stops the transient alarm → resolve → clear → re-alarm
+        # loop that caused 17 redundant dispatches in 2 hours.
+        self._resolved_cooldowns: dict[str, float] = {}
 
         # Ring buffer of alarm id sets seen on recent ticks. Drives 2-of-N
         # debouncing — a pattern must appear in ≥_ALARM_CONFIRMATION_COUNT
@@ -669,8 +683,13 @@ class SentinelDispatcher:
         if resolved:
             self._state.transition(SentinelState.HEALTHY, reason="resolved after action execution")
             self._state.escalated_count = 0  # Reset oscillation counter
+            # Record resolved-pattern cooldown BEFORE clearing attempts.
+            # This prevents re-dispatch for _RESOLVED_COOLDOWN_S even though
+            # attempts are cleared (the cooldown gate fires first).
+            if pattern:
+                self._resolved_cooldowns[pattern] = time.monotonic()
             # Clear backoff attempts for this pattern — the problem is fixed.
-            # Next occurrence starts from attempt 1.
+            # Next occurrence starts from attempt 1 (after cooldown expires).
             if pattern and pattern in self._pattern_attempts:
                 del self._pattern_attempts[pattern]
             if pattern and pattern in self._escalated_patterns:
@@ -1263,6 +1282,23 @@ class SentinelDispatcher:
         ready until cleared by a resolved dispatch or process restart.
         Rejected patterns are suppressed until their rejection window expires.
         """
+        # Check resolved-pattern cooldown (in-memory). If this pattern
+        # was recently resolved, block re-dispatch for _RESOLVED_COOLDOWN_S.
+        # This prevents transient self-resolving alarms from causing an
+        # infinite dispatch loop (alarm → resolve → clear attempts → alarm).
+        resolved_at = self._resolved_cooldowns.get(pattern)
+        if resolved_at is not None:
+            elapsed = time.monotonic() - resolved_at
+            if elapsed < _RESOLVED_COOLDOWN_S:
+                remaining_min = (_RESOLVED_COOLDOWN_S - elapsed) / 60
+                return (
+                    False,
+                    f"Pattern {pattern!r} resolved {elapsed / 60:.1f}m ago — "
+                    f"cooldown {remaining_min:.1f}m remaining",
+                )
+            # Cooldown expired — remove entry
+            del self._resolved_cooldowns[pattern]
+
         # Check persistent rejection window (survives restarts)
         rejected_until = self._state.rejected_patterns.get(pattern)
         if rejected_until:
