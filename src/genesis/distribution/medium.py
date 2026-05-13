@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -162,6 +163,54 @@ class MediumDistributor:
             logger.info("Not logged in to Medium (username: %s)", self._username)
         return logged_in
 
+    async def _attempt_relogin(self) -> bool:
+        """Try to re-authenticate via Google OAuth cookies already in profile.
+
+        Medium supports "Sign in with Google". If the Camoufox profile has
+        valid Google session cookies, clicking the Google sign-in button
+        auto-authenticates without user interaction.
+
+        Returns True if login succeeds, False otherwise.
+        """
+        logger.info("Attempting automatic Medium re-login via Google OAuth")
+        try:
+            result = await self._browser.navigate("https://medium.com/m/signin")
+            if "error" in result:
+                logger.warning("Failed to navigate to sign-in page: %s", result.get("error"))
+                return False
+
+            await asyncio.sleep(2)  # Let the sign-in page render
+            snap = await self._browser.snapshot()
+            snap_text = str(snap.get("snapshot", ""))
+
+            # Look for Google sign-in option (specific button text, not just "Google")
+            if "Sign in with Google" not in snap_text and "Continue with Google" not in snap_text:
+                logger.warning("Google sign-in option not found on Medium login page")
+                return False
+
+            # Click the Google sign-in button (browser.click returns error dict, not exception)
+            result = await self._browser.click('button:has-text("Sign in with Google")')
+            if "error" in result:
+                result = await self._browser.click('button:has-text("Continue with Google")')
+                if "error" in result:
+                    logger.warning("Could not click Google sign-in button: %s", result.get("error"))
+                    return False
+
+            # Wait for OAuth redirect chain (Google → Medium)
+            await asyncio.sleep(5)
+
+            # Verify login succeeded
+            if await self._check_logged_in():
+                logger.info("Automatic Medium re-login succeeded")
+                return True
+
+            logger.warning("Re-login flow completed but login check still fails")
+            return False
+
+        except Exception as exc:
+            logger.warning("Medium re-login failed: %s", exc)
+            return False
+
     async def publish(
         self,
         content: str,
@@ -188,15 +237,18 @@ class MediumDistributor:
                 error="Medium distributor not configured (missing username)",
             )
 
-        # Step 1: Check login
+        # Step 1: Check login (with automatic re-login attempt)
         if not await self._check_logged_in():
-            return PostResult(
-                post_id=None,
-                platform="medium",
-                url=None,
-                status="failed",
-                error="Not logged in to Medium. Open VNC and log in manually, then retry.",
-            )
+            logger.info("Not logged in — attempting automatic re-login")
+            if not await self._attempt_relogin():
+                return PostResult(
+                    post_id=None,
+                    platform="medium",
+                    url=None,
+                    status="failed",
+                    error="Not logged in to Medium and automatic re-login failed. "
+                    "Google OAuth cookies may have expired. Manual VNC login required.",
+                )
 
         title = _extract_title(content)
         body = _extract_body(content)
@@ -275,9 +327,9 @@ class MediumDistributor:
         if not self.available:
             return False
 
-        # Check login before attempting delete
-        if not await self._check_logged_in():
-            logger.warning("Cannot delete Medium post — not logged in")
+        # Check login before attempting delete (with re-login attempt)
+        if not await self._check_logged_in() and not await self._attempt_relogin():
+            logger.warning("Cannot delete Medium post — not logged in and re-login failed")
             return False
 
         try:
