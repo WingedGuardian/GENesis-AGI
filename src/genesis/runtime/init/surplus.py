@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("genesis.runtime")
 
-_CONFIG_DIR = __import__("pathlib").Path(__file__).resolve().parents[3] / "config"
+_CONFIG_DIR = __import__("pathlib").Path(__file__).resolve().parents[4] / "config"
 
 
 def _load_surplus_config() -> dict:
