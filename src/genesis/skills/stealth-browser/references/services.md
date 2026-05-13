@@ -127,7 +127,8 @@ inconsistencies (software rendering vs. claimed GPU). Options:
 4. **PCIe passthrough**: Dedicated GPU card ($25-30 for GT 710).
    Perfect fingerprints.
 
-See `references/gpu-passthrough.md` for setup instructions.
+GPU passthrough setup is host-specific — consult Proxmox/Incus docs for
+your hardware configuration.
 
 ---
 

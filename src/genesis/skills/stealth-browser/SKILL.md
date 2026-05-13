@@ -140,10 +140,12 @@ synthetic events (XTest, CDP, Playwright mouse).
 
 ### Why It Works
 
-x11vnc converts VNC protocol mouse/keyboard events into real X11 input
-device events. These are indistinguishable from physical hardware input.
-By contrast, xdotool uses the XTest extension, and Playwright uses CDP
-protocol — both produce synthetic events that Cloudflare fingerprints.
+x11vnc injects input through the VNC protocol, adding network-realistic
+timing and event sequencing patterns. While the underlying X11 mechanism
+is similar to xdotool, the VNC protocol layer produces timing closer to
+real human input (variable latency, natural event gaps). Playwright uses
+CDP protocol which Cloudflare directly fingerprints. The practical result:
+VNC-injected clicks pass Turnstile where xdotool and Playwright fail.
 
 ### When to Use
 
