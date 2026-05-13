@@ -117,3 +117,55 @@ class TestSchedulerJobs:
         ]
         for p in probes:
             assert callable(p)
+
+
+class TestCriticalFailureProbeWiring:
+    """The critical_failure probe set must respect ``ollama_enabled()``.
+
+    Ollama is opt-in (cloud-primary architecture). On installs that
+    don't enable Ollama, including ``probe_ollama`` in the
+    ``CriticalFailureCollector`` causes the signal to fire 1.0
+    permanently because the probe returns DOWN on every tick — which
+    pollutes reflections and observation writes with phantom emergencies.
+    """
+
+    def test_critical_failure_probes_exclude_ollama_when_disabled(self):
+        """When ollama_enabled() is False, probe_ollama is NOT in the probe set."""
+        from unittest.mock import patch
+
+        from genesis.observability.health import probe_db, probe_ollama, probe_qdrant
+
+        with patch("genesis.env.ollama_enabled", return_value=False):
+            from genesis.env import ollama_enabled
+
+            mock_db = MagicMock()
+            probes = [
+                partial(probe_db, mock_db),
+                probe_qdrant,
+            ]
+            if ollama_enabled():
+                probes.append(probe_ollama)
+
+            assert len(probes) == 2
+            # probe_ollama should NOT be in the set
+            assert not any(p is probe_ollama for p in probes)
+
+    def test_critical_failure_probes_include_ollama_when_enabled(self):
+        """When ollama_enabled() is True, probe_ollama IS in the probe set."""
+        from unittest.mock import patch
+
+        from genesis.observability.health import probe_db, probe_ollama, probe_qdrant
+
+        with patch("genesis.env.ollama_enabled", return_value=True):
+            from genesis.env import ollama_enabled
+
+            mock_db = MagicMock()
+            probes = [
+                partial(probe_db, mock_db),
+                probe_qdrant,
+            ]
+            if ollama_enabled():
+                probes.append(probe_ollama)
+
+            assert len(probes) == 3
+            assert any(p is probe_ollama for p in probes)

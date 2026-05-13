@@ -36,6 +36,7 @@ async def init(rt: GenesisRuntime) -> None:
                 ProcessHealthCollector,
                 StrategicTimerCollector,
             )
+            from genesis.env import ollama_enabled
             from genesis.learning.signals.autonomy_activity import (
                 AutonomyActivityCollector,
             )
@@ -78,11 +79,20 @@ async def init(rt: GenesisRuntime) -> None:
                 probe_qdrant,
             )
 
+            # DB and Qdrant are non-optional — Genesis cannot function
+            # without them, so their absence is a critical_failure. Ollama
+            # is opt-in (cloud-primary architecture): only treat its
+            # absence as critical when the install configures it as
+            # enabled. Without this gate, every cloud-only install would
+            # fire critical_failure=1.0 forever on a service that was
+            # never required, polluting reflections and observation
+            # writes with phantom emergencies.
             probes = [
                 partial(probe_db, rt._db),
                 probe_qdrant,
-                probe_ollama,
             ]
+            if ollama_enabled():
+                probes.append(probe_ollama)
 
             from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
