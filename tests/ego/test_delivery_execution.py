@@ -2,7 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,7 +12,6 @@ from genesis.ego.proposals import (
     _sort_proposals,
     parse_proposal_decisions,
 )
-
 
 # -- Layer 4: Delivery tests --
 
