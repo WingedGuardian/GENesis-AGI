@@ -106,7 +106,7 @@ async def init(rt: GenesisRuntime) -> None:
         try:
             from genesis.routing.model_profiles import ModelProfileRegistry
 
-            profiles_path = Path(__file__).resolve().parents[3] / "config" / "model_profiles.yaml"
+            profiles_path = Path(__file__).resolve().parents[4] / "config" / "model_profiles.yaml"
             rt._model_profile_registry = ModelProfileRegistry(profiles_path)
             rt._model_profile_registry.load()
             logger.info("Model profile registry loaded (%d profiles)", len(rt._model_profile_registry.all_profiles()))
