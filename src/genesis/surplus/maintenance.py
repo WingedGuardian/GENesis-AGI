@@ -13,6 +13,7 @@ Task types handled:
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -128,20 +129,36 @@ class BackupVerificationExecutor:
         self._max_age_hours = max_age_hours
 
     async def execute(self, task: SurplusTask) -> ExecutorResult:
-        backup_dir = Path.home() / ".genesis" / "backups"
-        marker_file = backup_dir / "last_backup_at"
+        status_file = Path.home() / ".genesis" / "backup_status.json"
         lines: list[str] = ["Backup verification:"]
         stale = False
 
-        if marker_file.exists():
+        if status_file.exists():
             try:
-                ts_str = marker_file.read_text().strip()
+                data = json.loads(status_file.read_text())
+                ts_str = data.get("timestamp", "")
+                success = data.get("success", False)
                 last_backup = datetime.fromisoformat(ts_str)
                 age = datetime.now(UTC) - last_backup
                 age_hours = age.total_seconds() / 3600
-                lines.append(f"  Last backup: {ts_str} ({age_hours:.1f}h ago)")
 
-                if age_hours > self._max_age_hours:
+                lines.append(f"  Last backup: {ts_str} ({age_hours:.1f}h ago)")
+                lines.append(f"  Success: {success}")
+
+                if data.get("duration_s"):
+                    lines.append(f"  Duration: {data['duration_s']}s")
+                if data.get("sqlite_lines"):
+                    lines.append(f"  SQLite rows: {data['sqlite_lines']:,}")
+                if data.get("qdrant_collections") is not None:
+                    lines.append(f"  Qdrant collections: {data['qdrant_collections']}")
+                if data.get("secrets_encrypted") is not None:
+                    lines.append(f"  Secrets encrypted: {data['secrets_encrypted']}")
+
+                if not success:
+                    stale = True
+                    reason = data.get("failure_reason") or "unknown"
+                    lines.append(f"  WARNING: Last backup FAILED — {reason}")
+                elif age_hours > self._max_age_hours:
                     stale = True
                     lines.append(
                         f"  WARNING: Backup is {age_hours:.0f}h old "
@@ -149,29 +166,12 @@ class BackupVerificationExecutor:
                     )
                 else:
                     lines.append("  Status: OK (within retention window)")
-            except (ValueError, OSError) as e:
-                lines.append(f"  Error reading backup marker: {e}")
+            except (ValueError, OSError, json.JSONDecodeError, KeyError) as e:
+                lines.append(f"  Error reading backup status: {e}")
                 stale = True
         else:
-            # Check if backup directory has any recent files
-            if backup_dir.is_dir():
-                latest = _newest_file(backup_dir)
-                if latest:
-                    age = datetime.now(UTC) - datetime.fromtimestamp(
-                        latest.stat().st_mtime, tz=UTC
-                    )
-                    age_hours = age.total_seconds() / 3600
-                    lines.append(
-                        f"  No marker file. Newest backup file: "
-                        f"{latest.name} ({age_hours:.1f}h ago)"
-                    )
-                    stale = age_hours > self._max_age_hours
-                else:
-                    lines.append("  No backup marker and no backup files found.")
-                    stale = True
-            else:
-                lines.append(f"  Backup directory not found: {backup_dir}")
-                stale = True
+            lines.append(f"  Backup status file not found: {status_file}")
+            stale = True
 
         content = "\n".join(lines)
         return ExecutorResult(
@@ -335,19 +335,3 @@ def _fmt_bytes(n: int) -> str:
     if n < 1024 * 1024 * 1024:
         return f"{n / (1024 * 1024):.1f} MB"
     return f"{n / (1024 * 1024 * 1024):.2f} GB"
-
-
-def _newest_file(directory: Path) -> Path | None:
-    """Find the most recently modified file in a directory."""
-    newest = None
-    newest_mtime = 0.0
-    for f in directory.iterdir():
-        if f.is_file():
-            try:
-                mtime = f.stat().st_mtime
-                if mtime > newest_mtime:
-                    newest_mtime = mtime
-                    newest = f
-            except OSError:
-                continue
-    return newest

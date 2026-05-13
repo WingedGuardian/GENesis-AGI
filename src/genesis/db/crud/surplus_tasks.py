@@ -98,6 +98,30 @@ async def mark_failed(
     return cursor.rowcount > 0
 
 
+async def consecutive_failures(
+    db: aiosqlite.Connection,
+    task_type: str,
+) -> int:
+    """Count consecutive recent failures for a task type.
+
+    Looks at the most recent tasks of this type and counts how many
+    consecutive ones have status='failed', stopping at the first
+    non-failed task.
+    """
+    cursor = await db.execute(
+        "SELECT status FROM surplus_tasks WHERE task_type = ? "
+        "ORDER BY created_at DESC LIMIT 20",
+        (task_type,),
+    )
+    count = 0
+    for row in await cursor.fetchall():
+        if row[0] == "failed":
+            count += 1
+        else:
+            break
+    return count
+
+
 async def recover_stuck(
     db: aiosqlite.Connection,
     *,

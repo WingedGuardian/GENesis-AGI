@@ -13,11 +13,11 @@ jobs:
   code_audit_hours: 12
   code_index_hours: 4
   recon_gather_hours: 84       # ~3.5 days
-  maintenance_hours: 6
+  maintenance_hours: 24
   analytical_hours: 12
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
-  j9_eval_batch_hours: 24
+  j9_eval_batch_hours: 0          # Disabled: 100% error rate, no value
 
 task_defaults:
   code_audit:                { priority: 0.5, drive: competence,   tier: free_api }
