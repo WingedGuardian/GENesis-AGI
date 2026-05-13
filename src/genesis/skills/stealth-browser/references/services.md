@@ -85,7 +85,7 @@ from camoufox.async_api import AsyncCamoufox
 
 async with AsyncCamoufox(
     proxy={"server": "http://proxy.example.com:8080",
-           "username": "user", "password": "pass"},
+           "username": "user", "password": "***"},  # noqa: placeholder
     geoip=True,  # Auto-set timezone/locale from proxy IP
 ) as browser:
     page = await browser.new_page()
