@@ -451,7 +451,7 @@ class ProposalWorkflow:
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         revoked = 0
         for i, prop in enumerate(proposals, 1):
-            if proposal_indices and i not in proposal_indices:
+            if proposal_indices is not None and i not in proposal_indices:
                 continue
             if prop["status"] != "approved":
                 continue

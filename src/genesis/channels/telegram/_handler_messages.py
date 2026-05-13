@@ -817,8 +817,6 @@ _SWEEP_GRACE_SECONDS = 300  # 5-minute grace period before dispatching
 
 async def _delayed_sweep() -> None:
     """Wait 5 minutes then sweep — gives user time to change their mind."""
-    import asyncio
-
     await asyncio.sleep(_SWEEP_GRACE_SECONDS)
     from genesis.runtime import GenesisRuntime
 
@@ -862,6 +860,24 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
         decisions = parse_proposal_decisions(msg.text)
         if not decisions:
             return False  # Unparseable — fall through to correction store
+
+        # Cancel/revoke approved proposals (works on approved, not pending)
+        has_cancel = any(s == "cancelled" for s, _ in decisions.values())
+        if has_cancel:
+            proposals = await ego_crud.list_proposals_by_batch(ctx.db, batch_id)
+            if 0 in decisions:
+                revoked = await ctx.proposal_workflow.revoke_approved_proposals(batch_id)
+            else:
+                indices = [idx for idx, (s, _) in decisions.items() if s == "cancelled"]
+                revoked = await ctx.proposal_workflow.revoke_approved_proposals(
+                    batch_id,
+                    proposal_indices=indices,
+                )
+            try:
+                await msg.reply_text(f"✅ Cancelled: {revoked} proposal(s) revoked")
+            except Exception:
+                log.debug("Failed to send cancel ack", exc_info=True)
+            return True
 
         # Cross-batch resolution (sentinel -1): resolve all pending
         if -1 in decisions:
@@ -973,8 +989,6 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
         try:
             from genesis.db.crud import ego as ego_crud
 
-            pending = await ego_crud.list_pending_proposals(ctx.db)
-            # Find the most recent batch (could be pending or approved)
             approved = await ego_crud.list_proposals(ctx.db, status="approved", limit=10)
             if not approved:
                 with contextlib.suppress(Exception):
