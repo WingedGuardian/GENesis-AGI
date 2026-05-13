@@ -29,6 +29,32 @@ file is fallback guidance for edge cases the exemplars don't cover.
 
 The final output must pass an AI-tell audit before delivery. No exceptions.
 
+## Quick Mode
+
+For short content, skip the exemplar research pipeline. Quick Mode runs
+Steps 5–7 only (generate + audit + deliver). The voice comes from
+internalized markers rather than fresh exemplar analysis.
+
+**Auto-triggers** (self-detected unless overridden):
+- Content request is <200 words of output
+- Content type is email, reply, DM, or Slack message
+- Caller explicitly says "quick" / "quick mode" / "just dash this off"
+
+**Audit-only** (editing existing text, not generating):
+- Skip Steps 1–5 entirely
+- Run Step 6 (full enhanced audit) on the provided text
+- Deliver the cleaned version
+
+**Quick Mode generation (Step 5 lite):**
+- Characteristic openers where natural ("Here's the thing," "Frankly,"
+  "Not for nothing")
+- Match register to audience (use Register Quick Reference below)
+- Evidence-first, no windup, no padding
+- Do NOT load exemplar files — use internalized voice markers only
+
+**Override:** If the user says "full mode" or "use exemplars," run the
+complete 7-step workflow regardless of content length.
+
 ## Workflow
 
 ### Step 1 — Read the exemplar index
@@ -80,6 +106,8 @@ Before delivering, scan the output and eliminate any of the following:
 - clean (as filler/intensifier, e.g. "clean architecture" — OK for
   literal cleanliness), smoking gun, landscape, ecosystem (when not
   literal), holistic, synergy, empower, elevate, harness, foster
+- pivotal, crucial, enhance, underscore, vibrant, testament, showcase,
+  intricate, evolving, navigate, journey
 - it's worth noting, it is important to note, it's important to
 - in conclusion, in summary, to summarize
 - cutting-edge, game-changing, transformative, revolutionary
@@ -102,6 +130,21 @@ Before delivering, scan the output and eliminate any of the following:
      Max 1-2 per page, not per paragraph. Stacking them is an AI fingerprint.
 - Hedging openers ("It's worth considering that...")
 - Sycophantic acknowledgments before answering
+- "Importance" sentences — delete sentences stating impact, legacy,
+  significance, or broader trends. Show why it matters, don't state
+  that it matters.
+- Contrast structures — delete "It's not X, it's Y" / "Not A. Not B.
+  But C" / "Despite this..." patterns. AI cadence markers.
+- Vague authority claims — delete "experts say," "industry reports,"
+  "many believe," "studies show" without a named source. No source =
+  no claim.
+- General claims without evidence — replace with specifics or delete.
+  No proof = doesn't belong.
+- Sentence length bias — strong bias toward sentences under 16 words.
+  Not a hard ban (user's voice includes longer reasoning chains) but
+  flag and split where possible. If you can say it shorter, do.
+- Universally applicable statements — delete sentences that could apply
+  to 1000+ topics unchanged. Not specific to THIS subject = padding.
 
 **Test:** Read each paragraph out loud. If it sounds like a polished AI
 response, it needs a rewrite. If it sounds like a person thinking through
@@ -141,3 +184,15 @@ formality 4 (public content) → AI-tell audit → deliver.
 
 **Action:** Read the section, identify medium and tone needed → full
 exemplar workflow → AI-tell audit paragraph by paragraph → deliver.
+
+### Quick email reply
+**Input:** "Write a reply declining the meeting. Keep it short."
+
+**Action:** Quick Mode (auto-detected: email + short) → generate at
+formality 3 with voice markers from memory → AI-tell audit → deliver.
+
+### Audit existing text
+**Input:** "Run the AI-tell audit on this paragraph."
+
+**Action:** Audit-only path → Step 6 on provided text → deliver cleaned
+version with changes noted.
