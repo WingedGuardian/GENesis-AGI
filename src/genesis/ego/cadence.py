@@ -35,11 +35,11 @@ logger = logging.getLogger(__name__)
 # When the user hasn't had a foreground session in a while, the ego
 # naturally winds down — through the cadence system, not self-suppression.
 _RECENCY_TIERS: list[tuple[timedelta | None, int]] = [
-    (timedelta(hours=24), 240),    # <24h:   current max (~6x/day)
-    (timedelta(days=3),   480),    # 1-3d:   ~3x/day
-    (timedelta(days=7),   1440),   # 3-7d:   ~1x/day
-    (timedelta(days=14),  2880),   # 7-14d:  every other day
-    (None,                4320),   # 14+d:   every 3 days
+    (timedelta(hours=24), 240),  # <24h:   current max (~6x/day)
+    (timedelta(days=3), 480),  # 1-3d:   ~3x/day
+    (timedelta(days=7), 1440),  # 3-7d:   ~1x/day
+    (timedelta(days=14), 2880),  # 7-14d:  every other day
+    (None, 4320),  # 14+d:   every 3 days
 ]
 
 
@@ -109,10 +109,10 @@ class EgoCadenceManager:
                 max_instances=1,
                 misfire_grace_time=600,
             )
-        # Mechanical sweep: dispatch approved proposals every 30 min,
-        # independent of ego LLM cycles.
+        # Mechanical sweep: expire stale proposals then dispatch approved
+        # proposals every 30 min, independent of ego LLM cycles.
         self._scheduler.add_job(
-            self._session.sweep_approved_proposals,
+            self._sweep_with_expiry,
             IntervalTrigger(minutes=30),
             id="ego_sweep_approved",
             max_instances=1,
@@ -165,6 +165,21 @@ class EgoCadenceManager:
     @property
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
+
+    # -- Sweep helpers -----------------------------------------------------
+
+    async def _sweep_with_expiry(self) -> None:
+        """Expire stale proposals, then dispatch approved ones."""
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            expired = await ego_crud.expire_stale_proposals(self._session._db)
+            if expired:
+                logger.info("Pre-sweep expiry: %d proposal(s) expired", expired)
+        except Exception:
+            logger.warning("Pre-sweep expiry failed", exc_info=True)
+
+        await self._session.sweep_approved_proposals()
 
     # -- Tick handlers -----------------------------------------------------
 
@@ -258,6 +273,7 @@ class EgoCadenceManager:
         # Check global Genesis pause
         try:
             from genesis.runtime import GenesisRuntime
+
             if GenesisRuntime.instance().paused:
                 logger.debug("Ego cycle skipped — Genesis paused")
                 return False
@@ -303,6 +319,7 @@ class EgoCadenceManager:
 
         try:
             from genesis.runtime import GenesisRuntime
+
             GenesisRuntime.instance().record_job_success("ego_cycle")
         except ImportError:
             pass
@@ -318,14 +335,14 @@ class EgoCadenceManager:
                 minutes=self._config.failure_backoff_minutes,
             )
             logger.warning(
-                "Ego circuit breaker OPEN — %d consecutive failures, "
-                "pausing for %d minutes",
+                "Ego circuit breaker OPEN — %d consecutive failures, pausing for %d minutes",
                 self._consecutive_failures,
                 self._config.failure_backoff_minutes,
             )
 
         try:
             from genesis.runtime import GenesisRuntime
+
             GenesisRuntime.instance().record_job_failure("ego_cycle", error)
         except ImportError:
             pass
@@ -397,11 +414,14 @@ class EgoCadenceManager:
                 )
                 logger.info(
                     "Ego interval adjusted: %dm → %dm (recency_max=%dm)",
-                    old_interval, new_interval, recency_max,
+                    old_interval,
+                    new_interval,
+                    recency_max,
                 )
             except Exception:
                 logger.warning(
-                    "Failed to reschedule ego interval", exc_info=True,
+                    "Failed to reschedule ego interval",
+                    exc_info=True,
                 )
 
     # -- Observability -----------------------------------------------------
