@@ -433,6 +433,26 @@ async def test_brainstorm_self_includes_ek_but_not_user_model():
 
 
 @pytest.mark.asyncio
+async def test_research_query_gen_includes_ek_and_user_model():
+    """RESEARCH_QUERY_GEN should include both EK and user model."""
+    router = _make_router()
+    executor = _make_llm_executor(router=router)
+    task = _make_task(task_type=TaskType.RESEARCH_QUERY_GEN)
+
+    with (
+        patch("genesis.surplus.executor._read_essential_knowledge", return_value="EK: active context"),
+        patch("genesis.surplus.executor._read_user_model_compact", new_callable=AsyncMock, return_value="- interests: AI agents"),
+        patch("genesis.surplus.executor.observations.query", new_callable=AsyncMock, return_value=[]),
+    ):
+        await executor.execute(task)
+
+    prompt = router.route_call.call_args[0][1][0]["content"]
+    assert "EK: active context" in prompt
+    assert "interests: AI agents" in prompt
+    assert "User Profile" in prompt
+
+
+@pytest.mark.asyncio
 async def test_infra_monitor_no_ek_injection():
     """INFRASTRUCTURE_MONITOR should NOT get EK or user model."""
     router = _make_router()

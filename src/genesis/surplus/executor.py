@@ -109,7 +109,9 @@ _COGNITIVE_TASK_TYPES = frozenset({
     TaskType.SELF_UNBLOCK, TaskType.MEMORY_AUDIT, TaskType.PROCEDURE_AUDIT,
 })
 
-# Fields extracted from user model — reuses ego's proven priority_keys.
+# Fields extracted from user model — subset of ego's priority_keys
+# (ego/user_context.py), excluding UI-oriented fields like
+# communication_preferences and autonomy_preferences.
 _USER_MODEL_PRIORITY_KEYS = [
     "active_projects", "current_focus", "priorities",
     "goals", "professional_role", "expertise_areas",
@@ -156,11 +158,13 @@ async def _read_user_model_compact(
                 continue
             val = model[key]
             if isinstance(val, str):
-                val_str = val[:200]
+                val_str = val[:200] + ("..." if len(val) > 200 else "")
             elif isinstance(val, (list, dict)):
-                val_str = json.dumps(val, default=str)[:200]
+                raw = json.dumps(val, default=str)
+                val_str = raw[:200] + ("..." if len(raw) > 200 else "")
             else:
-                val_str = str(val)[:200]
+                raw = str(val)
+                val_str = raw[:200] + ("..." if len(raw) > 200 else "")
             line = f"- {key}: {val_str}"
             if total + len(line) > max_chars:
                 break
@@ -603,7 +607,7 @@ class SurplusLLMExecutor:
                 parts.append("## System Context (current state & priorities)")
                 parts.append(ek)
 
-            if task.task_type == TaskType.BRAINSTORM_USER:
+            if task.task_type in (TaskType.BRAINSTORM_USER, TaskType.RESEARCH_QUERY_GEN):
                 user_model = await _read_user_model_compact(self._db)
                 if user_model:
                     parts.append("\n## User Profile")
