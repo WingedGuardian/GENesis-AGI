@@ -1205,10 +1205,8 @@ class CCSessionExecutor:
                 "Plan audit append failed (non-blocking)", exc_info=True,
             )
             # Clean up orphaned .tmp if write succeeded but rename failed
-            try:
+            with contextlib.suppress(OSError):
                 Path(plan_path).expanduser().with_suffix(".tmp").unlink(missing_ok=True)
-            except OSError:
-                pass
 
     async def _set_output(self, task_id: str, key: str, value: str) -> None:
         """JSON read-merge-write on the outputs column.
