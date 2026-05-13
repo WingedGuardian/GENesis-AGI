@@ -8,9 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.autonomy.executor.observe import (
-    COMMIT_BLOCK_THRESHOLD,
     COMMIT_WARN_THRESHOLD,
-    STALE_BLOCK_HOURS,
     STALE_WARN_HOURS,
     observe,
 )
@@ -49,56 +47,55 @@ def _ts(hours_ago: float) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Plan age checks
+# Activity age checks
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestPlanAge:
-    async def test_fresh_task_proceeds(self, monkeypatch, tmp_path):
+class TestActivityAge:
+    async def test_fresh_task_no_annotation(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
-        assert not any("stale" in a.lower() or "old" in a.lower()
-                       for a in result.annotations)
+        assert not result.annotations
 
-    async def test_48h_task_warns(self, monkeypatch, tmp_path):
+    async def test_48h_stale_annotates(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at=_ts(STALE_WARN_HOURS + 1), repo_root=tmp_path,
+            updated_at=_ts(STALE_WARN_HOURS + 1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
-        assert any("old" in a.lower() for a in result.annotations)
+        assert any("activity" in a.lower() or "no activity" in a.lower()
+                   for a in result.annotations)
 
-    async def test_7d_task_blocks(self, monkeypatch, tmp_path):
+    async def test_7d_stale_annotates_not_blocks(self, monkeypatch, tmp_path):
+        """Even very stale tasks only get annotated, never blocked."""
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at=_ts(STALE_BLOCK_HOURS + 1), repo_root=tmp_path,
+            updated_at=_ts(170), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is False
-        assert result.block_reason is not None
-        assert "days" in result.block_reason.lower()
+        # Should have an annotation about staleness
+        assert len(result.annotations) > 0
+        assert any("days" in a or "activity" in a.lower() for a in result.annotations)
 
-    async def test_empty_created_at_proceeds(self, monkeypatch, tmp_path):
+    async def test_empty_updated_at_no_annotation(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at="", repo_root=tmp_path,
+            updated_at="", repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
+        assert not result.annotations
 
-    async def test_invalid_created_at_proceeds(self, monkeypatch, tmp_path):
+    async def test_invalid_updated_at_no_annotation(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at="not-a-date", repo_root=tmp_path,
+            updated_at="not-a-date", repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
+        assert not result.annotations
 
 
 # ---------------------------------------------------------------------------
@@ -108,40 +105,38 @@ class TestPlanAge:
 
 @pytest.mark.asyncio
 class TestGitActivity:
-    async def test_low_activity_proceeds(self, monkeypatch, tmp_path):
+    async def test_low_activity_no_annotation(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=5)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
         assert not any("commit" in a.lower() for a in result.annotations)
 
-    async def test_moderate_activity_warns(self, monkeypatch, tmp_path):
+    async def test_moderate_activity_annotates(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=COMMIT_WARN_THRESHOLD + 1)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
         assert any("commit" in a.lower() for a in result.annotations)
 
-    async def test_extreme_activity_blocks(self, monkeypatch, tmp_path):
-        _mock_git(monkeypatch, commit_count=COMMIT_BLOCK_THRESHOLD + 1)
+    async def test_high_activity_annotates_not_blocks(self, monkeypatch, tmp_path):
+        """Even 100+ commits only annotates, never blocks."""
+        _mock_git(monkeypatch, commit_count=100)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is False
-        assert "commit" in result.block_reason.lower()
+        assert any("commit" in a.lower() for a in result.annotations)
 
     async def test_git_failure_is_failopen(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0, fail=True)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
+        assert not any("commit" in a.lower() for a in result.annotations)
 
 
 # ---------------------------------------------------------------------------
@@ -151,16 +146,15 @@ class TestGitActivity:
 
 @pytest.mark.asyncio
 class TestTaskOverlap:
-    async def test_no_overlap_no_warning(self, monkeypatch, tmp_path):
+    async def test_no_overlap_no_annotation(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         result = await observe(
-            created_at=_ts(1), repo_root=tmp_path,
+            updated_at=_ts(1), repo_root=tmp_path,
             active_tasks=[], task_id="t-001",
         )
-        assert result.proceed is True
         assert not any("other task" in a.lower() for a in result.annotations)
 
-    async def test_completed_task_overlap_warns(self, monkeypatch, tmp_path):
+    async def test_completed_task_overlap_annotates(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         other_tasks = [
             {
@@ -171,24 +165,23 @@ class TestTaskOverlap:
             },
         ]
         result = await observe(
-            created_at=_ts(2), repo_root=tmp_path,
+            updated_at=_ts(2), repo_root=tmp_path,
             active_tasks=other_tasks, task_id="t-001",
         )
-        assert result.proceed is True
         assert any("other task" in a.lower() for a in result.annotations)
 
     async def test_self_excluded_from_overlap(self, monkeypatch, tmp_path):
         _mock_git(monkeypatch, commit_count=0)
         other_tasks = [
             {
-                "task_id": "t-001",  # same task
+                "task_id": "t-001",
                 "current_phase": "completed",
                 "updated_at": datetime.now(UTC).isoformat(),
                 "created_at": _ts(3),
             },
         ]
         result = await observe(
-            created_at=_ts(2), repo_root=tmp_path,
+            updated_at=_ts(2), repo_root=tmp_path,
             active_tasks=other_tasks, task_id="t-001",
         )
         assert not any("other task" in a.lower() for a in result.annotations)
@@ -205,7 +198,7 @@ class TestTaskOverlap:
             },
         ]
         result = await observe(
-            created_at=_ts(2), repo_root=tmp_path,
+            updated_at=_ts(2), repo_root=tmp_path,
             active_tasks=other_tasks, task_id="t-001",
         )
         assert not any("other task" in a.lower() for a in result.annotations)

@@ -41,8 +41,7 @@ class TaskPhase(StrEnum):
 VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
     TaskPhase.PENDING: {TaskPhase.OBSERVING, TaskPhase.FAILED, TaskPhase.CANCELLED},
     TaskPhase.OBSERVING: {
-        TaskPhase.REVIEWING,
-        TaskPhase.BLOCKED,  # stale plan blocks for user review
+        TaskPhase.REVIEWING,  # annotation-only, always proceeds
         TaskPhase.FAILED,
         TaskPhase.CANCELLED,
     },
@@ -91,7 +90,6 @@ VALID_TRANSITIONS: dict[TaskPhase, set[TaskPhase]] = {
         TaskPhase.FAILED,  # retrospective itself fails (non-blocking)
     },
     TaskPhase.BLOCKED: {
-        TaskPhase.OBSERVING,  # resume from observation-phase blocker
         TaskPhase.REVIEWING,  # user responded to review-phase blocker
         TaskPhase.EXECUTING,  # user responded to mid-task blocker
         TaskPhase.VERIFYING,  # recovery resume after verify-phase blocker
