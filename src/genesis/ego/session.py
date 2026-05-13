@@ -1129,7 +1129,7 @@ def _sanitize_focus_summary(
     return focus, False
 
 
-_INTERACT_TYPES = frozenset({"outreach", "dispatch"})
+_INTERACT_TYPES = frozenset({"outreach", "dispatch", "publish"})
 _RESEARCH_TYPES = frozenset({"investigate"})
 
 
