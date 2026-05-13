@@ -797,17 +797,17 @@ class TestObservingPhase:
         task = await task_states.get_by_id(db, "t-001")
         assert task["current_phase"] == "completed"
 
-    async def test_stale_task_blocked_by_observing(
+    async def test_stale_task_annotates_plan(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
         mock_subprocess,
     ):
-        """Task created >7 days ago is blocked at OBSERVING."""
+        """Stale task gets annotations but still completes (never blocks)."""
         from datetime import timedelta
 
         old_date = (datetime.now(UTC) - timedelta(days=8)).isoformat()
         await _seed_task(db, plan_path=plan_file)
         await db.execute(
-            "UPDATE task_states SET created_at = ? WHERE task_id = ?",
+            "UPDATE task_states SET updated_at = ? WHERE task_id = ?",
             (old_date, "t-001"),
         )
         await db.commit()
@@ -815,12 +815,12 @@ class TestObservingPhase:
         engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
         result = await engine.execute("t-001")
 
-        assert result is False
-        task = await task_states.get_by_id(db, "t-001")
-        assert task["current_phase"] == "blocked"
-        blocker = json.loads(task["blockers"])
-        assert "Observation blocked" in blocker["description"]
-        assert blocker["resume_phase"] == "observing"
+        # Should complete, not block
+        assert result is True
+        # Plan file should have observation audit with staleness annotation
+        content = Path(plan_file).read_text()
+        assert "## Audit: OBSERVING" in content
+        assert "No activity" in content
 
     async def test_observing_skipped_on_recovery(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
@@ -856,12 +856,12 @@ class TestObservingPhase:
 
 @pytest.mark.asyncio
 class TestPrePlanningBlockerRecovery:
-    async def test_blocked_at_observing_reruns_fresh_path(
+    async def test_blocked_before_planning_reruns_fresh_path(
         self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
         mock_subprocess,
     ):
-        """Task blocked at OBSERVING (no steps) resumes via fresh path."""
-        # Seed as blocked (simulates a prior observation blocker)
+        """Task blocked before PLANNING (no steps) resumes via fresh path."""
+        # Seed as blocked (simulates a prior review blocker)
         await _seed_task(db, plan_path=plan_file, phase="blocked")
         # No steps exist in the DB (blocked before PLANNING)
 
@@ -873,19 +873,6 @@ class TestPrePlanningBlockerRecovery:
         task = await task_states.get_by_id(db, "t-001")
         assert task["current_phase"] == "completed"
         # Review was called (fresh path ran)
-        mock_reviewer.review_plan.assert_called_once()
-
-    async def test_blocked_at_reviewing_reruns_fresh_path(
-        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
-        mock_subprocess,
-    ):
-        """Pre-existing fix: blocked at REVIEWING (no steps) also gets fresh path."""
-        await _seed_task(db, plan_path=plan_file, phase="blocked")
-
-        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
-        result = await engine.execute("t-001")
-
-        assert result is True
         mock_reviewer.review_plan.assert_called_once()
 
 

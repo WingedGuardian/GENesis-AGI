@@ -231,24 +231,17 @@ class CCSessionExecutor:
             else:
                 # Fresh path: OBSERVING -> REVIEWING -> PLANNING
 
-                # --- OBSERVING ---
+                # --- OBSERVING (annotation-only, never blocks) ---
                 await self._transition(task_id, TaskPhase.OBSERVING)
                 all_tasks = await task_states.list_all_recent(
                     self._db, limit=50,
                 )
                 obs = await _observe.observe(
-                    created_at=task.get("created_at", ""),
+                    updated_at=task.get("updated_at", ""),
                     repo_root=_REPO_ROOT,
                     active_tasks=all_tasks,
                     task_id=task_id,
                 )
-                if not obs.proceed:
-                    await self._persist_blocker(
-                        task_id,
-                        f"Observation blocked: {obs.block_reason}",
-                        TaskPhase.OBSERVING,
-                    )
-                    return False
                 if obs.annotations:
                     ann_text = "\n".join(f"- {a}" for a in obs.annotations)
                     plan_content = (
