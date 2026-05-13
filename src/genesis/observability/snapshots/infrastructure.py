@@ -224,7 +224,9 @@ async def infrastructure(
             available_bytes = _read_mem_available()
             if available_bytes is not None:
                 mem_info["available_gb"] = round(available_bytes / (1024**3), 1)
-                mem_info["available_pct"] = round(available_bytes / limit * 100, 1)
+                # Cap at 100% — on non-namespaced hosts, MemAvailable may
+                # exceed the cgroup limit, producing a nonsensical ratio.
+                mem_info["available_pct"] = round(min(available_bytes / limit * 100, 100.0), 1)
             mem_info.update(_read_memory_stat())
             infra["container_memory"] = mem_info
         else:
