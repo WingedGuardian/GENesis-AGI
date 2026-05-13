@@ -1,13 +1,17 @@
-"""Pre-execution observation — staleness and context-drift checks.
+"""Pre-execution observation — context annotations for the reviewer.
 
-Deterministic checks run before REVIEWING to detect whether the
-codebase or task context has drifted since the plan was written.
+Deterministic checks run before REVIEWING to provide context about
+whether the task environment has drifted since the plan was written.
 No LLM calls — git commands + in-memory task comparison only.
 
+All checks are annotation-only — they NEVER block execution.
+Annotations are injected into plan_content so the reviewer LLM
+can factor them into its assessment.
+
 Three checks:
-1. Plan age: how old is the task since submission?
-2. Git activity: how many commits landed since task creation?
-3. Task overlap: have other tasks completed since this one was created?
+1. Activity age: time since last task activity (updated_at)
+2. Git activity: commits landed since last task activity
+3. Task overlap: other tasks completed since this one was last active
 """
 
 from __future__ import annotations
@@ -25,10 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 STALE_WARN_HOURS = 48
-STALE_BLOCK_HOURS = 168  # 7 days
-
 COMMIT_WARN_THRESHOLD = 20
-COMMIT_BLOCK_THRESHOLD = 50
 
 # ---------------------------------------------------------------------------
 # Result
@@ -37,11 +38,12 @@ COMMIT_BLOCK_THRESHOLD = 50
 
 @dataclass(frozen=True)
 class ObserveResult:
-    """Outcome of pre-execution observation checks."""
+    """Outcome of pre-execution observation checks.
 
-    proceed: bool  # True = continue to REVIEWING, False = block
+    Annotations only — this phase never blocks execution.
+    """
+
     annotations: list[str] = field(default_factory=list)
-    block_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +53,7 @@ class ObserveResult:
 
 async def observe(
     *,
-    created_at: str,
+    updated_at: str,
     repo_root: Path,
     active_tasks: list[dict],
     task_id: str,
@@ -60,8 +62,9 @@ async def observe(
 
     Parameters
     ----------
-    created_at:
-        ISO timestamp of task creation (from task_states.created_at).
+    updated_at:
+        ISO timestamp of last task activity (from task_states.updated_at).
+        Measures time since last meaningful interaction, not submission time.
     repo_root:
         Path to the repository root for git commands.
     active_tasks:
@@ -71,43 +74,27 @@ async def observe(
 
     Returns
     -------
-    ObserveResult with proceed=True/False and annotations/block_reason.
+    ObserveResult with annotations (may be empty if everything is fresh).
     """
     annotations: list[str] = []
 
-    # --- Check 1: Plan age ---
-    age_ann, age_block = _check_plan_age(created_at)
-    if age_block:
-        return ObserveResult(
-            proceed=False,
-            annotations=[age_ann] if age_ann else [],
-            block_reason=age_ann or "Plan is critically stale",
-        )
+    # --- Check 1: Activity age ---
+    age_ann = _check_activity_age(updated_at)
     if age_ann:
         annotations.append(age_ann)
 
     # --- Check 2: Git activity ---
-    commit_count = await _count_commits_since(created_at, repo_root)
-    if commit_count >= COMMIT_BLOCK_THRESHOLD:
-        reason = (
-            f"{commit_count} commits landed since task creation — "
-            f"codebase may have changed significantly"
-        )
-        return ObserveResult(
-            proceed=False,
-            annotations=[reason],
-            block_reason=reason,
-        )
+    commit_count = await _count_commits_since(updated_at, repo_root)
     if commit_count >= COMMIT_WARN_THRESHOLD:
         annotations.append(
-            f"{commit_count} commits landed since task creation"
+            f"{commit_count} commits landed since last task activity"
         )
 
     # --- Check 3: Task overlap ---
-    overlap_annotations = _check_task_overlap(created_at, active_tasks, task_id)
+    overlap_annotations = _check_task_overlap(updated_at, active_tasks, task_id)
     annotations.extend(overlap_annotations)
 
-    return ObserveResult(proceed=True, annotations=annotations)
+    return ObserveResult(annotations=annotations)
 
 
 # ---------------------------------------------------------------------------
@@ -115,46 +102,37 @@ async def observe(
 # ---------------------------------------------------------------------------
 
 
-def _check_plan_age(created_at: str) -> tuple[str | None, bool]:
-    """Check if the task is stale based on creation time.
-
-    Returns (annotation_or_None, should_block).
-    """
-    if not created_at:
-        return None, False
+def _check_activity_age(updated_at: str) -> str | None:
+    """Check time since last task activity. Returns annotation or None."""
+    if not updated_at:
+        return None
 
     try:
-        created = datetime.fromisoformat(created_at)
-        # SQLite datetime('now') produces naive UTC strings
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
-        age = datetime.now(UTC) - created
+        updated = datetime.fromisoformat(updated_at)
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=UTC)
+        age = datetime.now(UTC) - updated
         age_hours = age.total_seconds() / 3600
     except (ValueError, TypeError):
-        logger.warning("Cannot parse created_at: %s", created_at)
-        return None, False
-
-    if age_hours >= STALE_BLOCK_HOURS:
-        return (
-            f"Plan is {age.days} days old (>{STALE_BLOCK_HOURS // 24}d threshold)"
-        ), True
+        logger.warning("Cannot parse updated_at: %s", updated_at)
+        return None
 
     if age_hours >= STALE_WARN_HOURS:
-        return (
-            f"Plan is {age_hours:.0f}h old (>{STALE_WARN_HOURS}h warning threshold)"
-        ), False
+        if age.days >= 1:
+            return f"No activity for {age.days} days"
+        return f"No activity for {age_hours:.0f}h"
 
-    return None, False
+    return None
 
 
-async def _count_commits_since(created_at: str, repo_root: Path) -> int:
+async def _count_commits_since(updated_at: str, repo_root: Path) -> int:
     """Count git commits since the given timestamp. Fail-open: returns 0."""
-    if not created_at:
+    if not updated_at:
         return 0
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            "git", "log", "--oneline", f"--since={created_at}",
+            "git", "log", "--oneline", f"--since={updated_at}",
             cwd=str(repo_root),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -166,7 +144,6 @@ async def _count_commits_since(created_at: str, repo_root: Path) -> int:
                 proc.returncode,
             )
             return 0
-        # Count non-empty lines
         lines = [
             ln for ln in stdout.decode(errors="replace").splitlines()
             if ln.strip()
@@ -180,18 +157,18 @@ async def _count_commits_since(created_at: str, repo_root: Path) -> int:
 
 
 def _check_task_overlap(
-    created_at: str,
+    updated_at: str,
     active_tasks: list[dict],
     task_id: str,
 ) -> list[str]:
-    """Check for other tasks that completed since this task was created."""
-    if not created_at or not active_tasks:
+    """Check for other tasks that completed since this task was last active."""
+    if not updated_at or not active_tasks:
         return []
 
     try:
-        created = datetime.fromisoformat(created_at)
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=UTC)
+        updated = datetime.fromisoformat(updated_at)
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=UTC)
     except (ValueError, TypeError):
         return []
 
@@ -202,21 +179,21 @@ def _check_task_overlap(
         phase = t.get("current_phase", "")
         if phase not in ("completed", "failed"):
             continue
-        updated = t.get("updated_at", "")
-        if not updated:
+        t_updated = t.get("updated_at", "")
+        if not t_updated:
             continue
         try:
-            updated_dt = datetime.fromisoformat(updated)
-            if updated_dt.tzinfo is None:
-                updated_dt = updated_dt.replace(tzinfo=UTC)
-            if updated_dt > created:
+            t_updated_dt = datetime.fromisoformat(t_updated)
+            if t_updated_dt.tzinfo is None:
+                t_updated_dt = t_updated_dt.replace(tzinfo=UTC)
+            if t_updated_dt > updated:
                 completed_since.append(t.get("task_id", "unknown")[:8])
         except (ValueError, TypeError):
             continue
 
     if completed_since:
         return [
-            f"{len(completed_since)} other task(s) completed since this "
-            f"task was created ({', '.join(completed_since[:3])})"
+            f"{len(completed_since)} other task(s) completed since last "
+            f"activity ({', '.join(completed_since[:3])})"
         ]
     return []

@@ -37,11 +37,9 @@ class TestTaskPhase:
     def test_observing_can_transition_to_reviewing(self) -> None:
         assert TaskPhase.REVIEWING in VALID_TRANSITIONS[TaskPhase.OBSERVING]
 
-    def test_observing_can_transition_to_blocked(self) -> None:
-        assert TaskPhase.BLOCKED in VALID_TRANSITIONS[TaskPhase.OBSERVING]
-
-    def test_blocked_can_resume_to_observing(self) -> None:
-        assert TaskPhase.OBSERVING in VALID_TRANSITIONS[TaskPhase.BLOCKED]
+    def test_observing_cannot_transition_to_blocked(self) -> None:
+        """OBSERVING is annotation-only, never blocks."""
+        assert TaskPhase.BLOCKED not in VALID_TRANSITIONS[TaskPhase.OBSERVING]
 
     def test_executing_can_loop_to_executing(self) -> None:
         """Executing -> Executing is valid (next step in sequence)."""
