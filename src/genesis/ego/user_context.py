@@ -21,7 +21,8 @@ import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-# Observation categories that represent user-world signals
+# Observation categories that represent user-world signals.
+# Used by GenesisEgoContextBuilder to EXCLUDE these from its system-focused view.
 _USER_WORLD_CATEGORIES = frozenset({
     "email_recon", "inbox", "finding", "interest", "interests",
     "contribution", "user_model_delta",
@@ -68,9 +69,10 @@ class UserEgoContextBuilder:
 
         sections.append(await self._user_model_section())
         sections.append(self._ego_notepad_section())
+        sections.append(await self._user_goals_section())
+        sections.append(await self._world_snapshot_section())
         sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
-        sections.append(await self._user_world_observations_section())
         sections.append(await self._backlog_summary_section())
         sections.append(await self._genesis_escalations_section())
         sections.append(await self._capabilities_section())
@@ -192,6 +194,59 @@ class UserEgoContextBuilder:
         except Exception:
             logger.warning("Failed to read ego notepad", exc_info=True)
             return ""
+
+    async def _user_goals_section(self) -> str:
+        """Active user goals — the bedrock of the world model."""
+        lines = ["## User Goals\n"]
+
+        try:
+            from genesis.db.crud import user_goals
+            goals = await user_goals.list_active(self._db, limit=10)
+        except Exception:
+            logger.debug("Failed to query user goals", exc_info=True)
+            lines.append("*Goal tracking not yet populated.*\n")
+            return "\n".join(lines)
+
+        if not goals:
+            lines.append(
+                "*No goals tracked yet. Goals will be detected from "
+                "conversations and stored automatically.*\n"
+            )
+            return "\n".join(lines)
+
+        for g in goals:
+            priority = g.get("priority", "medium")
+            title = g.get("title", "?")[:120]
+            category = g.get("category", "")
+            timeline = g.get("timeline") or ""
+            timeline_str = f" — {timeline}" if timeline else ""
+            conf = g.get("confidence", 0.5)
+            lines.append(
+                f"- [{priority.upper()}] **{title}** "
+                f"({category}{timeline_str}, conf={conf:.0%})"
+            )
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _world_snapshot_section(self) -> str:
+        """Synthesized view of the user's world — events, contacts, signals.
+
+        Replaces the raw user-world observations section with a structured
+        world snapshot that connects goals to events, contacts, and signals.
+        """
+        lines = ["## User's World\n"]
+
+        try:
+            from genesis.ego.world_snapshot import build as build_snapshot
+            snapshot = await build_snapshot(self._db)
+            rendered = snapshot.render()
+            lines.append(rendered)
+        except Exception:
+            logger.debug("Failed to build world snapshot", exc_info=True)
+            lines.append("*World snapshot not available.*\n")
+
+        return "\n".join(lines)
 
     # Signals that track user activity — used to filter awareness tick
     # signals for the user ego's activity pulse section.
@@ -337,55 +392,6 @@ class UserEgoContextBuilder:
             "\nThese show what the user is actively working on. "
             "Unfinished threads are opportunities to help.\n"
         )
-        return "\n".join(lines)
-
-    async def _user_world_observations_section(self) -> str:
-        """External signals — email, inbox, findings."""
-        lines = ["## User-World Signals (last 7 days, max 15)\n"]
-
-        try:
-            # Build category filter — match exact user-world categories
-            # plus composite relevance tags ending in :user or :both
-            placeholders = ",".join("?" for _ in _USER_WORLD_CATEGORIES)
-            cursor = await self._db.execute(
-                f"SELECT source, type, category, content, priority, created_at "
-                f"FROM observations "
-                f"WHERE resolved = 0 "
-                f"AND (category IN ({placeholders}) "
-                f"     OR category LIKE '%:user' "
-                f"     OR category LIKE '%:both') "
-                f"AND created_at >= datetime('now', '-7 days') "
-                f"ORDER BY "
-                f"  CASE priority "
-                f"    WHEN 'critical' THEN 0 "
-                f"    WHEN 'high' THEN 1 "
-                f"    WHEN 'medium' THEN 2 "
-                f"    ELSE 3 "
-                f"  END, "
-                f"  created_at DESC "
-                f"LIMIT 15",
-                tuple(_USER_WORLD_CATEGORIES),
-            )
-            rows = await cursor.fetchall()
-        except Exception:
-            logger.error("Failed to query user-world observations", exc_info=True)
-            lines.append("*Could not query user-world observations.*\n")
-            return "\n".join(lines)
-
-        if not rows:
-            lines.append("*No user-world observations in last 7 days.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"**{len(rows)} signals** (sorted by priority):\n")
-        for source, obs_type, category, content, priority, _created_at in rows:
-            short = content[:200] + "..." if len(content) > 200 else content
-            short = short.replace("\n", " ")
-            cat_str = f"/{category}" if category else ""
-            lines.append(
-                f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
-            )
-
-        lines.append("")
         return "\n".join(lines)
 
     async def _backlog_summary_section(self) -> str:

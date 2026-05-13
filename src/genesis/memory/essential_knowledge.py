@@ -68,6 +68,13 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         for decision in decisions[:5]:
             parts.append(f"- {decision}")
 
+    # Upcoming events: user-world events from the SVO calendar
+    upcoming = await _upcoming_events(db, days=30)
+    if upcoming:
+        parts.append("\n### Upcoming Events")
+        for evt in upcoming[:5]:
+            parts.append(f"- {evt}")
+
     # Wing index: which wings have content + top topics from actual data
     wing_stats = await _wing_stats(db)
     if wing_stats:
@@ -265,6 +272,31 @@ async def _wing_stats(db: aiosqlite.Connection) -> dict[str, int]:
     except Exception:
         return {}
 
+
+
+async def _upcoming_events(
+    db: aiosqlite.Connection, days: int = 30,
+) -> list[str]:
+    """Get upcoming user-world events from the SVO event calendar.
+
+    Reuses the memory_events CRUD for consistent filtering (excludes
+    system events, caps at N days).
+    """
+    try:
+        from genesis.db.crud import memory_events
+        rows = await memory_events.upcoming_user_events(db, days=days, limit=10)
+        results = []
+        for row in rows:
+            subj = row.get("subject", "?")
+            verb = row.get("verb", "?")
+            obj = row.get("object") or ""
+            date = row.get("event_date") or ""
+            date_short = date[:10] if date else "?"
+            results.append(f"[{date_short}] {subj} {verb} {obj}".strip())
+        return results
+    except Exception:
+        logger.debug("Failed to query upcoming events", exc_info=True)
+        return []
 
 
 async def _wing_top_rooms(

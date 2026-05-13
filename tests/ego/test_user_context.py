@@ -304,7 +304,8 @@ class TestUserEgoContextBuilder:
     # ── User-World Observations ─────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_user_world_observations(self, db, mock_health_data, capabilities):
+    async def test_world_snapshot_with_signals(self, db, mock_health_data, capabilities):
+        """World snapshot surfaces user-world observation signals."""
         await db.execute(
             "INSERT INTO observations "
             "(id, source, type, category, content, priority, resolved, created_at) "
@@ -315,48 +316,40 @@ class TestUserEgoContextBuilder:
             "INSERT INTO observations "
             "(id, source, type, category, content, priority, resolved, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            ("obs2", "inbox", "finding", "inbox", "User received project update", "medium", 0),
+            ("obs2", "inbox", "user_signal", "inbox", "User received project update", "medium", 0),
         )
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "User-World Signals" in result
+        assert "User's World" in result
         assert "New job posting at Acme" in result
         assert "User received project update" in result
-        assert "2 signals" in result
 
     @pytest.mark.asyncio
-    async def test_genesis_internal_observations_excluded(
+    async def test_world_snapshot_excludes_non_signal_types(
         self, db, mock_health_data, capabilities,
     ):
-        """Observations with internal categories (routine, anomaly) should NOT appear."""
+        """World snapshot only surfaces user_signal/finding/interaction_theme types."""
         await db.execute(
             "INSERT INTO observations "
             "(id, source, type, category, content, priority, resolved, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            ("obs3", "sentinel", "finding", "routine", "Health check passed", "low", 0),
-        )
-        await db.execute(
-            "INSERT INTO observations "
-            "(id, source, type, category, content, priority, resolved, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            ("obs4", "sentinel", "finding", "anomaly", "CPU spike detected", "medium", 0),
+            ("obs3", "sentinel", "awareness_tick", "routine", "Health check passed", "low", 0),
         )
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
         assert "Health check passed" not in result
-        assert "CPU spike detected" not in result
 
     @pytest.mark.asyncio
-    async def test_user_world_observations_empty(self, db, mock_health_data, capabilities):
+    async def test_world_snapshot_empty(self, db, mock_health_data, capabilities):
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "No user-world observations in last 7 days" in result
+        assert "No world model data yet" in result or "User's World" in result
 
     @pytest.mark.asyncio
     async def test_resolved_observations_excluded(self, db, mock_health_data, capabilities):
@@ -498,7 +491,8 @@ class TestUserEgoContextBuilder:
             "## User Profile",
             "## User Activity Pulse",
             "## Recent Conversations",
-            "## User-World Signals",
+            "## User Goals",
+            "## User's World",
             "## Backlogs",
             "## Genesis Ego Escalations",
             "## Genesis Capabilities",

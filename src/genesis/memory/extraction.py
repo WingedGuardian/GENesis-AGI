@@ -52,7 +52,10 @@ segment. Quality over quantity.
 
 DO extract: architectural decisions, design rationale, bug root causes,
 tool/project evaluations, user preferences, external concepts introduced,
-lessons learned, non-obvious technical insights.
+lessons learned, non-obvious technical insights,
+user-world events (conferences, meetings, deadlines, job applications,
+career changes), user goals and aspirations (explicit or strongly implied),
+people the user mentions by name with their role/relationship context.
 
 DO NOT extract:
 - Session narration ("merged to main", "committed changes", "pushed to remote")
@@ -84,6 +87,24 @@ Respond with a JSON object inside backticks containing:
       ],
       "temporal": "2026-03-17",
       "event": {"subject": "Genesis", "verb": "evaluated", "object": "Agentmail"}
+    },
+    {
+      "content": "User registered for AI Conference, June 15-17 — plans to network with AGI researchers",
+      "type": "action_item",
+      "confidence": 0.95,
+      "entities": ["AI Conference"],
+      "relationships": [],
+      "temporal": "2026-06-15",
+      "event": {"subject": "user", "verb": "registered", "object": "AI Conference June 15-17"}
+    },
+    {
+      "content": "User applied for Solutions Engineer role at Salesforce via Workday",
+      "type": "action_item",
+      "confidence": 0.9,
+      "entities": ["Salesforce", "Workday"],
+      "relationships": [],
+      "temporal": "2026-05-12",
+      "event": {"subject": "user", "verb": "applied", "object": "Solutions Engineer at Salesforce"}
     }
   ],
   "session_keywords": ["agentmail", "email", "outreach", "evaluation"],
