@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.db.crud import observations
@@ -99,6 +100,79 @@ async def _fetch_search_results(queries: list[str]) -> str:
     return "\n\n".join(parts)
 
 
+# ── Cognitive task context helpers ─────────────────────────────────
+
+# Task types that benefit from essential knowledge + user model context.
+_COGNITIVE_TASK_TYPES = frozenset({
+    TaskType.BRAINSTORM_USER, TaskType.BRAINSTORM_SELF,
+    TaskType.RESEARCH_QUERY_GEN, TaskType.GAP_CLUSTERING,
+    TaskType.SELF_UNBLOCK, TaskType.MEMORY_AUDIT, TaskType.PROCEDURE_AUDIT,
+})
+
+# Fields extracted from user model — reuses ego's proven priority_keys.
+_USER_MODEL_PRIORITY_KEYS = [
+    "active_projects", "current_focus", "priorities",
+    "goals", "professional_role", "expertise_areas",
+    "interests", "active_investigations", "binding_constraints",
+]
+
+_EK_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
+
+
+def _read_essential_knowledge(*, max_chars: int = 2000) -> str | None:
+    """Read essential knowledge file, returning content truncated to max_chars."""
+    try:
+        if not _EK_PATH.exists():
+            return None
+        content = _EK_PATH.read_text().strip()
+        if not content:
+            return None
+        return content[:max_chars]
+    except Exception:
+        logger.debug("Failed to read essential knowledge", exc_info=True)
+        return None
+
+
+async def _read_user_model_compact(
+    db: aiosqlite.Connection, *, max_chars: int = 1500,
+) -> str | None:
+    """Read compact user model from DB, extracting priority fields."""
+    try:
+        cursor = await db.execute(
+            "SELECT model_json FROM user_model_cache WHERE id = 'current'"
+        )
+        row = await cursor.fetchone()
+        if not row or not row[0]:
+            return None
+
+        model = json.loads(row[0])
+        if not model:
+            return None
+
+        lines: list[str] = []
+        total = 0
+        for key in _USER_MODEL_PRIORITY_KEYS:
+            if key not in model:
+                continue
+            val = model[key]
+            if isinstance(val, str):
+                val_str = val[:200]
+            elif isinstance(val, (list, dict)):
+                val_str = json.dumps(val, default=str)[:200]
+            else:
+                val_str = str(val)[:200]
+            line = f"- {key}: {val_str}"
+            if total + len(line) > max_chars:
+                break
+            lines.append(line)
+            total += len(line)
+
+        return "\n".join(lines) if lines else None
+    except Exception:
+        logger.debug("Failed to read user model", exc_info=True)
+        return None
+
+
 class StubExecutor:
     """Stub executor — generates structured placeholders.
 
@@ -162,8 +236,8 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "{context}\n\n"
         "## Task\n"
         "Generate 2-3 concrete, actionable ideas for how the system could "
-        "better serve the user based on recent activity and known interests.  "
-        "Each idea should be specific enough to act on.\n\n"
+        "better serve the user based on the system context and user profile "
+        "above.  Each idea should be specific enough to act on.\n\n"
         "Respond in plain text with numbered ideas."
     ),
     TaskType.BRAINSTORM_SELF: (
@@ -225,6 +299,7 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "that would help fill knowledge gaps or answer open questions.\n\n"
         "Rules:\n"
         "- Each query should be a concrete search engine query (not a topic)\n"
+        "- Ground queries in the user's actual projects and interests\n"
         "- Focus on gaps where web research would add real value\n"
         "- Avoid queries about the system itself — focus on external knowledge\n\n"
         "Respond with ONLY the queries, one per line, numbered:\n"
@@ -520,6 +595,19 @@ class SurplusLLMExecutor:
                 logger.warning("Research web fetch failed", exc_info=True)
                 parts.append("(Web search unavailable)")
             # Fall through to also gather standard observations
+
+        # Cognitive tasks: inject essential knowledge + user model
+        if task.task_type in _COGNITIVE_TASK_TYPES:
+            ek = _read_essential_knowledge()
+            if ek:
+                parts.append("## System Context (current state & priorities)")
+                parts.append(ek)
+
+            if task.task_type == TaskType.BRAINSTORM_USER:
+                user_model = await _read_user_model_compact(self._db)
+                if user_model:
+                    parts.append("\n## User Profile")
+                    parts.append(user_model)
 
         # For analytical tasks: recent observations + basic stats
         try:

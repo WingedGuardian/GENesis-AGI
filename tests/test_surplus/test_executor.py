@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from genesis.surplus.executor import StubExecutor, SurplusLLMExecutor
+from genesis.surplus.executor import (
+    StubExecutor,
+    SurplusLLMExecutor,
+    _read_essential_knowledge,
+    _read_user_model_compact,
+)
 from genesis.surplus.types import ComputeTier, SurplusTask, TaskStatus, TaskType
 
 
@@ -306,3 +312,160 @@ async def test_llm_insight_structure():
     assert insight["generating_model"] == "qwen-72b"
     assert insight["drive_alignment"] == "growth"
     assert insight["confidence"] == 0.5
+
+
+# ── Context enrichment helpers ──────────────────────────────────────
+
+
+class TestReadEssentialKnowledge:
+    def test_file_exists(self, tmp_path, monkeypatch):
+        ek_file = tmp_path / "essential_knowledge.md"
+        ek_file.write_text("## Active Context\nWorking on surplus enrichment")
+        import genesis.surplus.executor as mod
+        monkeypatch.setattr(mod, "_EK_PATH", ek_file)
+        result = _read_essential_knowledge()
+        assert result is not None
+        assert "surplus enrichment" in result
+
+    def test_file_missing(self, tmp_path, monkeypatch):
+        import genesis.surplus.executor as mod
+        monkeypatch.setattr(mod, "_EK_PATH", tmp_path / "nonexistent.md")
+        assert _read_essential_knowledge() is None
+
+    def test_empty_file(self, tmp_path, monkeypatch):
+        ek_file = tmp_path / "essential_knowledge.md"
+        ek_file.write_text("   ")
+        import genesis.surplus.executor as mod
+        monkeypatch.setattr(mod, "_EK_PATH", ek_file)
+        assert _read_essential_knowledge() is None
+
+    def test_truncation(self, tmp_path, monkeypatch):
+        ek_file = tmp_path / "essential_knowledge.md"
+        ek_file.write_text("x" * 5000)
+        import genesis.surplus.executor as mod
+        monkeypatch.setattr(mod, "_EK_PATH", ek_file)
+        result = _read_essential_knowledge(max_chars=100)
+        assert result is not None
+        assert len(result) == 100
+
+
+@pytest.mark.asyncio
+class TestReadUserModelCompact:
+    async def test_model_present(self):
+        model_data = {
+            "active_projects": ["Genesis v3"],
+            "current_focus": "surplus context enrichment",
+            "priorities": "ship quality code",
+            "irrelevant_field": "should be excluded",
+        }
+        db = AsyncMock()
+        cursor = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=(json.dumps(model_data),))
+        db.execute = AsyncMock(return_value=cursor)
+
+        result = await _read_user_model_compact(db)
+        assert result is not None
+        assert "active_projects" in result
+        assert "current_focus" in result
+        assert "irrelevant_field" not in result
+
+    async def test_no_model_row(self):
+        db = AsyncMock()
+        cursor = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=None)
+        db.execute = AsyncMock(return_value=cursor)
+        assert await _read_user_model_compact(db) is None
+
+    async def test_empty_model(self):
+        db = AsyncMock()
+        cursor = AsyncMock()
+        cursor.fetchone = AsyncMock(return_value=("{}",))
+        db.execute = AsyncMock(return_value=cursor)
+        assert await _read_user_model_compact(db) is None
+
+    async def test_db_error(self):
+        db = AsyncMock()
+        db.execute = AsyncMock(side_effect=Exception("db locked"))
+        assert await _read_user_model_compact(db) is None
+
+
+# ── Context injection into _gather_context ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_user_includes_ek_and_user_model():
+    """BRAINSTORM_USER should include both EK and user model in context."""
+    router = _make_router()
+    executor = _make_llm_executor(router=router)
+    task = _make_task(task_type=TaskType.BRAINSTORM_USER)
+
+    with (
+        patch("genesis.surplus.executor._read_essential_knowledge", return_value="EK: system is healthy"),
+        patch("genesis.surplus.executor._read_user_model_compact", new_callable=AsyncMock, return_value="- current_focus: testing"),
+        patch("genesis.surplus.executor.observations.query", new_callable=AsyncMock, return_value=[]),
+    ):
+        await executor.execute(task)
+
+    prompt = router.route_call.call_args[0][1][0]["content"]
+    assert "EK: system is healthy" in prompt
+    assert "current_focus: testing" in prompt
+    assert "System Context" in prompt
+    assert "User Profile" in prompt
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_self_includes_ek_but_not_user_model():
+    """BRAINSTORM_SELF should include EK but NOT user model."""
+    router = _make_router()
+    executor = _make_llm_executor(router=router)
+    task = _make_task(task_type=TaskType.BRAINSTORM_SELF)
+
+    with (
+        patch("genesis.surplus.executor._read_essential_knowledge", return_value="EK: system data"),
+        patch("genesis.surplus.executor._read_user_model_compact", new_callable=AsyncMock, return_value="- focus: testing"),
+        patch("genesis.surplus.executor.observations.query", new_callable=AsyncMock, return_value=[]),
+    ):
+        await executor.execute(task)
+
+    prompt = router.route_call.call_args[0][1][0]["content"]
+    assert "EK: system data" in prompt
+    assert "User Profile" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_infra_monitor_no_ek_injection():
+    """INFRASTRUCTURE_MONITOR should NOT get EK or user model."""
+    router = _make_router()
+    executor = _make_llm_executor(router=router)
+    task = _make_task(task_type=TaskType.INFRASTRUCTURE_MONITOR)
+
+    with (
+        patch("genesis.surplus.executor._read_essential_knowledge", return_value="EK: should not appear"),
+        patch("genesis.db.crud.awareness_ticks.last_tick", new_callable=AsyncMock, return_value=None),
+    ):
+        await executor.execute(task)
+
+    prompt = router.route_call.call_args[0][1][0]["content"]
+    assert "EK: should not appear" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_graceful_fallback_when_both_sources_fail():
+    """Context should still work when EK and user model both fail."""
+    router = _make_router()
+    executor = _make_llm_executor(router=router)
+    task = _make_task(task_type=TaskType.BRAINSTORM_USER)
+
+    obs_data = [{"content": "test observation", "type": "infra", "created_at": "2026-01-15"}]
+    with (
+        patch("genesis.surplus.executor._read_essential_knowledge", return_value=None),
+        patch("genesis.surplus.executor._read_user_model_compact", new_callable=AsyncMock, return_value=None),
+        patch("genesis.surplus.executor.observations.query", new_callable=AsyncMock, return_value=obs_data),
+    ):
+        result = await executor.execute(task)
+
+    assert result.success is True
+    prompt = router.route_call.call_args[0][1][0]["content"]
+    assert "test observation" in prompt
+    assert "System Context" not in prompt
+    assert "User Profile" not in prompt
