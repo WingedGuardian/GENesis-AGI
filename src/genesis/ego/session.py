@@ -153,10 +153,7 @@ class EgoSession:
         """
         # Resolve cycle type
         if cycle_type is None:
-            cycle_type = (
-                CycleType.MORNING_REPORT if is_morning_report
-                else CycleType.PROACTIVE
-            )
+            cycle_type = CycleType.MORNING_REPORT if is_morning_report else CycleType.PROACTIVE
         is_morning_report = cycle_type == CycleType.MORNING_REPORT
 
         # Select model + effort: config is the base, cycle type overrides
@@ -168,8 +165,7 @@ class EgoSession:
         # 1. Budget check — raises BudgetExceededError (not a failure)
         if not await self._check_budget():
             raise BudgetExceededError(
-                f"Daily ego thinking spend exceeds cap "
-                f"${self._config.ego_thinking_budget_usd}"
+                f"Daily ego thinking spend exceeds cap ${self._config.ego_thinking_budget_usd}"
             )
 
         # 2. Assemble operational context (previous focus + fresh context)
@@ -263,7 +259,8 @@ class EgoSession:
         # 6b. If focus was sanitized, try previous legitimate focus as fallback
         if parsed and parsed.get("_focus_violation"):
             prev = await ego_crud.get_state(
-                self._db, self._focus_summary_key,
+                self._db,
+                self._focus_summary_key,
             )
             if prev and not _BEHAVIORAL_FOCUS_RE.search(prev):
                 parsed["focus_summary"] = prev
@@ -294,9 +291,12 @@ class EgoSession:
             # 8. Record last run for neural monitor
             try:
                 from genesis.observability.call_site_recorder import record_last_run
+
                 await record_last_run(
-                    self._db, self._call_site,
-                    provider="cc", model_id=output.model_used or model.value,
+                    self._db,
+                    self._call_site,
+                    provider="cc",
+                    model_id=output.model_used or model.value,
                     response_text=output.text[:500] if output.text else "",
                     input_tokens=output.input_tokens,
                     output_tokens=output.output_tokens,
@@ -315,7 +315,9 @@ class EgoSession:
                 proposals = await self._filter_proposals(proposals)
                 if proposals:
                     await self._process_proposals(
-                        proposals, cycle.id, communication_decision=comm_decision,
+                        proposals,
+                        cycle.id,
+                        communication_decision=comm_decision,
                     )
 
             # 9b. Process tabled/withdrawn proposal IDs
@@ -328,8 +330,11 @@ class EgoSession:
                             logger.info("Proposal %s tabled by ego", pid)
                             try:
                                 from genesis.db.crud import intervention_journal as journal_crud
+
                                 await journal_crud.resolve(
-                                    self._db, pid, outcome_status="tabled",
+                                    self._db,
+                                    pid,
+                                    outcome_status="tabled",
                                 )
                             except Exception:
                                 pass
@@ -343,8 +348,11 @@ class EgoSession:
                             logger.info("Proposal %s withdrawn by ego", pid)
                             try:
                                 from genesis.db.crud import intervention_journal as journal_crud
+
                                 await journal_crud.resolve(
-                                    self._db, pid, outcome_status="withdrawn",
+                                    self._db,
+                                    pid,
+                                    outcome_status="withdrawn",
                                 )
                             except Exception:
                                 pass
@@ -363,7 +371,8 @@ class EgoSession:
             resolved_follow_ups = parsed.get("resolved_follow_ups", [])
             if isinstance(resolved_follow_ups, list) and resolved_follow_ups:
                 await self._dispatcher.resolve_follow_ups(
-                    resolved_follow_ups, cycle.id,
+                    resolved_follow_ups,
+                    cycle.id,
                 )
 
             # 10c. Process knowledge notepad updates (user ego only)
@@ -374,7 +383,9 @@ class EgoSession:
             # 11. Store focus summary for reflection injection
             if focus:
                 await ego_crud.set_state(
-                    self._db, key=self._focus_summary_key, value=focus,
+                    self._db,
+                    key=self._focus_summary_key,
+                    value=focus,
                 )
 
             # 11b. Record violation if focus was behavioral self-assignment
@@ -492,7 +503,7 @@ class EgoSession:
         last_brace = text.rfind("}")
         if first_brace != -1 and last_brace > first_brace:
             try:
-                result = json.loads(text[first_brace:last_brace + 1])
+                result = json.loads(text[first_brace : last_brace + 1])
                 if isinstance(result, dict):
                     return _validate_output(result)
             except json.JSONDecodeError:
@@ -500,7 +511,8 @@ class EgoSession:
 
         logger.error(
             "Failed to parse ego output (length=%d): %.200s...",
-            len(text), text,
+            len(text),
+            text,
         )
         return None
 
@@ -548,16 +560,19 @@ class EgoSession:
         """
         try:
             batch_id, ids = await self._proposals.create_batch(
-                proposals, cycle_id=cycle_id,
+                proposals,
+                cycle_id=cycle_id,
             )
             logger.info(
                 "Created proposal batch %s with %d proposals",
-                batch_id, len(ids),
+                batch_id,
+                len(ids),
             )
 
             # Record intervention journal entries (fire-and-forget)
             try:
                 from genesis.db.crud import intervention_journal as journal_crud
+
                 now = datetime.now(UTC).isoformat()
                 for pid, prop in zip(ids, proposals, strict=False):
                     await journal_crud.create(
@@ -579,7 +594,8 @@ class EgoSession:
             if validation_issues:
                 logger.warning(
                     "Proposal validation issues in batch %s: %s",
-                    batch_id, "; ".join(validation_issues),
+                    batch_id,
+                    "; ".join(validation_issues),
                 )
 
             if communication_decision in ("send_digest", "urgent_notify"):
@@ -591,7 +607,8 @@ class EgoSession:
                     logger.info("Ego digest sent (delivery_id=%s)", delivery)
             else:
                 logger.info(
-                    "Ego decided stay_quiet — batch %s stored only", batch_id,
+                    "Ego decided stay_quiet — batch %s stored only",
+                    batch_id,
                 )
         except Exception:
             logger.error("Failed to process ego proposals", exc_info=True)
@@ -656,14 +673,17 @@ class EgoSession:
                 )
                 session_id = await self._direct_session_runner.spawn(request)
                 await ego_crud.execute_proposal(
-                    self._db, proposal_id,
+                    self._db,
+                    proposal_id,
                     status="executed",
                     user_response=f"session:{session_id}",
                 )
                 try:
                     from genesis.db.crud import intervention_journal as journal_crud
+
                     await journal_crud.resolve(
-                        self._db, proposal_id,
+                        self._db,
+                        proposal_id,
                         outcome_status="executed",
                         actual_outcome=f"Dispatched as session:{session_id}",
                     )
@@ -671,28 +691,34 @@ class EgoSession:
                     logger.warning("Journal resolve failed for %s", proposal_id)
                 logger.info(
                     "Dispatched proposal %s → session %s",
-                    proposal_id, session_id,
+                    proposal_id,
+                    session_id,
                 )
             except Exception:
                 logger.error(
-                    "Failed to dispatch proposal %s", proposal_id,
+                    "Failed to dispatch proposal %s",
+                    proposal_id,
                     exc_info=True,
                 )
                 try:
                     await ego_crud.execute_proposal(
-                        self._db, proposal_id,
+                        self._db,
+                        proposal_id,
                         status="failed",
                         user_response="dispatch failed",
                     )
                 except Exception:
                     logger.error(
                         "Failed to mark proposal %s as failed",
-                        proposal_id, exc_info=True,
+                        proposal_id,
+                        exc_info=True,
                     )
                 try:
                     from genesis.db.crud import intervention_journal as journal_crud
+
                     await journal_crud.resolve(
-                        self._db, proposal_id,
+                        self._db,
+                        proposal_id,
                         outcome_status="failed",
                         actual_outcome="Dispatch failed",
                     )
@@ -739,13 +765,15 @@ class EgoSession:
             except Exception:
                 logger.error(
                     "Failed to write escalation from cycle %s",
-                    cycle_id, exc_info=True,
+                    cycle_id,
+                    exc_info=True,
                 )
 
         if escalations:
             logger.info(
                 "Genesis ego cycle %s produced %d escalation(s)",
-                cycle_id, len(escalations),
+                cycle_id,
+                len(escalations),
             )
 
     # -- Knowledge notepad --------------------------------------------------
@@ -824,7 +852,9 @@ class EgoSession:
             result = _rebuild_notepad(sections, today)
             self._NOTEPAD_PATH.write_text(result)
             logger.info(
-                "Ego notepad: applied %d/%d updates", applied, len(updates),
+                "Ego notepad: applied %d/%d updates",
+                applied,
+                len(updates),
             )
         except Exception:
             logger.error("Failed to apply ego notepad updates", exc_info=True)
@@ -855,7 +885,9 @@ class EgoSession:
         from genesis.cc.direct_session import DirectSessionRequest
 
         approved = await ego_crud.list_proposals(
-            self._db, status="approved", limit=5,
+            self._db,
+            status="approved",
+            limit=5,
         )
         if not approved:
             return []
@@ -886,7 +918,8 @@ class EgoSession:
                 )
                 session_id = await self._direct_session_runner.spawn(request)
                 ok = await ego_crud.execute_proposal(
-                    self._db, prop["id"],
+                    self._db,
+                    prop["id"],
                     status="executed",
                     user_response=f"session:{session_id}",
                 )
@@ -894,25 +927,29 @@ class EgoSession:
                     dispatched.append(prop["id"])
                     logger.info(
                         "Sweep dispatched proposal %s → session %s",
-                        prop["id"], session_id,
+                        prop["id"],
+                        session_id,
                     )
                     # Send execution notification to ego_proposals topic
                     await self._notify_execution(prop, session_id)
             except Exception:
                 logger.error(
                     "Sweep failed to dispatch proposal %s",
-                    prop["id"], exc_info=True,
+                    prop["id"],
+                    exc_info=True,
                 )
                 try:
                     await ego_crud.execute_proposal(
-                        self._db, prop["id"],
+                        self._db,
+                        prop["id"],
                         status="failed",
                         user_response="sweep_dispatch_error",
                     )
                 except Exception:
                     logger.error(
                         "Failed to mark proposal %s as failed",
-                        prop["id"], exc_info=True,
+                        prop["id"],
+                        exc_info=True,
                     )
 
         if dispatched:
@@ -930,25 +967,23 @@ class EgoSession:
         # World model context — each section degrades independently
         try:
             from genesis.db.crud import user_goals
+
             goals = await user_goals.list_active(self._db)
             if goals:
                 goal_lines = [
-                    f"- {g['title']} ({g['category']}, {g['priority']})"
-                    for g in goals[:5]
+                    f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]
                 ]
-                parts.append(
-                    "\n\nUser's active goals:\n" + "\n".join(goal_lines)
-                )
+                parts.append("\n\nUser's active goals:\n" + "\n".join(goal_lines))
         except Exception:
             pass
 
         try:
             from genesis.db.crud import user_contacts
+
             contacts = await user_contacts.recently_active(self._db, days=14)
             if contacts:
                 contact_lines = [
-                    f"- {c['name']} ({c.get('relationship', 'contact')})"
-                    for c in contacts[:5]
+                    f"- {c['name']} ({c.get('relationship', 'contact')})" for c in contacts[:5]
                 ]
                 parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
         except Exception:
@@ -956,11 +991,11 @@ class EgoSession:
 
         try:
             from genesis.db.crud import memory_events
+
             events = await memory_events.upcoming_user_events(self._db, days=14)
             if events:
                 event_lines = [
-                    f"- {e['object']} ({e.get('event_date', 'TBD')})"
-                    for e in events[:5]
+                    f"- {e['object']} ({e.get('event_date', 'TBD')})" for e in events[:5]
                 ]
                 parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
         except Exception:
@@ -978,10 +1013,7 @@ class EgoSession:
                 return
             content = html_mod.escape(prop.get("content", "")[:200])
             action = html_mod.escape(prop.get("action_type", "unknown"))
-            msg = (
-                f"<b>Dispatched</b> [{action}]: {content}\n"
-                f"<i>Session:</i> {session_id}"
-            )
+            msg = f"<b>Dispatched</b> [{action}]: {content}\n<i>Session:</i> {session_id}"
             await tm.send_to_category("ego_proposals", msg)
         except Exception:
             logger.debug("Failed to send execution notification", exc_info=True)
@@ -993,7 +1025,8 @@ class EgoSession:
             if daily >= self._config.ego_thinking_budget_usd:
                 logger.warning(
                     "Ego thinking spend $%.2f exceeds cap $%.2f",
-                    daily, self._config.ego_thinking_budget_usd,
+                    daily,
+                    self._config.ego_thinking_budget_usd,
                 )
                 return False
         except Exception:
@@ -1007,7 +1040,8 @@ class EgoSession:
             if daily >= self._config.ego_dispatch_budget_usd:
                 logger.warning(
                     "Ego dispatch spend $%.2f exceeds cap $%.2f",
-                    daily, self._config.ego_dispatch_budget_usd,
+                    daily,
+                    self._config.ego_dispatch_budget_usd,
                 )
                 return False
         except Exception:
@@ -1075,8 +1109,7 @@ def _sanitize_focus_summary(
     if _BEHAVIORAL_FOCUS_RE.search(focus):
         fallback = previous_focus or "general system awareness"
         logger.warning(
-            "Ego focus_summary contains behavioral self-assignment: %r — "
-            "replacing with %r",
+            "Ego focus_summary contains behavioral self-assignment: %r — replacing with %r",
             focus[:120],
             fallback,
         )
@@ -1087,8 +1120,7 @@ def _sanitize_focus_summary(
     cleaned = _ENGAGEMENT_SUPPRESSION_RE.sub("", focus).strip().rstrip(";,")
     if cleaned != focus:
         logger.warning(
-            "Ego focus_summary contains engagement-suppression clause: %r — "
-            "stripped to %r",
+            "Ego focus_summary contains engagement-suppression clause: %r — stripped to %r",
             focus[:120],
             cleaned[:120],
         )
@@ -1152,7 +1184,8 @@ def _validate_output(data: dict) -> dict | None:
             data["knowledge_updates"] = []
         else:
             data["knowledge_updates"] = [
-                u for u in raw
+                u
+                for u in raw
                 if isinstance(u, dict)
                 and isinstance(u.get("section"), str)
                 and u.get("action") in _VALID_NOTEPAD_ACTIONS

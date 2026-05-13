@@ -38,10 +38,13 @@ _URGENCY_TAGS = {"critical": "[CRITICAL] ", "high": "[HIGH] "}
 
 def _sort_proposals(proposals: list[dict]) -> list[dict]:
     """Sort proposals by urgency (critical first) then confidence (desc)."""
-    return sorted(proposals, key=lambda p: (
-        _URGENCY_ORDER.get(p.get("urgency", "normal"), 2),
-        -float(p.get("confidence", 0)),
-    ))
+    return sorted(
+        proposals,
+        key=lambda p: (
+            _URGENCY_ORDER.get(p.get("urgency", "normal"), 2),
+            -float(p.get("confidence", 0)),
+        ),
+    )
 
 
 def _format_digest(
@@ -77,10 +80,7 @@ def _format_digest(
                 memory_basis = memory_basis[:500] + "\u2026"
             lines.append(f"<i>{_ESC(memory_basis)}</i>")
         confidence = p.get("confidence", 0.0)
-        lines.append(
-            f"<i>Confidence:</i> {confidence:.2f} | "
-            f"<i>Urgency:</i> {urgency}"
-        )
+        lines.append(f"<i>Confidence:</i> {confidence:.2f} | <i>Urgency:</i> {urgency}")
         alts = p.get("alternatives", "")
         if alts:
             if len(alts) > 300:
@@ -174,7 +174,8 @@ class ProposalWorkflow:
 
         logger.info(
             "Created ego proposal batch %s with %d proposals",
-            batch_id, len(ids),
+            batch_id,
+            len(ids),
         )
         return batch_id, ids
 
@@ -250,14 +251,14 @@ class ProposalWorkflow:
             if other_pending:
                 digest_html = (
                     f"<i>{len(other_pending)} proposal(s) pending from previous "
-                    f"batches. Reply 'approve all pending' to resolve all.</i>\n\n"
-                    + digest_html
+                    f"batches. Reply 'approve all pending' to resolve all.</i>\n\n" + digest_html
                 )
         except Exception:
             pass  # Non-critical; skip header on error
 
         delivery_id = await self._topic_manager.send_to_category(
-            TOPIC_CATEGORY, digest_html,
+            TOPIC_CATEGORY,
+            digest_html,
         )
 
         if delivery_id is None:
@@ -266,15 +267,21 @@ class ProposalWorkflow:
 
         # Store bidirectional mapping for reply resolution.
         await ego_crud.set_state(
-            self._db, key=f"delivery_batch:{delivery_id}", value=batch_id,
+            self._db,
+            key=f"delivery_batch:{delivery_id}",
+            value=batch_id,
         )
         await ego_crud.set_state(
-            self._db, key=f"batch_delivery:{batch_id}", value=delivery_id,
+            self._db,
+            key=f"batch_delivery:{batch_id}",
+            value=delivery_id,
         )
 
         logger.info(
             "Sent ego digest for batch %s (delivery_id=%s, %d proposals)",
-            batch_id, delivery_id, len(proposals),
+            batch_id,
+            delivery_id,
+            len(proposals),
         )
         return str(delivery_id)
 
@@ -301,17 +308,22 @@ class ProposalWorkflow:
                 continue
             prop = proposals[idx - 1]
             updated = await ego_crud.resolve_proposal(
-                self._db, prop["id"], status=status, user_response=reason,
+                self._db,
+                prop["id"],
+                status=status,
+                user_response=reason,
             )
             if updated:
                 results[prop["id"]] = status
                 logger.info(
                     "Proposal %s → %s%s",
-                    prop["id"], status,
+                    prop["id"],
+                    status,
                     f" ({reason})" if reason else "",
                 )
                 # J-9 eval: log proposal resolution for ego quality tracking
                 from genesis.eval.j9_hooks import emit_proposal_resolved
+
                 await emit_proposal_resolved(
                     self._db,
                     proposal_id=prop["id"],
@@ -322,8 +334,10 @@ class ProposalWorkflow:
                 # Intervention journal: record resolution
                 try:
                     from genesis.db.crud import intervention_journal as journal_crud
+
                     await journal_crud.resolve(
-                        self._db, prop["id"],
+                        self._db,
+                        prop["id"],
                         outcome_status=status,
                         actual_outcome=f"User {status}" + (f": {reason}" if reason else ""),
                         user_response=reason,
@@ -331,15 +345,12 @@ class ProposalWorkflow:
                 except Exception:
                     logger.warning("Failed to update intervention journal for %s", prop["id"])
                 # Auto-store correction memory on rejection with reason
-                if (
-                    status == ProposalStatus.REJECTED
-                    and reason
-                    and self._memory_store
-                ):
+                if status == ProposalStatus.REJECTED and reason and self._memory_store:
                     await self._store_correction(prop, reason)
             else:
                 logger.warning(
-                    "Proposal %s not updated (already resolved?)", prop["id"],
+                    "Proposal %s not updated (already resolved?)",
+                    prop["id"],
                 )
 
         return results
@@ -354,8 +365,7 @@ class ProposalWorkflow:
         action_category = proposal.get("action_category", "")
         content_snippet = proposal.get("content", "")[:200]
         correction_text = (
-            f"User rejected [{action_type}]: {content_snippet}. "
-            f"Reason: {reason}. Do not repeat."
+            f"User rejected [{action_type}]: {content_snippet}. Reason: {reason}. Do not repeat."
         )
         tags = ["ego_correction"]
         if action_category:
@@ -408,19 +418,20 @@ class ProposalWorkflow:
         for batch_id in batch_ids:
             # Get full batch to find correct 1-based positions
             full_batch = await ego_crud.list_proposals_by_batch(
-                self._db, batch_id,
+                self._db,
+                batch_id,
             )
             # Create decisions for ALL positions — resolve_proposal's
             # WHERE status='pending' clause skips already-resolved ones.
-            decisions = {
-                i + 1: (status, reason) for i in range(len(full_batch))
-            }
+            decisions = {i + 1: (status, reason) for i in range(len(full_batch))}
             results = await self.resolve_proposals(batch_id, decisions)
             all_results.update(results)
 
         logger.info(
             "Cross-batch resolve: %d proposals → %s across %d batch(es)",
-            len(all_results), status, len(batch_ids),
+            len(all_results),
+            status,
+            len(batch_ids),
         )
         return all_results
 
@@ -464,13 +475,17 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
 
     # Cross-batch bulk operations (all pending across batches)
     if stripped in (
-        "approve all pending", "approved all pending",
-        "accept all pending", "yes all pending",
+        "approve all pending",
+        "approved all pending",
+        "accept all pending",
+        "yes all pending",
     ):
         return {-1: ("approved", None)}  # -1 = sentinel for cross-batch
     if stripped in (
-        "reject all pending", "rejected all pending",
-        "deny all pending", "no all pending",
+        "reject all pending",
+        "rejected all pending",
+        "deny all pending",
+        "no all pending",
     ):
         return {-1: ("rejected", None)}
 

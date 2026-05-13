@@ -38,9 +38,18 @@ async def create_cycle(
             model_used, cost_usd, input_tokens, output_tokens,
             duration_ms, created_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, output_text, proposals_json, focus_summary,
-         model_used, cost_usd, input_tokens, output_tokens,
-         duration_ms, created_at),
+        (
+            id,
+            output_text,
+            proposals_json,
+            focus_summary,
+            model_used,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            created_at,
+        ),
     )
     await db.commit()
     return id
@@ -49,7 +58,8 @@ async def create_cycle(
 async def get_cycle(db: aiosqlite.Connection, id: str) -> dict | None:
     """Fetch a single cycle by id. Returns None if not found."""
     cursor = await db.execute(
-        "SELECT * FROM ego_cycles WHERE id = ?", (id,),
+        "SELECT * FROM ego_cycles WHERE id = ?",
+        (id,),
     )
     row = await cursor.fetchone()
     if row is None:
@@ -132,7 +142,8 @@ async def count_uncompacted(db: aiosqlite.Connection) -> int:
 async def get_state(db: aiosqlite.Connection, key: str) -> str | None:
     """Get a value from ego_state. Returns None if key not found."""
     cursor = await db.execute(
-        "SELECT value FROM ego_state WHERE key = ?", (key,),
+        "SELECT value FROM ego_state WHERE key = ?",
+        (key,),
     )
     row = await cursor.fetchone()
     return row[0] if row else None
@@ -224,10 +235,25 @@ async def create_proposal(
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, action_type, action_category, content, rationale,
-         confidence, urgency, alternatives, status, cycle_id,
-         batch_id, created_at, expires_at, rank, execution_plan,
-         1 if recurring else 0, memory_basis),
+        (
+            id,
+            action_type,
+            action_category,
+            content,
+            rationale,
+            confidence,
+            urgency,
+            alternatives,
+            status,
+            cycle_id,
+            batch_id,
+            created_at,
+            expires_at,
+            rank,
+            execution_plan,
+            1 if recurring else 0,
+            memory_basis,
+        ),
     )
     await db.commit()
     return id
@@ -236,7 +262,8 @@ async def create_proposal(
 async def get_proposal(db: aiosqlite.Connection, id: str) -> dict | None:
     """Fetch a single proposal by id."""
     cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE id = ?", (id,),
+        "SELECT * FROM ego_proposals WHERE id = ?",
+        (id,),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -257,8 +284,7 @@ async def list_proposals_by_batch(
 async def list_pending_proposals(db: aiosqlite.Connection) -> list[dict]:
     """All pending proposals, oldest first."""
     cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE status = 'pending' "
-        "ORDER BY created_at ASC",
+        "SELECT * FROM ego_proposals WHERE status = 'pending' ORDER BY created_at ASC",
     )
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -272,8 +298,7 @@ async def list_proposals(
     """All proposals, optionally filtered by status, newest first."""
     if status:
         cursor = await db.execute(
-            "SELECT * FROM ego_proposals WHERE status = ? "
-            "ORDER BY created_at DESC LIMIT ?",
+            "SELECT * FROM ego_proposals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
             (status, limit),
         )
     else:
@@ -317,9 +342,7 @@ async def execute_proposal(
     resolve_proposal (which operates on 'pending').
     """
     if status not in ("executed", "failed"):
-        raise ValueError(
-            f"execute_proposal status must be 'executed' or 'failed', got {status!r}"
-        )
+        raise ValueError(f"execute_proposal status must be 'executed' or 'failed', got {status!r}")
     cursor = await db.execute(
         "UPDATE ego_proposals SET status = ?, user_response = ?, resolved_at = ? "
         "WHERE id = ? AND status = 'approved'",
@@ -379,8 +402,7 @@ async def get_board(
 async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
     """All tabled proposals, newest first."""
     cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE status = 'tabled' "
-        "ORDER BY resolved_at DESC",
+        "SELECT * FROM ego_proposals WHERE status = 'tabled' ORDER BY resolved_at DESC",
     )
     return [dict(r) for r in await cursor.fetchall()]
 
@@ -437,6 +459,7 @@ def _next_date(date_str: str) -> str:
     """Return the next day as YYYY-MM-DD."""
     from datetime import date as dt_date
     from datetime import timedelta
+
     d = dt_date.fromisoformat(date_str)
     return (d + timedelta(days=1)).isoformat()
 
@@ -457,6 +480,7 @@ async def daily_ego_cost(
     """
     if date is None:
         from datetime import UTC, datetime
+
         date = datetime.now(UTC).strftime("%Y-%m-%d")
     async with db.execute(
         "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ego_cycles "

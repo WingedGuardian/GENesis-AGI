@@ -1,4 +1,5 @@
 """Message handlers for V2 Telegram handlers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -29,21 +30,29 @@ _MAX_VOICE_BYTES = 20 * 1024 * 1024
 _MAX_MEDIA_BYTES = 20 * 1024 * 1024  # Telegram getFile() limit
 _MEDIA_DIR = Path.home() / "tmp" / "tg_media"
 _READABLE_MIMES = (
-    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
     "application/pdf",
 )
 
 
 async def _persist_tg_message(
     ctx: HandlerContext,
-    chat_id: int, message_id: int, sender: str, content: str,
-    thread_id: str | None = None, reply_to: int | None = None,
+    chat_id: int,
+    message_id: int,
+    sender: str,
+    content: str,
+    thread_id: str | None = None,
+    reply_to: int | None = None,
     direction: str = "inbound",
 ) -> None:
     if ctx.db is None:
         return
     try:
         from genesis.db.crud.telegram_messages import store
+
         await store(
             ctx.db,
             chat_id=chat_id,
@@ -76,14 +85,19 @@ async def _apply_pending_settings(ctx: HandlerContext, user_id: int, tid: str | 
         return
     try:
         from genesis.db.crud import cc_sessions
+
         sess = await cc_sessions.get_active_foreground(
-            ctx.loop._db, user_id=f"tg-{user_id}",
-            channel=str(ChannelType.TELEGRAM), thread_id=tid,
+            ctx.loop._db,
+            user_id=f"tg-{user_id}",
+            channel=str(ChannelType.TELEGRAM),
+            thread_id=tid,
         )
         if sess:
             await cc_sessions.update_model_effort(
-                ctx.loop._db, sess["id"],
-                model=pending.get("model"), effort=pending.get("effort"),
+                ctx.loop._db,
+                sess["id"],
+                model=pending.get("model"),
+                effort=pending.get("effort"),
             )
         else:
             log.warning("Pending settings for user %s discarded — no active session", user_id)
@@ -104,7 +118,8 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
     """
     if not (
         ctx.draft_streaming_enabled
-        and ctx.adapter and ctx.adapter._app
+        and ctx.adapter
+        and ctx.adapter._app
         and msg.chat.type == "private"
     ):
         return None
@@ -129,6 +144,7 @@ async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer |
                 show_prefix = True
             else:
                 from datetime import UTC, datetime
+
                 prev_ts = datetime.fromisoformat(prev[0])
                 now = datetime.now(UTC)
                 # Handle naive timestamps
@@ -190,6 +206,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
                     log.debug("Status snapshot send failed", exc_info=True)
 
     from genesis.util.tasks import tracked_task
+
     status_task = tracked_task(_status_snapshot(), name="status-snapshot")
 
     try:
@@ -238,8 +255,13 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         if response:
             out_id = sent_msg.message_id if sent_msg else msg.message_id
             await _persist_tg_message(
-                ctx, msg.chat.id, out_id, "genesis", response,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                out_id,
+                "genesis",
+                response,
+                thread_id=tid,
+                direction="outbound",
             )
 
     except CCError as e:
@@ -248,8 +270,13 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to user %s", user.id, exc_info=True)
@@ -257,20 +284,26 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         if streamer and streamer.accumulated_text:
             log.warning(
                 "Connection error for user %s after streaming %d chars — delivering accumulated text",
-                user.id, len(streamer.accumulated_text),
+                user.id,
+                len(streamer.accumulated_text),
             )
             try:
                 sent = await _reply_formatted(msg, streamer.accumulated_text)
                 if sent:
                     await _persist_tg_message(
-                        ctx, msg.chat.id, sent.message_id, "genesis",
+                        ctx,
+                        msg.chat.id,
+                        sent.message_id,
+                        "genesis",
                         streamer.accumulated_text,
-                        thread_id=tid, direction="outbound",
+                        thread_id=tid,
+                        direction="outbound",
                     )
             except Exception:
                 log.error(
                     "Failed to deliver accumulated text after connection error for user %s",
-                    user.id, exc_info=True,
+                    user.id,
+                    exc_info=True,
                 )
         else:
             error_text = "Connection issue reaching Genesis."
@@ -278,19 +311,31 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             try:
                 sent = await msg.reply_text(error_text)
                 await _persist_tg_message(
-                    ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                    thread_id=tid, direction="outbound",
+                    ctx,
+                    msg.chat.id,
+                    sent.message_id,
+                    "genesis",
+                    error_text,
+                    thread_id=tid,
+                    direction="outbound",
                 )
             except Exception:
-                log.error("Failed to send connection-error reply for user %s", user.id, exc_info=True)
+                log.error(
+                    "Failed to send connection-error reply for user %s", user.id, exc_info=True
+                )
     except Exception as e:
         log.exception("CC request failed for user %s", user.id)
         error_text = _format_error(e)
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to user %s", user.id, exc_info=True)
@@ -325,6 +370,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
                     log.debug("Status snapshot send failed", exc_info=True)
 
     from genesis.util.tasks import tracked_task
+
     status_task = tracked_task(_status_snapshot(), name="voice-status-snapshot")
 
     try:
@@ -339,7 +385,11 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             return
 
         await _persist_tg_message(
-            ctx, msg.chat.id, msg.message_id, "user", f"[voice] {text}",
+            ctx,
+            msg.chat.id,
+            msg.message_id,
+            "user",
+            f"[voice] {text}",
             thread_id=tid,
         )
 
@@ -393,8 +443,13 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
         if response:
             out_id = sent_msg.message_id if sent_msg else msg.message_id
             await _persist_tg_message(
-                ctx, msg.chat.id, out_id, "genesis", response,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                out_id,
+                "genesis",
+                response,
+                thread_id=tid,
+                direction="outbound",
             )
 
     except CCError as e:
@@ -403,8 +458,13 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to voice user %s", user.id, exc_info=True)
@@ -412,20 +472,26 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
         if streamer and streamer.accumulated_text:
             log.warning(
                 "Connection error for voice %s after streaming %d chars — delivering accumulated text",
-                user.id, len(streamer.accumulated_text),
+                user.id,
+                len(streamer.accumulated_text),
             )
             try:
                 sent = await _reply_formatted(msg, streamer.accumulated_text)
                 if sent:
                     await _persist_tg_message(
-                        ctx, msg.chat.id, sent.message_id, "genesis",
+                        ctx,
+                        msg.chat.id,
+                        sent.message_id,
+                        "genesis",
                         streamer.accumulated_text,
-                        thread_id=tid, direction="outbound",
+                        thread_id=tid,
+                        direction="outbound",
                     )
             except Exception:
                 log.error(
                     "Failed to deliver accumulated text after connection error for voice %s",
-                    user.id, exc_info=True,
+                    user.id,
+                    exc_info=True,
                 )
         else:
             error_text = "Connection issue processing your voice message."
@@ -433,13 +499,19 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             try:
                 sent = await msg.reply_text(error_text)
                 await _persist_tg_message(
-                    ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                    thread_id=tid, direction="outbound",
+                    ctx,
+                    msg.chat.id,
+                    sent.message_id,
+                    "genesis",
+                    error_text,
+                    thread_id=tid,
+                    direction="outbound",
                 )
             except Exception:
                 log.error(
                     "Failed to send connection-error reply to voice %s",
-                    user.id, exc_info=True,
+                    user.id,
+                    exc_info=True,
                 )
     except Exception as e:
         log.exception("Voice handling failed for user %s", user.id)
@@ -447,8 +519,13 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to voice user %s", user.id, exc_info=True)
@@ -459,8 +536,12 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
 
 
 async def _handle_media_inner(
-    ctx: HandlerContext, msg, user, file_path: Path,
-    caption: str | None, context: ContextTypes.DEFAULT_TYPE,
+    ctx: HandlerContext,
+    msg,
+    user,
+    file_path: Path,
+    caption: str | None,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """Process a downloaded media file through CC."""
     from genesis.channels.telegram._handler_helpers import _TypingKeepAliveV2
@@ -485,6 +566,7 @@ async def _handle_media_inner(
                     log.debug("Status snapshot send failed", exc_info=True)
 
     from genesis.util.tasks import tracked_task
+
     status_task = tracked_task(_status_snapshot(), name="media-status-snapshot")
 
     # Build prompt — CC's Read tool will open the file (images, PDFs)
@@ -529,8 +611,13 @@ async def _handle_media_inner(
         if response:
             out_id = sent_msg.message_id if sent_msg else msg.message_id
             await _persist_tg_message(
-                ctx, msg.chat.id, out_id, "genesis", response,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                out_id,
+                "genesis",
+                response,
+                thread_id=tid,
+                direction="outbound",
             )
 
     except CCError as e:
@@ -539,8 +626,13 @@ async def _handle_media_inner(
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to media user %s", user.id, exc_info=True)
@@ -548,20 +640,26 @@ async def _handle_media_inner(
         if streamer and streamer.accumulated_text:
             log.warning(
                 "Connection error for media %s after streaming %d chars — delivering accumulated text",
-                user.id, len(streamer.accumulated_text),
+                user.id,
+                len(streamer.accumulated_text),
             )
             try:
                 sent = await _reply_formatted(msg, streamer.accumulated_text)
                 if sent:
                     await _persist_tg_message(
-                        ctx, msg.chat.id, sent.message_id, "genesis",
+                        ctx,
+                        msg.chat.id,
+                        sent.message_id,
+                        "genesis",
                         streamer.accumulated_text,
-                        thread_id=tid, direction="outbound",
+                        thread_id=tid,
+                        direction="outbound",
                     )
             except Exception:
                 log.error(
                     "Failed to deliver accumulated text after connection error for media %s",
-                    user.id, exc_info=True,
+                    user.id,
+                    exc_info=True,
                 )
         else:
             error_text = "Connection issue processing your file."
@@ -569,13 +667,19 @@ async def _handle_media_inner(
             try:
                 sent = await msg.reply_text(error_text)
                 await _persist_tg_message(
-                    ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                    thread_id=tid, direction="outbound",
+                    ctx,
+                    msg.chat.id,
+                    sent.message_id,
+                    "genesis",
+                    error_text,
+                    thread_id=tid,
+                    direction="outbound",
                 )
             except Exception:
                 log.error(
                     "Failed to send connection-error reply to media %s",
-                    user.id, exc_info=True,
+                    user.id,
+                    exc_info=True,
                 )
     except Exception as e:
         log.exception("Media handling failed for user %s", user.id)
@@ -583,8 +687,13 @@ async def _handle_media_inner(
         try:
             sent = await msg.reply_text(error_text)
             await _persist_tg_message(
-                ctx, msg.chat.id, sent.message_id, "genesis", error_text,
-                thread_id=tid, direction="outbound",
+                ctx,
+                msg.chat.id,
+                sent.message_id,
+                "genesis",
+                error_text,
+                thread_id=tid,
+                direction="outbound",
             )
         except Exception:
             log.error("Failed to send error reply to media user %s", user.id, exc_info=True)
@@ -611,6 +720,7 @@ def _bare_decision(text: str) -> str | None:
         return None
     # Allow optional trailing punctuation on a single token.
     import re
+
     cleaned = re.sub(r"[^\w]", "", stripped) if " " not in stripped else stripped
     if " " in cleaned:
         return None
@@ -622,7 +732,9 @@ def _bare_decision(text: str) -> str | None:
 
 
 async def _try_bare_approval_resolution(
-    ctx: HandlerContext, msg, user,
+    ctx: HandlerContext,
+    msg,
+    user,
 ) -> bool:
     """Resolve a bare 'approve'/'reject' typed into the Approvals topic.
 
@@ -687,16 +799,16 @@ async def _try_bare_approval_resolution(
         return False
     log.info(
         "Bare %s in Approvals topic resolved request %s (user %s)",
-        decision, resolved_id, user.id,
+        decision,
+        resolved_id,
+        user.id,
     )
     try:
         ack = "✅ Approved" if decision == "approved" else "❌ Rejected"
-        await msg.reply_text(f"{ack} request <code>{resolved_id}</code>",
-                             parse_mode="HTML")
+        await msg.reply_text(f"{ack} request <code>{resolved_id}</code>", parse_mode="HTML")
     except Exception:
         log.debug("Failed to ack bare approval", exc_info=True)
     return True
-
 
 
 def _trigger_immediate_sweep() -> None:
@@ -738,7 +850,8 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
         if -1 in decisions:
             status, reason = decisions[-1]
             results = await ctx.proposal_workflow.resolve_all_pending_proposals(
-                status, reason,
+                status,
+                reason,
             )
             approved = sum(1 for s in results.values() if s == "approved")
             rejected = sum(1 for s in results.values() if s == "rejected")
@@ -761,15 +874,15 @@ async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -
             status, reason = decisions[0]
             # Get all proposals in this batch and resolve them all
             proposals = await ego_crud.list_proposals_by_batch(ctx.db, batch_id)
-            all_decisions = {
-                i + 1: (status, reason) for i in range(len(proposals))
-            }
+            all_decisions = {i + 1: (status, reason) for i in range(len(proposals))}
             results = await ctx.proposal_workflow.resolve_proposals(
-                batch_id, all_decisions,
+                batch_id,
+                all_decisions,
             )
         else:
             results = await ctx.proposal_workflow.resolve_proposals(
-                batch_id, decisions,
+                batch_id,
+                decisions,
             )
 
         # Send confirmation
@@ -845,7 +958,8 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
         if -1 in decisions:
             status, reason = decisions[-1]
             results = await ctx.proposal_workflow.resolve_all_pending_proposals(
-                status, reason,
+                status,
+                reason,
             )
         else:
             # Get most recent pending proposals to find their batch
@@ -862,18 +976,18 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                 # Use full batch for correct 1-based indexing — resolve_proposal
                 # skips already-resolved proposals via WHERE status='pending'.
                 full_batch = await ego_crud.list_proposals_by_batch(
-                    ctx.db, batch_id,
+                    ctx.db,
+                    batch_id,
                 )
-                all_decisions = {
-                    i + 1: (status, reason)
-                    for i in range(len(full_batch))
-                }
+                all_decisions = {i + 1: (status, reason) for i in range(len(full_batch))}
                 results = await ctx.proposal_workflow.resolve_proposals(
-                    batch_id, all_decisions,
+                    batch_id,
+                    all_decisions,
                 )
             else:
                 results = await ctx.proposal_workflow.resolve_proposals(
-                    batch_id, decisions,
+                    batch_id,
+                    decisions,
                 )
 
         approved = sum(1 for s in results.values() if s == "approved")
@@ -964,7 +1078,11 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     log.info("Text from %s (%d chars)", user.id, len(msg.text))
 
     await _persist_tg_message(
-        ctx, msg.chat.id, msg.message_id, "user", msg.text,
+        ctx,
+        msg.chat.id,
+        msg.message_id,
+        "user",
+        msg.text,
         thread_id=ctx.thread_id(update),
         reply_to=msg.reply_to_message.message_id if msg.reply_to_message else None,
     )
@@ -1006,10 +1124,12 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
         if ctx.engagement_tracker and ctx.db:
             try:
                 from genesis.db.crud.outreach import find_by_delivery_id
+
                 outreach_record = await find_by_delivery_id(ctx.db, reply_to_id)
                 if outreach_record:
                     await ctx.engagement_tracker.record_reply(
-                        outreach_record["id"], msg.text,
+                        outreach_record["id"],
+                        msg.text,
                     )
                     log.info("Engagement recorded for outreach %s", outreach_record["id"])
             except Exception:
@@ -1028,6 +1148,7 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     if ctx.engagement_tracker and ctx.db:
         try:
             from genesis.db.crud.outreach import find_recent_unengaged
+
             recent = await find_recent_unengaged(ctx.db)
             for rec in recent:
                 await ctx.engagement_tracker.record_implicit_engagement(rec["id"])
@@ -1041,7 +1162,8 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
 
     chat_lock = (
         ctx.adapter.get_chat_lock(msg.chat.id, msg.message_thread_id)
-        if ctx.adapter else asyncio.Lock()
+        if ctx.adapter
+        else asyncio.Lock()
     )
     async with chat_lock:
         await _handle_text_inner(ctx, msg, user, tid)
@@ -1063,7 +1185,9 @@ async def _resolution_label(gate, request_id: str) -> str:
     return f"⚠️ Already resolved ({actual})"
 
 
-async def handle_callback_query(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback_query(
+    ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE
+):
     """Handle inline keyboard button presses (approval flows).
 
     Recognized callback_data prefixes:
@@ -1108,11 +1232,15 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             return
         try:
             ok = await ctx.autonomous_cli_gate.resolve_request(
-                key, decision="approved", resolved_by=f"telegram:button:{user.id}",
+                key,
+                decision="approved",
+                resolved_by=f"telegram:button:{user.id}",
             )
         except Exception:
             log.error(
-                "Failed to resolve cli_approve for request %s", key, exc_info=True,
+                "Failed to resolve cli_approve for request %s",
+                key,
+                exc_info=True,
             )
             return
         if ok:
@@ -1144,7 +1272,8 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             # reflects the click, even if approve_all_pending re-resolves
             # it as part of the batch sweep.
             triggered_ok = await ctx.autonomous_cli_gate.resolve_request(
-                key, decision="approved",
+                key,
+                decision="approved",
                 resolved_by=f"telegram:batch:{user.id}",
             )
             # Scope batch to same subsystem as the triggering request.
@@ -1166,7 +1295,9 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
                 batch_count = 0
         except Exception:
             log.error(
-                "Failed to resolve cli_approve_all for %s", key, exc_info=True,
+                "Failed to resolve cli_approve_all for %s",
+                key,
+                exc_info=True,
             )
             return
         total = batch_count + (1 if triggered_ok else 0)
@@ -1176,7 +1307,11 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             label = await _resolution_label(ctx.autonomous_cli_gate, key)
         log.info(
             "cli_approve_all triggered by %s: triggered=%s batch=%d total=%d (user %s)",
-            key, triggered_ok, batch_count, total, user.id,
+            key,
+            triggered_ok,
+            batch_count,
+            total,
+            user.id,
         )
         try:
             original = query.message.text_html or query.message.text or ""
@@ -1212,7 +1347,9 @@ async def handle_callback_query(ctx: HandlerContext, update: Update, context: Co
             decision_label = "Approved" if action == "approve" else "Rejected"
             log.info(
                 "Callback for expired/processed waiter %s: %s (user %s)",
-                key, decision_label, user.id,
+                key,
+                decision_label,
+                user.id,
             )
             try:
                 original = query.message.text_html or query.message.text or ""
@@ -1238,8 +1375,8 @@ async def handle_voice(ctx: HandlerContext, update: Update, context: ContextType
 
     if voice.file_size and voice.file_size > _MAX_VOICE_BYTES:
         await msg.reply_text(
-            f"Voice file too large ({voice.file_size // (1024*1024)}MB). "
-            f"Maximum is {_MAX_VOICE_BYTES // (1024*1024)}MB."
+            f"Voice file too large ({voice.file_size // (1024 * 1024)}MB). "
+            f"Maximum is {_MAX_VOICE_BYTES // (1024 * 1024)}MB."
         )
         return
 
@@ -1250,11 +1387,17 @@ async def handle_voice(ctx: HandlerContext, update: Update, context: ContextType
 
     chat_lock = (
         ctx.adapter.get_chat_lock(msg.chat.id, msg.message_thread_id)
-        if ctx.adapter else asyncio.Lock()
+        if ctx.adapter
+        else asyncio.Lock()
     )
     async with chat_lock:
         await _handle_voice_inner(
-            ctx, msg, user, voice, context, ctx.whisper_model,
+            ctx,
+            msg,
+            user,
+            voice,
+            context,
+            ctx.whisper_model,
         )
 
 
@@ -1295,7 +1438,8 @@ async def handle_photo(ctx: HandlerContext, update: Update, context: ContextType
 
     chat_lock = (
         ctx.adapter.get_chat_lock(msg.chat.id, msg.message_thread_id)
-        if ctx.adapter else asyncio.Lock()
+        if ctx.adapter
+        else asyncio.Lock()
     )
     try:
         async with chat_lock:
@@ -1357,7 +1501,8 @@ async def handle_document(ctx: HandlerContext, update: Update, context: ContextT
 
     chat_lock = (
         ctx.adapter.get_chat_lock(msg.chat.id, msg.message_thread_id)
-        if ctx.adapter else asyncio.Lock()
+        if ctx.adapter
+        else asyncio.Lock()
     )
     try:
         async with chat_lock:

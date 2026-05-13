@@ -23,8 +23,11 @@ class TestProposalExpiry:
         """Proposals past expires_at are marked expired."""
         past = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
         await ego_crud.create_proposal(
-            db, id="exp1", action_type="investigate",
-            content="Old proposal", expires_at=past,
+            db,
+            id="exp1",
+            action_type="investigate",
+            content="Old proposal",
+            expires_at=past,
         )
         expired = await ego_crud.expire_stale_proposals(db)
         assert expired == 1
@@ -37,8 +40,11 @@ class TestProposalExpiry:
         """Proposals with future expires_at are not expired."""
         future = (datetime.now(UTC) + timedelta(hours=2)).isoformat()
         await ego_crud.create_proposal(
-            db, id="fut1", action_type="investigate",
-            content="Future proposal", expires_at=future,
+            db,
+            id="fut1",
+            action_type="investigate",
+            content="Future proposal",
+            expires_at=future,
         )
         expired = await ego_crud.expire_stale_proposals(db)
         assert expired == 0
@@ -52,13 +58,19 @@ class TestProposalExpiry:
 
         past = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
         await ego_crud.create_proposal(
-            db, id="exp_j", action_type="dispatch",
-            content="Journal test", expires_at=past,
+            db,
+            id="exp_j",
+            action_type="dispatch",
+            content="Journal test",
+            expires_at=past,
         )
         # Create matching journal entry
         await journal_crud.create(
-            db, ego_source="user_ego_cycle", proposal_id="exp_j",
-            cycle_id="cycle1", action_type="dispatch",
+            db,
+            ego_source="user_ego_cycle",
+            proposal_id="exp_j",
+            cycle_id="cycle1",
+            action_type="dispatch",
             action_summary="Journal test",
         )
         expired = await ego_crud.expire_stale_proposals(db)
@@ -126,12 +138,18 @@ class TestCrossBatchApproval:
         """resolve_all_pending_proposals resolves proposals in multiple batches."""
         # Create two batches
         await ego_crud.create_proposal(
-            db, id="b1p1", action_type="dispatch",
-            content="Batch 1 proposal 1", batch_id="batch_a",
+            db,
+            id="b1p1",
+            action_type="dispatch",
+            content="Batch 1 proposal 1",
+            batch_id="batch_a",
         )
         await ego_crud.create_proposal(
-            db, id="b2p1", action_type="investigate",
-            content="Batch 2 proposal 1", batch_id="batch_b",
+            db,
+            id="b2p1",
+            action_type="investigate",
+            content="Batch 2 proposal 1",
+            batch_id="batch_b",
         )
 
         workflow = ProposalWorkflow(db=db)
@@ -152,16 +170,25 @@ class TestCrossBatchApproval:
         """Cross-batch approval works when a batch has some already-resolved proposals."""
         # Create batch with 3 proposals, resolve #1 first
         await ego_crud.create_proposal(
-            db, id="mix_a1", action_type="dispatch",
-            content="Already resolved", batch_id="mixed_batch",
+            db,
+            id="mix_a1",
+            action_type="dispatch",
+            content="Already resolved",
+            batch_id="mixed_batch",
         )
         await ego_crud.create_proposal(
-            db, id="mix_a2", action_type="investigate",
-            content="Still pending 1", batch_id="mixed_batch",
+            db,
+            id="mix_a2",
+            action_type="investigate",
+            content="Still pending 1",
+            batch_id="mixed_batch",
         )
         await ego_crud.create_proposal(
-            db, id="mix_a3", action_type="dispatch",
-            content="Still pending 2", batch_id="mixed_batch",
+            db,
+            id="mix_a3",
+            action_type="dispatch",
+            content="Still pending 2",
+            batch_id="mixed_batch",
         )
         # Resolve the first one manually
         await ego_crud.resolve_proposal(db, "mix_a1", status="rejected")
@@ -197,13 +224,19 @@ class TestPendingCountHeader:
         """send_digest includes pending count from other batches."""
         # Create pending proposals in another batch
         await ego_crud.create_proposal(
-            db, id="old1", action_type="investigate",
-            content="Old pending", batch_id="old_batch",
+            db,
+            id="old1",
+            action_type="investigate",
+            content="Old pending",
+            batch_id="old_batch",
         )
         # Create the batch we're sending
         await ego_crud.create_proposal(
-            db, id="new1", action_type="dispatch",
-            content="New proposal", batch_id="new_batch",
+            db,
+            id="new1",
+            action_type="dispatch",
+            content="New proposal",
+            batch_id="new_batch",
         )
 
         mock_tm = AsyncMock()
@@ -267,7 +300,9 @@ class TestBuildDispatchPrompt:
         from genesis.ego.session import EgoSession
 
         await user_goals.create(
-            db, title="Build thought leadership", category="career",
+            db,
+            title="Build thought leadership",
+            category="career",
             priority="high",
         )
 
