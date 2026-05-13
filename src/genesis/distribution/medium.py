@@ -183,22 +183,20 @@ class MediumDistributor:
             snap = await self._browser.snapshot()
             snap_text = str(snap.get("snapshot", ""))
 
-            # Look for Google sign-in option
-            if "Google" not in snap_text and "google" not in snap_text:
+            # Look for Google sign-in option (specific button text, not just "Google")
+            if "Sign in with Google" not in snap_text and "Continue with Google" not in snap_text:
                 logger.warning("Google sign-in option not found on Medium login page")
                 return False
 
-            # Click the Google sign-in button
-            try:
-                await self._browser.click('button:has-text("Sign in with Google")')
-            except Exception:
-                try:
-                    await self._browser.click('button:has-text("Continue with Google")')
-                except Exception:
-                    logger.warning("Could not click Google sign-in button")
+            # Click the Google sign-in button (browser.click returns error dict, not exception)
+            result = await self._browser.click('button:has-text("Sign in with Google")')
+            if "error" in result:
+                result = await self._browser.click('button:has-text("Continue with Google")')
+                if "error" in result:
+                    logger.warning("Could not click Google sign-in button: %s", result.get("error"))
                     return False
 
-            # Wait for OAuth redirect (Google cookies should auto-auth)
+            # Wait for OAuth redirect chain (Google → Medium)
             await asyncio.sleep(5)
 
             # Verify login succeeded
@@ -330,10 +328,9 @@ class MediumDistributor:
             return False
 
         # Check login before attempting delete (with re-login attempt)
-        if not await self._check_logged_in():
-            if not await self._attempt_relogin():
-                logger.warning("Cannot delete Medium post — not logged in and re-login failed")
-                return False
+        if not await self._check_logged_in() and not await self._attempt_relogin():
+            logger.warning("Cannot delete Medium post — not logged in and re-login failed")
+            return False
 
         try:
             url = post_id if post_id.startswith("http") else f"https://medium.com/p/{post_id}"
