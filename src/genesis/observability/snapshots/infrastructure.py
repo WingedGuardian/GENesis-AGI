@@ -54,6 +54,27 @@ def _read_memory_stat() -> dict:
         return {}
 
 
+def _read_mem_available() -> int | None:
+    """Read MemAvailable from /proc/meminfo (bytes).
+
+    MemAvailable is the kernel's estimate of memory available for new
+    allocations without swapping. It accounts for reclaimable page cache
+    and slab, making it the right metric for OOM risk assessment (unlike
+    cgroup memory.current which includes non-reclaimable cache).
+
+    Returns None if unavailable.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    # Format: "MemAvailable:   22612356 kB"
+                    return int(line.split()[1]) * 1024  # kB → bytes
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 # Module-level state for delta-based CPU reading (no blocking sleep)
 _last_cpu_reading: tuple[int, int, float] | None = None  # (idle, total, monotonic_time)
 
@@ -196,6 +217,16 @@ async def infrastructure(
                 "used_pct": round((total_mem[0] / limit * 100) if total_mem and total_mem[1] > 0 else anon_pct * 100, 1),
                 "anon_pct": round(anon_pct * 100, 1),
             }
+            # MemAvailable from /proc/meminfo — the kernel's estimate of
+            # memory available for new allocations without swapping. This is
+            # the metric that matters for OOM risk, not used_pct (which
+            # includes reclaimable file cache and inflates the number).
+            available_bytes = _read_mem_available()
+            if available_bytes is not None:
+                mem_info["available_gb"] = round(available_bytes / (1024**3), 1)
+                # Cap at 100% — on non-namespaced hosts, MemAvailable may
+                # exceed the cgroup limit, producing a nonsensical ratio.
+                mem_info["available_pct"] = round(min(available_bytes / limit * 100, 100.0), 1)
             mem_info.update(_read_memory_stat())
             infra["container_memory"] = mem_info
         else:
