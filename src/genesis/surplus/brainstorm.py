@@ -114,23 +114,38 @@ class BrainstormRunner:
 
         from datetime import timedelta
         now = self._clock()
-        ttl = (now + timedelta(days=7)).isoformat()
         now_iso = now.isoformat()
         staging_id = str(uuid.uuid4())
 
-        # Write to surplus_insights staging
         insight = result.insights[0] if result.insights else {}
-        await surplus_crud.create(
-            self._db,
-            id=staging_id,
-            content=result.content or "",
-            source_task_type=str(task_type),
-            generating_model=insight.get("generating_model", "stub"),
-            drive_alignment=drive_alignment,
-            confidence=insight.get("confidence", 0.0),
-            created_at=now_iso,
-            ttl=ttl,
-        )
+        content = result.content or ""
+
+        # Route through intake pipeline (atomize → score → knowledge base)
+        try:
+            from genesis.surplus.intake import run_intake, source_for_task_type
+            source = source_for_task_type(str(task_type))
+            await run_intake(
+                content=content,
+                source=source,
+                source_task_type=str(task_type),
+                generating_model=insight.get("generating_model", "stub"),
+                db=self._db,
+            )
+        except Exception:
+            # Fallback: write to surplus_insights staging (old behavior)
+            logger.warning("Intake pipeline failed in brainstorm — falling back to staging", exc_info=True)
+            ttl = (now + timedelta(days=7)).isoformat()
+            await surplus_crud.create(
+                self._db,
+                id=staging_id,
+                content=content,
+                source_task_type=str(task_type),
+                generating_model=insight.get("generating_model", "stub"),
+                drive_alignment=drive_alignment,
+                confidence=insight.get("confidence", 0.0),
+                created_at=now_iso,
+                ttl=ttl,
+            )
 
         # Write to brainstorm_log
         session_type = _SESSION_TYPE_MAP.get(task_type, str(task_type))
