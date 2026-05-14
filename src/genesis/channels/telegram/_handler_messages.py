@@ -842,6 +842,18 @@ def _trigger_immediate_sweep() -> None:
         pass  # Sweep will catch it on next 30-min interval
 
 
+def _wake_inbox_monitor() -> None:
+    """Nudge the inbox monitor to check immediately after an approval."""
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        if rt and rt.inbox_monitor:
+            rt.inbox_monitor.wake()
+    except Exception:
+        pass  # Monitor will pick it up on next interval
+
+
 async def _try_proposal_resolution(ctx: HandlerContext, msg, reply_to_id: str) -> bool:
     """Resolve a proposal batch from a quote-reply to an ego digest.
 
@@ -1328,6 +1340,7 @@ async def handle_callback_query(
             )
         except Exception:
             log.debug("Failed to edit message after cli_approve", exc_info=True)
+        _wake_inbox_monitor()
         return
 
     # --- Autonomous CLI fallback: batch approve ---
@@ -1348,23 +1361,10 @@ async def handle_callback_query(
                 decision="approved",
                 resolved_by=f"telegram:batch:{user.id}",
             )
-            # Scope batch to same subsystem as the triggering request.
-            # If subsystem lookup fails (request gone), skip batch to avoid
-            # accidentally approving all subsystems (the single approve
-            # above already resolved the triggering request).
-            _subsystem = await ctx.autonomous_cli_gate.get_request_subsystem(key)
-            if _subsystem is not None:
-                batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
-                    resolved_by=f"telegram:batch:{user.id}",
-                    subsystem=_subsystem,
-                )
-            else:
-                log.warning(
-                    "cli_approve_all: subsystem lookup failed for %s — "
-                    "skipping batch to avoid cross-subsystem approve",
-                    key,
-                )
-                batch_count = 0
+            # Approve everything else that's pending — no subsystem scoping.
+            batch_count = await ctx.autonomous_cli_gate.approve_all_pending(
+                resolved_by=f"telegram:batch:{user.id}",
+            )
         except Exception:
             log.error(
                 "Failed to resolve cli_approve_all for %s",
@@ -1393,6 +1393,7 @@ async def handle_callback_query(
             )
         except Exception:
             log.debug("Failed to edit message after cli_approve_all", exc_info=True)
+        _wake_inbox_monitor()
         return
 
     # --- Sentinel-style reply_waiter flow (existing behavior) ---
