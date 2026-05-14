@@ -273,11 +273,11 @@ class CCReflectionBridge:
             pending = await self._context_gatherer.detect_pending_work(db)
             logger.info(
                 "Deep reflection pending work: has_any=%s, jobs=%s "
-                "(obs=%d, surplus=%d, skills=%d, cog_stale=%s)",
+                "(obs=%d, intake=%d, skills=%d, cog_stale=%s)",
                 pending.has_any_work,
                 [j.value for j in pending.active_jobs],
                 pending.observation_backlog,
-                pending.surplus_pending,
+                pending.intake_items_since_last,
                 pending.skills_needing_review,
                 pending.cognitive_regeneration,
             )

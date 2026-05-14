@@ -320,10 +320,12 @@ async def score_batch_llm(
     prompt = _INTAKE_SCORE_PROMPT.format(findings_text=findings_text)
 
     try:
-        result = await router.route(
-            call_site_id="45_intelligence_intake",
-            system="You are an intelligence quality scorer.",
-            prompt=prompt,
+        result = await router.route_call(
+            "45_intelligence_intake",
+            messages=[
+                {"role": "system", "content": "You are an intelligence quality scorer."},
+                {"role": "user", "content": prompt},
+            ],
             temperature=0.1,
         )
         if not result.success or not result.content:
