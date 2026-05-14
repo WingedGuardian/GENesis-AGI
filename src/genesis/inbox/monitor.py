@@ -178,9 +178,17 @@ class InboxMonitor:
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         self._autonomous_dispatcher = dispatcher
         # Now that the approval gate is wired, check for items that were
-        # approved while the server was down.  Must happen AFTER the
-        # dispatcher is set so the approval_manager is available.
-        self.wake()
+        # approved while the server was down.  Use asyncio.call_later so
+        # the check fires after bootstrap completes (APScheduler DateTrigger
+        # is unreliable during init).
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_later(
+                10,
+                lambda: asyncio.ensure_future(self._check_inbox()),
+            )
+        except RuntimeError:
+            pass  # No running event loop — scheduler interval will catch it
 
     async def start(self) -> None:
         """Start the inbox monitor scheduler."""
@@ -198,18 +206,23 @@ class InboxMonitor:
             self._config.watch_path,
         )
 
-    def wake(self) -> None:
-        """Schedule an immediate inbox check (one-shot).
+    def wake(self, *, delay_seconds: int = 0) -> None:
+        """Schedule an inbox check (one-shot).
 
         Called after an approval is resolved so the monitor picks up
         the approved item without waiting for the next interval tick.
+        *delay_seconds* adds a short offset — useful at startup so the
+        event loop can finish bootstrap before the job fires.
         """
+        from datetime import timedelta
+
         from apscheduler.triggers.date import DateTrigger
 
+        run_at = datetime.now(UTC) + timedelta(seconds=delay_seconds)
         try:
             self._scheduler.add_job(
                 self._check_inbox,
-                DateTrigger(run_date=datetime.now(UTC)),
+                DateTrigger(run_date=run_at),
                 id="inbox_monitor_wake",
                 max_instances=1,
                 replace_existing=True,
