@@ -793,7 +793,7 @@ async def _send_turnstile_alert(page_url: str) -> None:
             title="CAPTCHA Challenge Detected",
             body=(
                 f"Browser at {page_url} hit a Cloudflare Turnstile challenge "
-                f"that won't auto-resolve.\n\n"
+                f"that didn't auto-resolve or respond to automated VNC click.\n\n"
                 f"Open VNC to solve it: {vnc_url}"
             ),
         )
@@ -840,6 +840,7 @@ async def _vnc_click_turnstile(page) -> bool:
             const rect = iframe.getBoundingClientRect();
             const chromeH = window.outerHeight - window.innerHeight;
             return {
+                // 28px ≈ horizontal offset to checkbox center within Turnstile iframe
                 x: Math.round(window.screenX + rect.left + 28),
                 y: Math.round(
                     window.screenY + chromeH + rect.top + rect.height / 2
@@ -869,7 +870,12 @@ async def _vnc_click_turnstile(page) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        _, stderr = await proc.communicate()
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except TimeoutError:
+            proc.kill()
+            logger.warning("VNC Turnstile click: vncdo timed out after 10s")
+            return False
         if proc.returncode != 0:
             logger.warning(
                 "VNC Turnstile click: vncdo failed (rc=%d): %s",
