@@ -323,7 +323,7 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
             {"id": "obs-1", "type": "test", "source": "test", "priority": "medium",
              "content": "Observation content here", "created_at": "2026-04-02T12:00:00"},
         ],
-        surplus_staging_items=[],
+        intelligence_digest="",
         pending_work=PendingWorkSummary(memory_consolidation=False),
         procedure_stats=ProcedureStats(total_active=0, total_quarantined=0, avg_success_rate=0, low_performers=[]),
         cost_summary=CostSummary(daily_usd=0.0, weekly_usd=0.0, monthly_usd=0.0,
