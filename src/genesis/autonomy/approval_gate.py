@@ -375,25 +375,11 @@ class AutonomousCliApprovalGate:
             return request_id
         return None
 
-    async def approve_all_pending(
-        self, *, resolved_by: str, subsystem: str | None = None,
-    ) -> int:
-        """Approve all pending CLI-fallback approval requests. Returns count.
-
-        Scoped to ``autonomous_cli_fallback`` action type only.  When
-        *subsystem* is provided, further restricts to requests whose
-        context matches that subsystem (e.g. only inbox, only ego).
-        Pass ``None`` for the dashboard "approve everything" path.
-        """
+    async def approve_all_pending(self, *, resolved_by: str) -> int:
+        """Approve every pending approval request.  Returns count approved."""
         pending = await self._approval_manager.get_pending()
         count = 0
         for req in pending:
-            if req.get("action_type") != "autonomous_cli_fallback":
-                continue
-            if subsystem is not None:
-                ctx = _json_loads(req.get("context"))
-                if ctx.get("subsystem") != subsystem:
-                    continue
             ok = await self._approval_manager.resolve(
                 req["id"], status="approved", resolved_by=resolved_by,
             )

@@ -180,6 +180,12 @@ class InboxMonitor:
 
     async def start(self) -> None:
         """Start the inbox monitor scheduler."""
+        # Immediate startup check for items approved while the server was down.
+        try:
+            await self.check_once()
+        except Exception:
+            logger.warning("Startup inbox check failed (non-fatal)", exc_info=True)
+
         self._scheduler.add_job(
             self._check_inbox,
             IntervalTrigger(seconds=self._config.check_interval_seconds),
@@ -193,6 +199,26 @@ class InboxMonitor:
             self._config.check_interval_seconds,
             self._config.watch_path,
         )
+
+    def wake(self) -> None:
+        """Schedule an immediate inbox check (one-shot).
+
+        Called after an approval is resolved so the monitor picks up
+        the approved item without waiting for the next interval tick.
+        """
+        from apscheduler.triggers.date import DateTrigger
+
+        try:
+            self._scheduler.add_job(
+                self._check_inbox,
+                DateTrigger(run_date=datetime.now(UTC)),
+                id="inbox_monitor_wake",
+                max_instances=1,
+                replace_existing=True,
+                misfire_grace_time=60,
+            )
+        except Exception:
+            logger.debug("wake: failed to schedule immediate check", exc_info=True)
 
     async def stop(self) -> None:
         """Stop the inbox monitor scheduler."""

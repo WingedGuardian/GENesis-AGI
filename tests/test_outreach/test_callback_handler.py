@@ -130,7 +130,6 @@ def _make_gate_ctx(*, allowed_users=None, resolve_ok=True, batch_count=0):
     gate = MagicMock()
     gate.resolve_request = AsyncMock(return_value=resolve_ok)
     gate.approve_all_pending = AsyncMock(return_value=batch_count)
-    gate.get_request_subsystem = AsyncMock(return_value="test_subsystem")
     # For Fix 2 status-aware labels when resolve_ok=False
     approval_mgr = MagicMock()
     approval_mgr.get_by_id = AsyncMock(return_value={"status": "approved"})
