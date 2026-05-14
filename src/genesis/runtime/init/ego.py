@@ -262,6 +262,54 @@ async def init(rt: GenesisRuntime) -> None:
             rt._session_manager.add_on_end(_ego_dispatch_on_end)
             logger.info("Ego dispatch outcome hook registered")
 
+        # ================================================================
+        # REACTIVE EVENT WIRING — EventBus → ego reactive queue
+        # ================================================================
+        if rt._event_bus is not None:
+            from genesis.observability.types import Severity
+
+            # Route by subsystem — reliable field on every GenesisEvent.
+            # User-facing subsystems trigger user ego; system subsystems
+            # trigger Genesis ego.
+            _USER_SUBSYSTEMS = frozenset({
+                "outreach", "inbox", "mail", "recon",
+            })
+            _SYSTEM_SUBSYSTEMS = frozenset({
+                "health", "routing", "providers", "guardian",
+                "awareness", "surplus", "learning",
+            })
+
+            async def _on_high_severity_event(event) -> None:
+                """Route high-severity events to the appropriate ego's reactive queue."""
+                # Only react to WARNING+ events with actionable types
+                if event.event_type in ("heartbeat", "metric"):
+                    return
+
+                subsystem = str(getattr(event, "subsystem", ""))
+
+                reactive_event = {
+                    "type": event.event_type,
+                    "summary": str(event.message)[:200],
+                    "priority": event.severity.name if hasattr(event, "severity") else "high",
+                    "source": subsystem,
+                }
+
+                # Route by subsystem (reliable field on every event)
+                if subsystem in _USER_SUBSYSTEMS:
+                    user_ego_cadence.push_reactive_event(reactive_event)
+                elif subsystem in _SYSTEM_SUBSYSTEMS:
+                    genesis_ego_cadence.push_reactive_event(reactive_event)
+                else:
+                    # ego, perception, memory, etc. — route to Genesis ego
+                    # (system-internal concerns)
+                    genesis_ego_cadence.push_reactive_event(reactive_event)
+
+            rt._event_bus.subscribe(
+                _on_high_severity_event,
+                min_severity=Severity.WARNING,
+            )
+            logger.info("Ego reactive event subscriber registered")
+
     except ImportError:
         logger.warning("genesis.ego not available")
     except Exception:

@@ -161,7 +161,8 @@ class TestEgoSession:
         assert cycle.cost_usd == 0.15
         assert cycle.model_used == "opus"
         assert cycle.focus_summary == "investigating backlog growth"
-        mock_invoker.run.assert_called_once()
+        # Invoker called for ego cycle + realist filter (2 calls when proposals exist)
+        assert mock_invoker.run.call_count >= 1
 
         # Focus summary stored in ego_state
         focus = await ego_crud.get_state(db, "ego_focus_summary")
@@ -192,7 +193,7 @@ class TestEgoSession:
         """Morning report flag appears in the user prompt."""
         await ego_session.run_cycle(is_morning_report=True)
 
-        call_args = mock_invoker.run.call_args[0][0]
+        call_args = mock_invoker.run.call_args_list[0][0][0]
         assert "MORNING REPORT" in call_args.prompt
 
     async def test_run_cycle_budget_exceeded(
@@ -245,7 +246,8 @@ class TestEgoSession:
         """Verify CCInvocation has correct model, effort, append mode."""
         await ego_session.run_cycle()
 
-        invocation = mock_invoker.run.call_args[0][0]
+        # First call is the ego cycle; subsequent calls are realist filter
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.model.value == "opus"
         assert invocation.effort.value == "high"  # default from EgoConfig
         assert invocation.append_system_prompt is True
@@ -277,7 +279,8 @@ class TestEgoSession:
     async def test_ephemeral_no_resume(self, ego_session, mock_invoker):
         """Every cycle is ephemeral — resume_session_id is always None."""
         await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args[0][0]
+        # First call is the ego cycle
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.resume_session_id is None
 
     async def test_ephemeral_consecutive_cycles(self, ego_session, mock_invoker):
@@ -286,41 +289,42 @@ class TestEgoSession:
         mock_invoker.run.reset_mock()
 
         await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args[0][0]
+        # First call after reset is the ego cycle
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.resume_session_id is None
 
     async def test_morning_report_uses_sonnet_low(self, ego_session, mock_invoker):
         """Morning report cycle uses Sonnet/Low per cycle type defaults."""
         await ego_session.run_cycle(is_morning_report=True)
-        invocation = mock_invoker.run.call_args[0][0]
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.model.value == "sonnet"
         assert invocation.effort.value == "low"
 
     async def test_cycle_type_proactive(self, ego_session, mock_invoker):
         """Proactive cycle type uses Opus/High."""
         await ego_session.run_cycle(cycle_type=CycleType.PROACTIVE)
-        invocation = mock_invoker.run.call_args[0][0]
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.model.value == "opus"
         assert invocation.effort.value == "high"
 
     async def test_cycle_type_escalation(self, ego_session, mock_invoker):
         """Escalation cycle type uses Sonnet/Medium."""
         await ego_session.run_cycle(cycle_type=CycleType.ESCALATION)
-        invocation = mock_invoker.run.call_args[0][0]
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert invocation.model.value == "sonnet"
         assert invocation.effort.value == "medium"
 
     async def test_system_prompt_is_static(self, ego_session, mock_invoker):
         """System prompt is the static identity — no dynamic content."""
         await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args[0][0]
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         # System prompt should be the cached static prompt
         assert invocation.system_prompt == ego_session._static_prompt
 
     async def test_dynamic_context_in_user_message(self, ego_session, mock_invoker):
         """Operational context appears in the user message, not system prompt."""
         await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args[0][0]
+        invocation = mock_invoker.run.call_args_list[0][0][0]
         assert "Test operational context" in invocation.prompt
 
 

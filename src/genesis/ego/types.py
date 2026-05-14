@@ -18,12 +18,13 @@ class CycleType(StrEnum):
 
 
 # Per-cycle-type model/effort OVERRIDES.  Only cycle types listed here
-# bypass the ego's config.model / config.default_effort.  PROACTIVE and
-# REACTIVE are intentionally absent — they respect the per-ego config so
-# genesis ego can run Sonnet while user ego runs Opus.
+# bypass the ego's config.model / config.default_effort.  PROACTIVE is
+# intentionally absent — it respects the per-ego config so genesis ego
+# can run Sonnet while user ego runs Opus.
 CYCLE_TYPE_DEFAULTS: dict[CycleType, tuple[str, str]] = {
     CycleType.MORNING_REPORT: ("sonnet", "low"),
     CycleType.ESCALATION: ("sonnet", "medium"),
+    CycleType.REACTIVE: ("opus", "high"),  # fires need the best model
 }
 
 
@@ -38,6 +39,21 @@ class ProposalStatus(StrEnum):
     FAILED = "failed"
     TABLED = "tabled"
     WITHDRAWN = "withdrawn"
+
+
+# Neutral status labels — factual lifecycle terms without judgment language.
+# Used in ego context to avoid LLM deference bias from loaded outcomes.
+NEUTRAL_STATUS: dict[str, str] = {
+    "pending": "pending",
+    "approved": "approved",
+    "rejected": "passed on",
+    "expired": "expired",
+    "tabled": "deferred",
+    "withdrawn": "recycled",
+    "executed": "completed",
+    "failed": "attempted",
+    "cancelled": "cancelled",
+}
 
 
 class ProposalUrgency(StrEnum):

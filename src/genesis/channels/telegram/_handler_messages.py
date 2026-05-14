@@ -1027,11 +1027,18 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                 reason,
             )
         else:
-            # Get most recent pending proposals to find their batch
-            pending = await ego_crud.list_pending_proposals(ctx.db)
+            # Get most recent pending proposals — prefer user ego to avoid
+            # cross-ego conflation (bare replies are from the user).
+            pending = await ego_crud.list_pending_proposals(
+                ctx.db, ego_source="user_ego_cycle",
+            )
+            if not pending:
+                # Fall back to any pending (handles pre-migration NULL ego_source)
+                pending = await ego_crud.list_pending_proposals(ctx.db)
             if not pending:
                 return False
-            batch_id = pending[0].get("batch_id")
+            # Use the MOST RECENT batch (user sees latest digest at top)
+            batch_id = pending[-1].get("batch_id")
             if not batch_id:
                 return False
 

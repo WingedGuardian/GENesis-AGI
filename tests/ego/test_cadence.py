@@ -126,7 +126,9 @@ class TestCadenceTick:
     ):
         mock_idle_detector.is_idle.return_value = True
         await cadence._on_tick()
-        mock_session.run_cycle.assert_called_once_with()
+        mock_session.run_cycle.assert_called_once()
+        # model_override is None for normal proactive cycles
+        assert mock_session.run_cycle.call_args.kwargs.get("model_override") is None
 
     async def test_tick_skips_when_active(
         self, cadence, mock_session, mock_idle_detector,

@@ -135,6 +135,7 @@ class ProposalWorkflow:
         proposals: list[dict],
         *,
         cycle_id: str | None = None,
+        ego_source: str | None = None,
     ) -> tuple[str, list[str]]:
         """Create a batch of proposals from ego output dicts.
 
@@ -169,6 +170,9 @@ class ProposalWorkflow:
                 execution_plan=p.get("execution_plan"),
                 recurring=bool(p.get("recurring", False)),
                 memory_basis=p.get("memory_basis", ""),
+                realist_verdict=p.get("_realist_verdict"),
+                realist_reasoning=p.get("_realist_reasoning"),
+                ego_source=ego_source,
             )
             ids.append(pid)
 
@@ -220,6 +224,7 @@ class ProposalWorkflow:
         batch_id: str,
         *,
         validation_warnings: list[str] | None = None,
+        ego_source: str | None = None,
     ) -> str | None:
         """Send the batch digest to Telegram. Returns delivery_id or None.
 
@@ -244,9 +249,11 @@ class ProposalWorkflow:
             warn_lines = "\n".join(f"  - {w}" for w in validation_warnings)
             digest_html = f"\u26a0\ufe0f <b>Validation:</b>\n{warn_lines}\n\n{digest_html}"
 
-        # Show pending count from other batches for visibility
+        # Show pending count from other batches (same ego only) for visibility
         try:
-            all_pending = await ego_crud.list_pending_proposals(self._db)
+            all_pending = await ego_crud.list_pending_proposals(
+                self._db, ego_source=ego_source,
+            )
             other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
             if other_pending:
                 digest_html = (

@@ -128,6 +128,33 @@ Every brainstorming cycle:
 Stale detection is YOUR job, not time-based. There is no automatic expiry.
 You judge relevance each cycle based on current signals.
 
+## Investigate Is Free
+
+Read operations do not need proposals. If you want to investigate,
+research, query, profile, or check something — just do it during your
+cycle using your MCP tools. Proposals are a **write permission gate**,
+not a read permission gate. Only propose actions that change state:
+sending messages, creating content, modifying configurations, dispatching
+background sessions.
+
+If you find yourself proposing "investigate X" or "research Y", stop.
+Just do the investigation right now, in this cycle. Use what you learn
+to inform better proposals.
+
+## Realist Gate
+
+Your proposals pass through a realist evaluation before delivery. The
+realist catches:
+- Read-only investigations that should be done in-cycle (not proposed)
+- Zombie proposals — same topic re-proposed after being recycled/deferred
+- Infeasible proposals — capabilities Genesis doesn't have
+- Vague proposals that need concrete steps
+
+The realist's annotations appear in your proposal history (the "Realist"
+column). Use this feedback to improve your next cycle's proposals. If the
+realist flagged something, address the concern — don't just re-propose
+the same thing.
+
 ## Pattern Recognition
 
 Before generating proposals, review the "Recurring Patterns" section in
@@ -136,9 +163,10 @@ your context. When you see a pattern appearing 3+ times:
 - Consider whether automation or a systematic response would help
 - Propose with action_type "recurring_pattern"
 - Be specific: "Recurring: [what]. Proposed: [specific automation]. Approve?"
-- If you proposed this pattern before and it was rejected, do NOT
+- If you proposed this pattern before and it was passed on, do NOT
   re-propose unless circumstances changed. Cross-reference your
-  proposal history.
+  proposal history — the "Outcome" and "Realist" columns show what
+  happened to previous proposals.
 
 Pattern proposals are regular proposals — same digest, same approval flow.
 
@@ -146,8 +174,8 @@ Pattern proposals are regular proposals — same digest, same approval flow.
 
 Focus on making every proposal worth the user's attention:
 
-1. Every cycle, review your pending proposals. Withdraw anything that's
-   no longer your best thinking. Supersede with better ideas.
+1. Every cycle, review your pending and deferred proposals. Withdraw
+   anything that's no longer your best thinking. Supersede with better ideas.
 2. Three high-confidence proposals are better than ten speculative ones.
    Depth over breadth.
 3. Proposals are for brainstorming cycles only. Morning reports, health

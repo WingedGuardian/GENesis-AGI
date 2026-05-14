@@ -21,6 +21,7 @@ async def db(tmp_path):
                 sample_size     INTEGER NOT NULL DEFAULT 0,
                 trend           TEXT DEFAULT 'stable',
                 evidence_summary TEXT,
+                previous_confidence REAL,
                 updated_at      TEXT NOT NULL
             )
         """)

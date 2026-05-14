@@ -12,6 +12,7 @@ Durable knowledge lives in the memory system (memory_store/recall).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -28,7 +29,13 @@ from genesis.cc.types import (
     background_session_dir,
 )
 from genesis.db.crud import ego as ego_crud
-from genesis.ego.types import CYCLE_TYPE_DEFAULTS, CycleType, EgoConfig, EgoCycle
+from genesis.ego.types import (
+    CYCLE_TYPE_DEFAULTS,
+    NEUTRAL_STATUS,
+    CycleType,
+    EgoConfig,
+    EgoCycle,
+)
 from genesis.observability.session_context import set_session_id as _set_obs_session
 
 if TYPE_CHECKING:
@@ -112,6 +119,7 @@ class EgoSession:
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
         self._source_tag = source_tag or "ego_cycle"
         self._sweep_lock = asyncio.Lock()
+        self._last_realist_cost_usd = 0.0  # accumulated by _filter_proposals
         # Cache the static system prompt (read once, not every cycle)
         actual_prompt_path = prompt_path or _DEFAULT_PROMPT_PATH
         if actual_prompt_path.exists():
@@ -133,6 +141,7 @@ class EgoSession:
         *,
         is_morning_report: bool = False,
         cycle_type: CycleType | None = None,
+        model_override: str | None = None,
     ) -> EgoCycle | None:
         """Execute one ego thinking cycle.
 
@@ -144,6 +153,9 @@ class EgoSession:
         cycle_type:
             Determines model and effort for this cycle. If None,
             inferred from ``is_morning_report``.
+        model_override:
+            Override model selection (e.g., "opus" for deep-think cycles).
+            Takes precedence over both config and cycle_type defaults.
 
         Returns the stored EgoCycle, or None if the cycle failed (CC error).
 
@@ -161,6 +173,10 @@ class EgoSession:
         cycle_model, cycle_effort = CYCLE_TYPE_DEFAULTS.get(cycle_type, (None, None))
         model = CCModel(cycle_model or self._config.model)
         effort = EffortLevel(cycle_effort or self._config.default_effort)
+
+        # model_override takes precedence (e.g., deep-think Opus cycle)
+        if model_override:
+            model = CCModel(model_override)
 
         # 1. Budget check — raises BudgetExceededError (not a failure)
         if not await self._check_budget():
@@ -265,7 +281,8 @@ class EgoSession:
             if prev and not _BEHAVIORAL_FOCUS_RE.search(prev):
                 parsed["focus_summary"] = prev
 
-        # 7. Store cycle
+        # 7. Store cycle (realist cost added below after _filter_proposals)
+        self._last_realist_cost_usd = 0.0
         focus = parsed.get("focus_summary", "") if parsed else ""
         proposals_json = json.dumps(parsed.get("proposals", [])) if parsed else "[]"
         cycle = EgoCycle(
@@ -309,10 +326,16 @@ class EgoSession:
             proposals = parsed.get("proposals", [])
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
-                # Light feasibility filter — only blocks clearly impossible
-                # proposals. The ego dreams freely; this filter catches
-                # proposals that reference nonexistent capabilities.
+                # Realist gate — LLM evaluates proposals against history
                 proposals = await self._filter_proposals(proposals)
+                # Log realist cost for observability (cycle dataclass is frozen,
+                # so cost is tracked via logging; negligible vs ego cycle cost)
+                if self._last_realist_cost_usd > 0:
+                    logger.info(
+                        "Realist cost: $%.4f (ego cycle: $%.4f)",
+                        self._last_realist_cost_usd,
+                        cycle.cost_usd,
+                    )
                 if proposals:
                     await self._process_proposals(
                         proposals,
@@ -522,28 +545,90 @@ class EgoSession:
         self,
         proposals: list[dict],
     ) -> list[dict]:
-        """Light feasibility filter — only block clearly impossible proposals.
+        """Realist gate — LLM evaluates proposals against recent history.
 
-        The ego proposes freely based on its world model ("dream first").
-        This filter catches proposals that reference capabilities Genesis
-        genuinely doesn't have. Questionable proposals pass through — the
-        user can reject them.
+        The dreamer proposes freely; the realist catches:
+        1. Read-only investigations disguised as proposals (investigate is free)
+        2. Zombie proposals (same topic proposed + withdrawn/tabled/expired)
+        3. Infeasible proposals (requires capabilities Genesis doesn't have)
+        4. Vague proposals that need amendment with concrete steps
 
-        The ego NEVER sees filter results. No per-proposal feedback.
+        Annotations are stored on proposals that pass (via _realist_verdict
+        and _realist_reasoning keys). The ego sees these in its next cycle's
+        proposal history context, forming the outer dreamer→realist loop.
+
+        Gracefully degrades to pass-through on ANY failure (DB, CC, parse).
         """
         if not proposals:
             return proposals
 
-        # Currently a pass-through: the architecture is in place for future
-        # capability-based filtering as the system matures. Starts fully
-        # permissive — better to let a questionable proposal through than
-        # suppress a creative one.
-        #
-        # Future filter criteria (when data supports it):
-        # - action_type references a capability domain that doesn't exist
-        # - content suggests a tool Genesis genuinely lacks
-        # - a known hard blocker (service down, API revoked)
-        return proposals
+        # Fetch recent history for zombie/duplicate detection
+        try:
+            cursor = await self._db.execute(
+                "SELECT action_type, content, status, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-2 days') "
+                "ORDER BY created_at DESC LIMIT 20",
+            )
+            recent = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            logger.warning("Realist: failed to fetch history, passing through")
+            return proposals
+
+        prompt = _build_realist_prompt(proposals, recent)
+
+        try:
+            invocation = CCInvocation(
+                prompt=prompt,
+                model=CCModel.SONNET,
+                effort=EffortLevel.LOW,
+                skip_permissions=True,
+                working_dir=background_session_dir(),
+            )
+            output = await self._invoker.run(invocation)
+            # Track realist cost for cycle accounting
+            self._last_realist_cost_usd = output.cost_usd
+            if output.is_error:
+                logger.warning("Realist CC call failed: %s", output.error_message)
+                return proposals
+
+            verdicts = _parse_realist_response(output.text, len(proposals))
+
+            filtered = []
+            rejected_count = 0
+            amended_count = 0
+            for i, prop in enumerate(proposals):
+                verdict = verdicts.get(i, {"verdict": "pass", "reasoning": ""})
+                prop["_realist_verdict"] = verdict["verdict"]
+                prop["_realist_reasoning"] = verdict.get("reasoning", "")
+
+                if verdict["verdict"] == "amend" and verdict.get("amended_content"):
+                    prop["content"] = verdict["amended_content"]
+                    amended_count += 1
+
+                if verdict["verdict"] != "reject":
+                    filtered.append(prop)
+                else:
+                    rejected_count += 1
+                    logger.info(
+                        "Realist rejected: %s — %s",
+                        prop.get("content", "")[:80],
+                        verdict.get("reasoning", "")[:100],
+                    )
+
+            if rejected_count or amended_count:
+                logger.info(
+                    "Realist: %d/%d passed (%d rejected, %d amended)",
+                    len(filtered),
+                    len(proposals),
+                    rejected_count,
+                    amended_count,
+                )
+
+            return filtered
+        except Exception:
+            logger.warning("Realist filter failed, passing through", exc_info=True)
+            return proposals
 
     async def _process_proposals(
         self,
@@ -562,6 +647,7 @@ class EgoSession:
             batch_id, ids = await self._proposals.create_batch(
                 proposals,
                 cycle_id=cycle_id,
+                ego_source=self._source_tag,
             )
             logger.info(
                 "Created proposal batch %s with %d proposals",
@@ -602,6 +688,7 @@ class EgoSession:
                 delivery = await self._proposals.send_digest(
                     batch_id,
                     validation_warnings=validation_issues or None,
+                    ego_source=self._source_tag,
                 )
                 if delivery:
                     logger.info("Ego digest sent (delivery_id=%s)", delivery)
@@ -1053,6 +1140,140 @@ class EgoSession:
         return True
 
 
+# -- Realist prompt & parser -----------------------------------------------
+
+_NEUTRAL_STATUS = NEUTRAL_STATUS  # re-export for backwards compat
+
+
+def _build_realist_prompt(
+    proposals: list[dict],
+    recent_history: list[dict],
+) -> str:
+    """Build the realist evaluation prompt.
+
+    Kept as small as possible — the realist prompt is ~2-3K input tokens
+    vs the ego's 50-80K, so cost is modest even at Opus pricing.
+    """
+    history_lines = []
+    if recent_history:
+        history_lines.append("| Type | Topic | Outcome | When |")
+        history_lines.append("|------|-------|---------|------|")
+        for h in recent_history:
+            action = h.get("action_type", "?")
+            content = (h.get("content") or "")[:100].replace("\n", " ").replace("|", "/")
+            status = _NEUTRAL_STATUS.get(h.get("status", ""), h.get("status", "?"))
+            created = (h.get("created_at") or "")[:16]
+            history_lines.append(f"| {action} | {content} | {status} | {created} |")
+    else:
+        history_lines.append("*No recent proposals.*")
+
+    proposal_lines = []
+    for i, p in enumerate(proposals):
+        content = (p.get("content") or "")[:300].replace("\n", " ")
+        action = p.get("action_type", "?")
+        conf = p.get("confidence", 0.0)
+        proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
+
+    return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
+proposal and return a JSON array of verdicts.
+
+## Rules
+
+1. **Read operations are NOT proposals.** Investigating, researching, reading,
+   profiling, querying, checking, monitoring — these are things the ego should
+   do during its normal cycle without asking permission. If a proposal is
+   purely investigative with no write/action/outreach component, REJECT it:
+   "Read operation — do this during your cycle, don't propose it."
+
+2. **Check for zombies.** If a proposal covers substantially the same topic
+   as a recent proposal that was recycled/withdrawn/deferred/expired, and
+   nothing has changed in the circumstances, REJECT: "Zombie — proposed
+   before with no change in circumstances."
+
+3. **Check feasibility.** If a proposal requires a capability Genesis
+   genuinely doesn't have, AMEND with a feasible alternative.
+
+4. **Check actionability.** If the proposal is too vague to execute,
+   AMEND with concrete steps.
+
+5. **Err on the side of passing.** When in doubt, PASS. The user is the
+   final gate. Your job is to catch clear issues, not second-guess
+   creative proposals.
+
+## Recent Proposal History (48h)
+{chr(10).join(history_lines)}
+
+## New Proposals to Evaluate
+{chr(10).join(proposal_lines)}
+
+## Output Format
+Return ONLY a JSON array, one entry per proposal (same order as input):
+[{{"index": 0, "verdict": "pass|amend|reject", "reasoning": "brief explanation", "amended_content": "only if verdict is amend"}}]"""
+
+
+def _parse_realist_response(
+    raw_text: str,
+    num_proposals: int,
+) -> dict[int, dict]:
+    """Parse the realist's JSON response into per-proposal verdicts.
+
+    Returns {index: {"verdict": str, "reasoning": str, "amended_content": str?}}.
+    On parse failure, returns empty dict (all proposals pass through).
+    """
+    if not raw_text or not raw_text.strip():
+        return {}
+
+    text = raw_text.strip()
+
+    # Try direct parse
+    parsed = None
+    with contextlib.suppress(json.JSONDecodeError):
+        parsed = json.loads(text)
+
+    # Try markdown code block
+    if parsed is None:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(match.group(1).strip())
+
+    # Try bracket extraction
+    if parsed is None:
+        first = text.find("[")
+        last = text.rfind("]")
+        if first != -1 and last > first:
+            with contextlib.suppress(json.JSONDecodeError):
+                parsed = json.loads(text[first : last + 1])
+
+    if not isinstance(parsed, list):
+        logger.warning("Realist response is not a JSON array: %.200s", text)
+        return {}
+
+    verdicts: dict[int, dict] = {}
+    for entry in parsed:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            idx = int(entry.get("index", -1))
+        except (ValueError, TypeError):
+            continue
+        if idx < 0 or idx >= num_proposals:
+            continue
+
+        verdict = entry.get("verdict", "pass")
+        if verdict not in ("pass", "amend", "reject"):
+            verdict = "pass"
+
+        verdicts[idx] = {
+            "verdict": verdict,
+            "reasoning": str(entry.get("reasoning", ""))[:500],
+        }
+        if verdict == "amend" and entry.get("amended_content"):
+            verdicts[idx]["amended_content"] = str(entry["amended_content"])[:2000]
+
+    return verdicts
+
+
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 
@@ -1207,6 +1428,7 @@ _CAP_PATTERN = re.compile(r"_\(max (\d+) items?\)_")
 _NOTEPAD_SECTIONS = [
     "Active Projects & Priorities",
     "Interests & Expertise",
+    "Proposal Context Journal",
     "Open Questions",
 ]
 
