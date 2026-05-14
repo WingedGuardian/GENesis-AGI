@@ -26,4 +26,3 @@ async def up(db: aiosqlite.Connection) -> None:
         "UPDATE depth_thresholds SET floor_seconds = 86400 "
         "WHERE depth_name = 'Deep' AND floor_seconds = 172800"
     )
-    await db.commit()
