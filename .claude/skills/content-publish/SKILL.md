@@ -23,6 +23,10 @@ platforms by swapping the publish step.
 - Medium username configured in `~/.genesis/config/distribution.yaml`
 - Voice-master skill available (exemplars at `~/.claude/skills/voice-master/`)
 - Narrative reference card at `~/.genesis/config/genesis-narrative.md`
+- **Stealth-browser skill** (`src/genesis/skills/stealth-browser/SKILL.md`) —
+  MUST load before any browser interaction. Covers anti-detection timing,
+  honeypot avoidance, and the VNC trusted input technique for Cloudflare
+  Turnstile. Without this, Turnstile challenges will block publishing.
 
 ## Workflow
 

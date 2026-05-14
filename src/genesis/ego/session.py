@@ -906,11 +906,15 @@ class EgoSession:
             prompt = await self._build_dispatch_prompt(prop)
             profile = _infer_profile(prop.get("action_type", ""))
 
+            # Interact-profile tasks (browser automation, publishing) need Opus
+            # for reliable multi-step workflow execution.
+            model = CCModel.OPUS if profile == "interact" else CCModel.SONNET
+
             try:
                 request = DirectSessionRequest(
                     prompt=prompt,
                     profile=profile,
-                    model=CCModel.SONNET,
+                    model=model,
                     effort=EffortLevel.HIGH,
                     notify=True,
                     source_tag="ego_dispatch",
