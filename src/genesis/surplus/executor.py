@@ -242,7 +242,19 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "Generate 2-3 concrete, actionable ideas for how the system could "
         "better serve the user based on the system context and user profile "
         "above.  Each idea should be specific enough to act on.\n\n"
-        "Respond in plain text with numbered ideas."
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '```json\n'
+        '{{\n'
+        '  "findings": [\n'
+        '    {{\n'
+        '      "title": "Short idea title",\n'
+        '      "content": "Detailed description of the idea",\n'
+        '      "sources": [],\n'
+        '      "relevance": "Why this would create value"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n'
+        '```\n'
     ),
     TaskType.BRAINSTORM_SELF: (
         "You are brainstorming ways to improve your own capabilities.\n\n"
@@ -251,7 +263,19 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "Identify 2-3 concrete improvements to your own processes, skills, "
         "or knowledge that would make you more effective.  Focus on gaps "
         "exposed by recent work.\n\n"
-        "Respond in plain text with numbered ideas."
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '```json\n'
+        '{{\n'
+        '  "findings": [\n'
+        '    {{\n'
+        '      "title": "Short improvement title",\n'
+        '      "content": "What to improve and how",\n'
+        '      "sources": [],\n'
+        '      "relevance": "Why this improvement matters"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n'
+        '```\n'
     ),
     TaskType.META_BRAINSTORM: (
         "You are reviewing the quality of recent brainstorm outputs.\n\n"
@@ -284,7 +308,19 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "Cluster recent unresolved observations into themes.  Identify "
         "recurring patterns that suggest systemic issues rather than "
         "one-off events.\n\n"
-        "Respond in plain text with grouped findings."
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '```json\n'
+        '{{\n'
+        '  "findings": [\n'
+        '    {{\n'
+        '      "title": "Theme/pattern name",\n'
+        '      "content": "Description of the pattern and evidence",\n'
+        '      "sources": [],\n'
+        '      "relevance": "Why this pattern matters"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n'
+        '```\n'
     ),
     TaskType.SELF_UNBLOCK: (
         "You are helping an autonomous AI system get unstuck.\n\n"
@@ -316,13 +352,21 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "{context}\n\n"
         "## Task\n"
         "Synthesize the search results above into 1-3 actionable findings.\n\n"
-        "For each finding:\n"
-        "- State the insight clearly\n"
-        "- Cite the source URL(s)\n"
-        "- Explain why this matters for the user or system\n\n"
-        "If no useful search results were found, state that clearly and "
-        "suggest better search queries for next time.\n\n"
-        "Respond in plain text with numbered findings."
+        "If no useful search results were found, respond with a plain text "
+        "message explaining that and suggesting better queries.\n\n"
+        "Otherwise, respond with ONLY a JSON object in this exact format:\n"
+        '```json\n'
+        '{{\n'
+        '  "findings": [\n'
+        '    {{\n'
+        '      "title": "Short descriptive title",\n'
+        '      "content": "The insight, explained clearly",\n'
+        '      "sources": ["https://..."],\n'
+        '      "relevance": "Why this matters for the user or system"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n'
+        '```\n'
     ),
     TaskType.PROMPT_REVIEW_CATALOG: (
         "You are cataloging LLM call site activity for an autonomous AI.\n\n"

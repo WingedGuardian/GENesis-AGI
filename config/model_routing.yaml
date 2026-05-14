@@ -426,6 +426,16 @@ call_sites:
     - gemini-free
     default_paid: true
     description: Pre-mortem failure analysis before committing to execution
+  45_intelligence_intake:
+    chain:
+    - cerebras-qwen
+    - gemini-free
+    - groq-free
+    - mistral-large-free
+    - openrouter-free
+    never_pays: true
+    retry_profile: background
+    description: "Intelligence intake — score uncurated recon findings for relevance and quality"
   35_content_draft:
     chain:
     - gemini-free
