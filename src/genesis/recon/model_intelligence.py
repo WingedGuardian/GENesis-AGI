@@ -377,7 +377,7 @@ class ModelIntelligenceJob:
         return findings
 
     async def _store_finding(self, finding: dict) -> str:
-        """Store a model intelligence finding in observations."""
+        """Store a model intelligence finding via intake pipeline."""
         import uuid
 
         finding_id = str(uuid.uuid4())
@@ -397,21 +397,31 @@ class ModelIntelligenceJob:
             "detected_at": now,
         })
 
-        _MEDIUM_TYPES = ("pricing_change", "new_model", "new_free_model", "free_model_removed")
-        priority = "medium" if finding_type in _MEDIUM_TYPES else "low"
+        try:
+            from genesis.surplus.intake import IntakeSource, run_intake
+            await run_intake(
+                content=content,
+                source=IntakeSource.MODEL_INTELLIGENCE,
+                source_task_type="model_intelligence",
+                db=self._db,
+            )
+        except Exception:
+            # Fallback: store as observation directly (old behavior)
+            logger.warning("Intake failed for model_intelligence finding — falling back to direct observation", exc_info=True)
+            _MEDIUM_TYPES = ("pricing_change", "new_model", "new_free_model", "free_model_removed")
+            priority = "medium" if finding_type in _MEDIUM_TYPES else "low"
 
-        from genesis.db.crud import observations
-
-        await observations.create(
-            self._db,
-            id=finding_id,
-            source="recon",
-            type="finding",
-            content=content,
-            priority=priority,
-            created_at=now,
-            category="model_intelligence",
-        )
+            from genesis.db.crud import observations
+            await observations.create(
+                self._db,
+                id=finding_id,
+                source="recon",
+                type="finding",
+                content=content,
+                priority=priority,
+                created_at=now,
+                category="model_intelligence",
+            )
         return finding_id
 
     async def _create_benchmark_follow_up(

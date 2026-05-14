@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 _CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
 _WATCHLIST_PATH = _CONFIG_DIR / "recon_watchlist.yaml"
 _GH_TIMEOUT = 15  # seconds — network calls are slower than local git
-_RELEASES_PER_PROJECT = 5
+_RELEASES_PER_PROJECT = 2
 _MAX_BODY_CHARS = 1000
 
 
@@ -219,7 +219,13 @@ class ReconGatherer:
         return None
 
     async def _check_releases(self, project: dict) -> int:
-        """Check a single project for new releases. Returns count of new findings."""
+        """Check a single project for new releases. Returns count of new findings.
+
+        Noise reduction:
+        - Pre-releases are skipped (filter on GitHub API prerelease field)
+        - Only the last _RELEASES_PER_PROJECT releases are checked
+        - Timestamp gate: only releases published after the last gather are processed
+        """
         repo = project.get("repo", "")
         if not repo:
             logger.warning("Watchlist project %s has no repo", project.get("name"))
@@ -228,7 +234,7 @@ class ReconGatherer:
         raw = await self._run_gh(
             "gh", "api",
             f"repos/{repo}/releases",
-            "--jq", f".[0:{_RELEASES_PER_PROJECT}]",
+            "--jq", f".[0:{_RELEASES_PER_PROJECT * 3}]",  # Fetch extra to filter pre-releases
         )
         if not raw:
             logger.warning("No release data from gh for %s", repo)
@@ -244,13 +250,31 @@ class ReconGatherer:
             logger.warning("Unexpected release format for %s: %s", repo, type(releases))
             return 0
 
+        # Get timestamp gate: last recorded release for this project
+        last_published = await self._get_last_release_timestamp(project.get("name", repo))
+
         new_count = 0
+        processed = 0
         for release in releases:
             if not isinstance(release, dict):
                 continue
 
+            # Skip pre-releases
+            if release.get("prerelease", False):
+                continue
+
+            # Limit to _RELEASES_PER_PROJECT stable releases
+            if processed >= _RELEASES_PER_PROJECT:
+                break
+            processed += 1
+
             tag_name = release.get("tag_name", "")
             if not tag_name:
+                continue
+
+            # Timestamp gate: skip releases published before last gather
+            published = release.get("published_at", "")
+            if last_published and published and published <= last_published:
                 continue
 
             content_hash = _release_hash(repo, tag_name)
@@ -260,9 +284,8 @@ class ReconGatherer:
             ):
                 continue
 
-            # New release — store it
+            # New release — route through intake pipeline
             name = release.get("name", tag_name)
-            published = release.get("published_at", "")
             body = release.get("body", "") or ""
             html_url = release.get("html_url", "")
 
@@ -273,23 +296,55 @@ class ReconGatherer:
             if html_url:
                 content += f"\n\nSource: {html_url}"
 
-            priority = project.get("priority", "medium")
-            now = datetime.now(UTC).isoformat()
-
-            await observations.create(
-                self._db,
-                id=str(uuid.uuid4()),
-                source="recon",
-                type="finding",
-                category="github_releases",
-                content=content,
-                priority=priority,
-                created_at=now,
-                content_hash=content_hash,
-            )
+            try:
+                from genesis.surplus.intake import IntakeSource, run_intake
+                await run_intake(
+                    content=content,
+                    source=IntakeSource.GITHUB_LANDSCAPE,
+                    source_task_type="github_releases",
+                    db=self._db,
+                )
+            except Exception:
+                # Fallback: store as observation directly (old behavior)
+                logger.warning("Intake failed for release %s — falling back to direct observation", tag_name, exc_info=True)
+                now = datetime.now(UTC).isoformat()
+                await observations.create(
+                    self._db,
+                    id=str(uuid.uuid4()),
+                    source="recon",
+                    type="finding",
+                    category="github_releases",
+                    content=content,
+                    priority=project.get("priority", "medium"),
+                    created_at=now,
+                    content_hash=content_hash,
+                )
             new_count += 1
 
         return new_count
+
+    async def _get_last_release_timestamp(self, project_name: str) -> str | None:
+        """Get the most recent release timestamp for a project from observations."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT content FROM observations "
+                "WHERE source IN ('recon', 'intake:github_landscape') "
+                "AND category = 'github_releases' "
+                "AND content LIKE ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (f"{project_name} %",),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            # Extract "Released: 2026-05-10T..." from content
+            text = row[0] if isinstance(row, tuple) else row["content"]
+            for line in text.split("\n"):
+                if line.startswith("Released: "):
+                    return line[len("Released: "):].strip()
+        except Exception:
+            logger.debug("Could not get last release timestamp for %s", project_name, exc_info=True)
+        return None
 
     async def _run_gh(self, *args: str) -> str:
         """Run gh CLI command with timeout. Returns stdout or empty on failure."""

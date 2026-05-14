@@ -93,6 +93,7 @@ class SurplusScheduler:
         self._dead_letter_replay_executor: SurplusExecutor | None = None
         self._db_maintenance_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
+        self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -154,6 +155,10 @@ class SurplusScheduler:
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
         self._recon_gatherer = gatherer
+
+    def set_model_intelligence_job(self, job) -> None:
+        """Set the ModelIntelligenceJob for scheduled model landscape scanning."""
+        self._model_intelligence_job = job
 
     def set_extraction_deps(
         self,
@@ -222,6 +227,16 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Model intelligence: weekly Sunday 6am (per config/recon_schedules.yaml)
+        if self._model_intelligence_job is not None:
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self.run_model_intelligence,
+                CronTrigger(day_of_week="sun", hour=6),
+                id="model_intelligence",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
         self._scheduler.add_job(
             self.schedule_maintenance,
             IntervalTrigger(hours=self._maintenance_hours),
@@ -560,6 +575,45 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("recon_gather", str(exc))
+            except Exception:
+                pass
+
+    async def run_model_intelligence(self) -> None:
+        """Run model intelligence scan (weekly)."""
+        if self._model_intelligence_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "model_intelligence", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._model_intelligence_job.run()
+            total = result.get("total_findings", 0)
+            logger.info("Model intelligence scan: %d findings", total)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "model_intelligence completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("model_intelligence")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Model intelligence scan failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "model_intelligence.failed",
+                    "Model intelligence scan failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
             except Exception:
                 pass
 
