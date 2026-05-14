@@ -11,7 +11,6 @@ from genesis.db.crud import (
     cognitive_state,
     cost_events,
     observations,
-    surplus,
 )
 from genesis.reflection.types import (
     ContextBundle,
@@ -25,7 +24,6 @@ logger = logging.getLogger(__name__)
 # Thresholds for "pending work" detection
 _MIN_OBSERVATIONS_FOR_CONSOLIDATION = 10
 _COGNITIVE_STATE_STALE_HOURS = 24
-_SURPLUS_BACKLOG_WARNING_THRESHOLD = 500
 
 
 class ContextGatherer:
@@ -42,7 +40,7 @@ class ContextGatherer:
         cog_state = await cognitive_state.render(db)
         recent_obs = await self._recent_observations(db)
         proc_stats = await self._procedure_stats(db)
-        surplus_items = await surplus.list_pending(db, limit=20)
+        intel_digest = await self._intelligence_digest(db)
         cost = await self._cost_summary(db)
         pending = await self.detect_pending_work(db)
         conversations = self._recent_conversation_turns()
@@ -52,7 +50,7 @@ class ContextGatherer:
             cognitive_state=cog_state,
             recent_observations=recent_obs,
             procedure_stats=proc_stats,
-            surplus_staging_items=surplus_items,
+            intelligence_digest=intel_digest,
             cost_summary=cost,
             pending_work=pending,
             recent_conversations=conversations,
@@ -67,15 +65,6 @@ class ContextGatherer:
         unresolved = await observations.query(db, resolved=False, limit=200)
         obs_backlog = len(unresolved)
         has_memory_work = obs_backlog >= _MIN_OBSERVATIONS_FOR_CONSOLIDATION
-
-        # Surplus review: pending staging items (real count, not capped)
-        surplus_count = await surplus.count_pending(db)
-        if surplus_count >= _SURPLUS_BACKLOG_WARNING_THRESHOLD:
-            logger.warning(
-                "Surplus backlog at %d items (threshold: %d) — "
-                "drain rate may be insufficient",
-                surplus_count, _SURPLUS_BACKLOG_WARNING_THRESHOLD,
-            )
 
         # Cognitive state staleness
         current_cog = await cognitive_state.get_current(db, "active_context")
@@ -104,16 +93,18 @@ class ContextGatherer:
         except Exception:
             logger.warning("Skill analysis failed in context_gatherer", exc_info=True)
 
+        # Intake pipeline items since last Deep cycle (for digest awareness)
+        intake_count = await self._intake_items_since_last_deep(db)
+
         return PendingWorkSummary(
             memory_consolidation=has_memory_work,
-            surplus_review=surplus_count > 0,
             skill_review=skills_needing_review > 0,
             cost_reconciliation=True,  # Always include cost summary
             lessons_extraction=has_lessons,
             cognitive_regeneration=cog_stale,
             observation_backlog=obs_backlog,
-            surplus_pending=surplus_count,
             skills_needing_review=skills_needing_review,
+            intake_items_since_last=intake_count,
         )
 
     async def gather_for_assessment(self, db: aiosqlite.Connection) -> dict:
@@ -148,11 +139,8 @@ class ContextGatherer:
             if two_weeks_ago <= o.get("created_at", "") < week_ago
         ]
 
-        # Dimension 5: Resource efficiency
-        surplus_items = await surplus.list_pending(db, limit=100)
-        # Count promoted/discarded this week
-        promoted_count = await self._surplus_status_count(db, "promoted", since=week_ago)
-        discarded_count = await self._surplus_status_count(db, "discarded", since=week_ago)
+        # Dimension 5: Resource efficiency — intake pipeline stats
+        intake_count = await self._intake_items_since_last_deep(db)
 
         # Dimension 6: Blind spots — topic distribution
         topic_dist = {}
@@ -178,9 +166,7 @@ class ContextGatherer:
                 "observations_last_week": len(last_week_obs),
             },
             "resource_efficiency": {
-                "surplus_pending": len(surplus_items),
-                "promoted_this_week": promoted_count,
-                "discarded_this_week": discarded_count,
+                "intake_items_this_cycle": intake_count,
             },
             "blind_spots": {
                 "topic_distribution": topic_dist,
@@ -351,16 +337,65 @@ class ContextGatherer:
         except Exception:
             return {}
 
-    async def _surplus_status_count(
-        self, db: aiosqlite.Connection, status: str, *, since: str
-    ) -> int:
-        """Count surplus items with a given promotion_status since a date."""
+    async def _intelligence_digest(self, db: aiosqlite.Connection) -> str:
+        """Build a summary of intelligence intake since last Deep cycle.
+
+        Replaces the old surplus.list_pending() call. Deep gets a digest
+        for pattern recognition, not individual promote/discard decisions.
+        """
+        # Get last Deep reflection timestamp
+        last_deep = await observations.query(
+            db, source="cc_reflection_deep", limit=1,
+        )
+        since = ""
+        if last_deep:
+            since = last_deep[0].get("created_at", "")
+
+        # Count knowledge units ingested since last Deep
         try:
-            cursor = await db.execute(
-                "SELECT COUNT(*) FROM surplus_insights "
-                "WHERE promotion_status = ? AND created_at >= ?",
-                (status, since),
+            query = (
+                "SELECT authority, COUNT(*) as cnt FROM knowledge_units "
+                "WHERE created_at > ? GROUP BY authority ORDER BY cnt DESC"
+            ) if since else (
+                "SELECT authority, COUNT(*) as cnt FROM knowledge_units "
+                "WHERE created_at > datetime('now', '-2 days') "
+                "GROUP BY authority ORDER BY cnt DESC"
             )
+            params = (since,) if since else ()
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+        except Exception:
+            logger.debug("knowledge_units query failed in digest", exc_info=True)
+            rows = []
+
+        if not rows:
+            return "No intelligence items ingested since last Deep cycle."
+
+        total = sum(r[1] for r in rows)
+        parts = [f"**{total} intelligence items** triaged since last Deep cycle:"]
+        for row in rows:
+            parts.append(f"- {row[0]}: {row[1]} items")
+
+        return "\n".join(parts)
+
+    async def _intake_items_since_last_deep(self, db: aiosqlite.Connection) -> int:
+        """Count intake items since last Deep reflection."""
+        last_deep = await observations.query(
+            db, source="cc_reflection_deep", limit=1,
+        )
+        since = ""
+        if last_deep:
+            since = last_deep[0].get("created_at", "")
+
+        try:
+            query = (
+                "SELECT COUNT(*) FROM knowledge_units WHERE created_at > ?"
+            ) if since else (
+                "SELECT COUNT(*) FROM knowledge_units "
+                "WHERE created_at > datetime('now', '-2 days')"
+            )
+            params = (since,) if since else ()
+            cursor = await db.execute(query, params)
             row = await cursor.fetchone()
             return row[0] if row else 0
         except Exception:
