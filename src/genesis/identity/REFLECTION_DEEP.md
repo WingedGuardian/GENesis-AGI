@@ -78,13 +78,12 @@ For each operation, specify the target observation IDs and a brief reason.
 **IMPORTANT:** Use exact observation IDs from the provided data. Do not fabricate
 or guess IDs. Operations referencing non-existent IDs will be skipped.
 
-### Surplus Review (if staging items are provided)
+### Intelligence Digest Review
 
-For each pending surplus insight, decide:
-- **Promote**: the insight is valuable and should become a permanent observation
-- **Discard**: the insight is low-quality, redundant, or no longer relevant
-
-Provide the item_id, action ("promote" or "discard"), and a brief reason.
+The intake pipeline now handles triage of surplus and recon findings automatically.
+You receive a digest of what was processed since your last cycle — use this for
+pattern recognition, contradiction detection, and strategic thinking. You do NOT
+make individual promote/discard decisions.
 
 ### Skill Review (if skill reports are provided)
 
@@ -210,10 +209,6 @@ the next deep reflection fires.
     {"operation": "merge", "target_ids": ["obs-id-3", "obs-id-4"], "reason": "complementary", "merged_content": "combined insight..."},
     {"operation": "prune", "target_ids": ["obs-id-5"], "reason": "no longer relevant"},
     {"operation": "flag_contradiction", "target_ids": ["obs-id-6", "obs-id-7"], "reason": "conflicting claims about X"}
-  ],
-  "surplus_decisions": [
-    {"item_id": "surplus-id-1", "action": "promote", "reason": "valuable insight"},
-    {"item_id": "surplus-id-2", "action": "discard", "reason": "redundant"}
   ],
   "surplus_task_requests": [
     {"task_type": "memory_audit", "reason": "50+ unresolved observations older than 72h", "priority": 0.7, "drive_alignment": "competence"}

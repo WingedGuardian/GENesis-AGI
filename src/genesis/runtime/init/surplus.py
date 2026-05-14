@@ -93,6 +93,22 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring ReconGatherer", exc_info=True)
             await _degraded(rt, "ReconGatherer")
 
+        try:
+            from genesis.recon.model_intelligence import ModelIntelligenceJob
+            mi_job = ModelIntelligenceJob(
+                db=rt._db,
+                profile_registry=getattr(rt, "_profile_registry", None),
+                surplus_queue=getattr(rt, "_surplus_queue", None),
+            )
+            rt._surplus_scheduler.set_model_intelligence_job(mi_job)
+            logger.info("ModelIntelligenceJob wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire ModelIntelligenceJob", exc_info=True)
+            await _degraded(rt, "ModelIntelligenceJob")
+        except Exception:
+            logger.error("Unexpected error wiring ModelIntelligenceJob", exc_info=True)
+            await _degraded(rt, "ModelIntelligenceJob")
+
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 

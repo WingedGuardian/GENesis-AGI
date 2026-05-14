@@ -93,6 +93,7 @@ class SurplusScheduler:
         self._dead_letter_replay_executor: SurplusExecutor | None = None
         self._db_maintenance_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
+        self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -154,6 +155,10 @@ class SurplusScheduler:
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
         self._recon_gatherer = gatherer
+
+    def set_model_intelligence_job(self, job) -> None:
+        """Set the ModelIntelligenceJob for scheduled model landscape scanning."""
+        self._model_intelligence_job = job
 
     def set_extraction_deps(
         self,
@@ -222,6 +227,16 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Model intelligence: weekly Sunday 6am (per config/recon_schedules.yaml)
+        if self._model_intelligence_job is not None:
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self.run_model_intelligence,
+                CronTrigger(day_of_week="sun", hour=6),
+                id="model_intelligence",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
         self._scheduler.add_job(
             self.schedule_maintenance,
             IntervalTrigger(hours=self._maintenance_hours),
@@ -563,6 +578,45 @@ class SurplusScheduler:
             except Exception:
                 pass
 
+    async def run_model_intelligence(self) -> None:
+        """Run model intelligence scan (weekly)."""
+        if self._model_intelligence_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "model_intelligence", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._model_intelligence_job.run()
+            total = result.get("total_findings", 0)
+            logger.info("Model intelligence scan: %d findings", total)
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "model_intelligence completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("model_intelligence")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Model intelligence scan failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "model_intelligence.failed",
+                    "Model intelligence scan failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
+            except Exception:
+                pass
+
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""
         try:
@@ -715,7 +769,7 @@ class SurplusScheduler:
             await self._maybe_observe_failure(task, result.error or "unknown")
             return False
 
-        # 6. Write to staging (with content-hash dedup + quality gate)
+        # 6. Route through intake pipeline (atomize → score → route to knowledge)
         staging_id = None
         if result.insights:
             insight = result.insights[0]
@@ -727,22 +781,52 @@ class SurplusScheduler:
                     len(content.strip()), task.id[:8],
                 )
             else:
-                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
-                staging_id = f"{task.task_type.value}-{content_hash}"
-                now = self._clock()
-                ttl = (now + timedelta(days=7)).isoformat()
-                now_iso = now.isoformat()
-                await surplus_crud.upsert(
-                    self._db,
-                    id=staging_id,
-                    content=content,
-                    source_task_type=str(task.task_type),
-                    generating_model=insight.get("generating_model", "unknown"),
-                    drive_alignment=task.drive_alignment,
-                    confidence=insight.get("confidence", 0.0),
-                    created_at=now_iso,
-                    ttl=ttl,
-                )
+                try:
+                    from genesis.surplus.intake import (
+                        run_intake,
+                        source_for_task_type,
+                    )
+                    source = source_for_task_type(str(task.task_type))
+                    intake_stats = await run_intake(
+                        content=content,
+                        source=source,
+                        source_task_type=str(task.task_type),
+                        generating_model=insight.get("generating_model", "unknown"),
+                        db=self._db,
+                    )
+                    logger.info(
+                        "Intake routed %d findings (k=%d, o=%d, d=%d) for task %s",
+                        intake_stats.findings_count,
+                        intake_stats.routed_knowledge,
+                        intake_stats.routed_observation,
+                        intake_stats.routed_discard,
+                        task.id[:8],
+                    )
+                    # Use a synthetic staging_id for tracking
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                    staging_id = f"{task.task_type.value}-{content_hash}"
+                except Exception:
+                    # Fallback: write to surplus_insights staging (old behavior)
+                    logger.warning(
+                        "Intake pipeline failed — falling back to surplus_insights staging",
+                        exc_info=True,
+                    )
+                    content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                    staging_id = f"{task.task_type.value}-{content_hash}"
+                    now = self._clock()
+                    ttl = (now + timedelta(days=7)).isoformat()
+                    now_iso = now.isoformat()
+                    await surplus_crud.upsert(
+                        self._db,
+                        id=staging_id,
+                        content=content,
+                        source_task_type=str(task.task_type),
+                        generating_model=insight.get("generating_model", "unknown"),
+                        drive_alignment=task.drive_alignment,
+                        confidence=insight.get("confidence", 0.0),
+                        created_at=now_iso,
+                        ttl=ttl,
+                    )
 
         await self._queue.mark_completed(task.id, staging_id=staging_id)
 

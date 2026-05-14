@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.db.crud import cognitive_state, observations, procedural, surplus
+from genesis.db.crud import cognitive_state, observations, procedural
 from genesis.perception.confidence import load_config as load_confidence_config
 from genesis.perception.confidence import should_gate
 from genesis.reflection.types import (
@@ -18,7 +18,6 @@ from genesis.reflection.types import (
     DimensionScore,
     MemoryOperation,
     QualityCalibrationOutput,
-    SurplusDecision,
     SurplusTaskRequest,
     UserQuestion,
     WeeklyAssessmentOutput,
@@ -70,16 +69,6 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
                 merged_content=op.get("merged_content"),
             ))
 
-    # Parse surplus decisions
-    surplus_decisions = []
-    for sd in data.get("surplus_decisions", []):
-        if isinstance(sd, dict):
-            surplus_decisions.append(SurplusDecision(
-                item_id=sd.get("item_id", ""),
-                action=sd.get("action", "discard"),
-                reason=sd.get("reason", ""),
-            ))
-
     # Parse surplus_task_requests
     task_requests = []
     for req in data.get("surplus_task_requests", []):
@@ -106,7 +95,6 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
         observations=data.get("observations", []),
         cognitive_state_update=data.get("cognitive_state_update"),
         memory_operations=mem_ops,
-        surplus_decisions=surplus_decisions,
         surplus_task_requests=task_requests,
         user_question=user_question,
         skill_triggers=data.get("skill_triggers", []),
@@ -228,7 +216,7 @@ class OutputRouter:
         summary: dict = {
             "observations_written": 0,
             "cognitive_state_updated": False,
-            "surplus_decisions": 0,
+            # surplus_decisions removed — intake pipeline handles triage now
             "memory_operations": 0,
             "quarantines": 0,
             "contradictions": 0,
@@ -253,7 +241,6 @@ class OutputRouter:
             output.observations
             or output.cognitive_state_update
             or output.memory_operations
-            or output.surplus_decisions
             or output.learnings
             or output.focus_next
             or output.skill_triggers
@@ -356,12 +343,7 @@ class OutputRouter:
             )
             summary["focus_next_stored"] = True
 
-        # 4. Surplus decisions
-        for decision in output.surplus_decisions:
-            await self._route_surplus_decision(db, decision)
-            summary["surplus_decisions"] += 1
-
-        # 4b. Surplus task requests (deep reflection dispatching new tasks)
+        # 4. Surplus task requests (deep reflection dispatching new tasks)
         if self._surplus_queue and output.surplus_task_requests:
             from genesis.surplus.types import ComputeTier, TaskType
             for req in output.surplus_task_requests:
@@ -745,48 +727,6 @@ class OutputRouter:
             skip_if_duplicate=True,
         )
         return obs_id
-
-    async def _route_surplus_decision(
-        self, db: aiosqlite.Connection, decision: SurplusDecision,
-    ) -> None:
-        """Apply a surplus promotion/discard decision.
-
-        On promote: fetch the insight, create an observation from its content,
-        then mark the surplus insight as promoted.
-        """
-        if not decision.item_id:
-            return
-        if decision.action == "promote":
-            # Verify the insight exists and isn't already promoted
-            insight = await surplus.get_by_id(db, decision.item_id)
-            if not insight:
-                logger.warning(
-                    "Surplus promote references non-existent ID: %s",
-                    decision.item_id,
-                )
-                return
-            if insight.get("promotion_status") == "promoted":
-                return  # Already promoted — idempotent
-            # Promote first, then create observation (avoids duplicate
-            # observations if promote succeeds but observation creation
-            # is retried by the awareness loop).
-            await surplus.promote(db, decision.item_id, promoted_to="observation")
-            try:
-                await self._write_observation(
-                    db,
-                    source="surplus_promotion",
-                    type=insight.get("source_task_type", "unknown"),
-                    content=insight.get("content", ""),
-                    priority="low",
-                )
-            except Exception:
-                logger.error(
-                    "Failed to create observation for promoted surplus %s",
-                    decision.item_id,
-                    exc_info=True,
-                )
-        elif decision.action == "discard":
-            await surplus.discard(db, decision.item_id)
 
     def _write_reflection_markdown(
         self, label: str, content: str, score: float | None = None,

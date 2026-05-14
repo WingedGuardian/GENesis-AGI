@@ -10,7 +10,6 @@ class DeepReflectionJob(StrEnum):
     """Jobs that a deep reflection cycle can perform."""
 
     MEMORY_CONSOLIDATION = "memory_consolidation"
-    SURPLUS_REVIEW = "surplus_review"
     SKILL_REVIEW = "skill_review"
     COST_RECONCILIATION = "cost_reconciliation"
     LESSONS_EXTRACTION = "lessons_extraction"
@@ -33,7 +32,6 @@ class PendingWorkSummary:
     """Summarises which deep reflection jobs have pending work."""
 
     memory_consolidation: bool = False
-    surplus_review: bool = False
     skill_review: bool = False
     cost_reconciliation: bool = False
     lessons_extraction: bool = False
@@ -41,8 +39,9 @@ class PendingWorkSummary:
 
     # Data counts for prompt assembly (only include sections with data)
     observation_backlog: int = 0
-    surplus_pending: int = 0
     skills_needing_review: int = 0
+    # Intelligence digest for intake pipeline awareness
+    intake_items_since_last: int = 0
 
     @property
     def has_any_work(self) -> bool:
@@ -54,7 +53,6 @@ class PendingWorkSummary:
         """
         return any([
             self.memory_consolidation,
-            self.surplus_review,
             self.skill_review,
             self.lessons_extraction,
             self.cognitive_regeneration,
@@ -65,8 +63,6 @@ class PendingWorkSummary:
         jobs = []
         if self.memory_consolidation:
             jobs.append(DeepReflectionJob.MEMORY_CONSOLIDATION)
-        if self.surplus_review:
-            jobs.append(DeepReflectionJob.SURPLUS_REVIEW)
         if self.skill_review:
             jobs.append(DeepReflectionJob.SKILL_REVIEW)
         if self.cost_reconciliation:
@@ -107,7 +103,7 @@ class ContextBundle:
     cognitive_state: str = ""
     recent_observations: list[dict] = field(default_factory=list)
     procedure_stats: ProcedureStats = field(default_factory=ProcedureStats)
-    surplus_staging_items: list[dict] = field(default_factory=list)
+    intelligence_digest: str = ""
     skill_reports: list[dict] = field(default_factory=list)
     cost_summary: CostSummary = field(default_factory=CostSummary)
     pending_work: PendingWorkSummary = field(default_factory=PendingWorkSummary)
@@ -128,15 +124,6 @@ class MemoryOperation:
     target_ids: list[str] = field(default_factory=list)
     reason: str = ""
     merged_content: str | None = None
-
-
-@dataclass(frozen=True)
-class SurplusDecision:
-    """Decision on a surplus staging item."""
-
-    item_id: str
-    action: str  # "promote" or "discard"
-    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -166,7 +153,6 @@ class DeepReflectionOutput:
     observations: list[str] = field(default_factory=list)
     cognitive_state_update: str | None = None
     memory_operations: list[MemoryOperation] = field(default_factory=list)
-    surplus_decisions: list[SurplusDecision] = field(default_factory=list)
     skill_triggers: list[str] = field(default_factory=list)
     procedure_quarantines: list[dict] = field(default_factory=list)
     contradictions: list[dict] = field(default_factory=list)

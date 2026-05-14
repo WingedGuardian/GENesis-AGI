@@ -370,14 +370,8 @@ async def build_enriched_prompt(
         obs_summary = _format_observations_grouped(bundle.recent_observations)
         parts.append(f"\n## Recent Observations (for consolidation)\n{obs_summary}")
 
-    if bundle.surplus_staging_items:
-        _surplus_limit = max(200, _OBS_TOTAL_CHAR_BUDGET // max(len(bundle.surplus_staging_items), 1))
-        surplus_summary = json.dumps([
-            {"id": s.get("id", ""), "content": s.get("content", "")[:_surplus_limit],
-             "confidence": s.get("confidence", 0), "drive": s.get("drive_alignment", "")}
-            for s in bundle.surplus_staging_items[:10]
-        ], indent=2)
-        parts.append(f"\n## Pending Surplus Items (decide: promote or discard)\n```json\n{surplus_summary}\n```")
+    if bundle.intelligence_digest:
+        parts.append(f"\n## Intelligence Digest (since last Deep cycle)\n{bundle.intelligence_digest}")
 
     stats = bundle.procedure_stats
     if stats.total_active > 0:

@@ -1,9 +1,7 @@
-"""Bridge code audit findings to surplus_insights staging table.
+"""Bridge code audit findings to the intelligence intake pipeline.
 
-Findings are staged for Genesis proper (via reflection) to review and
-promote/discard. They do NOT go to the observations table directly —
-free-model output must pass through Genesis proper before influencing
-reasoning or reaching the user.
+Findings are routed through intake (atomize → score → knowledge base).
+Falls back to surplus_insights staging if the intake pipeline is unavailable.
 """
 
 from __future__ import annotations
@@ -11,8 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import uuid
-from datetime import UTC, datetime, timedelta
 
 from genesis.db.crud import surplus
 
@@ -22,21 +18,19 @@ logger = logging.getLogger(__name__)
 # likely generic/speculative and not worth persisting.
 _MIN_CONFIDENCE = 0.7
 
-_TTL_DAYS = 7
-
 
 class FindingsBridge:
-    """Writes code audit findings to surplus_insights for Genesis proper to review.
+    """Routes code audit findings through the intake pipeline.
 
-    Findings are staged with promotion_status='pending'. Deep reflection
-    reads surplus.list_pending() and decides whether to promote or discard.
+    Findings that pass the confidence gate are routed to the knowledge base
+    via intake. If intake fails, falls back to surplus_insights staging.
     """
 
     def __init__(self, db) -> None:
         self._db = db
 
     async def bridge_findings(self, insights: list[dict]) -> int:
-        """Write findings to surplus_insights table. Returns count of new findings written."""
+        """Route findings through intake. Returns count of findings processed."""
         written = 0
         for insight in insights:
             try:
@@ -62,7 +56,7 @@ class FindingsBridge:
             )
             return 0
 
-        # Hash only semantically meaningful fields for dedup
+        # Hash for dedup check
         hash_keys = {
             k: insight.get(k) for k in ("file", "line", "severity", "suggestion")
         }
@@ -70,7 +64,7 @@ class FindingsBridge:
             json.dumps(hash_keys, sort_keys=True).encode()
         ).hexdigest()[:16]
 
-        # Dedup: use content_hash as id prefix, check with exact prefix match
+        # Dedup: check surplus_insights for already-processed findings
         id_prefix = f"audit-{content_hash}"
         cursor = await self._db.execute(
             "SELECT 1 FROM surplus_insights WHERE id = ? OR id GLOB ?",
@@ -80,19 +74,34 @@ class FindingsBridge:
             logger.debug("Duplicate finding skipped: %s", content_hash)
             return 0
 
-        now = datetime.now(UTC)
-        ttl = (now + timedelta(days=_TTL_DAYS)).isoformat()
-
-        await surplus.create(
-            self._db,
-            id=f"{id_prefix}-{uuid.uuid4().hex[:8]}",
-            content=json.dumps(insight),
-            source_task_type="code_audit",
-            generating_model=insight.get("model", "unknown"),
-            drive_alignment="competence",
-            confidence=confidence,
-            created_at=now.isoformat(),
-            ttl=ttl,
-        )
+        # Route through intake pipeline
+        content = json.dumps(insight)
+        try:
+            from genesis.surplus.intake import IntakeSource, run_intake
+            await run_intake(
+                content=content,
+                source=IntakeSource.ANTICIPATORY_RESEARCH,
+                source_task_type="code_audit",
+                generating_model=insight.get("model", "unknown"),
+                db=self._db,
+            )
+        except Exception:
+            # Fallback: write to surplus_insights staging (old behavior)
+            logger.warning("Intake failed for code audit finding — falling back to staging", exc_info=True)
+            import uuid
+            from datetime import UTC, datetime, timedelta
+            now = datetime.now(UTC)
+            ttl = (now + timedelta(days=7)).isoformat()
+            await surplus.create(
+                self._db,
+                id=f"{id_prefix}-{uuid.uuid4().hex[:8]}",
+                content=content,
+                source_task_type="code_audit",
+                generating_model=insight.get("model", "unknown"),
+                drive_alignment="competence",
+                confidence=confidence,
+                created_at=now.isoformat(),
+                ttl=ttl,
+            )
 
         return 1

@@ -628,8 +628,7 @@ class MailMonitor:
         decision: dict,
         batch_id: str,
     ) -> None:
-        """Store a single KEEP decision as a recon observation."""
-        now = datetime.now(UTC).isoformat()
+        """Store a single KEEP decision via intake pipeline."""
         content_hash = hashlib.sha256(
             f"email_recon:{email.message_id}".encode(),
         ).hexdigest()[:16]
@@ -649,17 +648,29 @@ class MailMonitor:
             f"Judge rationale: {rationale}"
         )
 
-        await observations.create(
-            self._db,
-            id=str(uuid.uuid4()),
-            source="recon",
-            type="finding",
-            category="email_recon",
-            content=content,
-            priority="medium",
-            created_at=now,
-            content_hash=content_hash,
-        )
+        try:
+            from genesis.surplus.intake import IntakeSource, run_intake
+            await run_intake(
+                content=content,
+                source=IntakeSource.EMAIL_RECON,
+                source_task_type="email_recon",
+                db=self._db,
+            )
+        except Exception:
+            # Fallback: store as observation directly (old behavior)
+            logger.warning("Intake failed for email_recon finding — falling back to direct observation", exc_info=True)
+            now = datetime.now(UTC).isoformat()
+            await observations.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source="recon",
+                type="finding",
+                category="email_recon",
+                content=content,
+                priority="medium",
+                created_at=now,
+                content_hash=content_hash,
+            )
 
     def _build_judge_prompt(self, briefs: list[EmailBrief]) -> str:
         """Build the Layer 2 judge prompt from paralegal briefs."""
