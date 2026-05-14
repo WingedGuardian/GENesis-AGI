@@ -65,8 +65,8 @@ class WorldSnapshot:
                 verb = evt.get("verb", "?")
                 obj = evt.get("object", "")
 
-                # Urgency marker
-                urgency = ""
+                # Relative time annotation
+                relative = ""
                 try:
                     evt_date = datetime.fromisoformat(
                         evt.get("event_date", "")
@@ -74,17 +74,24 @@ class WorldSnapshot:
                     if evt_date.tzinfo is None:
                         evt_date = evt_date.replace(tzinfo=UTC)
                     days_until = (evt_date - now).days
-                    if days_until < 0:
-                        urgency = " **OVERDUE**"
-                    elif days_until <= 2:
-                        urgency = " **IMMINENT**"
+                    if days_until < -1:
+                        relative = f" **OVERDUE** ({abs(days_until)} days ago)"
+                    elif days_until == -1:
+                        relative = " **OVERDUE** (yesterday)"
+                    elif days_until == 0:
+                        relative = " **TODAY**"
+                    elif days_until == 1:
+                        relative = " **TOMORROW**"
                     elif days_until <= 7:
-                        urgency = " *APPROACHING*"
+                        relative = f" **in {days_until} days**"
+                    elif days_until <= 14:
+                        relative = f" (in {days_until} days)"
+                    # >14 days: no annotation, just the date
                 except (ValueError, TypeError):
                     pass
 
                 parts.append(
-                    f"- [{date_str}] {subj} {verb} {obj}{urgency}"
+                    f"- [{date_str}] {subj} {verb} {obj}{relative}"
                 )
             parts.append("")
 

@@ -59,6 +59,7 @@ class GenesisEgoContextBuilder:
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
+        sections.append(await self._capability_performance_section())
         sections.append(await self._autonomy_readiness_section())
         sections.append(self._output_contract_section())
 
@@ -472,6 +473,42 @@ class GenesisEgoContextBuilder:
             lines.append(f"- [{ts}] [{priority}] {short}")
 
         lines.append("")
+        return "\n".join(lines)
+
+    async def _capability_performance_section(self) -> str:
+        """System capability performance — domain confidence from multiple sources."""
+        lines = ["## Capability Performance\n"]
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+
+            entries = await cap_crud.get_all(self._db)
+        except Exception:
+            return ""
+
+        if not entries:
+            lines.append("*No performance data yet.*\n")
+            return "\n".join(lines)
+
+        _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
+
+        lines.append("| Domain | Confidence | Trend | Samples | Evidence |")
+        lines.append("|--------|-----------|-------|---------|----------|")
+        for e in entries[:15]:
+            domain = e.get("domain", "?")
+            conf = e.get("confidence", 0.0)
+            trend = e.get("trend", "stable")
+            samples = e.get("sample_size", 0)
+            evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
+            icon = _TREND_ICONS.get(trend, "=")
+            lines.append(
+                f"| {domain} | {conf:.0%} | {icon} | {samples} | {evidence} |"
+            )
+
+        lines.append(
+            "\nDeclining domains may need investigation. Improving domains "
+            "indicate effective maintenance patterns.\n"
+        )
         return "\n".join(lines)
 
     async def _autonomy_readiness_section(self) -> str:

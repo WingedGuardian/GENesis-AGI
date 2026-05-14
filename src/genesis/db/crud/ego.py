@@ -224,6 +224,9 @@ async def create_proposal(
     execution_plan: str | None = None,
     recurring: bool = False,
     memory_basis: str = "",
+    realist_verdict: str | None = None,
+    realist_reasoning: str | None = None,
+    ego_source: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -233,8 +236,9 @@ async def create_proposal(
            (id, action_type, action_category, content, rationale,
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
-            recurring, memory_basis)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            recurring, memory_basis, realist_verdict, realist_reasoning,
+            ego_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -253,6 +257,9 @@ async def create_proposal(
             execution_plan,
             1 if recurring else 0,
             memory_basis,
+            realist_verdict,
+            realist_reasoning,
+            ego_source,
         ),
     )
     await db.commit()
@@ -281,11 +288,27 @@ async def list_proposals_by_batch(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-async def list_pending_proposals(db: aiosqlite.Connection) -> list[dict]:
-    """All pending proposals, oldest first."""
-    cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE status = 'pending' ORDER BY created_at ASC",
-    )
+async def list_pending_proposals(
+    db: aiosqlite.Connection,
+    *,
+    ego_source: str | None = None,
+) -> list[dict]:
+    """All pending proposals, oldest first.
+
+    If ``ego_source`` is provided, only returns proposals from that ego.
+    NULL ego_source proposals (pre-migration) match any filter.
+    """
+    if ego_source:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals "
+            "WHERE status = 'pending' AND (ego_source = ? OR ego_source IS NULL) "
+            "ORDER BY created_at ASC",
+            (ego_source,),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals WHERE status = 'pending' ORDER BY created_at ASC",
+        )
     return [dict(r) for r in await cursor.fetchall()]
 
 

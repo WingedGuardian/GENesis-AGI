@@ -1091,6 +1091,24 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # lack rows. Without backfill, the "recent" dashboard view is empty.
     await _migrate_backfill_memory_metadata(db)
 
+    # Ego proposals: realist gate annotations (dreamer/realist architecture).
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN realist_verdict TEXT",
+        "ego_proposals.realist_verdict")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN realist_reasoning TEXT",
+        "ego_proposals.realist_reasoning")
+
+    # Ego proposals: ego_source for cross-ego isolation.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN ego_source TEXT",
+        "ego_proposals.ego_source")
+
+    # Capability map: previous_confidence for trend detection.
+    await _try_alter(db,
+        "ALTER TABLE capability_map ADD COLUMN previous_confidence REAL",
+        "capability_map.previous_confidence")
+
     # World model tables: user goals and contacts for ego world model.
     await _migrate_world_model_tables(db)
 

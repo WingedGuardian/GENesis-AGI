@@ -22,15 +22,19 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
     domains: dict[str, _DomainAccumulator] = {}
 
     # 1. Intervention journal — proposal outcome rates by action_type
+    # Excludes withdrawn/tabled from denominator — these are lifecycle
+    # events, not user decisions on proposal quality.
     try:
         from genesis.db.crud import intervention_journal as journal_crud
         aggs = await journal_crud.aggregate_by_type(db)
         for row in aggs:
             domain = row["action_type"]
-            total = row["total"]
+            # Only count terminal user-decision states in denominator
+            success = row.get("approved", 0) + row.get("executed", 0)
+            rejected = row.get("rejected", 0) + row.get("failed", 0)
+            total = success + rejected
             if total == 0:
                 continue
-            success = row.get("approved", 0) + row.get("executed", 0)
             rate = success / total
             acc = domains.setdefault(domain, _DomainAccumulator(domain))
             acc.add_signal("journal", rate, total)
@@ -38,17 +42,20 @@ async def compute_capability_map(db: aiosqlite.Connection) -> list[dict]:
         logger.debug("Capability aggregation: intervention_journal unavailable")
 
     # 2. Ego proposals — approval rates by action_type (30d)
+    # Excludes withdrawn/tabled/expired from denominator — only count
+    # proposals that reached a terminal user-decision state.
     try:
         cur = await db.execute(
             """SELECT action_type,
-                      COUNT(*) as total,
-                      SUM(CASE WHEN status IN ('approved', 'executed') THEN 1 ELSE 0 END) as success
+                      SUM(CASE WHEN status IN ('approved', 'executed') THEN 1 ELSE 0 END) as success,
+                      SUM(CASE WHEN status IN ('rejected', 'failed') THEN 1 ELSE 0 END) as rejected
                FROM ego_proposals
                WHERE created_at >= datetime('now', '-30 days')
-                 AND status != 'pending'
+                 AND status IN ('approved', 'executed', 'rejected', 'failed')
                GROUP BY action_type"""
         )
-        for action_type, total, success in await cur.fetchall():
+        for action_type, success, rejected in await cur.fetchall():
+            total = success + rejected
             if total == 0:
                 continue
             rate = success / total

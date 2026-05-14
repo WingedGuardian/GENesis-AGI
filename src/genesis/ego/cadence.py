@@ -85,6 +85,19 @@ class EgoCadenceManager:
         # Prevent concurrent cycles (interval + morning could overlap)
         self._lock = asyncio.Lock()
 
+        # Deep-think counter: every Nth proactive cycle uses Opus instead
+        # of the ego's base model. Only meaningful for egos that run Sonnet
+        # by default (Genesis ego). User ego already runs Opus proactive.
+        self._deep_think_interval = 5
+        self._proactive_cycle_count = 0
+
+        # Reactive event queue: events push here, debounce loop drains
+        self._reactive_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
+        self._reactive_task: asyncio.Task | None = None
+        self._reactive_debounce_s = 300  # 5 minutes
+        self._reactive_max_per_hour = 3
+        self._reactive_timestamps: list[datetime] = []
+
     # -- Lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
@@ -119,6 +132,9 @@ class EgoCadenceManager:
             misfire_grace_time=300,
         )
         self._scheduler.start()
+        self._reactive_task = asyncio.create_task(
+            self._reactive_loop(), name=f"ego_reactive_{id(self)}",
+        )
         self._running = True
         morning_str = (
             f", morning={self._config.morning_report_hour:02d}:"
@@ -128,13 +144,16 @@ class EgoCadenceManager:
             else ", morning=disabled"
         )
         logger.info(
-            "Ego cadence started (interval=%dm%s)",
+            "Ego cadence started (interval=%dm%s, reactive=enabled)",
             self._current_interval,
             morning_str,
         )
 
     async def stop(self) -> None:
-        """Shut down APScheduler."""
+        """Shut down APScheduler and reactive loop."""
+        if self._reactive_task is not None:
+            self._reactive_task.cancel()
+            self._reactive_task = None
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
         self._running = False
@@ -166,10 +185,104 @@ class EgoCadenceManager:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
+    # -- Reactive event queue -----------------------------------------------
+
+    def push_reactive_event(self, event: dict) -> None:
+        """Push an event that may trigger a reactive ego cycle.
+
+        Events are debounced: the reactive loop waits 5 minutes after the
+        first event before running a cycle (batching concurrent events).
+        Rate-limited to 3 reactive cycles per hour.
+
+        event keys: {"type": str, "summary": str, "priority": str?, "source": str?}
+        """
+        if not self._running or self._paused:
+            return
+        try:
+            self._reactive_queue.put_nowait(event)
+            logger.debug("Reactive event queued: %s", event.get("type", "?"))
+        except asyncio.QueueFull:
+            logger.warning("Reactive queue full — dropping event")
+
+    async def _reactive_loop(self) -> None:
+        """Background task: drain reactive queue with debounce, run cycle."""
+        while True:
+            try:
+                # Block until first event arrives
+                first_event = await self._reactive_queue.get()
+                events = [first_event]
+
+                # Debounce: wait, then drain anything that arrived meanwhile
+                await asyncio.sleep(self._reactive_debounce_s)
+                while not self._reactive_queue.empty():
+                    try:
+                        events.append(self._reactive_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Rate limit: max N reactive cycles per hour
+                now = datetime.now(UTC)
+                cutoff = now - timedelta(hours=1)
+                self._reactive_timestamps = [
+                    ts for ts in self._reactive_timestamps if ts > cutoff
+                ]
+                if len(self._reactive_timestamps) >= self._reactive_max_per_hour:
+                    logger.info(
+                        "Reactive rate limit: %d/%d in last hour, skipping %d event(s)",
+                        len(self._reactive_timestamps),
+                        self._reactive_max_per_hour,
+                        len(events),
+                    )
+                    continue
+
+                # Run reactive cycle
+                event_summary = "; ".join(
+                    e.get("summary", e.get("type", "?"))[:80] for e in events[:5]
+                )
+                logger.info(
+                    "Reactive cycle triggered by %d event(s): %s",
+                    len(events),
+                    event_summary,
+                )
+
+                async with self._lock:
+                    if not self._should_run(skip_idle_check=True):
+                        continue
+
+                    try:
+                        from genesis.ego.types import CycleType
+
+                        cycle = await self._session.run_cycle(
+                            cycle_type=CycleType.REACTIVE,
+                        )
+                    except (BudgetExceededError, CycleBlockedError) as exc:
+                        logger.info("Reactive cycle gated: %s", exc)
+                        continue
+                    except Exception:
+                        logger.error("Reactive cycle failed", exc_info=True)
+                        self._record_failure("reactive cycle failed")
+                        continue
+
+                    if cycle is not None:
+                        self._record_success()
+                        self._reactive_timestamps.append(datetime.now(UTC))
+                        logger.info(
+                            "Reactive cycle %s completed (cost=$%.4f)",
+                            cycle.id,
+                            cycle.cost_usd,
+                        )
+
+            except asyncio.CancelledError:
+                logger.debug("Reactive loop cancelled")
+                return
+            except Exception:
+                logger.error("Reactive loop error", exc_info=True)
+                await asyncio.sleep(60)  # Back off on unexpected errors
+
     # -- Sweep helpers -----------------------------------------------------
 
     async def _sweep_with_expiry(self) -> None:
-        """Expire stale proposals, then dispatch approved ones."""
+        """Expire stale proposals, dispatch approved, check deadlines."""
         try:
             from genesis.db.crud import ego as ego_crud
 
@@ -181,6 +294,35 @@ class EgoCadenceManager:
 
         await self._session.sweep_approved_proposals()
 
+        # Deadline scanner: push reactive events for approaching deadlines
+        await self._check_approaching_deadlines()
+
+    async def _check_approaching_deadlines(self) -> None:
+        """Push reactive events for events approaching within 48h."""
+        try:
+            from genesis.db.crud import memory_events
+
+            events = await memory_events.approaching_deadlines(
+                self._session._db, days=2, limit=5,
+            )
+            if not events:
+                return
+
+            for evt in events:
+                subj = evt.get("subject", "?")
+                verb = evt.get("verb", "?")
+                obj = evt.get("object", "")
+                date = evt.get("event_date", "")[:10]
+                self.push_reactive_event({
+                    "type": "deadline_approaching",
+                    "summary": f"{subj} {verb} {obj} on {date}",
+                    "priority": "high",
+                    "source": "deadline_scanner",
+                })
+            logger.debug("Deadline scanner found %d approaching event(s)", len(events))
+        except Exception:
+            logger.debug("Deadline scanner failed", exc_info=True)
+
     # -- Tick handlers -----------------------------------------------------
 
     async def _on_tick(self) -> None:
@@ -190,8 +332,25 @@ class EgoCadenceManager:
             if not self._should_run(skip_idle_check=False):
                 return
 
+            # Deep-think: every Nth proactive cycle upgrades to Opus.
+            # Only effective for egos that normally run Sonnet (Genesis ego).
+            self._proactive_cycle_count += 1
+            model_override = None
+            if (
+                self._deep_think_interval > 0
+                and self._proactive_cycle_count % self._deep_think_interval == 0
+                and self._config.model != "opus"
+            ):
+                model_override = "opus"
+                logger.info(
+                    "Deep-think cycle %d — upgrading to Opus",
+                    self._proactive_cycle_count,
+                )
+
             try:
-                cycle = await self._session.run_cycle()
+                cycle = await self._session.run_cycle(
+                    model_override=model_override,
+                )
             except BudgetExceededError:
                 # Budget exhaustion is intentional, not a failure.
                 # Don't trip the circuit breaker.

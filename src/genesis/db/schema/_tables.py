@@ -770,7 +770,10 @@ TABLES = {
             rank            INTEGER,                  -- board position (lower = higher priority)
             execution_plan  TEXT,                     -- dispatch instructions for approved proposals
             recurring       INTEGER DEFAULT 0,        -- 1 if ongoing/recurring commitment
-            memory_basis    TEXT DEFAULT ''            -- non-obvious memory attribution
+            memory_basis    TEXT DEFAULT '',           -- non-obvious memory attribution
+            realist_verdict  TEXT,                     -- realist gate: pass/amend/reject
+            realist_reasoning TEXT,                    -- realist gate: explanation
+            ego_source       TEXT                     -- which ego created this (user_ego_cycle / genesis_ego_cycle)
         )
     """,
     "ego_state": """
@@ -810,7 +813,8 @@ TABLES = {
             trend           TEXT DEFAULT 'stable'
                 CHECK (trend IN ('improving', 'stable', 'declining')),
             evidence_summary TEXT,                        -- brief rationale
-            updated_at      TEXT NOT NULL
+            updated_at      TEXT NOT NULL,
+            previous_confidence REAL                      -- last refresh score for trend detection
         )
     """,
     # ── Behavioral Immune System (BIS) ───────────────────────────────────────

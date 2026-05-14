@@ -19,6 +19,8 @@ from typing import Any
 
 import aiosqlite
 
+from genesis.ego.types import NEUTRAL_STATUS
+
 logger = logging.getLogger(__name__)
 
 # Observation categories that represent user-world signals.
@@ -81,6 +83,7 @@ class UserEgoContextBuilder:
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
+        sections.append(await self._capability_performance_section())
         sections.append(await self._autonomy_readiness_section())
         sections.append(await self._recurring_patterns_section())
         sections.append(self._output_contract_section())
@@ -624,23 +627,26 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _proposal_history_section(self) -> str:
-        """Recent proposal topics for duplicate avoidance.
+    _NEUTRAL_STATUS = NEUTRAL_STATUS  # single source of truth in ego.types
 
-        Shows WHAT was proposed (to prevent re-proposing the same idea),
-        but NOT status/response — engagement metrics trigger LLM deference
-        bias and self-suppression.  Intervention history (separate section)
-        provides outcome learning for executed proposals.
+    async def _proposal_history_section(self) -> str:
+        """Recent proposal topics with neutral status for context.
+
+        Shows WHAT was proposed and its lifecycle outcome using neutral
+        labels (no judgment language). Also shows realist annotations
+        when available. No aggregate scores, no user_response text —
+        those trigger deference bias.
         """
         lines = ["## Recent Proposals (last 7 days)\n"]
 
         try:
             cursor = await self._db.execute(
-                "SELECT action_type, content, created_at "
+                "SELECT action_type, content, status, realist_verdict, "
+                "realist_reasoning, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "ORDER BY created_at DESC "
-                "LIMIT 15"
+                "LIMIT 15",
             )
             rows = await cursor.fetchall()
         except Exception:
@@ -653,12 +659,22 @@ class UserEgoContextBuilder:
 
         lines.append(f"**{len(rows)} proposals** in last 7 days:\n")
 
-        lines.append("| Action | Topic |")
-        lines.append("|--------|-------|")
-        for action_type, content, _created in rows:
+        lines.append("| Action | Topic | Outcome | Realist |")
+        lines.append("|--------|-------|---------|---------|")
+        for row in rows:
+            action_type = row["action_type"]
+            content = row["content"]
             short = content[:100] + "..." if len(content) > 100 else content
             short = short.replace("\n", " ").replace("|", "/")
-            lines.append(f"| {action_type} | {short} |")
+            status = self._NEUTRAL_STATUS.get(row["status"], row["status"])
+            realist = ""
+            if row["realist_verdict"]:
+                realist = row["realist_verdict"]
+                if row["realist_reasoning"]:
+                    reason_short = row["realist_reasoning"][:60]
+                    reason_short = reason_short.replace("|", "/")
+                    realist = f"{realist}: {reason_short}"
+            lines.append(f"| {action_type} | {short} | {status} | {realist} |")
 
         lines.append("")
         return "\n".join(lines)
@@ -711,6 +727,28 @@ class UserEgoContextBuilder:
         else:
             lines.append("\n*No approved proposals awaiting execution.*\n")
 
+        # Deferred (tabled) proposals — ego can resurface or withdraw
+        try:
+            tabled = await ego_crud.get_tabled(self._db)
+        except Exception:
+            tabled = []
+
+        if tabled:
+            shown = tabled[:8]
+            lines.append(f"\n**Deferred ({len(tabled)} tabled)**:\n")
+            for p in shown:
+                content = (p.get("content") or "")[:120]
+                content = content.replace("\n", " ")
+                lines.append(
+                    f"- (id:{p['id']}) **{p.get('action_type', '?')}**: {content}"
+                )
+            if len(tabled) > 8:
+                lines.append(f"- ... and {len(tabled) - 8} more")
+            lines.append(
+                "\nReview deferred items each cycle. Withdraw if stale, "
+                "resurface if conditions changed.\n"
+            )
+
         lines.append("")
         return "\n".join(lines)
 
@@ -742,6 +780,44 @@ class UserEgoContextBuilder:
             lines.append(f"- [{ts}] [{priority}] {short}")
 
         lines.append("")
+        return "\n".join(lines)
+
+    async def _capability_performance_section(self) -> str:
+        """Your track record — domain confidence from multiple data sources.
+
+        Framed as context for better proposals, NOT as a limiter.
+        The realist gate handles feasibility; this informs confidence calibration.
+        """
+        lines = ["## Your Track Record\n"]
+
+        try:
+            from genesis.db.crud import capability_map as cap_crud
+
+            entries = await cap_crud.get_all(self._db)
+        except Exception:
+            return ""
+
+        if not entries:
+            lines.append("*No performance data yet.*\n")
+            return "\n".join(lines)
+
+        _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
+
+        lines.append("| Domain | Confidence | Trend | Evidence |")
+        lines.append("|--------|-----------|-------|----------|")
+        for e in entries[:12]:
+            domain = e.get("domain", "?")
+            conf = e.get("confidence", 0.0)
+            trend = e.get("trend", "stable")
+            evidence = (e.get("evidence_summary") or "")[:80].replace("|", "/")
+            icon = _TREND_ICONS.get(trend, "=")
+            lines.append(f"| {domain} | {conf:.0%} | {icon} | {evidence} |")
+
+        lines.append(
+            "\nUse this to calibrate confidence on proposals. High-confidence "
+            "domains deserve ambitious proposals. Low-confidence domains may "
+            "benefit from smaller, incremental actions.\n"
+        )
         return "\n".join(lines)
 
     async def _autonomy_readiness_section(self) -> str:
