@@ -147,6 +147,22 @@ class TestClassifyAlerts:
         assert alarms[1].tier == 2
         assert alarms[2].tier == 3
 
+    def test_call_site_down_is_tier3(self):
+        """Call site DOWN alerts emit WARNING (not CRITICAL) because the
+        Sentinel has no remediation path for provider circuit breakers.
+        WARNING routes to Tier 3 (reflexes only, Sentinel stays asleep).
+        """
+        alerts = [
+            {
+                "id": "call_site:33_skill_refiner",
+                "severity": "WARNING",
+                "message": "Call site 33_skill_refiner is DOWN (all providers exhausted)",
+            },
+        ]
+        alarms = classify_alerts(alerts)
+        assert len(alarms) == 1
+        assert alarms[0].tier == 3
+
     def test_info_severity_ignored(self):
         alerts = [
             {"id": "resolved:thing", "severity": "INFO", "message": "All good"},

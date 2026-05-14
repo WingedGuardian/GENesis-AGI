@@ -168,9 +168,14 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             continue
 
         if status_val == "down":
+            # Call site DOWN means all provider circuit breakers are open —
+            # a transient provider-side condition (rate limits, API outages).
+            # The Sentinel has no remediation path for external providers;
+            # circuit breakers auto-reset. Emit WARNING (→ Tier 3, reflexes
+            # only) instead of CRITICAL (→ Tier 2, wakes Sentinel).
             alerts.append({
                 "id": alert_id,
-                "severity": "CRITICAL",
+                "severity": "WARNING",
                 "message": f"Call site {site_id} is DOWN (all providers exhausted)",
             })
             current_ids.add(alert_id)
