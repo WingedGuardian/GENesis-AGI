@@ -60,6 +60,7 @@ _IDLE_TIMEOUT_S = 3600  # 1 hour
 
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
+_VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
 
 
 def _is_page_alive(page) -> bool:
@@ -818,6 +819,79 @@ async def _poll_turnstile_token(page, timeout_s: float, interval_s: float) -> bo
     return False
 
 
+async def _vnc_click_turnstile(page) -> bool:
+    """Click the Turnstile checkbox via VNC trusted input.
+
+    Uses vncdotool to send a mouse click through the VNC protocol, producing
+    real X11 input events with network-realistic timing that passes
+    Cloudflare's synthetic event fingerprinting (XTest, CDP are detected).
+
+    Returns True if the click was sent (caller must poll for token afterward).
+    """
+    try:
+        # Calculate screen coordinates from browser position + iframe rect.
+        # Uses JS to get the browser's own screen offset and chrome height,
+        # avoiding fragile hardcoded pixel offsets.
+        coords = await page.evaluate("""() => {
+            const iframe = document.querySelector(
+                'iframe[src*="challenges.cloudflare"]'
+            );
+            if (!iframe) return null;
+            const rect = iframe.getBoundingClientRect();
+            const chromeH = window.outerHeight - window.innerHeight;
+            return {
+                x: Math.round(window.screenX + rect.left + 28),
+                y: Math.round(
+                    window.screenY + chromeH + rect.top + rect.height / 2
+                ),
+            };
+        }""")
+        if coords is None:
+            logger.warning("VNC Turnstile click: iframe not found via JS")
+            return False
+
+        click_x, click_y = coords["x"], coords["y"]
+        logger.info("VNC Turnstile click: targeting (%d, %d)", click_x, click_y)
+
+        # Human-like pre-click delay
+        await asyncio.sleep(random.uniform(0.5, 1.5))
+
+        # Send mouse move + click via VNC protocol (trusted input).
+        # vncdo handles VNC auth (DES key derivation) internally.
+        # asyncio.create_subprocess_exec is the safe path (no shell).
+        proc = await asyncio.create_subprocess_exec(
+            "vncdo",
+            "-s", "localhost::5900",
+            "-p", _VNC_PASSWORD,
+            "--delay=300",
+            "move", str(click_x), str(click_y),
+            "click", "1",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.warning(
+                "VNC Turnstile click: vncdo failed (rc=%d): %s",
+                proc.returncode,
+                stderr.decode()[:200],
+            )
+            return False
+
+        logger.info("VNC Turnstile click sent at (%d, %d)", click_x, click_y)
+        return True
+
+    except FileNotFoundError:
+        logger.warning(
+            "VNC Turnstile click: vncdo binary not found — "
+            "install vncdotool: pip install vncdotool"
+        )
+        return False
+    except Exception as e:
+        logger.warning("VNC Turnstile click failed: %s", e, exc_info=True)
+        return False
+
+
 async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     """Detect and handle Cloudflare Turnstile challenge.
 
@@ -825,10 +899,13 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     iframe to produce a ``cf-turnstile-response`` token.  Many challenges
     auto-resolve for legitimate-looking browsers.
 
-    Phase 2 (human escalation): If auto-resolve fails, sends a Telegram
-    alert and polls for up to 5 minutes for human intervention via VNC.
-    The browser is always headed on :99, so the human can see and interact
-    with it immediately — no restart needed.
+    Phase 2 (VNC trusted input): Sends a real mouse click through the VNC
+    protocol, bypassing Cloudflare's synthetic event detection.  Up to 2
+    attempts with coordinate recalculation between them.
+
+    Phase 3 (human escalation): Sends a Telegram alert and polls for up to
+    5 minutes.  The browser is always headed on :99, so the human can see
+    and interact immediately — no restart needed.
 
     Returns None if no Turnstile detected, or a status dict.
     """
@@ -850,8 +927,33 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 2: escalate to human
-        logger.warning("Turnstile did NOT auto-resolve — escalating to human via Telegram")
+        # Phase 2: VNC trusted input click (up to 2 attempts)
+        logger.warning(
+            "Turnstile did NOT auto-resolve in %dms — trying VNC click",
+            timeout_ms,
+        )
+        for attempt in range(1, 3):
+            if await _vnc_click_turnstile(page):
+                if await _poll_turnstile_token(page, 30, 1.0):
+                    logger.info(
+                        "Turnstile resolved via VNC click (attempt %d)",
+                        attempt,
+                    )
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                    return {"status": "resolved", "method": "vnc_click"}
+                logger.info(
+                    "VNC click %d sent but Turnstile not yet resolved",
+                    attempt,
+                )
+            else:
+                logger.warning("VNC click attempt %d failed to send", attempt)
+            if attempt < 2:
+                await asyncio.sleep(random.uniform(1.0, 2.0))
+
+        # Phase 3: human escalation (last resort)
+        logger.warning(
+            "Turnstile NOT resolved via VNC — escalating to human"
+        )
         await _send_turnstile_alert(page.url)
 
         if await _poll_turnstile_token(page, 300, 5.0):  # 5 minutes
