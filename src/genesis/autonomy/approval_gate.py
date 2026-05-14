@@ -394,14 +394,6 @@ class AutonomousCliApprovalGate:
             request_id, status=decision, resolved_by=resolved_by,
         )
 
-    async def get_request_subsystem(self, request_id: str) -> str | None:
-        """Return the subsystem from a request's context, or ``None``."""
-        row = await self._approval_manager.get_by_id(request_id)
-        if not row:
-            return None
-        context = _json_loads(row.get("context"))
-        return context.get("subsystem")
-
     async def _find_existing(
         self, approval_key: str,
         *,

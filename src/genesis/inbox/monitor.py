@@ -177,15 +177,13 @@ class InboxMonitor:
 
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         self._autonomous_dispatcher = dispatcher
+        # Now that the approval gate is wired, check for items that were
+        # approved while the server was down.  Must happen AFTER the
+        # dispatcher is set so the approval_manager is available.
+        self.wake()
 
     async def start(self) -> None:
         """Start the inbox monitor scheduler."""
-        # Immediate startup check for items approved while the server was down.
-        try:
-            await self.check_once()
-        except Exception:
-            logger.warning("Startup inbox check failed (non-fatal)", exc_info=True)
-
         self._scheduler.add_job(
             self._check_inbox,
             IntervalTrigger(seconds=self._config.check_interval_seconds),

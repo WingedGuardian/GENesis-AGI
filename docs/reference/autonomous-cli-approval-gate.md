@@ -33,10 +33,10 @@ Every approval message carries an inline keyboard built by
    `cli_approve:{request_id}`. Tapping resolves only that request.
 2. **Row 2 (conditional):** A `✅✅ Approve all N pending` button whose
    `callback_data` is `cli_approve_all:{request_id}`. Appears only when
-   at least two `autonomous_cli_fallback` approvals are pending at send
-   time (the triggering one plus at least one other). Tapping resolves
-   the triggering request first, then calls `approve_all_pending` to
-   clear every other pending `autonomous_cli_fallback` row.
+   at least two gated approvals are pending at send time (the triggering
+   one plus at least one other). Tapping resolves the triggering request
+   first, then calls `approve_all_pending` to clear every other pending
+   approval regardless of action type or subsystem.
 
 There is **no reject button.** Rejection is handled by not clicking —
 the approval stays parked until the 24h re-ask fires a reminder, and

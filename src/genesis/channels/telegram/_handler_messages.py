@@ -848,8 +848,8 @@ def _wake_inbox_monitor() -> None:
         from genesis.runtime import GenesisRuntime
 
         rt = GenesisRuntime.instance()
-        if rt and rt._inbox_monitor:
-            rt._inbox_monitor.wake()
+        if rt and rt.inbox_monitor:
+            rt.inbox_monitor.wake()
     except Exception:
         pass  # Monitor will pick it up on next interval
 
