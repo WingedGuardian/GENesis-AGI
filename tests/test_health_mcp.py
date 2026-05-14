@@ -113,9 +113,11 @@ class TestHealthAlerts:
         assert result[0]["severity"] == "CRITICAL"
 
     @pytest.mark.asyncio
-    async def test_down_call_site_generates_critical(self):
+    async def test_down_call_site_generates_warning(self):
         # Must use a wired call site — health_alerts now skips groundwork
         # sites (meta.wired=False) to prevent ghost-down spam.
+        # DOWN = all circuit breakers open (transient, self-resolving).
+        # Severity is WARNING (Tier 3), not CRITICAL (Tier 2).
         svc = _mock_service({
             "call_sites": {"3_micro_reflection": {"status": "down"}},
             "queues": {},
@@ -123,9 +125,9 @@ class TestHealthAlerts:
         })
         health_mcp.init_health_mcp(svc)
         result = await _impl_health_alerts()
-        criticals = [a for a in result if a["severity"] == "CRITICAL"]
-        assert len(criticals) == 1
-        assert "3_micro_reflection" in criticals[0]["message"]
+        warnings = [a for a in result if a["severity"] == "WARNING"]
+        assert len(warnings) == 1
+        assert "3_micro_reflection" in warnings[0]["message"]
 
     @pytest.mark.asyncio
     async def test_degraded_call_site_generates_warning(self):

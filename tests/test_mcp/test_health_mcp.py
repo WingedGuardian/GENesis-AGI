@@ -136,7 +136,11 @@ async def test_alert_fires_on_stale_dead_letters():
 
 
 async def test_call_site_alert_fires_on_down():
-    """A wired call site in DOWN status should emit a CRITICAL alert."""
+    """A wired call site in DOWN status should emit a WARNING alert.
+
+    DOWN = all provider circuit breakers open (transient, self-resolving).
+    Severity is WARNING (Tier 3 / reflexes only), not CRITICAL (Tier 2).
+    """
     mock_svc = AsyncMock()
     mock_svc.snapshot.return_value = {
         "call_sites": {
@@ -158,7 +162,7 @@ async def test_call_site_alert_fires_on_down():
         alerts = await _impl_health_alerts()
         down = [a for a in alerts if a["id"] == "call_site:3_micro_reflection"]
         assert len(down) == 1
-        assert down[0]["severity"] == "CRITICAL"
+        assert down[0]["severity"] == "WARNING"
     finally:
         health_mcp_mod._service = old
         health_mcp_mod._alert_history = old_history
