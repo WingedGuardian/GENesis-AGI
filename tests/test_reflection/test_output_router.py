@@ -16,7 +16,6 @@ from genesis.reflection.output_router import (
 from genesis.reflection.types import (
     DeepReflectionOutput,
     QualityCalibrationOutput,
-    SurplusDecision,
     WeeklyAssessmentOutput,
 )
 
@@ -70,16 +69,16 @@ class TestParseDeepReflectionOutput:
         assert len(out.memory_operations) == 1
         assert out.memory_operations[0].operation == "dedup"
 
-    def test_surplus_decisions_parsed(self):
+    def test_surplus_decisions_ignored(self):
+        """Old outputs with surplus_decisions should parse without error."""
         raw = json.dumps({
             "surplus_decisions": [
                 {"item_id": "s1", "action": "promote", "reason": "good"},
-                {"item_id": "s2", "action": "discard"},
             ],
         })
         out = parse_deep_reflection_output(raw)
-        assert len(out.surplus_decisions) == 2
-        assert out.surplus_decisions[0].action == "promote"
+        # surplus_decisions field no longer exists on output
+        assert not hasattr(out, "surplus_decisions")
 
     def test_missing_fields_get_defaults(self):
         raw = json.dumps({"observations": ["only this"]})
@@ -181,78 +180,6 @@ class TestRouteDeepReflection:
         row = await cursor.fetchone()
         assert row is not None
         assert dict(row)["content"] == "new active context"
-
-    @pytest.mark.asyncio
-    async def test_routes_surplus_promote(self, db, router):
-        # Insert a pending surplus item
-        now = datetime.now(UTC).isoformat()
-        ttl = (datetime.now(UTC) + timedelta(days=3)).isoformat()
-        await db.execute(
-            "INSERT INTO surplus_insights "
-            "(id, content, source_task_type, generating_model, drive_alignment, "
-            "confidence, created_at, ttl) VALUES ('s1', 'test', 'brainstorm', "
-            "'model', 'curiosity', 0.5, ?, ?)",
-            (now, ttl),
-        )
-        await db.commit()
-
-        output = DeepReflectionOutput(
-            surplus_decisions=[SurplusDecision(item_id="s1", action="promote", reason="good")]
-        )
-        summary = await router.route(output, db)
-        assert summary["surplus_decisions"] == 1
-
-        cursor = await db.execute("SELECT promotion_status FROM surplus_insights WHERE id = 's1'")
-        row = await cursor.fetchone()
-        assert row[0] == "promoted"
-
-        # Verify an observation was also created from the promoted insight
-        cursor = await db.execute(
-            "SELECT * FROM observations WHERE source = 'surplus_promotion'"
-        )
-        obs_rows = await cursor.fetchall()
-        assert len(obs_rows) == 1
-        obs = dict(obs_rows[0])
-        assert obs["type"] == "brainstorm"
-        assert obs["content"] == "test"
-
-    @pytest.mark.asyncio
-    async def test_promote_nonexistent_id_is_noop(self, db, router):
-        """Promoting a non-existent surplus ID logs warning and does nothing."""
-        output = DeepReflectionOutput(
-            surplus_decisions=[SurplusDecision(item_id="nonexistent", action="promote", reason="test")]
-        )
-        summary = await router.route(output, db)
-        assert summary["surplus_decisions"] == 1
-
-        # No observation should be created
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM observations WHERE source = 'surplus_promotion'"
-        )
-        row = await cursor.fetchone()
-        assert row[0] == 0
-
-    @pytest.mark.asyncio
-    async def test_routes_surplus_discard(self, db, router):
-        now = datetime.now(UTC).isoformat()
-        ttl = (datetime.now(UTC) + timedelta(days=3)).isoformat()
-        await db.execute(
-            "INSERT INTO surplus_insights "
-            "(id, content, source_task_type, generating_model, drive_alignment, "
-            "confidence, created_at, ttl) VALUES ('s2', 'test', 'brainstorm', "
-            "'model', 'curiosity', 0.5, ?, ?)",
-            (now, ttl),
-        )
-        await db.commit()
-
-        output = DeepReflectionOutput(
-            surplus_decisions=[SurplusDecision(item_id="s2", action="discard")]
-        )
-        await router.route(output, db)
-
-        cursor = await db.execute("SELECT promotion_status FROM surplus_insights WHERE id = 's2'")
-        row = await cursor.fetchone()
-        assert row[0] == "discarded"
 
     @pytest.mark.asyncio
     async def test_routes_quarantines(self, db, router):

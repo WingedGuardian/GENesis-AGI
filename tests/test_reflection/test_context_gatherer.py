@@ -29,7 +29,6 @@ class TestDetectPendingWork:
     async def test_no_pending_work_empty_db(self, db, gatherer):
         pending = await gatherer.detect_pending_work(db)
         assert not pending.memory_consolidation
-        assert not pending.surplus_review
         assert pending.cost_reconciliation  # always true
         assert not pending.has_any_work or pending.cost_reconciliation
 
@@ -62,23 +61,6 @@ class TestDetectPendingWork:
         pending = await gatherer.detect_pending_work(db)
         assert pending.memory_consolidation
         assert pending.observation_backlog == 12
-
-    @pytest.mark.asyncio
-    async def test_surplus_review_pending(self, db, gatherer):
-        """Pending surplus items → surplus review needed."""
-        now = datetime.now(UTC).isoformat()
-        ttl = (datetime.now(UTC) + timedelta(days=3)).isoformat()
-        await db.execute(
-            "INSERT INTO surplus_insights "
-            "(id, content, source_task_type, generating_model, drive_alignment, "
-            "confidence, created_at, ttl) VALUES (?, 'test', 'brainstorm', "
-            "'model', 'curiosity', 0.5, ?, ?)",
-            (str(uuid.uuid4()), now, ttl),
-        )
-        await db.commit()
-        pending = await gatherer.detect_pending_work(db)
-        assert pending.surplus_review
-        assert pending.surplus_pending == 1
 
     @pytest.mark.asyncio
     async def test_cognitive_state_stale(self, db, gatherer):
@@ -125,7 +107,7 @@ class TestGather:
     async def test_gather_empty_db(self, db, gatherer):
         bundle = await gatherer.gather(db)
         assert bundle.recent_observations == []
-        assert bundle.surplus_staging_items == []
+        assert bundle.intelligence_digest != ""  # always has a message
         assert isinstance(bundle.cost_summary.daily_usd, float)
 
     @pytest.mark.asyncio

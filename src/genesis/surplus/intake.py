@@ -498,6 +498,15 @@ async def run_intake(
         stats.routed_discard, stats.scoring_skipped,
     )
 
+    # If ALL non-discard findings failed routing, raise so caller can fall back.
+    expected_routes = stats.findings_count - stats.routed_discard
+    actual_routes = stats.routed_knowledge + stats.routed_observation
+    if expected_routes > 0 and actual_routes == 0 and stats.errors:
+        raise RuntimeError(
+            f"Intake routing failed for all {expected_routes} findings: "
+            f"{stats.errors[0]}"
+        )
+
     return stats
 
 
@@ -519,8 +528,7 @@ async def _route_to_knowledge(
             store = None
 
     if store is None:
-        logger.warning("No MemoryStore available — skipping knowledge ingestion")
-        return
+        raise RuntimeError("No MemoryStore available for knowledge ingestion")
 
     from genesis.memory.knowledge_ingest import ingest_knowledge_unit
 

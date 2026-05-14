@@ -14,7 +14,6 @@ from genesis.reflection.types import (
     ProcedureStats,
     ProcedureTrend,
     QualityCalibrationOutput,
-    SurplusDecision,
     WeeklyAssessmentOutput,
 )
 
@@ -22,14 +21,16 @@ from genesis.reflection.types import (
 class TestDeepReflectionJob:
     def test_enum_values(self):
         assert DeepReflectionJob.MEMORY_CONSOLIDATION == "memory_consolidation"
-        assert DeepReflectionJob.SURPLUS_REVIEW == "surplus_review"
         assert DeepReflectionJob.SKILL_REVIEW == "skill_review"
         assert DeepReflectionJob.COST_RECONCILIATION == "cost_reconciliation"
         assert DeepReflectionJob.LESSONS_EXTRACTION == "lessons_extraction"
         assert DeepReflectionJob.COGNITIVE_REGENERATION == "cognitive_regeneration"
 
     def test_all_values(self):
-        assert len(DeepReflectionJob) == 6
+        assert len(DeepReflectionJob) == 5
+
+    def test_surplus_review_removed(self):
+        assert "surplus_review" not in [j.value for j in DeepReflectionJob]
 
 
 class TestAssessmentDimension:
@@ -44,22 +45,25 @@ class TestPendingWorkSummary:
         assert p.active_jobs == []
 
     def test_single_job(self):
-        p = PendingWorkSummary(surplus_review=True, surplus_pending=3)
+        p = PendingWorkSummary(memory_consolidation=True, observation_backlog=15)
         assert p.has_any_work
-        assert p.active_jobs == [DeepReflectionJob.SURPLUS_REVIEW]
+        assert p.active_jobs == [DeepReflectionJob.MEMORY_CONSOLIDATION]
 
     def test_multiple_jobs(self):
         p = PendingWorkSummary(
             memory_consolidation=True,
-            surplus_review=True,
             cognitive_regeneration=True,
         )
-        assert len(p.active_jobs) == 3
+        assert len(p.active_jobs) == 2
 
     def test_frozen(self):
         p = PendingWorkSummary()
         with pytest.raises(AttributeError):
-            p.surplus_review = True  # type: ignore[misc]
+            p.memory_consolidation = True  # type: ignore[misc]
+
+    def test_intake_items_field(self):
+        p = PendingWorkSummary(intake_items_since_last=42)
+        assert p.intake_items_since_last == 42
 
 
 class TestProcedureStats:
@@ -89,22 +93,16 @@ class TestContextBundle:
         assert cb.recent_observations == []
         assert isinstance(cb.pending_work, PendingWorkSummary)
 
+    def test_intelligence_digest(self):
+        cb = ContextBundle(intelligence_digest="5 items triaged")
+        assert cb.intelligence_digest == "5 items triaged"
+
 
 class TestMemoryOperation:
     def test_construction(self):
         op = MemoryOperation(operation="dedup", target_ids=["a", "b"], reason="similar")
         assert op.operation == "dedup"
         assert len(op.target_ids) == 2
-
-
-class TestSurplusDecision:
-    def test_promote(self):
-        sd = SurplusDecision(item_id="s1", action="promote", reason="valuable")
-        assert sd.action == "promote"
-
-    def test_discard(self):
-        sd = SurplusDecision(item_id="s2", action="discard")
-        assert sd.action == "discard"
 
 
 class TestDeepReflectionOutput:
@@ -117,10 +115,9 @@ class TestDeepReflectionOutput:
     def test_with_data(self):
         out = DeepReflectionOutput(
             observations=["obs1"],
-            surplus_decisions=[SurplusDecision(item_id="x", action="promote")],
             confidence=0.9,
         )
-        assert len(out.surplus_decisions) == 1
+        assert len(out.observations) == 1
 
 
 class TestDimensionScore:

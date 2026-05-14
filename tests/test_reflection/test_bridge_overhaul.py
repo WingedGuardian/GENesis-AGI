@@ -270,7 +270,7 @@ class TestPromptFiles:
         path = Path(__file__).resolve().parent.parent.parent / "src" / "genesis" / "identity" / "REFLECTION_DEEP.md"
         content = path.read_text()
         assert "Memory Consolidation" in content
-        assert "Surplus Review" in content
+        assert "Intelligence Digest" in content
         assert "Skill Review" in content
         assert "Cognitive State Regeneration" in content
         assert "memory_operations" in content

@@ -608,14 +608,9 @@ class CCReflectionBridge:
             ], indent=2)
             parts.append(f"\n## Recent Observations (for consolidation)\n```json\n{obs_summary}\n```")
 
-        # Surplus staging items
-        if bundle.surplus_staging_items:
-            surplus_summary = json.dumps([
-                {"id": s.get("id", ""), "content": s.get("content", "")[:200],
-                 "confidence": s.get("confidence", 0), "drive": s.get("drive_alignment", "")}
-                for s in bundle.surplus_staging_items[:10]
-            ], indent=2)
-            parts.append(f"\n## Pending Surplus Items (decide: promote or discard)\n```json\n{surplus_summary}\n```")
+        # Intelligence digest (replaces old surplus staging items section)
+        if bundle.intelligence_digest:
+            parts.append(f"\n## Intelligence Digest (since last Deep cycle)\n{bundle.intelligence_digest}")
 
         # Procedure stats
         stats = bundle.procedure_stats
