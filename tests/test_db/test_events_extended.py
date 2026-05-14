@@ -119,6 +119,65 @@ class TestQueryPaginated:
 # ── count_filtered ───────────────────────────────────────────────────────
 
 
+class TestPrune:
+    @pytest.mark.asyncio
+    async def test_prune_all_types(self, db):
+        """Without event_type filter, prune deletes all old events."""
+        await crud.insert(
+            db, subsystem="awareness", severity="info",
+            event_type="heartbeat", message="alive",
+            timestamp="2026-01-01T00:00:00",
+        )
+        await crud.insert(
+            db, subsystem="routing", severity="error",
+            event_type="breaker.tripped", message="down",
+            timestamp="2026-01-01T00:00:00",
+        )
+        pruned = await crud.prune(db, older_than="2026-06-01T00:00:00")
+        assert pruned == 2
+
+    @pytest.mark.asyncio
+    async def test_prune_by_event_type(self, db):
+        """With event_type filter, only matching events are pruned."""
+        await crud.insert(
+            db, subsystem="awareness", severity="info",
+            event_type="heartbeat", message="alive",
+            timestamp="2026-01-01T00:00:00",
+        )
+        await crud.insert(
+            db, subsystem="routing", severity="error",
+            event_type="breaker.tripped", message="down",
+            timestamp="2026-01-01T00:00:00",
+        )
+        pruned = await crud.prune(
+            db, older_than="2026-06-01T00:00:00", event_type="heartbeat",
+        )
+        assert pruned == 1
+        # The error event should remain
+        remaining = await crud.count(db)
+        assert remaining == 1
+
+    @pytest.mark.asyncio
+    async def test_prune_respects_timestamp(self, db):
+        """Events newer than cutoff are kept."""
+        await crud.insert(
+            db, subsystem="awareness", severity="info",
+            event_type="heartbeat", message="old",
+            timestamp="2026-01-01T00:00:00",
+        )
+        await crud.insert(
+            db, subsystem="awareness", severity="info",
+            event_type="heartbeat", message="new",
+            timestamp="2026-12-01T00:00:00",
+        )
+        pruned = await crud.prune(
+            db, older_than="2026-06-01T00:00:00", event_type="heartbeat",
+        )
+        assert pruned == 1
+        remaining = await crud.count(db)
+        assert remaining == 1
+
+
 class TestCountFiltered:
     @pytest.mark.asyncio
     async def test_total_count(self, db):

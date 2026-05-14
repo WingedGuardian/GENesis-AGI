@@ -134,12 +134,22 @@ async def prune(
     db: aiosqlite.Connection,
     *,
     older_than: str,
+    event_type: str | None = None,
 ) -> int:
-    """Delete events older than the given ISO timestamp. Returns count deleted."""
-    cursor = await db.execute(
-        "DELETE FROM events WHERE timestamp < ?",
-        (older_than,),
-    )
+    """Delete events older than the given ISO timestamp. Returns count deleted.
+
+    If *event_type* is provided, only events of that type are pruned.
+    """
+    if event_type is not None:
+        cursor = await db.execute(
+            "DELETE FROM events WHERE event_type = ? AND timestamp < ?",
+            (event_type, older_than),
+        )
+    else:
+        cursor = await db.execute(
+            "DELETE FROM events WHERE timestamp < ?",
+            (older_than,),
+        )
     await db.commit()
     return cursor.rowcount
 

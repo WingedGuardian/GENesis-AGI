@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 
 
@@ -120,6 +122,22 @@ async def delete_by_memory(db: aiosqlite.Connection, *, memory_id: str) -> int:
     cursor = await db.execute(
         "DELETE FROM pending_embeddings WHERE memory_id = ?",
         (memory_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def purge_completed(
+    db: aiosqlite.Connection,
+    *,
+    older_than_days: int = 30,
+) -> int:
+    """Delete embedded/failed rows older than *older_than_days*. Returns count deleted."""
+    cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM pending_embeddings "
+        "WHERE status IN ('embedded', 'failed') AND created_at < ?",
+        (cutoff,),
     )
     await db.commit()
     return cursor.rowcount
