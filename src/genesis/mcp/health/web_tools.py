@@ -1,7 +1,8 @@
 """Web intelligence MCP tools — external world discoverability.
 
-Exposes Genesis's web infrastructure (TinyFish, Scrapling, Crawl4AI, SearXNG,
-Brave, Tavily, Exa, Perplexity) as MCP tools accessible from all session types.
+Exposes Genesis's web infrastructure (TinyFish, Scrapling, Ladder, Crawl4AI,
+SearXNG, Brave, Tavily, Exa, Perplexity) as MCP tools accessible from all
+session types.
 
 Smart fallback chains — callers say what they want, the tool figures out how.
 Parallel to code intelligence tools (CBM, Serena, GitNexus) for internal
@@ -152,6 +153,38 @@ async def _try_crawl4ai(url: str, max_chars: int) -> dict | None:
     return None
 
 
+async def _try_ladder_fetch(url: str, max_chars: int) -> dict | None:
+    """Attempt Ladder proxy fetch. Returns result dict or None on failure.
+
+    Ladder impersonates Googlebot with per-domain rules for ~41 domains
+    (major publications, Medium, etc.). Runs locally on port 8079.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            start = time.monotonic()
+            resp = await client.get(f"http://localhost:8079/raw/{url}")
+            latency = (time.monotonic() - start) * 1000
+        if resp.status_code == 200 and len(resp.text.strip()) > 100:
+            content = resp.text[:max_chars]
+            return {
+                "url": url,
+                "title": "",
+                "content": content,
+                "backend_used": "ladder",
+                "status_code": 200,
+                "truncated": len(resp.text) > max_chars,
+                "error": None,
+                "latency_ms": round(latency, 1),
+            }
+    except httpx.ConnectError:
+        pass  # Ladder not running — silent fallthrough
+    except Exception as exc:
+        logger.debug("Ladder fetch failed for %s: %s", url, exc)
+    return None
+
+
 async def _impl_web_fetch(
     url: str,
     backend: str = "auto",
@@ -178,9 +211,13 @@ async def _impl_web_fetch(
         result = await fetcher.fetch(url, max_chars=max_chars)
         latency = (time.monotonic() - start) * 1000
 
-        # If challenge detected, escalate to Crawl4AI
+        # If challenge detected, escalate: Ladder (lightweight) → Crawl4AI (heavy)
         if _is_challenge_response(result.text, result.status_code):
-            logger.info("Challenge detected for %s, escalating to Crawl4AI", url)
+            logger.info("Challenge detected for %s, trying Ladder proxy", url)
+            ladder_result = await _try_ladder_fetch(url, max_chars)
+            if ladder_result:
+                return ladder_result
+            logger.info("Ladder unavailable/failed for %s, escalating to Crawl4AI", url)
             crawl_result = await _try_crawl4ai(url, max_chars)
             if crawl_result:
                 return crawl_result
@@ -202,6 +239,12 @@ async def _impl_web_fetch(
         if tf_result:
             return tf_result
         return {"url": url, "error": "TinyFish fetch failed or unavailable", "backend_used": "tinyfish"}
+
+    elif backend == "ladder":
+        ladder_result = await _try_ladder_fetch(url, max_chars)
+        if ladder_result:
+            return ladder_result
+        return {"url": url, "error": "Ladder proxy failed or unavailable", "backend_used": "ladder"}
 
     elif backend == "crawl4ai":
         crawl_result = await _try_crawl4ai(url, max_chars)
@@ -225,7 +268,7 @@ async def _impl_web_fetch(
         }
 
     else:
-        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, scrapling, crawl4ai, httpx"}
+        return {"error": f"Unknown backend '{backend}'. Use: auto, tinyfish, ladder, scrapling, crawl4ai, httpx"}
 
 
 async def _impl_web_fetch_multi(
@@ -438,13 +481,15 @@ async def web_fetch(
     """Fetch URL(s) and return clean text content.
 
     Smart fallback chain: TinyFish (anti-bot, JS rendering) → Scrapling
-    (TLS impersonation) → Crawl4AI (local Playwright) → httpx (plain).
+    (TLS impersonation) → Ladder (Googlebot proxy) → Crawl4AI (local
+    Playwright) → httpx (plain).
 
     Args:
         url: Single URL to fetch.
         urls: Multiple URLs (1-10) for parallel fetch via TinyFish.
         backend: "auto" (smart fallback), "tinyfish" (cloud anti-bot),
-                 "scrapling" (fast, TLS), "crawl4ai" (JS-rendered), "httpx".
+                 "ladder" (Googlebot proxy, paywalls), "scrapling" (fast, TLS),
+                 "crawl4ai" (JS-rendered), "httpx".
         max_chars: Maximum characters per URL (default 50000 ≈ 12k tokens).
 
     Returns dict with: url, title, content, backend_used, status_code,
