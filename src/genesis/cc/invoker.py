@@ -10,6 +10,7 @@ import shutil
 import signal
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from genesis.cc.exceptions import (
     CCError,
@@ -115,6 +116,9 @@ class CCInvoker:
         # prompts safely.
         return args
 
+    # CC's Bash sandbox root — persistent disk, managed by tmp_watchgod.
+    _CC_SANDBOX_TMPDIR = Path.home() / ".genesis" / "cc-tmp"
+
     def _build_env(self, inv: CCInvocation | None = None) -> dict[str, str]:
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)
@@ -125,6 +129,12 @@ class CCInvoker:
         env["GENESIS_CC_SESSION"] = "1"
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
+        # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
+        # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
+        # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
+        # Without this, the sandbox lives on /tmp where intermittent ENOENT
+        # failures break the Bash tool for entire sessions.
+        env["CLAUDE_CODE_TMPDIR"] = str(self._CC_SANDBOX_TMPDIR)
         return env
 
     async def interrupt(self) -> None:

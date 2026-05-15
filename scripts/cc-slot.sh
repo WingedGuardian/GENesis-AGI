@@ -74,7 +74,12 @@ export TMPDIR="$HOME/.genesis/cc-tmp"
 mkdir -p "$TMPDIR"
 chmod 700 "$TMPDIR"
 
+# Move CC's Bash sandbox off volatile /tmp onto persistent disk.
+# CC uses CLAUDE_CODE_TMPDIR for its sandbox root (/claude-<uid>/<cwd>/).
+# Without this, intermittent ENOENT failures on /tmp break the Bash tool.
+export CLAUDE_CODE_TMPDIR="$HOME/.genesis/cc-tmp"
 
 exec tmux new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
+    -e "CLAUDE_CODE_TMPDIR=$CLAUDE_CODE_TMPDIR" \
     "cd ${GENESIS_ROOT} && exec claude --dangerously-skip-permissions"
