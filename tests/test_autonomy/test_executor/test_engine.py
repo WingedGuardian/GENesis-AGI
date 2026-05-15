@@ -915,3 +915,60 @@ class TestLivingPlan:
             assert result is True
         finally:
             os.chmod(plan_file, 0o644)
+
+
+# ---------------------------------------------------------------------------
+# Pre-synthesis guard (todo continuation enforcer)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPreSynthesisGuard:
+    async def test_incomplete_steps_block_synthesis(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """If any steps are not completed, task should be blocked before synthesis."""
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        # Override step dispatcher to mark step 1 as "failed" in DB after execution
+        original_execute = engine._step_dispatcher.execute_step
+
+        call_count = 0
+
+        async def execute_with_one_failure(task_id, step, prior, **kw):
+            nonlocal call_count
+            result = await original_execute(task_id, step, prior, **kw)
+            call_count += 1
+            # After executing step 1 (idx=1), manually corrupt its DB status
+            if step["idx"] == 1:
+                await task_steps.update_step(db, task_id, 1, status="failed")
+            return result
+
+        engine._step_dispatcher.execute_step = execute_with_one_failure
+
+        result = await engine.execute("t-001")
+
+        assert result is False
+        task = await task_states.get_by_id(db, "t-001")
+        # Task should be blocked, not completed
+        assert task["current_phase"] in ("blocked", "verifying")
+
+    async def test_all_completed_steps_pass_guard(
+        self, db, plan_file, mock_invoker, mock_decomposer, mock_reviewer,
+        mock_subprocess,
+    ):
+        """Normal case: all steps completed => task proceeds to synthesis."""
+        await _seed_task(db, plan_path=plan_file)
+        engine = _make_engine(db, mock_invoker, mock_decomposer, mock_reviewer)
+
+        result = await engine.execute("t-001")
+
+        assert result is True
+        task = await task_states.get_by_id(db, "t-001")
+        assert task["current_phase"] == "completed"
+
+        # All steps should be completed
+        steps = await task_steps.get_steps_for_task(db, "t-001")
+        assert all(s["status"] == "completed" for s in steps)
