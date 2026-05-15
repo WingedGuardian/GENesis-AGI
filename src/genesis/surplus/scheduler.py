@@ -238,6 +238,15 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
+        # Dream cycle: weekly Sunday 3am — episodic memory consolidation
+        from apscheduler.triggers.cron import CronTrigger
+        self._scheduler.add_job(
+            self.run_dream_cycle,
+            CronTrigger(day_of_week="sun", hour=3),
+            id="dream_cycle",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         self._scheduler.add_job(
             self.schedule_maintenance,
             IntervalTrigger(hours=self._maintenance_hours),
@@ -666,6 +675,81 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
+            except Exception:
+                pass
+
+    async def run_dream_cycle(self) -> None:
+        """Run weekly episodic memory consolidation (dream cycle).
+
+        Dry-run by default — set ``dream_cycle_live`` in Genesis config
+        to enable live merges after reviewing a dry-run report.
+        """
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Dream cycle skipped (Genesis paused)")
+                return
+        except Exception:
+            logger.warning("Pause check failed — skipping dream cycle", exc_info=True)
+            return
+
+        try:
+            from genesis.memory import dream_cycle
+            from genesis.runtime import GenesisRuntime
+
+            rt = GenesisRuntime.instance()
+            if rt.db is None or rt.qdrant is None or rt.router is None:
+                logger.warning("Dream cycle skipped — missing runtime dependencies")
+                return
+
+            # Default dry-run until user enables live mode.
+            # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
+            import os
+            dry_run = os.environ.get("GENESIS_DREAM_CYCLE_LIVE", "") not in ("1", "true")
+
+            store = getattr(rt, "_memory_store", None)
+            if store is None:
+                logger.warning("Dream cycle skipped — MemoryStore not initialized")
+                return
+
+            report = await dream_cycle.run(
+                qdrant=rt.qdrant,
+                db=rt.db,
+                router=rt.router,
+                store=store,
+                dry_run=dry_run,
+            )
+
+            # Write observation with the report
+            try:
+                import uuid as _uuid
+                from genesis.db.crud import observations as obs_crud
+                await obs_crud.create(
+                    rt.db,
+                    id=str(_uuid.uuid4()),
+                    source="dream_cycle",
+                    type="dream_cycle_report",
+                    content=(
+                        f"Dream cycle {'DRY RUN' if dry_run else 'LIVE'}: "
+                        f"{report.get('clusters_found', 0)} clusters found, "
+                        f"{report.get('clusters_merged', 0)} merged, "
+                        f"{report.get('memories_deprecated', 0)} deprecated, "
+                        f"{len(report.get('errors', []))} errors"
+                    ),
+                    priority="low",
+                    created_at=datetime.now(UTC).isoformat(),
+                )
+            except Exception:
+                pass
+
+            logger.info("Dream cycle complete: %s", report)
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_success("dream_cycle")
+        except Exception as exc:
+            logger.exception("Dream cycle failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("dream_cycle", str(exc))
             except Exception:
                 pass
 
