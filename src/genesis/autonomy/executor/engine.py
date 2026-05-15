@@ -586,6 +586,34 @@ class CCSessionExecutor:
                 f"Verification passed (iteration {iteration}).",
             )
 
+            # --- PRE-SYNTHESIS GUARD: all steps must be completed ---
+            incomplete = await task_steps.get_incomplete_steps(
+                self._db, task_id,
+            )
+            if incomplete:
+                descs = [
+                    f"step {s['step_idx']} ({s['status']}): "
+                    f"{s.get('description', '')[:80]}"
+                    for s in incomplete
+                ]
+                blocker_msg = (
+                    f"{len(incomplete)} step(s) not completed:\n"
+                    + "\n".join(descs)
+                )
+                logger.warning(
+                    "Task %s blocked: incomplete steps detected "
+                    "before synthesis: %s",
+                    task_id, blocker_msg,
+                )
+                self._append_to_plan(
+                    plan_path, "GUARD",
+                    f"BLOCKED: {len(incomplete)} incomplete step(s).",
+                )
+                await self._persist_blocker(
+                    task_id, blocker_msg, TaskPhase.VERIFYING,
+                )
+                return False
+
             # --- SYNTHESIZING ---
             await self._transition(task_id, TaskPhase.SYNTHESIZING)
             await self._set_output(task_id, "deliverable", deliverable)
