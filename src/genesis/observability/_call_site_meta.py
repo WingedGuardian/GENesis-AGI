@@ -424,6 +424,13 @@ _CALL_SITE_META: dict[str, dict] = {
         "wired": False,
         "status_reason": "V4_PLACEHOLDER",
     },
+    "dream_cycle_synthesis": {
+        "description": "Dream cycle cluster-merge synthesis. Consolidates near-duplicate episodic memories into canonical records. Weekly Sunday 3am via CronTrigger.",
+        "category": "consolidation",
+        "frequency": "Weekly batch (Sunday 3am, max 100 clusters/run)",
+        "model_tier": "slm",
+        "wired": True,
+    },
     "28_observation_sweep": {
         "description": "Functionally replaced by awareness loop's signal collection (awareness/loop.py:perform_tick). Kept as historical reference; no live consumers route through this call site.",
         "category": "processing",
