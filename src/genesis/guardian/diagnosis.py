@@ -29,6 +29,30 @@ from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
 
+# Pre-flight memory thresholds for CC launch decisions.
+# Hard floor: refuse to launch CC entirely (OOM risk too high).
+# Soft floor: downgrade to sonnet (smaller CC footprint).
+_CC_PREFLIGHT_HARD_FLOOR_GiB = 8.0
+_CC_PREFLIGHT_SOFT_FLOOR_GiB = 14.0
+
+
+def _host_mem_available_gib() -> float | None:
+    """Read MemAvailable from /proc/meminfo (GiB). None if unavailable.
+
+    Uses the kernel's own estimate of memory available for new allocations
+    without swapping — accounts for reclaimable page cache and slab.
+    No external dependencies (no psutil).
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    # Format: "MemAvailable:   22612356 kB"
+                    return int(line.split()[1]) / (1024 * 1024)  # kB → GiB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
 
 class CCDiagnosisError(Exception):
     """CC diagnosis failed with a specific, capturable reason."""
@@ -327,18 +351,62 @@ class DiagnosisEngine:
         work_dir = Path("~/.local/share/genesis-guardian").expanduser()
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        # Pre-flight: check host memory before launching CC.
+        # CC + its tool subprocesses run on the host unconstrained by any
+        # container cgroup. Launching during memory pressure risks a VM freeze
+        # (incident 2026-05-15: min_free_kbytes too low → kernel death spiral).
+        effective_model = self._config.cc.model
+        available_gib = _host_mem_available_gib()
+        if available_gib is not None:
+            if available_gib < _CC_PREFLIGHT_HARD_FLOOR_GiB:
+                logger.error(
+                    "Host memory critically low (%.1f GiB free < %.0f GiB floor) "
+                    "— refusing CC diagnosis to prevent OOM",
+                    available_gib, _CC_PREFLIGHT_HARD_FLOOR_GiB,
+                )
+                raise CCDiagnosisError(
+                    f"Host memory too low for CC diagnosis: "
+                    f"{available_gib:.1f} GiB free < "
+                    f"{_CC_PREFLIGHT_HARD_FLOOR_GiB:.0f} GiB minimum"
+                )
+            if available_gib < _CC_PREFLIGHT_SOFT_FLOOR_GiB:
+                logger.warning(
+                    "Host memory low (%.1f GiB free < %.0f GiB) "
+                    "— downgrading CC model from %s to sonnet",
+                    available_gib, _CC_PREFLIGHT_SOFT_FLOOR_GiB,
+                    self._config.cc.model,
+                )
+                effective_model = "sonnet"
+        else:
+            logger.warning("Cannot read /proc/meminfo — skipping memory preflight")
+
+        # Disable MCP servers for diagnostic sessions. CC only needs its
+        # built-in tools (Bash, Read, Edit, etc.) for investigation.
+        # --strict-mcp-config ensures no global/project MCP configs are loaded,
+        # preventing unnecessary memory consumption from heavy MCP server
+        # processes (codebase-memory-mcp, serena, gitnexus, etc.).
+        no_mcp_config = work_dir / "config" / "no_mcp.json"
         cmd = [
             cc_path, "-p",
-            "--model", self._config.cc.model,
+            "--model", effective_model,
             "--output-format", "json",
             "--max-turns", str(self._config.cc.max_turns),
             "--dangerously-skip-permissions",
         ]
+        if no_mcp_config.exists():
+            cmd.extend(["--mcp-config", str(no_mcp_config), "--strict-mcp-config"])
+        else:
+            logger.warning(
+                "config/no_mcp.json not found at %s — CC may load MCP servers",
+                no_mcp_config,
+            )
 
         logger.info(
-            "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds",
-            self._config.cc.model, self._config.cc.max_turns,
+            "Starting CC diagnosis: model=%s, max_turns=%d, timeout=%ds, "
+            "host_mem_available=%.1f GiB",
+            effective_model, self._config.cc.max_turns,
             self._config.cc.timeout_s,
+            available_gib if available_gib is not None else -1,
         )
 
         proc = await asyncio.create_subprocess_exec(
