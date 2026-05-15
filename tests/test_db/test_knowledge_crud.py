@@ -174,6 +174,47 @@ async def test_stats_filtered_by_project(db):
     assert s["total"] == 1
 
 
+# ─── knowledge.increment_retrieved_batch ─────────────────────────────────────
+
+
+async def test_increment_retrieved_batch_by_qdrant_id(db):
+    """Incrementing by qdrant_id (not id) bumps retrieved_count."""
+    uid = await knowledge.insert(
+        db, project_type="cloud", domain="aws", source_doc="m1",
+        concept="VPC", body="vpc", qdrant_id="qdrant-point-1",
+    )
+    count = await knowledge.increment_retrieved_batch(db, ["qdrant-point-1"])
+    assert count == 1
+    row = await knowledge.get(db, uid)
+    assert row["retrieved_count"] == 1
+
+
+async def test_increment_retrieved_batch_multiple(db):
+    """Batch increment touches all matching rows."""
+    await knowledge.insert(
+        db, project_type="cloud", domain="aws", source_doc="m1",
+        concept="VPC", body="vpc", qdrant_id="qp-1",
+    )
+    await knowledge.insert(
+        db, project_type="cloud", domain="gcp", source_doc="m2",
+        concept="GKE", body="gke", qdrant_id="qp-2",
+    )
+    count = await knowledge.increment_retrieved_batch(db, ["qp-1", "qp-2"])
+    assert count == 2
+
+
+async def test_increment_retrieved_batch_empty_list(db):
+    """Empty list returns 0 without errors."""
+    count = await knowledge.increment_retrieved_batch(db, [])
+    assert count == 0
+
+
+async def test_increment_retrieved_batch_nonexistent_id(db):
+    """Non-matching qdrant_ids are silently skipped."""
+    count = await knowledge.increment_retrieved_batch(db, ["no-such-id"])
+    assert count == 0
+
+
 # ─── knowledge.delete ────────────────────────────────────────────────────────
 
 

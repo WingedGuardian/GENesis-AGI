@@ -421,6 +421,21 @@ class SurplusScheduler:
                 if purged:
                     logger.info("Purged %d expired surplus insights", purged)
 
+                # GC: remove completed/failed pending_embeddings older than 30 days
+                from genesis.db.crud import pending_embeddings as pe_crud
+                pe_purged = await pe_crud.purge_completed(rt.db, older_than_days=30)
+                if pe_purged:
+                    logger.info("Purged %d completed pending_embeddings", pe_purged)
+
+                # GC: rotate heartbeat events older than 7 days
+                from genesis.db.crud import events as events_crud
+                hb_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+                hb_purged = await events_crud.prune(
+                    rt.db, older_than=hb_cutoff, event_type="heartbeat",
+                )
+                if hb_purged:
+                    logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
+
             with contextlib.suppress(Exception):
                 GenesisRuntime.instance().record_job_success("schedule_maintenance")
         except Exception as exc:

@@ -134,6 +134,58 @@ class TestResetFailedToPending:
         assert items[0]["error_message"] is None
 
 
+class TestPurgeCompleted:
+    @pytest.mark.asyncio
+    async def test_purges_old_embedded(self, db):
+        """Embedded rows older than threshold are deleted."""
+        await crud.create(
+            db, id="pe-1", memory_id="mem-1", content="old",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2025-01-01T00:00:00",  # very old
+        )
+        await crud.mark_embedded(db, "pe-1", embedded_at="2025-01-01T00:01:00")
+        purged = await crud.purge_completed(db, older_than_days=30)
+        assert purged == 1
+
+    @pytest.mark.asyncio
+    async def test_purges_old_failed(self, db):
+        """Failed rows older than threshold are deleted."""
+        await crud.create(
+            db, id="pe-1", memory_id="mem-1", content="old",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2025-01-01T00:00:00",
+        )
+        await crud.mark_failed(db, "pe-1", error_message="some error")
+        purged = await crud.purge_completed(db, older_than_days=30)
+        assert purged == 1
+
+    @pytest.mark.asyncio
+    async def test_spares_pending_rows(self, db):
+        """Pending rows are never deleted regardless of age."""
+        await crud.create(
+            db, id="pe-1", memory_id="mem-1", content="old pending",
+            memory_type="episodic", collection="episodic_memory",
+            created_at="2025-01-01T00:00:00",
+        )
+        purged = await crud.purge_completed(db, older_than_days=30)
+        assert purged == 0
+        assert await crud.count_pending(db) == 1
+
+    @pytest.mark.asyncio
+    async def test_spares_recent_embedded(self, db):
+        """Recently embedded rows within threshold are kept."""
+        from datetime import UTC, datetime
+        now = datetime.now(UTC).isoformat()
+        await crud.create(
+            db, id="pe-1", memory_id="mem-1", content="recent",
+            memory_type="episodic", collection="episodic_memory",
+            created_at=now,
+        )
+        await crud.mark_embedded(db, "pe-1", embedded_at=now)
+        purged = await crud.purge_completed(db, older_than_days=30)
+        assert purged == 0
+
+
 class TestCountPending:
     @pytest.mark.asyncio
     async def test_count_empty(self, db):

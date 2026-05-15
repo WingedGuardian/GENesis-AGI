@@ -350,6 +350,28 @@ async def list_by_domain(
     return result
 
 
+async def increment_retrieved_batch(
+    db: aiosqlite.Connection,
+    qdrant_ids: list[str],
+) -> int:
+    """Increment retrieved_count for knowledge units matched by Qdrant point IDs.
+
+    Qdrant point IDs map to knowledge_units.qdrant_id (not .id) because
+    ingest_knowledge_unit stores the memory_metadata ID as qdrant_id.
+    Returns count of rows updated.
+    """
+    if not qdrant_ids:
+        return 0
+    placeholders = ",".join("?" for _ in qdrant_ids)
+    cursor = await db.execute(
+        f"UPDATE knowledge_units SET retrieved_count = retrieved_count + 1 "
+        f"WHERE qdrant_id IN ({placeholders})",
+        qdrant_ids,
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def delete(db: aiosqlite.Connection, unit_id: str) -> bool:
     """Delete a knowledge unit from both knowledge_units and knowledge_fts."""
     cursor = await db.execute(

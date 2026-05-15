@@ -485,6 +485,31 @@ class HybridRetriever:
                     len(obs_ids), exc_info=True,
                 )
 
+        # 11c. Sync knowledge_units retrieved_count in SQLite
+        #       Match via qdrant_id (Qdrant point ID == knowledge_units.qdrant_id)
+        ku_qdrant_ids: list[str] = []
+        for mid in top:
+            qdrant_hit = qdrant_by_id.get(mid)
+            if qdrant_hit:
+                if qdrant_hit.get("_collection") == "knowledge_base":
+                    ku_qdrant_ids.append(mid)
+            else:
+                # FTS5-only hit — check collection tag
+                fts_hit = fts_by_id.get(mid)
+                if fts_hit and fts_hit.get("collection") == "knowledge_base":
+                    ku_qdrant_ids.append(mid)
+        if ku_qdrant_ids:
+            try:
+                from genesis.db.crud import knowledge as knowledge_crud
+                await knowledge_crud.increment_retrieved_batch(
+                    self._db, ku_qdrant_ids,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to sync knowledge retrieved_count for %d units",
+                    len(ku_qdrant_ids), exc_info=True,
+                )
+
         # 12. Build RetrievalResult objects
         results: list[RetrievalResult] = []
         for mid in top:
