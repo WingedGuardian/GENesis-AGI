@@ -949,6 +949,17 @@ TABLES = {
             timestamp        TEXT NOT NULL
         )
     """,
+    "tool_call_outcomes": """
+        CREATE TABLE IF NOT EXISTS tool_call_outcomes (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id       TEXT,
+            tool_name        TEXT NOT NULL,
+            file_path        TEXT,
+            success          INTEGER NOT NULL DEFAULT 1,
+            error_snippet    TEXT,
+            timestamp        TEXT NOT NULL
+        )
+    """,
     "direct_session_queue": """
         CREATE TABLE IF NOT EXISTS direct_session_queue (
             id              TEXT PRIMARY KEY,
@@ -1247,6 +1258,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_file_mod_path ON file_modifications(file_path)",
     "CREATE INDEX IF NOT EXISTS idx_file_mod_session ON file_modifications(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_file_mod_ts ON file_modifications(timestamp)",
+    # tool call outcomes (edit failure sensor)
+    "CREATE INDEX IF NOT EXISTS idx_tco_tool_ts ON tool_call_outcomes(tool_name, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_tco_success ON tool_call_outcomes(success, timestamp)",
     # direct session queue
     "CREATE INDEX IF NOT EXISTS idx_dsq_status_created ON direct_session_queue(status, created_at)",
     # J-9 eval infrastructure
