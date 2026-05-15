@@ -134,7 +134,8 @@ def test_load_full_yaml(monkeypatch):
     # 7_task_retrospective removed by this PR).
     # 2026-05-12: 43 → 44 after 44_task_premortem added by #334.
     # 2026-05-14: 44 → 45 after 45_intelligence_intake added by #349.
-    assert len(cfg.call_sites) == 45
+    # 2026-05-15: 45 → 46 after dream_cycle_synthesis added by #359.
+    assert len(cfg.call_sites) == 46
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
     assert "background" in cfg.retry_profiles
