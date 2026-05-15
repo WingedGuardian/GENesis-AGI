@@ -352,6 +352,35 @@ if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]; then
     echo "  + IP forwarding enabled"
 fi
 
+# ── Kernel OOM protection ─────────────────────────────────────
+# Prevent hard VM freezes under memory pressure. Without this, the default
+# min_free_kbytes is often <100MB on cloud VMs — the kernel has no room
+# to maneuver before OOM conditions become unrecoverable (death spiral
+# instead of graceful OOM-kill). Incident reference: 2026-05-15.
+echo "  Configuring kernel OOM protection..."
+
+# Scale min_free_kbytes to ~1% of host RAM (floor 128MB, cap 1024MB)
+_min_free_mb=$(( host_mem_gb * 10 ))  # ~1% in MB
+[ "$_min_free_mb" -lt 128 ] && _min_free_mb=128
+[ "$_min_free_mb" -gt 1024 ] && _min_free_mb=1024
+_min_free_kb=$(( _min_free_mb * 1024 ))
+
+# Idempotency: don't downgrade if someone already set a higher value.
+_current_min_free=$(sysctl -n vm.min_free_kbytes 2>/dev/null || echo "0")
+if [ "${_current_min_free:-0}" -ge "$_min_free_kb" ]; then
+    echo "  + OOM tuning already adequate (min_free_kbytes=${_current_min_free})"
+else
+    sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null << SYSCTL
+# Genesis — kernel OOM protection (installed by host-setup.sh)
+# Prevents VM freeze under memory pressure. Safe to customize.
+vm.min_free_kbytes = $_min_free_kb
+vm.watermark_scale_factor = 50
+vm.oom_kill_allocating_task = 1
+SYSCTL
+    sudo sysctl --system > /dev/null 2>&1
+    echo "  + OOM tuning applied (min_free=${_min_free_mb}MB for ${host_mem_gb}GB host)"
+fi
+
 # Find the managed bridge (not the host NIC). Column order: NAME,TYPE,MANAGED,...
 # Filter for MANAGED=YES to avoid trying to modify physical interfaces like ens4.
 _INCUS_BRIDGE=$(incus network list --format csv 2>/dev/null | grep ",YES," | head -1 | cut -d, -f1)
