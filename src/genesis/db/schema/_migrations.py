@@ -1109,6 +1109,17 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE capability_map ADD COLUMN previous_confidence REAL",
         "capability_map.previous_confidence")
 
+    # Dream cycle: deprecated flag and run_id on memory_metadata (PR #359).
+    # Migration 0018 adds these for existing DBs via numbered migration, but
+    # _migrate_add_columns must also include them so create_all_tables can
+    # create the idx_memory_meta_deprecated index on existing DBs.
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN deprecated INTEGER NOT NULL DEFAULT 0",
+        "memory_metadata.deprecated")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN dream_cycle_run_id TEXT",
+        "memory_metadata.dream_cycle_run_id")
+
     # World model tables: user goals and contacts for ego world model.
     await _migrate_world_model_tables(db)
 

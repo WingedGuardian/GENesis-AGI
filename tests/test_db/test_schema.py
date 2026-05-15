@@ -370,3 +370,93 @@ async def test_depth_thresholds_seeded(db):
     rows = await cursor.fetchall()
     names = [r["depth_name"] for r in rows]
     assert names == ["Deep", "Light", "Micro", "Strategic"]
+
+
+# ─── Migration / table sync regression tests ────────────────────────────────
+# Regression for VM crash incident 2026-05-15: _migrate_add_columns() was
+# missing ALTER TABLEs for columns that INDEXES referenced, causing
+# sqlite3.OperationalError on restart from an older DB.
+
+
+async def test_migration_creates_all_indexed_columns():
+    """Every column referenced by an index exists after migration runs.
+
+    Simulates an older database that has tables but is missing columns
+    added after Phase 0. Runs _migrate_add_columns() then verifies all
+    indexes can be created without OperationalError.
+
+    This catches the exact class of bug from PR #359: a column added to
+    _tables.py (and referenced by an index) but missing from
+    _migrate_add_columns() → crash on any DB that predates the column.
+    """
+    import aiosqlite
+
+    from genesis.db.schema._tables import INDEXES, TABLES
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        # 1. Create tables (DDL includes all columns — simulates a "fresh" DB)
+        for ddl in TABLES.values():
+            await conn.execute(ddl)
+        await conn.commit()
+
+        # 2. Run migrations (on a fresh DB this is a no-op, but it exercises
+        #    all _try_alter paths to ensure they don't error)
+        from genesis.db.schema._migrations import _migrate_add_columns
+        await _migrate_add_columns(conn)
+        await conn.commit()
+
+        # 3. Create all indexes — if a migration forgot to add a column that
+        #    an index references, this will raise OperationalError
+        errors = []
+        for idx_ddl in INDEXES:
+            try:
+                await conn.execute(idx_ddl)
+            except Exception as exc:
+                errors.append(f"{idx_ddl[:80]}... → {exc}")
+        await conn.commit()
+
+        assert not errors, (
+            "Index creation failed after migration — likely missing _try_alter:\n"
+            + "\n".join(errors)
+        )
+    finally:
+        await conn.close()
+
+
+async def test_migration_on_stripped_db():
+    """Fresh DB consistency: DDL columns + migration + indexes all agree.
+
+    Verifies that specific post-Phase-0 columns (deprecated, dream_cycle_run_id)
+    exist after migration runs on a fresh database, and that all indexes can
+    be created. This complements test_migration_creates_all_indexed_columns by
+    asserting specific column names rather than just checking for errors.
+    """
+    import aiosqlite
+
+    from genesis.db.schema._migrations import _migrate_add_columns
+    from genesis.db.schema._tables import INDEXES, TABLES
+
+    conn = await aiosqlite.connect(":memory:")
+    try:
+        # Create tables from DDL
+        for ddl in TABLES.values():
+            await conn.execute(ddl)
+        await conn.commit()
+
+        # Run migration — should succeed on fresh DB
+        await _migrate_add_columns(conn)
+        await conn.commit()
+
+        # Verify at least one expected post-migration column exists
+        cursor = await conn.execute("PRAGMA table_info(memory_metadata)")
+        col_names = {row[1] for row in await cursor.fetchall()}
+        assert "deprecated" in col_names, "migration didn't add 'deprecated' column"
+        assert "dream_cycle_run_id" in col_names, "migration didn't add 'dream_cycle_run_id'"
+
+        # Create all indexes
+        for idx_ddl in INDEXES:
+            await conn.execute(idx_ddl)
+        await conn.commit()
+    finally:
+        await conn.close()

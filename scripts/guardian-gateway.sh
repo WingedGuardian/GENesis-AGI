@@ -137,6 +137,16 @@ PYEOF
                     chmod +x "$HOME/.local/bin/guardian-gateway.sh.new"
                     mv "$HOME/.local/bin/guardian-gateway.sh.new" "$HOME/.local/bin/guardian-gateway.sh"
                 fi
+                # Update systemd units from repo (picks up MemoryMax, OOMScoreAdjust, etc.)
+                SYSTEMD_DIR="$HOME/.config/systemd/user"
+                mkdir -p "$SYSTEMD_DIR"
+                for unit in genesis-guardian.service genesis-guardian.timer \
+                            genesis-guardian-watchman.service genesis-guardian-watchman.timer; do
+                    if [ -f "$INSTALL_DIR/config/$unit" ]; then
+                        cp "$INSTALL_DIR/config/$unit" "$SYSTEMD_DIR/$unit"
+                    fi
+                done
+                systemctl --user daemon-reload 2>/dev/null || true
                 # Restart timer so new check.py code takes effect immediately
                 systemctl --user restart genesis-guardian.timer 2>/dev/null || true
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
