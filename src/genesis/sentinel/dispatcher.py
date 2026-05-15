@@ -1048,7 +1048,7 @@ class SentinelDispatcher:
                 prompt=full_prompt,
                 model=CCModel.OPUS,
                 effort=EffortLevel.HIGH,
-                timeout_s=900,
+                timeout_s=3600,
                 skip_permissions=True,
                 system_prompt=system_prompt,
                 append_system_prompt=True,

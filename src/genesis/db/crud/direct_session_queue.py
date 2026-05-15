@@ -20,7 +20,7 @@ async def enqueue(
     profile: str = "observe",
     model: str = "sonnet",
     effort: str = "high",
-    timeout_s: int = 900,
+    timeout_s: int = 3600,
     notify: bool = True,
     notify_on_failure_only: bool = False,
     caller_context: str | None = None,

@@ -46,7 +46,7 @@ class TestEnqueue:
         assert payload["profile"] == "observe"
         assert payload["model"] == "sonnet"
         assert payload["effort"] == "high"
-        assert payload["timeout_s"] == 900
+        assert payload["timeout_s"] == 3600
         assert payload["notify"] is True
         assert payload["notify_on_failure_only"] is False
 

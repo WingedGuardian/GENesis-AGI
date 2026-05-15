@@ -141,7 +141,7 @@ class DirectSessionRequest:
     model: CCModel = CCModel.SONNET
     effort: EffortLevel = EffortLevel.HIGH
     system_prompt: str | None = None  # None = SOUL.md identity
-    timeout_s: int = 900  # 15 min default
+    timeout_s: int = 3600  # 1 hour — model decides when to stop
     notify: bool = True
     notify_on_failure_only: bool = False
     source_tag: str = "direct_session"

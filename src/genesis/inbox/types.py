@@ -38,7 +38,7 @@ class InboxConfig:
     enabled: bool = True
     model: str = "sonnet"
     effort: str = "high"
-    timeout_s: int = 900
+    timeout_s: int = 3600
     max_retries: int = 3
     recursive: bool = False
     # timezone removed — uses genesis.env.user_timezone()
