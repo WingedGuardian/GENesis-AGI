@@ -19,3 +19,12 @@ StandardError=journal
 # deep investigation + recovery + verification. 65 min allows CC its full
 # hour plus 5 min for signal collection, alerts, and cleanup.
 TimeoutStartSec=3900
+
+# Resource limits — prevent CC diagnostic from consuming unbounded host memory.
+# 6G covers the guardian Python process + one CC session + tool subprocesses.
+# MemorySwapMax=0 prevents I/O thrashing under pressure.
+# OOMScoreAdjust=500 (positive) makes guardian first to be OOM-killed vs
+# genesis (-500) or ollama — guardian is expendable, primary workloads are not.
+MemoryMax=6G
+MemorySwapMax=0
+OOMScoreAdjust=500
