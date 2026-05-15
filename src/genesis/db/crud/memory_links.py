@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import aiosqlite
 
 
@@ -68,6 +70,26 @@ async def delete_by_memory(db: aiosqlite.Connection, *, memory_id: str) -> int:
     cursor = await db.execute(
         "DELETE FROM memory_links WHERE source_id = ? OR target_id = ?",
         (memory_id, memory_id),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def prune_weak(
+    db: aiosqlite.Connection,
+    *,
+    max_strength: float = 0.3,
+    min_age_days: int = 30,
+) -> int:
+    """Delete weak, old links that were never reinforced.
+
+    Criteria: strength <= *max_strength* AND created_at older than
+    *min_age_days*. Returns count deleted.
+    """
+    cutoff = (datetime.now(UTC) - timedelta(days=min_age_days)).isoformat()
+    cursor = await db.execute(
+        "DELETE FROM memory_links WHERE strength <= ? AND created_at < ?",
+        (max_strength, cutoff),
     )
     await db.commit()
     return cursor.rowcount

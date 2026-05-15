@@ -6,6 +6,7 @@ import contextlib
 import hashlib
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import aiosqlite
@@ -413,28 +414,64 @@ class SurplusScheduler:
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
 
-            # Purge expired surplus insights (TTL enforcement)
+            # ── GC operations ──────────────────────────────────────────
+            # Each wrapped individually so one failure doesn't skip the rest.
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
             if rt.db is not None:
-                purged = await surplus_crud.purge_expired(rt.db)
-                if purged:
-                    logger.info("Purged %d expired surplus insights", purged)
+                # Purge expired surplus insights (TTL enforcement)
+                try:
+                    purged = await surplus_crud.purge_expired(rt.db)
+                    if purged:
+                        logger.info("Purged %d expired surplus insights", purged)
+                except Exception:
+                    logger.warning("GC: surplus insights purge failed", exc_info=True)
 
                 # GC: remove completed/failed pending_embeddings older than 30 days
-                from genesis.db.crud import pending_embeddings as pe_crud
-                pe_purged = await pe_crud.purge_completed(rt.db, older_than_days=30)
-                if pe_purged:
-                    logger.info("Purged %d completed pending_embeddings", pe_purged)
+                try:
+                    from genesis.db.crud import pending_embeddings as pe_crud
+                    pe_purged = await pe_crud.purge_completed(rt.db, older_than_days=30)
+                    if pe_purged:
+                        logger.info("Purged %d completed pending_embeddings", pe_purged)
+                except Exception:
+                    logger.warning("GC: pending_embeddings purge failed", exc_info=True)
 
                 # GC: rotate heartbeat events older than 7 days
-                from genesis.db.crud import events as events_crud
-                hb_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-                hb_purged = await events_crud.prune(
-                    rt.db, older_than=hb_cutoff, event_type="heartbeat",
-                )
-                if hb_purged:
-                    logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
+                try:
+                    from genesis.db.crud import events as events_crud
+                    hb_cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+                    hb_purged = await events_crud.prune(
+                        rt.db, older_than=hb_cutoff, event_type="heartbeat",
+                    )
+                    if hb_purged:
+                        logger.info("Pruned %d heartbeat events older than 7d", hb_purged)
+                except Exception:
+                    logger.warning("GC: heartbeat event rotation failed", exc_info=True)
+
+                # GC: prune weak memory links (strength <= 0.3, older than 30d)
+                try:
+                    from genesis.db.crud import memory_links as links_crud
+                    links_pruned = await links_crud.prune_weak(
+                        rt.db, max_strength=0.3, min_age_days=30,
+                    )
+                    if links_pruned:
+                        logger.info("Pruned %d weak memory links", links_pruned)
+                except Exception:
+                    logger.warning("GC: weak link pruning failed", exc_info=True)
+
+                # GC: archive old transcript files (gzip .jsonl > 90 days)
+                try:
+                    from genesis.surplus.maintenance import archive_old_transcripts
+                    transcripts_archived = await archive_old_transcripts(
+                        Path.home() / ".genesis" / "background-sessions",
+                        older_than_days=90,
+                    )
+                    if transcripts_archived:
+                        logger.info(
+                            "Archived %d old transcript files", transcripts_archived,
+                        )
+                except Exception:
+                    logger.warning("GC: transcript archival failed", exc_info=True)
 
             with contextlib.suppress(Exception):
                 GenesisRuntime.instance().record_job_success("schedule_maintenance")
