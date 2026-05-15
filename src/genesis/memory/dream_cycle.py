@@ -251,15 +251,21 @@ async def _cluster_bucket(
     uf = _UnionFind()
     point_map = {p["id"]: p for p in points}
 
+    # Batch-retrieve all vectors for this bucket in one call
+    # (avoids N sync blocking calls to Qdrant)
+    vector_map = _batch_get_vectors(qdrant, [p["id"] for p in points])
+
     # Build similarity graph
     for point in points:
         pid = point["id"]
-        # We need the vector to search — retrieve it from Qdrant
+        vec = vector_map.get(pid)
+        if vec is None:
+            continue
         try:
             neighbors = search(
                 qdrant,
                 collection=COLLECTION,
-                query_vector=_get_vector(qdrant, pid),
+                query_vector=vec,
                 limit=20,
                 wing=wing,
                 room=room,
@@ -293,8 +299,36 @@ async def _cluster_bucket(
     return clusters
 
 
+def _batch_get_vectors(
+    qdrant: QdrantClient, point_ids: list[str],
+) -> dict[str, list[float]]:
+    """Batch-retrieve vectors for all points in one Qdrant call.
+
+    Returns {point_id: vector}. Missing points are silently omitted.
+    Batches in chunks of 100 to avoid oversized requests.
+    """
+    vector_map: dict[str, list[float]] = {}
+    batch_size = 100
+    for i in range(0, len(point_ids), batch_size):
+        batch_ids = point_ids[i:i + batch_size]
+        try:
+            results = qdrant.retrieve(
+                collection_name=COLLECTION,
+                ids=batch_ids,
+                with_vectors=True,
+            )
+            for r in results:
+                vector_map[str(r.id)] = r.vector
+        except Exception:
+            logger.warning(
+                "Failed to retrieve vectors for batch %d-%d",
+                i, i + len(batch_ids), exc_info=True,
+            )
+    return vector_map
+
+
 def _get_vector(qdrant: QdrantClient, point_id: str) -> list[float]:
-    """Retrieve a point's vector from Qdrant."""
+    """Retrieve a single point's vector from Qdrant (used by tests)."""
     result = qdrant.retrieve(
         collection_name=COLLECTION,
         ids=[point_id],
@@ -358,6 +392,7 @@ async def _synthesize_and_deprecate(
         source_pipeline="dream_cycle",
         wing=synthesis.get("wing", wing),
         room=synthesis.get("room", room),
+        auto_link=False,  # We create provenance links explicitly below
     )
 
     # Set synthesized_from on the new memory's Qdrant payload
@@ -367,6 +402,13 @@ async def _synthesize_and_deprecate(
         collection=COLLECTION,
         point_id=new_memory_id,
         payload={"synthesized_from": original_ids},
+    )
+
+    # Stamp synthesis memory with run_id for rollback (prefixed to
+    # distinguish from deprecated originals in the same column)
+    await db.execute(
+        "UPDATE memory_metadata SET dream_cycle_run_id = ? WHERE memory_id = ?",
+        (f"synthesis:{run_id}", new_memory_id),
     )
 
     # Deprecate originals
@@ -411,7 +453,10 @@ async def _synthesize_and_deprecate(
                     created_at=now_iso,
                 )
             except Exception:
-                pass  # Best-effort linking
+                logger.debug(
+                    "Dream cycle: link %s → %s failed",
+                    new_memory_id, original_id, exc_info=True,
+                )
 
     logger.info(
         "Dream cycle: synthesized %d memories into %s (%s/%s)",
@@ -478,11 +523,10 @@ async def rollback(
     await db.commit()
 
     # 2. Delete synthesized memories created by this run
-    # They carry the tag "dream_cycle_run_id:{run_id}"
-    tag_marker = f"dream_cycle_run_id:{run_id}"
+    # Syntheses are stamped with "synthesis:{run_id}" in dream_cycle_run_id
     cursor = await db.execute(
-        "SELECT memory_id FROM memory_fts WHERE tags LIKE ?",
-        (f"%{tag_marker}%",),
+        "SELECT memory_id FROM memory_metadata WHERE dream_cycle_run_id = ?",
+        (f"synthesis:{run_id}",),
     )
     synthesis_ids = [row[0] for row in await cursor.fetchall()]
 
@@ -505,6 +549,14 @@ async def rollback(
             report["errors"].append({"synthesis_id": sid, "error": str(exc)})
 
     await db.commit()
+
+    # Invalidate graph cache since we deleted links
+    if report["syntheses_deleted"] > 0:
+        try:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
+        except ImportError:
+            pass
 
     logger.info(
         "Dream cycle rollback %s: restored %d, deleted %d syntheses, %d errors",

@@ -22,7 +22,7 @@ _SCROLL = "genesis.qdrant.collections.scroll_points"
 _SEARCH = "genesis.qdrant.collections.search"
 _UPDATE = "genesis.qdrant.collections.update_payload"
 _DELETE = "genesis.qdrant.collections.delete_point"
-_GET_VEC = "genesis.memory.dream_cycle._get_vector"
+_BATCH_VEC = "genesis.memory.dream_cycle._batch_get_vectors"
 
 
 # ── Union-Find ───────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ class TestDryRun:
 
         with patch(_SCROLL) as mock_scroll, \
              patch(_SEARCH) as mock_search, \
-             patch(_GET_VEC) as mock_vec:
+             patch(_BATCH_VEC) as mock_vec:
             mock_scroll.return_value = (
                 [
                     {"id": "p1", "payload": {"wing": "memory", "room": "store", "content": "fact A", "confidence": 0.9}},
@@ -169,7 +169,7 @@ class TestDryRun:
             mock_search.return_value = [
                 {"id": "p2", "score": 0.92, "payload": {}},
             ]
-            mock_vec.return_value = [0.1] * 768
+            mock_vec.return_value = {"p1": [0.1] * 768, "p2": [0.1] * 768}
 
             report = await run(
                 qdrant=mock_qdrant,
@@ -214,7 +214,7 @@ class TestLiveRun:
 
         with patch(_SCROLL) as mock_scroll, \
              patch(_SEARCH) as mock_search, \
-             patch(_GET_VEC) as mock_vec, \
+             patch(_BATCH_VEC) as mock_vec, \
              patch(_UPDATE) as mock_update:
             mock_scroll.return_value = (
                 [
@@ -226,7 +226,7 @@ class TestLiveRun:
             mock_search.return_value = [
                 {"id": "p2", "score": 0.92, "payload": {}},
             ]
-            mock_vec.return_value = [0.1] * 768
+            mock_vec.return_value = {"p1": [0.1] * 768, "p2": [0.1] * 768}
 
             report = await run(
                 qdrant=mock_qdrant,
@@ -260,13 +260,15 @@ class TestLiveRun:
 
         with patch(_SCROLL) as mock_scroll, \
              patch(_SEARCH) as mock_search, \
-             patch(_GET_VEC) as mock_vec:
+             patch(_BATCH_VEC) as mock_vec:
             mock_scroll.return_value = (large_cluster_points, None)
             mock_search.side_effect = lambda *a, **kw: [
                 {"id": p["id"], "score": 0.95, "payload": {}}
                 for p in large_cluster_points
             ]
-            mock_vec.return_value = [0.1] * 768
+            mock_vec.return_value = {
+                p["id"]: [0.1] * 768 for p in large_cluster_points
+            }
 
             report = await run(
                 qdrant=mock_qdrant,

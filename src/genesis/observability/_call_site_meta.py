@@ -168,7 +168,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "cc",
     },
     "8_ego_compaction": {
-        "description": "Ego-internal rolling summary compactor. Folds old ego_cycles outputs into a single compacted_summary in ego_state so long-running ego memory stays bounded. NOT Genesis-wide memory consolidation — that pipeline (dream cycle) is not yet built. Only caller: ego/compaction.py:54 (inert until ego sessions go live). Note: 8_user_ego_compaction and 8_genesis_ego_compaction are observability labels (NOT routing IDs) — see runtime/init/ego.py:86,157.",
+        "description": "Ego-internal rolling summary compactor. Folds old ego_cycles outputs into a single compacted_summary in ego_state so long-running ego memory stays bounded. NOT Genesis-wide memory consolidation — that is the dream cycle (call site: dream_cycle_synthesis, weekly Sunday 3am). Only caller: ego/compaction.py:54. Note: 8_user_ego_compaction and 8_genesis_ego_compaction are observability labels (NOT routing IDs) — see runtime/init/ego.py:86,157.",
         "category": "processing",
         "frequency": "Daily",
         "model_tier": "slm",

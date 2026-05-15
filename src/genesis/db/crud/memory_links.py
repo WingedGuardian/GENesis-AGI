@@ -92,4 +92,11 @@ async def prune_weak(
         (max_strength, cutoff),
     )
     await db.commit()
-    return cursor.rowcount
+    pruned = cursor.rowcount
+    if pruned:
+        try:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
+        except ImportError:
+            pass
+    return pruned
