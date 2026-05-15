@@ -9,6 +9,46 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+---
+
+## [v3.0b9] - 2026-05-14
+
+54 PRs merged. Ego gains layers 3--6 (realist gate, cross-ego isolation,
+capability map, reactive cycles, model tiering). The surplus engine gets
+an intelligence intake pipeline. Approval system rebuilt. Memory and
+learning subsystems hardened across a dozen fixes. Browser automation
+gains stealth and VNC-based Turnstile bypass. CC's Bash sandbox moved
+off volatile `/tmp` to prevent intermittent session-breaking failures.
+
+### Added
+
+- **Ego layers 3--6** (#333, #335, #346) --- realist gate for proposal
+  quality control, cross-ego isolation (user ego and Genesis ego run
+  independently), capability map for self-awareness, reactive cycles
+  that respond to environmental changes, and model tiering for
+  cost-appropriate execution.
+- **Intelligence intake pipeline** (#349) --- surplus engine atomizes
+  incoming intelligence signals, scores them for relevance, and routes
+  to the appropriate processing lane.
+- **Stealth browser skill** (#338) --- VNC trusted-input technique for
+  bypassing anti-bot protections like Cloudflare Turnstile.
+- **VNC Turnstile auto-bypass** (#348) --- wires VNC trusted input into
+  the browser automation layer for hands-free CAPTCHA solving.
+- **Medium self-healing login** (#342) --- `MediumDistributor` recovers
+  from expired sessions without manual intervention.
+- **Ego Opus dispatch** (#347) --- interact-profile sessions use Opus
+  for higher-quality output.
+- **Voice-master quick mode** (#341) --- lightweight voice application
+  with anti-AI audit rules.
+- **Ego publish profile type** (#339) --- adds `publish` to the interact
+  profile types for content distribution dispatch.
+- **Evolution proposal review tool** (#316) --- MCP tool for triaging
+  ego proposals.
+- **DB migration auto-apply at startup** (#302) --- pending migrations
+  run automatically on server start.
+- **Memory lifecycle GC** (#352) --- garbage collection for
+  `pending_embeddings`, events rotation, and `retrieved_count` tracking.
+
 ### Changed
 
 - **Automated-subsystem memory writes no longer get embedded into
@@ -174,14 +214,52 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   a bug --- it should be discoverable. Sentinel does not alert on
   these sites (existing filter for `wired:False`/`disabled`/no
   `last_run_at` covers it).
+- **Approval system overhauled** (#323, #329, #351) --- removes
+  subsystem scoping, adds instant wake on approval, startup recovery
+  for pending approvals, and staleness guard for approvals blocking the
+  inbox monitor indefinitely.
+- **Ego self-suppression eliminated** (#331) --- removes root causes
+  of ego cycles suppressing their own output, plus fixes deep reflection
+  floor bug.
+- **Sentinel alarm flapping cooldown** (#340) --- 15-minute cooldown
+  prevents repeated alarm/clear cycles from spamming notifications.
+  Adds `MemAvailable` metric.
+- **CC Bash sandbox moved off volatile `/tmp`** (#357) --- sets
+  `CLAUDE_CODE_TMPDIR` to persistent disk (`~/.genesis/cc-tmp`),
+  eliminating intermittent ENOENT failures that broke the Bash tool
+  for 7+ sessions.
+- **Inbox startup wake delay** (#354, #355) --- uses
+  `asyncio.call_later` for reliable startup wake instead of immediate
+  wake that raced with event loop bootstrap.
+- **Migration 0017 transaction fix** (#350) --- removes erroneous
+  `db.commit()` since the migration runner manages transactions.
+- **Inbox content hash normalization** (#330) --- prevents duplicate
+  processing. Strengthens YouTube fallback instructions.
+- **Learning pipeline structural fixes** (#332) --- 5 fixes for the
+  procedural learning pipeline.
+- **Memory tagging and recall fixes** (#324, #325, #326, #327) ---
+  separate episodic/knowledge stores, Qdrant collection tagging, drift
+  null safety, CBM hook, and curated KB migration.
+- **Contribution gate force-with-lease** (#320) --- explicit expected
+  SHA prevents accidental overwrites.
+- **Cloud-only install Ollama exclusion** (#328) --- `probe_ollama`
+  excluded from critical failure on cloud-only installs.
+- **Runtime config path fix** (#344) --- corrects config path in
+  runtime/init modules.
+- **Surplus operational fixes** (#343) --- zombie approvals, backup
+  verification, failure visibility.
+- **Surplus cognitive context enrichment** (#345) --- enriches task
+  context for higher-quality surplus output.
 
 ### Migrations
 
-- **0014_eval_results_metadata** --- adds a `metadata_json` TEXT
-  column to `eval_results` so structured judge output (rubric name +
-  version, judge model, score, rationale) can be queried without
-  re-parsing `scorer_detail`. Idempotent; applies automatically on
-  first server start after the upgrade.
+- **0014_eval_results_metadata** --- adds `metadata_json` to
+  `eval_results` for structured judge output.
+- **0015_rename_confusable_call_sites** --- renames overloaded call-site
+  IDs in `call_site_last_run` and `deferred_work_queue`.
+- **0016_source_subsystem** --- backfills `source_subsystem` column on
+  `memory_metadata` for subsystem content filtering.
+- **0017_ego_tables** --- ego world model, proposal, and session tables.
 
 ---
 
