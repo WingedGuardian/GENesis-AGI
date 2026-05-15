@@ -9,10 +9,10 @@ import pytest
 
 from genesis.memory.dream_cycle import (
     MAX_CLUSTER_SIZE,
-    _UnionFind,
     _build_synthesis_prompt,
     _parse_synthesis_response,
     _size_distribution,
+    _UnionFind,
     run,
 )
 
