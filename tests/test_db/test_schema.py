@@ -425,11 +425,12 @@ async def test_migration_creates_all_indexed_columns():
 
 
 async def test_migration_on_stripped_db():
-    """Migration brings a stripped-down DB (no post-Phase-0 columns) up to date.
+    """Fresh DB consistency: DDL columns + migration + indexes all agree.
 
-    Creates tables using only the columns that existed in Phase 0 (approximated
-    by stripping columns that have _try_alter entries), then verifies that
-    _migrate_add_columns() + index creation succeeds without error.
+    Verifies that specific post-Phase-0 columns (deprecated, dream_cycle_run_id)
+    exist after migration runs on a fresh database, and that all indexes can
+    be created. This complements test_migration_creates_all_indexed_columns by
+    asserting specific column names rather than just checking for errors.
     """
     import aiosqlite
 
