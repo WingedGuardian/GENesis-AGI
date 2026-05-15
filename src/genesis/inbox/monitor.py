@@ -98,6 +98,24 @@ _ACKNOWLEDGED_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Platform name aliases for coherence check — maps bare domains to names
+# that evaluations commonly use instead of the raw URL domain.
+_DOMAIN_TO_NAMES: dict[str, list[str]] = {
+    "linkedin.com": ["linkedin"],
+    "github.com": ["github"],
+    "youtube.com": ["youtube"],
+    "youtu.be": ["youtube"],
+    "medium.com": ["medium"],
+    "twitter.com": ["twitter", "x.com", "x/twitter"],
+    "x.com": ["twitter", "x.com", "x/twitter"],
+    "reddit.com": ["reddit"],
+    "arxiv.org": ["arxiv"],
+    "huggingface.co": ["hugging face", "huggingface"],
+    "producthunt.com": ["product hunt", "producthunt"],
+    "news.ycombinator.com": ["hacker news", "ycombinator", "hn"],
+    "substack.com": ["substack"],
+}
+
 
 def _is_acknowledged(response_text: str) -> bool:
     """Detect if the LLM classified this item as Acknowledged (no response needed).
@@ -132,22 +150,6 @@ def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
     # Source URLs should appear in evaluation (domain-level or platform-name check).
     # Evaluations often use platform names ("LinkedIn") rather than raw domains
     # ("www.linkedin.com"), so we check both.
-    _DOMAIN_TO_NAMES: dict[str, list[str]] = {
-        "linkedin.com": ["linkedin"],
-        "github.com": ["github"],
-        "youtube.com": ["youtube"],
-        "youtu.be": ["youtube"],
-        "medium.com": ["medium"],
-        "twitter.com": ["twitter", "x.com", "x/twitter"],
-        "x.com": ["twitter", "x.com", "x/twitter"],
-        "reddit.com": ["reddit"],
-        "arxiv.org": ["arxiv"],
-        "huggingface.co": ["hugging face", "huggingface"],
-        "producthunt.com": ["product hunt", "producthunt"],
-        "news.ycombinator.com": ["hacker news", "ycombinator", "hn"],
-        "substack.com": ["substack"],
-    }
-
     urls = re.findall(r"https?://([^\s/]+)", source_content)
     if urls:
         eval_lower = evaluation.lower()

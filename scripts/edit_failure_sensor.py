@@ -72,21 +72,23 @@ def _process(data: dict) -> None:
 
     try:
         conn = sqlite3.connect(str(_DB_PATH), timeout=2)
-        conn.execute(
-            """INSERT INTO tool_call_outcomes
-               (session_id, tool_name, file_path, success, error_snippet, timestamp)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                session_id or None,
-                tool_name,
-                file_path or None,
-                success,
-                error_snippet,
-                datetime.now(UTC).isoformat(),
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """INSERT INTO tool_call_outcomes
+                   (session_id, tool_name, file_path, success, error_snippet, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id or None,
+                    tool_name,
+                    file_path or None,
+                    success,
+                    error_snippet,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     except sqlite3.OperationalError:
         pass
 
