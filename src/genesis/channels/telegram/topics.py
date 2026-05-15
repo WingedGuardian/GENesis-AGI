@@ -223,6 +223,27 @@ class TopicManager:
                     msg = await self._bot.send_message(**kwargs)
                 else:
                     raise
+            # Persist outbound message for audit trail + reply resolution
+            if self._db is not None:
+                try:
+                    from genesis.db.crud.telegram_messages import store
+
+                    await store(
+                        self._db,
+                        chat_id=self._chat_id,
+                        message_id=msg.message_id,
+                        sender="genesis",
+                        content=text,
+                        thread_id=thread_id,
+                        direction="outbound",
+                    )
+                except Exception:
+                    logger.debug(
+                        "Failed to persist topic message %s",
+                        msg.message_id,
+                        exc_info=True,
+                    )
+
             return str(msg.message_id)
         except Exception:
             logger.error(
