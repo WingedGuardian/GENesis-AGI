@@ -246,8 +246,6 @@ async def _cluster_bucket(
     For each point, searches Qdrant for neighbors above threshold,
     then extracts connected components via union-find.
     """
-    from qdrant_client.models import FieldCondition, Filter, MatchValue
-
     from genesis.qdrant.collections import search
 
     uf = _UnionFind()

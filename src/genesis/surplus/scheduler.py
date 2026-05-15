@@ -722,7 +722,8 @@ class SurplusScheduler:
 
             # Write observation with the report
             try:
-                import uuid as _uuid
+                import uuid as _uuid  # noqa: PLC0415
+
                 from genesis.db.crud import observations as obs_crud
                 await obs_crud.create(
                     rt.db,
