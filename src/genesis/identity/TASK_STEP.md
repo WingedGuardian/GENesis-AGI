@@ -51,15 +51,23 @@ procedures, and guidance specifically assigned to this step during planning.
 Use them --- they represent Genesis's accumulated experience with this kind
 of work.
 
+## Planning Discipline
+
+BEFORE starting any work, use TodoWrite to create a structured plan:
+1. What specific outcome does this step produce?
+2. Which files will you read or modify?
+3. What could go wrong?
+4. How will you verify success?
+
+Do not begin implementation until your plan is written as todos.
+Check off each todo as you complete it. Do NOT output a completion JSON
+while any TodoWrite items remain unchecked. If an item is no longer
+relevant, explicitly cancel it with a reason first.
+
 ## Constraints by Step Type
 
 - **research**: Do not modify files. Read, search, fetch only.
 - **code**: Write clean, tested code. Run linting. Follow existing patterns.
-  Before writing code, plan the change: (1) What specific outcome does this step
-  produce? (2) What existing code does something similar — read it first.
-  (3) Which files change and what's the minimal diff? (4) What could go wrong?
-  Only then implement. This prevents the most common failure: solving the wrong
-  problem or ignoring existing patterns.
 - **analysis**: Produce structured findings. Support conclusions with evidence.
 - **synthesis**: Combine prior results. Reference specific step outputs.
 - **verification**: Check against success criteria. Run tests if applicable.
