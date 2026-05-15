@@ -352,6 +352,14 @@ call_sites:
     - mistral-small-free
     - groq-free
     - openrouter-free
+  # Dream cycle: cluster-merge synthesis for episodic memory consolidation.
+  # Free-tier only. Separate from 22_tagging (entity extraction).
+  dream_cycle_synthesis:
+    chain:
+    - groq-free
+    - mistral-small-free
+    - openrouter-free
+    retry_profile: background
   27_pre_execution_assessment:
     chain:
     - glm51

@@ -87,48 +87,48 @@ def search(
     points missing the key (legacy data without the tag) are preserved.
     Includes use ``must`` — only points whose key matches are returned.
     """
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
     conditions: list = []
     must_not_conditions: list = []
-    if (
-        source_type or wing or room
-        or exclude_subsystems or include_only_subsystems
-    ):
-        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
-        if source_type:
-            conditions.append(
-                FieldCondition(key="source_type", match=MatchValue(value=source_type))
-            )
-        if wing:
-            conditions.append(
-                FieldCondition(key="wing", match=MatchValue(value=wing))
-            )
-        if room:
-            conditions.append(
-                FieldCondition(key="room", match=MatchValue(value=room))
-            )
-        if include_only_subsystems:
-            conditions.append(
-                FieldCondition(
-                    key="source_subsystem",
-                    match=MatchAny(any=list(include_only_subsystems)),
-                )
-            )
-        if exclude_subsystems:
-            must_not_conditions.append(
-                FieldCondition(
-                    key="source_subsystem",
-                    match=MatchAny(any=list(exclude_subsystems)),
-                )
-            )
-    query_filter = None
-    if conditions or must_not_conditions:
-        from qdrant_client.models import Filter
+    # Always exclude deprecated memories (dream cycle soft-delete).
+    # Points without the field (legacy data) are preserved — Qdrant's
+    # must_not only excludes points where the field exists AND matches.
+    must_not_conditions.append(
+        FieldCondition(key="deprecated", match=MatchValue(value=True))
+    )
 
-        query_filter = Filter(
-            must=conditions or None,
-            must_not=must_not_conditions or None,
+    if source_type:
+        conditions.append(
+            FieldCondition(key="source_type", match=MatchValue(value=source_type))
         )
+    if wing:
+        conditions.append(
+            FieldCondition(key="wing", match=MatchValue(value=wing))
+        )
+    if room:
+        conditions.append(
+            FieldCondition(key="room", match=MatchValue(value=room))
+        )
+    if include_only_subsystems:
+        conditions.append(
+            FieldCondition(
+                key="source_subsystem",
+                match=MatchAny(any=list(include_only_subsystems)),
+            )
+        )
+    if exclude_subsystems:
+        must_not_conditions.append(
+            FieldCondition(
+                key="source_subsystem",
+                match=MatchAny(any=list(exclude_subsystems)),
+            )
+        )
+    query_filter = Filter(
+        must=conditions or None,
+        must_not=must_not_conditions or None,
+    )
     results = client.query_points(
         collection_name=collection,
         query=query_vector,

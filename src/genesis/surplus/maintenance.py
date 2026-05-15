@@ -324,6 +324,60 @@ class DbMaintenanceExecutor:
         )
 
 
+# ─── Transcript Archival ────────────────────────────────────────────────
+
+
+async def archive_old_transcripts(
+    base_dir: Path,
+    *,
+    older_than_days: int = 90,
+) -> int:
+    """Gzip .jsonl transcript files older than *older_than_days*.
+
+    Lossless and reversible — originals are deleted only after a
+    successful gzip write with size verification. Returns count of
+    files archived.
+    """
+    import gzip
+
+    cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+    archived = 0
+
+    if not base_dir.is_dir():
+        return 0
+
+    for f in base_dir.glob("*.jsonl"):
+        if not f.is_file():
+            continue
+        try:
+            mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=UTC)
+            if mtime >= cutoff:
+                continue
+
+            gz_path = f.with_suffix(".jsonl.gz")
+            original_size = f.stat().st_size
+
+            # Write compressed
+            with f.open("rb") as src, gzip.open(gz_path, "wb") as dst:
+                while chunk := src.read(65536):
+                    dst.write(chunk)
+
+            # Verify gzip wrote something reasonable
+            if gz_path.stat().st_size == 0 and original_size > 0:
+                gz_path.unlink(missing_ok=True)
+                logger.warning("Gzip produced empty file for %s — skipped", f.name)
+                continue
+
+            # Safe to remove original
+            f.unlink()
+            archived += 1
+        except OSError:
+            logger.warning("Failed to archive %s", f.name, exc_info=True)
+            continue
+
+    return archived
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────
 
 def _fmt_bytes(n: int) -> str:
