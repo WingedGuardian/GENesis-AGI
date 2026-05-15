@@ -418,8 +418,8 @@ class TestProcessExecutionBriefs:
 
         mock_direct_runner.spawn.assert_not_called()
 
-    async def test_spawn_failure_marks_failed(self, ego_with_runner, mock_direct_runner, db):
-        """DirectSessionRunner failure transitions proposal to failed."""
+    async def test_spawn_failure_reverts_to_approved(self, ego_with_runner, mock_direct_runner, db):
+        """DirectSessionRunner failure reverts proposal to approved for retry."""
         await self._insert_proposal(db, "prop_004")
         mock_direct_runner.spawn.side_effect = RuntimeError("spawn failed")
 
@@ -427,7 +427,7 @@ class TestProcessExecutionBriefs:
         await ego_with_runner._process_execution_briefs(briefs)
 
         prop = await ego_crud.get_proposal(db, "prop_004")
-        assert prop["status"] == "failed"
+        assert prop["status"] == "approved"
 
     async def test_no_runner_returns_early(self, ego_session, db):
         """No DirectSessionRunner → log warning and return."""

@@ -740,13 +740,16 @@ class EgoSession:
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
-            ok = await ego_crud.execute_proposal(
-                self._db,
-                proposal_id,
-                status="executed",
-                user_response="dispatching",
+            # Use raw SQL to preserve resolved_at (the approval timestamp
+            # the staleness guard depends on).
+            cursor = await self._db.execute(
+                "UPDATE ego_proposals SET status = 'executed', "
+                "user_response = 'dispatching' "
+                "WHERE id = ? AND status = 'approved'",
+                (proposal_id,),
             )
-            if not ok:
+            await self._db.commit()
+            if cursor.rowcount == 0:
                 logger.info(
                     "Execution brief for proposal %s skipped — already claimed",
                     proposal_id,
@@ -1004,13 +1007,16 @@ class EgoSession:
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (_process_execution_briefs is a second path).
-            ok = await ego_crud.execute_proposal(
-                self._db,
-                prop["id"],
-                status="executed",
-                user_response="dispatching",
+            # Use raw SQL to preserve resolved_at (the approval timestamp
+            # the staleness guard depends on).
+            cursor = await self._db.execute(
+                "UPDATE ego_proposals SET status = 'executed', "
+                "user_response = 'dispatching' "
+                "WHERE id = ? AND status = 'approved'",
+                (prop["id"],),
             )
-            if not ok:
+            await self._db.commit()
+            if cursor.rowcount == 0:
                 logger.info(
                     "Proposal %s already claimed — skipping",
                     prop["id"],
