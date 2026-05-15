@@ -129,12 +129,47 @@ def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
     if "# Inbox Evaluation" not in evaluation:
         return False
 
-    # Source URLs should appear in evaluation (domain-level check)
+    # Source URLs should appear in evaluation (domain-level or platform-name check).
+    # Evaluations often use platform names ("LinkedIn") rather than raw domains
+    # ("www.linkedin.com"), so we check both.
+    _DOMAIN_TO_NAMES: dict[str, list[str]] = {
+        "linkedin.com": ["linkedin"],
+        "github.com": ["github"],
+        "youtube.com": ["youtube"],
+        "youtu.be": ["youtube"],
+        "medium.com": ["medium"],
+        "twitter.com": ["twitter", "x.com", "x/twitter"],
+        "x.com": ["twitter", "x.com", "x/twitter"],
+        "reddit.com": ["reddit"],
+        "arxiv.org": ["arxiv"],
+        "huggingface.co": ["hugging face", "huggingface"],
+        "producthunt.com": ["product hunt", "producthunt"],
+        "news.ycombinator.com": ["hacker news", "ycombinator", "hn"],
+        "substack.com": ["substack"],
+    }
+
     urls = re.findall(r"https?://([^\s/]+)", source_content)
     if urls:
         eval_lower = evaluation.lower()
-        url_hits = sum(1 for u in urls if u.lower() in eval_lower)
-        if url_hits == 0:
+        matched = False
+        for u in urls:
+            domain = u.lower()
+            # Direct domain match (original check)
+            if domain in eval_lower:
+                matched = True
+                break
+            # Platform-name match: strip www., look up known names
+            bare = domain.removeprefix("www.")
+            names = _DOMAIN_TO_NAMES.get(bare, [])
+            if any(name in eval_lower for name in names):
+                matched = True
+                break
+            # Fallback: use bare domain stem (e.g. "linkedin" from "linkedin.com")
+            stem = bare.split(".")[0]
+            if len(stem) > 3 and stem in eval_lower:
+                matched = True
+                break
+        if not matched:
             return False  # Evaluation doesn't reference ANY source URLs
 
     return True
