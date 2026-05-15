@@ -64,7 +64,7 @@ async def _direct_session_poll(runner: DirectSessionRunner, db) -> None:
                     profile=payload.get("profile", "observe"),
                     model=CCModel(payload.get("model", "sonnet")),
                     effort=EffortLevel(payload.get("effort", "high")),
-                    timeout_s=payload.get("timeout_s", 900),
+                    timeout_s=payload.get("timeout_s", 3600),
                     notify=payload.get("notify", True),
                     notify_on_failure_only=payload.get("notify_on_failure_only", False),
                     caller_context=payload.get("caller_context"),
