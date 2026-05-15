@@ -1229,6 +1229,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_metadata_collection ON memory_metadata(collection)",
     "CREATE INDEX IF NOT EXISTS idx_memory_meta_valid_at ON memory_metadata(valid_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_meta_invalid_at ON memory_metadata(invalid_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_meta_deprecated ON memory_metadata(deprecated)",
+    # knowledge_units
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_units_qdrant_id ON knowledge_units(qdrant_id)",
     # codebase index
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_module ON code_symbols(module_path)",
     "CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(name)",
