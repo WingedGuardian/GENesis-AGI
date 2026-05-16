@@ -1093,10 +1093,24 @@ class CCSessionExecutor:
             content = notepad.read_text(encoding="utf-8")
         except OSError:
             return
-        # Strip the skeleton to see if steps added anything
-        added = content.replace(self._NOTEPAD_SKELETON, "").strip()
-        if not added or len(added) < 20:
+        # Check if any section has real content (not just the skeleton headings).
+        # Steps insert content under ## Learnings / ## Decisions / ## Issues,
+        # so a contiguous skeleton replace won't work — check per-section.
+        import re
+        sections = re.split(r"^## ", content, flags=re.MULTILINE)
+        has_content = False
+        added_parts: list[str] = []
+        for section in sections[1:]:  # skip preamble before first ##
+            lines = section.split("\n", 1)
+            if len(lines) < 2:
+                continue
+            body = lines[1].strip()
+            if body:
+                has_content = True
+                added_parts.append(f"## {section.strip()}")
+        if not has_content:
             return  # Nothing substantive was added
+        added = "\n\n".join(added_parts)
         # Resolve memory store from runtime (same pattern as surplus)
         store = None
         try:
