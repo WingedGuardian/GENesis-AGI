@@ -389,7 +389,7 @@ async def update_proposal_outcome(
     """
     suffix = f"|{'completed' if success else 'failed'}:{summary[:200]}"
     cursor = await db.execute(
-        "UPDATE ego_proposals SET user_response = user_response || ? "
+        "UPDATE ego_proposals SET user_response = COALESCE(user_response, '') || ? "
         "WHERE id = ? AND status = 'executed'",
         (suffix, proposal_id),
     )

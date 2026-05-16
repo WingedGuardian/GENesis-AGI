@@ -371,19 +371,18 @@ class DirectSessionRunner:
             # On failure: create observation so ego sees it next cycle
             if not result.success:
                 try:
-                    from genesis.memory.store import get_store
-
-                    store = get_store()
-                    await store.store(
-                        content=(
-                            f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
-                        ),
-                        source="ego_dispatch_outcome",
-                        tags=["ego", "dispatch_failure"],
-                        memory_type="episodic",
-                        wing="autonomy",
-                        room="ego",
-                    )
+                    store = getattr(self._rt, "_memory_store", None)
+                    if store is not None:
+                        await store.store(
+                            content=(
+                                f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                            ),
+                            source="ego_dispatch_outcome",
+                            tags=["ego", "dispatch_failure"],
+                            memory_type="episodic",
+                            wing="autonomy",
+                            room="ego",
+                        )
                 except Exception:
                     logger.debug("Failed to store failure observation", exc_info=True)
         except Exception:

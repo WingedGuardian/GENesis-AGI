@@ -705,13 +705,27 @@ class ConversationLoop:
 
             lines.append(
                 "\n### To resolve a proposal:\n"
-                "Run this SQL (replace the proposal ID):\n"
-                "```sql\n"
-                "UPDATE ego_proposals SET status = 'approved', "
-                "resolved_at = datetime('now') WHERE id = '<proposal_id>' "
-                "AND status = 'pending';\n"
+                "Use Bash to run the genesis CLI:\n"
+                "```bash\n"
+                "source ~/genesis/.venv/bin/activate && python -c \"\n"
+                "import asyncio, aiosqlite\n"
+                "async def go():\n"
+                "    async with aiosqlite.connect("
+                "'$HOME/genesis/data/genesis.db') as db:\n"
+                "        await db.execute(\n"
+                "            'UPDATE ego_proposals SET status=?, "
+                "resolved_at=datetime(\"now\") WHERE id=? AND status=\"pending\"',\n"
+                "            ('approved', '<PROPOSAL_ID>'),\n"
+                "        )\n"
+                "        await db.commit()\n"
+                "asyncio.run(go())\n"
+                "\"\n"
                 "```\n"
-                "For rejection: SET status = 'rejected' instead.\n"
+                "For rejection: use 'rejected' instead of 'approved'.\n"
+                "\n### Important:\n"
+                "- If the user gives guidance or corrections (not just approve/reject),\n"
+                "  store it via `memory_store` MCP so the ego sees it in future cycles.\n"
+                "- Always confirm what you did: 'Approved proposal 1: [content]'\n"
             )
             return "\n".join(lines)
         except Exception:
