@@ -2853,7 +2853,6 @@
               method: "POST", headers: {"Content-Type": "application/json"},
               body: JSON.stringify({decision})
             });
-            // Also record engagement on the outreach message
             if (outreachMsgId) {
               const outcome = decision === 'approved' ? 'useful' : 'not_useful';
               await fetchApi("/api/genesis/outreach/" + outreachMsgId + "/engage", {
@@ -2861,16 +2860,32 @@
                 body: JSON.stringify({outcome, response: decision === 'approved' ? 'approve' : 'deny'})
               });
             }
-            await this.fetchOutreachMessages();
+            // Refresh all approval-related stores for immediate UI update
+            await Promise.all([
+              this.fetchOutreachMessages(),
+              this.fetchApprovals(),
+              this.fetchComms(),
+            ]);
           } catch (e) { console.error("resolve failed", e); }
         },
 
         async approveAllPending() {
           try {
-            await fetchApi("/api/genesis/approvals/approve-all", {
+            const resp = await fetchApi("/api/genesis/approvals/approve-all", {
               method: "POST", headers: {"Content-Type": "application/json"},
             });
-            await this.fetchOutreachMessages();
+            if (resp?.ok) {
+              // Optimistic clear for instant visual feedback
+              this.approvals = [];
+              this.commsPendingApprovals = [];
+              this.outreachModal.pendingApprovals = [];
+              // Confirm from server
+              await Promise.all([
+                this.fetchOutreachMessages(),
+                this.fetchApprovals(),
+                this.fetchComms(),
+              ]);
+            }
           } catch (e) { console.error("approve-all failed", e); }
         },
 
@@ -7127,8 +7142,8 @@
                           'executed': 'background:rgba(33,150,243,0.15); color:#2196F3;',
                         }[p.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
                         x-text="p.status"></span>
-                  <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"
-                        :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.15); color:#ce93d8;' : 'background:rgba(33,150,243,0.15); color:#64b5f6;'"
+                  <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase;"
+                        :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.25); color:#e1bee7;' : 'background:rgba(33,150,243,0.25); color:#90caf9;'"
                         x-text="p.ego_source === 'genesis_ego_cycle' ? 'Genesis' : p.ego_source === 'user_ego_cycle' ? 'User' : 'Ego'"></span>
                   <span x-show="p.action_type" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
                         x-text="p.action_type"></span>
