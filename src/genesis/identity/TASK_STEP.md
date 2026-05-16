@@ -64,6 +64,14 @@ Check off each todo as you complete it. Do NOT output a completion JSON
 while any TodoWrite items remain unchecked. If an item is no longer
 relevant, explicitly cancel it with a reason first.
 
+## Task Notepad
+
+A `TASK_NOTEPAD.md` file exists in your working directory. At the START
+of this step, read it for context from prior steps. Before completing
+this step, append any learnings, decisions, or issues you encountered
+that future steps should know about. Keep entries concise (1-2 lines each)
+under the appropriate section heading (Learnings, Decisions, Issues).
+
 ## Constraints by Step Type
 
 - **research**: Do not modify files. Read, search, fetch only.

@@ -352,6 +352,8 @@ class CCSessionExecutor:
                 has_code = any(s.get("type") == "code" for s in steps)
                 if has_code:
                     await self._create_worktree(task_id)
+                    # Seed task notepad for cross-step knowledge sharing
+                    self._seed_notepad(task_id)
 
                 self._append_to_plan(
                     plan_path, "PLANNING",
@@ -624,6 +626,10 @@ class CCSessionExecutor:
 
             # --- RETROSPECTIVE ---
             await self._transition(task_id, TaskPhase.RETROSPECTIVE)
+
+            # Promote task notepad to memory (before worktree cleanup)
+            await self._promote_notepad(task_id, description)
+
             if trace and self._tracer:
                 try:
                     retro_id = await self._tracer.finalize(trace)
@@ -1054,6 +1060,72 @@ class CCSessionExecutor:
                 "Worktree recovery failed for task %s", task_id,
             )
             return False
+
+    _NOTEPAD_SKELETON = (
+        "# Task Notepad\n\n"
+        "Record learnings, decisions, and issues as you work.\n"
+        "Each step should READ this file first and APPEND before finishing.\n\n"
+        "## Learnings\n\n"
+        "## Decisions\n\n"
+        "## Issues\n"
+    )
+
+    def _seed_notepad(self, task_id: str) -> None:
+        """Write an empty TASK_NOTEPAD.md into the task worktree."""
+        wt_path = self._worktree_paths.get(task_id)
+        if not wt_path:
+            return
+        notepad = Path(wt_path) / "TASK_NOTEPAD.md"
+        try:
+            notepad.write_text(self._NOTEPAD_SKELETON, encoding="utf-8")
+        except OSError:
+            logger.debug("Failed to seed notepad for task %s", task_id)
+
+    async def _promote_notepad(
+        self, task_id: str, description: str,
+    ) -> None:
+        """Read notepad from worktree and store to memory if non-trivial."""
+        wt_path = self._worktree_paths.get(task_id)
+        if not wt_path:
+            return
+        notepad = Path(wt_path) / "TASK_NOTEPAD.md"
+        try:
+            content = notepad.read_text(encoding="utf-8")
+        except OSError:
+            return
+        # Strip the skeleton to see if steps added anything
+        added = content.replace(self._NOTEPAD_SKELETON, "").strip()
+        if not added or len(added) < 20:
+            return  # Nothing substantive was added
+        # Resolve memory store from runtime (same pattern as surplus)
+        store = None
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            store = rt._memory_store
+        except Exception:
+            pass
+        if store is None:
+            logger.debug("No MemoryStore for notepad promotion (task %s)", task_id)
+            return
+        try:
+            await store.store(
+                content=f"Task notepad for: {description}\n\n{added}",
+                source="task_executor",
+                memory_type="episodic",
+                tags=["task_notepad", "synthesis"],
+                wing="autonomy",
+                room="tasks",
+            )
+            logger.info(
+                "Task %s notepad promoted to memory (%d chars)",
+                task_id, len(added),
+            )
+        except Exception:
+            logger.debug(
+                "Notepad promotion failed for task %s (non-blocking)",
+                task_id, exc_info=True,
+            )
 
     async def _cleanup_worktree(self, task_id: str) -> None:
         """Remove worktree if one was created for this task."""
