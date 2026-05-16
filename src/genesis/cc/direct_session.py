@@ -295,6 +295,9 @@ class DirectSessionRunner:
             # Persist result in session metadata (merge, don't overwrite)
             await self._store_result(session_id, request, result)
 
+            # Feed outcome back to ego proposal if this was a proposal dispatch
+            await self._record_proposal_outcome(request, result)
+
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
@@ -321,6 +324,7 @@ class DirectSessionRunner:
             # Best-effort: persist failure and notify
             try:
                 await self._store_result(session_id, request, error_result)
+                await self._record_proposal_outcome(request, error_result)
                 await self._session_manager.fail(
                     session_id, reason=str(exc)[:500],
                 )
@@ -344,6 +348,49 @@ class DirectSessionRunner:
                 session_id[:8], elapsed, exc,
             )
             raise
+
+    async def _record_proposal_outcome(
+        self,
+        request: DirectSessionRequest,
+        result: DirectSessionResult,
+    ) -> None:
+        """Feed session outcome back to ego proposal for feedback loop."""
+        if not request.caller_context or not request.caller_context.startswith("ego_proposal:"):
+            return
+        proposal_id = request.caller_context.split(":", 1)[1]
+        try:
+            from genesis.db.crud.ego import update_proposal_outcome
+
+            db = getattr(self._rt, "_db", None)
+            if db is None:
+                return
+            summary = (result.output_text or result.error or "")[:200]
+            await update_proposal_outcome(
+                db, proposal_id, success=result.success, summary=summary,
+            )
+            # On failure: create observation so ego sees it next cycle
+            if not result.success:
+                try:
+                    store = getattr(self._rt, "_memory_store", None)
+                    if store is not None:
+                        await store.store(
+                            content=(
+                                f"Ego dispatch FAILED for proposal {proposal_id}: {summary}"
+                            ),
+                            source="ego_dispatch_outcome",
+                            tags=["ego", "dispatch_failure"],
+                            memory_type="episodic",
+                            wing="autonomy",
+                            room="ego",
+                        )
+                except Exception:
+                    logger.debug("Failed to store failure observation", exc_info=True)
+        except Exception:
+            logger.warning(
+                "Failed to record proposal outcome for %s",
+                proposal_id,
+                exc_info=True,
+            )
 
     def _build_invocation(self, request: DirectSessionRequest) -> CCInvocation:
         system_prompt = request.system_prompt

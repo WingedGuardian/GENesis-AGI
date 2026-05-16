@@ -989,11 +989,12 @@ class EgoSession:
 
         dispatched: list[str] = []
         for prop in approved:
-            # Staleness guard — skip proposals approved more than 48h ago.
-            # resolved_at is set by resolve_proposal() at approval time.
+            # Staleness guard — skip proposals approved more than 7 days ago.
+            # Proposals go stale by clock only as a safety net; semantic
+            # staleness (premise invalid) is the ego's job to evaluate.
             try:
                 approved_at = datetime.fromisoformat(prop["resolved_at"])
-                if datetime.now(UTC) - approved_at > timedelta(hours=48):
+                if datetime.now(UTC) - approved_at > timedelta(days=7):
                     continue
             except (KeyError, TypeError, ValueError):
                 continue
