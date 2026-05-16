@@ -7127,6 +7127,9 @@
                           'executed': 'background:rgba(33,150,243,0.15); color:#2196F3;',
                         }[p.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
                         x-text="p.status"></span>
+                  <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"
+                        :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.15); color:#ce93d8;' : 'background:rgba(33,150,243,0.15); color:#64b5f6;'"
+                        x-text="p.ego_source === 'genesis_ego_cycle' ? 'Genesis' : p.ego_source === 'user_ego_cycle' ? 'User' : 'Ego'"></span>
                   <span x-show="p.action_type" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
                         x-text="p.action_type"></span>
                   <span x-show="p.urgency && p.urgency !== 'normal'" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"

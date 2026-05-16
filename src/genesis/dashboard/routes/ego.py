@@ -128,6 +128,7 @@ async def ego_proposals():
             "rank": p.get("rank"),
             "execution_plan": p.get("execution_plan"),
             "recurring": bool(p.get("recurring", 0)),
+            "ego_source": p.get("ego_source"),
         }
         for p in pending
     ])
@@ -191,6 +192,7 @@ async def ego_proposals_all():
             "rank": p.get("rank"),
             "execution_plan": p.get("execution_plan"),
             "recurring": bool(p.get("recurring", 0)),
+            "ego_source": p.get("ego_source"),
         }
         for p in proposals
     ])
