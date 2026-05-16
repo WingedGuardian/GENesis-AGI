@@ -375,6 +375,28 @@ async def execute_proposal(
     return cursor.rowcount > 0
 
 
+async def update_proposal_outcome(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    *,
+    success: bool,
+    summary: str,
+) -> bool:
+    """Append session outcome to an executed proposal's user_response.
+
+    Called after the dispatched session completes, so the ego knows whether
+    the action actually succeeded or failed.
+    """
+    suffix = f"|{'completed' if success else 'failed'}:{summary[:200]}"
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET user_response = user_response || ? "
+        "WHERE id = ? AND status = 'executed'",
+        (suffix, proposal_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def table_proposal(
     db: aiosqlite.Connection,
     id: str,
