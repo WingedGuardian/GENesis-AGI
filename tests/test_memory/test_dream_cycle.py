@@ -8,9 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from genesis.memory.dream_cycle import (
+    MAX_BUCKET_SIZE,
     MAX_CLUSTER_SIZE,
     _build_synthesis_prompt,
     _parse_synthesis_response,
+    _read_mem_available_mb,
     _size_distribution,
     _UnionFind,
     run,
@@ -322,3 +324,273 @@ class TestRollback:
         assert report["restored"] == 2
         assert report["syntheses_deleted"] == 1
         assert len(report["errors"]) == 0
+
+
+# ── Bucket Chunking ────────────────────────────────────────────────────
+
+
+class TestBucketChunking:
+    @pytest.mark.asyncio
+    async def test_large_bucket_is_chunked(self):
+        """A bucket exceeding MAX_BUCKET_SIZE gets split into chunks."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        # Create a bucket larger than MAX_BUCKET_SIZE
+        n_points = MAX_BUCKET_SIZE + 200  # 700 points → 2 chunks
+        points = [
+            {
+                "id": f"p{i}",
+                "payload": {
+                    "wing": "memory", "room": "store",
+                    "content": f"fact {i}", "confidence": 0.5,
+                },
+            }
+            for i in range(n_points)
+        ]
+
+        search_call_count = 0
+
+        def mock_search_fn(*args, **kwargs):
+            nonlocal search_call_count
+            search_call_count += 1
+            # Return no neighbors — no clusters formed
+            return []
+
+        with patch(_SCROLL) as mock_scroll, \
+             patch(_SEARCH, side_effect=mock_search_fn), \
+             patch(_BATCH_VEC) as mock_vec:
+            mock_scroll.return_value = (points, None)
+            mock_vec.return_value = {
+                f"p{i}": [0.1] * 768 for i in range(n_points)
+            }
+
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        # All points should be searched (across chunks)
+        assert search_call_count == n_points
+        assert report["total_points"] == n_points
+        # bucket_sizes should report the full pre-chunk size
+        assert report["bucket_sizes"]["memory/store"] == n_points
+
+    @pytest.mark.asyncio
+    async def test_tail_chunk_of_one_skipped(self):
+        """A bucket of MAX_BUCKET_SIZE+1 splits into 500 + 1; the 1-point tail is skipped."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        n_points = MAX_BUCKET_SIZE + 1  # 501 → chunks of 500 + 1
+        points = [
+            {
+                "id": f"p{i}",
+                "payload": {
+                    "wing": "memory", "room": "store",
+                    "content": f"fact {i}", "confidence": 0.5,
+                },
+            }
+            for i in range(n_points)
+        ]
+
+        search_call_count = 0
+
+        def mock_search_fn(*args, **kwargs):
+            nonlocal search_call_count
+            search_call_count += 1
+            return []
+
+        with patch(_SCROLL) as mock_scroll, \
+             patch(_SEARCH, side_effect=mock_search_fn), \
+             patch(_BATCH_VEC) as mock_vec:
+            mock_scroll.return_value = (points, None)
+            mock_vec.return_value = {
+                f"p{i}": [0.1] * 768 for i in range(n_points)
+            }
+
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        # Only 500 points searched — tail chunk of 1 skipped
+        assert search_call_count == MAX_BUCKET_SIZE
+
+    @pytest.mark.asyncio
+    async def test_small_bucket_not_chunked(self):
+        """Buckets within MAX_BUCKET_SIZE are processed in one pass."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        points = [
+            {
+                "id": f"p{i}",
+                "payload": {
+                    "wing": "memory", "room": "store",
+                    "content": f"fact {i}", "confidence": 0.5,
+                },
+            }
+            for i in range(10)
+        ]
+
+        with patch(_SCROLL) as mock_scroll, \
+             patch(_SEARCH, return_value=[]), \
+             patch(_BATCH_VEC) as mock_vec:
+            mock_scroll.return_value = (points, None)
+            mock_vec.return_value = {
+                f"p{i}": [0.1] * 768 for i in range(10)
+            }
+
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        assert report["total_points"] == 10
+        assert report["bucket_sizes"]["memory/store"] == 10
+
+
+# ── Memory Preflight ────────────────────────────────────────────────────
+
+
+class TestMemoryPreflight:
+    @pytest.mark.asyncio
+    async def test_aborts_on_low_memory(self):
+        """Dream cycle aborts early when available memory is too low."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        with patch(
+            "genesis.memory.dream_cycle._read_mem_available_mb",
+            return_value=100,  # 100MB < 256MB threshold
+        ):
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        assert "aborted" in report
+        assert "low_memory" in report["aborted"]
+        # Should NOT have scrolled Qdrant at all
+        assert "total_points" not in report
+
+    @pytest.mark.asyncio
+    async def test_proceeds_when_memory_ok(self):
+        """Dream cycle proceeds when sufficient memory is available."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        with patch(
+            "genesis.memory.dream_cycle._read_mem_available_mb",
+            return_value=8000,  # 8GB — plenty
+        ), patch(_SCROLL, return_value=([], None)):
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        assert "aborted" not in report
+        assert report["total_points"] == 0
+
+    @pytest.mark.asyncio
+    async def test_skips_check_on_non_linux(self):
+        """Non-Linux systems (None return) skip preflight, proceed normally."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        with patch(
+            "genesis.memory.dream_cycle._read_mem_available_mb",
+            return_value=None,  # Non-Linux
+        ), patch(_SCROLL, return_value=([], None)):
+            report = await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        assert "aborted" not in report
+
+    def test_read_mem_available_returns_int(self):
+        """Smoke test — on Linux this should return an int."""
+        result = _read_mem_available_mb()
+        # We're on Linux, so this should work
+        assert result is not None
+        assert isinstance(result, int)
+        assert result > 0
+
+
+# ── Async Yielding ──────────────────────────────────────────────────────
+
+
+class TestAsyncYielding:
+    @pytest.mark.asyncio
+    async def test_yields_during_search_loop(self):
+        """asyncio.sleep(0) is called periodically during clustering."""
+        mock_qdrant = MagicMock()
+        mock_db = AsyncMock()
+        mock_router = AsyncMock()
+        mock_store = AsyncMock()
+
+        # Create exactly 100 points to trigger 2 yields (at 50 and 100)
+        n_points = 100
+        points = [
+            {
+                "id": f"p{i}",
+                "payload": {
+                    "wing": "memory", "room": "store",
+                    "content": f"fact {i}", "confidence": 0.5,
+                },
+            }
+            for i in range(n_points)
+        ]
+
+        with patch(_SCROLL) as mock_scroll, \
+             patch(_SEARCH, return_value=[]), \
+             patch(_BATCH_VEC) as mock_vec, \
+             patch("genesis.memory.dream_cycle.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            mock_scroll.return_value = (points, None)
+            mock_vec.return_value = {
+                f"p{i}": [0.1] * 768 for i in range(n_points)
+            }
+
+            await run(
+                qdrant=mock_qdrant,
+                db=mock_db,
+                router=mock_router,
+                store=mock_store,
+                dry_run=True,
+            )
+
+        # With 100 points and _YIELD_EVERY=50, sleep(0) called twice
+        assert mock_sleep.call_count == 2
+        mock_sleep.assert_called_with(0)

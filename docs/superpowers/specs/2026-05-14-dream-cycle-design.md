@@ -412,6 +412,27 @@ async def rollback(run_id: str) -> dict:
     """
 ```
 
+### Resource Guards (added after VM crash 2026-05-15)
+
+The initial dry-run crashed the VM because the `(general, uncategorized)` bucket
+held ~11,725 points, generating 11,725 Qdrant search calls that saturated I/O
+and exhausted memory. Fixes:
+
+1. **Bucket chunking** (`MAX_BUCKET_SIZE = 500`) — large buckets are shuffled
+   and split into independent chunks. Each chunk gets its own union-find pass.
+   Cross-chunk cluster convergence happens over 2-3 weekly runs via random
+   shuffle rotation.
+
+2. **Async yielding** (`_YIELD_EVERY = 50`) — `await asyncio.sleep(0)` every
+   50 search calls prevents event loop starvation when run inside the server
+   scheduler.
+
+3. **Memory preflight** (`MIN_AVAILABLE_MB = 256`) — reads `/proc/meminfo`
+   before starting; aborts with informative report if available memory is
+   below threshold.
+
+4. **Progress logging** — logs every 100 points per bucket for observability.
+
 ### What NOT to Merge
 
 - **knowledge_base collection** — excluded entirely (different collection,

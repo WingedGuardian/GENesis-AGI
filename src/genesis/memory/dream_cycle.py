@@ -19,8 +19,10 @@ Spec: docs/superpowers/specs/2026-05-14-dream-cycle-design.md
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import random
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -40,6 +42,9 @@ logger = logging.getLogger(__name__)
 SIMILARITY_THRESHOLD: float = 0.87
 MAX_CLUSTER_SIZE: int = 10
 MAX_MERGES_PER_RUN: int = 100
+MAX_BUCKET_SIZE: int = 500
+MIN_AVAILABLE_MB: int = 256
+_YIELD_EVERY: int = 50  # yield to event loop every N search calls
 CALL_SITE_ID: str = "dream_cycle_synthesis"
 COLLECTION: str = "episodic_memory"
 
@@ -79,6 +84,22 @@ class _UnionFind:
         return groups
 
 
+def _read_mem_available_mb() -> int | None:
+    """Read MemAvailable from /proc/meminfo in MB.
+
+    Returns None if unavailable (non-Linux).  Inlined to avoid importing
+    the heavy ``genesis.observability.snapshots.infrastructure`` module.
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024  # kB → MB
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 # ── Core ─────────────────────────────────────────────────────────────────
 
 
@@ -110,6 +131,16 @@ async def run(
         "errors": [],
     }
 
+    # Phase 0 — Memory preflight
+    avail_mb = _read_mem_available_mb()
+    if avail_mb is not None and avail_mb < MIN_AVAILABLE_MB:
+        report["aborted"] = f"low_memory ({avail_mb}MB < {MIN_AVAILABLE_MB}MB)"
+        logger.error(
+            "Dream cycle %s: aborting — only %dMB available (need %dMB)",
+            run_id[:8], avail_mb, MIN_AVAILABLE_MB,
+        )
+        return report
+
     # Phase 1 — Scroll and group by (wing, room)
     buckets = await _scroll_and_group(qdrant)
     total_points = sum(len(pts) for pts in buckets.values())
@@ -120,21 +151,37 @@ async def run(
         run_id[:8], total_points, len(buckets),
     )
 
-    # Phase 2 — Cluster within each bucket
+    # Phase 2 — Cluster within each bucket (chunked for safety)
     all_clusters: list[list[dict]] = []
+    bucket_sizes: dict[str, int] = {}
     for (wing, room), points in buckets.items():
+        bucket_sizes[f"{wing}/{room}"] = len(points)
         if len(points) < 2:
             continue
-        if len(points) > 2000:
-            logger.warning(
-                "Bucket (%s, %s) has %d points — may be slow",
+
+        # Chunk large buckets to prevent I/O saturation.
+        # Shuffling rotates chunk boundaries across weekly runs,
+        # giving cross-chunk convergence over 2-3 cycles.
+        if len(points) > MAX_BUCKET_SIZE:
+            logger.info(
+                "Bucket (%s, %s): %d points — splitting into %d chunks of %d",
                 wing, room, len(points),
+                -(-len(points) // MAX_BUCKET_SIZE),  # ceil division
+                MAX_BUCKET_SIZE,
             )
-        clusters = await _cluster_bucket(
-            qdrant, points, wing, room,
-            threshold=similarity_threshold,
-        )
-        all_clusters.extend(clusters)
+            random.shuffle(points)
+
+        for chunk_start in range(0, len(points), MAX_BUCKET_SIZE):
+            chunk = points[chunk_start:chunk_start + MAX_BUCKET_SIZE]
+            if len(chunk) < 2:
+                continue
+            clusters = await _cluster_bucket(
+                qdrant, chunk, wing, room,
+                threshold=similarity_threshold,
+            )
+            all_clusters.extend(clusters)
+
+    report["bucket_sizes"] = bucket_sizes
 
     report["clusters_found"] = len(all_clusters)
     logger.info("Dream cycle %s: found %d clusters", run_id[:8], len(all_clusters))
@@ -256,7 +303,8 @@ async def _cluster_bucket(
     vector_map = _batch_get_vectors(qdrant, [p["id"] for p in points])
 
     # Build similarity graph
-    for point in points:
+    n_points = len(points)
+    for idx, point in enumerate(points):
         pid = point["id"]
         vec = vector_map.get(pid)
         if vec is None:
@@ -283,6 +331,16 @@ async def _cluster_bucket(
                 continue  # Different bucket or deprecated
             if score >= threshold:
                 uf.union(pid, nid)
+
+        # Yield to the event loop periodically so other coroutines
+        # (health probes, scheduler heartbeats) stay alive.
+        if (idx + 1) % _YIELD_EVERY == 0:
+            if (idx + 1) % 100 == 0:
+                logger.info(
+                    "Bucket (%s, %s): searched %d/%d points",
+                    wing, room, idx + 1, n_points,
+                )
+            await asyncio.sleep(0)
 
     # Extract components with >= 2 members
     clusters: list[list[dict]] = []
