@@ -1104,6 +1104,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN ego_source TEXT",
         "ego_proposals.ego_source")
 
+    # Surplus insights: consumed_at so reflection can mark promoted insights
+    # as processed without losing the 'promoted' status.
+    await _try_alter(db,
+        "ALTER TABLE surplus_insights ADD COLUMN consumed_at TEXT",
+        "surplus_insights.consumed_at")
+
     # Capability map: previous_confidence for trend detection.
     await _try_alter(db,
         "ALTER TABLE capability_map ADD COLUMN previous_confidence REAL",

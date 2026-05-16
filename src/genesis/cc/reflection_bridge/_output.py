@@ -28,6 +28,7 @@ async def route_deep_output(
     db,
     output_router,
     gathered_obs_ids: tuple[str, ...] = (),
+    gathered_surplus_ids: tuple[str, ...] = (),
 ) -> dict:
     """Parse and route deep reflection output via OutputRouter.
 
@@ -38,10 +39,17 @@ async def route_deep_output(
     ``gathered_obs_ids`` are observation IDs that were fed into the
     reflection context. They are marked as "influenced" only if routing
     succeeds (non-empty, non-failed output).
+
+    ``gathered_surplus_ids`` are promoted surplus insight IDs fed into
+    context. Marked as consumed after successful routing.
     """
     from genesis.reflection.output_router import parse_deep_reflection_output
     parsed = parse_deep_reflection_output(raw_text)
-    return await output_router.route(parsed, db, gathered_obs_ids=gathered_obs_ids)
+    return await output_router.route(
+        parsed, db,
+        gathered_obs_ids=gathered_obs_ids,
+        gathered_surplus_ids=gathered_surplus_ids,
+    )
 
 
 async def store_reflection_output(depth, tick, output, *, db) -> None:

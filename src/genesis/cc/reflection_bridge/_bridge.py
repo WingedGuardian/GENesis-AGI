@@ -225,7 +225,7 @@ class CCReflectionBridge:
                 )
 
         # 1. Build prompt
-        prompt, gathered_obs_ids = await build_reflection_prompt(
+        prompt, gathered_obs_ids, gathered_surplus_ids = await build_reflection_prompt(
             depth, tick, db=db,
             context_gatherer=self._context_gatherer,
             context_assembler=self._context_assembler,
@@ -413,6 +413,7 @@ class CCReflectionBridge:
                 routing_summary = await route_deep_output(
                     output.text, db=db, output_router=self._output_router,
                     gathered_obs_ids=gathered_obs_ids,
+                    gathered_surplus_ids=gathered_surplus_ids,
                 )
                 if routing_summary.get("parse_failed") or routing_summary.get("empty_output"):
                     routing_failed = True
