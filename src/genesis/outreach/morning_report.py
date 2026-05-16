@@ -11,55 +11,15 @@ import aiosqlite
 
 from genesis.content.drafter import ContentDrafter
 from genesis.content.types import DraftRequest, FormatTarget
+from genesis.db.crud.observations import INTERNAL_OBS_TYPES as _INTERNAL_OBS_TYPES_SET
 from genesis.outreach.types import OutreachCategory, OutreachRequest
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
+# Convert to tuple for db.execute() compatibility (requires sequence, not frozenset)
+_INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
 
-# Observation types that are Genesis-internal telemetry and should NOT surface
-# to the user.  Everything else surfaces by default — more robust as new types
-# are added (new types are user-visible unless explicitly excluded here).
-_INTERNAL_OBS_TYPES = (
-    # Reflection / awareness lifecycle
-    "awareness_tick",
-    "micro_reflection",
-    "light_reflection",
-    "deep_reflection",
-    "reflection_observation",
-    "reflection_summary",
-    "reflection_output",
-    "light_escalation_pending",
-    "light_escalation_resolved",
-    "light_reflection_candidate",
-    # Memory internals
-    "memory_operation_executed",
-    "memory_operation",
-    "memory_index",
-    "cc_memory_file",
-    "merged_observation",
-    # Version tracking internals
-    "version_current",
-    "version_change",
-    "genesis_version_change",
-    "cc_version_baseline",
-    "cc_version_available",
-    "genesis_version_baseline",
-    "genesis_update_available",
-    "genesis_update_failed",
-    # Build / project state
-    "build_state",
-    "project_context",
-    "model_downgrade",
-    # Triage telemetry
-    "triage_depth_3",
-    "triage_depth_4",
-    # Development internals
-    "bugfix_committed",
-    "interpretation_correction",
-    "scope_clarification",
-    "feedback_rule",
-)
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
 
 
 class MorningReportGenerator:
