@@ -25,7 +25,7 @@
       Alpine.store("genesisDashboard", {
         // Tab state
         activeTab: "overview",
-        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, memory: false, knowledge: false, backup: false },
+        _tabInitialized: { overview: false, chat: false, internals: false, config: false, files: false, work: false, observations: false, memory: false, knowledge: false, backup: false },
 
         // State
         health: {},
@@ -279,7 +279,20 @@
         _tasksInterval: null,
         _workSessionsInterval: null,
         _followUpsInterval: null,
+        _observationsInterval: null,
         _commsInterval: null,
+
+        // Observations tab state
+        observationsList: [],
+        observationsHasMore: false,
+        observationsExpanded: null,
+        observationsView: 'unresolved',
+        observationsFilters: { priority: '', type: '', source: '' },
+        observationsAvailableFilters: { types: [], sources: [] },
+        observationsCounts: { counts: {}, total_unsurfaced: 0, total_unresolved: 0 },
+        observationsResolving: {},
+        observationsMarkingRead: {},
+        observationsBatchIds: {},
 
         // Tab management
         _TAB_INTERVALS: {
@@ -289,6 +302,7 @@
           config:    [],
           files:     [],
           work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
+          observations: ["_observationsInterval"],
           memory:    [],
           knowledge: [],
           backup:    [],
@@ -296,7 +310,7 @@
 
         initTab() {
           const hash = location.hash.replace("#", "") || "overview";
-          const valid = ["overview", "chat", "internals", "config", "files", "work", "memory", "knowledge", "backup"];
+          const valid = ["overview", "chat", "internals", "config", "files", "work", "observations", "memory", "knowledge", "backup"];
           this.activeTab = valid.includes(hash) ? hash : "overview";
           window.addEventListener("hashchange", () => {
             const h = location.hash.replace("#", "");
@@ -354,6 +368,10 @@
               this._tasksInterval = setInterval(() => this.fetchTasks(), 5000);
               this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
               this._followUpsInterval = setInterval(() => this.fetchFollowUps(), 15000);
+              break;
+            case "observations":
+              if (first) { this.fetchObservations(); this.fetchObservationsSummary(); this.fetchObservationsFilters(); }
+              this._observationsInterval = setInterval(() => { this.fetchObservations(); this.fetchObservationsSummary(); }, 30000);
               break;
             case "memory":
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
@@ -729,6 +747,97 @@
               this.followUpsCounts = data.counts || {};
             }
           } catch (e) { console.warn("Follow-ups fetch failed:", e); }
+        },
+
+        // ── Observations tab fetches ─────────────────────────────
+        async fetchObservations() {
+          try {
+            const f = this.observationsFilters;
+            const params = new URLSearchParams();
+            params.set("limit", "50");
+            if (this.observationsView === 'unresolved') params.set("resolved", "false");
+            if (f.priority) params.set("priority", f.priority);
+            if (f.type) params.set("type", f.type);
+            if (f.source) params.set("source", f.source);
+            const resp = await fetchApi(`/api/genesis/observations?${params}`);
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.observationsList = data.observations || [];
+              this.observationsHasMore = data.has_more || false;
+            }
+          } catch (e) { console.warn("Observations fetch failed:", e); }
+        },
+        async fetchObservationsSummary() {
+          try {
+            const resp = await fetchApi("/api/genesis/observations/summary");
+            if (resp && resp.ok) {
+              this.observationsCounts = await resp.json();
+            }
+          } catch (e) { console.warn("Observations summary fetch failed:", e); }
+        },
+        async fetchObservationsFilters() {
+          try {
+            const resp = await fetchApi("/api/genesis/observations/filters");
+            if (resp && resp.ok) {
+              this.observationsAvailableFilters = await resp.json();
+            }
+          } catch (e) { console.warn("Observations filters fetch failed:", e); }
+        },
+        async resolveObservation(id, notes) {
+          this.observationsResolving = { ...this.observationsResolving, [id]: true };
+          try {
+            const resp = await fetchApi(`/api/genesis/observations/${id}/resolve`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ notes: notes || "" }),
+            });
+            if (resp && resp.ok) {
+              await this.fetchObservations();
+              await this.fetchObservationsSummary();
+            }
+          } catch (e) { console.warn("Resolve failed:", e); }
+          finally { const { [id]: _, ...rest } = this.observationsResolving; this.observationsResolving = rest; }
+        },
+        async markObservationRead(id) {
+          this.observationsMarkingRead = { ...this.observationsMarkingRead, [id]: true };
+          try {
+            const resp = await fetchApi(`/api/genesis/observations/${id}/mark-read`, {
+              method: "POST",
+            });
+            if (resp && resp.ok) {
+              const obs = this.observationsList.find(o => o.id === id);
+              if (obs) obs.surfaced_at = new Date().toISOString();
+              await this.fetchObservationsSummary();
+            }
+          } catch (e) { console.warn("Mark read failed:", e); }
+          finally { const { [id]: _, ...rest } = this.observationsMarkingRead; this.observationsMarkingRead = rest; }
+        },
+        async batchObservationsAction(action) {
+          const ids = Object.keys(this.observationsBatchIds).filter(k => this.observationsBatchIds[k]);
+          if (!ids.length) return;
+          try {
+            const resp = await fetchApi("/api/genesis/observations/batch", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action, ids }),
+            });
+            if (resp && resp.ok) {
+              this.observationsBatchIds = {};
+              await this.fetchObservations();
+              await this.fetchObservationsSummary();
+            }
+          } catch (e) { console.warn("Batch action failed:", e); }
+        },
+        toggleObservationBatch(id) {
+          if (this.observationsBatchIds[id]) {
+            const { [id]: _, ...rest } = this.observationsBatchIds;
+            this.observationsBatchIds = rest;
+          } else {
+            this.observationsBatchIds = { ...this.observationsBatchIds, [id]: true };
+          }
+        },
+        get observationsBatchCount() {
+          return Object.keys(this.observationsBatchIds).filter(k => this.observationsBatchIds[k]).length;
         },
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
@@ -3497,6 +3606,12 @@
               @click="location.hash = 'chat'">Chat</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'work' }"
               @click="location.hash = 'work'">Work</button>
+      <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'observations' }"
+              @click="location.hash = 'observations'">Observations
+        <span x-show="$store.genesisDashboard.observationsCounts.total_unsurfaced > 0"
+              style="background:#ffa726; color:#000; border-radius:8px; padding:0 5px; font-size:0.6rem; margin-left:4px; font-weight:700;"
+              x-text="$store.genesisDashboard.observationsCounts.total_unsurfaced"></span>
+      </button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'memory' }"
               @click="location.hash = 'memory'">Memory</button>
       <button :class="{ 'active-tab': $store.genesisDashboard.activeTab === 'knowledge' }"
@@ -7734,6 +7849,184 @@
               </template>
             </div>
           </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══════════════════════════════════════════════════════════
+         Panel: Observations [Tab: observations]
+         ═══════════════════════════════════════════════════════════ -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'observations'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">visibility</span>
+        Observations
+        <span class="panel-status" x-show="$store.genesisDashboard.observationsCounts.total_unsurfaced > 0">
+          <span class="status-dot" style="background:#ffa726;"></span>
+          <span x-text="$store.genesisDashboard.observationsCounts.total_unsurfaced + ' unsurfaced'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Summary badges -->
+        <div style="display:flex; gap:0.5rem; margin-bottom:0.75rem; flex-wrap:wrap; align-items:center;">
+          <template x-for="[prio, count] in Object.entries($store.genesisDashboard.observationsCounts.counts || {})" :key="prio">
+            <span style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; font-weight:600; text-transform:uppercase;"
+                  :style="{
+                    critical: 'background:rgba(244,67,54,0.15); color:#f44336; border:1px solid rgba(244,67,54,0.3)',
+                    high: 'background:rgba(255,152,0,0.15); color:#ff9800; border:1px solid rgba(255,152,0,0.3)',
+                    medium: 'background:rgba(255,193,7,0.15); color:#ffc107; border:1px solid rgba(255,193,7,0.3)',
+                    low: 'background:rgba(158,158,158,0.15); color:#9e9e9e; border:1px solid rgba(158,158,158,0.3)'
+                  }[prio] || ''"
+                  x-text="prio + ': ' + count"></span>
+          </template>
+          <span style="font-size:0.65rem; color:var(--color-text-secondary); margin-left:auto;"
+                x-text="$store.genesisDashboard.observationsCounts.total_unresolved + ' total unresolved'"></span>
+        </div>
+
+        <!-- Filter bar -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem; flex-wrap:wrap; align-items:center;">
+          <button style="font-size:0.68rem; padding:0.2rem 0.5rem; border-radius:3px; cursor:pointer; border:1px solid #555;"
+                  :style="$store.genesisDashboard.observationsView === 'unresolved' ? 'background:rgba(33,150,243,0.15); color:#2196F3; border-color:rgba(33,150,243,0.4)' : 'background:transparent; color:var(--color-text-secondary)'"
+                  @click="$store.genesisDashboard.observationsView = 'unresolved'; $store.genesisDashboard.fetchObservations()">Unresolved</button>
+          <button style="font-size:0.68rem; padding:0.2rem 0.5rem; border-radius:3px; cursor:pointer; border:1px solid #555;"
+                  :style="$store.genesisDashboard.observationsView === 'all' ? 'background:rgba(33,150,243,0.15); color:#2196F3; border-color:rgba(33,150,243,0.4)' : 'background:transparent; color:var(--color-text-secondary)'"
+                  @click="$store.genesisDashboard.observationsView = 'all'; $store.genesisDashboard.fetchObservations()">All</button>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary); margin-left:0.5rem;"
+                  @change="$store.genesisDashboard.observationsFilters.priority = $event.target.value; $store.genesisDashboard.fetchObservations()">
+            <option value="">All priorities</option>
+            <option value="critical">Critical</option>
+            <option value="high">High</option>
+            <option value="medium">Medium</option>
+            <option value="low">Low</option>
+          </select>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  @change="$store.genesisDashboard.observationsFilters.type = $event.target.value; $store.genesisDashboard.fetchObservations()">
+            <option value="">All types</option>
+            <template x-for="t in $store.genesisDashboard.observationsAvailableFilters.types" :key="t">
+              <option :value="t" x-text="t"></option>
+            </template>
+          </select>
+
+          <select style="font-size:0.68rem; padding:0.2rem 0.3rem; border-radius:3px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);"
+                  @change="$store.genesisDashboard.observationsFilters.source = $event.target.value; $store.genesisDashboard.fetchObservations()">
+            <option value="">All sources</option>
+            <template x-for="s in $store.genesisDashboard.observationsAvailableFilters.sources" :key="s">
+              <option :value="s" x-text="s"></option>
+            </template>
+          </select>
+
+          <!-- Batch actions -->
+          <template x-if="$store.genesisDashboard.observationsBatchCount > 0">
+            <div style="margin-left:auto; display:flex; gap:0.25rem;">
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);"
+                      @click="$store.genesisDashboard.batchObservationsAction('mark_read')">
+                Mark Read (<span x-text="$store.genesisDashboard.observationsBatchCount"></span>)
+              </button>
+              <button style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);"
+                      @click="$store.genesisDashboard.batchObservationsAction('resolve')">
+                Resolve (<span x-text="$store.genesisDashboard.observationsBatchCount"></span>)
+              </button>
+            </div>
+          </template>
+        </div>
+
+        <!-- Empty state -->
+        <template x-if="$store.genesisDashboard.observationsList.length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No observations found.
+          </div>
+        </template>
+
+        <!-- Observation list -->
+        <div class="activity-feed">
+          <template x-for="obs in $store.genesisDashboard.observationsList" :key="obs.id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
+                   @click="$store.genesisDashboard.observationsExpanded = $store.genesisDashboard.observationsExpanded === obs.id ? null : obs.id">
+                <!-- Batch checkbox -->
+                <input type="checkbox" @click.stop
+                       :checked="!!$store.genesisDashboard.observationsBatchIds[obs.id]"
+                       @change="$store.genesisDashboard.toggleObservationBatch(obs.id)"
+                       style="width:12px; height:12px; cursor:pointer; flex-shrink:0;">
+                <!-- Priority badge -->
+                <span style="font-size:0.6rem; padding:0.1rem 0.35rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0; min-width:3rem; text-align:center;"
+                      :style="{
+                        critical: 'background:rgba(244,67,54,0.15); color:#f44336',
+                        high: 'background:rgba(255,152,0,0.15); color:#ff9800',
+                        medium: 'background:rgba(255,193,7,0.15); color:#ffc107',
+                        low: 'background:rgba(158,158,158,0.15); color:#9e9e9e'
+                      }[obs.priority] || ''"
+                      x-text="obs.priority"></span>
+                <!-- Unsurfaced indicator -->
+                <span x-show="!obs.surfaced_at && !obs.resolved" style="width:6px; height:6px; border-radius:50%; background:#ffa726; flex-shrink:0;" title="Unsurfaced"></span>
+                <!-- Content preview -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.72rem;"
+                      x-text="(obs.content || '').substring(0, 120)"></span>
+                <!-- Type -->
+                <span style="color:var(--color-text-secondary); font-size:0.58rem; font-family:monospace; flex-shrink:0; max-width:8rem; overflow:hidden; text-overflow:ellipsis;"
+                      x-text="obs.type"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.63rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime ? $store.genesisDashboard.formatTime(obs.created_at) : (obs.created_at || '').substring(0, 16)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.observationsExpanded === obs.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.observationsExpanded === obs.id">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 1.5rem; font-size:0.72rem;">
+                  <!-- Full content -->
+                  <div style="margin-bottom:0.4rem; line-height:1.5; white-space:pre-wrap; word-break:break-word;" x-text="obs.content"></div>
+                  <!-- Metadata -->
+                  <div style="display:flex; gap:0.5rem; font-size:0.63rem; color:var(--color-text-secondary); flex-wrap:wrap; margin-bottom:0.4rem;">
+                    <span x-text="'Source: ' + (obs.source || 'unknown')"></span>
+                    <span x-text="'Type: ' + obs.type"></span>
+                    <span x-show="obs.category" x-text="'Category: ' + obs.category"></span>
+                    <span x-text="'Retrieved: ' + (obs.retrieved_count || 0) + 'x'"></span>
+                    <span x-show="obs.influenced_action" style="color:#66bb6a;">Influenced action</span>
+                    <span x-show="obs.surfaced_at" style="color:#90caf9;">Surfaced</span>
+                  </div>
+                  <!-- Resolution info (if resolved) -->
+                  <template x-if="obs.resolved">
+                    <div style="margin-top:0.3rem; padding:0.25rem 0.5rem; background:rgba(102,187,106,0.08); border-radius:3px; font-size:0.65rem;">
+                      <strong style="color:#66bb6a;">Resolved:</strong>
+                      <span x-text="obs.resolution_notes || 'No notes'"></span>
+                      <span style="margin-left:0.5rem; color:var(--color-text-secondary);"
+                            x-text="(obs.resolved_at || '').substring(0, 16)"></span>
+                    </div>
+                  </template>
+                  <!-- Actions (unresolved only) -->
+                  <template x-if="!obs.resolved">
+                    <div style="display:flex; gap:0.3rem; margin-top:0.5rem; align-items:center;">
+                      <button @click.stop="$store.genesisDashboard.markObservationRead(obs.id)"
+                              :disabled="$store.genesisDashboard.observationsMarkingRead[obs.id]"
+                              x-show="!obs.surfaced_at"
+                              style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(33,150,243,0.1); color:#2196F3; border:1px solid rgba(33,150,243,0.2);">
+                        <span x-text="$store.genesisDashboard.observationsMarkingRead[obs.id] ? 'Marking...' : 'Mark Read'"></span>
+                      </button>
+                      <button @click.stop="$store.genesisDashboard.resolveObservation(obs.id, '')"
+                              :disabled="$store.genesisDashboard.observationsResolving[obs.id]"
+                              style="font-size:0.65rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer; background:rgba(102,187,106,0.1); color:#66bb6a; border:1px solid rgba(102,187,106,0.2);">
+                        <span x-text="$store.genesisDashboard.observationsResolving[obs.id] ? 'Resolving...' : 'Resolve'"></span>
+                      </button>
+                      <input type="text" placeholder="Resolution notes... (Enter to resolve)"
+                             @click.stop
+                             @keydown.enter.stop="$store.genesisDashboard.resolveObservation(obs.id, $el.value); $el.value = ''"
+                             style="font-size:0.65rem; padding:0.15rem 0.4rem; border-radius:3px; flex:1; min-width:120px; background:rgba(0,0,0,0.2); border:1px solid #555; color:var(--color-text-primary);">
+                    </div>
+                  </template>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+
+        <!-- Load more indicator -->
+        <div x-show="$store.genesisDashboard.observationsHasMore"
+             style="text-align:center; padding:0.5rem; font-size:0.65rem; color:var(--color-text-secondary);">
+          Showing first 50 results. Use filters to narrow down.
         </div>
       </div>
     </div>

@@ -18,6 +18,52 @@ _PERMANENT_TYPES: frozenset[str] = frozenset({
     "execution_challenge",       # Task failure post-mortem — resolved manually
 })
 
+# Observation types that are Genesis-internal telemetry and should NOT surface
+# to the user in morning reports or the dashboard observations panel.
+# Everything else surfaces by default — new types are user-visible unless
+# explicitly excluded here.  Canonical source — imported by morning_report.py
+# and dashboard routes.
+INTERNAL_OBS_TYPES: frozenset[str] = frozenset({
+    # Reflection / awareness lifecycle
+    "awareness_tick",
+    "micro_reflection",
+    "light_reflection",
+    "deep_reflection",
+    "reflection_observation",
+    "reflection_summary",
+    "reflection_output",
+    "light_escalation_pending",
+    "light_escalation_resolved",
+    "light_reflection_candidate",
+    # Memory internals
+    "memory_operation_executed",
+    "memory_operation",
+    "memory_index",
+    "cc_memory_file",
+    "merged_observation",
+    # Version tracking internals
+    "version_current",
+    "version_change",
+    "genesis_version_change",
+    "cc_version_baseline",
+    "cc_version_available",
+    "genesis_version_baseline",
+    "genesis_update_available",
+    "genesis_update_failed",
+    # Build / project state
+    "build_state",
+    "project_context",
+    "model_downgrade",
+    # Triage telemetry
+    "triage_depth_3",
+    "triage_depth_4",
+    # Development internals
+    "bugfix_committed",
+    "interpretation_correction",
+    "scope_clarification",
+    "feedback_rule",
+})
+
 # Default TTL for types not explicitly listed. Any new type that appears without
 # an entry in _TTL_BY_TYPE gets this default + a warning log so we notice and
 # categorize it properly.
@@ -255,6 +301,7 @@ async def query(
     priority: str | None = None,
     category: str | None = None,
     resolved: bool | None = None,
+    exclude_types: tuple[str, ...] | frozenset[str] | None = None,
     limit: int = 50,
 ) -> list[dict]:
     if source and source_in:
@@ -283,6 +330,10 @@ async def query(
     if resolved is not None:
         sql += " AND resolved = ?"
         params.append(int(resolved))
+    if exclude_types:
+        type_placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({type_placeholders})"
+        params.extend(exclude_types)
     sql += " ORDER BY created_at DESC LIMIT ?"
     params.append(limit)
     cursor = await db.execute(sql, params)
@@ -447,7 +498,7 @@ async def get_unsurfaced(
     db: aiosqlite.Connection,
     *,
     priority_filter: tuple[str, ...] = ("critical", "high", "medium"),
-    exclude_types: tuple[str, ...] = (),
+    exclude_types: tuple[str, ...] | frozenset[str] = (),
     limit: int = 10,
 ) -> list[dict]:
     """Return unsurfaced, unresolved observations for user delivery.
@@ -509,3 +560,20 @@ async def unsurfaced_counts_by_priority(db: aiosqlite.Connection) -> dict[str, i
     )
     rows = await cursor.fetchall()
     return {row[0]: row[1] for row in rows}
+
+
+async def count_unresolved(
+    db: aiosqlite.Connection,
+    *,
+    exclude_types: tuple[str, ...] | frozenset[str] = (),
+) -> int:
+    """Count unresolved observations, optionally excluding internal types."""
+    sql = "SELECT COUNT(*) FROM observations WHERE resolved = 0"
+    params: list = []
+    if exclude_types:
+        placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({placeholders})"
+        params.extend(exclude_types)
+    cursor = await db.execute(sql, params)
+    row = await cursor.fetchone()
+    return row[0] if row else 0
