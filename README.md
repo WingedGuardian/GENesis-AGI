@@ -106,7 +106,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-50+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+60+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 <p align="center">
   <img src="docs/images/genesis-architecture.png" alt="Genesis cognitive architecture — three concentric rings" width="820">
@@ -437,7 +437,7 @@ The `/integrate-module` skill handles onboarding automatically — discovery, co
 
 ## What's inside
 
-50+ subsystems organized into seven layers:
+60+ subsystems organized into seven layers:
 
 ```mermaid
 graph LR
@@ -513,11 +513,6 @@ V3 was built in 10 phases over seven months: from data schemas to full autonomou
 ## Where it's headed
 
 V3 is the foundation -- cognitive architecture complete, ego module live, running in production. What comes next is where it gets ambitious enough to need a community behind it.
-
-### What's landing next
-
-- **Reflection pipeline refinement** -- the ego sees filtered, tagged observations from the reflection engine. Next: a user-focused micro template, "learn slow, unlearn fast" steering rules (user says "stop" and it stops permanently), and graduated response logic so the system handles stale goals without nagging.
-- **Surplus compute redesign** -- idle time is currently underutilized. The scheduler and executor need real teeth: better task selection, actual execution of brainstorm outputs, and research pipelines that produce actionable results.
 
 ### V4 -- Coordinated cognition
 
