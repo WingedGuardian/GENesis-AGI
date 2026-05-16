@@ -21,7 +21,7 @@ jobs:
 
 task_defaults:
   code_audit:                { priority: 0.5, drive: competence,   tier: free_api }
-  code_index:                { priority: 0.3, drive: competence,   tier: local_30b }
+  code_index:                { priority: 0.3, drive: competence,   tier: free_api }
   infrastructure_monitor:    { priority: 0.6, drive: preservation, tier: free_api }
   disk_cleanup:              { priority: 0.4, drive: preservation, tier: free_api }
   backup_verification:       { priority: 0.7, drive: preservation, tier: free_api }

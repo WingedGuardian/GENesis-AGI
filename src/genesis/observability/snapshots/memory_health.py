@@ -80,12 +80,22 @@ async def _link_distribution(db: aiosqlite.Connection) -> dict:
 
 
 async def _extraction_coverage(db: aiosqlite.Connection) -> dict:
-    """Session extraction pipeline coverage."""
+    """Session extraction pipeline coverage.
+
+    Only counts sessions with extractable source_tags (foreground, inbox)
+    since other session types (reflections, ego cycles, etc.) are
+    intentionally excluded from extraction.
+    """
     try:
-        cursor = await db.execute("SELECT COUNT(*) FROM cc_sessions")
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM cc_sessions "
+            "WHERE source_tag IN ('foreground', 'inbox')"
+        )
         total = (await cursor.fetchone())[0]
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM cc_sessions WHERE last_extracted_line > 0"
+            "SELECT COUNT(*) FROM cc_sessions "
+            "WHERE source_tag IN ('foreground', 'inbox') "
+            "AND last_extracted_line > 0"
         )
         extracted = (await cursor.fetchone())[0]
         pct = round(extracted / total * 100, 1) if total else 0.0
