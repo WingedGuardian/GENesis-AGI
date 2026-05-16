@@ -44,6 +44,7 @@ class ContextGatherer:
         cost = await self._cost_summary(db)
         pending = await self.detect_pending_work(db)
         conversations = self._recent_conversation_turns()
+        surplus_digest, surplus_ids = await self._promoted_surplus_digest(db)
 
         obs_ids = tuple(o["id"] for o in recent_obs if o.get("id"))
         return ContextBundle(
@@ -54,7 +55,9 @@ class ContextGatherer:
             cost_summary=cost,
             pending_work=pending,
             recent_conversations=conversations,
+            surplus_digest=surplus_digest,
             gathered_observation_ids=obs_ids,
+            gathered_surplus_ids=tuple(surplus_ids),
         )
 
     async def detect_pending_work(self, db: aiosqlite.Connection) -> PendingWorkSummary:
@@ -551,3 +554,43 @@ class ContextGatherer:
                 "inbox_findings": len(inbox_obs),
             },
         }
+
+    async def _promoted_surplus_digest(
+        self, db: aiosqlite.Connection,
+    ) -> tuple[str, list[str]]:
+        """Build digest of promoted surplus insights awaiting reflection.
+
+        Returns ``(formatted_digest, list_of_insight_ids)``.  IDs are used
+        to mark insights consumed AFTER reflection routes output successfully.
+        """
+        from genesis.db.crud import surplus
+
+        try:
+            insights = await surplus.list_promoted(db, limit=20, unconsumed_only=True)
+        except Exception:
+            logger.warning("surplus.list_promoted failed", exc_info=True)
+            return "", []
+
+        if not insights:
+            return "", []
+
+        ids = [i["id"] for i in insights]
+
+        # Group by source_task_type for readability.
+        by_type: dict[str, list[dict]] = {}
+        for i in insights:
+            tt = i.get("source_task_type", "unknown")
+            by_type.setdefault(tt, []).append(i)
+
+        parts = [f"**{len(insights)} promoted surplus insight(s)** awaiting reflection:\n"]
+        for task_type, items in sorted(by_type.items()):
+            parts.append(f"### {task_type} ({len(items)})")
+            for item in items:
+                conf = item.get("confidence", 0)
+                content = item.get("content", "")
+                if len(content) > 400:
+                    content = content[:400] + "\u2026"
+                parts.append(f"- [confidence: {conf:.2f}] {content}")
+            parts.append("")
+
+        return "\n".join(parts), ids

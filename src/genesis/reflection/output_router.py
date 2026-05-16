@@ -205,6 +205,7 @@ class OutputRouter:
     async def route(
         self, output: DeepReflectionOutput, db: aiosqlite.Connection,
         *, gathered_obs_ids: tuple[str, ...] = (),
+        gathered_surplus_ids: tuple[str, ...] = (),
     ) -> dict:
         """Route all components of a deep reflection output to their stores.
 
@@ -212,6 +213,8 @@ class OutputRouter:
 
         ``gathered_obs_ids``: observation IDs fed into the reflection context.
         Marked as "influenced" only when output is substantive.
+        ``gathered_surplus_ids``: promoted surplus insight IDs fed into context.
+        Marked as consumed after successful routing.
         """
         summary: dict = {
             "observations_written": 0,
@@ -493,7 +496,20 @@ class OutputRouter:
                     exc_info=True,
                 )
 
-        # 10. Emit events
+        # 10. Mark surplus insights consumed (they've been seen by deep reflection)
+        if gathered_surplus_ids:
+            try:
+                from genesis.db.crud import surplus
+                count = await surplus.mark_consumed_batch(
+                    db, list(gathered_surplus_ids),
+                )
+                summary["surplus_consumed"] = count
+            except Exception:
+                logger.warning(
+                    "Failed to mark surplus insights consumed", exc_info=True,
+                )
+
+        # 11. Emit events
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
             await self._event_bus.emit(

@@ -35,6 +35,11 @@ _ESC = html.escape
 _URGENCY_ORDER = {"critical": 0, "high": 1, "normal": 2, "low": 3}
 _URGENCY_TAGS = {"critical": "[CRITICAL] ", "high": "[HIGH] "}
 
+_EGO_LABELS = {
+    "user_ego_cycle": "User Ego",
+    "genesis_ego_cycle": "Genesis Ego",
+}
+
 
 def _sort_proposals(proposals: list[dict]) -> list[dict]:
     """Sort proposals by urgency (critical first) then confidence (desc)."""
@@ -50,13 +55,15 @@ def _sort_proposals(proposals: list[dict]) -> list[dict]:
 def _format_digest(
     proposals: list[dict],
     batch_id: str,
+    ego_source: str | None = None,
 ) -> str:
     """Format proposals as an HTML numbered digest for Telegram.
 
     Proposals are sorted by urgency x confidence before numbering.
     """
     sorted_proposals = _sort_proposals(proposals)
-    lines = [f"<b>Ego Proposals</b> \u2014 Batch {_ESC(batch_id[:8])}\n"]
+    label = _EGO_LABELS.get(ego_source or "", "Ego")
+    lines = [f"<b>{_ESC(label)} Proposals</b> \u2014 Batch {_ESC(batch_id[:8])}\n"]
 
     for i, p in enumerate(sorted_proposals, 1):
         content = p.get("content", "")
@@ -213,9 +220,10 @@ class ProposalWorkflow:
         self,
         proposals: list[dict],
         batch_id: str,
+        ego_source: str | None = None,
     ) -> str:
         """Format proposals as an HTML numbered digest for Telegram."""
-        return _format_digest(proposals, batch_id)
+        return _format_digest(proposals, batch_id, ego_source=ego_source)
 
     # -- Delivery ----------------------------------------------------------
 
@@ -242,7 +250,7 @@ class ProposalWorkflow:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
 
-        digest_html = self.format_digest(proposals, batch_id)
+        digest_html = self.format_digest(proposals, batch_id, ego_source=ego_source)
 
         # Prepend validation warnings if any
         if validation_warnings:
