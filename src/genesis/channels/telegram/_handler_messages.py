@@ -1181,11 +1181,11 @@ async def handle_text(ctx: HandlerContext, update: Update, context: ContextTypes
     if not msg.reply_to_message and await _try_bare_proposal_resolution(ctx, msg):
         return
 
-    # Messages in the ego_proposals topic (that aren't quote-replies to
-    # proposals and weren't parsed as decisions) get stored as
-    # user corrections for the ego's next cycle.
-    if not msg.reply_to_message and await _try_ego_correction_store(ctx, msg):
-        return
+    # Messages in the ego_proposals topic that aren't parseable as decisions
+    # fall through to the conversation handler below, which now has
+    # topic-aware context injection (pending proposals + resolution
+    # instructions). The CC session can discuss and resolve proposals
+    # conversationally.
 
     if msg.reply_to_message:
         reply_to_id = str(msg.reply_to_message.message_id)

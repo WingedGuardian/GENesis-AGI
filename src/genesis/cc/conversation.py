@@ -403,6 +403,13 @@ class ConversationLoop:
                         "\n\n## Recent conversation (session recovered)\n"
                         + recovery_context
                     )
+
+                # Topic-aware context: inject proposal board when in ego_proposals
+                if thread_id:
+                    topic_ctx = await self._build_topic_context(thread_id)
+                    if topic_ctx:
+                        system_prompt += topic_ctx
+
                 resume_id = None
 
             invocation = CCInvocation(
@@ -652,6 +659,64 @@ class ConversationLoop:
                 "Session %s updated: model=%s effort=%s",
                 session["id"][:8], model, effort,
             )
+
+    async def _build_topic_context(self, thread_id: str) -> str | None:
+        """Build topic-specific context for the conversation system prompt.
+
+        When the user is messaging in the ego_proposals topic, inject the
+        pending proposal board so the CC session can discuss and resolve them.
+        """
+        if self._db is None:
+            return None
+        try:
+            # Look up which topic this thread_id belongs to
+            async with self._db.execute(
+                "SELECT category FROM telegram_topics WHERE thread_id = ?",
+                (int(thread_id),),
+            ) as cur:
+                row = await cur.fetchone()
+            if not row or row[0] != "ego_proposals":
+                return None
+
+            # Fetch pending proposals
+            from genesis.db.crud import ego as ego_crud
+
+            pending = await ego_crud.list_proposals(
+                self._db, status="pending", limit=10,
+            )
+            if not pending:
+                return "\n\n## Ego Proposals Topic\n\nNo pending proposals.\n"
+
+            lines = ["\n\n## You Are in the Ego Proposals Topic\n"]
+            lines.append(
+                "The user communicates with you here to review, approve, reject, "
+                "or discuss ego proposals. When the user indicates approval "
+                "(e.g., 'do it', 'yes', 'go ahead', 'approve 1'), resolve the "
+                "proposal. When they reject, mark it rejected with their reason. "
+                "When unclear, ask for clarification.\n"
+            )
+            lines.append("### Pending Proposals:\n")
+            for i, p in enumerate(pending, 1):
+                cat = p.get("action_category", "unknown")
+                content = (p.get("content") or "")[:120]
+                pid = p["id"]
+                lines.append(f"{i}. **[{cat}]** {content}")
+                lines.append(f"   ID: `{pid}`\n")
+
+            lines.append(
+                "\n### To resolve a proposal:\n"
+                "Run this SQL (replace the proposal ID):\n"
+                "```sql\n"
+                "UPDATE ego_proposals SET status = 'approved', "
+                "resolved_at = datetime('now') WHERE id = '<proposal_id>' "
+                "AND status = 'pending';\n"
+                "```\n"
+                "For rejection: SET status = 'rejected' instead.\n"
+            )
+            return "\n".join(lines)
+        except Exception:
+            logger.debug("Failed to build topic context", exc_info=True)
+            return None
 
     async def _enrich_with_context(
         self, system_prompt: str | None, query: str,
