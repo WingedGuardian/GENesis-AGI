@@ -79,6 +79,13 @@ def build_step_prompt(
             "",
         ])
 
+    # Notepad reminder for code steps (file is seeded by engine)
+    if step.get("type") == "code":
+        parts.extend([
+            "**Notepad:** Read and update `TASK_NOTEPAD.md` in your working directory.",
+            "",
+        ])
+
     return "\n".join(parts)
 
 
