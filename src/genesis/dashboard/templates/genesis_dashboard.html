@@ -156,17 +156,20 @@
         },
         fileUpload: { dragging: false, uploading: false, error: null },
 
-        // ── Work tab state (tasks + follow-ups + bg sessions) ──────
+        // ── Work tab state (tasks + sessions + follow-ups) ──────
         taskList: [],
         taskActive: {},
         taskExpanded: null,
         taskDetail: null,
         taskDetailSteps: [],
-        workItems: [],
-        workCounts: {},
-        workView: 'active',
-        workTypeFilter: null,
-        workExpanded: null,
+        tasksView: 'active',       // 'active' or 'completed'
+        sessionsList: [],
+        sessionsView: 'active',    // 'active' or 'history'
+        sessionsExpanded: null,
+        followUpsList: [],
+        followUpsView: 'active',   // 'active' or 'all'
+        followUpsCounts: {},
+        followUpsExpanded: null,
 
         // ── Comms state (on Chat tab) ────────────────────────────
         commsOutreach: [],
@@ -274,7 +277,8 @@
         _awarenessInterval: null,
         _jobHealthInterval: null,
         _tasksInterval: null,
-        _workInterval: null,
+        _workSessionsInterval: null,
+        _followUpsInterval: null,
         _commsInterval: null,
 
         // Tab management
@@ -284,7 +288,7 @@
           internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
-          work:      ["_workInterval"],
+          work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
           memory:    [],
           knowledge: [],
           backup:    [],
@@ -346,8 +350,10 @@
               if (first) { this.fetchFiles(); }
               break;
             case "work":
-              if (first) { this.fetchWork(); this.fetchTasks(); }
-              this._workInterval = setInterval(() => this.fetchWork(), 5000);
+              if (first) { this.fetchTasks(); this.fetchWorkSessions(); this.fetchFollowUps(); }
+              this._tasksInterval = setInterval(() => this.fetchTasks(), 5000);
+              this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
+              this._followUpsInterval = setInterval(() => this.fetchFollowUps(), 15000);
               break;
             case "memory":
               if (first) { this.fetchMemoryRecent(); this.fetchMemoryStats(); }
@@ -705,15 +711,24 @@
         },
 
         // ── Work tab fetches ──────────────────────────────────────
-        async fetchWork() {
+        async fetchWorkSessions() {
           try {
-            const resp = await fetchApi(`/api/genesis/work?view=${this.workView}&limit=50`);
+            const resp = await fetchApi(`/api/genesis/work?type=session&view=${this.sessionsView}&limit=50`);
             if (resp && resp.ok) {
               const data = await resp.json();
-              this.workItems = data.items || [];
-              this.workCounts = data.counts || {};
+              this.sessionsList = data.items || [];
             }
-          } catch (e) { console.warn("Work fetch failed:", e); }
+          } catch (e) { console.warn("Work sessions fetch failed:", e); }
+        },
+        async fetchFollowUps() {
+          try {
+            const resp = await fetchApi("/api/genesis/follow-ups?limit=50");
+            if (resp && resp.ok) {
+              const data = await resp.json();
+              this.followUpsList = data.follow_ups || [];
+              this.followUpsCounts = data.counts || {};
+            }
+          } catch (e) { console.warn("Follow-ups fetch failed:", e); }
         },
 
         // ── Comms fetches (on Chat tab) ──────────────────────────
@@ -2853,7 +2868,6 @@
               method: "POST", headers: {"Content-Type": "application/json"},
               body: JSON.stringify({decision})
             });
-            // Also record engagement on the outreach message
             if (outreachMsgId) {
               const outcome = decision === 'approved' ? 'useful' : 'not_useful';
               await fetchApi("/api/genesis/outreach/" + outreachMsgId + "/engage", {
@@ -2861,16 +2875,32 @@
                 body: JSON.stringify({outcome, response: decision === 'approved' ? 'approve' : 'deny'})
               });
             }
-            await this.fetchOutreachMessages();
+            // Refresh all approval-related stores for immediate UI update
+            await Promise.all([
+              this.fetchOutreachMessages(),
+              this.fetchApprovals(),
+              this.fetchComms(),
+            ]);
           } catch (e) { console.error("resolve failed", e); }
         },
 
         async approveAllPending() {
           try {
-            await fetchApi("/api/genesis/approvals/approve-all", {
+            const resp = await fetchApi("/api/genesis/approvals/approve-all", {
               method: "POST", headers: {"Content-Type": "application/json"},
             });
-            await this.fetchOutreachMessages();
+            if (resp?.ok) {
+              // Optimistic clear for instant visual feedback
+              this.approvals = [];
+              this.commsPendingApprovals = [];
+              this.outreachModal.pendingApprovals = [];
+              // Confirm from server
+              await Promise.all([
+                this.fetchOutreachMessages(),
+                this.fetchApprovals(),
+                this.fetchComms(),
+              ]);
+            }
           } catch (e) { console.error("approve-all failed", e); }
         },
 
@@ -6213,7 +6243,7 @@
                 <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(192,132,252,0.1); color:#c084fc; border:1px solid rgba(192,132,252,0.2);"
                         @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'chat'; $store.genesisDashboard.commsTab = 'proposals'">View Proposals</button>
                 <button style="font-size:0.72rem; padding:0.3rem 0.8rem; border-radius:4px; cursor:pointer; background:rgba(156,39,176,0.1); color:#ce93d8; border:1px solid rgba(156,39,176,0.2);"
-                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'work'; $store.genesisDashboard.workTypeFilter = 'follow_up'">View Follow-ups</button>
+                        @click="$store.genesisDashboard.egoModal.open = false; location.hash = 'work';">View Follow-ups</button>
               </div>
             </div>
 
@@ -7127,8 +7157,8 @@
                           'executed': 'background:rgba(33,150,243,0.15); color:#2196F3;',
                         }[p.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
                         x-text="p.status"></span>
-                  <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px;"
-                        :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.15); color:#ce93d8;' : 'background:rgba(33,150,243,0.15); color:#64b5f6;'"
+                  <span x-show="p.ego_source" style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase;"
+                        :style="p.ego_source === 'genesis_ego_cycle' ? 'background:rgba(156,39,176,0.25); color:#e1bee7;' : 'background:rgba(33,150,243,0.25); color:#90caf9;'"
                         x-text="p.ego_source === 'genesis_ego_cycle' ? 'Genesis' : p.ego_source === 'user_ego_cycle' ? 'User' : 'Ego'"></span>
                   <span x-show="p.action_type" style="font-size:0.65rem; padding:0.08rem 0.35rem; border-radius:3px; background:rgba(33,150,243,0.1); color:#64b5f6;"
                         x-text="p.action_type"></span>
@@ -7394,29 +7424,45 @@
     </div>
 
     <!-- ═══════════════════════════════════════════════════════════════
-         Panel: Work [Tab: work] — Tasks + Follow-ups + Background Sessions
+         Panel: Work [Tab: work] — Tasks + Sessions + Follow-ups
          ═══════════════════════════════════════════════════════════════ -->
 
-    <!-- Work: Autonomous Executions (step-by-step background plans) -->
+    <!-- Work: Tasks -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
       <div class="panel-header">
         <span class="material-symbols-outlined">task_alt</span>
-        Autonomous Executions
-        <span style="font-size:0.62rem; opacity:0.5; font-weight:400; margin-left:0.3rem;">background plans with step-by-step progress</span>
+        Tasks
         <span class="panel-status" x-show="Object.keys($store.genesisDashboard.taskActive).length > 0">
           <span class="status-dot" style="background:#66bb6a;"></span>
           <span x-text="Object.keys($store.genesisDashboard.taskActive).length + ' active'"></span>
         </span>
       </div>
       <div class="panel-body">
+        <!-- Active / Completed toggle -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.tasksView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.tasksView = 'active'">Active</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.tasksView === 'completed' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.tasksView = 'completed'">Completed</button>
+        </div>
         <!-- Task list -->
-        <template x-if="$store.genesisDashboard.taskList.length === 0">
-          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
-            No tasks found. Submit tasks via the <code>task_submit</code> MCP tool.
+        <template x-if="$store.genesisDashboard.taskList.filter(t => {
+          const phase = (t.current_phase || '').toLowerCase();
+          const active = ['executing','paused','blocked','pending'].includes(phase);
+          return $store.genesisDashboard.tasksView === 'active' ? active : !active;
+        }).length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;"
+               x-text="$store.genesisDashboard.tasksView === 'active' ? 'No active tasks.' : 'No completed tasks.'">
           </div>
         </template>
         <div class="activity-feed">
-          <template x-for="task in $store.genesisDashboard.taskList" :key="task.task_id">
+          <template x-for="task in $store.genesisDashboard.taskList.filter(t => {
+            const phase = (t.current_phase || '').toLowerCase();
+            const active = ['executing','paused','blocked','pending'].includes(phase);
+            return $store.genesisDashboard.tasksView === 'active' ? active : !active;
+          })" :key="task.task_id">
             <div>
               <div class="activity-row"
                    @click="$store.genesisDashboard.fetchTaskDetail(task.task_id)"
@@ -7473,7 +7519,6 @@
                     <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
                     <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
                       <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
-                        <!-- Status icon -->
                         <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
                               :style="{
                                 'completed': 'color:#66bb6a',
@@ -7501,7 +7546,6 @@
                             <span x-show="step.started_at && step.completed_at"
                                   x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
                           </div>
-                          <!-- Result preview -->
                           <template x-if="step.result_json && step.result_json.result">
                             <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
                                         font-family:monospace; font-size:0.65rem; max-height:80px; overflow:hidden; color:var(--color-text-secondary);"
@@ -7515,7 +7559,6 @@
                       <div style="color:var(--color-text-secondary); font-size:0.7rem; padding:0.3rem 0;">No steps recorded yet.</div>
                     </template>
                   </div>
-                  <!-- Blockers -->
                   <template x-if="$store.genesisDashboard.taskDetail.blockers">
                     <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(255,167,38,0.08); border-radius:3px; border:1px solid rgba(255,167,38,0.15);">
                       <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
@@ -7531,106 +7574,143 @@
       </div>
     </div>
 
-    <!-- Work: Unified view -->
+    <!-- Work: Background Sessions -->
     <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
       <div class="panel-header">
-        <span class="material-symbols-outlined">work</span>
-        Work
-        <span style="font-size:0.62rem; opacity:0.5; font-weight:400; margin-left:0.3rem;">tasks, follow-ups & sessions</span>
-        <span class="panel-status">
-          <span style="font-size:0.72rem; opacity:0.7;"
-                x-text="(() => {
-                  const c = $store.genesisDashboard.workCounts;
-                  const parts = [];
-                  if (c.tasks?.active) parts.push(c.tasks.active + ' task' + (c.tasks.active > 1 ? 's' : ''));
-                  if (c.follow_ups?.pending) parts.push(c.follow_ups.pending + ' follow-up' + (c.follow_ups.pending > 1 ? 's' : ''));
-                  if (c.sessions?.active_bg) parts.push(c.sessions.active_bg + ' bg');
-                  return parts.length ? parts.join(' · ') : '';
-                })()"></span>
+        <span class="material-symbols-outlined">terminal</span>
+        Background Sessions
+        <span class="panel-status" x-show="$store.genesisDashboard.sessionsList.filter(s => ['active','running','executing'].includes(s.status?.toLowerCase())).length > 0">
+          <span class="status-dot" style="background:#80cbc4;"></span>
+          <span x-text="$store.genesisDashboard.sessionsList.filter(s => ['active','running','executing'].includes(s.status?.toLowerCase())).length + ' active'"></span>
         </span>
       </div>
       <div class="panel-body">
-        <!-- View toggle + type filter -->
-        <div style="display:flex; gap:0.5rem; margin-bottom:0.75rem; align-items:center; flex-wrap:wrap;">
-          <div style="display:flex; gap:0.25rem;">
-            <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                    :style="$store.genesisDashboard.workView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                    @click="$store.genesisDashboard.workView = 'active'; $store.genesisDashboard.fetchWork()">Active</button>
-            <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
-                    :style="$store.genesisDashboard.workView === 'history' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                    @click="$store.genesisDashboard.workView = 'history'; $store.genesisDashboard.fetchWork()">History</button>
-          </div>
-          <div style="display:flex; gap:0.25rem; margin-left:0.5rem;">
-            <template x-for="[filterVal, label] in [[null, 'All'], ['task', 'Tasks'], ['follow_up', 'Follow-ups'], ['session', 'Sessions']]" :key="filterVal || 'all'">
-              <button style="font-size:0.68rem; padding:0.15rem 0.5rem; border-radius:3px; cursor:pointer;"
-                      :style="$store.genesisDashboard.workTypeFilter === filterVal ? 'background:#ffffff15; border:1px solid #888; color:#fff;' : 'background:transparent; border:1px solid #555; color:#888;'"
-                      @click="$store.genesisDashboard.workTypeFilter = filterVal"
-                      x-text="label"></button>
-            </template>
-          </div>
+        <!-- Active / History toggle -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.sessionsView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.sessionsView = 'active'; $store.genesisDashboard.fetchWorkSessions()">Active</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.sessionsView === 'history' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.sessionsView = 'history'; $store.genesisDashboard.fetchWorkSessions()">History</button>
         </div>
-
-        <!-- Counts bar -->
-        <div style="display:flex; gap:0.75rem; margin-bottom:0.75rem; font-size:0.72rem; color:var(--color-text-secondary);">
-          <span x-show="$store.genesisDashboard.workCounts.tasks" x-text="'Tasks: ' + ($store.genesisDashboard.workCounts.tasks?.active || 0) + ' active / ' + ($store.genesisDashboard.workCounts.tasks?.completed || 0) + ' done'"></span>
-          <span x-show="$store.genesisDashboard.workCounts.follow_ups" x-text="'Follow-ups: ' + ($store.genesisDashboard.workCounts.follow_ups?.pending || 0) + ' pending'"></span>
-          <span x-show="$store.genesisDashboard.workCounts.sessions" x-text="'BG Sessions: ' + ($store.genesisDashboard.workCounts.sessions?.active_bg || 0) + ' active'"></span>
-        </div>
-
-        <!-- Unified item list -->
-        <template x-if="$store.genesisDashboard.workItems.filter(i => !$store.genesisDashboard.workTypeFilter || i.type === $store.genesisDashboard.workTypeFilter).length === 0">
+        <template x-if="$store.genesisDashboard.sessionsList.length === 0">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
-            No work items found.
+            No background sessions found.
           </div>
         </template>
         <div class="activity-feed">
-          <template x-for="item in $store.genesisDashboard.workItems.filter(i => !$store.genesisDashboard.workTypeFilter || i.type === $store.genesisDashboard.workTypeFilter)" :key="item.id">
+          <template x-for="item in $store.genesisDashboard.sessionsList" :key="item.id">
             <div>
               <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
-                   @click="if (item.type === 'task') { $store.genesisDashboard.fetchTaskDetail(item.id); } else { $store.genesisDashboard.workExpanded = $store.genesisDashboard.workExpanded === item.id ? null : item.id; }">
-                <!-- Type badge -->
-                <span style="font-size:0.6rem; padding:0.08rem 0.35rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
-                      :style="{
-                        'task':      'background:rgba(33,150,243,0.15); color:#2196F3;',
-                        'follow_up': 'background:rgba(156,39,176,0.15); color:#ce93d8;',
-                        'session':   'background:rgba(0,150,136,0.15); color:#80cbc4;',
-                      }[item.type] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
-                      x-text="item.type === 'follow_up' ? 'follow-up' : item.type"></span>
+                   @click="$store.genesisDashboard.sessionsExpanded = $store.genesisDashboard.sessionsExpanded === item.id ? null : item.id">
                 <!-- Status badge -->
-                <span style="font-size:0.6rem; padding:0.08rem 0.35rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
                       :style="{
-                        'executing':   'background:rgba(33,150,243,0.15); color:#2196F3;',
-                        'completed':   'background:rgba(102,187,106,0.15); color:#66bb6a;',
-                        'failed':      'background:rgba(239,154,154,0.15); color:#ef9a9a;',
-                        'cancelled':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                        'paused':      'background:rgba(255,167,38,0.15); color:#ffa726;',
-                        'blocked':     'background:rgba(255,167,38,0.15); color:#ffa726;',
-                        'pending':     'background:rgba(158,158,158,0.15); color:#9e9e9e;',
-                        'in_progress': 'background:rgba(33,150,243,0.15); color:#2196F3;',
-                        'active':      'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'active':    'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'running':   'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'executing': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                        'cancelled': 'background:rgba(158,158,158,0.15); color:#9e9e9e;',
                       }[item.status?.toLowerCase()] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
                       x-text="item.status"></span>
-                <!-- Priority badge (follow-ups only) -->
-                <template x-if="item.type === 'follow_up' && item.priority && item.priority !== 'medium'">
+                <!-- Description -->
+                <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
+                      x-text="item.description || item.id"></span>
+                <!-- Model -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="item.model || ''"></span>
+                <!-- Timestamp -->
+                <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
+                      x-text="$store.genesisDashboard.formatTime(item.created_at)"></span>
+                <!-- Expand arrow -->
+                <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
+                      :style="$store.genesisDashboard.sessionsExpanded === item.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+              </div>
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.sessionsExpanded === item.id">
+                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
+                  <div style="display:flex; gap:1rem; flex-wrap:wrap; color:var(--color-text-secondary); font-size:0.7rem;">
+                    <span x-text="'Type: ' + (item.session_type || 'unknown')"></span>
+                    <span x-text="'Model: ' + (item.model || 'unknown')"></span>
+                    <span x-show="item.cost_usd != null" x-text="'Cost: $' + (item.cost_usd || 0).toFixed(4)"></span>
+                    <span x-text="'Started: ' + $store.genesisDashboard.formatTime(item.created_at)"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
+
+    <!-- Work: Follow-ups -->
+    <div class="panel" x-show="$store.genesisDashboard.activeTab === 'work'">
+      <div class="panel-header">
+        <span class="material-symbols-outlined">follow_the_signs</span>
+        Follow-ups
+        <span class="panel-status" x-show="$store.genesisDashboard.followUpsCounts.pending > 0">
+          <span style="background:#ce93d8; width:6px; height:6px; border-radius:50%; display:inline-block;"></span>
+          <span x-text="$store.genesisDashboard.followUpsCounts.pending + ' pending'"></span>
+        </span>
+      </div>
+      <div class="panel-body">
+        <!-- Active / All toggle -->
+        <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.followUpsView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.followUpsView = 'active'">Active</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.followUpsView === 'all' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.followUpsView = 'all'">All</button>
+        </div>
+        <template x-if="$store.genesisDashboard.followUpsList.filter(f => {
+          if ($store.genesisDashboard.followUpsView === 'active') return ['pending','in_progress','blocked'].includes(f.status);
+          return true;
+        }).length === 0">
+          <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
+            No follow-ups found.
+          </div>
+        </template>
+        <div class="activity-feed">
+          <template x-for="item in $store.genesisDashboard.followUpsList.filter(f => {
+            if ($store.genesisDashboard.followUpsView === 'active') return ['pending','in_progress','blocked'].includes(f.status);
+            return true;
+          })" :key="item.id">
+            <div>
+              <div class="activity-row" style="cursor:pointer; display:flex; align-items:center; gap:0.5rem;"
+                   @click="$store.genesisDashboard.followUpsExpanded = $store.genesisDashboard.followUpsExpanded === item.id ? null : item.id">
+                <!-- Status badge -->
+                <span style="font-size:0.65rem; padding:0.1rem 0.4rem; border-radius:3px; font-weight:600; text-transform:uppercase; flex-shrink:0;"
+                      :style="{
+                        'pending':     'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                        'in_progress': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                        'blocked':     'background:rgba(255,167,38,0.15); color:#ffa726;',
+                        'completed':   'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                        'cancelled':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                      }[item.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
+                      x-text="item.status"></span>
+                <!-- Priority badge -->
+                <template x-if="item.priority && item.priority !== 'medium'">
                   <span style="font-size:0.6rem; padding:0.08rem 0.3rem; border-radius:3px; flex-shrink:0;"
                         :style="item.priority === 'high' || item.priority === 'critical' ? 'background:rgba(239,154,154,0.15); color:#ef9a9a;' : 'background:rgba(158,158,158,0.1); color:#9e9e9e;'"
                         x-text="item.priority"></span>
                 </template>
                 <!-- Description -->
                 <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:0.73rem;"
-                      x-text="item.description || item.id"></span>
+                      x-text="item.content || item.id"></span>
                 <!-- Timestamp -->
                 <span style="color:var(--color-text-secondary); font-size:0.65rem; flex-shrink:0;"
                       x-text="$store.genesisDashboard.formatTime(item.created_at)"></span>
                 <!-- Expand arrow -->
                 <span class="material-symbols-outlined" style="font-size:0.9rem; color:var(--color-text-secondary); transition:transform 0.15s;"
-                      :style="($store.genesisDashboard.taskExpanded === item.id || $store.genesisDashboard.workExpanded === item.id) ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                      :style="$store.genesisDashboard.followUpsExpanded === item.id ? 'transform:rotate(90deg)' : ''">chevron_right</span>
               </div>
-
-              <!-- Expanded: follow-up detail -->
-              <template x-if="item.type === 'follow_up' && $store.genesisDashboard.workExpanded === item.id">
+              <!-- Expanded detail -->
+              <template x-if="$store.genesisDashboard.followUpsExpanded === item.id">
                 <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
-                  <div style="margin-bottom:0.4rem; line-height:1.5;" x-text="item.description"></div>
+                  <div style="margin-bottom:0.4rem; line-height:1.5;" x-text="item.content"></div>
                   <template x-if="item.reason">
                     <div style="margin-bottom:0.3rem; color:var(--color-text-secondary); font-size:0.7rem;">
                       <strong>Reason:</strong> <span x-text="item.reason"></span>
@@ -7650,18 +7730,6 @@
                       <strong style="color:#ffa726;">Blocked:</strong> <span x-text="item.blocked_reason"></span>
                     </div>
                   </template>
-                </div>
-              </template>
-
-              <!-- Expanded: session detail -->
-              <template x-if="item.type === 'session' && $store.genesisDashboard.workExpanded === item.id">
-                <div style="padding:0.5rem 0.75rem; background:rgba(0,0,0,0.15); border-radius:4px; margin:0.25rem 0 0.5rem 0; font-size:0.72rem;">
-                  <div style="display:flex; gap:1rem; flex-wrap:wrap; color:var(--color-text-secondary); font-size:0.7rem;">
-                    <span x-text="'Type: ' + (item.session_type || 'unknown')"></span>
-                    <span x-text="'Model: ' + (item.model || 'unknown')"></span>
-                    <span x-show="item.cost_usd != null" x-text="'Cost: $' + (item.cost_usd || 0).toFixed(4)"></span>
-                    <span x-text="'Started: ' + $store.genesisDashboard.formatTime(item.created_at)"></span>
-                  </div>
                 </div>
               </template>
             </div>

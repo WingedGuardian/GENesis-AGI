@@ -21,6 +21,17 @@ from genesis.mcp.health.settings import (
 logger = logging.getLogger(__name__)
 
 
+def _strip_hidden(domain, data: dict) -> dict:
+    """Remove hidden_fields from a config dict before serving to UI."""
+    for field in domain.hidden_fields:
+        data.pop(field, None)
+        # Also strip inside wrapper keys (e.g., {inbox_monitor: {timezone: ...}})
+        wrapper = data.get(domain.name)
+        if isinstance(wrapper, dict):
+            wrapper.pop(field, None)
+    return data
+
+
 @blueprint.route("/api/genesis/settings", methods=["GET"])
 @_async_route
 async def settings_index():
@@ -47,6 +58,7 @@ async def settings_get(domain_name: str):
     if not domain:
         return jsonify({"error": f"Unknown domain: {domain_name}"}), 404
     data = _load_yaml_merged(domain.config_filename)
+    _strip_hidden(domain, data)
     return jsonify({"domain": domain_name, "config": data, "readonly": domain.readonly})
 
 
@@ -81,6 +93,7 @@ async def settings_update(domain_name: str):
         # Return the full merged view
         base = _load_yaml(domain.config_filename)
         merged = _deep_merge(base, new_local)
+        _strip_hidden(domain, merged)
         return jsonify({
             "domain": domain_name,
             "config": merged,
