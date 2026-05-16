@@ -58,6 +58,7 @@ class SurplusScheduler:
         follow_up_dispatch_minutes: int | None = None,
         memory_extraction_hours: int = 2,
         j9_eval_batch_hours: int = 24,
+        model_eval_hours: int = 24,
         clock=None,
         event_bus: GenesisEventBus | None = None,
         enable_code_audits: bool = True,
@@ -83,6 +84,7 @@ class SurplusScheduler:
         self._follow_up_dispatch_minutes = follow_up_dispatch_minutes or dispatch_interval_minutes
         self._memory_extraction_hours = memory_extraction_hours
         self._j9_eval_batch_hours = j9_eval_batch_hours
+        self._model_eval_hours = model_eval_hours
         self._clock = clock or (lambda: datetime.now(UTC))
         self._code_audit_executor: SurplusExecutor | None = None
         self._code_index_executor: SurplusExecutor | None = None
@@ -270,6 +272,14 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=300,
             )
+        if self._model_eval_hours > 0:
+            self._scheduler.add_job(
+                self.schedule_model_eval,
+                IntervalTrigger(hours=self._model_eval_hours),
+                id="schedule_model_eval",
+                max_instances=1,
+                misfire_grace_time=300,
+            )
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(
                 self.dispatch_follow_ups,
@@ -290,6 +300,8 @@ class SurplusScheduler:
         await self.schedule_maintenance()
         if self._j9_eval_batch_hours > 0:
             await self.schedule_j9_eval_batch()
+        if self._model_eval_hours > 0:
+            await self.schedule_model_eval()
         if self._analytical_hours > 0:
             await self.schedule_analytical()
         logger.info(
@@ -401,6 +413,33 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_j9_eval_batch", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_model_eval(self) -> None:
+        """Enqueue a MODEL_EVAL task if none pending/running."""
+        try:
+            import json
+
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            active = await self._queue.active_by_type(TaskType.MODEL_EVAL)
+            if active == 0:
+                payload = json.dumps({"model_id": "groq-free"})
+                await self._queue.enqueue(
+                    TaskType.MODEL_EVAL, ComputeTier.FREE_API, 0.4, "competence",
+                    payload=payload,
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_model_eval")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Model eval scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_model_eval", str(exc))
             except Exception:
                 pass
 
