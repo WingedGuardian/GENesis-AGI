@@ -38,6 +38,7 @@ class SettingsDomain:
     needs_restart: bool
     dedicated_tool: str | None = None
     readonly_reason: str = ""
+    hidden_fields: frozenset[str] = frozenset()  # Fields excluded from UI
 
 
 _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
@@ -61,6 +62,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="inbox_monitor.yaml",
         readonly=False,
         needs_restart=True,
+        hidden_fields=frozenset({"timezone"}),
     ),
     "autonomy": SettingsDomain(
         name="autonomy",
@@ -177,6 +179,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="ego.yaml",
         readonly=False,
         needs_restart=True,
+        hidden_fields=frozenset({"morning_report_timezone"}),
     ),
     "channels": SettingsDomain(
         name="channels",
@@ -620,6 +623,12 @@ async def _impl_settings_get(domain: str) -> dict:
         }
 
     config = _load_yaml_merged(entry.config_filename)
+    # Strip deprecated/hidden fields before serving
+    for field in entry.hidden_fields:
+        config.pop(field, None)
+        wrapper = config.get(domain)
+        if isinstance(wrapper, dict):
+            wrapper.pop(field, None)
     local_file = _local_filename(entry.config_filename)
     has_local = (_CONFIG_DIR / local_file).is_file()
     result = {
