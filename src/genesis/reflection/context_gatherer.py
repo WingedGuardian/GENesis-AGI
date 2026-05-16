@@ -568,7 +568,7 @@ class ContextGatherer:
         try:
             insights = await surplus.list_promoted(db, limit=20, unconsumed_only=True)
         except Exception:
-            logger.debug("surplus.list_promoted failed", exc_info=True)
+            logger.warning("surplus.list_promoted failed", exc_info=True)
             return "", []
 
         if not insights:

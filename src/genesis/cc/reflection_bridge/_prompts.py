@@ -330,7 +330,9 @@ async def build_strategic_prompt_enriched(
         )
 
     parts.append(build_data_pointers())
-    return "\n".join(parts), bundle.gathered_observation_ids, bundle.gathered_surplus_ids
+    # Strategic prompt does not inject surplus digest, so don't claim
+    # surplus IDs — they would never be marked consumed downstream.
+    return "\n".join(parts), bundle.gathered_observation_ids, ()
 
 
 async def build_enriched_prompt(
@@ -341,7 +343,7 @@ async def build_enriched_prompt(
 ) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
     """Build rich prompt using ContextGatherer data.
 
-    Returns (prompt_text, gathered_observation_ids).
+    Returns ``(prompt_text, gathered_observation_ids, gathered_surplus_ids)``.
     """
     bundle = await context_gatherer.gather(db)
 

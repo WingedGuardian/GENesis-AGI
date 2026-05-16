@@ -178,7 +178,7 @@ async def test_reflection_prompt_includes_cognitive_state(db, bridge, tick):
         section="active_context", generated_by="test", created_at=now,
     )
     from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
-    prompt, _obs_ids = await build_reflection_prompt(
+    prompt, _obs_ids, _surplus_ids = await build_reflection_prompt(
         depth=Depth.DEEP, tick=tick, db=db,
         context_gatherer=None, context_assembler=None,
         prompt_dir=Path("/nonexistent"),
@@ -344,7 +344,7 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
     )
 
     from genesis.cc.reflection_bridge._prompts import build_reflection_prompt
-    prompt, obs_ids = await build_reflection_prompt(
+    prompt, obs_ids, _surplus_ids = await build_reflection_prompt(
         depth=Depth.STRATEGIC, tick=tick, db=db,
         context_gatherer=mock_gatherer, context_assembler=None,
         prompt_dir=Path("/nonexistent"),
