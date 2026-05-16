@@ -11,6 +11,36 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b10] - 2026-05-15
+
+5 PRs merged. Dream cycle adds retroactive memory consolidation. Ego
+proposals show attribution (User vs Genesis). Promoted surplus insights
+now feed into deep reflection instead of dead-ending. Guardian hardened
+against VM crashes.
+
+### Added
+
+- **Dream cycle** (#359) --- retroactive episodic memory consolidation.
+  Background process reviews recent memories, identifies clusters and
+  patterns, and synthesizes higher-order observations.
+- **Ego attribution** (#362) --- proposals display which ego (User CEO
+  vs Genesis COO) created them, on both Telegram digests and the
+  dashboard.
+- **Surplus→reflection pipeline** (#362) --- promoted surplus insights
+  feed into deep reflection context. After routing, insights are marked
+  consumed so they don't re-appear.
+
+### Fixed
+
+- **Ego dispatch pipeline** (#358) --- timeout handling, double-dispatch
+  prevention, and message persistence for proposal execution.
+- **Dream cycle safety** (#363) --- bucket chunking, memory preflight
+  validation, and async yielding to prevent runaway consolidation.
+- **Guardian VM crash hardening** (#361) --- kernel OOM tuning, MCP
+  process isolation, and preflight health checks before diagnosis.
+
+---
+
 ## [v3.0b9] - 2026-05-14
 
 54 PRs merged. Ego gains layers 3--6 (realist gate, cross-ego isolation,
