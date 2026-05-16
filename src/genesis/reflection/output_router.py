@@ -357,12 +357,17 @@ class OutputRouter:
                     logger.warning("Invalid surplus task_type from reflection: %s", req.task_type)
                     continue
                 try:
+                    # Payload must be a JSON string for the queue/executor.
+                    # Reflection output may provide it as any JSON type (parsed).
+                    raw_payload = req.payload
+                    if raw_payload is not None and not isinstance(raw_payload, str):
+                        raw_payload = json.dumps(raw_payload)
                     task_id = await self._surplus_queue.enqueue(
                         task_type=task_type,
                         compute_tier=ComputeTier.FREE_API,
                         priority=req.priority,
                         drive_alignment=req.drive_alignment,
-                        payload=req.payload,
+                        payload=raw_payload,
                     )
                     logger.info("Enqueued surplus task %s (type=%s) from deep reflection", task_id, req.task_type)
                     summary["surplus_tasks_enqueued"] += 1

@@ -18,6 +18,7 @@ jobs:
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
   j9_eval_batch_hours: 0          # Disabled: 100% error rate, no value
+  model_eval_hours: 24            # Run model quality assessments daily
 
 task_defaults:
   code_audit:                { priority: 0.5, drive: competence,   tier: free_api }

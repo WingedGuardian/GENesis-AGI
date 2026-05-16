@@ -79,6 +79,7 @@ async def init(rt: GenesisRuntime) -> None:
             follow_up_dispatch_minutes=int(jobs.get("follow_up_dispatch_minutes", 5)),
             memory_extraction_hours=int(jobs.get("memory_extraction_hours", 2)),
             j9_eval_batch_hours=int(jobs.get("j9_eval_batch_hours", 24)),
+            model_eval_hours=int(jobs.get("model_eval_hours", 24)),
         )
 
         try:
