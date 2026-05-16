@@ -46,6 +46,9 @@ class OutreachScheduler:
         # (returns empty set), causing repeated alerts. This dict survives
         # across health check cycles as a reliable dedup layer.
         self._alert_last_sent: dict[str, float] = {}  # alert_id → monotonic time
+        # Critical observation dedup — prevents re-alerting if mark_surfaced
+        # fails after successful delivery. Entries expire after 30 minutes.
+        self._critical_obs_sent: dict[str, float] = {}  # obs_id → monotonic time
 
     @property
     def is_running(self) -> bool:
@@ -356,6 +359,24 @@ class OutreachScheduler:
                 await self._record_job_result("critical_observations")
                 return
 
+            # In-memory dedup — filter out observations already alerted recently
+            # (protects against mark_surfaced DB failure causing repeat alerts)
+            import time
+            now_mono = time.monotonic()
+            dedup_window = 30 * 60  # 30 minutes
+            # Evict expired entries
+            self._critical_obs_sent = {
+                k: v for k, v in self._critical_obs_sent.items()
+                if (now_mono - v) < dedup_window
+            }
+            observations = [
+                obs for obs in observations
+                if obs["id"] not in self._critical_obs_sent
+            ]
+            if not observations:
+                await self._record_job_result("critical_observations")
+                return
+
             # Format the alert
             try:
                 alert_tz = ZoneInfo(user_timezone())
@@ -389,10 +410,19 @@ class OutreachScheduler:
                 len(observations), result.status.value,
             )
 
-            # Mark as surfaced so they don't re-alert
+            # Only mark surfaced if delivery actually succeeded
+            from genesis.outreach.types import OutreachStatus
             ids = [obs["id"] for obs in observations]
-            now = datetime.now(UTC).isoformat()
-            await obs_crud.mark_surfaced(self._db, ids, now)
+            if result.status == OutreachStatus.DELIVERED:
+                now = datetime.now(UTC).isoformat()
+                await obs_crud.mark_surfaced(self._db, ids, now)
+
+            # In-memory dedup — prevent re-alerting if mark_surfaced fails
+            # after delivery, or if delivery was rejected by dedup layer.
+            import time
+            now_mono = time.monotonic()
+            for obs_id in ids:
+                self._critical_obs_sent[obs_id] = now_mono
 
             await self._record_job_result("critical_observations")
         except Exception as exc:
