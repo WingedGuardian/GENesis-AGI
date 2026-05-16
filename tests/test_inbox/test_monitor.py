@@ -1417,3 +1417,19 @@ def test_coherence_check_no_urls_in_source():
     evaluation = "# Inbox Evaluation\n\n" + "Analysis of the plain text content " * 15
     source = "Just some plain text with no links"
     assert _passes_coherence_check(evaluation, source) is True
+
+
+def test_coherence_check_passes_with_platform_name():
+    """Evaluations use platform names ('LinkedIn') not raw domains ('www.linkedin.com')."""
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nA LinkedIn post by Hao Hoang " + "x" * 300
+    source = "Check out https://www.linkedin.com/posts/some-post"
+    assert _passes_coherence_check(evaluation, source) is True
+
+
+def test_coherence_check_passes_with_domain_stem_fallback():
+    """Unknown domains still match via stem extraction (e.g. 'langchain' from 'langchain.com')."""
+    from genesis.inbox.monitor import _passes_coherence_check
+    evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nLangChain's new feature " + "x" * 300
+    source = "https://www.langchain.com/blog/something"
+    assert _passes_coherence_check(evaluation, source) is True

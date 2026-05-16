@@ -98,3 +98,17 @@ async def get_last_completed_step(
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
+
+
+async def get_incomplete_steps(
+    db: aiosqlite.Connection,
+    task_id: str,
+) -> list[dict]:
+    """Return all steps for a task that are NOT 'completed', ordered by step_idx."""
+    cursor = await db.execute(
+        """SELECT * FROM task_steps
+           WHERE task_id = ? AND status != 'completed'
+           ORDER BY step_idx""",
+        (task_id,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
