@@ -75,11 +75,11 @@ async def _impl_health_errors(
 
             db_rows = await events_crud.query(
                 _service._db,
-                severity="WARNING",
+                severity="warning",
                 since=cutoff,
                 limit=50,
             )
-            for sev in ("ERROR", "CRITICAL"):
+            for sev in ("error", "critical"):
                 db_rows.extend(await events_crud.query(
                     _service._db,
                     severity=sev,
