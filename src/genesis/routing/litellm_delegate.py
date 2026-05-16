@@ -92,6 +92,12 @@ class LiteLLMDelegate:
             )
             content = response.choices[0].message.content
             usage = getattr(response, "usage", None)
+            # Extract provider-level prompt cache info when available
+            cache_read = 0
+            if usage:
+                details = getattr(usage, "prompt_tokens_details", None)
+                if details:
+                    cache_read = getattr(details, "cached_tokens", 0) or 0
             if cfg.is_free:
                 cost = 0.0
                 cost_known = True
@@ -112,6 +118,7 @@ class LiteLLMDelegate:
                 content=content,
                 input_tokens=usage.prompt_tokens if usage else 0,
                 output_tokens=usage.completion_tokens if usage else 0,
+                cache_read_tokens=cache_read,
                 cost_usd=cost,
                 cost_known=cost_known,
             )

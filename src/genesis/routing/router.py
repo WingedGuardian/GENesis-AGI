@@ -240,6 +240,7 @@ class Router:
                         f"llm.{provider_name}",
                         latency_ms=latency_ms,
                         success=result.success,
+                        error_message=result.error if not result.success else None,
                     )
                 except Exception:
                     logger.warning(

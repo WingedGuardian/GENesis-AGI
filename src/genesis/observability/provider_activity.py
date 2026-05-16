@@ -42,7 +42,7 @@ class ProviderActivityTracker:
         self._calls: dict[str, deque[CallRecord]] = defaultdict(deque)
         self._db: aiosqlite.Connection | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._write_batch: list[tuple[str, float, bool, bool]] = []
+        self._write_batch: list[tuple[str, float, bool, bool, str | None]] = []
         self._flush_task: asyncio.Task | None = None
 
     def set_db(self, db: aiosqlite.Connection) -> None:
@@ -60,6 +60,7 @@ class ProviderActivityTracker:
         latency_ms: float,
         success: bool,
         cache_hit: bool = False,
+        error_message: str | None = None,
     ) -> None:
         """Record a single call. Auto-evicts entries older than window."""
         self._calls[provider].append(
@@ -74,7 +75,9 @@ class ProviderActivityTracker:
 
         # Queue for DB persistence (fire-and-forget)
         if self._db is not None:
-            self._write_batch.append((provider, latency_ms, success, cache_hit))
+            self._write_batch.append(
+                (provider, latency_ms, success, cache_hit, error_message),
+            )
             self._schedule_flush()
 
     def _schedule_flush(self) -> None:
@@ -113,9 +116,13 @@ class ProviderActivityTracker:
         now = datetime.now(UTC).isoformat()
         try:
             await self._db.executemany(
-                "INSERT INTO activity_log (provider, latency_ms, success, cache_hit, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(p, lat, int(s), int(c), now) for p, lat, s, c in batch],
+                "INSERT INTO activity_log "
+                "(provider, latency_ms, success, cache_hit, error_message, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (p, lat, int(s), int(c), err, now)
+                    for p, lat, s, c, err in batch
+                ],
             )
             await self._db.commit()
         except Exception:

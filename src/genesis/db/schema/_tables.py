@@ -265,6 +265,7 @@ TABLES = {
             person_id        TEXT,               -- GROUNDWORK(multi-person)
             input_tokens     INTEGER,
             output_tokens    INTEGER,
+            cache_read_tokens INTEGER,
             cost_usd         REAL NOT NULL DEFAULT 0.0,
             cost_known       INTEGER NOT NULL DEFAULT 1,  -- 0 if litellm couldn't price
             metadata         TEXT,               -- JSON
@@ -709,12 +710,13 @@ TABLES = {
     """,
     "activity_log": """
         CREATE TABLE IF NOT EXISTS activity_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider    TEXT NOT NULL,
-            latency_ms  REAL NOT NULL,
-            success     INTEGER NOT NULL DEFAULT 1,
-            cache_hit   INTEGER NOT NULL DEFAULT 0,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider      TEXT NOT NULL,
+            latency_ms    REAL NOT NULL,
+            success       INTEGER NOT NULL DEFAULT 1,
+            cache_hit     INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
     "module_config": """

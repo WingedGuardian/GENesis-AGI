@@ -41,6 +41,7 @@ class CostTracker:
             provider=provider,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            cache_read_tokens=result.cache_read_tokens or None,
             cost_usd=result.cost_usd,
             cost_known=cost_known,
             metadata={"call_site": call_site_id},
