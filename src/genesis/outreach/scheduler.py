@@ -108,8 +108,16 @@ class OutreachScheduler:
             id="outreach_drain_pending",
             replace_existing=True,
         )
+        # Critical observation alerting — surfaces critical observations to Telegram
+        self._scheduler.add_job(
+            self._critical_observations_job,
+            "interval",
+            minutes=5,
+            id="outreach_critical_observations",
+            replace_existing=True,
+        )
         self._scheduler.start()
-        logger.info("OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m)",
+        logger.info("OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m, critical_obs=5m)",
                      hour, minute, tz,
                      self._config.engagement_poll_minutes)
 
@@ -320,6 +328,76 @@ class OutreachScheduler:
         except Exception as exc:
             logger.exception("Health check outreach job failed")
             await self._record_job_result("health_check", error=str(exc))
+
+    async def _critical_observations_job(self) -> None:
+        """Alert user via Telegram when critical observations are created.
+
+        Polls every 5 minutes for unsurfaced critical observations, batches
+        them into one message, marks them as surfaced after delivery. Runs
+        even when paused (like health checks — observability, not dispatches).
+        """
+        try:
+            from datetime import UTC, datetime
+            from zoneinfo import ZoneInfo
+
+            from genesis.db.crud import observations as obs_crud
+            from genesis.db.crud.observations import INTERNAL_OBS_TYPES
+            from genesis.env import user_timezone
+
+            # Only surface critical observations that haven't been seen yet
+            observations = await obs_crud.get_unsurfaced(
+                self._db,
+                priority_filter=("critical",),
+                exclude_types=tuple(INTERNAL_OBS_TYPES),
+                limit=10,
+            )
+
+            if not observations:
+                await self._record_job_result("critical_observations")
+                return
+
+            # Format the alert
+            try:
+                alert_tz = ZoneInfo(user_timezone())
+            except Exception:
+                alert_tz = UTC
+
+            lines = ["\U0001f6a8 CRITICAL OBSERVATION" + ("S" if len(observations) > 1 else ""), ""]
+            for obs in observations:
+                content = (obs.get("content") or "")[:200]
+                obs_type = obs.get("type", "unknown")
+                lines.append(f"\u2022 [{obs_type}] {content}")
+            lines.append("")
+            lines.append(
+                f"({len(observations)} critical observation(s) at "
+                f"{datetime.now(alert_tz).strftime('%H:%M %Z')})"
+            )
+            batched_text = "\n".join(lines)
+
+            envelope = OutreachRequest(
+                category=OutreachCategory.BLOCKER,
+                topic="Critical Observations",
+                context=batched_text,
+                salience_score=1.0,
+                signal_type="critical_observation",
+                source_id=",".join(obs["id"] for obs in observations),
+            )
+
+            result = await self._pipeline.submit_raw(batched_text, envelope)
+            logger.info(
+                "Critical observations outreach (%d obs): %s",
+                len(observations), result.status.value,
+            )
+
+            # Mark as surfaced so they don't re-alert
+            ids = [obs["id"] for obs in observations]
+            now = datetime.now(UTC).isoformat()
+            await obs_crud.mark_surfaced(self._db, ids, now)
+
+            await self._record_job_result("critical_observations")
+        except Exception as exc:
+            logger.exception("Critical observations outreach job failed")
+            await self._record_job_result("critical_observations", error=str(exc))
 
     async def _calibration_job(self) -> None:
         """Reconcile predictions and recompute calibration curves."""
