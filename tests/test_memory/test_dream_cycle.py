@@ -416,7 +416,7 @@ class TestBucketChunking:
                 f"p{i}": [0.1] * 768 for i in range(n_points)
             }
 
-            report = await run(
+            await run(
                 qdrant=mock_qdrant,
                 db=mock_db,
                 router=mock_router,
