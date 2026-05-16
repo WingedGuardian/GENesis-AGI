@@ -277,7 +277,7 @@
         _awarenessInterval: null,
         _jobHealthInterval: null,
         _tasksInterval: null,
-        _sessionsInterval: null,
+        _workSessionsInterval: null,
         _followUpsInterval: null,
         _commsInterval: null,
 
@@ -288,7 +288,7 @@
           internals: ["_awarenessInterval", "_routingInterval", "_jobHealthInterval", "_activityInterval", "_sessionsInterval"],
           config:    [],
           files:     [],
-          work:      ["_tasksInterval", "_sessionsInterval", "_followUpsInterval"],
+          work:      ["_tasksInterval", "_workSessionsInterval", "_followUpsInterval"],
           memory:    [],
           knowledge: [],
           backup:    [],
@@ -350,9 +350,9 @@
               if (first) { this.fetchFiles(); }
               break;
             case "work":
-              if (first) { this.fetchTasks(); this.fetchSessions(); this.fetchFollowUps(); }
+              if (first) { this.fetchTasks(); this.fetchWorkSessions(); this.fetchFollowUps(); }
               this._tasksInterval = setInterval(() => this.fetchTasks(), 5000);
-              this._sessionsInterval = setInterval(() => this.fetchSessions(), 10000);
+              this._workSessionsInterval = setInterval(() => this.fetchWorkSessions(), 10000);
               this._followUpsInterval = setInterval(() => this.fetchFollowUps(), 15000);
               break;
             case "memory":
@@ -711,14 +711,14 @@
         },
 
         // ── Work tab fetches ──────────────────────────────────────
-        async fetchSessions() {
+        async fetchWorkSessions() {
           try {
             const resp = await fetchApi(`/api/genesis/work?type=session&view=${this.sessionsView}&limit=50`);
             if (resp && resp.ok) {
               const data = await resp.json();
               this.sessionsList = data.items || [];
             }
-          } catch (e) { console.warn("Sessions fetch failed:", e); }
+          } catch (e) { console.warn("Work sessions fetch failed:", e); }
         },
         async fetchFollowUps() {
           try {
@@ -7589,10 +7589,10 @@
         <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
           <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
                   :style="$store.genesisDashboard.sessionsView === 'active' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.sessionsView = 'active'; $store.genesisDashboard.fetchSessions()">Active</button>
+                  @click="$store.genesisDashboard.sessionsView = 'active'; $store.genesisDashboard.fetchWorkSessions()">Active</button>
           <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
                   :style="$store.genesisDashboard.sessionsView === 'history' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.sessionsView = 'history'; $store.genesisDashboard.fetchSessions()">History</button>
+                  @click="$store.genesisDashboard.sessionsView = 'history'; $store.genesisDashboard.fetchWorkSessions()">History</button>
         </div>
         <template x-if="$store.genesisDashboard.sessionsList.length === 0">
           <div style="padding:1.5rem; text-align:center; color:var(--color-text-secondary); font-size:0.75rem;">
