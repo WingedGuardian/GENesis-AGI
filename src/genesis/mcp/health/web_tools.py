@@ -583,7 +583,7 @@ async def web_agent(
                     await cost_events.create(
                         db,
                         id=str(uuid.uuid4()),
-                        event_type="tinyfish_agent",
+                        event_type="api_call",
                         provider="tinyfish",
                         cost_usd=cost_usd,
                         cost_known=True,
