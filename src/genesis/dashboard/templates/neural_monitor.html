@@ -1714,12 +1714,18 @@ async function loadSurplusDetail(container) {
             container.appendChild(driveSection);
         }
 
-        // Section 3: Eval Staleness
+        // Section 3: Eval Metrics
         const evalData = data.eval_staleness || {};
+        const evalMetrics = data.eval_metrics || {};
         const providers = evalData.providers || [];
-        if (providers.length > 0) {
+        const evalRuns = evalMetrics.runs || [];
+        const j9Snaps = evalMetrics.j9 || [];
+
+        if (providers.length > 0 || evalRuns.length > 0 || j9Snaps.length > 0) {
             const evalSection = el('div', 'detail-section');
-            evalSection.appendChild(el('h4', null, 'Eval Freshness'));
+            evalSection.appendChild(el('h4', null, 'Eval & Assessment'));
+
+            // Provider freshness
             for (const p of providers) {
                 const row = el('div', 'surplus-task-row');
                 row.appendChild(el('span', 'task-type', p.provider));
@@ -1734,6 +1740,44 @@ async function loadSurplusDetail(container) {
                 }
                 evalSection.appendChild(row);
             }
+
+            // Recent eval run scores
+            if (evalRuns.length > 0) {
+                const runsHeader = el('div', null, '');
+                runsHeader.style.cssText = 'margin-top:8px;font-size:11px;color:#94a3b8;';
+                runsHeader.textContent = 'Recent Runs';
+                evalSection.appendChild(runsHeader);
+                for (const run of evalRuns.slice(0, 5)) {
+                    const row = el('div', 'surplus-task-row');
+                    row.appendChild(el('span', 'task-type', `${run.model_id} / ${run.dataset}`));
+                    const score = run.aggregate_score != null ? Math.round(run.aggregate_score * 100) + '%' : '?';
+                    const scoreColor = run.aggregate_score == null ? '#94a3b8' : run.aggregate_score >= 0.8 ? '#4ade80' : run.aggregate_score >= 0.6 ? '#fbbf24' : '#ef4444';
+                    const passed = run.passed_cases || 0;
+                    const failed = run.failed_cases || 0;
+                    const scoreEl = el('span', 'task-time', `${score} (${passed}/${passed + failed})`);
+                    scoreEl.style.color = scoreColor;
+                    row.appendChild(scoreEl);
+                    evalSection.appendChild(row);
+                }
+            }
+
+            // J-9 dimension scores
+            if (j9Snaps.length > 0) {
+                const j9Header = el('div', null, '');
+                j9Header.style.cssText = 'margin-top:8px;font-size:11px;color:#94a3b8;';
+                j9Header.textContent = 'J-9 Dimensions';
+                evalSection.appendChild(j9Header);
+                for (const snap of j9Snaps) {
+                    if (snap.dimension === 'composite') continue;
+                    const row = el('div', 'surplus-task-row');
+                    row.appendChild(el('span', 'task-type', snap.dimension));
+                    const samples = el('span', 'task-time', `${snap.sample_count} samples`);
+                    samples.style.color = snap.sample_count > 0 ? '#94a3b8' : '#ef4444';
+                    row.appendChild(samples);
+                    evalSection.appendChild(row);
+                }
+            }
+
             container.appendChild(evalSection);
         }
 
