@@ -39,6 +39,7 @@ class SuspiciousChecksConfig:
     tick_history_count: int = 10
     error_spike_window_min: int = 30
     error_spike_threshold: int = 50
+    db_latency_warning_ms: float = 5000.0  # Normal is <100ms; 5s = serious degradation
 
 
 @dataclass

@@ -7,7 +7,7 @@ asyncio.gather.
 Probes:
   1. Container exists     — incus info genesis → "Status: RUNNING"
   2. ICMP reachable       — ping -c1 -W3 {container_ip}
-  3. Health API           — HTTP GET :5000/api/genesis/health
+  3. Health API           — HTTP GET :5000/api/genesis/health (retries once on 503)
   4. Heartbeat canary     — HTTP GET :5000/api/genesis/heartbeat
   5. Log freshness        — incus exec journalctl last line timestamp
 
@@ -18,7 +18,7 @@ Suspicious checks (run when all 5 probes pass):
   4. CC tmp usage         — watchgod_state.json tier check
   5. Restart count        — systemctl NRestarts
   6. Error spike          — journalctl error count in window
-  7. Pause state          — /api/genesis/pause or paused.json
+  7. Health API depth     — parse response body for degraded metrics
 """
 
 from __future__ import annotations
@@ -247,12 +247,23 @@ async def probe_icmp_reachable(config: GuardianConfig) -> SignalResult:
 
 
 async def probe_health_api(config: GuardianConfig) -> SignalResult:
-    """Check Flask health API responds with 200."""
+    """Check Flask health API responds with 200.
+
+    Retries once on 503 (often transient during DB lock or bootstrap).
+    Reported latency reflects the successful call, not the retry wait.
+    """
     name = "health_api"
     t0 = datetime.now(UTC)
     try:
         url = f"{config.health_url}/api/genesis/health"
         status, body = await _http_get_async(url, timeout=config.probes.http_timeout_s)
+
+        # 503 is often transient (DB lock, bootstrap race). Retry once.
+        if status == 503:
+            await asyncio.sleep(5)
+            t0 = datetime.now(UTC)  # Reset — report latency of the successful call
+            status, body = await _http_get_async(url, timeout=config.probes.http_timeout_s)
+
         latency = (datetime.now(UTC) - t0).total_seconds() * 1000
         alive = status == 200
         detail = "healthy" if alive else f"status={status} body={body[:200]}"
@@ -587,6 +598,58 @@ async def check_error_spike(config: GuardianConfig) -> SuspiciousResult:
         )
 
 
+async def check_health_api_depth(config: GuardianConfig) -> SuspiciousResult:
+    """Parse health API response body for degraded infrastructure metrics.
+
+    Runs only when all probes pass (health API already returned 200).
+    Checks DB latency, scheduler status, and Qdrant status against thresholds.
+    """
+    name = "health_api_depth"
+    t0 = datetime.now(UTC)
+    try:
+        url = f"{config.health_url}/api/genesis/health"
+        status, body = await _http_get_async(url, timeout=config.probes.http_timeout_s)
+        if status != 200:
+            return SuspiciousResult(
+                name=name, ok=True, detail=f"skipped (status={status})",
+                collected_at=t0.isoformat(),
+            )
+
+        data = json.loads(body)
+        infra = data.get("infrastructure", {})
+
+        warnings: list[str] = []
+
+        # DB latency
+        db = infra.get("genesis.db", {})
+        db_latency = db.get("latency_ms", 0)
+        if isinstance(db_latency, (int, float)) and db_latency > config.suspicious.db_latency_warning_ms:
+            warnings.append(f"db_latency={db_latency:.0f}ms")
+
+        # Scheduler
+        sched = infra.get("scheduler", {})
+        sched_status = sched.get("status", "unknown")
+        if sched_status not in ("healthy", "unknown"):
+            warnings.append(f"scheduler={sched_status}")
+
+        # Qdrant
+        qdrant = infra.get("qdrant", {})
+        qdrant_status = qdrant.get("status", "unknown")
+        if qdrant_status not in ("healthy", "unknown"):
+            warnings.append(f"qdrant={qdrant_status}")
+
+        ok = len(warnings) == 0
+        detail = ", ".join(warnings) if warnings else "all metrics healthy"
+        return SuspiciousResult(
+            name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
+        )
+    except Exception as exc:
+        return SuspiciousResult(
+            name=name, ok=True, detail=f"exception: {exc}",
+            collected_at=t0.isoformat(),
+        )
+
+
 async def check_pause_state(config: GuardianConfig) -> PauseState:
     """Read Genesis pause state from the container."""
     try:
@@ -660,6 +723,7 @@ async def collect_all_signals(config: GuardianConfig) -> HealthSnapshot:
             check_cc_tmp_usage(config),
             check_restart_count(config),
             check_error_spike(config),
+            check_health_api_depth(config),
             return_exceptions=True,
         )
         for result in suspicious_results:
