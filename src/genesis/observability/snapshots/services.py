@@ -105,6 +105,8 @@ def _sentinel_unavailable() -> dict:
         "last_trigger_reason": "",
         "last_dispatch_at": "",
         "escalated_count": 0,
+        "staleness_s": 0,
+        "is_stale": False,
     }
 
 

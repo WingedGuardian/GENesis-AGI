@@ -1427,10 +1427,6 @@ class SentinelDispatcher:
         appeared in ≥_ALARM_CONFIRMATION_COUNT of the last _ALARM_RING_SIZE
         ticks. Single-tick flaps never wake the Sentinel.
         """
-        # Record heartbeat on every tick so staleness can be detected.
-        self._state.record_heartbeat()
-        save_state(self._state)
-
         # Auto-reset ESCALATED on every tick (not just on new dispatches).
         # Without this, the sentinel stays red forever if no new alarms fire.
         self._try_auto_reset_escalated()
@@ -1444,6 +1440,12 @@ class SentinelDispatcher:
         except Exception:
             logger.debug("Failed to query health alerts for fire alarm check", exc_info=True)
             return None
+
+        # Record heartbeat AFTER the health query succeeds. This certifies
+        # "sentinel checked the system this tick." If the query above fails
+        # or health_data is None, no heartbeat is stamped → staleness detected.
+        self._state.record_heartbeat()
+        save_state(self._state)
 
         alarms = classify_alerts(alerts or [])
         current_ids = {a.alert_id for a in alarms}
