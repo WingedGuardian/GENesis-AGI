@@ -63,8 +63,18 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",  # No recursive spawn
     "mcp__genesis-health__module_call",
-    # Knowledge ingestion requires explicit user authorization — too
-    # impactful for any autonomous process to do unilaterally.
+    # ── Vector store isolation ────────────────────────────────────
+    # Background sessions MUST NOT write to Qdrant (episodic_memory
+    # or knowledge_base). Episodic memory is exclusively for
+    # foreground user interactions. Background findings belong in
+    # the session transcript (the deliverable) or in SQLite tables
+    # (observations, references, follow-ups) — never in vector stores.
+    # Server-side code (ego corrections, reflection output) uses
+    # MemoryStore directly and is unaffected by tool-level blocking.
+    "mcp__genesis-memory__memory_store",
+    "mcp__genesis-memory__memory_synthesize",
+    "mcp__genesis-memory__memory_extract",
+    # Knowledge ingestion requires explicit user authorization.
     "mcp__genesis-memory__knowledge_ingest",
     "mcp__genesis-memory__knowledge_ingest_batch",
     "mcp__genesis-memory__knowledge_ingest_source",
@@ -85,12 +95,11 @@ _NO_BROWSER_INTERACTION = [
 ]
 
 _NO_MEMORY_WRITES = [
-    "mcp__genesis-memory__memory_store",
-    "mcp__genesis-memory__memory_synthesize",
-    "mcp__genesis-memory__memory_extract",
+    # memory_store/synthesize/extract + knowledge_ingest* are in
+    # _UNIVERSAL_DISALLOW (vector store isolation).
+    # This list covers SQLite-table writes blocked only for observe.
     "mcp__genesis-memory__observation_write",
     "mcp__genesis-memory__observation_resolve",
-    # knowledge_ingest* moved to _UNIVERSAL_DISALLOW
     "mcp__genesis-memory__procedure_store",
     "mcp__genesis-memory__reference_store",
     "mcp__genesis-memory__reference_delete",
