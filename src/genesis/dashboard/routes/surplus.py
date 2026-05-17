@@ -169,6 +169,25 @@ async def surplus_config():
     # Eval staleness
     eval_data = await eval_staleness(db)
 
+    # Eval metrics — per-run scores + J-9 dimension snapshots
+    eval_metrics = {"runs": [], "j9": []}
+    if db is not None:
+        try:
+            cursor = await db.execute("""
+                SELECT model_id, dataset, aggregate_score, passed_cases,
+                       failed_cases, skipped_cases, duration_s, created_at
+                FROM eval_runs ORDER BY created_at DESC LIMIT 20
+            """)
+            eval_metrics["runs"] = [dict(r) for r in await cursor.fetchall()]
+
+            cursor = await db.execute("""
+                SELECT dimension, metrics_json, sample_count, created_at
+                FROM eval_snapshots ORDER BY created_at DESC LIMIT 10
+            """)
+            eval_metrics["j9"] = [dict(r) for r in await cursor.fetchall()]
+        except Exception:
+            logger.debug("eval_metrics query failed (tables may not exist yet)")
+
     # Queue stats
     stats = {}
     if db is not None:
@@ -187,6 +206,7 @@ async def surplus_config():
         "catalog": catalog,
         "drives": drives,
         "eval_staleness": eval_data,
+        "eval_metrics": eval_metrics,
         "stats": stats,
     })
 
