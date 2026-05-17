@@ -190,6 +190,7 @@ async def _lookup_session(db, session_id: str) -> dict | None:
         "output_tokens": row.get("output_tokens", 0),
         "profile": metadata.get("profile"),
         "output_preview": (metadata.get("output_text") or "")[:500],
+        "transcript_path": metadata.get("transcript_path"),
         "tools_summary": metadata.get("tools_summary", {}),
         "error": metadata.get("error"),
         "duration_s": metadata.get("duration_s"),

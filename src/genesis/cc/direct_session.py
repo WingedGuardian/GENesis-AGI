@@ -63,6 +63,21 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",  # No recursive spawn
     "mcp__genesis-health__module_call",
+    # ── Vector store isolation ────────────────────────────────────
+    # Background sessions MUST NOT write to Qdrant (episodic_memory
+    # or knowledge_base). Episodic memory is exclusively for
+    # foreground user interactions. Background findings belong in
+    # the session transcript (the deliverable) or in SQLite tables
+    # (observations, references, follow-ups) — never in vector stores.
+    # Server-side code (ego corrections, reflection output) uses
+    # MemoryStore directly and is unaffected by tool-level blocking.
+    "mcp__genesis-memory__memory_store",
+    "mcp__genesis-memory__memory_synthesize",
+    "mcp__genesis-memory__memory_extract",
+    # Knowledge ingestion requires explicit user authorization.
+    "mcp__genesis-memory__knowledge_ingest",
+    "mcp__genesis-memory__knowledge_ingest_batch",
+    "mcp__genesis-memory__knowledge_ingest_source",
 ]
 
 _NO_OUTREACH_SEND = [
@@ -80,14 +95,11 @@ _NO_BROWSER_INTERACTION = [
 ]
 
 _NO_MEMORY_WRITES = [
-    "mcp__genesis-memory__memory_store",
-    "mcp__genesis-memory__memory_synthesize",
-    "mcp__genesis-memory__memory_extract",
+    # memory_store/synthesize/extract + knowledge_ingest* are in
+    # _UNIVERSAL_DISALLOW (vector store isolation).
+    # This list covers SQLite-table writes blocked only for observe.
     "mcp__genesis-memory__observation_write",
     "mcp__genesis-memory__observation_resolve",
-    "mcp__genesis-memory__knowledge_ingest",
-    "mcp__genesis-memory__knowledge_ingest_batch",
-    "mcp__genesis-memory__knowledge_ingest_source",
     "mcp__genesis-memory__procedure_store",
     "mcp__genesis-memory__reference_store",
     "mcp__genesis-memory__reference_delete",
@@ -444,12 +456,30 @@ class DirectSessionRunner:
 
         tool_counts = self._summarize_tools(result.tools_called)
 
+        # Derive transcript path from CC's project-key convention:
+        # working_dir ~/.genesis/background-sessions → project key
+        # -home-ubuntu--genesis-background-sessions → transcript .jsonl
+        transcript_path = ""
+        if result.cc_session_id:
+            from pathlib import Path
+
+            project_key = (
+                background_session_dir()
+                .replace("/", "-")
+                .lstrip("-")
+            )
+            transcript_path = str(
+                Path.home() / ".claude" / "projects"
+                / f"-{project_key}" / f"{result.cc_session_id}.jsonl"
+            )
+
         existing.update({
             "profile": request.profile,
             "caller_context": request.caller_context,
-            "output_text": result.output_text[:5000],
+            "output_text": result.output_text[:20000],
             "tools_summary": tool_counts,
             "cc_session_id": result.cc_session_id,
+            "transcript_path": transcript_path,
             "error": result.error,
             "model_used": result.model_used,
             "duration_s": result.duration_s,

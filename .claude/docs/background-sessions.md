@@ -8,7 +8,6 @@ Read this guide any time you're considering a background session or sub-agent.
 | Situation | Use |
 |---|---|
 | Task > 20 minutes | Background session |
-| Needs `memory_store` writes that must persist across sessions | Background session |
 | Needs browser automation with a persistent profile | Background session |
 | Quick research returning results to this conversation | Sub-agent |
 | Parallel analysis with no memory writes needed | Sub-agent |
@@ -19,17 +18,37 @@ the next few minutes → sub-agent.
 
 ## Profiles
 
-| Profile | Browser click/fill | memory_store | outreach_send | follow_up_create | Web search |
+| Profile | Browser | observation_write | outreach_send | follow_up_create | Web search |
 |---|---|---|---|---|---|
 | `observe` | ✗ | ✗ | ✗ | ✗ | ✓ |
 | `research` | ✗ | ✓ | ✗ | ✓ | ✓ |
 | `interact` | ✓ | ✓ | ✓ | ✓ | ✓ |
 
 All profiles block: Bash, Edit, Write, task_submit, settings_update,
-direct_session_run. Use `interact` for workflows that operate external
-platforms (publishing, form filling) and need to communicate with the user.
-Use `research` for data gathering that writes to memory. Use `observe` for
-read-only investigation.
+direct_session_run, module_call. Use `interact` for workflows that operate
+external platforms (publishing, form filling) and need to communicate with the
+user. Use `research` for investigation that writes observations/follow-ups.
+Use `observe` for read-only investigation.
+
+## Memory Access Policy
+
+Background sessions have strict memory isolation:
+
+- **Vector store writes (Qdrant) are BLOCKED for ALL profiles.** No background
+  session can call `memory_store`, `memory_synthesize`, or `memory_extract`.
+  Episodic memory is exclusively for foreground user interactions.
+- **Knowledge ingestion is BLOCKED for ALL profiles.** `knowledge_ingest`,
+  `knowledge_ingest_batch`, and `knowledge_ingest_source` require explicit user
+  authorization in an interactive session.
+- **SQLite table writes are profile-gated.** `observation_write`,
+  `reference_store`, `procedure_store` are available to research/interact but
+  not observe. These write to structured tables, not vector stores.
+- **Server-side code is unaffected.** Ego corrections, reflection output, and
+  other server-side `MemoryStore.store()` calls bypass tool-level blocking
+  because they don't go through MCP.
+- **The session output IS the deliverable.** Background session findings belong
+  in the final message (session transcript), not in vector stores. The
+  foreground user reviews and decides what to persist.
 
 ## Key Parameters
 

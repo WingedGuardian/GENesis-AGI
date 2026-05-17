@@ -29,6 +29,14 @@ _UNIVERSAL_BLOCKED = {
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",
     "mcp__genesis-health__module_call",
+    # Vector store isolation — no background session writes to Qdrant
+    "mcp__genesis-memory__memory_store",
+    "mcp__genesis-memory__memory_synthesize",
+    "mcp__genesis-memory__memory_extract",
+    # Knowledge ingestion — user authorization required
+    "mcp__genesis-memory__knowledge_ingest",
+    "mcp__genesis-memory__knowledge_ingest_batch",
+    "mcp__genesis-memory__knowledge_ingest_source",
 }
 
 
@@ -70,10 +78,17 @@ def test_observe_blocks_follow_ups():
     assert "mcp__genesis-health__follow_up_create" in PROFILES["observe"]
 
 
-# --- Research: memory writes + follow-ups, no browser interaction ---
+# --- Research: SQLite writes + follow-ups, no vector store / browser ---
 
-def test_research_allows_memory_writes():
-    assert "mcp__genesis-memory__memory_store" not in PROFILES["research"]
+def test_research_blocks_vector_store_writes():
+    """Vector store writes (memory_store/synthesize/extract) are universally blocked."""
+    assert "mcp__genesis-memory__memory_store" in PROFILES["research"]
+    assert "mcp__genesis-memory__memory_synthesize" in PROFILES["research"]
+    assert "mcp__genesis-memory__memory_extract" in PROFILES["research"]
+
+
+def test_research_allows_sqlite_writes():
+    """SQLite table writes (observations, procedures, references) are allowed."""
     assert "mcp__genesis-memory__observation_write" not in PROFILES["research"]
     assert "mcp__genesis-memory__procedure_store" not in PROFILES["research"]
 
@@ -101,8 +116,15 @@ def test_interact_allows_browser_interaction():
     assert "mcp__genesis-health__browser_run_js" not in PROFILES["interact"]
 
 
-def test_interact_allows_memory_writes():
-    assert "mcp__genesis-memory__memory_store" not in PROFILES["interact"]
+def test_interact_blocks_vector_store_writes():
+    """Vector store writes are universally blocked — even for interact."""
+    assert "mcp__genesis-memory__memory_store" in PROFILES["interact"]
+    assert "mcp__genesis-memory__memory_synthesize" in PROFILES["interact"]
+    assert "mcp__genesis-memory__memory_extract" in PROFILES["interact"]
+
+
+def test_interact_allows_sqlite_writes():
+    """SQLite table writes (observations, procedures, references) are allowed."""
     assert "mcp__genesis-memory__observation_write" not in PROFILES["interact"]
     assert "mcp__genesis-memory__procedure_store" not in PROFILES["interact"]
 
