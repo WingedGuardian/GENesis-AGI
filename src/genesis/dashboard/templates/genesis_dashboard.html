@@ -2435,6 +2435,9 @@
           // paints the card red, an in-flight investigation paints it degraded.
           const sentinel = services?.sentinel;
           if (sentinel?.enabled) {
+            if (sentinel.is_stale) {
+              return { state: "degraded", reason: `sentinel stale — last heartbeat ${Math.round((sentinel.staleness_s || 0) / 60)}m ago` };
+            }
             if (sentinel.current_state === "escalated") {
               return { state: "error", reason: "sentinel escalated — CC diagnosis failed" };
             }
@@ -4079,7 +4082,8 @@
                          const s = $store.genesisDashboard.health.services?.sentinel;
                          if (!s || !s.enabled) return 'Sentinel: unavailable';
                          let tip = 'Sentinel: ' + s.current_state;
-                         if (s.is_active) tip += ' (running)';
+                         if (s.is_stale) tip += ` (stale ${Math.round((s.staleness_s || 0) / 60)}m)`;
+                         else if (s.is_active) tip += ' (running)';
                          if (s.last_trigger_reason) tip += ' — last: ' + s.last_trigger_reason;
                          return tip;
                        })()">
@@ -4087,6 +4091,7 @@
                           :style="`background: ${(() => {
                             const s = $store.genesisDashboard.health.services?.sentinel;
                             if (!s || !s.enabled) return '#666';
+                            if (s.is_stale || s.current_state === 'stale') return '#ff9800';
                             if (s.current_state === 'healthy') return '#4caf50';
                             if (s.current_state === 'escalated') return '#d9534f';
                             if (['investigating', 'remediating', 'awaiting_dispatch_approval', 'awaiting_action_approval'].includes(s.current_state)) return '#f0ad4e';
@@ -4097,6 +4102,7 @@
                           x-text="(() => {
                             const s = $store.genesisDashboard.health.services?.sentinel;
                             if (!s || !s.enabled) return '';
+                            if (s.is_stale) return '(stale)';
                             if (s.is_active) return '(running)';
                             if (s.current_state.startsWith('awaiting')) return '(awaiting approval)';
                             if (s.current_state !== 'healthy') return '(' + s.current_state + ')';

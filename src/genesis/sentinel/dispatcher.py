@@ -1427,6 +1427,10 @@ class SentinelDispatcher:
         appeared in ≥_ALARM_CONFIRMATION_COUNT of the last _ALARM_RING_SIZE
         ticks. Single-tick flaps never wake the Sentinel.
         """
+        # Record heartbeat on every tick so staleness can be detected.
+        self._state.record_heartbeat()
+        save_state(self._state)
+
         # Auto-reset ESCALATED on every tick (not just on new dispatches).
         # Without this, the sentinel stays red forever if no new alarms fire.
         self._try_auto_reset_escalated()
