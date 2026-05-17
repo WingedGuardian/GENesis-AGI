@@ -413,6 +413,8 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "from the context above.\n\n"
         "Respond in plain text with numbered recommendations."
     ),
+    # Wing audit findings are observational-only (posted to Telegram for user review).
+    # Future: parse JSON output and auto-propose reclassifications via ego cycle.
     TaskType.WING_AUDIT: (
         "You are auditing memory taxonomy for an autonomous AI system.\n\n"
         "{context}\n\n"
@@ -557,6 +559,7 @@ class SurplusLLMExecutor:
                         parts.append(f"- {name}: {value}")
             except Exception:
                 parts.append("(Signal data unavailable)")
+            return "\n".join(parts) if parts else "(No recent signals)"
 
         # Wing audit: fetch recent general/uncategorized memories
         if task.task_type == TaskType.WING_AUDIT:
@@ -585,7 +588,6 @@ class SurplusLLMExecutor:
                 )
                 parts.append("(Memory query failed)")
             return "\n".join(parts) if parts else "(No data available)"
-            return "\n".join(parts) if parts else "(No recent signals)"
 
         # Pipeline step 1: call site activity + cost aggregation
         if task.task_type == TaskType.PROMPT_REVIEW_CATALOG:

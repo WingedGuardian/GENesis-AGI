@@ -34,12 +34,15 @@ if str(SRC_DIR) not in sys.path:
 
 
 def _embedding_available() -> bool:
-    """Check if at least one embedding backend is reachable."""
+    """Check if at least one embedding backend is reachable (5s timeout)."""
     try:
         from genesis.memory.embeddings import EmbeddingProvider
 
-        provider = EmbeddingProvider()
-        result = asyncio.run(provider.embed("test"))
+        async def _check():
+            provider = EmbeddingProvider()
+            return await asyncio.wait_for(provider.embed("test"), timeout=5.0)
+
+        result = asyncio.run(_check())
         return result is not None and len(result) > 0
     except Exception:
         return False
