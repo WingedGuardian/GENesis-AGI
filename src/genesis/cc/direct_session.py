@@ -63,6 +63,11 @@ _UNIVERSAL_DISALLOW = [
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",  # No recursive spawn
     "mcp__genesis-health__module_call",
+    # Knowledge ingestion requires explicit user authorization — too
+    # impactful for any autonomous process to do unilaterally.
+    "mcp__genesis-memory__knowledge_ingest",
+    "mcp__genesis-memory__knowledge_ingest_batch",
+    "mcp__genesis-memory__knowledge_ingest_source",
 ]
 
 _NO_OUTREACH_SEND = [
@@ -85,9 +90,7 @@ _NO_MEMORY_WRITES = [
     "mcp__genesis-memory__memory_extract",
     "mcp__genesis-memory__observation_write",
     "mcp__genesis-memory__observation_resolve",
-    "mcp__genesis-memory__knowledge_ingest",
-    "mcp__genesis-memory__knowledge_ingest_batch",
-    "mcp__genesis-memory__knowledge_ingest_source",
+    # knowledge_ingest* moved to _UNIVERSAL_DISALLOW
     "mcp__genesis-memory__procedure_store",
     "mcp__genesis-memory__reference_store",
     "mcp__genesis-memory__reference_delete",
