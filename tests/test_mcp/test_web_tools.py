@@ -88,21 +88,23 @@ class TestWebFetch:
             title="",
             status_code=403,
         )
-        with patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher:
+        with (
+            patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher,
+            patch("genesis.mcp.health.web_tools._try_ladder_fetch", return_value=None),
+            patch("genesis.mcp.health.web_tools._try_crawl4ai") as mock_crawl,
+        ):
             mock_fetcher.return_value.fetch = AsyncMock(return_value=challenge_result)
-            with patch("genesis.mcp.health.web_tools._try_ladder_fetch", return_value=None):
-                with patch("genesis.mcp.health.web_tools._try_crawl4ai") as mock_crawl:
-                    mock_crawl.return_value = {
-                        "url": "https://protected.com",
-                        "title": "Real Page",
-                        "content": "JS rendered content",
-                        "backend_used": "crawl4ai",
-                        "status_code": 200,
-                        "truncated": False,
-                        "error": None,
-                        "latency_ms": 2000.0,
-                    }
-                    result = await _impl_web_fetch("https://protected.com", "auto", 50000)
+            mock_crawl.return_value = {
+                "url": "https://protected.com",
+                "title": "Real Page",
+                "content": "JS rendered content",
+                "backend_used": "crawl4ai",
+                "status_code": 200,
+                "truncated": False,
+                "error": None,
+                "latency_ms": 2000.0,
+            }
+            result = await _impl_web_fetch("https://protected.com", "auto", 50000)
 
         assert result["backend_used"] == "crawl4ai"
         assert result["content"] == "JS rendered content"
