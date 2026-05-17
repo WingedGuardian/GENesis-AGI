@@ -542,13 +542,14 @@ class TestCollectAllSignals:
             patch("genesis.guardian.health_signals.check_cc_tmp_usage", return_value=SuspiciousResult("cc_tmp_usage", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_restart_count", return_value=SuspiciousResult("restart_count", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_error_spike", return_value=SuspiciousResult("error_spike", True, "ok", "t")),
+            patch("genesis.guardian.health_signals.check_health_api_depth", return_value=SuspiciousResult("health_api_depth", True, "all metrics healthy", "t")),
         ):
             snapshot = await collect_all_signals(config)
 
         assert snapshot.all_alive is True
         assert len(snapshot.signals) == 5
-        # Suspicious checks run when all alive
-        assert len(snapshot.suspicious) == 6
+        # Suspicious checks run when all alive (7 checks: 6 original + health_api_depth)
+        assert len(snapshot.suspicious) == 7
 
     @pytest.mark.asyncio
     async def test_partial_failure_skips_suspicious(self, config: GuardianConfig) -> None:
