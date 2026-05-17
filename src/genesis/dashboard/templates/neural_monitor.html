@@ -1751,8 +1751,10 @@ async function loadSurplusDetail(container) {
                     const row = el('div', 'surplus-task-row');
                     row.appendChild(el('span', 'task-type', `${run.model_id} / ${run.dataset}`));
                     const score = run.aggregate_score != null ? Math.round(run.aggregate_score * 100) + '%' : '?';
-                    const scoreColor = run.aggregate_score >= 0.8 ? '#4ade80' : run.aggregate_score >= 0.6 ? '#fbbf24' : '#ef4444';
-                    const scoreEl = el('span', 'task-time', `${score} (${run.passed_cases}/${run.passed_cases + run.failed_cases})`);
+                    const scoreColor = run.aggregate_score == null ? '#94a3b8' : run.aggregate_score >= 0.8 ? '#4ade80' : run.aggregate_score >= 0.6 ? '#fbbf24' : '#ef4444';
+                    const passed = run.passed_cases || 0;
+                    const failed = run.failed_cases || 0;
+                    const scoreEl = el('span', 'task-time', `${score} (${passed}/${passed + failed})`);
                     scoreEl.style.color = scoreColor;
                     row.appendChild(scoreEl);
                     evalSection.appendChild(row);
