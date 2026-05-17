@@ -379,6 +379,9 @@ class MorningReportGenerator:
         Returns None (not empty string) when all clear — caller skips the
         section entirely. This is not a standing checklist.
         """
+        lines: list[str] = []
+
+        # Health alerts (call sites down, queue depth, resilience warnings)
         try:
             from genesis.mcp.health_mcp import _impl_health_alerts
 
@@ -387,7 +390,6 @@ class MorningReportGenerator:
             # - CRITICAL/ERROR always included (something is actually down)
             # - WARNING only if NOT a degraded call site (fallback routing
             #   is normal operation, not worth morning-report space)
-            critical = []
             for a in alerts:
                 severity = a.get("severity", "").upper()
                 alert_id = a.get("id", "")
@@ -395,19 +397,30 @@ class MorningReportGenerator:
                     severity in ("ERROR", "CRITICAL")
                     or (severity == "WARNING" and not alert_id.startswith("call_site:"))
                 ):
-                    critical.append(a)
-            if not critical:
-                return None
-            lines = []
-            for a in critical:
-                lines.append(
-                    f"- **{a.get('severity', '?')}**: {a.get('message', 'Unknown')} "
-                    f"(id: {a.get('id', '?')})"
-                )
-            return "\n".join(lines)
+                    lines.append(
+                        f"- **{severity}**: {a.get('message', 'Unknown')} "
+                        f"(id: {alert_id})"
+                    )
         except Exception:
             logger.warning("Failed to query health alerts for morning report", exc_info=True)
-            return None
+
+        # Subsystem heartbeat staleness (detects silent deaths)
+        try:
+            from genesis.mcp.health.manifest import _impl_subsystem_heartbeats
+
+            heartbeats = await _impl_subsystem_heartbeats()
+            for name, info in heartbeats.items():
+                if info.get("status") == "overdue":
+                    age = info.get("age_seconds", 0)
+                    age_h = age / 3600 if age else 0
+                    lines.append(
+                        f"- **WARNING**: Subsystem '{name}' heartbeat overdue "
+                        f"({age_h:.1f}h since last seen)"
+                    )
+        except Exception:
+            logger.warning("Failed to query heartbeats for morning report", exc_info=True)
+
+        return "\n".join(lines) if lines else None
 
     async def _get_engagement_summary(self) -> str:
         try:
