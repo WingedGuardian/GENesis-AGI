@@ -249,6 +249,14 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am UTC)
+        self._scheduler.add_job(
+            self.schedule_wing_audit,
+            CronTrigger(day_of_week="sun,wed", hour=2),
+            id="wing_audit",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         self._scheduler.add_job(
             self.schedule_maintenance,
             IntervalTrigger(hours=self._maintenance_hours),
@@ -564,6 +572,29 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_analytical", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_wing_audit(self) -> None:
+        """Enqueue a wing audit task if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            active = await self._queue.active_by_type(TaskType.WING_AUDIT)
+            if active == 0:
+                await self._queue.enqueue(
+                    TaskType.WING_AUDIT, ComputeTier.FREE_API, 0.4, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_wing_audit")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Wing audit scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_wing_audit", str(exc))
             except Exception:
                 pass
 

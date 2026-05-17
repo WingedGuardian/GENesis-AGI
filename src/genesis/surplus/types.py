@@ -35,6 +35,8 @@ class TaskType(StrEnum):
     BACKUP_VERIFICATION = "backup_verification"
     # J-9 paper eval infrastructure
     J9_EVAL_BATCH = "j9_eval_batch"
+    # Memory taxonomy hygiene
+    WING_AUDIT = "wing_audit"
 
 
 class ComputeTier(StrEnum):
