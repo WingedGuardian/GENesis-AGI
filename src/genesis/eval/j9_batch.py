@@ -4,7 +4,8 @@ Runs as a surplus task. For each recall_fired event from the past 24h,
 asks a cheap model to judge whether each recalled memory was relevant
 to the query. Stores recall_relevance events.
 
-Cost: ~50K tokens/day at Haiku ≈ $0.04/day.
+Routes through the Genesis LLM router (call site "judge") to use whatever
+provider is available — no hardcoded model dependency.
 """
 
 from __future__ import annotations
@@ -14,18 +15,15 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
-import litellm
-
 from genesis.db.crud import j9_eval
 from genesis.surplus.types import ExecutorResult, SurplusTask
 
 if TYPE_CHECKING:
     import aiosqlite
 
-logger = logging.getLogger(__name__)
+    from genesis.routing.router import LLMRouter
 
-# Model for relevance judgments — cheap and fast
-_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+logger = logging.getLogger(__name__)
 
 def _text_overlap(memory_text: str, reference_text: str, min_phrases: int = 2) -> bool:
     """Check if memory content appears in reference text via trigram overlap.
@@ -64,8 +62,14 @@ class J9EvalBatchExecutor:
     Scores memory recall relevance for the past 24 hours.
     """
 
-    def __init__(self, *, db: aiosqlite.Connection | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        db: aiosqlite.Connection | None = None,
+        router: LLMRouter | None = None,
+    ) -> None:
         self._db = db
+        self._router = router
 
     async def execute(self, task: SurplusTask) -> ExecutorResult:
         if self._db is None:
@@ -116,7 +120,7 @@ class J9EvalBatchExecutor:
                             "memory_id": mid,
                             "relevance": relevance,
                             "judge_rationale": rationale,
-                            "judge_model": _JUDGE_MODEL,
+                            "judge_model": "router:judge",
                         },
                     )
                     scored += 1
@@ -137,7 +141,7 @@ class J9EvalBatchExecutor:
             insights=[{
                 "content": content,
                 "source_task_type": task.task_type,
-                "generating_model": _JUDGE_MODEL,
+                "generating_model": "router:judge",
                 "drive_alignment": "competence",
                 "confidence": 0.8 if errors == 0 else 0.6,
             }],
@@ -237,19 +241,24 @@ class J9EvalBatchExecutor:
     async def _judge_relevance(
         self, query: str, memory_content: str,
     ) -> tuple[float | None, str]:
-        """Ask the judge model to score relevance."""
+        """Ask the judge model to score relevance via the router."""
+        if self._router is None:
+            return (None, "no router configured")
+
         prompt = _RELEVANCE_PROMPT.format(
             query=query[:500],
             memory_content=memory_content[:1000],
         )
         try:
-            response = await litellm.acompletion(
-                model=_JUDGE_MODEL,
+            result = await self._router.route_call(
+                call_site_id="judge",
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=150,
                 temperature=0.0,
             )
-            text = response.choices[0].message.content or ""
+            if not result.success:
+                logger.debug("J9 relevance routing failed: %s", result.error)
+                return (None, result.error or "routing failed")
+            text = result.content or ""
             # Parse JSON response
             parsed = json.loads(text.strip())
             relevance = float(parsed.get("relevance", 0.0))
