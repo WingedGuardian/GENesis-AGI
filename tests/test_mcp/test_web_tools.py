@@ -81,7 +81,7 @@ class TestWebFetch:
 
     @pytest.mark.asyncio
     async def test_auto_escalates_to_crawl4ai_on_challenge(self):
-        """When Scrapling gets a 403, should try Crawl4AI."""
+        """When Scrapling gets a 403 and Ladder is unavailable, should try Crawl4AI."""
         challenge_result = FetchResult(
             url="https://protected.com",
             text="cloudflare challenge",
@@ -90,21 +90,51 @@ class TestWebFetch:
         )
         with patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher:
             mock_fetcher.return_value.fetch = AsyncMock(return_value=challenge_result)
-            with patch("genesis.mcp.health.web_tools._try_crawl4ai") as mock_crawl:
-                mock_crawl.return_value = {
-                    "url": "https://protected.com",
-                    "title": "Real Page",
-                    "content": "JS rendered content",
-                    "backend_used": "crawl4ai",
-                    "status_code": 200,
-                    "truncated": False,
-                    "error": None,
-                    "latency_ms": 2000.0,
-                }
-                result = await _impl_web_fetch("https://protected.com", "auto", 50000)
+            with patch("genesis.mcp.health.web_tools._try_ladder_fetch", return_value=None):
+                with patch("genesis.mcp.health.web_tools._try_crawl4ai") as mock_crawl:
+                    mock_crawl.return_value = {
+                        "url": "https://protected.com",
+                        "title": "Real Page",
+                        "content": "JS rendered content",
+                        "backend_used": "crawl4ai",
+                        "status_code": 200,
+                        "truncated": False,
+                        "error": None,
+                        "latency_ms": 2000.0,
+                    }
+                    result = await _impl_web_fetch("https://protected.com", "auto", 50000)
 
         assert result["backend_used"] == "crawl4ai"
         assert result["content"] == "JS rendered content"
+
+    @pytest.mark.asyncio
+    async def test_auto_uses_ladder_before_crawl4ai_on_challenge(self):
+        """When Scrapling gets a challenge, Ladder should be tried before Crawl4AI."""
+        challenge_result = FetchResult(
+            url="https://protected.com",
+            text="cloudflare challenge",
+            title="",
+            status_code=403,
+        )
+        with patch("genesis.mcp.health.web_tools._get_fetcher") as mock_fetcher:
+            mock_fetcher.return_value.fetch = AsyncMock(return_value=challenge_result)
+            with patch("genesis.mcp.health.web_tools._try_ladder_fetch") as mock_ladder:
+                mock_ladder.return_value = {
+                    "url": "https://protected.com",
+                    "title": "",
+                    "content": "Ladder bypassed content",
+                    "backend_used": "ladder",
+                    "status_code": 200,
+                    "truncated": False,
+                    "error": None,
+                    "latency_ms": 500.0,
+                }
+                with patch("genesis.mcp.health.web_tools._try_crawl4ai") as mock_crawl:
+                    result = await _impl_web_fetch("https://protected.com", "auto", 50000)
+
+        assert result["backend_used"] == "ladder"
+        assert result["content"] == "Ladder bypassed content"
+        mock_crawl.assert_not_called()  # Ladder succeeded, Crawl4AI should not be tried
 
     @pytest.mark.asyncio
     async def test_explicit_crawl4ai_backend(self):
