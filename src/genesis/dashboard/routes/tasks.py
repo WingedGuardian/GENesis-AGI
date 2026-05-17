@@ -10,12 +10,71 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+from datetime import UTC, datetime
 
 from flask import jsonify, request
 
 from genesis.dashboard._blueprint import _async_route, blueprint
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_iso(ts: str) -> datetime:
+    """Parse ISO timestamp string to datetime (UTC)."""
+    ts = ts.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return datetime.now(UTC)
+
+
+async def _build_phase_timeline(db, task_id: str) -> list[dict]:
+    """Build phase transition timeline from events table."""
+    cursor = await db.execute(
+        "SELECT timestamp, details FROM events "
+        "WHERE event_type = 'task.phase_changed' AND details LIKE ? "
+        "ORDER BY timestamp ASC",
+        (f"%{task_id}%",),
+    )
+    rows = await cursor.fetchall()
+    phases = []
+    for i, row in enumerate(rows):
+        details = {}
+        if row["details"]:
+            with contextlib.suppress(json.JSONDecodeError, ValueError, TypeError):
+                details = json.loads(row["details"])
+        if details.get("task_id") != task_id:
+            continue
+        entered = row["timestamp"]
+        exited = None
+        if i + 1 < len(rows):
+            # Check next row is same task before using as exit time
+            next_details = {}
+            if rows[i + 1]["details"]:
+                with contextlib.suppress(json.JSONDecodeError, ValueError, TypeError):
+                    next_details = json.loads(rows[i + 1]["details"])
+            if next_details.get("task_id") == task_id:
+                exited = rows[i + 1]["timestamp"]
+        duration_s = None
+        if exited:
+            duration_s = (_parse_iso(exited) - _parse_iso(entered)).total_seconds()
+        phases.append({
+            "phase": details.get("to_phase", "unknown"),
+            "entered_at": entered,
+            "exited_at": exited,
+            "duration_s": duration_s,
+        })
+    return phases
+
+
+async def _get_linked_follow_ups(db, task_id: str) -> list[dict]:
+    """Get follow-ups linked to this task."""
+    cursor = await db.execute(
+        "SELECT id, content, status, priority, created_at "
+        "FROM follow_ups WHERE linked_task_id = ? ORDER BY created_at DESC",
+        (task_id,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
 
 
 @blueprint.route("/api/genesis/tasks")
@@ -94,10 +153,18 @@ async def task_detail(task_id: str):
     if rt.task_executor is not None:
         is_paused = rt.task_executor.is_task_paused(task_id)
 
+    # Phase timeline from events
+    timeline = await _build_phase_timeline(rt.db, task_id)
+
+    # Linked follow-ups
+    linked_follow_ups = await _get_linked_follow_ups(rt.db, task_id)
+
     return jsonify({
         "task": task,
         "steps": enriched_steps,
         "is_paused": is_paused,
+        "timeline": timeline,
+        "linked_follow_ups": linked_follow_ups,
     })
 
 
