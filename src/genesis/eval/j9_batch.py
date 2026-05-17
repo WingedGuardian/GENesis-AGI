@@ -21,7 +21,7 @@ from genesis.surplus.types import ExecutorResult, SurplusTask
 if TYPE_CHECKING:
     import aiosqlite
 
-    from genesis.routing.router import LLMRouter
+    from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +66,7 @@ class J9EvalBatchExecutor:
         self,
         *,
         db: aiosqlite.Connection | None = None,
-        router: LLMRouter | None = None,
+        router: Router | None = None,
     ) -> None:
         self._db = db
         self._router = router
@@ -107,7 +107,7 @@ class J9EvalBatchExecutor:
                 if not content:
                     continue
 
-                relevance, rationale = await self._judge_relevance(query, content)
+                relevance, rationale, model_used = await self._judge_relevance(query, content)
                 if relevance is not None:
                     await j9_eval.insert_event(
                         self._db,
@@ -120,7 +120,7 @@ class J9EvalBatchExecutor:
                             "memory_id": mid,
                             "relevance": relevance,
                             "judge_rationale": rationale,
-                            "judge_model": "router:judge",
+                            "judge_model": model_used,
                         },
                     )
                     scored += 1
@@ -240,10 +240,13 @@ class J9EvalBatchExecutor:
 
     async def _judge_relevance(
         self, query: str, memory_content: str,
-    ) -> tuple[float | None, str]:
-        """Ask the judge model to score relevance via the router."""
+    ) -> tuple[float | None, str, str]:
+        """Ask the judge model to score relevance via the router.
+
+        Returns (relevance_score, rationale_or_error, model_used).
+        """
         if self._router is None:
-            return (None, "no router configured")
+            return (None, "no router configured", "none")
 
         prompt = _RELEVANCE_PROMPT.format(
             query=query[:500],
@@ -254,19 +257,21 @@ class J9EvalBatchExecutor:
                 call_site_id="judge",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
+                max_tokens=150,
             )
+            model_used = result.model_id or result.provider_used or "router:judge"
             if not result.success:
                 logger.debug("J9 relevance routing failed: %s", result.error)
-                return (None, result.error or "routing failed")
+                return (None, result.error or "routing failed", model_used)
             text = result.content or ""
             # Parse JSON response
             parsed = json.loads(text.strip())
             relevance = float(parsed.get("relevance", 0.0))
             rationale = parsed.get("rationale", "")
-            return (max(0.0, min(1.0, relevance)), rationale)
+            return (max(0.0, min(1.0, relevance)), rationale, model_used)
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             logger.debug("J9 relevance parse error: %s", exc)
-            return (None, str(exc))
+            return (None, str(exc), "router:judge")
         except Exception as exc:
             logger.debug("J9 relevance LLM error: %s", exc)
-            return (None, str(exc))
+            return (None, str(exc), "router:judge")
