@@ -444,12 +444,30 @@ class DirectSessionRunner:
 
         tool_counts = self._summarize_tools(result.tools_called)
 
+        # Derive transcript path from CC's project-key convention:
+        # working_dir ~/.genesis/background-sessions → project key
+        # -home-ubuntu--genesis-background-sessions → transcript .jsonl
+        transcript_path = ""
+        if result.cc_session_id:
+            from pathlib import Path
+
+            project_key = (
+                background_session_dir()
+                .replace("/", "-")
+                .lstrip("-")
+            )
+            transcript_path = str(
+                Path.home() / ".claude" / "projects"
+                / f"-{project_key}" / f"{result.cc_session_id}.jsonl"
+            )
+
         existing.update({
             "profile": request.profile,
             "caller_context": request.caller_context,
-            "output_text": result.output_text[:5000],
+            "output_text": result.output_text[:20000],
             "tools_summary": tool_counts,
             "cc_session_id": result.cc_session_id,
+            "transcript_path": transcript_path,
             "error": result.error,
             "model_used": result.model_used,
             "duration_s": result.duration_s,
