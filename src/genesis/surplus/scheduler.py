@@ -737,8 +737,15 @@ class SurplusScheduler:
             from genesis.runtime import GenesisRuntime
 
             rt = GenesisRuntime.instance()
-            if rt.db is None or rt.qdrant is None or rt.router is None:
+            store = rt.memory_store
+            if rt.db is None or store is None or rt.router is None:
                 logger.warning("Dream cycle skipped — missing runtime dependencies")
+                return
+
+            # MemoryStore always holds the QdrantClient it was constructed with.
+            qdrant = store._qdrant
+            if qdrant is None:
+                logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
                 return
 
             # Default dry-run until user enables live mode.
@@ -746,13 +753,8 @@ class SurplusScheduler:
             import os
             dry_run = os.environ.get("GENESIS_DREAM_CYCLE_LIVE", "") not in ("1", "true")
 
-            store = getattr(rt, "_memory_store", None)
-            if store is None:
-                logger.warning("Dream cycle skipped — MemoryStore not initialized")
-                return
-
             report = await dream_cycle.run(
-                qdrant=rt.qdrant,
+                qdrant=qdrant,
                 db=rt.db,
                 router=rt.router,
                 store=store,
