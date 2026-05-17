@@ -129,13 +129,19 @@ def _passes_coherence_check(evaluation: str, source_content: str) -> bool:
     if "# Inbox Evaluation" not in evaluation:
         return False
 
-    # Source URLs should appear in evaluation (domain-level check)
+    # Source URLs should appear in evaluation (domain or platform name)
     urls = re.findall(r"https?://([^\s/]+)", source_content)
     if urls:
         eval_lower = evaluation.lower()
-        url_hits = sum(1 for u in urls if u.lower() in eval_lower)
+        url_hits = 0
+        for u in urls:
+            domain = u.lower().removeprefix("www.")
+            # Check raw domain OR platform name (e.g., "github.com" → "github")
+            platform_name = domain.split(".")[0]
+            if domain in eval_lower or platform_name in eval_lower:
+                url_hits += 1
         if url_hits == 0:
-            return False  # Evaluation doesn't reference ANY source URLs
+            return False  # Evaluation doesn't reference ANY source URLs/platforms
 
     return True
 

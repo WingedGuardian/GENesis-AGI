@@ -284,15 +284,19 @@ async def memory_expand(
     memory_mod._require_init()
     assert memory_mod._qdrant is not None and memory_mod._db is not None
 
-    # Batch retrieve all IDs in a single Qdrant call
-    try:
-        points = memory_mod._qdrant.retrieve(
-            collection_name="episodic_memory",
-            ids=memory_ids,
-            with_payload=True,
-        )
-    except Exception:
-        logger.warning("Qdrant batch retrieve failed", exc_info=True)
+    # Batch retrieve from all collections (episodic_memory + knowledge_base)
+    points: list = []
+    for coll in ("episodic_memory", "knowledge_base"):
+        try:
+            points.extend(memory_mod._qdrant.retrieve(
+                collection_name=coll,
+                ids=memory_ids,
+                with_payload=True,
+            ))
+        except Exception:
+            logger.warning("Qdrant retrieve from %s failed", coll, exc_info=True)
+
+    if not points:
         return []
 
     found_ids = {str(p.id) for p in points}
