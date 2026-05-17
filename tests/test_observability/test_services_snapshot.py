@@ -21,12 +21,14 @@ from genesis.runtime._core import GenesisRuntime
 
 
 def _fake_sentinel(current_state="healthy", is_active=False, **kw):
+    from datetime import UTC, datetime
     state = SimpleNamespace(
         current_state=current_state,
         last_trigger_source=kw.get("last_trigger_source", ""),
         last_trigger_reason=kw.get("last_trigger_reason", ""),
         last_cc_dispatch_at=kw.get("last_cc_dispatch_at", ""),
         escalated_count=kw.get("escalated_count", 0),
+        last_heartbeat_at=kw.get("last_heartbeat_at", datetime.now(UTC).isoformat()),
     )
     return SimpleNamespace(state=state, is_active=is_active)
 

@@ -57,7 +57,7 @@ def services() -> dict:
         else:
             state = sentinel.state
             # Compute heartbeat staleness (stale = >10 min since last tick)
-            heartbeat = state.last_heartbeat_at
+            heartbeat = getattr(state, "last_heartbeat_at", "")
             if heartbeat:
                 try:
                     age_s = (datetime.now(UTC) - datetime.fromisoformat(heartbeat)).total_seconds()
@@ -67,9 +67,15 @@ def services() -> dict:
                 age_s = 9999  # No heartbeat recorded yet — treat as stale
             is_stale = age_s > 600  # 10 min = 2x awareness loop interval
 
+            # Only override to "stale" when sentinel reports healthy — active
+            # states (investigating, escalated) are more informative than stale.
+            reported_state = state.current_state
+            if is_stale and reported_state == "healthy":
+                reported_state = "stale"
+
             result["sentinel"] = {
                 "enabled": True,
-                "current_state": "stale" if is_stale else state.current_state,
+                "current_state": reported_state,
                 "is_active": bool(sentinel.is_active),
                 "last_trigger_source": state.last_trigger_source or "",
                 "last_trigger_reason": state.last_trigger_reason or "",
