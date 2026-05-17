@@ -162,6 +162,8 @@
         taskExpanded: null,
         taskDetail: null,
         taskDetailSteps: [],
+        taskTimeline: [],
+        taskLinkedFollowUps: [],
         tasksView: 'active',       // 'active' or 'completed'
         sessionsList: [],
         sessionsView: 'active',    // 'active' or 'history'
@@ -709,7 +711,7 @@
           } catch (e) { console.warn("Tasks fetch failed:", e); }
         },
         async fetchTaskDetail(taskId) {
-          if (this.taskExpanded === taskId) { this.taskExpanded = null; this.taskDetail = null; this.taskDetailSteps = []; return; }
+          if (this.taskExpanded === taskId) { this.taskExpanded = null; this.taskDetail = null; this.taskDetailSteps = []; this.taskTimeline = []; this.taskLinkedFollowUps = []; return; }
           this.taskExpanded = taskId;
           try {
             const resp = await fetchApi(`/api/genesis/tasks/${taskId}`);
@@ -717,8 +719,19 @@
               const data = await resp.json();
               this.taskDetail = data.task;
               this.taskDetailSteps = data.steps || [];
+              this.taskTimeline = data.timeline || [];
+              this.taskLinkedFollowUps = data.linked_follow_ups || [];
             }
           } catch (e) { console.warn("Task detail fetch failed:", e); }
+        },
+        phaseColor(phase) {
+          const colors = {
+            pending: '#616161', observing: '#78909c', reviewing: '#7e57c2',
+            planning: '#9e9e9e', executing: '#2196F3', verifying: '#ab47bc',
+            synthesizing: '#26a69a', delivering: '#66bb6a', completed: '#66bb6a',
+            failed: '#ef9a9a', cancelled: '#9e9e9e', blocked: '#ffa726', paused: '#ffa726',
+          };
+          return colors[phase?.toLowerCase()] || '#9e9e9e';
         },
         async taskAction(taskId, action) {
           try {
@@ -7635,11 +7648,33 @@
                                      background:rgba(239,154,154,0.1); color:#ef9a9a; border:1px solid rgba(239,154,154,0.2);">Cancel</button>
                     </template>
                   </div>
+                  <!-- Phase Timeline -->
+                  <template x-if="$store.genesisDashboard.taskTimeline.length > 0">
+                    <div style="margin-bottom:0.5rem;">
+                      <div style="font-weight:600; margin-bottom:0.2rem; color:var(--color-text-secondary); font-size:0.65rem;">Phase Timeline</div>
+                      <div style="display:flex; height:6px; border-radius:3px; overflow:hidden; background:rgba(255,255,255,0.05);">
+                        <template x-for="(phase, idx) in $store.genesisDashboard.taskTimeline" :key="idx">
+                          <div :style="`flex:${phase.duration_s || 1}; background:${$store.genesisDashboard.phaseColor(phase.phase)};`"
+                               :title="`${phase.phase}: ${phase.duration_s ? Math.round(phase.duration_s) + 's' : 'active'}`"></div>
+                        </template>
+                      </div>
+                      <div style="display:flex; gap:0.4rem; margin-top:0.15rem; flex-wrap:wrap;">
+                        <template x-for="(phase, idx) in $store.genesisDashboard.taskTimeline" :key="'lbl'+idx">
+                          <span style="font-size:0.6rem; display:inline-flex; align-items:center; gap:0.15rem;">
+                            <span :style="`width:6px; height:6px; border-radius:50%; background:${$store.genesisDashboard.phaseColor(phase.phase)};`"></span>
+                            <span style="color:var(--color-text-secondary);"
+                                  x-text="`${phase.phase} ${phase.duration_s ? '(' + (phase.duration_s > 60 ? Math.round(phase.duration_s/60) + 'm' : Math.round(phase.duration_s) + 's') + ')' : '(active)'}`"></span>
+                          </span>
+                        </template>
+                      </div>
+                    </div>
+                  </template>
                   <!-- Steps -->
                   <div style="margin-top:0.3rem;">
                     <div style="font-weight:600; margin-bottom:0.3rem; color:var(--color-text-secondary);">Steps</div>
                     <template x-for="step in $store.genesisDashboard.taskDetailSteps" :key="step.step_idx">
-                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                      <div style="display:flex; align-items:flex-start; gap:0.4rem; padding:0.2rem 0; border-bottom:1px solid rgba(255,255,255,0.05); transition:all 0.15s;"
+                           :style="step.status === 'executing' ? 'background:rgba(33,150,243,0.06); border-left:2px solid #2196F3; padding-left:0.3rem; margin-left:-0.3rem;' : ''">
                         <span class="material-symbols-outlined" style="font-size:0.85rem; flex-shrink:0; margin-top:0.05rem;"
                               :style="{
                                 'completed': 'color:#66bb6a',
@@ -7664,8 +7699,11 @@
                           <div style="display:flex; gap:0.5rem; color:var(--color-text-secondary); font-size:0.65rem; margin-top:0.1rem;">
                             <span x-show="step.model_used" x-text="step.model_used"></span>
                             <span x-show="step.cost_usd" x-text="'$' + step.cost_usd?.toFixed(4)"></span>
-                            <span x-show="step.started_at && step.completed_at"
-                                  x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
+                            <span x-show="step.started_at && step.completed_at" style="display:inline-flex; align-items:center; gap:0.2rem;">
+                              <span x-text="((new Date(step.completed_at) - new Date(step.started_at)) / 1000).toFixed(0) + 's'"></span>
+                              <span style="display:inline-block; height:3px; border-radius:2px; background:#2196F3;"
+                                    :style="`width:${Math.min(50, Math.max(4, ((new Date(step.completed_at) - new Date(step.started_at)) / 1000) * 0.5))}px;`"></span>
+                            </span>
                           </div>
                           <template x-if="step.result_json && step.result_json.result">
                             <div style="margin-top:0.2rem; padding:0.2rem 0.4rem; background:rgba(0,0,0,0.2); border-radius:3px;
@@ -7685,6 +7723,29 @@
                       <div style="font-weight:600; color:#ffa726; font-size:0.68rem; margin-bottom:0.15rem;">Blockers</div>
                       <div style="font-size:0.7rem; color:var(--color-text-secondary);"
                            x-text="JSON.stringify($store.genesisDashboard.taskDetail.blockers)"></div>
+                    </div>
+                  </template>
+                  <!-- Linked Follow-ups -->
+                  <template x-if="$store.genesisDashboard.taskLinkedFollowUps.length > 0">
+                    <div style="margin-top:0.5rem; padding:0.3rem 0.5rem; background:rgba(33,150,243,0.05); border-radius:3px; border:1px solid rgba(33,150,243,0.1);">
+                      <div style="font-weight:600; color:#64b5f6; font-size:0.68rem; margin-bottom:0.15rem;">
+                        Linked Follow-ups <span style="font-weight:400; opacity:0.7;" x-text="'(' + $store.genesisDashboard.taskLinkedFollowUps.length + ')'"></span>
+                      </div>
+                      <template x-for="fu in $store.genesisDashboard.taskLinkedFollowUps" :key="fu.id">
+                        <div style="display:flex; gap:0.3rem; align-items:flex-start; font-size:0.68rem; padding:0.15rem 0; border-bottom:1px solid rgba(255,255,255,0.03);">
+                          <span style="font-size:0.6rem; padding:0.05rem 0.25rem; border-radius:2px; flex-shrink:0; text-transform:uppercase; font-weight:600;"
+                                :style="{
+                                  'completed': 'background:rgba(102,187,106,0.15); color:#66bb6a;',
+                                  'pending':   'background:rgba(158,158,158,0.15); color:#9e9e9e;',
+                                  'in_progress': 'background:rgba(33,150,243,0.15); color:#2196F3;',
+                                  'blocked':   'background:rgba(255,167,38,0.15); color:#ffa726;',
+                                  'failed':    'background:rgba(239,154,154,0.15); color:#ef9a9a;',
+                                }[fu.status] || 'background:rgba(158,158,158,0.15); color:#9e9e9e;'"
+                                x-text="fu.status"></span>
+                          <span style="color:var(--color-text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"
+                                x-text="fu.content"></span>
+                        </div>
+                      </template>
                     </div>
                   </template>
                 </div>
