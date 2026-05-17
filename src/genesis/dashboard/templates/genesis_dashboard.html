@@ -4857,7 +4857,7 @@
         <span class="panel-status">
           <template x-if="$store.genesisDashboard.evalMetrics?.dimensions">
             <span style="font-size: 0.68rem; opacity: 0.7;"
-                  x-text="(() => { const d = $store.genesisDashboard.evalMetrics.dimensions; const weeks = Math.max(...Object.values(d).map(x => x.weeks_of_data || 0)); return weeks + ' weeks of data'; })()"></span>
+                  x-text="(() => { const d = $store.genesisDashboard.evalMetrics.dimensions; const vals = Object.values(d).map(x => x.weeks_of_data || 0); const weeks = vals.length ? Math.max(...vals) : 0; return weeks + ' weeks of data'; })()"></span>
           </template>
         </span>
       </div>
@@ -4875,15 +4875,22 @@
                 </div>
                 <div style="display: flex; align-items: baseline; gap: 0.4rem;">
                   <span style="font-size: 1.1rem; font-weight: 700;"
-                        x-text="data.current_value !== null ? (data.current_value * 100).toFixed(1) + '%' : '—'"></span>
+                        x-text="data.current_value !== null ? (data.headline_metric === 'delta' ? (data.current_value >= 0 ? '+' : '') : '') + (data.current_value * 100).toFixed(1) + '%' : '—'"></span>
                   <span style="font-size: 0.7rem;"
                         :style="data.trend === 'up' ? 'color: #4caf50' : data.trend === 'down' ? 'color: #d9534f' : 'color: #888'"
                         x-text="data.trend === 'up' ? '\u2191' : data.trend === 'down' ? '\u2193' : data.trend === 'flat' ? '\u2192' : '\u2026'"></span>
                 </div>
-                <!-- Sparkline: CSS bar chart -->
+                <!-- Sparkline: CSS bar chart (min-max normalized per series) -->
                 <div style="display: flex; align-items: flex-end; gap: 1px; height: 24px; margin-top: 0.3rem;">
                   <template x-for="(pt, i) in data.series" :key="i">
-                    <div :style="`flex: 1; background: ${data.trend === 'up' ? 'rgba(76,175,80,0.5)' : data.trend === 'down' ? 'rgba(217,83,79,0.5)' : 'rgba(136,136,136,0.4)'}; border-radius: 1px; height: ${pt.value !== null ? Math.max(2, pt.value * 100) + '%' : '2px'};`"></div>
+                    <div :style="(() => {
+                      const color = data.trend === 'up' ? 'rgba(76,175,80,0.5)' : data.trend === 'down' ? 'rgba(217,83,79,0.5)' : 'rgba(136,136,136,0.4)';
+                      if (pt.value === null) return `flex:1; background:${color}; border-radius:1px; height:2px;`;
+                      const vals = data.series.filter(p => p.value !== null).map(p => p.value);
+                      const mn = Math.min(...vals), mx = Math.max(...vals);
+                      const pct = mx > mn ? ((pt.value - mn) / (mx - mn)) * 90 + 10 : 50;
+                      return `flex:1; background:${color}; border-radius:1px; height:${pct}%;`;
+                    })()"></div>
                   </template>
                 </div>
                 <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;" x-text="data.weeks_of_data + ' weeks'"></div>
