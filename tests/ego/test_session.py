@@ -181,13 +181,13 @@ class TestEgoSession:
         mock_proposal_workflow.create_batch.assert_not_called()
 
     async def test_run_cycle_with_follow_ups(self, ego_session, dispatcher):
-        """Follow_ups from output are recorded in ego_state."""
+        """Follow-up recording is disabled — output is parsed but not stored."""
         cycle = await ego_session.run_cycle()
         assert cycle is not None
 
+        # record_follow_ups is a no-op (PR #375), so nothing lands in DB
         pending = await dispatcher.get_pending_follow_ups()
-        assert len(pending) == 1
-        assert pending[0]["content"] == "check backlog tomorrow"
+        assert len(pending) == 0
 
     async def test_run_cycle_morning_report(self, ego_session, mock_invoker):
         """Morning report flag appears in the user prompt."""

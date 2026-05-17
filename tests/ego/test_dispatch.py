@@ -1,4 +1,9 @@
-"""Tests for the ego follow-up dispatcher (follow_ups table backend)."""
+"""Tests for the ego follow-up dispatcher (follow_ups table backend).
+
+Note: record_follow_ups() is intentionally a no-op (PR #375) — ego-generated
+follow-ups had an 84% stale rate. Ego can still READ and RESOLVE follow-ups
+created by foreground sessions.
+"""
 
 from __future__ import annotations
 
@@ -26,98 +31,34 @@ def dispatcher(db):
 
 
 class TestEgoDispatcher:
-    async def test_record_and_get_roundtrip(self, dispatcher):
+    async def test_record_is_noop(self, dispatcher):
+        """record_follow_ups always returns 0 — creation is disabled."""
         count = await dispatcher.record_follow_ups(
             ["investigate backlog", "check CC bridge"], cycle_id="c1",
         )
-        assert count == 2
+        assert count == 0
+        assert await dispatcher.get_pending_follow_ups() == []
 
-        pending = await dispatcher.get_pending_follow_ups()
-        assert len(pending) == 2
-        contents = {p["content"] for p in pending}
-        assert contents == {"investigate backlog", "check CC bridge"}
+    async def test_record_noop_with_empty_strings(self, dispatcher):
+        """No-op regardless of input content (empty strings, whitespace)."""
+        count = await dispatcher.record_follow_ups(
+            ["real task", "", "  ", "another task"], cycle_id="c1",
+        )
+        assert count == 0
+
+    async def test_record_noop_multiple_cycles(self, dispatcher):
+        """Multiple record calls all return 0."""
+        assert await dispatcher.record_follow_ups(["A"], cycle_id="c1") == 0
+        assert await dispatcher.record_follow_ups(["B", "C"], cycle_id="c2") == 0
+        assert await dispatcher.get_pending_follow_ups() == []
 
     async def test_empty_follow_ups(self, dispatcher):
         assert await dispatcher.get_pending_follow_ups() == []
 
-    async def test_skips_empty_strings(self, dispatcher):
-        count = await dispatcher.record_follow_ups(
-            ["real task", "", "  ", "another task"], cycle_id="c1",
-        )
-        assert count == 2
-        assert len(await dispatcher.get_pending_follow_ups()) == 2
-
-    async def test_clear_follow_up(self, dispatcher):
-        await dispatcher.record_follow_ups(["task1", "task2"], cycle_id="c1")
-        pending = await dispatcher.get_pending_follow_ups()
-        assert len(pending) == 2
-
-        await dispatcher.clear_follow_up(pending[0]["id"])
-        remaining = await dispatcher.get_pending_follow_ups()
-        assert len(remaining) == 1
-
-    async def test_follow_ups_accumulate(self, dispatcher):
-        """Follow-ups persist across cycles (no clearing on new record)."""
-        await dispatcher.record_follow_ups(["task A"], cycle_id="c1")
-        assert len(await dispatcher.get_pending_follow_ups()) == 1
-
-        await dispatcher.record_follow_ups(["task B", "task C"], cycle_id="c2")
-        pending = await dispatcher.get_pending_follow_ups()
-        # All 3 follow-ups should be present (not just the latest cycle's)
-        assert len(pending) == 3
-
     async def test_clear_nonexistent_id(self, dispatcher):
-        # Should not raise — update_status on nonexistent ID just does nothing
+        """Clear on nonexistent ID does not raise."""
         await dispatcher.clear_follow_up("nonexistent-id")
         assert await dispatcher.get_pending_follow_ups() == []
-
-    async def test_dedup_same_content(self, dispatcher):
-        """Duplicate content from a second cycle is NOT re-recorded."""
-        await dispatcher.record_follow_ups(["investigate backlog"], cycle_id="c1")
-        count = await dispatcher.record_follow_ups(
-            ["investigate backlog"], cycle_id="c2",
-        )
-        assert count == 0  # duplicate skipped
-        assert len(await dispatcher.get_pending_follow_ups()) == 1
-
-    async def test_dedup_case_insensitive(self, dispatcher):
-        """Dedup is case-insensitive."""
-        await dispatcher.record_follow_ups(["Check backlog"], cycle_id="c1")
-        count = await dispatcher.record_follow_ups(
-            ["check backlog"], cycle_id="c2",
-        )
-        assert count == 0
-        assert len(await dispatcher.get_pending_follow_ups()) == 1
-
-    async def test_dedup_within_single_batch(self, dispatcher):
-        """Duplicate entries within one cycle are also deduped."""
-        count = await dispatcher.record_follow_ups(
-            ["same task", "same task"], cycle_id="c1",
-        )
-        assert count == 1
-        assert len(await dispatcher.get_pending_follow_ups()) == 1
-
-    async def test_dedup_allows_different_content(self, dispatcher):
-        """Non-duplicate content from a second cycle IS recorded."""
-        await dispatcher.record_follow_ups(["task A"], cycle_id="c1")
-        count = await dispatcher.record_follow_ups(
-            ["task B"], cycle_id="c2",
-        )
-        assert count == 1
-        assert len(await dispatcher.get_pending_follow_ups()) == 2
-
-    async def test_resolve_follow_ups(self, dispatcher):
-        """Resolve a follow-up by ID."""
-        await dispatcher.record_follow_ups(["task to resolve"], cycle_id="c1")
-        pending = await dispatcher.get_pending_follow_ups()
-        assert len(pending) == 1
-        fid = pending[0]["id"]
-
-        count = await dispatcher.resolve_follow_ups(
-            [{"id": fid, "resolution": "Done by ego"}], cycle_id="c2",
-        )
-        assert count == 1
-        assert len(await dispatcher.get_pending_follow_ups()) == 0
 
     async def test_resolve_nonexistent_follow_up(self, dispatcher):
         """Resolving a nonexistent follow-up returns 0, no error."""
@@ -133,3 +74,39 @@ class TestEgoDispatcher:
             cycle_id="c1",
         )
         assert count == 0
+
+    async def test_get_pending_reads_existing_follow_ups(self, db, dispatcher):
+        """get_pending_follow_ups reads from DB even though record is disabled."""
+        # Insert a follow-up directly (simulates foreground session creation)
+        import uuid
+        from datetime import UTC, datetime
+
+        fid = str(uuid.uuid4()).replace("-", "")
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, reason, strategy, status, priority, created_at) "
+            "VALUES (?, 'foreground_session', 'test follow-up', 'test', 'ego_judgment', 'pending', 'medium', ?)",
+            (fid, datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+
+        pending = await dispatcher.get_pending_follow_ups()
+        assert len(pending) >= 1
+        assert any(p["content"] == "test follow-up" for p in pending)
+
+    async def test_resolve_existing_follow_up(self, db, dispatcher):
+        """Ego can resolve follow-ups created by other sources."""
+        import uuid
+        from datetime import UTC, datetime
+
+        fid = str(uuid.uuid4()).replace("-", "")
+        await db.execute(
+            "INSERT INTO follow_ups (id, source, content, reason, strategy, status, priority, created_at) "
+            "VALUES (?, 'foreground_session', 'task to resolve', 'test', 'ego_judgment', 'pending', 'medium', ?)",
+            (fid, datetime.now(UTC).isoformat()),
+        )
+        await db.commit()
+
+        count = await dispatcher.resolve_follow_ups(
+            [{"id": fid, "resolution": "Done by ego"}], cycle_id="c1",
+        )
+        assert count == 1
