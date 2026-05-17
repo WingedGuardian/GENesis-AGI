@@ -136,6 +136,8 @@ class ExternalProgramAdapter:
         The program's API decides how to handle it. If no specific endpoint
         is configured, this is a no-op.
         """
+        if not self._enabled:
+            return None
         if not self._healthy:
             logger.debug("Skipping opportunity for unhealthy module '%s'", self.name)
             return None
@@ -154,6 +156,8 @@ class ExternalProgramAdapter:
 
     async def record_outcome(self, outcome: dict) -> None:
         """Forward outcome to the external program if it has an outcome endpoint."""
+        if not self._enabled:
+            return
         if not self._healthy:
             return
         try:

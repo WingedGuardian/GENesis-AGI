@@ -190,7 +190,7 @@ async def init(rt: GenesisRuntime) -> None:
         # J-9 eval batch executor (daily memory relevance scoring)
         try:
             from genesis.eval.j9_batch import J9EvalBatchExecutor
-            j9_executor = J9EvalBatchExecutor(db=rt._db)
+            j9_executor = J9EvalBatchExecutor(db=rt._db, router=rt._router)
             rt._surplus_scheduler.set_j9_eval_batch_executor(j9_executor)
             logger.info("J9EvalBatchExecutor wired to surplus scheduler")
         except (ImportError, AttributeError):
