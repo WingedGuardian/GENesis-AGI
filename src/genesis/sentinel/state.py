@@ -72,6 +72,10 @@ class SentinelStateData:
     pending_request_json: str = ""  # JSON-serialized SentinelRequest fields
     pending_cc_result_json: str = ""  # JSON-serialized CC result (for action phase)
 
+    # Heartbeat — updated every awareness tick via check_fire_alarms().
+    # If this goes stale (>10 min), dashboard reports sentinel as "stale".
+    last_heartbeat_at: str = ""
+
     # Bootstrap grace
     bootstrap_grace_s: int = 240
     started_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -100,6 +104,10 @@ class SentinelStateData:
             return elapsed < self.bootstrap_grace_s
         except (ValueError, TypeError):
             return False
+
+    def record_heartbeat(self) -> None:
+        """Stamp the heartbeat. Called every awareness tick."""
+        self.last_heartbeat_at = datetime.now(UTC).isoformat()
 
     def record_cc_dispatch(self) -> None:
         """Stamp the last dispatch time. Used for observability only."""

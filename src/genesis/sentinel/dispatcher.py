@@ -1441,6 +1441,12 @@ class SentinelDispatcher:
             logger.debug("Failed to query health alerts for fire alarm check", exc_info=True)
             return None
 
+        # Record heartbeat AFTER the health query succeeds. This certifies
+        # "sentinel checked the system this tick." If the query above fails
+        # or health_data is None, no heartbeat is stamped → staleness detected.
+        self._state.record_heartbeat()
+        save_state(self._state)
+
         alarms = classify_alerts(alerts or [])
         current_ids = {a.alert_id for a in alarms}
 
