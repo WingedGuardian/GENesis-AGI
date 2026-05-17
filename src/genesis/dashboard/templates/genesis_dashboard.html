@@ -130,6 +130,7 @@
         essentialKnowledge: null,
         awarenessSignals: null,
         jobHealth: null,
+        evalMetrics: null,
         autonomyConfig: null,
         approvalActions: {},
         _restartingBridge: false,
@@ -345,7 +346,7 @@
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
-              if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchApprovals(); this.fetchActivity(); this.fetchSessions(); }
+              if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchEvalMetrics(); this.fetchApprovals(); this.fetchActivity(); this.fetchSessions(); }
               this._awarenessInterval = setInterval(() => this.fetchAwarenessSignals(), 30000);
               this._routingInterval = setInterval(() => this.fetchRoutingConfig(), 15000);
               this._jobHealthInterval = setInterval(() => this.fetchJobHealth(), 60000);
@@ -1707,6 +1708,17 @@
           } catch (e) {
             console.warn("Job health fetch failed:", e);
             this.failFetch("jobHealth", "Job health unavailable");
+          }
+        },
+
+        async fetchEvalMetrics() {
+          try {
+            const resp = await fetchApi("/api/genesis/metrics/compounding");
+            if (resp && resp.ok) {
+              this.evalMetrics = await resp.json();
+            }
+          } catch (e) {
+            console.warn("Eval metrics fetch failed:", e);
           }
         },
 
@@ -4831,6 +4843,52 @@
                 </tbody>
               </table>
             </div>
+          </div>
+        </template>
+      </div>
+    </div>
+
+    <!-- Panel: Eval Metrics (Compounding Intelligence) [Tab: internals] -->
+    <div class="panel" x-data="{ evalOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="evalOpen = !evalOpen">
+        <span class="material-symbols-outlined" :style="evalOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">insights</span>
+        Eval Metrics (J-9)
+        <span class="panel-status">
+          <template x-if="$store.genesisDashboard.evalMetrics?.dimensions">
+            <span style="font-size: 0.68rem; opacity: 0.7;"
+                  x-text="(() => { const d = $store.genesisDashboard.evalMetrics.dimensions; const weeks = Math.max(...Object.values(d).map(x => x.weeks_of_data || 0)); return weeks + ' weeks of data'; })()"></span>
+          </template>
+        </span>
+      </div>
+      <div class="panel-body" x-show="evalOpen" x-transition>
+        <template x-if="!$store.genesisDashboard.evalMetrics?.dimensions">
+          <div class="empty-state">No eval data yet. Aggregation runs Sundays 05:00 UTC.</div>
+        </template>
+        <template x-if="$store.genesisDashboard.evalMetrics?.dimensions">
+          <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.6rem;">
+            <template x-for="[dim, data] in Object.entries($store.genesisDashboard.evalMetrics.dimensions)" :key="dim">
+              <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.5rem 0.6rem;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem;">
+                  <span style="font-size: 0.72rem; font-weight: 600; text-transform: capitalize;" x-text="dim"></span>
+                  <span style="font-size: 0.65rem; opacity: 0.6;" x-text="data.headline_metric"></span>
+                </div>
+                <div style="display: flex; align-items: baseline; gap: 0.4rem;">
+                  <span style="font-size: 1.1rem; font-weight: 700;"
+                        x-text="data.current_value !== null ? (data.current_value * 100).toFixed(1) + '%' : '—'"></span>
+                  <span style="font-size: 0.7rem;"
+                        :style="data.trend === 'up' ? 'color: #4caf50' : data.trend === 'down' ? 'color: #d9534f' : 'color: #888'"
+                        x-text="data.trend === 'up' ? '\u2191' : data.trend === 'down' ? '\u2193' : data.trend === 'flat' ? '\u2192' : '\u2026'"></span>
+                </div>
+                <!-- Sparkline: CSS bar chart -->
+                <div style="display: flex; align-items: flex-end; gap: 1px; height: 24px; margin-top: 0.3rem;">
+                  <template x-for="(pt, i) in data.series" :key="i">
+                    <div :style="`flex: 1; background: ${data.trend === 'up' ? 'rgba(76,175,80,0.5)' : data.trend === 'down' ? 'rgba(217,83,79,0.5)' : 'rgba(136,136,136,0.4)'}; border-radius: 1px; height: ${pt.value !== null ? Math.max(2, pt.value * 100) + '%' : '2px'};`"></div>
+                  </template>
+                </div>
+                <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;" x-text="data.weeks_of_data + ' weeks'"></div>
+              </div>
+            </template>
           </div>
         </template>
       </div>
