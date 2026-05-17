@@ -298,9 +298,10 @@ class EgoContextBuilder:
             lines.append(line)
 
         lines.append(
-            "\nYou can: create new follow-ups (they persist until resolved), "
-            "mark items completed, or change strategy. Failed items need "
-            "your judgment — retry, promote to task, escalate to user, or dismiss.\n"
+            "\nYou can RESOLVE follow-ups via resolved_follow_ups output. "
+            "You CANNOT create new follow-ups — use proposals for actions "
+            "and observations for noting things. Follow-ups are a user-facing "
+            "tracking mechanism managed by foreground sessions only.\n"
         )
         return "\n".join(lines)
 
@@ -499,7 +500,7 @@ class EgoContextBuilder:
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what Genesis is focused on",\n'
-            '  "follow_ups": ["open thread 1", "open thread 2"],\n'
+            '  "follow_ups": [],\n'
             '  "morning_report": "only if this is a morning trigger"\n'
             "}\n"
             "```\n\n"

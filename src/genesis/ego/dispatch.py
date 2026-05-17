@@ -33,45 +33,22 @@ class EgoDispatcher:
         follow_ups: list[str],
         cycle_id: str,
     ) -> int:
-        """Store follow-ups from an ego cycle in the accountability ledger.
+        """No-op: ego follow-up creation is disabled.
 
-        Deduplicates against existing pending follow-ups from ego_cycle
-        source to prevent the accumulation bug where the ego re-outputs
-        follow-ups it already sees in its context.
+        The ego has proposals for action and observations for noting things.
+        Follow-ups are a user-facing tracking mechanism — only foreground
+        sessions should create them. Ego-generated follow-ups accumulated
+        at ~50/month with 84% stale/noise rate (audit 2026-05-16).
 
-        Returns count of genuinely new follow-ups stored.
+        The ego can still READ follow-ups (get_pending_follow_ups) and
+        RESOLVE them (resolve_follow_ups), but cannot create new ones.
         """
-        # Fetch existing pending ego follow-ups for dedup comparison.
-        existing = await follow_up_crud.get_pending(
-            self._db, source="ego_cycle",
-        )
-        existing_contents = {row["content"].strip().lower() for row in existing}
-
-        count = 0
-        for text in follow_ups:
-            if not text or not text.strip():
-                continue
-            normalized = text.strip()
-            if normalized.lower() in existing_contents:
-                logger.debug(
-                    "Skipping duplicate follow-up from cycle %s: %.80s",
-                    cycle_id, normalized,
-                )
-                continue
-            await follow_up_crud.create(
-                self._db,
-                content=normalized,
-                source="ego_cycle",
-                source_session=cycle_id,
-                strategy="ego_judgment",
-                reason=f"Ego cycle {cycle_id} identified this as an open thread",
+        if follow_ups:
+            logger.debug(
+                "Ego cycle %s produced %d follow-ups (creation disabled)",
+                cycle_id, len(follow_ups),
             )
-            # Track the new entry so subsequent items in this batch dedup too.
-            existing_contents.add(normalized.lower())
-            count += 1
-        if count:
-            logger.info("Recorded %d new follow-ups from ego cycle %s", count, cycle_id)
-        return count
+        return 0
 
     async def resolve_follow_ups(
         self,
