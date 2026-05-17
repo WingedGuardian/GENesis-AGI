@@ -10,7 +10,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 
 from flask import jsonify, request
 
@@ -19,13 +19,13 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 logger = logging.getLogger(__name__)
 
 
-def _parse_iso(ts: str) -> datetime:
-    """Parse ISO timestamp string to datetime (UTC)."""
+def _parse_iso(ts: str) -> datetime | None:
+    """Parse ISO timestamp string to datetime (UTC). Returns None on failure."""
     ts = ts.replace("Z", "+00:00")
     try:
         return datetime.fromisoformat(ts)
     except (ValueError, TypeError):
-        return datetime.now(UTC)
+        return None
 
 
 async def _build_phase_timeline(db, task_id: str) -> list[dict]:
@@ -33,7 +33,7 @@ async def _build_phase_timeline(db, task_id: str) -> list[dict]:
     cursor = await db.execute(
         "SELECT timestamp, details FROM events "
         "WHERE event_type = 'task.phase_changed' AND details LIKE ? "
-        "ORDER BY timestamp ASC",
+        "ORDER BY timestamp ASC LIMIT 100",
         (f"%{task_id}%",),
     )
     rows = await cursor.fetchall()
@@ -57,7 +57,10 @@ async def _build_phase_timeline(db, task_id: str) -> list[dict]:
                 exited = rows[i + 1]["timestamp"]
         duration_s = None
         if exited:
-            duration_s = (_parse_iso(exited) - _parse_iso(entered)).total_seconds()
+            t_entered = _parse_iso(entered)
+            t_exited = _parse_iso(exited)
+            if t_entered and t_exited:
+                duration_s = (t_exited - t_entered).total_seconds()
         phases.append({
             "phase": details.get("to_phase", "unknown"),
             "entered_at": entered,
