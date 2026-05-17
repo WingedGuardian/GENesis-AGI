@@ -7,7 +7,7 @@ asyncio.gather.
 Probes:
   1. Container exists     — incus info genesis → "Status: RUNNING"
   2. ICMP reachable       — ping -c1 -W3 {container_ip}
-  3. Health API           — HTTP GET :5000/api/genesis/health
+  3. Health API           — HTTP GET :5000/api/genesis/health (retries once on 503)
   4. Heartbeat canary     — HTTP GET :5000/api/genesis/heartbeat
   5. Log freshness        — incus exec journalctl last line timestamp
 
@@ -18,7 +18,7 @@ Suspicious checks (run when all 5 probes pass):
   4. CC tmp usage         — watchgod_state.json tier check
   5. Restart count        — systemctl NRestarts
   6. Error spike          — journalctl error count in window
-  7. Pause state          — /api/genesis/pause or paused.json
+  7. Health API depth     — parse response body for degraded metrics
 """
 
 from __future__ import annotations
@@ -250,6 +250,7 @@ async def probe_health_api(config: GuardianConfig) -> SignalResult:
     """Check Flask health API responds with 200.
 
     Retries once on 503 (often transient during DB lock or bootstrap).
+    Reported latency reflects the successful call, not the retry wait.
     """
     name = "health_api"
     t0 = datetime.now(UTC)
@@ -260,6 +261,7 @@ async def probe_health_api(config: GuardianConfig) -> SignalResult:
         # 503 is often transient (DB lock, bootstrap race). Retry once.
         if status == 503:
             await asyncio.sleep(5)
+            t0 = datetime.now(UTC)  # Reset — report latency of the successful call
             status, body = await _http_get_async(url, timeout=config.probes.http_timeout_s)
 
         latency = (datetime.now(UTC) - t0).total_seconds() * 1000

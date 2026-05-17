@@ -16,6 +16,7 @@ from genesis.guardian.health_signals import (
     SignalResult,
     SuspiciousResult,
     check_error_spike,
+    check_health_api_depth,
     check_memory_pressure,
     check_pause_state,
     check_restart_count,
@@ -187,12 +188,34 @@ class TestProbeHealthApi:
 
     @pytest.mark.asyncio
     async def test_unhealthy(self, config: GuardianConfig) -> None:
-        with patch(
-            "genesis.guardian.health_signals._http_get_async",
-            _mock_http(503, '{"status": "unhealthy"}'),
+        with (
+            patch(
+                "genesis.guardian.health_signals._http_get_async",
+                _mock_http(503, '{"status": "unhealthy"}'),
+            ),
+            patch("genesis.guardian.health_signals.asyncio.sleep", return_value=None),
         ):
             result = await probe_health_api(config)
         assert result.alive is False
+
+    @pytest.mark.asyncio
+    async def test_503_retry_succeeds(self, config: GuardianConfig) -> None:
+        """503 followed by 200 should report alive=True."""
+        call_count = [0]
+
+        async def mock_retry(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return (503, '{"status": "unhealthy"}')
+            return (200, '{"status": "healthy"}')
+
+        with (
+            patch("genesis.guardian.health_signals._http_get_async", mock_retry),
+            patch("genesis.guardian.health_signals.asyncio.sleep", return_value=None),
+        ):
+            result = await probe_health_api(config)
+        assert result.alive is True
+        assert call_count[0] == 2
 
     @pytest.mark.asyncio
     async def test_connection_refused(self, config: GuardianConfig) -> None:
@@ -442,6 +465,85 @@ class TestCheckErrorSpike:
         ):
             result = await check_error_spike(config)
         assert result.ok is False
+
+
+class TestCheckHealthApiDepth:
+
+    @pytest.mark.asyncio
+    async def test_all_healthy(self, config: GuardianConfig) -> None:
+        body = '{"infrastructure": {"genesis.db": {"status": "healthy", "latency_ms": 5}, "scheduler": {"status": "healthy"}, "qdrant": {"status": "healthy"}}}'
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, body),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is True
+        assert "all metrics healthy" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_high_db_latency(self, config: GuardianConfig) -> None:
+        body = '{"infrastructure": {"genesis.db": {"status": "healthy", "latency_ms": 8000}, "scheduler": {"status": "healthy"}, "qdrant": {"status": "healthy"}}}'
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, body),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is False
+        assert "db_latency=8000ms" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_degraded_scheduler(self, config: GuardianConfig) -> None:
+        body = '{"infrastructure": {"genesis.db": {"status": "healthy", "latency_ms": 10}, "scheduler": {"status": "degraded"}, "qdrant": {"status": "healthy"}}}'
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, body),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is False
+        assert "scheduler=degraded" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_qdrant_down(self, config: GuardianConfig) -> None:
+        body = '{"infrastructure": {"genesis.db": {"status": "healthy", "latency_ms": 10}, "scheduler": {"status": "healthy"}, "qdrant": {"status": "down"}}}'
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, body),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is False
+        assert "qdrant=down" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_multiple_warnings(self, config: GuardianConfig) -> None:
+        body = '{"infrastructure": {"genesis.db": {"status": "healthy", "latency_ms": 9000}, "scheduler": {"status": "error"}, "qdrant": {"status": "down"}}}'
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, body),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is False
+        assert "db_latency=9000ms" in result.detail
+        assert "scheduler=error" in result.detail
+        assert "qdrant=down" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_non_200_skipped(self, config: GuardianConfig) -> None:
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(503, '{"status": "unhealthy"}'),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is True
+        assert "skipped" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_malformed_body(self, config: GuardianConfig) -> None:
+        with patch(
+            "genesis.guardian.health_signals._http_get_async",
+            _mock_http(200, "not json"),
+        ):
+            result = await check_health_api_depth(config)
+        assert result.ok is True  # Errors fall safe
 
 
 class TestCheckPauseState:
