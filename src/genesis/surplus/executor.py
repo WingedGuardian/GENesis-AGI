@@ -413,6 +413,37 @@ _TASK_PROMPTS: dict[TaskType, str] = {
         "from the context above.\n\n"
         "Respond in plain text with numbered recommendations."
     ),
+    # Wing audit findings are observational-only (posted to Telegram for user review).
+    # Future: parse JSON output and auto-propose reclassifications via ego cycle.
+    TaskType.WING_AUDIT: (
+        "You are auditing memory taxonomy for an autonomous AI system.\n\n"
+        "{context}\n\n"
+        "## Task\n"
+        "The memories above are all currently classified as wing='general', "
+        "room='uncategorized'. Your job is to identify clusters of related "
+        "memories that should be reclassified into a more specific wing/room.\n\n"
+        "Rules:\n"
+        "- Only propose a new wing/room if 3+ memories clearly belong together\n"
+        "- Use existing wings when possible: learning, infrastructure, channels, "
+        "routing, memory, autonomy, dev_workflow, career, integrations, research, "
+        "architecture, identity\n"
+        "- Propose new rooms within existing wings before proposing new wings\n"
+        "- Be conservative — uncategorized is fine if nothing clearly clusters\n\n"
+        "Respond with ONLY a JSON object in this exact format:\n"
+        '```json\n'
+        '{{\n'
+        '  "findings": [\n'
+        '    {{\n'
+        '      "title": "Proposed wing/room",\n'
+        '      "content": "wing=X, room=Y — rationale for this classification",\n'
+        '      "sources": ["memory_id_1", "memory_id_2", "memory_id_3"],\n'
+        '      "relevance": "Why this grouping improves retrieval"\n'
+        '    }}\n'
+        '  ]\n'
+        '}}\n'
+        '```\n\n'
+        "If no clear clusters emerge, respond with exactly NOMINAL."
+    ),
 }
 
 
@@ -529,6 +560,34 @@ class SurplusLLMExecutor:
             except Exception:
                 parts.append("(Signal data unavailable)")
             return "\n".join(parts) if parts else "(No recent signals)"
+
+        # Wing audit: fetch recent general/uncategorized memories
+        if task.task_type == TaskType.WING_AUDIT:
+            try:
+                cursor = await self._db.execute(
+                    "SELECT m.memory_id, substr(f.content, 1, 200) "
+                    "FROM memory_metadata m "
+                    "JOIN memory_fts f ON m.memory_id = f.memory_id "
+                    "WHERE m.wing = 'general' AND m.room = 'uncategorized' "
+                    "AND m.created_at > datetime('now', '-7 days') "
+                    "ORDER BY m.created_at DESC LIMIT 80"
+                )
+                rows = await cursor.fetchall()
+                if rows:
+                    parts.append(
+                        f"## Uncategorized Memories ({len(rows)} from last 7 days)"
+                    )
+                    for i, (mid, content) in enumerate(rows, 1):
+                        parts.append(f"{i}. [{mid[:8]}] {content}")
+                else:
+                    parts.append("(No uncategorized memories in last 7 days)")
+            except Exception:
+                logger.warning(
+                    "_gather_context failed for %s (wing_audit)",
+                    task.task_type, exc_info=True,
+                )
+                parts.append("(Memory query failed)")
+            return "\n".join(parts) if parts else "(No data available)"
 
         # Pipeline step 1: call site activity + cost aggregation
         if task.task_type == TaskType.PROMPT_REVIEW_CATALOG:
