@@ -106,6 +106,7 @@ class UserEgoContextBuilder:
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
         sections.append(await self._execution_outcomes_section())
+        sections.append(await self._goal_progress_section())
         sections.append(await self._capability_performance_section())
         sections.append(await self._autonomy_readiness_section())
         sections.append(await self._recurring_patterns_section())
@@ -759,6 +760,48 @@ class UserEgoContextBuilder:
             short = (content or "")[:200].replace("\n", " ")
             ts = (created_at or "?")[:16]
             lines.append(f"- [{ts}] [{priority}] {short}")
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _goal_progress_section(self) -> str:
+        """Goal pursuit progress — executed proposals grouped by goal."""
+        lines = ["## Goal Progress (7d)\n"]
+
+        try:
+            cursor = await self._db.execute(
+                "SELECT p.goal_id, g.title, p.content, p.status, "
+                "  p.user_response, p.created_at "
+                "FROM ego_proposals p "
+                "JOIN user_goals g ON p.goal_id = g.id "
+                "WHERE p.goal_id IS NOT NULL "
+                "AND p.status = 'executed' "
+                "AND p.created_at >= datetime('now', '-7 days') "
+                "ORDER BY p.created_at DESC "
+                "LIMIT 15"
+            )
+            rows = await cursor.fetchall()
+        except Exception:
+            logger.error("Failed to query goal progress", exc_info=True)
+            lines.append("*Could not query goal progress.*\n")
+            return "\n".join(lines)
+
+        if not rows:
+            lines.append("*No goal-linked proposals executed recently.*\n")
+            return "\n".join(lines)
+
+        # Group by goal
+        by_goal: dict[str, dict] = {}
+        for goal_id, title, content, status, response, created in rows:
+            by_goal.setdefault(goal_id, {"title": title, "items": []})
+            outcome = "done" if "success" in (response or "").lower() else status
+            by_goal[goal_id]["items"].append(
+                f"  - [{outcome}] {(content or '')[:100]} ({(created or '')[:10]})"
+            )
+
+        for gid, info in by_goal.items():
+            lines.append(f"**{info['title']}** (id={gid})")
+            lines.extend(info["items"])
 
         lines.append("")
         return "\n".join(lines)
