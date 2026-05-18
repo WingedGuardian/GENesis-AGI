@@ -468,6 +468,7 @@ class TestUserEgoContextBuilder:
             "## Open Threads",
             "## Recent Proposals",
             "## Recurring Patterns (72h)",
+            "## Goal Progress (7d)",
             "## Output Contract",
         ]
         for section in expected_sections:
@@ -510,7 +511,7 @@ class TestUserEgoContextBuilder:
             " user_response, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
             ("prop-1", "investigate", "Research v4 architecture",
-             "executed", "goal-xyz", "session:abc12345 success"),
+             "executed", "goal-xyz", "session:abc12345|completed:Research done"),
         )
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
