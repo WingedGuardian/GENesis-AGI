@@ -238,7 +238,7 @@ class TestEgoContextBuilder:
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "Recent Proposals" in result
+        assert "Active Proposals" in result
         assert "investigate" in result
         assert "approved" in result
 

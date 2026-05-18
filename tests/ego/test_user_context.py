@@ -466,7 +466,7 @@ class TestUserEgoContextBuilder:
             "## Genesis Ego Escalations",
             "## Genesis Capabilities",
             "## Open Threads",
-            "## Recent Proposals",
+            "## Active Proposals",
             "## Recurring Patterns (72h)",
             "## Goal Progress (7d)",
             "## Output Contract",

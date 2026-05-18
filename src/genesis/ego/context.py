@@ -341,50 +341,87 @@ class EgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
+    def _format_proposal_row(
+        self,
+        action_type: str,
+        category: str,
+        content: str,
+        status: str,
+        response: str | None,
+    ) -> str:
+        """Format a single proposal row for the context table."""
+        short = content[:60] + "..." if len(content) > 60 else content
+        short = short.replace("\n", " ").replace("|", "/")
+        # Parse outcome from user_response: "session:xxx|failed:reason"
+        resp = response or ""
+        if "|failed:" in resp:
+            outcome = "FAILED: " + resp.split("|failed:", 1)[1][:60]
+        elif "|completed:" in resp:
+            outcome = "OK: " + resp.split("|completed:", 1)[1][:60]
+        elif status == "executed" and resp and not resp.startswith("dispatching"):
+            outcome = "dispatched"
+        else:
+            outcome = "—"
+        outcome = outcome.replace("|", "/").replace("\n", " ")
+        return f"| {action_type} | {category} | {status} | {outcome} | {short} |"
+
     async def _proposal_history_section(self) -> str:
-        """Recent proposal outcomes for calibration."""
-        lines = ["## Recent Proposals (last 7 days)\n"]
+        """Recent proposal outcomes for calibration.
+
+        Split into two sections so active proposals are always visible
+        regardless of how many withdrawn/tabled proposals exist.
+        """
+        lines = ["## Active Proposals\n"]
+        table_header = (
+            "| Action | Category | Status | Outcome | Content |\n"
+            "|--------|----------|--------|---------|---------|"
+        )
 
         try:
+            # Section 1: Active proposals (pending, approved, executed)
             cursor = await self._db.execute(
                 "SELECT action_type, action_category, content, status, "
                 "user_response, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('pending', 'approved', 'executed') "
                 "ORDER BY created_at DESC "
                 "LIMIT 15"
             )
-            rows = await cursor.fetchall()
-        except Exception:
-            # Table may not exist yet
-            lines.append("*No proposal history available.*\n")
-            return "\n".join(lines)
+            active_rows = await cursor.fetchall()
 
-        if not rows:
-            lines.append("*No proposals in last 7 days.*\n")
-            return "\n".join(lines)
-
-        lines.append("| Action | Category | Status | Outcome | Content |")
-        lines.append("|--------|----------|--------|---------|---------|")
-        for action_type, category, content, status, response, _created in rows:
-            short = content[:60] + "..." if len(content) > 60 else content
-            short = short.replace("\n", " ").replace("|", "/")
-            # Parse outcome from user_response: "session:xxx|failed:reason"
-            resp = response or ""
-            if "|failed:" in resp:
-                outcome = "FAILED: " + resp.split("|failed:", 1)[1][:60]
-            elif "|completed:" in resp:
-                outcome = "OK: " + resp.split("|completed:", 1)[1][:60]
-            elif status == "executed" and resp and not resp.startswith("dispatching"):
-                outcome = "dispatched"
+            if not active_rows:
+                lines.append("*No active proposals.*\n")
             else:
-                outcome = "—"
-            outcome = outcome.replace("|", "/").replace("\n", " ")
-            lines.append(
-                f"| {action_type} | {category} | {status} | {outcome} | {short} |"
-            )
+                lines.append(table_header)
+                for row in active_rows:
+                    lines.append(self._format_proposal_row(*row[:5]))
+                lines.append("")
 
-        lines.append("")
+            # Section 2: Recently tried (withdrawn, tabled, rejected, failed)
+            lines.append("## Recently Tried (do not re-propose)\n")
+            cursor2 = await self._db.execute(
+                "SELECT action_type, action_category, content, status, "
+                "user_response, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
+                "ORDER BY created_at DESC "
+                "LIMIT 10"
+            )
+            tried_rows = await cursor2.fetchall()
+
+            if not tried_rows:
+                lines.append("*No recently tried proposals.*\n")
+            else:
+                lines.append(table_header)
+                for row in tried_rows:
+                    lines.append(self._format_proposal_row(*row[:5]))
+                lines.append("")
+
+        except Exception:
+            lines.append("*No proposal history available.*\n")
+
         return "\n".join(lines)
 
     async def _intervention_history_section(self) -> str:

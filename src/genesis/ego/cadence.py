@@ -328,6 +328,11 @@ class EgoCadenceManager:
     async def _on_tick(self) -> None:
         """Interval trigger handler. Checks all gates then runs cycle."""
         self._emit_heartbeat("tick")
+        logger.debug(
+            "Ego tick fired (current_interval=%dm, config_cadence=%dm)",
+            self._current_interval,
+            self._config.cadence_minutes,
+        )
         async with self._lock:
             if not self._should_run(skip_idle_check=False):
                 return
@@ -552,7 +557,23 @@ class EgoCadenceManager:
         - Idle cycle (no proposals): multiply by backoff_multiplier
         - Productive cycle: reset to base cadence_minutes
         - Max interval adapts to user recency (longer absence → higher cap)
+        - Hot-reloads config from disk so dashboard changes take effect
         """
+        # Hot-reload config from disk (allows dashboard changes without restart)
+        try:
+            from genesis.ego.config import load_ego_config
+
+            fresh = load_ego_config()
+            if fresh.cadence_minutes != self._config.cadence_minutes:
+                logger.info(
+                    "Ego config hot-reload: cadence %d → %d",
+                    self._config.cadence_minutes,
+                    fresh.cadence_minutes,
+                )
+            self._config = fresh
+        except Exception:
+            logger.debug("Config hot-reload failed, using cached", exc_info=True)
+
         recency_max = await self._recency_max_interval()
 
         if had_proposals:
@@ -563,6 +584,13 @@ class EgoCadenceManager:
                 recency_max,
             )
 
+        logger.info(
+            "Ego interval calc: new=%dm, current=%dm, had_proposals=%s, recency_max=%dm",
+            new_interval,
+            self._current_interval,
+            had_proposals,
+            recency_max,
+        )
         if new_interval != self._current_interval:
             old_interval = self._current_interval
             self._current_interval = new_interval

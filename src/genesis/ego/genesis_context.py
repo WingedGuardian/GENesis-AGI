@@ -351,45 +351,72 @@ class GenesisEgoContextBuilder:
         return "\n".join(lines)
 
     async def _proposal_history_section(self) -> str:
-        """Recent proposal outcomes for self-calibration."""
-        lines = ["## Recent Proposals (last 7 days)\n"]
+        """Recent proposal outcomes for self-calibration.
+
+        Split into Active (pending/approved/executed) and Recently Tried
+        (withdrawn/tabled/rejected/failed/expired) so active proposals
+        are always visible regardless of withdrawn noise volume.
+        """
+        lines = ["## Active Proposals\n"]
+        table_header = (
+            "| Action | Content | Status | Response |\n"
+            "|--------|---------|--------|----------|"
+        )
 
         try:
+            # Section 1: Active proposals
             cursor = await self._db.execute(
                 "SELECT action_type, content, status, "
                 "user_response, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('pending', 'approved', 'executed') "
                 "ORDER BY created_at DESC "
                 "LIMIT 15"
             )
-            rows = await cursor.fetchall()
+            active_rows = await cursor.fetchall()
+
+            if not active_rows:
+                lines.append("*No active proposals.*\n")
+            else:
+                lines.append(table_header)
+                for action_type, content, status, response, _created in active_rows:
+                    short = content[:80] + "..." if len(content) > 80 else content
+                    short = short.replace("\n", " ").replace("|", "/")
+                    resp = (response or "\u2014")[:50]
+                    lines.append(
+                        f"| {action_type} | {short} | {status} | {resp} |"
+                    )
+                lines.append("")
+
+            # Section 2: Recently tried
+            lines.append("## Recently Tried (do not re-propose)\n")
+            cursor2 = await self._db.execute(
+                "SELECT action_type, content, status, "
+                "user_response, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
+                "ORDER BY created_at DESC "
+                "LIMIT 10"
+            )
+            tried_rows = await cursor2.fetchall()
+
+            if not tried_rows:
+                lines.append("*No recently tried proposals.*\n")
+            else:
+                lines.append(table_header)
+                for action_type, content, status, response, _created in tried_rows:
+                    short = content[:80] + "..." if len(content) > 80 else content
+                    short = short.replace("\n", " ").replace("|", "/")
+                    resp = (response or "\u2014")[:50]
+                    lines.append(
+                        f"| {action_type} | {short} | {status} | {resp} |"
+                    )
+                lines.append("")
+
         except Exception:
             lines.append("*No proposal history available.*\n")
-            return "\n".join(lines)
-
-        if not rows:
-            lines.append("*No proposals in last 7 days.*\n")
-            return "\n".join(lines)
-
-        # Summary line for quick calibration
-        from collections import Counter
-        status_counts = Counter(r[2] for r in rows)
-        parts = [f"{status_counts[s]} {s}" for s in
-                 ("approved", "rejected", "executed", "pending", "failed",
-                  "expired", "tabled", "withdrawn")
-                 if status_counts.get(s)]
-        lines.append(f"**{len(rows)} proposals**: {', '.join(parts)}\n")
-
-        lines.append("| Action | Content | Status | Response |")
-        lines.append("|--------|---------|--------|----------|")
-        for action_type, content, status, response, _created in rows:
-            short = content[:80] + "..." if len(content) > 80 else content
-            short = short.replace("\n", " ").replace("|", "/")
-            resp = (response or "\u2014")[:50]
-            lines.append(
-                f"| {action_type} | {short} | {status} | {resp} |"
-            )
 
         lines.append("")
         return "\n".join(lines)

@@ -483,7 +483,7 @@ class TestGenesisEgoContextBuilder:
             "## Unresolved Observations",
             "## Maintenance Follow-ups",
             "## Cost Status",
-            "## Recent Proposals",
+            "## Active Proposals",
             "## Output Contract",
         ]
         for section in expected_sections:
@@ -532,7 +532,7 @@ class TestGenesisEgoContextBuilder:
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "Recent Proposals" in result
+        assert "Active Proposals" in result
         assert "outreach" in result
         assert "Post update on LinkedIn" in result
         assert "approved" in result
@@ -545,7 +545,7 @@ class TestGenesisEgoContextBuilder:
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "No proposals in last 7 days" in result
+        assert "No active proposals" in result
 
     @pytest.mark.asyncio
     async def test_proposal_history_truncates_long_content(
@@ -564,7 +564,7 @@ class TestGenesisEgoContextBuilder:
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        proposals_section = result.split("## Recent Proposals")[1].split("##")[0]
+        proposals_section = result.split("## Active Proposals")[1].split("##")[0]
         assert "..." in proposals_section
         assert "Z" * 200 not in proposals_section
 
