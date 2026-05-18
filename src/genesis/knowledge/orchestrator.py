@@ -277,7 +277,7 @@ class KnowledgeOrchestrator:
                 if old_qdrant_id and old_qdrant_id != qdrant_id:
                     try:
                         delete_point(
-                            memory_mod._store._qdrant,
+                            memory_mod._store.qdrant_client,
                             collection="knowledge_base",
                             point_id=old_qdrant_id,
                         )
@@ -332,7 +332,7 @@ class KnowledgeOrchestrator:
             for qid in qdrant_ids:
                 try:
                     delete_point(
-                        memory_mod._store._qdrant,
+                        memory_mod._store.qdrant_client,
                         collection="knowledge_base",
                         point_id=qid,
                     )

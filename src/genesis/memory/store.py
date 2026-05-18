@@ -64,6 +64,11 @@ class MemoryStore:
         self._event_bus = event_bus
 
     @property
+    def qdrant_client(self) -> QdrantClient:
+        """Public accessor for the QdrantClient instance."""
+        return self._qdrant
+
+    @property
     def linker(self) -> MemoryLinker | None:
         """Public access to the memory linker for extraction typed links."""
         return self._linker

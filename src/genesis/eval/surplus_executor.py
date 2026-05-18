@@ -43,6 +43,28 @@ class ModelEvalExecutor:
                 error="MODEL_EVAL task missing 'model_id' in payload",
             )
 
+        # Pre-flight: verify provider exists in routing config before
+        # attempting eval.  Model intelligence discovers new models faster
+        # than they get registered — skip gracefully rather than failing.
+        try:
+            from pathlib import Path
+
+            from genesis.routing.config import load_config
+
+            cfg_path = Path(__file__).resolve().parents[3] / "config" / "model_routing.yaml"
+            config = load_config(cfg_path)
+            if provider_name not in config.providers:
+                logger.debug(
+                    "MODEL_EVAL skipped: provider '%s' not in router config",
+                    provider_name,
+                )
+                return ExecutorResult(
+                    success=True,
+                    content=f"skipped: provider '{provider_name}' not in router config",
+                )
+        except Exception as exc:
+            logger.debug("MODEL_EVAL pre-flight config check failed: %s", exc)
+
         requested_datasets = payload.get("datasets") or list_datasets()
         if not requested_datasets:
             return ExecutorResult(
