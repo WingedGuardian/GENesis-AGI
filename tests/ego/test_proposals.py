@@ -200,6 +200,50 @@ class TestProposalWorkflow:
         assert row["execution_plan"] == "background CC, ~$0.30"
         assert row["recurring"] == 1
 
+    async def test_create_batch_valid_goal_id(self, workflow, db):
+        """Valid goal_id is stored when it matches an active goal."""
+        # Create user_goals table and insert a goal
+        await db.execute(TABLES["user_goals"])
+        from genesis.db.crud import user_goals
+
+        goal_id = await user_goals.create(
+            db, title="Land AI role", category="career",
+            priority="high", description="Find an AI eng position",
+        )
+        props = [{
+            "action_type": "investigate",
+            "content": "Research Temporal for interview",
+            "confidence": 0.8,
+            "goal_id": goal_id,
+        }]
+        batch_id, ids = await workflow.create_batch(props)
+        row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
+        assert row["goal_id"] == goal_id
+
+    async def test_create_batch_invalid_goal_id_dropped(self, workflow, db):
+        """Invalid/hallucinated goal_id is dropped to None."""
+        await db.execute(TABLES["user_goals"])
+        props = [{
+            "action_type": "investigate",
+            "content": "Research something",
+            "confidence": 0.7,
+            "goal_id": "fake-goal-that-doesnt-exist",
+        }]
+        batch_id, ids = await workflow.create_batch(props)
+        row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
+        assert row["goal_id"] is None
+
+    async def test_create_batch_no_goal_id(self, workflow, db):
+        """Proposals without goal_id default to None."""
+        props = [{
+            "action_type": "maintenance",
+            "content": "Fix memory index",
+            "confidence": 0.9,
+        }]
+        batch_id, ids = await workflow.create_batch(props)
+        row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
+        assert row["goal_id"] is None
+
     async def test_format_digest_html(self, workflow):
         digest = workflow.format_digest(_sample_proposals(2), "batch123")
         assert "<b>Ego Proposals</b>" in digest

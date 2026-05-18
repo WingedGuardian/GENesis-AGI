@@ -151,6 +151,21 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
+        # hallucinated goal_ids from persisting).
+        valid_goal_ids: set[str] | None = None
+        if any(p.get("goal_id") for p in proposals):
+            try:
+                from genesis.db.crud import user_goals
+
+                active_goals = await user_goals.list_active(self._db, limit=200)
+                valid_goal_ids = {g["id"] for g in active_goals}
+            except Exception:
+                logger.warning(
+                    "Goal ID validation degraded — cannot verify goal_ids",
+                    exc_info=True,
+                )
+
         ids: list[str] = []
         for p in proposals:
             pid = uuid.uuid4().hex[:16]
@@ -160,6 +175,20 @@ class ProposalWorkflow:
                     rank_val = int(rank_val)
                 except (ValueError, TypeError):
                     rank_val = None
+
+            # Validate goal_id — drop if not a real active goal.
+            # If validation is degraded (valid_goal_ids is None), pass through.
+            raw_goal_id = p.get("goal_id") or None
+            if raw_goal_id and valid_goal_ids is not None:
+                goal_id = raw_goal_id if raw_goal_id in valid_goal_ids else None
+                if not goal_id:
+                    logger.warning(
+                        "Proposal %s: dropping invalid goal_id %r",
+                        pid, raw_goal_id,
+                    )
+            else:
+                goal_id = raw_goal_id
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -180,6 +209,7 @@ class ProposalWorkflow:
                 realist_verdict=p.get("_realist_verdict"),
                 realist_reasoning=p.get("_realist_reasoning"),
                 ego_source=ego_source,
+                goal_id=goal_id,
             )
             ids.append(pid)
 

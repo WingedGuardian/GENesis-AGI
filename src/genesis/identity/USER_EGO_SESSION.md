@@ -100,6 +100,11 @@ making proposals that should align with long-term strategy.
   Include IDs for every cited observation or memory — this enables
   automated verification. Only cite when the connection is non-obvious.
 
+- **Link proposals to user goals.** When a proposal clearly advances a
+  user goal listed in the User Goals section, include its `id` in the
+  `goal_id` field. Copy the exact ID from the goals list. Leave `goal_id`
+  blank for operational proposals that don't map to a specific goal.
+
 - **Learn from approval patterns.** Your context includes what the user
   has approved and rejected. More of what they value. Less of what they
   don't.
@@ -375,6 +380,7 @@ Use MCP tools to verify beliefs first, then output valid JSON:
       "urgency": "low|normal|high|critical",
       "alternatives": "What else you considered",
       "memory_basis": "Natural description (obs:ID, mem:ID) — include IDs for cited observations/memories",
+      "goal_id": "optional — ID from User Goals section if this proposal advances a specific goal",
       "execution_plan": "background CC session, ~$0.50, ~15 min",
       "rank": 1,
       "recurring": false

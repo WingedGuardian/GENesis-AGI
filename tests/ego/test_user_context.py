@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 
+from genesis.db.schema import TABLES
 from genesis.ego.user_context import UserEgoContextBuilder
 
 
@@ -467,10 +468,68 @@ class TestUserEgoContextBuilder:
             "## Open Threads",
             "## Recent Proposals",
             "## Recurring Patterns (72h)",
+            "## Goal Progress (7d)",
             "## Output Contract",
         ]
         for section in expected_sections:
             assert section in result, f"Missing section: {section}"
+
+    @pytest.mark.asyncio
+    async def test_user_goals_renders_id(self, db, mock_health_data, capabilities):
+        """Goal IDs should appear in the rendered goals section."""
+        await db.execute(TABLES["user_goals"])
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, confidence, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            ("goal-abc-123", "Land AI engineering role", "career", "high", "active", 0.8),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "id=goal-abc-123" in result
+        assert "Land AI engineering role" in result
+
+    @pytest.mark.asyncio
+    async def test_goal_progress_with_executed_proposals(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Goal progress section shows executed proposals grouped by goal."""
+        await db.execute(TABLES["user_goals"])
+        # Fixture creates ego_proposals inline without goal_id — add the column
+        await db.execute("ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT")
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, confidence, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            ("goal-xyz", "Ship Genesis v4", "project", "high", "active", 0.7),
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, "
+            " user_response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            ("prop-1", "investigate", "Research v4 architecture",
+             "executed", "goal-xyz", "session:abc12345|completed:Research done"),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "## Goal Progress" in result
+        assert "Ship Genesis v4" in result
+        assert "Research v4 architecture" in result
+        assert "id=goal-xyz" in result
+
+    @pytest.mark.asyncio
+    async def test_goal_progress_empty(self, db, mock_health_data, capabilities):
+        """Goal progress section renders gracefully when no data."""
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "## Goal Progress" in result
 
     @pytest.mark.asyncio
     async def test_user_model_long_value_truncated(

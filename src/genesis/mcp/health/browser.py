@@ -306,7 +306,19 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
 
         _remote_pw = await async_playwright().start()
         try:
-            _remote_browser = await _remote_pw.chromium.connect_over_cdp(url)
+            _remote_browser = await asyncio.wait_for(
+                _remote_pw.chromium.connect_over_cdp(url), timeout=30.0
+            )
+        except TimeoutError:
+            await _remote_pw.stop()
+            _remote_pw = None
+            raise ConnectionError(
+                f"CDP connection to {url} timed out after 30s. "
+                "The remote machine may be asleep or unreachable.\n\n"
+                "Check:\n"
+                "  1. The machine is awake and on Tailscale\n"
+                "  2. Chrome is running with --remote-debugging-port=9222"
+            ) from None
         except Exception as e:
             await _remote_pw.stop()
             _remote_pw = None
@@ -1469,7 +1481,14 @@ async def browser_navigate(
     NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
     block for up to ~5 minutes while waiting for human resolution via VNC.
     """
-    return await _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish)
+    # Remote CDP: bounded by 30s connect + 30s goto = 60s ceiling.
+    # Camoufox: Turnstile VNC resolution can take up to 5 minutes.
+    timeout = _TOOL_TIMEOUT_S if remote else 300.0
+    return await _with_tool_timeout(
+        _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish),
+        timeout,
+        "browser_navigate",
+    )
 
 
 @mcp.tool()
