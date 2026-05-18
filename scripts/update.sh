@@ -397,22 +397,31 @@ _do_rollback() {
     echo "  Reason: $reason"
     [ -n "$degraded" ] && echo "  Degraded subsystems: $degraded"
 
-    # Write failure context for CC to pick up
+    # Write failure context for CC to pick up.
+    # Values passed as positional args so json.dump() handles all escaping —
+    # raw git output in $reason can contain quotes and backslashes.
     mkdir -p "$HOME/.genesis"
-    cat > "$HOME/.genesis/last_update_failure.json" << FAILEOF
-{
-    "old_tag": "$OLD_TAG",
-    "new_tag": "$NEW_TAG",
-    "old_commit": "$OLD_COMMIT",
-    "new_commit": "$NEW_COMMIT",
-    "rollback_tag": "$ROLLBACK_TAG",
-    "reason": "$reason",
-    "degraded_subsystems": "$degraded",
-    "original_branch": "$ORIGINAL_BRANCH",
-    "rollback_complete": $([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false),
-    "timestamp": "$(date -Iseconds)"
+    python3 -c "
+import json, sys
+data = {
+    'old_tag':             sys.argv[1],
+    'new_tag':             sys.argv[2],
+    'old_commit':          sys.argv[3],
+    'new_commit':          sys.argv[4],
+    'rollback_tag':        sys.argv[5],
+    'reason':              sys.argv[6],
+    'degraded_subsystems': sys.argv[7],
+    'original_branch':     sys.argv[8],
+    'rollback_complete':   sys.argv[9] == 'true',
+    'timestamp':           sys.argv[10],
 }
-FAILEOF
+with open(sys.argv[11], 'w') as f:
+    json.dump(data, f, indent=4)
+" "$OLD_TAG" "$NEW_TAG" "$OLD_COMMIT" "$NEW_COMMIT" "$ROLLBACK_TAG" \
+  "$reason" "${degraded:-}" "$ORIGINAL_BRANCH" \
+  "$([ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && echo true || echo false)" \
+  "$(date -Iseconds)" \
+  "$HOME/.genesis/last_update_failure.json"
 
     echo ""
     echo "  ──────────────────────────────────────"
