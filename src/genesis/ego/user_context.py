@@ -814,7 +814,9 @@ class UserEgoContextBuilder:
         by_goal: dict[str, dict] = {}
         for goal_id, title, content, status, response, created in rows:
             by_goal.setdefault(goal_id, {"title": title, "items": []})
-            outcome = "done" if "success" in (response or "").lower() else status
+            # user_response format: "session:{id}|completed:{summary}" or "|failed:{summary}"
+            resp = response or ""
+            outcome = "done" if "|completed:" in resp else "failed" if "|failed:" in resp else status
             by_goal[goal_id]["items"].append(
                 f"  - [{outcome}] {(content or '')[:100]} ({(created or '')[:10]})"
             )
