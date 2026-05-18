@@ -151,6 +151,18 @@ class ProposalWorkflow:
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
 
+        # Pre-fetch valid goal IDs for validation (cheap SELECT, prevents
+        # hallucinated goal_ids from persisting).
+        valid_goal_ids: set[str] = set()
+        if any(p.get("goal_id") for p in proposals):
+            try:
+                from genesis.db.crud import user_goals
+
+                active_goals = await user_goals.list_active(self._db, limit=50)
+                valid_goal_ids = {g["id"] for g in active_goals}
+            except Exception:
+                logger.debug("Could not fetch goal IDs for validation", exc_info=True)
+
         ids: list[str] = []
         for p in proposals:
             pid = uuid.uuid4().hex[:16]
@@ -160,6 +172,15 @@ class ProposalWorkflow:
                     rank_val = int(rank_val)
                 except (ValueError, TypeError):
                     rank_val = None
+
+            # Validate goal_id — drop if not a real active goal
+            raw_goal_id = p.get("goal_id")
+            goal_id = raw_goal_id if raw_goal_id in valid_goal_ids else None
+            if raw_goal_id and not goal_id:
+                logger.warning(
+                    "Proposal %s: dropping invalid goal_id %r", pid, raw_goal_id
+                )
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -180,6 +201,7 @@ class ProposalWorkflow:
                 realist_verdict=p.get("_realist_verdict"),
                 realist_reasoning=p.get("_realist_reasoning"),
                 ego_source=ego_source,
+                goal_id=goal_id,
             )
             ids.append(pid)
 

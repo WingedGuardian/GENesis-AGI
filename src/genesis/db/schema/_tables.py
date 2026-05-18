@@ -775,7 +775,8 @@ TABLES = {
             memory_basis    TEXT DEFAULT '',           -- non-obvious memory attribution
             realist_verdict  TEXT,                     -- realist gate: pass/amend/reject
             realist_reasoning TEXT,                    -- realist gate: explanation
-            ego_source       TEXT                     -- which ego created this (user_ego_cycle / genesis_ego_cycle)
+            ego_source       TEXT,                    -- which ego created this (user_ego_cycle / genesis_ego_cycle)
+            goal_id          TEXT                     -- FK to user_goals.id (nullable — not all proposals serve a goal)
         )
     """,
     "ego_state": """
@@ -1222,6 +1223,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
     # intervention journal
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_status ON intervention_journal(outcome_status)",
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_proposal ON intervention_journal(proposal_id)",

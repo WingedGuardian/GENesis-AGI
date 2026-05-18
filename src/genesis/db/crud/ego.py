@@ -227,6 +227,7 @@ async def create_proposal(
     realist_verdict: str | None = None,
     realist_reasoning: str | None = None,
     ego_source: str | None = None,
+    goal_id: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -237,8 +238,8 @@ async def create_proposal(
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
-            ego_source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ego_source, goal_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -260,6 +261,7 @@ async def create_proposal(
             realist_verdict,
             realist_reasoning,
             ego_source,
+            goal_id,
         ),
     )
     await db.commit()
