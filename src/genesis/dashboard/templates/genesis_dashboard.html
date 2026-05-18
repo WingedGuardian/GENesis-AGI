@@ -1222,6 +1222,13 @@
                 }
               }
             } catch (e) { /* server may be restarting, keep polling */ }
+            // Backstop: if server is completely dead, stop after 30 min
+            if (Date.now() - start > 1800000) {
+              clearInterval(poll);
+              this._updating = false;
+              alert("Update polling timed out after 30 minutes.\nCheck server status manually.");
+              return;
+            }
           }, 5000);
         },
         async resolveConflicts() {
