@@ -614,36 +614,19 @@ class UserEgoContextBuilder:
     async def _proposal_history_section(self) -> str:
         """Recent proposal topics with neutral status for context.
 
-        Shows WHAT was proposed and its lifecycle outcome using neutral
-        labels (no judgment language). Also shows realist annotations
+        Split into Active and Recently Tried so active proposals are always
+        visible. Shows WHAT was proposed and its lifecycle outcome using
+        neutral labels (no judgment language). Also shows realist annotations
         when available. No aggregate scores, no user_response text —
         those trigger deference bias.
         """
-        lines = ["## Recent Proposals (last 7 days)\n"]
+        lines = ["## Active Proposals\n"]
+        table_header = (
+            "| Action | Topic | Outcome | Realist |\n"
+            "|--------|-------|---------|---------|"
+        )
 
-        try:
-            cursor = await self._db.execute(
-                "SELECT action_type, content, status, realist_verdict, "
-                "realist_reasoning, created_at "
-                "FROM ego_proposals "
-                "WHERE created_at >= datetime('now', '-7 days') "
-                "ORDER BY created_at DESC "
-                "LIMIT 15",
-            )
-            rows = await cursor.fetchall()
-        except Exception:
-            lines.append("*No proposal history available.*\n")
-            return "\n".join(lines)
-
-        if not rows:
-            lines.append("*No proposals in last 7 days.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"**{len(rows)} proposals** in last 7 days:\n")
-
-        lines.append("| Action | Topic | Outcome | Realist |")
-        lines.append("|--------|-------|---------|---------|")
-        for row in rows:
+        def _format_row(row) -> str:
             action_type = row["action_type"]
             content = row["content"]
             short = content[:100] + "..." if len(content) > 100 else content
@@ -656,9 +639,53 @@ class UserEgoContextBuilder:
                     reason_short = row["realist_reasoning"][:60]
                     reason_short = reason_short.replace("|", "/")
                     realist = f"{realist}: {reason_short}"
-            lines.append(f"| {action_type} | {short} | {status} | {realist} |")
+            return f"| {action_type} | {short} | {status} | {realist} |"
 
-        lines.append("")
+        try:
+            # Section 1: Active proposals
+            cursor = await self._db.execute(
+                "SELECT action_type, content, status, realist_verdict, "
+                "realist_reasoning, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('pending', 'approved', 'executed') "
+                "ORDER BY created_at DESC "
+                "LIMIT 15",
+            )
+            active_rows = await cursor.fetchall()
+
+            if not active_rows:
+                lines.append("*No active proposals.*\n")
+            else:
+                lines.append(table_header)
+                for row in active_rows:
+                    lines.append(_format_row(row))
+                lines.append("")
+
+            # Section 2: Recently tried
+            lines.append("## Recently Tried (do not re-propose)\n")
+            cursor2 = await self._db.execute(
+                "SELECT action_type, content, status, realist_verdict, "
+                "realist_reasoning, created_at "
+                "FROM ego_proposals "
+                "WHERE created_at >= datetime('now', '-7 days') "
+                "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
+                "ORDER BY created_at DESC "
+                "LIMIT 10",
+            )
+            tried_rows = await cursor2.fetchall()
+
+            if not tried_rows:
+                lines.append("*No recently tried proposals.*\n")
+            else:
+                lines.append(table_header)
+                for row in tried_rows:
+                    lines.append(_format_row(row))
+                lines.append("")
+
+        except Exception:
+            lines.append("*No proposal history available.*\n")
+
         return "\n".join(lines)
 
     async def _proposal_board_section(self) -> str:
