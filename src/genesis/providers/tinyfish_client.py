@@ -28,6 +28,7 @@ _BROWSER_URL = "https://api.browser.tinyfish.ai/"
 _search_client: httpx.AsyncClient | None = None
 _fetch_client: httpx.AsyncClient | None = None
 _agent_client: httpx.AsyncClient | None = None
+_browser_client: httpx.AsyncClient | None = None
 
 
 def _get_key() -> str:
@@ -63,6 +64,14 @@ def _get_agent_client() -> httpx.AsyncClient:
     if _agent_client is None:
         _agent_client = httpx.AsyncClient(timeout=600.0)
     return _agent_client
+
+
+def _get_browser_client() -> httpx.AsyncClient:
+    global _browser_client
+    if _browser_client is None:
+        # Session creation takes 10-30s per TinyFish docs; 90s gives safe margin
+        _browser_client = httpx.AsyncClient(timeout=90.0)
+    return _browser_client
 
 
 async def search(
@@ -126,3 +135,46 @@ async def agent_run(
     resp = await client.post(_AGENT_URL, json=body, headers=_headers())
     resp.raise_for_status()
     return resp.json()
+
+
+async def browser_session_create(
+    url: str | None = None,
+    *,
+    timeout_seconds: int | None = None,
+) -> dict:
+    """Create a TinyFish remote browser session.
+
+    Paid: 1 credit per 4 minutes of session time (~$0.015/credit PAYG).
+    60-minute hard cap per session. Failed sessions cost $0.
+
+    Returns dict with:
+        session_id: str — unique identifier (e.g. "br-a1b2c3d4-...")
+        cdp_url: str — WebSocket URL for playwright.chromium.connect_over_cdp()
+        base_url: str — HTTPS base for session-level REST calls
+    """
+    body: dict = {}
+    if url:
+        body["url"] = url
+    if timeout_seconds is not None:
+        body["timeout_seconds"] = max(5, min(timeout_seconds, 3600))
+
+    client = _get_browser_client()
+    resp = await client.post(_BROWSER_URL, json=body, headers=_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def browser_session_delete(session_id: str) -> None:
+    """Terminate a TinyFish browser session. Idempotent.
+
+    Always call in a finally block after CDP work to avoid credit burn
+    from inactivity timeout.
+    """
+    client = _get_browser_client()
+    resp = await client.delete(
+        f"{_BROWSER_URL}{session_id}",
+        headers=_headers(),
+    )
+    # 204 = deleted, 404 = already gone — both are fine
+    if resp.status_code not in (204, 404):
+        resp.raise_for_status()
