@@ -132,11 +132,16 @@ fi
 if [[ "$POST_MERGE" == "false" ]]; then
     DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v "^??")
     if [[ -n "$DIRTY_FILES" ]]; then
-        echo "ERROR: Working tree has uncommitted changes. Commit or stash them first:"
+        echo "ERROR: Working tree has uncommitted changes. Clean them up first:"
         echo "$DIRTY_FILES"
         echo ""
-        echo "  git stash        # to save and restore after update"
-        echo "  git add -p && git commit -m 'chore: save local changes'  # to commit"
+        # Mid-merge state (UU/AA entries) needs abort, not stash/commit
+        if git -C "$GENESIS_ROOT" rev-parse --verify MERGE_HEAD &>/dev/null; then
+            echo "  Repo is mid-merge. Run: git merge --abort"
+        else
+            echo "  git stash        # save and restore after update"
+            echo "  git add -p && git commit -m 'chore: save local changes'  # commit"
+        fi
         exit 1
     fi
 fi
