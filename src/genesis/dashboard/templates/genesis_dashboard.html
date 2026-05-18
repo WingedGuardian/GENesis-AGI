@@ -1212,7 +1212,7 @@
                 }
               }
               // Silent-death detection: process ended without leaving any state
-              if (!prog.in_progress && !prog.summary && !prog.escalation && !prog.conflicts) {
+              if (!prog.in_progress && !prog.summary && !prog.escalation && !(prog.conflicts && prog.conflicts.length)) {
                 if (seenInProgress || Date.now() - start > 30000) {
                   clearInterval(poll);
                   this._updating = false;
