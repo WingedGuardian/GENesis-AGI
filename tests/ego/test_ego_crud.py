@@ -318,6 +318,22 @@ class TestCreateProposalNewFields:
         assert row["execution_plan"] is None
         assert row["recurring"] == 0
 
+    async def test_goal_id_stored(self, db_with_proposals):
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs("p1", goal_id="goal-abc-123"),
+        )
+        row = await ego_crud.get_proposal(db_with_proposals, "p1")
+        assert row["goal_id"] == "goal-abc-123"
+
+    async def test_goal_id_default_none(self, db_with_proposals):
+        await ego_crud.create_proposal(
+            db_with_proposals,
+            **_make_proposal_kwargs("p1"),
+        )
+        row = await ego_crud.get_proposal(db_with_proposals, "p1")
+        assert row["goal_id"] is None
+
 
 class TestTableProposal:
     async def test_table_pending(self, db_with_proposals):
