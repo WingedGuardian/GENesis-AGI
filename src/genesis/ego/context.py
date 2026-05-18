@@ -379,6 +379,7 @@ class EgoContextBuilder:
                 outcome = "dispatched"
             else:
                 outcome = "—"
+            outcome = outcome.replace("|", "/").replace("\n", " ")
             lines.append(
                 f"| {action_type} | {category} | {status} | {outcome} | {short} |"
             )
