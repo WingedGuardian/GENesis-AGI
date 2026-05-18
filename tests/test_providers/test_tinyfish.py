@@ -1,9 +1,10 @@
-"""Tests for TinyFish adapters (search, fetch, agent) and MCP tool wiring."""
+"""Tests for TinyFish adapters (search, fetch, agent, browser) and MCP tool wiring."""
 
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from genesis.providers.protocol import ToolProvider
@@ -391,3 +392,119 @@ class TestWebFetchMulti:
 
         assert "error" in result
         assert "API_KEY_TINYFISH" in result["error"]
+
+
+# ── Browser client functions ─────────────────────────────────────
+
+
+class TestBrowserSessionCreate:
+    @pytest.mark.asyncio
+    async def test_creates_session_with_url(self):
+        from genesis.providers.tinyfish_client import browser_session_create
+
+        mock_response = httpx.Response(
+            status_code=201,
+            json={
+                "session_id": "br-test-1234",
+                "cdp_url": "wss://test.tinyfish.io/cdp-1234",
+                "base_url": "https://test.tinyfish.io/cdp-1234",
+            },
+            request=httpx.Request("POST", "https://api.browser.tinyfish.ai/"),
+        )
+
+        with patch.dict("os.environ", ENV), \
+             patch("genesis.providers.tinyfish_client._get_browser_client") as mock_client:
+            mock_client.return_value.post = AsyncMock(return_value=mock_response)
+            result = await browser_session_create(url="https://example.com")
+
+        assert result["session_id"] == "br-test-1234"
+        assert result["cdp_url"].startswith("wss://")
+        # Verify URL was passed in body
+        call_kwargs = mock_client.return_value.post.call_args
+        assert call_kwargs[1]["json"]["url"] == "https://example.com"
+
+    @pytest.mark.asyncio
+    async def test_creates_session_without_url(self):
+        from genesis.providers.tinyfish_client import browser_session_create
+
+        mock_response = httpx.Response(
+            status_code=201,
+            json={
+                "session_id": "br-test-5678",
+                "cdp_url": "wss://test.tinyfish.io/cdp-5678",
+                "base_url": "https://test.tinyfish.io/cdp-5678",
+            },
+            request=httpx.Request("POST", "https://api.browser.tinyfish.ai/"),
+        )
+
+        with patch.dict("os.environ", ENV), \
+             patch("genesis.providers.tinyfish_client._get_browser_client") as mock_client:
+            mock_client.return_value.post = AsyncMock(return_value=mock_response)
+            result = await browser_session_create()
+
+        assert result["session_id"] == "br-test-5678"
+        # No URL in body
+        call_kwargs = mock_client.return_value.post.call_args
+        assert "url" not in call_kwargs[1]["json"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_seconds_clamped(self):
+        from genesis.providers.tinyfish_client import browser_session_create
+
+        mock_response = httpx.Response(
+            status_code=201,
+            json={"session_id": "br-x", "cdp_url": "wss://x", "base_url": "https://x"},
+            request=httpx.Request("POST", "https://api.browser.tinyfish.ai/"),
+        )
+
+        with patch.dict("os.environ", ENV), \
+             patch("genesis.providers.tinyfish_client._get_browser_client") as mock_client:
+            mock_client.return_value.post = AsyncMock(return_value=mock_response)
+            # Value below minimum 5 should be clamped
+            await browser_session_create(timeout_seconds=1)
+
+        call_kwargs = mock_client.return_value.post.call_args
+        assert call_kwargs[1]["json"]["timeout_seconds"] == 5
+
+    @pytest.mark.asyncio
+    async def test_missing_api_key_raises(self):
+        from genesis.providers.tinyfish_client import browser_session_create
+
+        with patch.dict("os.environ", {}, clear=True), \
+             pytest.raises(ValueError, match="API_KEY_TINYFISH"):
+            await browser_session_create()
+
+
+class TestBrowserSessionDelete:
+    @pytest.mark.asyncio
+    async def test_deletes_session(self):
+        from genesis.providers.tinyfish_client import browser_session_delete
+
+        mock_response = httpx.Response(
+            status_code=204,
+            request=httpx.Request("DELETE", "https://api.browser.tinyfish.ai/br-test-1234"),
+        )
+
+        with patch.dict("os.environ", ENV), \
+             patch("genesis.providers.tinyfish_client._get_browser_client") as mock_client:
+            mock_client.return_value.delete = AsyncMock(return_value=mock_response)
+            await browser_session_delete("br-test-1234")
+
+        # Verify correct URL used
+        call_args = mock_client.return_value.delete.call_args
+        assert "br-test-1234" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_already_deleted_is_ok(self):
+        from genesis.providers.tinyfish_client import browser_session_delete
+
+        mock_response = httpx.Response(
+            status_code=404,
+            request=httpx.Request("DELETE", "https://api.browser.tinyfish.ai/br-gone"),
+        )
+
+        with patch.dict("os.environ", ENV), \
+             patch("genesis.providers.tinyfish_client._get_browser_client") as mock_client:
+            mock_client.return_value.delete = AsyncMock(return_value=mock_response)
+            # Should not raise — 404 is treated as idempotent success
+            await browser_session_delete("br-gone")

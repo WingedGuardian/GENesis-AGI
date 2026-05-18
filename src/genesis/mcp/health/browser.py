@@ -48,6 +48,12 @@ _remote_page = None  # Active page on user's remote Chrome
 _remote_cdp_url: str | None = None  # e.g. "http://100.x.y.z:9222"
 _remote_last_url: str | None = None  # URL at last Genesis action (drift detection)
 
+# Layer 4: TinyFish cloud browser (on-demand CDP, paid credits)
+_tinyfish_pw = None  # Playwright instance for TinyFish session
+_tinyfish_browser = None  # CDP Browser connection to TinyFish
+_tinyfish_page = None  # Active page
+_tinyfish_session_id: str | None = None  # For cleanup via DELETE
+
 # Collaborative mode — when True, browser launches headed on virtual display :99.
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
@@ -104,6 +110,9 @@ async def async_cleanup():
 
     # Remote CDP: disconnect (does NOT close user's Chrome)
     await _cleanup_remote_cdp()
+
+    # TinyFish: terminate cloud session (stops credit burn)
+    await _cleanup_tinyfish()
 
     if _context is not None:
         try:
@@ -342,6 +351,148 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
         return _remote_page
 
 
+async def _cleanup_tinyfish():
+    """Clean up TinyFish browser session (terminate to stop credit burn).
+
+    Timeouts match the existing user-approved 10s pattern in async_cleanup().
+    """
+    global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
+
+    if _tinyfish_browser is not None:
+        try:
+            await asyncio.wait_for(_tinyfish_browser.close(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("TinyFish browser close timed out (10s)")
+        except Exception:
+            logger.debug("TinyFish browser cleanup failed", exc_info=True)
+        _tinyfish_browser = None
+
+    if _tinyfish_pw is not None:
+        try:
+            await asyncio.wait_for(_tinyfish_pw.stop(), timeout=10.0)
+        except TimeoutError:
+            logger.warning("TinyFish Playwright stop timed out (10s)")
+        except Exception:
+            logger.debug("TinyFish Playwright cleanup failed", exc_info=True)
+        _tinyfish_pw = None
+
+    _tinyfish_page = None
+
+    # Terminate the remote session to stop credit consumption
+    if _tinyfish_session_id is not None:
+        try:
+            from genesis.providers.tinyfish_client import browser_session_delete
+
+            await asyncio.wait_for(
+                browser_session_delete(_tinyfish_session_id), timeout=10.0,
+            )
+            logger.info("TinyFish session %s terminated", _tinyfish_session_id[:12])
+        except TimeoutError:
+            logger.warning(
+                "TinyFish session %s DELETE timed out (10s)",
+                _tinyfish_session_id[:12],
+            )
+        except Exception:
+            logger.warning(
+                "Failed to terminate TinyFish session %s",
+                _tinyfish_session_id[:12],
+                exc_info=True,
+            )
+        _tinyfish_session_id = None
+
+
+async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
+    """Create a TinyFish cloud browser session and connect via CDP.
+
+    Returns (page, is_new_session). When is_new_session is True and url was
+    provided, the page has already navigated to the URL (skip goto).
+
+    Always call _cleanup_tinyfish() when done to terminate the session
+    and stop credit consumption.
+    """
+    global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
+
+    async with _browser_lock:
+        # Already connected and alive — reuse
+        if _tinyfish_page is not None and _tinyfish_browser is not None:
+            if _tinyfish_browser.is_connected() and _is_page_alive(_tinyfish_page):
+                return _tinyfish_page, False
+            logger.warning("TinyFish session stale — cleaning up")
+            await _cleanup_tinyfish()
+
+        from playwright.async_api import async_playwright
+
+        from genesis.providers.tinyfish_client import browser_session_create
+
+        # Create remote browser session (takes 10-30s)
+        logger.info("Creating TinyFish browser session...")
+        session = await browser_session_create(url=url)
+        _tinyfish_session_id = session["session_id"]
+        cdp_url = session["cdp_url"]
+        logger.info(
+            "TinyFish session %s created — connecting via CDP",
+            _tinyfish_session_id[:12],
+        )
+
+        _tinyfish_pw = await async_playwright().start()
+        try:
+            _tinyfish_browser = await _tinyfish_pw.chromium.connect_over_cdp(cdp_url)
+        except Exception as e:
+            await _tinyfish_pw.stop()
+            _tinyfish_pw = None
+            # Terminate the session we just created
+            try:
+                from genesis.providers.tinyfish_client import browser_session_delete
+
+                await browser_session_delete(_tinyfish_session_id)
+            except Exception:
+                pass
+            _tinyfish_session_id = None
+            raise ConnectionError(
+                f"TinyFish CDP connection failed: {e}"
+            ) from e
+
+        # Handle disconnection: clear state and terminate session
+        _tinyfish_browser.on("disconnected", lambda: _on_tinyfish_disconnected())
+
+        # TinyFish docs: sleep 2s after connect for startup nav to settle
+        await asyncio.sleep(2)
+
+        # Get the page (TinyFish starts with one context, one tab)
+        _tinyfish_page = None
+        for ctx in _tinyfish_browser.contexts:
+            for pg in ctx.pages:
+                _tinyfish_page = pg
+                break
+            if _tinyfish_page is not None:
+                break
+
+        if _tinyfish_page is None:
+            contexts = _tinyfish_browser.contexts
+            if contexts:
+                _tinyfish_page = await contexts[0].new_page()
+            else:
+                ctx = await _tinyfish_browser.new_context()
+                _tinyfish_page = await ctx.new_page()
+
+        if url:
+            await _tinyfish_page.wait_for_load_state("domcontentloaded")
+
+        logger.info("TinyFish browser ready — session %s", _tinyfish_session_id[:12])
+        return _tinyfish_page, True
+
+
+def _on_tinyfish_disconnected():
+    """Handle TinyFish CDP disconnection — clear state, log warning."""
+    global _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
+    sid = _tinyfish_session_id[:12] if _tinyfish_session_id else "unknown"
+    logger.warning("TinyFish CDP disconnected (session %s)", sid)
+    _tinyfish_browser = None
+    _tinyfish_page = None
+    # session_id is intentionally NOT cleared here — async_cleanup()
+    # or next _ensure_tinyfish_browser() will attempt DELETE
+
+
 def _touch():
     """Record browser activity timestamp for idle timeout tracking."""
     global _last_used
@@ -387,18 +538,27 @@ async def _get_page(
     stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
+    tinyfish: bool = False,
+    tinyfish_url: str | None = None,
 ):
     """Get the appropriate browser page based on mode.
 
     Default (stealth=True): Camoufox (anti-detection, primary).
     Plain (stealth=False): Chromium fallback for Camoufox-incompatible sites.
     Remote (remote=True): User's real Chrome via CDP over Tailscale.
+    TinyFish (tinyfish=True): Cloud-hosted CDP browser (paid credits).
 
     Sets _active_page so subsequent interaction tools (click, fill, etc.)
     use whichever browser was last navigated.
+
+    Returns (page, is_new_tinyfish_session) — is_new_tinyfish_session is True
+    only when a fresh TinyFish session was just created (URL already loaded).
     """
     global _active_page
-    if remote:
+    is_new_tinyfish = False
+    if tinyfish:
+        _active_page, is_new_tinyfish = await _ensure_tinyfish_browser(url=tinyfish_url)
+    elif remote:
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
         _active_page = await _ensure_browser()
@@ -406,7 +566,7 @@ async def _get_page(
         _active_page = await _ensure_chromium_fallback()
     _touch()
     _start_idle_watcher()
-    return _active_page
+    return _active_page, is_new_tinyfish
 
 
 async def _snapshot_page(page) -> str:
@@ -983,10 +1143,14 @@ async def _impl_browser_navigate(
     stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
+    tinyfish: bool = False,
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
     global _collaborate_mode, _remote_last_url
     _touch()
+
+    if tinyfish and remote:
+        return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
 
     # Auto-enable collaborate timing for remote CDP (user watching their screen)
     if remote and not _collaborate_mode:
@@ -994,14 +1158,21 @@ async def _impl_browser_navigate(
         logger.info("Auto-enabled collaborate timing for remote CDP session")
 
     try:
-        page = await _get_page(stealth, remote=remote, cdp_url=cdp_url)
+        page, is_new_tinyfish = await _get_page(
+            stealth, remote=remote, cdp_url=cdp_url,
+            tinyfish=tinyfish, tinyfish_url=url if tinyfish else None,
+        )
     except ConnectionError as e:
         return {"error": str(e)}
     except ImportError as e:
         return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        # Skip goto only when TinyFish session was JUST created with this URL
+        # (it already navigated on creation). Subsequent navigations must goto.
+        skip_goto = is_new_tinyfish and url
+        if not skip_goto:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
         # Turnstile detection only for Camoufox (real Chrome won't trigger it)
         turnstile_result = None
@@ -1013,13 +1184,21 @@ async def _impl_browser_navigate(
             _remote_last_url = page.url
 
         snapshot = await _snapshot_page(page)
+
+        def _layer_name():
+            if tinyfish:
+                return "tinyfish_cdp"
+            if _is_remote_active():
+                return "remote_cdp"
+            if _is_camoufox_active():
+                return "camoufox"
+            return "chromium"
+
         result = {
             "url": page.url,
             "title": await page.title(),
             "snapshot": snapshot,
-            "layer": "remote_cdp" if _is_remote_active() else (
-                "camoufox" if _is_camoufox_active() else "chromium"
-            ),
+            "layer": _layer_name(),
         }
         if turnstile_result:
             result["turnstile"] = turnstile_result
@@ -1260,6 +1439,7 @@ async def browser_navigate(
     stealth: bool = True,
     remote: bool = False,
     cdp_url: str | None = None,
+    tinyfish: bool = False,
 ) -> dict:
     """Navigate to a URL and return an accessibility tree snapshot.
 
@@ -1279,13 +1459,17 @@ async def browser_navigate(
     Collaborate timing is auto-enabled. Use for ATS submissions with aggressive
     anti-bot detection (Ashby, Greenhouse with reCAPTCHA v3).
 
+    Set tinyfish=True for a cloud-hosted browser via TinyFish Browser API.
+    Fresh isolated Chromium on each session. Paid: 1 credit per 4 minutes.
+    Use when local browsers fail anti-bot or you need a clean isolated session.
+
     cdp_url: Override the CDP endpoint. Default: GENESIS_CDP_URL env var.
     Example: browser_navigate("https://jobs.ashbyhq.com/...", remote=True)
 
     NOTE: If Cloudflare Turnstile is detected (Camoufox only), this call may
     block for up to ~5 minutes while waiting for human resolution via VNC.
     """
-    return await _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url)
+    return await _impl_browser_navigate(url, stealth, remote=remote, cdp_url=cdp_url, tinyfish=tinyfish)
 
 
 @mcp.tool()
