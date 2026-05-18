@@ -98,6 +98,12 @@ class EgoCadenceManager:
         self._reactive_max_per_hour = 3
         self._reactive_timestamps: list[datetime] = []
 
+        # Reactive dedup: skip events with same summary within window.
+        # Prevents the same deadline or observation from re-triggering
+        # a reactive cycle every 30 min (sweep interval).
+        self._reactive_seen: dict[str, datetime] = {}
+        self._reactive_dedup_hours = 6
+
     # -- Lifecycle ---------------------------------------------------------
 
     async def start(self) -> None:
@@ -193,11 +199,29 @@ class EgoCadenceManager:
         Events are debounced: the reactive loop waits 5 minutes after the
         first event before running a cycle (batching concurrent events).
         Rate-limited to 3 reactive cycles per hour.
+        Content-deduped: same summary within 6h window is skipped.
 
         event keys: {"type": str, "summary": str, "priority": str?, "source": str?}
         """
         if not self._running or self._paused:
             return
+
+        # Content dedup: skip if same summary seen recently
+        summary = event.get("summary", "")[:100]
+        now = datetime.now(UTC)
+        if summary in self._reactive_seen:
+            age = (now - self._reactive_seen[summary]).total_seconds()
+            if age < self._reactive_dedup_hours * 3600:
+                logger.debug("Reactive event deduped (%.0fm old): %s", age / 60, summary[:50])
+                return
+
+        # Prune old entries (keep dict bounded)
+        cutoff = now - timedelta(hours=self._reactive_dedup_hours)
+        self._reactive_seen = {
+            k: v for k, v in self._reactive_seen.items() if v > cutoff
+        }
+        self._reactive_seen[summary] = now
+
         try:
             self._reactive_queue.put_nowait(event)
             logger.debug("Reactive event queued: %s", event.get("type", "?"))
