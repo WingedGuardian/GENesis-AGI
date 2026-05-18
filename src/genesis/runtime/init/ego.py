@@ -253,6 +253,34 @@ async def init(rt: GenesisRuntime) -> None:
                         "Recorded ego dispatch outcome for session %s",
                         session_id[:8],
                     )
+
+                    # Write goal progress if proposal is linked to a goal
+                    if "ego_proposal:" in caller_ctx:
+                        try:
+                            from genesis.db.crud import ego as ego_crud
+                            from genesis.db.crud import user_goals
+
+                            _pid = caller_ctx.split("ego_proposal:")[-1]
+                            _prop = await ego_crud.get_proposal(rt._db, _pid)
+                            _gid = _prop.get("goal_id") if _prop else None
+                            if _gid:
+                                _content = (_prop.get("content") or "")[:80]
+                                _note = (
+                                    f"[{status}] Proposal: {_content} "
+                                    f"(session {session_id[:8]}, ${cost:.4f})"
+                                )
+                                await user_goals.add_progress_note(
+                                    rt._db, _gid, _note,
+                                )
+                                logger.info(
+                                    "Recorded goal progress for %s via %s",
+                                    _gid[:12], _pid[:8],
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Failed to record goal progress",
+                                exc_info=True,
+                            )
                 except Exception:
                     logger.warning(
                         "Failed to record ego dispatch outcome",
