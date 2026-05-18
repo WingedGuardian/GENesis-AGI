@@ -364,14 +364,24 @@ class EgoContextBuilder:
             lines.append("*No proposals in last 7 days.*\n")
             return "\n".join(lines)
 
-        lines.append("| Action | Category | Status | Response |")
-        lines.append("|--------|----------|--------|----------|")
+        lines.append("| Action | Category | Status | Outcome | Content |")
+        lines.append("|--------|----------|--------|---------|---------|")
         for action_type, category, content, status, response, _created in rows:
-            short = content[:80] + "..." if len(content) > 80 else content
+            short = content[:60] + "..." if len(content) > 60 else content
             short = short.replace("\n", " ").replace("|", "/")
-            resp = (response or "—")[:50]
+            # Parse outcome from user_response: "session:xxx|failed:reason"
+            resp = response or ""
+            if "|failed:" in resp:
+                outcome = "FAILED: " + resp.split("|failed:", 1)[1][:60]
+            elif "|completed:" in resp:
+                outcome = "OK: " + resp.split("|completed:", 1)[1][:60]
+            elif status == "executed" and resp and not resp.startswith("dispatching"):
+                outcome = "dispatched"
+            else:
+                outcome = "—"
+            outcome = outcome.replace("|", "/").replace("\n", " ")
             lines.append(
-                f"| {action_type} | {category} | {status} | {resp} |"
+                f"| {action_type} | {category} | {status} | {outcome} | {short} |"
             )
 
         lines.append("")
