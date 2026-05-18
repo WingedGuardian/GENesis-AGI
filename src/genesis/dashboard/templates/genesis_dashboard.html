@@ -1209,10 +1209,10 @@
                 }
               }
             } catch (e) { /* server may be restarting, keep polling */ }
-            if (Date.now() - start > 300000) {
+            if (Date.now() - start > 900000) {
               clearInterval(poll);
               this._updating = false;
-              alert("Update did not complete after 5 minutes.\nCheck server logs for status.");
+              alert("Update did not complete after 15 minutes.\nCheck server logs for status.");
               await this.fetchUpdateStatus();
             }
           }, 5000);
@@ -1241,8 +1241,13 @@
               }
             } catch (e) { /* keep polling */ }
           }, 5000);
-          // Safety timeout
-          setTimeout(() => { clearInterval(poll); this._resolvingConflicts = false; }, 600000);
+          // Safety timeout — alert and refresh status so user isn't left with a blank UI
+          setTimeout(async () => {
+            clearInterval(poll);
+            this._resolvingConflicts = false;
+            alert("Conflict resolution did not complete after 15 minutes.\nCheck server logs for status.");
+            await this.fetchUpdateStatus();
+          }, 900000);
         },
 
         async dismissUpdate() {

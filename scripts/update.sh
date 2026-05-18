@@ -125,6 +125,27 @@ if [ -x "$GENESIS_ROOT/scripts/backup.sh" ]; then
     echo ""
 fi
 
+# ── Dirty-tree guard ─────────────────────────────────────
+# Abort before touching anything if tracked files are modified.
+# Untracked files (^??) are excluded — merge/reset never touches them.
+# git reset --hard in _do_rollback would silently discard uncommitted work.
+if [[ "$POST_MERGE" == "false" ]]; then
+    DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v "^??")
+    if [[ -n "$DIRTY_FILES" ]]; then
+        echo "ERROR: Working tree has uncommitted changes. Clean them up first:"
+        echo "$DIRTY_FILES"
+        echo ""
+        # Mid-merge state (UU/AA entries) needs abort, not stash/commit
+        if git -C "$GENESIS_ROOT" rev-parse --verify MERGE_HEAD &>/dev/null; then
+            echo "  Repo is mid-merge. Run: git merge --abort"
+        else
+            echo "  git stash        # save and restore after update"
+            echo "  git add -p && git commit -m 'chore: save local changes'  # commit"
+        fi
+        exit 1
+    fi
+fi
+
 # ── Rollback tag ─────────────────────────────────────────
 ROLLBACK_TAG="pre-update-$(date +%Y%m%d-%H%M%S)"
 if [[ "$POST_MERGE" == "true" ]] && [ -f "$STATE_FILE" ]; then
@@ -489,9 +510,12 @@ CEOF
         trap - ERR
         exit 2
     else
-        # Not a conflict — some other merge error. Let ERR trap handle rollback.
+        # Not a conflict — some other merge error. Call rollback directly so the
+        # DB gets a meaningful reason instead of "command failed (exit 1): false".
         echo "  Merge failed: $MERGE_OUTPUT"
-        false  # triggers ERR trap → rollback
+        trap - ERR
+        _do_rollback "git merge failed: $(echo "$MERGE_OUTPUT" | head -3 | tr '\n' ' ')"
+        exit 1
     fi
 fi
 
