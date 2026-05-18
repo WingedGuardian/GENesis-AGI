@@ -241,6 +241,7 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         for g in goals:
+            goal_id = g.get("id", "?")
             priority = g.get("priority", "medium")
             title = g.get("title", "?")[:120]
             category = g.get("category", "")
@@ -249,7 +250,7 @@ class UserEgoContextBuilder:
             conf = g.get("confidence", 0.5)
             lines.append(
                 f"- [{priority.upper()}] **{title}** "
-                f"({category}{timeline_str}, conf={conf:.0%})"
+                f"(id={goal_id}, {category}{timeline_str}, conf={conf:.0%})"
             )
 
         lines.append("")
