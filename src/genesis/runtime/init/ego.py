@@ -60,9 +60,13 @@ async def init(rt: GenesisRuntime) -> None:
             logger.info("Ego disabled by config — skipping")
             return
 
-        # MCP config: reflection profile (genesis-health + genesis-memory)
+        # MCP configs: user ego gets memory-only, genesis ego gets full health+memory.
+        # User ego has no need for health tools — its jurisdiction is the user's
+        # world, not Genesis infrastructure. System issues reach it only via
+        # genesis ego escalations.
         config_builder = SessionConfigBuilder()
-        mcp_config_path = config_builder.build_mcp_config("reflection")
+        user_ego_mcp_path = config_builder.build_mcp_config("user_reflection")
+        genesis_ego_mcp_path = config_builder.build_mcp_config("reflection")
 
         # -- Shared components --
         # ProposalWorkflow is shared — both egos create proposals that go
@@ -109,7 +113,7 @@ async def init(rt: GenesisRuntime) -> None:
             db=rt._db,
             event_bus=rt._event_bus,
             direct_session_runner=rt._direct_session_runner,
-            mcp_config_path=mcp_config_path,
+            mcp_config_path=user_ego_mcp_path,
             prompt_path=_IDENTITY_DIR / "USER_EGO_SESSION.md",
             call_site="7_user_ego_cycle",
             session_id_key="user_ego_cc_session_id",
@@ -182,7 +186,7 @@ async def init(rt: GenesisRuntime) -> None:
             db=rt._db,
             event_bus=rt._event_bus,
             direct_session_runner=rt._direct_session_runner,
-            mcp_config_path=mcp_config_path,
+            mcp_config_path=genesis_ego_mcp_path,
             prompt_path=_IDENTITY_DIR / "GENESIS_EGO_SESSION.md",
             call_site="7_genesis_ego_cycle",
             session_id_key="genesis_ego_cc_session_id",

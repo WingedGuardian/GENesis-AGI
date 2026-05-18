@@ -417,52 +417,20 @@ class TestUserEgoContextBuilder:
         result = await builder.build()
         assert "No capabilities registered" in result
 
-    # ── System Status ───────────────────────────────────────────────────
+    # ── System Status (removed from user ego) ─────────────────────────
 
     @pytest.mark.asyncio
-    async def test_system_status_healthy(self, db, mock_health_data, capabilities):
+    async def test_no_system_status_section(self, db, mock_health_data, capabilities):
+        """System status is intentionally excluded from user ego context.
+
+        User ego has no jurisdiction over Genesis health — system issues
+        reach it only via genesis ego escalations.
+        """
         builder = UserEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "## System Status" in result
-        assert "all systems nominal" in result
-
-    @pytest.mark.asyncio
-    async def test_system_status_degraded(self, db, capabilities):
-        hd = AsyncMock()
-        hd.snapshot.return_value = {
-            "infrastructure": {
-                "genesis.db": {"status": "healthy", "latency_ms": 0.5},
-                "qdrant": {"status": "degraded", "latency_ms": 5000.0},
-                "ollama": {"status": "down", "latency_ms": None},
-            },
-            "resilience": "degraded",
-        }
-        builder = UserEgoContextBuilder(
-            db=db, health_data=hd, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "qdrant: degraded" in result
-        assert "ollama: down" in result
-
-    @pytest.mark.asyncio
-    async def test_system_status_no_health_data(self, db, capabilities):
-        builder = UserEgoContextBuilder(
-            db=db, health_data=None, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "Health data not available" in result
-
-    @pytest.mark.asyncio
-    async def test_system_status_snapshot_failure(self, db, capabilities):
-        hd = AsyncMock()
-        hd.snapshot.side_effect = RuntimeError("DB locked")
-        builder = UserEgoContextBuilder(
-            db=db, health_data=hd, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "Health snapshot failed" in result
+        assert "## System Status" not in result
 
     # ── Output Contract ─────────────────────────────────────────────────
 
@@ -496,7 +464,6 @@ class TestUserEgoContextBuilder:
             "## Backlogs",
             "## Genesis Ego Escalations",
             "## Genesis Capabilities",
-            "## System Status",
             "## Open Threads",
             "## Recent Proposals",
             "## Recurring Patterns (72h)",
