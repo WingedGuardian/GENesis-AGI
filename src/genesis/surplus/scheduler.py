@@ -743,7 +743,7 @@ class SurplusScheduler:
                 return
 
             # MemoryStore always holds the QdrantClient it was constructed with.
-            qdrant = store._qdrant
+            qdrant = store.qdrant_client
             if qdrant is None:
                 logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
                 return
