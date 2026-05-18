@@ -9,6 +9,16 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+### Changed
+
+- **Update polling** --- replaced 15-minute wall-clock timeout in the
+  dashboard update flow with state-based silent-death detection. The
+  poller now tracks whether the update process was ever seen alive
+  (`seenInProgress`) and alerts within one 5-second poll cycle if the
+  process ends without leaving a summary, escalation, or conflict
+  record. A 30-second startup grace period prevents false positives
+  during the brief PID-write window at launch.
+
 ---
 
 ## [v3.0b10] - 2026-05-15

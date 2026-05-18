@@ -1170,11 +1170,13 @@
             });
           } catch (e) { /* expected — server may restart */ }
           const start = Date.now();
+          let seenInProgress = false;
           const poll = setInterval(async () => {
             try {
               await this.fetchUpdateProgress();
               const prog = this.updateProgress;
               if (!prog) return;
+              if (prog.in_progress) seenInProgress = true;
               // Conflicts detected — stop polling, show resolve UI
               if (prog.escalation && (prog.escalation.includes("tier3_needed") || prog.escalation.includes("tier2_needed"))
                   && !prog.in_progress) {
@@ -1206,15 +1208,20 @@
                   this._updating = false;
                   await this.fetchUpdateStatus();
                   await this.fetchHealth();
+                  return;
+                }
+              }
+              // Silent-death detection: process ended without leaving any state
+              if (!prog.in_progress && !prog.summary && !prog.escalation && !(prog.conflicts && prog.conflicts.length)) {
+                if (seenInProgress || Date.now() - start > 30000) {
+                  clearInterval(poll);
+                  this._updating = false;
+                  alert("Update process ended without completing.\nCheck server logs for status.");
+                  await this.fetchUpdateStatus();
+                  return;
                 }
               }
             } catch (e) { /* server may be restarting, keep polling */ }
-            if (Date.now() - start > 900000) {
-              clearInterval(poll);
-              this._updating = false;
-              alert("Update did not complete after 15 minutes.\nCheck server logs for status.");
-              await this.fetchUpdateStatus();
-            }
           }, 5000);
         },
         async resolveConflicts() {
