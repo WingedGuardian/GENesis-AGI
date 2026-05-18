@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import aiosqlite
 import pytest
 
+from genesis.db.schema import TABLES
 from genesis.ego.user_context import UserEgoContextBuilder
 
 
@@ -504,6 +505,23 @@ class TestUserEgoContextBuilder:
         ]
         for section in expected_sections:
             assert section in result, f"Missing section: {section}"
+
+    @pytest.mark.asyncio
+    async def test_user_goals_renders_id(self, db, mock_health_data, capabilities):
+        """Goal IDs should appear in the rendered goals section."""
+        await db.execute(TABLES["user_goals"])
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, confidence, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))",
+            ("goal-abc-123", "Land AI engineering role", "career", "high", "active", 0.8),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "id=goal-abc-123" in result
+        assert "Land AI engineering role" in result
 
     @pytest.mark.asyncio
     async def test_user_model_long_value_truncated(
