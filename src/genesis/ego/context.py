@@ -405,7 +405,7 @@ class EgoContextBuilder:
                 "user_response, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
-                "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed') "
+                "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
                 "ORDER BY created_at DESC "
                 "LIMIT 10"
             )

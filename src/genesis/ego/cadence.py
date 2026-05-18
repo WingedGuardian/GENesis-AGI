@@ -328,7 +328,7 @@ class EgoCadenceManager:
     async def _on_tick(self) -> None:
         """Interval trigger handler. Checks all gates then runs cycle."""
         self._emit_heartbeat("tick")
-        logger.info(
+        logger.debug(
             "Ego tick fired (current_interval=%dm, config_cadence=%dm)",
             self._current_interval,
             self._config.cadence_minutes,
