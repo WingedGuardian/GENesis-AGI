@@ -2,7 +2,8 @@
 
 The user ego sees the world through the user's eyes: their conversations,
 their interests, their pending work, and what Genesis can do for them.
-Genesis-internal details are compressed to a one-line status.
+Genesis infrastructure is intentionally excluded — system issues reach
+the user ego ONLY via genesis ego escalations.
 
 This is an automated prompt generator — it builds the prompt the user
 WOULD give if they were sitting here. The quality of this prompt
@@ -30,6 +31,25 @@ _USER_WORLD_CATEGORIES = frozenset({
     "contribution", "user_model_delta",
 })
 
+# Keywords indicating a session is about Genesis internals (not user-world).
+# Used to annotate conversation transcripts so the user ego knows which
+# sessions fall under the Genesis ego's jurisdiction.
+_GENESIS_INTERNAL_KEYWORDS = frozenset({
+    "surplus", "dream cycle", "dream_cycle", "genesis runtime",
+    "routing config", "circuit breaker", "guardian", "sentinel", "qdrant",
+    "awareness loop", "health check", "dead letter", "model_routing",
+    "worktree", "genesis-development", "dashboard fix", "ego cycle",
+    "model eval", "surplus_task", "provider fallback", "watchdog",
+    "systemd", "genesis server", "eval batch", "j9 eval",
+    "runtime init", "embedding chain", "embedding fallback",
+})
+
+
+def _is_genesis_internal(topic: str) -> bool:
+    """Check if a session topic is about Genesis internals."""
+    topic_lower = topic.lower()
+    return any(kw in topic_lower for kw in _GENESIS_INTERNAL_KEYWORDS)
+
 
 class UserEgoContextBuilder:
     """Builds the user-focused operational briefing for the user ego.
@@ -44,19 +64,21 @@ class UserEgoContextBuilder:
     4. User-world observations — email, inbox, findings
     5. Genesis ego escalations — things Genesis can't resolve alone
     6. Capabilities — what Genesis CAN do but ISN'T doing
-    7. Minimal system status — one-line health summary
-    8. Open threads — pending follow-ups
+    7. Open threads — pending follow-ups
+
+    NOTE: System health is intentionally EXCLUDED. The user ego has no
+    jurisdiction over Genesis infrastructure. System issues reach it ONLY
+    via genesis ego escalations (source 5 above).
     """
 
     def __init__(
         self,
         *,
         db: aiosqlite.Connection,
-        health_data: Any | None = None,
+        health_data: Any | None = None,  # Retained for API compat; unused
         capabilities: dict[str, str] | None = None,
     ) -> None:
         self._db = db
-        self._health_data = health_data
         self._capabilities = capabilities or {}
 
     async def build(self) -> str:
@@ -78,7 +100,8 @@ class UserEgoContextBuilder:
         sections.append(await self._backlog_summary_section())
         sections.append(await self._genesis_escalations_section())
         sections.append(await self._capabilities_section())
-        sections.append(await self._system_status_section())
+        # System status removed — user ego has no jurisdiction over Genesis
+        # health.  System issues reach it ONLY via genesis ego escalations.
         sections.append(await self._follow_ups_section())
         sections.append(await self._proposal_history_section())
         sections.append(await self._proposal_board_section())
@@ -389,11 +412,12 @@ class UserEgoContextBuilder:
             short_topic = topic[:200] + "..." if len(topic) > 200 else topic
             short_topic = short_topic.replace("\n", " ")
             ts = started_at[:16] if started_at else "?"
-            lines.append(f"- [{ts}] ({model}) {short_topic}")
+            domain = " [Genesis internal]" if _is_genesis_internal(short_topic) else ""
+            lines.append(f"- [{ts}] ({model}) {short_topic}{domain}")
 
         lines.append(
-            "\nThese show what the user is actively working on. "
-            "Unfinished threads are opportunities to help.\n"
+            "\nSessions marked [Genesis internal] are system development work — "
+            "the Genesis ego's domain. Focus on user-facing threads only.\n"
         )
         return "\n".join(lines)
 
@@ -530,50 +554,6 @@ class UserEgoContextBuilder:
             "\nThink about which capabilities could serve the user "
             "that aren't being used enough.\n"
         )
-        return "\n".join(lines)
-
-    async def _system_status_section(self) -> str:
-        """Compressed one-liner — only RED items matter to the user ego."""
-        lines = ["## System Status (summary)\n"]
-
-        if not self._health_data:
-            lines.append("*Health data not available.*\n")
-            return "\n".join(lines)
-
-        try:
-            snap = await self._health_data.snapshot()
-        except Exception:
-            lines.append("*Health snapshot failed.*\n")
-            return "\n".join(lines)
-
-        resilience = snap.get("resilience", "unknown")
-        infra = snap.get("infrastructure", {})
-
-        # Only surface degraded/down items
-        problems = []
-        for key, val in sorted(infra.items()):
-            if isinstance(val, dict):
-                status = val.get("status", "?")
-                if status not in ("ok", "healthy"):
-                    problems.append(f"{key}: {status}")
-            elif isinstance(val, str) and val not in ("ok", "healthy"):
-                problems.append(f"{key}: {val}")
-
-        if problems:
-            lines.append(f"**State**: {resilience} — issues: {', '.join(problems)}")
-        else:
-            lines.append(f"**State**: {resilience} — all systems nominal.")
-
-        lines.append(
-            "\nGenesis ego handles infrastructure. Only act on system "
-            "issues if they directly impact the user.\n"
-        )
-
-        # Cost tracking is NOT the user ego's domain — it belongs to the
-        # Genesis ego (see genesis_context.py) or the dashboard.  Removed
-        # per audit: user ego was creating cost-focused follow-ups.
-
-        lines.append("")
         return "\n".join(lines)
 
     async def _follow_ups_section(self) -> str:
