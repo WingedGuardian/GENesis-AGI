@@ -543,7 +543,7 @@ The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **
 
 Every change is proposed to the user first. Genesis backs itself up before self-modification, tests in isolation, and rolls back automatically if something breaks.
 
-Nobody else is attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. We're bold enough to build it and find out which.
+Nobody else is attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. Giving a system a framework and the capability to autonomusly upgrade itself may end up being the pinnicale of an "AGI-like" system, or the downfall of the whole thing--we're bold enough to build it and find out which.
 
 <p align="center">
   <img src="docs/images/data-acceptable.jpg" alt="That is acceptable." width="280">
