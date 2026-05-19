@@ -244,21 +244,12 @@ async def run_extraction_cycle(
                                 memory_id, exc_info=True,
                             )
 
-                    # Goal signal detection
-                    try:
-                        from genesis.memory.goal_tracker import (
-                            process_extraction as _track_goal,
-                        )
-                        if await _track_goal(
-                            db, extraction,
-                            source_session_id=cc_session_id,
-                        ):
-                            summary["goals_detected"] += 1
-                    except Exception:
-                        logger.debug(
-                            "Goal tracker failed for %s",
-                            memory_id, exc_info=True,
-                        )
+                    # Goal signal detection — DISABLED: keyword matcher
+                    # produced ~95% false positives (277 garbage goals from
+                    # conversation snippets). Replaced by explicit goal
+                    # creation via MCP tool / foreground session.
+                    # See PR for context; re-enable when goal_tracker uses
+                    # LLM classification instead of keyword matching.
 
                     # Contact detection from person entities
                     try:

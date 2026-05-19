@@ -1104,6 +1104,12 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN ego_source TEXT",
         "ego_proposals.ego_source")
 
+    # Ego proposals: goal_id FK to user_goals — enables goal-proposal
+    # linkage and the progress feedback loop in _ego_dispatch_on_end.
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT",
+        "ego_proposals.goal_id")
+
     # Surplus insights: consumed_at so reflection can mark promoted insights
     # as processed without losing the 'promoted' status.
     await _try_alter(db,
