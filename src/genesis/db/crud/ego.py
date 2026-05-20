@@ -584,3 +584,80 @@ async def daily_dispatch_cost(
     except Exception:
         logger.warning("daily_dispatch_cost query failed", exc_info=True)
         return 0.0
+
+
+# ---------------------------------------------------------------------------
+# ego_directives
+# ---------------------------------------------------------------------------
+
+
+async def create_directive(
+    db: aiosqlite.Connection,
+    *,
+    content: str,
+    priority: str = "normal",
+    ego_target: str = "user_ego",
+    source: str = "user",
+) -> str:
+    """Insert a new ego directive. Returns the id."""
+    import uuid
+
+    directive_id = uuid.uuid4().hex[:16]
+    created_at = datetime.now(UTC).isoformat()
+    await db.execute(
+        """INSERT INTO ego_directives
+           (id, content, priority, source, ego_target, status, created_at)
+           VALUES (?, ?, ?, ?, ?, 'active', ?)""",
+        (directive_id, content, priority, source, ego_target, created_at),
+    )
+    await db.commit()
+    return directive_id
+
+
+async def list_active_directives(
+    db: aiosqlite.Connection,
+    ego_target: str = "user_ego",
+    limit: int = 5,
+) -> list[dict]:
+    """Active directives for a given ego target, newest first."""
+    cursor = await db.execute(
+        "SELECT * FROM ego_directives "
+        "WHERE status = 'active' AND ego_target = ? "
+        "ORDER BY created_at DESC LIMIT ?",
+        (ego_target, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def resolve_directive(
+    db: aiosqlite.Connection,
+    directive_id: str,
+    *,
+    status: str = "completed",
+    resolution: str = "",
+) -> bool:
+    """Mark a directive as completed/cancelled. Returns True if updated."""
+    resolved_at = datetime.now(UTC).isoformat()
+    cursor = await db.execute(
+        "UPDATE ego_directives SET status = ?, resolved_at = ?, resolution = ? "
+        "WHERE id = ? AND status = 'active'",
+        (status, resolved_at, resolution, directive_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_goal_proposal_summary(
+    db: aiosqlite.Connection,
+    goal_id: str,
+) -> dict[str, int]:
+    """Count proposals by status for a given goal_id."""
+    try:
+        cursor = await db.execute(
+            "SELECT status, count(*) FROM ego_proposals "
+            "WHERE goal_id = ? GROUP BY status",
+            (goal_id,),
+        )
+        return dict(await cursor.fetchall())
+    except Exception:
+        return {}
