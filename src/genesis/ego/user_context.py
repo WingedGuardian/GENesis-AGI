@@ -94,6 +94,7 @@ class UserEgoContextBuilder:
         sections.append(await self._user_model_section())
         sections.append(self._ego_notepad_section())
         sections.append(await self._user_goals_section())
+        sections.append(await self._user_directives_section())
         sections.append(await self._world_snapshot_section())
         sections.append(await self._user_activity_pulse_section())
         sections.append(await self._recent_conversations_section())
@@ -241,17 +242,118 @@ class UserEgoContextBuilder:
             )
             return "\n".join(lines)
 
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import ego as ego_crud
+
+        now = datetime.now(UTC)
+
         for g in goals:
             goal_id = g.get("id", "?")
             priority = g.get("priority", "medium")
             title = g.get("title", "?")[:120]
             category = g.get("category", "")
-            timeline = g.get("timeline") or ""
-            timeline_str = f" — {timeline}" if timeline else ""
-            conf = g.get("confidence", 0.5)
-            lines.append(
+
+            # Staleness: days since updated_at
+            updated_at = g.get("updated_at") or g.get("created_at") or ""
+            stale_str = ""
+            if updated_at:
+                try:
+                    updated = datetime.fromisoformat(updated_at)
+                    days_since = (now - updated).days
+                    if days_since >= 7:
+                        stale_str = f" STALE ({days_since}d)"
+                except (ValueError, TypeError):
+                    pass
+
+            # Latest progress note
+            progress_str = ""
+            progress_notes_raw = g.get("progress_notes", "[]")
+            try:
+                import json
+                notes = json.loads(progress_notes_raw) if isinstance(progress_notes_raw, str) else progress_notes_raw
+                if notes and isinstance(notes, list):
+                    latest = notes[-1]
+                    note_text = latest.get("note", str(latest)) if isinstance(latest, dict) else str(latest)
+                    progress_str = f' | Last: "{note_text[:60]}"'
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+            # Proposal outcome summary
+            proposal_str = ""
+            try:
+                summary = await ego_crud.get_goal_proposal_summary(self._db, goal_id)
+                if summary:
+                    parts = [f"{count} {status}" for status, count in summary.items()]
+                    proposal_str = f" | Proposals: {', '.join(parts)}"
+            except Exception:
+                pass
+
+            # Render
+            header = (
                 f"- [{priority.upper()}] **{title}** "
-                f"(id={goal_id}, {category}{timeline_str}, conf={conf:.0%})"
+                f"(id={goal_id}, {category})"
+            )
+            detail_parts = [p for p in [stale_str, progress_str, proposal_str] if p]
+            if detail_parts:
+                detail = "".join(detail_parts).lstrip(" |")
+                lines.append(f"{header}\n  {detail}")
+            else:
+                lines.append(header)
+
+        lines.append("")
+        return "\n".join(lines)
+
+    async def _user_directives_section(self) -> str:
+        """User directives — explicit user instructions for the ego.
+
+        Only rendered if there are active directives. Returns empty string
+        otherwise to avoid polluting context with empty sections.
+        """
+        try:
+            from genesis.db.crud import ego as ego_crud
+
+            directives = await ego_crud.list_active_directives(
+                self._db, ego_target="user_ego", limit=5,
+            )
+        except Exception:
+            logger.debug("Failed to query ego directives", exc_info=True)
+            return ""
+
+        if not directives:
+            return ""
+
+        lines = ["## User Directives\n"]
+        lines.append(
+            "*The user flagged these as important. Factor them into your "
+            "thinking — but you decide what to propose.*\n"
+        )
+
+        from datetime import UTC, datetime
+
+        now = datetime.now(UTC)
+        for d in directives:
+            priority = d.get("priority", "normal").upper()
+            content = d.get("content", "?")[:200]
+            directive_id = d.get("id", "?")
+            created_at = d.get("created_at", "")
+            # Compute age
+            age_str = ""
+            if created_at:
+                try:
+                    created = datetime.fromisoformat(created_at)
+                    delta = now - created
+                    if delta.days > 0:
+                        age_str = f"{delta.days}d ago"
+                    else:
+                        hours = int(delta.total_seconds() / 3600)
+                        age_str = f"{hours}h ago" if hours > 0 else "just now"
+                except (ValueError, TypeError):
+                    pass
+            age_part = f", {age_str}" if age_str else ""
+            lines.append(
+                f"- [{priority}] {content}\n"
+                f"  (id={directive_id}{age_part})"
             )
 
         lines.append("")

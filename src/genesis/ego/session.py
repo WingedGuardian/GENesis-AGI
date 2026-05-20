@@ -398,7 +398,27 @@ class EgoSession:
                     cycle.id,
                 )
 
-            # 10c. Process knowledge notepad updates (user ego only)
+            # 10c. Resolve directives the ego addressed
+            resolved_directives = parsed.get("resolved_directives", [])
+            if isinstance(resolved_directives, list):
+                for rd in resolved_directives:
+                    if isinstance(rd, dict) and "id" in rd:
+                        try:
+                            await ego_crud.resolve_directive(
+                                self._db, rd["id"],
+                                status="completed",
+                                resolution=rd.get("resolution", ""),
+                            )
+                            logger.info(
+                                "Directive %s resolved by ego", rd["id"],
+                            )
+                        except Exception:
+                            logger.debug(
+                                "Failed to resolve directive %s",
+                                rd.get("id"), exc_info=True,
+                            )
+
+            # 10d. Process knowledge notepad updates (user ego only)
             knowledge_updates = parsed.get("knowledge_updates", [])
             if knowledge_updates and self._source_tag == "user_ego_cycle":
                 await self._apply_knowledge_updates(knowledge_updates)
@@ -1442,6 +1462,20 @@ def _validate_output(data: dict) -> dict | None:
                 and isinstance(u.get("section"), str)
                 and u.get("action") in _VALID_NOTEPAD_ACTIONS
                 and isinstance(u.get("content"), str)
+            ]
+
+    # Sanitize resolved_directives — filter malformed entries.
+    if "resolved_directives" in data:
+        raw = data["resolved_directives"]
+        if not isinstance(raw, list):
+            data["resolved_directives"] = []
+        else:
+            data["resolved_directives"] = [
+                r
+                for r in raw
+                if isinstance(r, dict)
+                and isinstance(r.get("id"), str)
+                and r["id"]
             ]
 
     return data

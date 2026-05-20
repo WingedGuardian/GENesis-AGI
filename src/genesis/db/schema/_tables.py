@@ -786,6 +786,22 @@ TABLES = {
             updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """,
+    # ── Ego Directives ─────────────────────────────────────────────────────
+    "ego_directives": """
+        CREATE TABLE IF NOT EXISTS ego_directives (
+            id          TEXT PRIMARY KEY,
+            content     TEXT NOT NULL,
+            priority    TEXT NOT NULL DEFAULT 'normal'
+                CHECK (priority IN ('low', 'normal', 'high', 'critical')),
+            source      TEXT NOT NULL DEFAULT 'user',
+            ego_target  TEXT NOT NULL DEFAULT 'user_ego',
+            status      TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'completed', 'cancelled')),
+            created_at  TEXT NOT NULL,
+            resolved_at TEXT,
+            resolution  TEXT
+        )
+    """,
     # ── Intervention Journal ────────────────────────────────────────────────
     "intervention_journal": """
         CREATE TABLE IF NOT EXISTS intervention_journal (
@@ -1224,6 +1240,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
     "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
+    # ego directives
+    "CREATE INDEX IF NOT EXISTS idx_ego_directives_status ON ego_directives(status)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_directives_created ON ego_directives(created_at)",
     # intervention journal
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_status ON intervention_journal(outcome_status)",
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_proposal ON intervention_journal(proposal_id)",

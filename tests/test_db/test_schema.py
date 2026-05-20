@@ -88,7 +88,7 @@ async def test_no_unexpected_tables(db):
         "direct_session_queue",
         "eval_events", "eval_snapshots",
         "memory_events",
-        "user_goals", "user_contacts",
+        "user_goals", "user_contacts", "ego_directives",
         "tool_call_outcomes",
     }
     for table in tables:

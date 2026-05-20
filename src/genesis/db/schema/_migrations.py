@@ -1389,7 +1389,7 @@ async def _migrate_world_model_tables(db: aiosqlite.Connection) -> None:
     """
     from genesis.db.schema._tables import TABLES
 
-    for table_name in ("user_goals", "user_contacts"):
+    for table_name in ("user_goals", "user_contacts", "ego_directives"):
         ddl = TABLES.get(table_name)
         if ddl:
             try:
