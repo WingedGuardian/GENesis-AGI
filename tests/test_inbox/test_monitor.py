@@ -451,6 +451,24 @@ async def test_build_prompt_no_urls_section_when_none(monitor, inbox_dir):
     assert "### Content:" in prompt
 
 
+@pytest.mark.asyncio
+async def test_build_prompt_includes_delta_instruction(monitor, inbox_dir):
+    """Prompt includes delta evaluation instruction to prevent re-evaluation."""
+    from genesis.inbox.types import InboxItem
+
+    item = InboxItem(
+        id="delta-test",
+        file_path=str(inbox_dir / "Genesis.md"),
+        content="https://example.com/new-article",
+        content_hash="ghi",
+        detected_at="2026-05-21",
+    )
+    prompt = monitor._build_prompt([item])
+    assert "DELTA EVALUATION" in prompt
+    assert "Do NOT use the Read tool" in prompt
+    assert "ONLY" in prompt
+
+
 # --- Acknowledged classification tests ---
 
 
