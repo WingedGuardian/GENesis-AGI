@@ -756,7 +756,12 @@ class EgoSession:
             if profile not in VALID_PROFILES:
                 profile = "observe"
             model_str = brief.get("model", "sonnet")
-            model = CCModel.SONNET if model_str != "haiku" else CCModel.HAIKU
+            if model_str == "opus":
+                model = CCModel.OPUS
+            elif model_str == "haiku":
+                model = CCModel.HAIKU
+            else:
+                model = CCModel.SONNET
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
