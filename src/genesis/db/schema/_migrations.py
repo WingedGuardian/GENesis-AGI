@@ -1229,7 +1229,11 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 rank            INTEGER,
                 execution_plan  TEXT,
                 recurring       INTEGER DEFAULT 0,
-                memory_basis    TEXT DEFAULT ''
+                memory_basis    TEXT DEFAULT '',
+                realist_verdict  TEXT,
+                realist_reasoning TEXT,
+                ego_source       TEXT,
+                goal_id          TEXT
             )
         """)
         await db.execute("""
@@ -1237,12 +1241,14 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
                 (id, action_type, action_category, content, rationale,
                  confidence, urgency, alternatives, status, user_response,
                  cycle_id, batch_id, created_at, resolved_at, expires_at,
-                 rank, execution_plan, recurring, memory_basis)
+                 rank, execution_plan, recurring, memory_basis,
+                 realist_verdict, realist_reasoning, ego_source, goal_id)
             SELECT
                 id, action_type, action_category, content, rationale,
                 confidence, urgency, alternatives, status, user_response,
                 cycle_id, batch_id, created_at, resolved_at, expires_at,
-                rank, execution_plan, recurring, memory_basis
+                rank, execution_plan, recurring, memory_basis,
+                realist_verdict, realist_reasoning, ego_source, goal_id
             FROM ego_proposals
         """)
         await db.execute("DROP TABLE ego_proposals")
@@ -1258,6 +1264,7 @@ async def _migrate_ego_proposals_status_check(db: aiosqlite.Connection) -> None:
             "CREATE INDEX IF NOT EXISTS idx_ego_proposals_batch ON ego_proposals(batch_id)",
             "CREATE INDEX IF NOT EXISTS idx_ego_proposals_expires ON ego_proposals(expires_at)",
             "CREATE INDEX IF NOT EXISTS idx_ego_proposals_rank ON ego_proposals(status, rank)",
+            "CREATE INDEX IF NOT EXISTS idx_ego_proposals_goal ON ego_proposals(goal_id)",
         ]:
             await db.execute(idx_sql)
         await db.commit()

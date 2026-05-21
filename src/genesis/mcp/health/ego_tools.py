@@ -15,6 +15,12 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
+# Validation sets matching DB CHECK constraints
+_VALID_DIRECTIVE_PRIORITIES = frozenset({"low", "normal", "high", "critical"})
+_VALID_EGO_TARGETS = frozenset({"user_ego", "genesis_ego"})
+_VALID_GOAL_CATEGORIES = frozenset({"career", "project", "learning", "relationship", "financial", "other"})
+_VALID_GOAL_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
+
 
 def _get_db_path():
     """Late-import DB path."""
@@ -115,6 +121,11 @@ async def ego_directive(
         priority: low, normal, high, or critical
         ego_target: user_ego (default) or genesis_ego
     """
+    if priority not in _VALID_DIRECTIVE_PRIORITIES:
+        return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_DIRECTIVE_PRIORITIES)}"}
+    if ego_target not in _VALID_EGO_TARGETS:
+        return {"status": "error", "reason": f"Invalid ego_target: {ego_target!r}. Must be one of: {sorted(_VALID_EGO_TARGETS)}"}
+
     import aiosqlite
 
     from genesis.db.crud import ego as ego_crud
@@ -161,6 +172,11 @@ async def ego_goal_create(
         description: Detailed description of the goal
         timeline: Expected timeline (e.g., "Q2 2026")
     """
+    if category not in _VALID_GOAL_CATEGORIES:
+        return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
+    if priority not in _VALID_GOAL_PRIORITIES:
+        return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_GOAL_PRIORITIES)}"}
+
     import aiosqlite
 
     from genesis.db.crud import user_goals
@@ -238,6 +254,13 @@ async def ego_goal_update(
         timeline: New timeline (optional)
         status: Set to 'achieved' or 'abandoned' to close the goal (optional)
     """
+    if category and category not in _VALID_GOAL_CATEGORIES:
+        return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
+    if priority and priority not in _VALID_GOAL_PRIORITIES:
+        return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_GOAL_PRIORITIES)}"}
+    if status and status not in ("achieved", "abandoned"):
+        return {"status": "error", "reason": f"Invalid status: {status!r}. Must be 'achieved' or 'abandoned'"}
+
     import aiosqlite
 
     from genesis.db.crud import user_goals
