@@ -1229,6 +1229,12 @@ class InboxMonitor:
         parts = [
             f"Evaluate the following {len(items)} inbox item(s).\n",
             "For each item, decide its type and provide a full evaluation.\n",
+            (
+                "⚠️ **DELTA EVALUATION** — The content below contains ONLY new "
+                "items added since the last evaluation. Do NOT use the Read tool "
+                "to open the source inbox file. Do NOT re-evaluate items that are "
+                "not listed below. Evaluate ONLY the content provided here.\n"
+            ),
         ]
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
