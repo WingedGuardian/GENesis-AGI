@@ -55,6 +55,7 @@ class ReflectionResult:
     success: bool
     output: MicroOutput | LightOutput | None = None
     reason: str | None = None
+    stored: bool = False
 
 
 @dataclass(frozen=True)

@@ -120,4 +120,6 @@ class ReflectionEngine:
         # 5. Write results (returns False if gated by salience/dedup)
         stored = await self._writer.write(parsed.output, depth, tick, db=db)
 
-        return ReflectionResult(success=True, output=parsed.output if stored else None)
+        # Always return the parsed output — Telegram delivery should not
+        # be coupled to observation storage gates (PR #101 rule).
+        return ReflectionResult(success=True, output=parsed.output, stored=stored)
