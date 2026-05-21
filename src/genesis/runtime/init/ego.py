@@ -237,7 +237,21 @@ async def init(rt: GenesisRuntime) -> None:
 
                     status = session.get("status", "unknown")
                     cost = session.get("cost_usd", 0.0)
-                    caller_ctx = session.get("caller_context", "")
+
+                    # caller_context lives inside the metadata JSON blob,
+                    # not as a top-level column on cc_sessions.
+                    import json as _json
+
+                    _meta_raw = session.get("metadata") or "{}"
+                    try:
+                        _meta = (
+                            _json.loads(_meta_raw)
+                            if isinstance(_meta_raw, str)
+                            else (_meta_raw or {})
+                        )
+                    except (ValueError, TypeError):
+                        _meta = {}
+                    caller_ctx = _meta.get("caller_context", "")
 
                     await obs_crud.create(
                         rt._db,
