@@ -148,6 +148,45 @@ async def test_reflect_retry_on_parse_failure(db):
     assert caller.call.call_count == 2
 
 
+async def test_reflect_output_preserved_when_writer_gates(db):
+    """Output must survive writer gating — Telegram delivery is decoupled from storage."""
+    from genesis.perception.engine import ReflectionEngine
+
+    assembler = AsyncMock()
+    assembler.assemble = AsyncMock(return_value=PromptContext(
+        depth="Micro", identity="Genesis", signals_text="cpu: 0.3",
+        tick_number=1,
+    ))
+    builder = MagicMock()
+    builder.build = MagicMock(return_value="Test prompt")
+    caller = AsyncMock()
+    caller.call = AsyncMock(return_value=LLMResponse(
+        text='{"tags":["idle"],"salience":0.1,"anomaly":false,"summary":"Normal.","signals_examined":1}',
+        model="groq-free", input_tokens=100, output_tokens=50,
+        cost_usd=0.0, latency_ms=200,
+    ))
+    parser = MagicMock()
+    parser.parse = MagicMock(return_value=ParseResult(
+        success=True, output=_micro_output(),
+    ))
+    writer = AsyncMock()
+    writer.write = AsyncMock(return_value=False)  # Writer gates storage
+
+    engine = ReflectionEngine(
+        context_assembler=assembler,
+        prompt_builder=builder,
+        llm_caller=caller,
+        output_parser=parser,
+        result_writer=writer,
+    )
+
+    result = await engine.reflect(Depth.MICRO, _make_tick(), db=db)
+
+    assert result.success is True
+    assert result.output is not None  # Output preserved despite gating
+    assert result.stored is False     # But flagged as not stored
+
+
 async def test_reflect_max_retries_exceeded(db):
     from genesis.perception.engine import ReflectionEngine
 

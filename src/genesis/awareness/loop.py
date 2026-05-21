@@ -813,6 +813,13 @@ class AwarenessLoop:
                 except Exception:
                     logger.warning("Failed to emit reflection heartbeat", exc_info=True)
 
+            # Mark tick as dispatched on success (mirrors Light/Deep path)
+            if ref_result and ref_result.success:
+                try:
+                    await awareness_ticks.mark_dispatched(db, tick_id)
+                except Exception:
+                    logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
+
             # Post micro reflection to supergroup topic
             if ref_result and ref_result.success and ref_result.output and self._topic_manager:
                 micro = ref_result.output
