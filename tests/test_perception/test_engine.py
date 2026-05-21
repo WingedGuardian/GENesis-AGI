@@ -52,7 +52,7 @@ async def test_reflect_success(db):
         success=True, output=_micro_output(),
     ))
     writer = AsyncMock()
-    writer.write = AsyncMock()
+    writer.write = AsyncMock(return_value=True)
 
     engine = ReflectionEngine(
         context_assembler=assembler,
@@ -66,6 +66,7 @@ async def test_reflect_success(db):
 
     assert result.success is True
     assert result.output is not None
+    assert result.stored is True
     assembler.assemble.assert_called_once()
     builder.build.assert_called_once()
     caller.call.assert_called_once()
