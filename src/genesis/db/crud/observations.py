@@ -83,6 +83,8 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "dead_letter_replay": timedelta(days=3),
     "light_reflection_candidate": timedelta(days=3),
     "process_reaper_kill": timedelta(days=3),
+    "operational_alert": timedelta(days=3),
+    "strategic_reflection": timedelta(days=3),
     # ── 1-day (transient) ──────────────────────────────────────────────
     "light_escalation_resolved": timedelta(days=1),
     "light_escalation_pending": timedelta(days=1),
@@ -91,11 +93,9 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     # ── 7-day (version tracking, operational) ──────────────────────────
     "genesis_version_change": timedelta(days=7),
     "memory_index": timedelta(days=7),
-    "operational_alert": timedelta(days=7),
     "db_maintenance": timedelta(days=7),
     "backup_verification": timedelta(days=7),
     "scheduled_review": timedelta(days=7),
-    "strategic_reflection": timedelta(days=7),
     "micro_reflection": timedelta(days=7),
     "deep_reflection": timedelta(days=7),
     "reflection_observation": timedelta(days=7),
@@ -106,6 +106,9 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "question_response": timedelta(days=7),
     "init_degradation": timedelta(days=7),
     "procedure_quarantined": timedelta(days=7),
+    "escalation_to_user_ego": timedelta(days=7),
+    "sentinel_escalated": timedelta(days=7),
+    "guardian_diagnosis": timedelta(days=7),
     # ── 14-day (learning artifacts & assessments — also the DEFAULT) ───
     "build_state": timedelta(days=14),
     "project_context": timedelta(days=14),
@@ -121,12 +124,10 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "quality_calibration": timedelta(days=14),
     "user_model_delta": timedelta(days=14),
     "capability_improvement": timedelta(days=14),
-    "escalation_to_user_ego": timedelta(days=14),
     "strategic_analysis": timedelta(days=14),
     # ── 30-day (intake signals, need processing time) ──────────────────
     "finding": timedelta(days=30),
     "bugfix_committed": timedelta(days=30),
-    "sentinel_escalated": timedelta(days=30),
     "user_signal": timedelta(days=30),
     "user_model_gap": timedelta(days=30),
     "reference_pointer": timedelta(days=30),
@@ -134,7 +135,6 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "test_isolation_gap": timedelta(days=30),
     "operational_gap": timedelta(days=30),
     "interaction_theme": timedelta(days=30),
-    "guardian_diagnosis": timedelta(days=30),
     # ── 60-day (action-required, real issues) ──────────────────────────
     "bug_identified": timedelta(days=60),
     "tech_debt": timedelta(days=60),
