@@ -620,7 +620,7 @@ class TestReflectionHeartbeatEmission:
         from unittest.mock import AsyncMock, MagicMock
 
         from genesis.awareness.loop import AwarenessLoop
-        from genesis.awareness.types import Depth, TickResult
+        from genesis.awareness.types import Depth, SignalReading, TickResult
         from genesis.observability.types import Severity, Subsystem
 
         mock_engine = AsyncMock()
@@ -641,6 +641,11 @@ class TestReflectionHeartbeatEmission:
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
         tick.tick_id = "test-tick-123"
+        # Micro is silent by default — needs a critical signal to trigger LLM
+        tick.signals = [
+            SignalReading(name="software_error_spike", value=1.0,
+                          source="test", collected_at="2026-01-01T00:00:00"),
+        ]
 
         await loop._dispatch_reflection(tick)
 
@@ -673,6 +678,7 @@ class TestReflectionHeartbeatEmission:
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
         tick.tick_id = "test-tick-456"
+        tick.signals = []  # micro gate reads tick.signals
 
         await loop._dispatch_reflection(tick)
 
