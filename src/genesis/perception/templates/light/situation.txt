@@ -19,6 +19,11 @@ You are in situation assessment mode.
 **Grounding rule:** Every claim in your assessment MUST cite a specific signal
 value or observation timestamp. If you cannot cite evidence, do not make the claim.
 
+**Delta-only:** Focus on what has CHANGED since the cognitive state above.
+If nothing material changed, say so — a short "no material change" with
+confidence 0.3 is better than restating known conditions. Persistent issues
+only need mention if they crossed a new threshold or have new evidence.
+
 **Anti-repetition:** If a condition appears in Recent Observations above AND
 Current Signals still confirm it, note "persists" with the current value.
 If signals no longer confirm it, omit it entirely. Silence > stale echoes.

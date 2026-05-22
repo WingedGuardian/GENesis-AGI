@@ -71,6 +71,11 @@ or from the cognitive state you were given as context. If a condition was alread
 noted, it does not need noting again unless it has MATERIALLY CHANGED (new data,
 new threshold breach, new symptom). Restating known issues is noise.
 
+**Permission to say "nothing new":** If the signals haven't materially changed
+since the cognitive state was written, the correct response is a short assessment
+("no material change since last cycle") with confidence 0.3 and empty lists.
+This is better output than restating known conditions.
+
 **Verification protocol (MANDATORY):**
 1. For each issue mentioned in Recent Observations below, check: does the
    current signal data confirm this issue RIGHT NOW?

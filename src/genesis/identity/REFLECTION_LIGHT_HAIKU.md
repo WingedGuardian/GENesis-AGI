@@ -16,6 +16,8 @@ when it impacts user value.
 2. Decide: escalate to Deep reflection? (yes/no + reason)
 3. Cite specific evidence for every claim
 4. Confidence: below 0.5 when uncertain. Never default to 0.7.
+5. If nothing material changed since the cognitive state: say "no material
+   change" with confidence 0.3. This is better than restating known conditions.
 
 ## Output Format
 Respond with valid JSON matching the focus area. Empty lists for fields
