@@ -97,6 +97,7 @@ class SurplusScheduler:
         self._db_maintenance_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
+        self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
         self._extraction_store: MemoryStore | None = None
         self._extraction_router: Router | None = None
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
@@ -162,6 +163,10 @@ class SurplusScheduler:
     def set_model_intelligence_job(self, job) -> None:
         """Set the ModelIntelligenceJob for scheduled model landscape scanning."""
         self._model_intelligence_job = job
+
+    def set_models_md_synthesis_job(self, job) -> None:
+        """Set the ModelsMdSynthesisJob for weekly models.md updates."""
+        self._models_md_synthesis_job = job
 
     def set_extraction_deps(
         self,
@@ -237,6 +242,16 @@ class SurplusScheduler:
                 self.run_model_intelligence,
                 CronTrigger(day_of_week="sun", hour=6),
                 id="model_intelligence",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+        # Models.md synthesis: weekly Sunday 8am — updates model catalog from recon
+        if self._models_md_synthesis_job is not None:
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self.run_models_md_synthesis,
+                CronTrigger(day_of_week="sun", hour=8),
+                id="models_md_synthesis",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
@@ -745,6 +760,59 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("model_intelligence", str(exc))
+            except Exception:
+                pass
+
+    async def run_models_md_synthesis(self) -> None:
+        """Run weekly models.md synthesis (Sunday 8am UTC)."""
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("Models.md synthesis skipped (Genesis paused)")
+                return
+        except Exception:
+            pass
+        if self._models_md_synthesis_job is None:
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure(
+                    "models_md_synthesis", "job not wired",
+                )
+            except Exception:
+                pass
+            return
+        try:
+            result = await self._models_md_synthesis_job.run()
+            skipped = result.get("skipped", False)
+            if skipped:
+                logger.info("Models.md synthesis skipped: %s", result.get("reason"))
+            else:
+                logger.info(
+                    "Models.md synthesis: %d findings applied (cost $%.4f)",
+                    result.get("findings_count", 0),
+                    result.get("cost_usd", 0),
+                )
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.DEBUG,
+                    "heartbeat", "models_md_synthesis completed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("models_md_synthesis")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Models.md synthesis failed")
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.RECON, Severity.ERROR,
+                    "models_md_synthesis.failed",
+                    "Models.md synthesis failed",
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("models_md_synthesis", str(exc))
             except Exception:
                 pass
 

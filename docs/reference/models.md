@@ -1,7 +1,8 @@
 <!-- This file is the model catalog — what's available and what each model is good at.
      For which model is assigned to which call site, see the Model Routing Registry:
      docs/architecture/genesis-v3-model-routing-registry.md
-     Read by the task decomposer and routing registry. Reviewed weekly by the dream cycle. -->
+     Read by the task decomposer and routing registry.
+     Updated weekly by ModelsMdSynthesisJob (Sunday 8am UTC, after model intelligence recon). -->
 
 # Model Pool
 
