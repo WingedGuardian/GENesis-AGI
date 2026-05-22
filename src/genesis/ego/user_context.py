@@ -631,10 +631,11 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         lines.append(f"**{len(rows)} escalations** needing your attention:\n")
-        for _source, content, priority, _created_at in rows:
+        for _source, content, priority, created_at in rows:
+            age = self._days_ago(created_at) or "?"
             short = content[:300] + "..." if len(content) > 300 else content
             short = short.replace("\n", " ")
-            lines.append(f"- [{priority}] {short}")
+            lines.append(f"- [{age}] [{priority}] {short}")
 
         lines.append(
             "\nThese are issues the Genesis ego couldn't resolve alone. "
