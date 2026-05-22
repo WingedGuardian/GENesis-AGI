@@ -110,6 +110,21 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring ModelIntelligenceJob", exc_info=True)
             await _degraded(rt, "ModelIntelligenceJob")
 
+        try:
+            from genesis.recon.models_md_synthesis import ModelsMdSynthesisJob
+            if rt._router is not None:
+                synthesis_job = ModelsMdSynthesisJob(db=rt._db, router=rt._router)
+                rt._surplus_scheduler.set_models_md_synthesis_job(synthesis_job)
+                logger.info("ModelsMdSynthesisJob wired to surplus scheduler")
+            else:
+                logger.warning("ModelsMdSynthesisJob skipped — router not available")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire ModelsMdSynthesisJob", exc_info=True)
+            await _degraded(rt, "ModelsMdSynthesisJob")
+        except Exception:
+            logger.error("Unexpected error wiring ModelsMdSynthesisJob", exc_info=True)
+            await _degraded(rt, "ModelsMdSynthesisJob")
+
         await rt._surplus_scheduler.start()
         logger.info("Genesis surplus scheduler started")
 
