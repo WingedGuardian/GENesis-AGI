@@ -92,6 +92,7 @@ LIGHT_FOCUS_INSTRUCTIONS: dict[str, str] = {
 # signals are active.  Continuous-drift signals (container_memory_pct,
 # micro_count_since_light, etc.) always change between ticks, making
 # staleness-based gating ineffective (0% of ticks would be gated).
+# NOTE: Must stay in sync with _MICRO_CRITICAL_SIGNALS in awareness/loop.py.
 _ANOMALY_RELEVANT_SIGNALS = frozenset({"software_error_spike", "critical_failure"})
 _SENTINEL_ANOMALY_THRESHOLD = 0.7
 
