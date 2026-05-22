@@ -302,6 +302,19 @@ async def memory_expand(
     found_ids = {str(p.id) for p in points}
     not_found = [mid for mid in memory_ids if mid not in found_ids]
 
+    # J-9 eval: implicit relevance signal — expanded memories are "used"
+    if found_ids:
+        try:
+            from genesis.eval.j9_hooks import emit_recall_used
+
+            await emit_recall_used(
+                memory_mod._db,
+                memory_ids=list(found_ids),
+                source="memory_expand",
+            )
+        except Exception:
+            logger.debug("eval: recall_used emit failed", exc_info=True)
+
     results = []
     for point in points:
         mid = str(point.id)

@@ -623,6 +623,7 @@ class EgoSession:
                 prop["_realist_reasoning"] = verdict.get("reasoning", "")
 
                 if verdict["verdict"] == "amend" and verdict.get("amended_content"):
+                    prop["_original_content"] = prop["content"]
                     prop["content"] = verdict["amended_content"]
                     amended_count += 1
 
