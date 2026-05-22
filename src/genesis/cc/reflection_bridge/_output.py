@@ -59,6 +59,17 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
     now = datetime.now(UTC).isoformat()
     source = f"cc_reflection_{depth.value.lower()}"
 
+    # Extract focus_area from Light output JSON for category metadata.
+    focus_area = None
+    if depth == Depth.LIGHT:
+        try:
+            json_match = re.search(r"```json\s*(.*?)\s*```", output.text, re.DOTALL)
+            raw_json = json_match.group(1) if json_match else output.text
+            parsed = json.loads(raw_json)
+            focus_area = (parsed.get("focus_area") or "").strip() or None
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            pass
+
     # Cooldown gate: skip primary observation if one of the same type+source
     # was created within the last 30 minutes.  Still process sub-outputs
     # (light escalations, deltas, surplus) and strategic focus.
@@ -88,6 +99,7 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
                 source=source,
                 type="reflection_output",
                 content=content,
+                category=focus_area,
                 priority="high" if depth == Depth.STRATEGIC else "medium",
                 created_at=now,
                 content_hash=content_hash,
@@ -105,7 +117,9 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
     # Store a consolidated reflection summary for embedding.
     # Deep reflections get their summary via OutputRouter.route() — skip here.
     if depth != Depth.DEEP:
-        await _store_reflection_summary(output, source=source, now=now, db=db)
+        await _store_reflection_summary(
+            output, source=source, now=now, db=db, category=focus_area,
+        )
 
 
 async def _process_light_output(output, *, source: str, now: str, db) -> None:
@@ -296,7 +310,9 @@ async def _extract_strategic_focus(output, *, now: str, db) -> None:
         logger.debug("Could not parse focus_next_week from strategic output")
 
 
-async def _store_reflection_summary(output, *, source: str, now: str, db) -> None:
+async def _store_reflection_summary(
+    output, *, source: str, now: str, db, category: str | None = None,
+) -> None:
     """Store a consolidated reflection summary for embedding."""
     from genesis.db.crud import observations
 
@@ -334,6 +350,7 @@ async def _store_reflection_summary(output, *, source: str, now: str, db) -> Non
                 source=source,
                 type="reflection_summary",
                 content=summary_text,
+                category=category,
                 priority="medium",
                 created_at=now,
                 content_hash=summary_hash,

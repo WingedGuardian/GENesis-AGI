@@ -17,6 +17,10 @@ How do current conditions affect the user's goals and work?
 You are in user impact analysis mode. This is the ONLY reflection mode
 that produces user model updates.
 
+**Delta-only:** Only report user impacts that represent a CHANGE from the
+cognitive state above. If the user's situation hasn't shifted, say so —
+a short "no material user impact change" with confidence 0.3 is correct.
+
 **User model updates:** Only propose a delta if:
 1. You have specific signal or observation evidence (cite it)
 2. Confidence >= 0.9

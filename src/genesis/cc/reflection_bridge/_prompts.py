@@ -88,15 +88,38 @@ LIGHT_FOCUS_INSTRUCTIONS: dict[str, str] = {
 }
 
 
+# Anomaly focus is event-driven — only fires when critical operational
+# signals are active.  Continuous-drift signals (container_memory_pct,
+# micro_count_since_light, etc.) always change between ticks, making
+# staleness-based gating ineffective (0% of ticks would be gated).
+_ANOMALY_RELEVANT_SIGNALS = frozenset({"software_error_spike", "critical_failure"})
+_SENTINEL_ANOMALY_THRESHOLD = 0.7
+
+
 def _light_focus_area(tick: TickResult) -> str:
-    """Derive focus area from tick_id, matching perception engine rotation."""
+    """Derive focus area from tick_id.  Anomaly is event-driven — falls back
+    to situation when no critical operational signals are active."""
     import uuid as _uuid
 
     try:
         tick_number = _uuid.UUID(tick.tick_id).int % 10000
     except ValueError:
         tick_number = int.from_bytes(tick.tick_id.encode()[:8], "big") % 10000
-    return LIGHT_FOCUS_ROTATION[tick_number % len(LIGHT_FOCUS_ROTATION)]
+
+    candidate = LIGHT_FOCUS_ROTATION[tick_number % len(LIGHT_FOCUS_ROTATION)]
+
+    if candidate == "anomaly":
+        has_critical = any(
+            s.value > 0 for s in tick.signals
+            if s.name in _ANOMALY_RELEVANT_SIGNALS
+        ) or any(
+            s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in tick.signals
+            if s.name == "sentinel_activity"
+        )
+        if not has_critical:
+            return "situation"
+
+    return candidate
 
 
 # ── Observation formatting ───────────────────────────────────────────
