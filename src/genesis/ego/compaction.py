@@ -69,6 +69,8 @@ class CompactionEngine:
         Returns the cycle id. Cycles are stored for audit logging,
         cost tracking, and historical analysis.
         """
+        from genesis.ego.integrity import content_hash, content_size
+
         return await ego_crud.create_cycle(
             self._db,
             id=cycle.id,
@@ -81,6 +83,8 @@ class CompactionEngine:
             output_tokens=cycle.output_tokens,
             duration_ms=cycle.duration_ms,
             created_at=cycle.created_at,
+            output_hash=content_hash(cycle.output_text),
+            output_size=content_size(cycle.output_text),
         )
 
     async def assemble_context(

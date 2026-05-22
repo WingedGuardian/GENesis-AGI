@@ -28,6 +28,8 @@ async def create_cycle(
     output_tokens: int = 0,
     duration_ms: int = 0,
     created_at: str | None = None,
+    output_hash: str | None = None,
+    output_size: int | None = None,
 ) -> str:
     """Insert a new ego cycle record. Returns the id."""
     if created_at is None:
@@ -36,8 +38,8 @@ async def create_cycle(
         """INSERT INTO ego_cycles
            (id, output_text, proposals_json, focus_summary,
             model_used, cost_usd, input_tokens, output_tokens,
-            duration_ms, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            duration_ms, created_at, output_hash, output_size)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             output_text,
@@ -49,6 +51,8 @@ async def create_cycle(
             output_tokens,
             duration_ms,
             created_at,
+            output_hash,
+            output_size,
         ),
     )
     await db.commit()
@@ -228,6 +232,8 @@ async def create_proposal(
     realist_reasoning: str | None = None,
     ego_source: str | None = None,
     goal_id: str | None = None,
+    content_hash: str | None = None,
+    original_content: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -238,8 +244,8 @@ async def create_proposal(
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
-            ego_source, goal_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ego_source, goal_id, content_hash, original_content)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -262,6 +268,8 @@ async def create_proposal(
             realist_reasoning,
             ego_source,
             goal_id,
+            content_hash,
+            original_content,
         ),
     )
     await db.commit()

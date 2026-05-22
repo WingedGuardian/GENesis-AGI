@@ -166,6 +166,8 @@ class ProposalWorkflow:
                     exc_info=True,
                 )
 
+        from genesis.ego.integrity import content_hash as _content_hash
+
         ids: list[str] = []
         for p in proposals:
             pid = uuid.uuid4().hex[:16]
@@ -189,12 +191,13 @@ class ProposalWorkflow:
             else:
                 goal_id = raw_goal_id
 
+            proposal_content = p.get("content", "")
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
                 action_type=p.get("action_type", "unknown"),
                 action_category=p.get("action_category", ""),
-                content=p.get("content", ""),
+                content=proposal_content,
                 rationale=p.get("rationale", ""),
                 confidence=float(p.get("confidence", 0.0)),
                 urgency=p.get("urgency", "normal"),
@@ -210,6 +213,8 @@ class ProposalWorkflow:
                 realist_reasoning=p.get("_realist_reasoning"),
                 ego_source=ego_source,
                 goal_id=goal_id,
+                content_hash=_content_hash(proposal_content),
+                original_content=p.get("_original_content"),
             )
             ids.append(pid)
 

@@ -29,8 +29,11 @@ async def emit_recall_fired(
     mode: str | None = None,
     pipeline_used: str | None = None,
     intent_category: str | None = None,
-) -> None:
-    """Log a memory recall() invocation as an eval event."""
+) -> str | None:
+    """Log a memory recall() invocation as an eval event.
+
+    Returns the event id so callers can link diagnostics events.
+    """
     try:
         metrics: dict = {
             "query": query[:500],
@@ -46,7 +49,7 @@ async def emit_recall_fired(
             metrics["pipeline_used"] = pipeline_used
         if intent_category:
             metrics["intent_category"] = intent_category
-        await j9_eval.insert_event(
+        return await j9_eval.insert_event(
             db,
             dimension="memory",
             event_type="recall_fired",
@@ -55,6 +58,7 @@ async def emit_recall_fired(
         )
     except Exception:
         logger.debug("eval: failed to emit recall_fired", exc_info=True)
+        return None
 
 
 async def emit_proposal_resolved(
@@ -128,3 +132,75 @@ async def emit_procedure_outcome(
         )
     except Exception:
         logger.debug("eval: failed to emit procedure_outcome", exc_info=True)
+
+
+async def emit_recall_diagnostics(
+    db: aiosqlite.Connection,
+    *,
+    recall_event_id: str | None,
+    qdrant_pool_size: int,
+    fts_pool_size: int,
+    event_pool_size: int,
+    total_candidates: int,
+    overlap_count: int,
+    score_spread: float | None,
+    embedding_available: bool,
+    intent_category: str,
+    intent_confidence: float,
+    query_expanded: bool,
+) -> None:
+    """Log intermediate retrieval pipeline diagnostics for a recall.
+
+    Captures source pool sizes, overlap statistics, and RRF score
+    distribution — data that exists in local variables during recall()
+    but otherwise goes out of scope.
+    """
+    try:
+        await j9_eval.insert_event(
+            db,
+            dimension="memory",
+            event_type="recall_diagnostics",
+            subject_id=recall_event_id,
+            metrics={
+                "qdrant_pool": qdrant_pool_size,
+                "fts_pool": fts_pool_size,
+                "event_pool": event_pool_size,
+                "total_candidates": total_candidates,
+                "overlap": overlap_count,
+                "score_spread": score_spread,
+                "embedding_available": embedding_available,
+                "intent": intent_category,
+                "intent_confidence": round(intent_confidence, 3),
+                "query_expanded": query_expanded,
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit recall_diagnostics", exc_info=True)
+
+
+async def emit_recall_used(
+    db: aiosqlite.Connection,
+    *,
+    memory_ids: list[str],
+    source: str = "memory_expand",
+) -> None:
+    """Log that specific memories were accessed/used downstream.
+
+    This provides the implicit relevance signal that
+    _compute_memory_quality() in j9_aggregator expects from
+    'recall_used' events.
+    """
+    try:
+        await j9_eval.insert_event(
+            db,
+            dimension="memory",
+            event_type="recall_used",
+            metrics={
+                "memory_ids": memory_ids[:20],
+                "source": source,
+                "used": True,
+                "count": len(memory_ids),
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit recall_used", exc_info=True)

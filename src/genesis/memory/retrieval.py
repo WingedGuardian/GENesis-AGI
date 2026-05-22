@@ -570,8 +570,12 @@ class HybridRetriever:
             )
 
         # J-9 eval: log recall event for memory retrieval quality measurement
-        from genesis.eval.j9_hooks import emit_recall_fired
-        await emit_recall_fired(
+        from genesis.eval.j9_hooks import (
+            emit_recall_diagnostics,
+            emit_recall_fired,
+        )
+
+        recall_event_id = await emit_recall_fired(
             self._db,
             query=query,
             result_count=len(results),
@@ -579,6 +583,25 @@ class HybridRetriever:
             memory_ids=[r.memory_id for r in results[:10]],
             latency_ms=(time.monotonic() - _t0) * 1000,
             source=source,
+            intent_category=intent.category,
+        )
+
+        # Recall diagnostics: capture intermediate pipeline metrics
+        _overlap = len(set(qdrant_by_id) & set(fts_by_id))
+        _scores = [r.score for r in results]
+        await emit_recall_diagnostics(
+            self._db,
+            recall_event_id=recall_event_id,
+            qdrant_pool_size=len(qdrant_by_id),
+            fts_pool_size=len(fts_by_id),
+            event_pool_size=len(event_memory_ids),
+            total_candidates=len(all_ids),
+            overlap_count=_overlap,
+            score_spread=round(max(_scores) - min(_scores), 4) if _scores else None,
+            embedding_available=embedding_available,
+            intent_category=intent.category,
+            intent_confidence=intent.confidence,
+            query_expanded=fts_query != query,
         )
 
         return results
