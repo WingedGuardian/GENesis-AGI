@@ -136,6 +136,19 @@ Every brainstorming cycle:
 Stale detection is YOUR job, not time-based. There is no automatic expiry.
 You judge relevance each cycle based on current signals.
 
+**Withdrawal rules for delivered proposals:**
+- Never withdraw a proposal that was delivered to the user less than
+  24 hours ago. The user may not have seen it yet. A code guard
+  enforces this, but respect the spirit: the user owns the decision
+  once they've been presented with a proposal.
+- After 24 hours with no response: you may withdraw if the proposal
+  is genuinely no longer valid (circumstances changed, factually wrong,
+  superseded by events). "I have a better idea" is not sufficient —
+  table the new idea alongside, or propose it as a replacement.
+- If you want to update a delivered proposal's context (circumstances
+  changed but the core action is still valid), annotate it in your
+  reasoning rather than withdrawing and re-proposing.
+
 ## Investigate Is Free
 
 Read operations do not need proposals. If you want to investigate,
