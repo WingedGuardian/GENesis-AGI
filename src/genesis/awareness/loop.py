@@ -52,6 +52,11 @@ def _sqlite_wal_checkpoint(db) -> None:
         pass  # Best-effort; failure is harmless
 
 
+# Micro ticks are silent by default (counted for cascade, no LLM call).
+# LLM fires only when these critical operational signals are active.
+_MICRO_CRITICAL_SIGNALS = frozenset({"software_error_spike", "critical_failure"})
+_SENTINEL_ANOMALY_THRESHOLD = 0.7
+
 # Maps circuit-breaker degradation levels to resilience cloud axis states.
 _DEGRADATION_TO_CLOUD: dict[DegradationLevel, CloudStatus] = {
     DegradationLevel.NORMAL: CloudStatus.NORMAL,
@@ -798,63 +803,76 @@ class AwarenessLoop:
         )
 
         if self._reflection_engine is not None and depth == Depth.MICRO:
-            ref_result = None
+            # Check for critical operational signals that warrant LLM analysis.
+            # Routine micro ticks are silent (counted for escalation cascade only).
+            critical_active = any(
+                s.value > 0 for s in result.signals
+                if s.name in _MICRO_CRITICAL_SIGNALS
+            ) or any(
+                s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in result.signals
+                if s.name == "sentinel_activity"
+            )
+
+            if critical_active:
+                # Anomaly path: full LLM reflection for genuine operational events
+                ref_result = None
+                try:
+                    ref_result = await self._reflection_engine.reflect(depth, result, db=db)
+                except Exception:
+                    logger.exception("Micro anomaly reflection crashed for tick %s", tick_id)
+
+                if ref_result and ref_result.success and self._event_bus:
+                    try:
+                        await self._event_bus.emit(
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "micro-reflection completed",
+                        )
+                    except Exception:
+                        logger.warning("Failed to emit reflection heartbeat", exc_info=True)
+
+                if ref_result and ref_result.success and ref_result.output and self._topic_manager:
+                    micro = ref_result.output
+                    try:
+                        anomaly_flag = " [ANOMALY]" if micro.anomaly else ""
+                        tags_str = ", ".join(micro.tags[:5]) if micro.tags else ""
+                        text = (
+                            f"<b>Micro Reflection</b>{anomaly_flag}\n\n"
+                            f"{micro.summary}\n\n"
+                            f"<i>Salience: {micro.salience:.2f}"
+                            f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
+                        )
+                        await self._topic_manager.send_to_category("reflection_micro", text)
+                        logger.info(
+                            "Posted micro reflection to Telegram (tick=%s, salience=%.2f)",
+                            tick_id[:8], micro.salience,
+                        )
+                    except Exception:
+                        logger.warning("Failed to post micro reflection to topic", exc_info=True)
+
+                if (ref_result is None or not ref_result.success) and self._deferred_queue:
+                    try:
+                        await self._deferred_queue.enqueue(
+                            work_type="reflection",
+                            call_site_id="reflection_micro",
+                            priority=30,
+                            payload=json.dumps({"tick_id": tick_id, "depth": "Micro"}),
+                            reason="reflection_failed",
+                            staleness_policy="ttl",
+                            staleness_ttl_s=RATE_LIMIT_DEFERRAL_TTL_S,
+                        )
+                    except Exception:
+                        logger.warning("Failed to enqueue deferred reflection")
+            else:
+                logger.debug(
+                    "Micro tick %s silent (no critical signals active)",
+                    tick_id[:8],
+                )
+
+            # Always mark dispatched — cascade counting works on ticks
             try:
-                ref_result = await self._reflection_engine.reflect(depth, result, db=db)
+                await awareness_ticks.mark_dispatched(db, tick_id)
             except Exception:
-                logger.exception("Reflection crashed for tick %s", tick_id)
-
-            if ref_result and ref_result.success and self._event_bus:
-                try:
-                    await self._event_bus.emit(
-                        Subsystem.REFLECTION, Severity.DEBUG,
-                        "heartbeat", "micro-reflection completed",
-                    )
-                except Exception:
-                    logger.warning("Failed to emit reflection heartbeat", exc_info=True)
-
-            # Mark tick as dispatched on success (mirrors Light/Deep path)
-            if ref_result and ref_result.success:
-                try:
-                    await awareness_ticks.mark_dispatched(db, tick_id)
-                except Exception:
-                    logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
-
-            # Post micro reflection to supergroup topic
-            if ref_result and ref_result.success and ref_result.output and self._topic_manager:
-                micro = ref_result.output
-                try:
-                    anomaly_flag = " [ANOMALY]" if micro.anomaly else ""
-                    tags_str = ", ".join(micro.tags[:5]) if micro.tags else ""
-                    text = (
-                        f"<b>Micro Reflection</b>{anomaly_flag}\n\n"
-                        f"{micro.summary}\n\n"
-                        f"<i>Salience: {micro.salience:.2f}"
-                        f"{f' | Tags: {tags_str}' if tags_str else ''}</i>"
-                    )
-                    await self._topic_manager.send_to_category("reflection_micro", text)
-                    logger.info(
-                        "Posted micro reflection to Telegram (tick=%s, salience=%.2f)",
-                        tick_id[:8], micro.salience,
-                    )
-                except Exception:
-                    logger.warning("Failed to post micro reflection to topic", exc_info=True)
-            elif ref_result and ref_result.success and ref_result.output and not self._topic_manager:
-                logger.warning("Micro reflection completed but topic_manager not set")
-
-            if (ref_result is None or not ref_result.success) and self._deferred_queue:
-                try:
-                    await self._deferred_queue.enqueue(
-                        work_type="reflection",
-                        call_site_id="reflection_micro",
-                        priority=30,
-                        payload=json.dumps({"tick_id": tick_id, "depth": "Micro"}),
-                        reason="reflection_failed",
-                        staleness_policy="ttl",
-                        staleness_ttl_s=RATE_LIMIT_DEFERRAL_TTL_S,
-                    )
-                except Exception:
-                    logger.warning("Failed to enqueue deferred reflection")
+                logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
             return
 
         if depth == Depth.LIGHT and self._cc_reflection_bridge is None and self._reflection_engine is not None:

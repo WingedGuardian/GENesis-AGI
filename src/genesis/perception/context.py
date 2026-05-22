@@ -250,13 +250,16 @@ class ContextAssembler:
             chain_section = await self._build_light_chain_context(db, depth_value)
 
         try:
-            # Pass 1: reflection-origin observations
+            # Pass 1: reflection-origin observations (exclude micro — low-value
+            # free-model output that adds noise to higher-depth context).
             reflection_obs = await observations.query(
                 db, resolved=False, source_in=_REFLECTION_SOURCES, limit=refl_cap,
+                exclude_types=("micro_reflection",),
             )
             # Pass 2: everything else
             other_obs = await observations.query(
                 db, resolved=False, limit=other_cap,
+                exclude_types=("micro_reflection",),
             )
 
             # Depth-specific age guard — drop observations older than the cutoff

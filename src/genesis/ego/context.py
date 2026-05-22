@@ -213,6 +213,7 @@ class EgoContextBuilder:
                 "SELECT source, type, category, content, priority, created_at "
                 "FROM observations "
                 "WHERE resolved = 0 "
+                "AND type NOT IN ('micro_reflection', 'awareness_tick') "
                 "AND created_at >= datetime('now', '-48 hours') "
                 "ORDER BY "
                 "  CASE priority "

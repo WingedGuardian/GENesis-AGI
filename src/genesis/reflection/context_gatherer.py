@@ -65,7 +65,12 @@ class ContextGatherer:
         now = datetime.now(UTC)
 
         # Memory consolidation: unresolved observations above threshold
-        unresolved = await observations.query(db, resolved=False, limit=200)
+        # Exclude micro_reflection — low-value free-model output that inflates
+        # the backlog count without providing consolidation material.
+        unresolved = await observations.query(
+            db, resolved=False, limit=200,
+            exclude_types=("micro_reflection",),
+        )
         obs_backlog = len(unresolved)
         has_memory_work = obs_backlog >= _MIN_OBSERVATIONS_FOR_CONSOLIDATION
 
@@ -211,14 +216,19 @@ class ContextGatherer:
         last_deep = await observations.query(
             db, source="cc_reflection_deep", limit=1,
         )
+        _micro_excl = ("micro_reflection",)
         if last_deep:
             since = last_deep[0].get("created_at", "")
-            all_obs = await observations.query(db, resolved=False, limit=100)
+            all_obs = await observations.query(
+                db, resolved=False, limit=100, exclude_types=_micro_excl,
+            )
             result = [o for o in all_obs if o.get("created_at", "") > since]
         else:
             # No prior deep reflection — get last 48h
             cutoff = (datetime.now(UTC) - timedelta(hours=48)).isoformat()
-            all_obs = await observations.query(db, resolved=False, limit=100)
+            all_obs = await observations.query(
+                db, resolved=False, limit=100, exclude_types=_micro_excl,
+            )
             result = [o for o in all_obs if o.get("created_at", "") >= cutoff]
 
         # Hard age cap — no observation older than 48h enters deep reflection

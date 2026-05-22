@@ -4,10 +4,28 @@ Tests the tick pipeline directly (perform_tick) without relying on
 APScheduler timing. Scheduler integration is tested separately.
 """
 
-from genesis.awareness.loop import perform_tick
+from unittest.mock import AsyncMock, MagicMock
+
+from genesis.awareness.loop import AwarenessLoop, perform_tick
 from genesis.awareness.signals import ConversationCollector
-from genesis.awareness.types import SignalReading
+from genesis.awareness.types import Depth, DepthScore, SignalReading, TickResult
 from genesis.db.crud import awareness_ticks, observations
+
+import json
+
+
+async def _persist_tick(db, tick: TickResult) -> None:
+    """Persist a TickResult to the DB so mark_dispatched can find it."""
+    await awareness_ticks.create(
+        db,
+        id=tick.tick_id,
+        source=tick.source,
+        signals_json=json.dumps([{"name": s.name, "value": s.value} for s in tick.signals]),
+        scores_json=json.dumps({}),
+        created_at=tick.timestamp,
+        classified_depth=tick.classified_depth.value if tick.classified_depth else None,
+        trigger_reason=tick.trigger_reason,
+    )
 
 
 async def test_perform_tick_no_trigger(db):
@@ -91,3 +109,104 @@ async def test_replace_collectors(db):
     assert len(loop._collectors) == 2
     assert loop._collectors[0].signal_name == "real_a"
     assert loop._collectors[1].signal_name == "real_b"
+
+
+def _micro_tick(signals: list[SignalReading], tick_id: str = "test-tick") -> TickResult:
+    """Helper: build a TickResult classified as Micro with given signals."""
+    return TickResult(
+        tick_id=tick_id,
+        timestamp="2026-05-21T12:00:00+00:00",
+        source="scheduled",
+        signals=signals,
+        scores=[DepthScore(
+            depth=Depth.MICRO, raw_score=0.5,
+            time_multiplier=1.0, final_score=0.5,
+            threshold=0.3, triggered=True,
+        )],
+        classified_depth=Depth.MICRO,
+        trigger_reason="threshold_exceeded",
+    )
+
+
+async def test_micro_dispatch_silent_on_routine_signals(db):
+    """Micro ticks with only routine signals skip LLM — mark dispatched, no engine call."""
+    engine = AsyncMock()
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_reflection_engine(engine)
+
+    tick = _micro_tick([
+        SignalReading(name="autonomy_activity", value=0.3, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+        SignalReading(name="surplus_activity", value=0.0, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+    ])
+
+    # Persist the tick so mark_dispatched can find it
+    await _persist_tick(db, tick)
+
+    await loop._dispatch_reflection(tick)
+
+    # Engine should NOT be called — silent path
+    engine.reflect.assert_not_called()
+
+    # But tick should be marked dispatched (cascade counting)
+    row = await awareness_ticks.get_by_id(db, tick.tick_id)
+    assert row["dispatched"] == 1
+
+
+async def test_micro_dispatch_fires_llm_on_critical_signal(db):
+    """Micro ticks with software_error_spike > 0 fire the LLM."""
+    engine = AsyncMock()
+    engine.reflect = AsyncMock(return_value=MagicMock(success=True, output=None))
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_reflection_engine(engine)
+
+    tick = _micro_tick([
+        SignalReading(name="software_error_spike", value=0.5, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+        SignalReading(name="autonomy_activity", value=0.0, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+    ])
+
+    await _persist_tick(db, tick)
+    await loop._dispatch_reflection(tick)
+
+    # Engine SHOULD be called — critical signal active
+    engine.reflect.assert_called_once()
+    row = await awareness_ticks.get_by_id(db, tick.tick_id)
+    assert row["dispatched"] == 1
+
+
+async def test_micro_dispatch_fires_llm_on_sentinel_anomaly(db):
+    """Micro ticks with sentinel_activity >= 0.7 fire the LLM."""
+    engine = AsyncMock()
+    engine.reflect = AsyncMock(return_value=MagicMock(success=True, output=None))
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_reflection_engine(engine)
+
+    tick = _micro_tick([
+        SignalReading(name="sentinel_activity", value=0.7, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+    ])
+
+    await _persist_tick(db, tick)
+    await loop._dispatch_reflection(tick)
+
+    engine.reflect.assert_called_once()
+
+
+async def test_micro_dispatch_silent_on_low_sentinel(db):
+    """Micro ticks with sentinel_activity < 0.7 do NOT fire LLM."""
+    engine = AsyncMock()
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_reflection_engine(engine)
+
+    tick = _micro_tick([
+        SignalReading(name="sentinel_activity", value=0.3, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+    ])
+
+    await _persist_tick(db, tick)
+    await loop._dispatch_reflection(tick)
+
+    engine.reflect.assert_not_called()
