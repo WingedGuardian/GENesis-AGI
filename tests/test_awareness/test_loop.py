@@ -4,14 +4,13 @@ Tests the tick pipeline directly (perform_tick) without relying on
 APScheduler timing. Scheduler integration is tested separately.
 """
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 from genesis.awareness.loop import AwarenessLoop, perform_tick
 from genesis.awareness.signals import ConversationCollector
 from genesis.awareness.types import Depth, DepthScore, SignalReading, TickResult
 from genesis.db.crud import awareness_ticks, observations
-
-import json
 
 
 async def _persist_tick(db, tick: TickResult) -> None:
