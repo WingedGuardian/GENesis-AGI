@@ -620,7 +620,7 @@ class TestReflectionHeartbeatEmission:
         from unittest.mock import AsyncMock, MagicMock
 
         from genesis.awareness.loop import AwarenessLoop
-        from genesis.awareness.types import Depth, TickResult
+        from genesis.awareness.types import Depth, SignalReading, TickResult
         from genesis.observability.types import Severity, Subsystem
 
         mock_engine = AsyncMock()
@@ -638,9 +638,16 @@ class TestReflectionHeartbeatEmission:
         loop._db = AsyncMock()
         loop._topic_manager = None  # _dispatch_reflection reads this
 
+        # A critical signal is required to trigger the LLM reflection path
+        # (PR #404: silent micro ticks unless critical signals are present)
+        critical_signal = SignalReading(
+            name="software_error_spike", value=1.0,
+            source="test", collected_at="2026-01-01T00:00:00Z",
+        )
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
         tick.tick_id = "test-tick-123"
+        tick.signals = [critical_signal]
 
         await loop._dispatch_reflection(tick)
 
@@ -654,7 +661,7 @@ class TestReflectionHeartbeatEmission:
         from unittest.mock import AsyncMock, MagicMock
 
         from genesis.awareness.loop import AwarenessLoop
-        from genesis.awareness.types import Depth, TickResult
+        from genesis.awareness.types import Depth, SignalReading, TickResult
 
         mock_engine = AsyncMock()
         mock_result = MagicMock()
@@ -670,9 +677,16 @@ class TestReflectionHeartbeatEmission:
         loop._deferred_queue = None
         loop._db = AsyncMock()
 
+        # Provide a critical signal so we enter the reflect path,
+        # but reflect returns success=False → no heartbeat
+        critical_signal = SignalReading(
+            name="software_error_spike", value=1.0,
+            source="test", collected_at="2026-01-01T00:00:00Z",
+        )
         tick = MagicMock(spec=TickResult)
         tick.classified_depth = Depth.MICRO
         tick.tick_id = "test-tick-456"
+        tick.signals = [critical_signal]
 
         await loop._dispatch_reflection(tick)
 
