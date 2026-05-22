@@ -116,6 +116,26 @@ Full syntax, Cypher examples, and decision matrix:
   fires. Use `CronTrigger` for anything longer than a few hours.
   Bit us with `user_model_evolution` (48h interval, daily restarts).
 
+### Anti-Rationalization
+
+These are excuses sessions use to skip discipline. If you catch yourself
+thinking any of these, STOP — you are rationalizing a shortcut.
+
+| Rationalization | Why it's wrong |
+|---|---|
+| "This is just a simple fix, no tests needed" | Simple fixes break complex systems. The Qdrant regression was a "simple fix." Write the test. |
+| "I already know what this function does" | You haven't read the implementation. Docstrings lie. Read the actual code. |
+| "Tests pass, so we're done" | Tests verify what they cover, not the outcome. Verify actual end-to-end behavior. |
+| "I'll clean this up in the next commit" | Next commit never comes in autonomous sessions. Do it now or create a follow-up. |
+| "This file is too large to read fully" | Read the relevant section. Partial reads lead to partial understanding and wrong fixes. |
+| "The linter is happy, ship it" | Linters catch syntax, not logic. Clean lint with broken behavior is worse than a warning with correct behavior. |
+| "This change is low-risk, no impact analysis needed" | Your confidence is based on what you know. Impact analysis reveals what you don't. Run gitnexus impact. |
+| "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
+| "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
+| "I'll add the follow-up later" | Follow-ups not created in-session are lost. Create it now while context is fresh. |
+| "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
+| "I can read the summary instead of the source" | Summaries lose context. If you're about to change code, read the code, not the description of it. |
+
 ### Code Discovery
 
 Use the right tool for how you're exploring:

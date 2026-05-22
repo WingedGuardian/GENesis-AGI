@@ -32,8 +32,10 @@ def config():
     )
 
 
-# Narrow quiet window that won't interfere with test execution.
-_NO_QUIET_HOURS = QuietHours(start="02:00", end="02:30")
+# Quiet window that cannot interfere with test execution regardless of
+# timezone.  The 1-minute window at 23:58-23:59 avoids the 02:00-02:30
+# collision that broke CI (GitHub Actions runs at ~02:18 UTC).
+_NO_QUIET_HOURS = QuietHours(start="23:58", end="23:59")
 
 
 def _cfg_no_quiet(**overrides):

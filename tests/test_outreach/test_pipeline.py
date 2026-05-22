@@ -20,7 +20,7 @@ from genesis.outreach.types import (
 @pytest.fixture
 def config():
     return OutreachConfig(
-        quiet_hours=QuietHours(start="02:00", end="02:30"),
+        quiet_hours=QuietHours(start="23:58", end="23:59"),
         channel_preferences={"default": "telegram"},
         thresholds={"blocker": 0.0, "alert": 0.3, "surplus": 0.7, "digest": 0.0},
         max_daily=5,
