@@ -1060,6 +1060,15 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "WHERE signal_name = 'user_goal_staleness'"
     )
 
+    # Fix: user_session_pattern is a behavioral signal that produces noise at
+    # Micro depth (persistent ~0.53 value drives 55% of Micro triggers with
+    # zero actionable insight).  Scope to Light only — Light can reason about
+    # behavioral patterns; Micro should focus on operational health.
+    await db.execute(
+        "UPDATE signal_weights SET feeds_depths = '[\"Light\"]' "
+        "WHERE signal_name = 'user_session_pattern'"
+    )
+
     # Ego proposals: memory_basis column for non-obvious memory attribution.
     await _try_alter(db,
         "ALTER TABLE ego_proposals ADD COLUMN memory_basis TEXT DEFAULT ''",
