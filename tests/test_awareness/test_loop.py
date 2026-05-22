@@ -210,3 +210,21 @@ async def test_micro_dispatch_silent_on_low_sentinel(db):
     await loop._dispatch_reflection(tick)
 
     engine.reflect.assert_not_called()
+
+
+async def test_micro_dispatch_fires_llm_on_critical_failure(db):
+    """Micro ticks with critical_failure > 0 fire the LLM."""
+    engine = AsyncMock()
+    engine.reflect = AsyncMock(return_value=MagicMock(success=True, output=None))
+    loop = AwarenessLoop(db=db, collectors=[])
+    loop.set_reflection_engine(engine)
+
+    tick = _micro_tick([
+        SignalReading(name="critical_failure", value=1.0, source="test",
+                      collected_at="2026-05-21T12:00:00+00:00"),
+    ], tick_id="test-crit-fail")
+
+    await _persist_tick(db, tick)
+    await loop._dispatch_reflection(tick)
+
+    engine.reflect.assert_called_once()
