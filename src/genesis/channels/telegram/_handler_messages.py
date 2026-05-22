@@ -1054,7 +1054,7 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                 if is_approve:
                     try:
                         recent_withdrawn = await ego_crud.list_proposals(
-                            ctx.db, status="withdrawn", limit=3,
+                            ctx.db, status="withdrawn", limit=1,
                         )
                         if recent_withdrawn:
                             top = recent_withdrawn[0]

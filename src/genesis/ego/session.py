@@ -371,8 +371,6 @@ class EgoSession:
                         if prop:
                             created = prop.get("created_at", "")
                             if created:
-                                from datetime import UTC, datetime
-
                                 try:
                                     age = datetime.now(UTC) - datetime.fromisoformat(created)
                                     if age.total_seconds() < 86400:  # 24 hours

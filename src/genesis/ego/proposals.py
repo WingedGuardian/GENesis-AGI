@@ -552,24 +552,23 @@ _CANCEL_WORDS = {"cancel", "cancelled", "revoke", "revoked", "stop", "undo"}
 # the ego_proposals topic.  Checked AFTER cross-batch and cancel
 # patterns, BEFORE the numbered regex.
 _BARE_APPROVE = frozenset({
+    # Short affirmatives — caught AFTER the explicit "X all" checks above,
+    # so entries like "approve all" belong there, not here.
     "ok", "okay", "ok.", "okay.",
     "yes", "yes.", "yep", "yep.", "yeah", "ya",
     "sure", "sure.", "absolutely",
-    "go ahead", "go for it", "do it", "let's go", "lets go",
+    "go for it", "do it", "let's go", "lets go",
     "proceed", "sounds good", "lgtm",
-    "approved", "approve", "approve all",
-    "approved all", "accept all", "yes all",
-    "accept", "ship it", "send it",
+    "approved", "approve", "accept",
+    "ship it", "send it",
     "go", "alright", "aight",
     "\U0001f44d", "\u2705",
 })
 _BARE_REJECT = frozenset({
     "no", "no.", "nope", "nah",
-    "reject", "reject all", "rejected",
-    "deny", "deny all", "denied all",
-    "skip", "skip all", "pass", "pass all",
+    "reject", "rejected", "deny",
+    "skip", "pass",
     "don't", "dont", "not now", "hold off",
-    "rejected all",
     "\U0001f44e", "\u274c",
 })
 
