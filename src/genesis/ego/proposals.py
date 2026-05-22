@@ -95,6 +95,10 @@ def _format_digest(
             lines.append(f"<i>Alternatives:</i> {_ESC(alts)}")
         lines.append("")
 
+    lines.append(
+        "<i>Reply: ok/yes/approve \u2022 no/reject \u2022 "
+        "\"approve 1, reject 2\" \u2022 or just talk</i>"
+    )
     return "\n".join(lines)
 
 
@@ -544,6 +548,30 @@ _APPROVE_WORDS = {"approve", "approved", "yes", "accept", "go", "ok", "okay"}
 _REJECT_WORDS = {"reject", "rejected", "no", "deny", "denied", "skip", "nope"}
 _CANCEL_WORDS = {"cancel", "cancelled", "revoke", "revoked", "stop", "undo"}
 
+# Bare affirmative / negative — matches standalone short replies in
+# the ego_proposals topic.  Checked AFTER cross-batch and cancel
+# patterns, BEFORE the numbered regex.
+_BARE_APPROVE = frozenset({
+    # Short affirmatives — caught AFTER the explicit "X all" checks above,
+    # so entries like "approve all" belong there, not here.
+    "ok", "okay", "ok.", "okay.",
+    "yes", "yes.", "yep", "yep.", "yeah", "ya",
+    "sure", "sure.", "absolutely",
+    "go for it", "do it", "let's go", "lets go",
+    "proceed", "sounds good", "lgtm",
+    "approved", "approve", "accept",
+    "ship it", "send it",
+    "go", "alright", "aight",
+    "\U0001f44d", "\u2705",
+})
+_BARE_REJECT = frozenset({
+    "no", "no.", "nope", "nah",
+    "reject", "rejected", "deny",
+    "skip", "pass",
+    "don't", "dont", "not now", "hold off",
+    "\U0001f44e", "\u274c",
+})
+
 # Pattern: "1 approve" or "approve 1" or "1 yes" or "reject 2: reason"
 _NUMBERED_PATTERN = re.compile(
     r"(?:(\d+)\s*[.:)?\-]?\s*(\w+)|(\w+)\s+(\d+))"
@@ -563,8 +591,9 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
     Returns {1-based-index: (status, optional_reason)} or empty dict
     if unparseable.  Empty dict means fall through to correction store.
 
-    IMPORTANT: bare "approve" without "all" or a number does NOT match —
-    it falls through to avoid false positives on conversational replies.
+    Bare short replies ("ok", "yes", "sure", "no", "nope") are recognized
+    as approve-all / reject-all for the most recent batch.  This is safe
+    because the parser only fires in the ego_proposals topic.
     """
     stripped = text.strip().lower()
 
@@ -588,10 +617,16 @@ def parse_proposal_decisions(text: str) -> dict[int, tuple[str, str | None]]:
     if stripped in ("cancel all", "revoke all", "stop all", "undo all"):
         return {0: ("cancelled", None)}  # 0 = sentinel, "cancelled" triggers revoke path
 
-    # Batch-scoped bulk operations
+    # Batch-scoped bulk operations (explicit "all" qualifier)
     if stripped in ("approve all", "approved all", "accept all", "yes all", "go ahead"):
         return {0: ("approved", None)}  # 0 = sentinel for "all in batch"
     if stripped in ("reject all", "rejected all", "deny all", "no all"):
+        return {0: ("rejected", None)}
+
+    # Bare short replies — natural approval/rejection without numbers
+    if stripped in _BARE_APPROVE:
+        return {0: ("approved", None)}
+    if stripped in _BARE_REJECT:
         return {0: ("rejected", None)}
 
     # Try numbered decisions (comma or newline separated)

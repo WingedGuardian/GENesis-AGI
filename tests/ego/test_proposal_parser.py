@@ -86,21 +86,48 @@ class TestNumberedDecisions:
         assert result == {1: ("rejected", None)}
 
 
-class TestFallthrough:
-    """Cases that should return empty dict (fall through to correction store)."""
+class TestBareShortReplies:
+    """Bare short replies resolve as approve-all or reject-all."""
 
     def test_bare_approve(self):
-        """Bare 'approve' without 'all' or number must NOT match."""
-        assert parse_proposal_decisions("approve") == {}
+        assert parse_proposal_decisions("approve") == {0: ("approved", None)}
 
     def test_bare_reject(self):
-        assert parse_proposal_decisions("reject") == {}
+        assert parse_proposal_decisions("reject") == {0: ("rejected", None)}
+
+    def test_ok(self):
+        assert parse_proposal_decisions("ok") == {0: ("approved", None)}
+
+    def test_yes(self):
+        assert parse_proposal_decisions("yes") == {0: ("approved", None)}
+
+    def test_sounds_good(self):
+        assert parse_proposal_decisions("sounds good") == {0: ("approved", None)}
+
+    def test_nope(self):
+        assert parse_proposal_decisions("nope") == {0: ("rejected", None)}
+
+    def test_thumbs_up(self):
+        assert parse_proposal_decisions("\U0001f44d") == {0: ("approved", None)}
+
+    def test_hold_off(self):
+        assert parse_proposal_decisions("hold off") == {0: ("rejected", None)}
+
+
+class TestFallthrough:
+    """Cases that should return empty dict (fall through to correction store)."""
 
     def test_conversational_text(self):
         assert parse_proposal_decisions("sounds good to me") == {}
 
     def test_empty_string(self):
         assert parse_proposal_decisions("") == {}
+
+    def test_question(self):
+        assert parse_proposal_decisions("tell me more about proposal 1") == {}
+
+    def test_long_text(self):
+        assert parse_proposal_decisions("I think we should do this differently") == {}
 
     def test_random_sentence(self):
         assert parse_proposal_decisions("I think we should reconsider the approach") == {}

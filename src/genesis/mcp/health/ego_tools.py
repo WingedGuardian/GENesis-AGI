@@ -292,3 +292,138 @@ async def ego_goal_update(
 
         await user_goals.update(db, goal_id, **fields)
         return {"status": "updated", "goal_id": goal_id, "fields": list(fields.keys())}
+
+
+@mcp.tool()
+async def ego_proposal_resolve(
+    action: str,
+    proposal_numbers: str = "all",
+    reason: str = "",
+) -> dict:
+    """Resolve pending ego proposals from a conversation.
+
+    Use when the user expresses approval or rejection of proposals
+    in natural language. This is the conversational alternative to
+    the automated parser.
+
+    Args:
+        action: "approve" or "reject"
+        proposal_numbers: Comma-separated 1-based numbers (e.g., "1,3"),
+            or "all" to resolve all pending in the most recent batch
+        reason: Optional reason (used for rejections)
+    """
+    if action not in ("approve", "reject"):
+        return {
+            "status": "error",
+            "reason": f"action must be 'approve' or 'reject', got {action!r}",
+        }
+
+    import aiosqlite
+
+    from genesis.db.crud import ego as ego_crud
+
+    status = "approved" if action == "approve" else "rejected"
+    db_path = _get_db_path()
+    results: dict[str, str] = {}
+    batch_id = None
+
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Find most recent pending batch (prefer user_ego_cycle)
+        pending = await ego_crud.list_pending_proposals(
+            db, ego_source="user_ego_cycle",
+        )
+        if not pending:
+            pending = await ego_crud.list_pending_proposals(db)
+
+        if pending:
+            batch_id = pending[-1].get("batch_id")
+
+        # If no pending, check for recently withdrawn (re-validate path)
+        if not batch_id:
+            recent = await ego_crud.list_proposals(db, status="withdrawn", limit=5)
+            if recent:
+                # Create a directive so the ego reconsiders
+                top = recent[0]
+                directive_id = await ego_crud.create_directive(
+                    db,
+                    content=(
+                        f"User tried to approve but all proposals were withdrawn. "
+                        f"Most recent: {(top.get('content') or '')[:200]}. "
+                        f"Re-propose if still valid."
+                    ),
+                    priority="high",
+                    ego_target="user_ego",
+                    source="user",
+                )
+                return {
+                    "status": "no_pending",
+                    "note": "All proposals were withdrawn. Created directive for ego to reconsider.",
+                    "directive_id": directive_id,
+                }
+            return {"status": "error", "reason": "No pending proposals found"}
+
+        batch = await ego_crud.list_proposals_by_batch(db, batch_id)
+        if not batch:
+            return {"status": "error", "reason": f"Empty batch {batch_id}"}
+
+        # Determine which proposals to resolve
+        if proposal_numbers.strip().lower() == "all":
+            indices = list(range(1, len(batch) + 1))
+        else:
+            try:
+                indices = [
+                    int(n.strip())
+                    for n in proposal_numbers.split(",")
+                    if n.strip()
+                ]
+            except ValueError:
+                return {
+                    "status": "error",
+                    "reason": f"Invalid numbers: {proposal_numbers!r}",
+                }
+
+        for idx in indices:
+            if idx < 1 or idx > len(batch):
+                results[f"#{idx}"] = "out of range"
+                continue
+            prop = batch[idx - 1]
+
+            # Re-validate withdrawn proposals → create directive
+            if prop.get("status") == "withdrawn":
+                directive_id = await ego_crud.create_directive(
+                    db,
+                    content=(
+                        f"User approved withdrawn proposal: "
+                        f"{(prop.get('content') or '')[:200]}. "
+                        f"Re-propose this or explain why it's no longer valid."
+                    ),
+                    priority="high",
+                    ego_target="user_ego",
+                    source="user",
+                )
+                results[prop["id"]] = f"withdrawn → directive ({directive_id})"
+                continue
+
+            if prop.get("status") != "pending":
+                results[prop["id"]] = f"already {prop.get('status')}"
+                continue
+
+            updated = await ego_crud.resolve_proposal(
+                db,
+                prop["id"],
+                status=status,
+                user_response=reason or None,
+            )
+            results[prop["id"]] = status if updated else "not updated"
+
+    resolved = sum(1 for v in results.values() if v in ("approved", "rejected"))
+    return {
+        "status": "ok",
+        "action": action,
+        "resolved": resolved,
+        "details": results,
+        "batch_id": batch_id,
+        "timestamp": datetime.now(UTC).isoformat(),
+    }

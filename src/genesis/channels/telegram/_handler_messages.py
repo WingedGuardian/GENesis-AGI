@@ -1048,6 +1048,37 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                 # Fall back to any pending (handles pre-migration NULL ego_source)
                 pending = await ego_crud.list_pending_proposals(ctx.db)
             if not pending:
+                # No pending proposals — check if user is approving something
+                # that was withdrawn. If so, create a directive for the ego.
+                is_approve = any(s == "approved" for s, _ in decisions.values())
+                if is_approve:
+                    try:
+                        recent_withdrawn = await ego_crud.list_proposals(
+                            ctx.db, status="withdrawn", limit=1,
+                        )
+                        if recent_withdrawn:
+                            top = recent_withdrawn[0]
+                            await ego_crud.create_directive(
+                                ctx.db,
+                                content=(
+                                    f"User tried to approve but all proposals "
+                                    f"were withdrawn. Most recent withdrawn: "
+                                    f"{(top.get('content') or '')[:200]}. "
+                                    f"Re-propose if still valid."
+                                ),
+                                priority="high",
+                                ego_target="user_ego",
+                                source="user",
+                            )
+                            with contextlib.suppress(Exception):
+                                await msg.reply_text(
+                                    "That proposal was withdrawn \u2014 I've "
+                                    "flagged it for the ego to reconsider on "
+                                    "its next cycle."
+                                )
+                            return True
+                    except Exception:
+                        log.warning("Withdrawn re-validate failed", exc_info=True)
                 return False
             # Use the MOST RECENT batch (user sees latest digest at top)
             batch_id = pending[-1].get("batch_id")
