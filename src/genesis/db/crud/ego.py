@@ -397,7 +397,7 @@ async def update_proposal_outcome(
     Called after the dispatched session completes, so the ego knows whether
     the action actually succeeded or failed.
     """
-    suffix = f"|{'completed' if success else 'failed'}:{summary[:200]}"
+    suffix = f"|{'completed' if success else 'failed'}:{summary[:1000]}"
     cursor = await db.execute(
         "UPDATE ego_proposals SET user_response = COALESCE(user_response, '') || ? "
         "WHERE id = ? AND status = 'executed'",
