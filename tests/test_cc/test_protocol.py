@@ -6,7 +6,6 @@ import inspect
 
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.protocol import AgentProvider
-from genesis.cc.types import CCInvocation, CCOutput, StreamEvent
 
 
 def test_ccinvoker_is_agent_provider():

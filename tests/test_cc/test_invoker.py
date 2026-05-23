@@ -77,9 +77,16 @@ def test_build_env_sets_anthropic_base_url(invoker):
 def test_build_env_omits_anthropic_base_url_when_none(invoker):
     inv = CCInvocation(prompt="hello")
     with patch.dict("os.environ", {}, clear=False):
-        # Ensure no ANTHROPIC_BASE_URL leaks from parent env
         import os
         os.environ.pop("ANTHROPIC_BASE_URL", None)
+        env = invoker._build_env(inv)
+        assert "ANTHROPIC_BASE_URL" not in env
+
+
+def test_build_env_strips_parent_anthropic_base_url(invoker):
+    """Parent env ANTHROPIC_BASE_URL must not leak when field is None."""
+    inv = CCInvocation(prompt="hello")
+    with patch.dict("os.environ", {"ANTHROPIC_BASE_URL": "http://leaked:8100"}):
         env = invoker._build_env(inv)
         assert "ANTHROPIC_BASE_URL" not in env
 

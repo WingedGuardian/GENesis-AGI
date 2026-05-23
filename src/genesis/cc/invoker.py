@@ -131,6 +131,8 @@ class CCInvoker:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
         if inv and inv.anthropic_base_url:
             env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
+        else:
+            env.pop("ANTHROPIC_BASE_URL", None)
         # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
         # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
