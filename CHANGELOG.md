@@ -9,15 +9,73 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ## [Unreleased]
 
+---
+
+## [v3.0b11] - 2026-05-23
+
+48 PRs merged. Proposal lifecycle redesigned --- ego's focus board
+decoupled from user approval queue. Ego reliability hardened across
+resolution UX, realist gate, and sovereignty guards. Reflection goes
+event-driven. Dashboard gains observations tab and eval metrics.
+
+### Added
+
+- **Board/queue separation** (#412) --- ego's 0-3 focus board is now
+  independent of the user's pending approval queue. New `unboard` action
+  rotates ego focus without destroying user approvals. 14-day auto-table
+  for stale proposals.
+- **Unified proposal resolution** (#411) --- natural language approval
+  ("ok", "yes", "sounds good") recognized across Telegram, MCP tool,
+  and CC sessions. Re-validate path for withdrawn proposals.
+- **User directives** (#399) --- direct instructions to the ego with
+  rich goal context and MCP tools for goal/directive management.
+- **Goal-proposal linking** (#390, #403) --- proposals advance specific
+  user goals with progress tracking and Opus-quality dispatch.
+- **Critical observation alerting** (#369, #370) --- automatic Telegram
+  alerts for critical observations with delivery gating and dedup.
+- **Observations tab** (#367) --- browse and resolve observations on
+  the dashboard.
+- **J-9 eval metrics** (#378, #383) --- evaluation dimensions and
+  meta-health heartbeat surfaced on dashboard.
+- **Workflow visibility** (#380) --- phase timeline with linked
+  follow-ups on dashboard.
+- **TinyFish Browser API** (#388) --- Layer 4 CDP option for browser
+  automation.
+- **Model assessment framework** (#372) --- activated scheduler for
+  provider evaluation.
+- **Weekly models.md synthesis** (#410) --- recon pipeline auto-generates
+  model intelligence report.
+
 ### Changed
 
-- **Update polling** --- replaced 15-minute wall-clock timeout in the
-  dashboard update flow with state-based silent-death detection. The
-  poller now tracks whether the update process was ever seen alive
-  (`seenInProgress`) and alerts within one 5-second poll cycle if the
-  process ends without leaving a summary, escalation, or conflict
-  record. A 30-second startup grace period prevents false positives
-  during the brief PID-write window at launch.
+- **Event-driven reflection** (#408) --- anomaly focus with delta-only
+  Light prompts. No re-reporting known conditions.
+- **Silent micro ticks** (#404) --- perception runs without LLM unless
+  critical signal detected.
+- **Jurisdiction separation** (#387) --- user ego and genesis ego
+  operate in distinct domains.
+- **Update polling** --- state-based silent-death detection replaces
+  wall-clock timeout with 30-second startup grace period.
+
+### Fixed
+
+- **24h sovereignty guard** (#411, #412) --- tabling and withdrawal
+  blocked for proposals delivered less than 24 hours ago.
+- **Realist confabulation** (#412) --- realist gate can no longer
+  fabricate system state claims from failure patterns in history.
+- **Observation TTL tuning** (#407) --- infrastructure types expire
+  faster to prevent stale belief errors.
+- **Ego outcome visibility** (#391) --- clear FAILED/OK outcomes in
+  proposal history context.
+- **Reactive event dedup** (#397) --- content-dedup prevents 30-minute
+  spam from repeated signals.
+- **Guardian depth checks** (#377) --- health API probes with 503 retry.
+- **Sentinel stale heartbeat** (#376) --- detects and reports on
+  dashboard.
+- **Inbox re-evaluation** (#402) --- previously evaluated items no
+  longer re-processed.
+- **Dashboard UX** (#364, #394, #396) --- approvals, ego badges, work
+  tab, timezone handling, silent-death detection.
 
 ---
 
