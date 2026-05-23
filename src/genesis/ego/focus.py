@@ -19,12 +19,9 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Any, Protocol
 
 from genesis.ego.signals import EgoSignal
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -202,8 +199,9 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
 # Focus selector
 # ---------------------------------------------------------------------------
 
-# Regex to extract JSON from LLM response (same as session.py parse pattern)
-_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+# Regex to extract JSON from LLM response (non-greedy to avoid matching
+# across multiple JSON objects or trailing text with braces).
+_JSON_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
 class FocusSelector:

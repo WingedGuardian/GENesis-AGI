@@ -47,7 +47,9 @@ if TYPE_CHECKING:
     from genesis.ego.compaction import CompactionEngine
     from genesis.ego.context import EgoContextBuilder
     from genesis.ego.dispatch import EgoDispatcher
+    from genesis.ego.focus import FocusResult
     from genesis.ego.proposals import ProposalWorkflow
+    from genesis.ego.signals import EgoSignal
     from genesis.observability.events import GenesisEventBus
 
 logger = logging.getLogger(__name__)
@@ -279,7 +281,7 @@ class EgoSession:
 
     async def run_unified_cycle(
         self,
-        signals: list,
+        signals: list[EgoSignal],
         *,
         model_override: str | None = None,
     ) -> EgoCycle | None:
@@ -431,7 +433,7 @@ class EgoSession:
 
         return cycle
 
-    async def _perceive(self, signals: list) -> object | None:
+    async def _perceive(self, signals: list[EgoSignal]) -> FocusResult | None:
         """Focus selection — perceive phase of the unified cognitive loop.
 
         Returns a FocusResult or None if no actionable signals.
@@ -483,11 +485,15 @@ class EgoSession:
     async def _record_cycle_outcome(
         self,
         cycle: EgoCycle,
-        focus: object,
+        focus: FocusResult,
     ) -> None:
         """Record cycle outcome for the Learn phase (ego_cycle_outcomes table)."""
         try:
             proposals = json.loads(cycle.proposals_json) if cycle.proposals_json else []
+            # GROUNDWORK(unified-loop-dispatches): num_dispatches is always 0
+            # here because dispatch count isn't known at cycle-completion time.
+            # PR 2+ should wire the on_end hook to update this column after
+            # dispatched sessions complete.
             await ego_crud.create_cycle_outcome(
                 self._db,
                 cycle_id=cycle.id,
@@ -812,7 +818,7 @@ class EgoSession:
         self,
         *,
         dynamic_context: str,
-        focus: object,
+        focus: FocusResult,
     ) -> str:
         """Build a focus-specific user message for the unified cognitive loop.
 
@@ -856,6 +862,11 @@ class EgoSession:
             directive += (
                 "\n\nThis cycle was triggered by a dispatch outcome. "
                 "Assess the result and determine next steps."
+            )
+        elif focus.focus_type == "escalation":
+            directive += (
+                "\n\nThis is an ESCALATION cycle. Assess the health issue "
+                "or system alert and propose remediation actions."
             )
 
         return f"{directive}\n\n---\n\n{dynamic_context}"

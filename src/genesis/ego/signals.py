@@ -113,8 +113,9 @@ class SignalQueue:
             logger.debug("Signal rejected (expired): %s", signal.summary[:50])
             return False
 
-        # Content dedup: skip if same summary seen recently
-        summary_key = signal.summary[:100]
+        # Content dedup: skip if same summary seen recently.
+        # Include focus_category to prevent collision on empty/short summaries.
+        summary_key = f"{signal.focus_category}:{signal.summary[:100]}"
         now = datetime.now(UTC)
 
         if summary_key in self._seen:

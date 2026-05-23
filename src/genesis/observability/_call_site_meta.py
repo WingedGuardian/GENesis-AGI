@@ -347,7 +347,7 @@ _CALL_SITE_META: dict[str, dict] = {
         "category": "classification",
         "frequency": "Per ego cycle (4-6/day), skipped when single signal",
         "model_tier": "slm",
-        "status_reason": "WIRED",
+        "status_reason": "BUILT",  # Wired to cadence consumer loop in PR 2
     },
     "contingency_foreground": {
         "description": "API-based foreground conversation fallback when CC is rate-limited or unavailable.",
