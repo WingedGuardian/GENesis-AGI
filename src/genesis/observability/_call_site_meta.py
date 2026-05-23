@@ -342,6 +342,13 @@ _CALL_SITE_META: dict[str, dict] = {
         "frequency": "On demand",
         "model_tier": "mid",
     },
+    "40_ego_focus_selection": {
+        "description": "Unified cognitive loop focus selector. Classifies pending signals to pick ego attention direction. Only fires for multi-signal arbitration; single-signal and critical-preemption cases bypass LLM.",
+        "category": "classification",
+        "frequency": "Per ego cycle (4-6/day), skipped when single signal",
+        "model_tier": "slm",
+        "status_reason": "WIRED",
+    },
     "contingency_foreground": {
         "description": "API-based foreground conversation fallback when CC is rate-limited or unavailable.",
         "category": "reasoning",
