@@ -514,6 +514,17 @@ V3 was built in 10 phases over seven months: from data schemas to full autonomou
 
 V3 is the foundation -- cognitive architecture complete, ego module live, running in production. What comes next is where it gets ambitious enough to need a community behind it.
 
+### V3.x -- Voice interface & ambient awareness
+
+Genesis has memory, learning, and autonomy -- but only through text. The next step is making it ambient: always listening, always available, always aware of what's happening around you.
+
+- **Real-time voice conversation** -- talk to Genesis through a speaker like talking to Alexa, except with full memory, knowledge, and action capabilities behind it. Speech-to-speech model handles the conversation; Genesis handles the thinking.
+- **Ambient transcription** -- continuous listening, transcription, and intelligence extraction. Decisions made, action items, names mentioned, topics discussed -- captured and stored without explicit commands.
+- **Proactive awareness** -- Genesis speaks up when it has something valuable to contribute. Hears you mention a broken deployment? It tells you. Detects emotional escalation in a conversation? It can offer to help.
+- **Genesis HTTP Tool API** -- exposes Genesis's capabilities (memory, health, knowledge, actions) over HTTP, enabling any client -- speech models, Home Assistant, external agents -- to call Genesis tools directly.
+
+The voice interface is built on Home Assistant as the frontend (wake word, mic, speaker) with Genesis as the cognitive backend. Ambient awareness adds a passive listening mode with a dedicated memory tier, privacy filtering, and a lightweight attention system that decides what deserves Genesis's attention in real time.
+
 ### V4 -- Coordinated cognition
 
 V3 has perception, cognition, learning, and autonomous decision-making. What it lacks is coordination -- subsystems act independently, with no shared awareness of what the system is focused on. V4 fixes that.
