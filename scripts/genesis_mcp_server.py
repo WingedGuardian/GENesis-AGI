@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""Genesis MCP Server — standalone stdio wrapper for CC integration.
+"""Genesis MCP Server — standalone wrapper for CC and HTTP integration.
 
-Launches one of the Genesis MCP servers (health, memory, recon) as a stdio
-process that Claude Code can connect to via .mcp.json auto-discovery.
+Launches one of the Genesis MCP servers (health, memory, outreach, recon) as
+either a stdio process (for Claude Code via .mcp.json) or an HTTP server
+(for external clients like speech models, Home Assistant, or other agents).
 
 Usage:
-    python genesis_mcp_server.py --server health|memory|outreach|recon
+    # Stdio (default, for CC integration):
+    python genesis_mcp_server.py --server health
 
-Architecture note: mcp.run(transport="stdio") owns the event loop (via anyio).
+    # HTTP (for external clients):
+    python genesis_mcp_server.py --server health --transport streamable-http --port 8100
+
+Architecture note: mcp.run(transport=...) owns the event loop (via anyio).
 Bootstrappers must be synchronous — async DB connections are opened inside
 the MCP server's event loop via FastMCP's _lifespan hook.
 """
@@ -37,6 +42,17 @@ def _default_db_path() -> Path:
 _DEFAULT_DB = _default_db_path()
 
 
+_VALID_TRANSPORTS = {"stdio", "streamable-http"}
+
+# Default HTTP ports per server (avoids conflicts when running multiple)
+_DEFAULT_PORTS = {
+    "health": 8100,
+    "memory": 8101,
+    "outreach": 8102,
+    "recon": 8103,
+}
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Genesis MCP Server (standalone)")
     parser.add_argument(
@@ -44,6 +60,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         choices=sorted(_VALID_SERVERS),
         help="Which MCP server to run",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=sorted(_VALID_TRANSPORTS),
+        default="stdio",
+        help="Transport protocol (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="HTTP port (default: per-server, 8100-8103)",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=None,
+        help="Bearer token for HTTP auth (default: GENESIS_MCP_HTTP_TOKEN env var)",
     )
     return parser.parse_args(argv)
 
@@ -53,7 +91,19 @@ def is_genesis_enabled(*, flag_path: Path = _DEFAULT_FLAG) -> bool:
     return flag_path.exists()
 
 
-def _run_disabled_stub() -> None:
+def _build_transport_kwargs(args: argparse.Namespace) -> dict:
+    """Build kwargs dict for mcp.run() from parsed CLI args."""
+    kwargs: dict = {"transport": args.transport}
+    if args.transport == "streamable-http":
+        kwargs["host"] = args.host
+        kwargs["port"] = args.port or _DEFAULT_PORTS.get(args.server, 8100)
+        kwargs["path"] = "/mcp"
+        kwargs["stateless_http"] = True
+        kwargs["log_level"] = "warning"
+    return kwargs
+
+
+def _run_disabled_stub(transport_kwargs: dict) -> None:
     """Run a minimal MCP server that reports Genesis context is disabled."""
     from fastmcp import FastMCP
 
@@ -64,10 +114,10 @@ def _run_disabled_stub() -> None:
         """Genesis context is disabled. Use /genesis on to enable."""
         return "Genesis context is disabled. Run /genesis on in interactive CC to enable."
 
-    stub.run(transport="stdio")
+    _run_mcp(stub, transport_kwargs)
 
 
-def _bootstrap_health() -> None:
+def _bootstrap_health(transport_kwargs: dict) -> None:
     """Bootstrap and run the health MCP server.
 
     Uses StandaloneHealthDataService which reads ~/.genesis/status.json
@@ -85,7 +135,7 @@ def _bootstrap_health() -> None:
         tracker = ProviderActivityTracker()
         init_health_mcp(svc, activity_tracker=tracker)
         clear_mcp_crash("health")
-        mcp.run(transport="stdio")
+        _run_mcp(mcp, transport_kwargs)
         return
 
     @asynccontextmanager
@@ -148,10 +198,10 @@ def _bootstrap_health() -> None:
             await db.close()
 
     mcp._lifespan = _lifespan
-    mcp.run(transport="stdio")
+    _run_mcp(mcp, transport_kwargs)
 
 
-def _bootstrap_memory() -> None:
+def _bootstrap_memory(transport_kwargs: dict) -> None:
     """Bootstrap and run the memory MCP server.
 
     Requires Qdrant + Ollama for embeddings. Opens aiosqlite connection
@@ -197,10 +247,10 @@ def _bootstrap_memory() -> None:
         return
 
     mcp._lifespan = _lifespan
-    mcp.run(transport="stdio")
+    _run_mcp(mcp, transport_kwargs)
 
 
-def _bootstrap_recon() -> None:
+def _bootstrap_recon(transport_kwargs: dict) -> None:
     """Bootstrap and run the recon MCP server."""
     from genesis.mcp.recon_mcp import mcp
 
@@ -237,10 +287,10 @@ def _bootstrap_recon() -> None:
         return
 
     mcp._lifespan = _lifespan
-    mcp.run(transport="stdio")
+    _run_mcp(mcp, transport_kwargs)
 
 
-def _bootstrap_outreach() -> None:
+def _bootstrap_outreach(transport_kwargs: dict) -> None:
     """Bootstrap and run the outreach MCP server.
 
     In standalone mode, pipeline/engagement/config are None — outreach_send
@@ -283,7 +333,7 @@ def _bootstrap_outreach() -> None:
         return
 
     mcp._lifespan = _lifespan
-    mcp.run(transport="stdio")
+    _run_mcp(mcp, transport_kwargs)
 
 
 _BOOTSTRAPPERS = {
@@ -292,6 +342,69 @@ _BOOTSTRAPPERS = {
     "outreach": _bootstrap_outreach,
     "recon": _bootstrap_recon,
 }
+
+
+def _run_mcp(mcp_instance, transport_kwargs: dict) -> None:
+    """Run an MCP server with the configured transport.
+
+    For stdio: delegates directly to mcp.run().
+    For HTTP with auth: injects a raw ASGI auth wrapper via FastMCP's
+    middleware parameter, then delegates to mcp.run() so lifespan
+    handling works correctly.
+    """
+    auth_token = transport_kwargs.pop("_auth_token", None)
+
+    if auth_token and transport_kwargs["transport"] != "stdio":
+        transport_kwargs["middleware"] = [_bearer_auth_middleware(auth_token)]
+
+    mcp_instance.run(**transport_kwargs)
+
+
+def _bearer_auth_middleware(expected_token: str):
+    """Create a raw ASGI middleware for bearer token auth.
+
+    Returns a Starlette Middleware wrapping a pure-ASGI class so SSE
+    streaming responses pass through without buffering (unlike
+    BaseHTTPMiddleware which breaks text/event-stream).
+    """
+    import hmac
+    import json as _json
+
+    from starlette.middleware import Middleware
+
+    _token = expected_token
+
+    class _AuthGuard:
+        def __init__(self, app):
+            self.app = app
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] not in ("http", "websocket"):
+                return await self.app(scope, receive, send)
+
+            headers = dict(scope.get("headers", []))
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], _token):
+                return await self.app(scope, receive, send)
+
+            if scope["type"] == "http":
+                body = _json.dumps({"error": "Unauthorized"}).encode()
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        [b"content-type", b"application/json"],
+                        [b"content-length", str(len(body)).encode()],
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            if scope["type"] == "websocket":
+                await send({"type": "websocket.close", "code": 4001})
+                return
+
+    return Middleware(_AuthGuard)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -319,26 +432,47 @@ def main(argv: list[str] | None = None) -> None:
         "API_KEY_DEEPSEEK",
         # Ollama config
         "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL",
+        # HTTP transport auth
+        "GENESIS_MCP_HTTP_TOKEN",
     }
+    import os
+
     from genesis.env import secrets_path
 
     secrets = secrets_path()
     if secrets.exists():
-        import os
-
         from dotenv import dotenv_values
 
         for key, value in dotenv_values(secrets).items():
             if key in _MCP_VARS and key not in os.environ and value:
                 os.environ[key] = value
 
+    transport_kwargs = _build_transport_kwargs(args)
+
+    # HTTP transport: validate auth token is configured
+    if args.transport == "streamable-http":
+        token = args.auth_token or os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
+        if not token:
+            logger.error(
+                "HTTP transport requires auth token. Set GENESIS_MCP_HTTP_TOKEN "
+                "env var or pass --auth-token."
+            )
+            sys.exit(1)
+        transport_kwargs["_auth_token"] = token
+        logger.warning(
+            "Starting %s MCP server on http://%s:%d/mcp",
+            args.server,
+            transport_kwargs["host"],
+            transport_kwargs["port"],
+        )
+
     if not is_genesis_enabled():
-        _run_disabled_stub()
+        _run_disabled_stub(transport_kwargs)
         return
 
     bootstrapper = _BOOTSTRAPPERS[args.server]
     try:
-        bootstrapper()
+        bootstrapper(transport_kwargs)
     except Exception:
         _record_mcp_crash(args.server)
         raise
