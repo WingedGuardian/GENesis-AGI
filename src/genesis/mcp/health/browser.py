@@ -68,6 +68,21 @@ _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 _VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
 
+# VNC infrastructure state — verified once per session
+_vnc_verified = False
+
+# Cloudflare challenge detection constants (FlareSolverr-proven)
+_CHALLENGE_TITLES = ["just a moment", "ddos-guard"]
+_CHALLENGE_SELECTORS = [
+    'iframe[src*="challenges.cloudflare.com"]',
+    'input[name="cf-turnstile-response"]',
+    "#cf-challenge-running",
+    "#challenge-spinner",
+    "#turnstile-wrapper",
+    ".ray_id",
+    "#cf-please-wait",
+]
+
 
 def _is_page_alive(page) -> bool:
     """Check if a Playwright page reference is still usable.
@@ -546,6 +561,48 @@ def _start_idle_watcher():
         )
 
 
+async def _ensure_vnc():
+    """Verify x11vnc + websockify are running for local browser VNC access.
+
+    Uses systemd services (genesis-vnc, genesis-novnc) as primary mechanism.
+    Falls back to raw subprocess if systemctl fails.  Checks once per
+    session (module-level ``_vnc_verified`` flag).
+    """
+    global _vnc_verified
+    if _vnc_verified:
+        return
+
+    import subprocess as _sp
+
+    # Check and start x11vnc
+    try:
+        r = _sp.run(
+            ["systemctl", "--user", "is-active", "genesis-vnc"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if r.stdout.strip() != "active":
+            _sp.run(
+                ["systemctl", "--user", "start", "genesis-vnc", "genesis-novnc"],
+                capture_output=True, timeout=5,
+            )
+            logger.info("Started genesis-vnc + genesis-novnc via systemctl")
+    except Exception:
+        # Fallback: start x11vnc directly if systemctl unavailable
+        try:
+            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+            auth_arg = ["-rfbauth", str(vnc_passwd)] if vnc_passwd.exists() else ["-nopw"]
+            _sp.Popen(
+                ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
+                 "-rfbport", "5900", "-bg"] + auth_arg,
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+            logger.info("Started x11vnc directly (systemctl fallback)")
+        except FileNotFoundError:
+            logger.debug("x11vnc not installed — VNC click unavailable")
+
+    _vnc_verified = True
+
+
 async def _get_page(
     stealth: bool = True,
     remote: bool = False,
@@ -573,8 +630,10 @@ async def _get_page(
     elif remote:
         _active_page = await _ensure_remote_cdp(cdp_url)
     elif stealth:
+        await _ensure_vnc()
         _active_page = await _ensure_browser()
     else:
+        await _ensure_vnc()
         _active_page = await _ensure_chromium_fallback()
     _touch()
     _start_idle_watcher()
@@ -1095,88 +1154,127 @@ async def _vnc_click_turnstile(page) -> bool:
         return False
 
 
+async def _detect_challenge(page) -> bool:
+    """Detect any Cloudflare challenge (iframe, managed, interstitial).
+
+    Uses FlareSolverr-proven selectors plus page title check.
+    Returns True if a challenge is detected.
+    """
+    # Check DOM selectors (fastest)
+    for selector in _CHALLENGE_SELECTORS:
+        el = await page.query_selector(selector)
+        if el is not None:
+            return True
+
+    # Title-based detection for very early interstitials
+    title = (await page.title()).lower()
+    return any(ct in title for ct in _CHALLENGE_TITLES)
+
+
 async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
-    """Detect and handle Cloudflare Turnstile challenge.
+    """Detect and handle Cloudflare challenge (Turnstile or managed).
 
-    Phase 1 (auto-resolve): Polls for up to ``timeout_ms`` for the Turnstile
-    iframe to produce a ``cf-turnstile-response`` token.  Many challenges
-    auto-resolve for legitimate-looking browsers.
+    Phase 1 (auto-resolve): Polls for up to ``timeout_ms`` for the challenge
+    to resolve automatically.  Trusted browsers on residential IPs typically
+    auto-resolve in 3-5 seconds.
 
-    Phase 2 (VNC trusted input): Sends a real mouse click through the VNC
-    protocol, bypassing Cloudflare's synthetic event detection.  Up to 2
-    attempts with coordinate recalculation between them.
+    Phase 2 (VNC click): Sends a real mouse click through VNC protocol
+    during the checkbox window.  The Turnstile widget cycles between
+    spinner (~10s) and checkbox (~30-60s) phases — clicks must land
+    during the checkbox phase.  Up to 3 attempts.
+
+    Phase 2.5 (reload): If VNC clicks fail, reloads the page.  Research
+    shows this predictably escalates from spinner to interactive checkbox.
 
     Phase 3 (human escalation): Sends a Telegram alert and polls for up to
     5 minutes.  The browser is always headed on :99, so the human can see
-    and interact immediately — no restart needed.
+    and interact immediately.
 
-    Returns None if no Turnstile detected, or a status dict.
+    Returns None if no challenge detected, or a status dict.
     """
     try:
-        # Brief delay for SPA-injected Turnstile iframes/widgets
+        # Brief delay for SPA-injected widgets to load
         await asyncio.sleep(0.8)
 
-        # Detect both iframe-based and managed (inline) Turnstile variants.
-        # Managed challenges embed cf-turnstile-response directly in the page
-        # without an iframe (e.g., Medium's "Just a moment..." interstitial).
-        turnstile = await page.query_selector(
-            'iframe[src*="challenges.cloudflare.com"]'
-        )
-        if turnstile is None:
-            # Check for managed challenge (no iframe, inline widget)
-            managed = await page.query_selector(
-                'input[name="cf-turnstile-response"]'
-            )
-            if managed is None:
-                return None
-            logger.info("Managed Turnstile challenge detected (no iframe)")
+        if not await _detect_challenge(page):
+            return None
 
-        logger.info("Turnstile challenge detected — waiting for auto-resolve")
+        logger.info("Cloudflare challenge detected — waiting for auto-resolve")
 
-        # Phase 1: auto-resolve
+        # Phase 1: auto-resolve (3-5s for trusted browsers, 15s max)
         if await _poll_turnstile_token(page, timeout_ms / 1000, 1.0):
-            logger.info("Turnstile auto-resolved")
+            logger.info("Challenge auto-resolved")
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 2: VNC trusted input click (up to 2 attempts)
+        # Phase 2: VNC click — checkbox-aware with retry
+        # The Turnstile widget cycles: spinner (~10s) → checkbox (~30-60s).
+        # We must click during the checkbox window, not during spinner.
         logger.warning(
-            "Turnstile did NOT auto-resolve in %dms — trying VNC click",
+            "Challenge did NOT auto-resolve in %dms — trying VNC click",
             timeout_ms,
         )
-        for attempt in range(1, 3):
-            if await _vnc_click_turnstile(page):
-                if await _poll_turnstile_token(page, 30, 1.0):
+        for attempt in range(1, 4):  # up to 3 attempts
+            # Wait for spinner to finish (checkbox to appear)
+            for _ in range(10):  # poll every 2s for up to 20s
+                # Check if challenge already resolved (e.g., auto-resolved
+                # during a re-evaluation cycle)
+                if await _poll_turnstile_token(page, 1, 0.5):
                     logger.info(
-                        "Turnstile resolved via VNC click (attempt %d)",
+                        "Challenge resolved during wait (attempt %d)", attempt,
+                    )
+                    await asyncio.sleep(random.uniform(1.0, 3.0))
+                    return {"status": "resolved", "method": "auto_delayed"}
+
+                # Check if we're still on a challenge page
+                if not await _detect_challenge(page):
+                    logger.info("Challenge page gone — resolved externally")
+                    return {"status": "resolved", "method": "external"}
+
+                await asyncio.sleep(2)
+
+            # Attempt VNC click
+            if await _vnc_click_turnstile(page):
+                if await _poll_turnstile_token(page, 15, 1.0):
+                    logger.info(
+                        "Challenge resolved via VNC click (attempt %d)",
                         attempt,
                     )
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     return {"status": "resolved", "method": "vnc_click"}
                 logger.info(
-                    "VNC click %d sent but Turnstile not yet resolved",
+                    "VNC click %d sent but challenge not yet resolved",
                     attempt,
                 )
             else:
                 logger.warning("VNC click attempt %d failed to send", attempt)
-            if attempt < 2:
-                await asyncio.sleep(random.uniform(1.0, 2.0))
+
+        # Phase 2.5: Reload and retry — triggers different challenge variant
+        logger.info("VNC clicks exhausted — trying page reload")
+        try:
+            await page.reload(wait_until="domcontentloaded", timeout=15000)
+            await asyncio.sleep(2)
+            if await _poll_turnstile_token(page, 15, 1.0):
+                logger.info("Challenge resolved after reload")
+                return {"status": "resolved", "method": "reload"}
+        except Exception:
+            logger.debug("Reload failed", exc_info=True)
 
         # Phase 3: human escalation (last resort)
         logger.warning(
-            "Turnstile NOT resolved via VNC — escalating to human"
+            "Challenge NOT resolved via VNC/reload — escalating to human"
         )
         await _send_turnstile_alert(page.url)
 
         if await _poll_turnstile_token(page, 300, 5.0):  # 5 minutes
-            logger.info("Turnstile resolved by human intervention")
+            logger.info("Challenge resolved by human intervention")
             await asyncio.sleep(random.uniform(1.0, 2.0))
             return {"status": "resolved", "method": "human"}
 
-        logger.warning("Turnstile NOT resolved after 5 min escalation")
+        logger.warning("Challenge NOT resolved after 5 min escalation")
         return {"status": "blocked", "method": "timeout"}
     except Exception as e:
-        logger.debug("Turnstile detection error: %s", e)
+        logger.debug("Challenge detection error: %s", e)
         return None
 
 
@@ -1220,9 +1318,11 @@ async def _impl_browser_navigate(
         if not skip_goto:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-        # Turnstile detection only for Camoufox (real Chrome won't trigger it)
+        # Challenge detection for local browsers (Camoufox + Chromium).
+        # Skip for TinyFish (cloud browser, clean IP) and remote CDP
+        # (user watching their own screen — they can handle challenges).
         turnstile_result = None
-        if _is_camoufox_active():
+        if not tinyfish and not remote:
             turnstile_result = await _wait_for_turnstile(page)
 
         # Track URL for drift detection on remote sessions
