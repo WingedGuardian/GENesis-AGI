@@ -215,7 +215,7 @@ class TestHealthBootstrapLifespan:
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
-            _bootstrap_health()
+            _bootstrap_health({"transport": "stdio"})
 
         # _lifespan was set (not None) and run was called
         assert mock_mcp._lifespan is not None
@@ -236,7 +236,7 @@ class TestHealthBootstrapLifespan:
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
-            _bootstrap_health()
+            _bootstrap_health({"transport": "stdio"})
 
         # Should still call run (db=None fallback)
         mock_mcp.run.assert_called_once_with(transport="stdio")
@@ -266,7 +266,7 @@ class TestHealthBootstrapLifespan:
         ):
             from scripts.genesis_mcp_server import _bootstrap_health
 
-            _bootstrap_health()
+            _bootstrap_health({"transport": "stdio"})
 
             # Extract the lifespan that was set
             lifespan = mock_mcp._lifespan
