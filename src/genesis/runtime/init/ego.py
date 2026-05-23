@@ -282,11 +282,25 @@ async def init(rt: GenesisRuntime) -> None:
                             _prop = await ego_crud.get_proposal(rt._db, _pid)
                             _gid = _prop.get("goal_id") if _prop else None
                             if _gid:
-                                _content = (_prop.get("content") or "")[:80]
-                                _note = (
-                                    f"[{status}] Proposal: {_content} "
-                                    f"(session {session_id[:8]}, ${cost:.4f})"
-                                )
+                                _content = (_prop.get("content") or "")[:60]
+                                # Extract outcome summary from session
+                                # metadata (stored by DirectSessionRunner
+                                # at direct_session.py:479,483).
+                                if status in ("completed", "success"):
+                                    _outcome = (_meta.get("output_text") or "")[:120]
+                                else:
+                                    _outcome = (_meta.get("error") or "")[:120]
+                                _outcome = _outcome.replace("\n", " ").strip()
+                                if _outcome:
+                                    _note = (
+                                        f"[{status}] {_content}: "
+                                        f"{_outcome} (session:{session_id[:8]})"
+                                    )
+                                else:
+                                    _note = (
+                                        f"[{status}] {_content} "
+                                        f"(session:{session_id[:8]})"
+                                    )
                                 await user_goals.add_progress_note(
                                     rt._db, _gid, _note,
                                 )

@@ -1,9 +1,9 @@
-"""MCP tools for ego management — focus reset, directives, goal CRUD.
+"""MCP tools for ego management — focus reset, directives, goal CRUD, progress.
 
 Allows foreground CC sessions to interact with the ego system:
 - Reset focus (break holdback loops)
 - Create directives (flag things as important for the ego)
-- Manage goals (create, list, update, achieve, abandon)
+- Manage goals (create, list, update, achieve, abandon, add progress notes)
 """
 
 from __future__ import annotations
@@ -292,6 +292,46 @@ async def ego_goal_update(
 
         await user_goals.update(db, goal_id, **fields)
         return {"status": "updated", "goal_id": goal_id, "fields": list(fields.keys())}
+
+
+@mcp.tool()
+async def ego_goal_progress(
+    goal_id: str,
+    note: str,
+) -> dict:
+    """Add a progress note to a user goal.
+
+    Progress notes are visible to the ego in its thinking cycles.
+    Use this to record incremental progress, blockers, or status
+    changes on a goal.
+
+    Args:
+        goal_id: The goal ID to add a note to
+        note: The progress note text (will be timestamped automatically)
+    """
+    if not note.strip():
+        return {"status": "error", "reason": "Note cannot be empty"}
+
+    import aiosqlite
+
+    from genesis.db.crud import user_goals
+
+    db_path = _get_db_path()
+    async with aiosqlite.connect(str(db_path)) as db:
+        db.row_factory = aiosqlite.Row
+        goal = await user_goals.get_by_id(db, goal_id)
+        if not goal:
+            return {"status": "error", "reason": f"Goal {goal_id} not found"}
+        updated = await user_goals.add_progress_note(db, goal_id, note.strip())
+        if not updated:
+            return {"status": "error", "reason": "Failed to add note"}
+
+    return {
+        "status": "ok",
+        "goal_id": goal_id,
+        "goal_title": goal["title"][:80],
+        "note": note.strip()[:120],
+    }
 
 
 @mcp.tool()
