@@ -435,6 +435,98 @@ async def withdraw_proposal(
     return cursor.rowcount > 0
 
 
+async def unboard_proposal(
+    db: aiosqlite.Connection,
+    id: str,
+) -> bool:
+    """Remove a pending proposal from the board without changing status.
+
+    Clears ``rank`` so the proposal drops out of the ego's focus board
+    but remains in the pending queue for user approval.
+    Returns True if a row was updated.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET rank = NULL "
+        "WHERE id = ? AND status = 'pending'",
+        (id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_pending_queue(
+    db: aiosqlite.Connection,
+    *,
+    ego_source: str | None = None,
+) -> list[dict]:
+    """All pending proposals — ranked first, then unranked by age.
+
+    Unlike ``get_board`` this has no size limit and returns every pending
+    proposal.  Callers can split the result into board (ranked) and queue
+    (unranked) for display.
+    """
+    if ego_source:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals "
+            "WHERE status = 'pending' AND (ego_source = ? OR ego_source IS NULL) "
+            "ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, "
+            "rank ASC, created_at ASC",
+            (ego_source,),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals WHERE status = 'pending' "
+            "ORDER BY CASE WHEN rank IS NULL THEN 1 ELSE 0 END, "
+            "rank ASC, created_at ASC",
+        )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def auto_table_stale_proposals(
+    db: aiosqlite.Connection,
+    max_age_days: int = 14,
+) -> int:
+    """Auto-table pending proposals older than *max_age_days*.
+
+    Also updates corresponding intervention_journal entries to keep
+    them in sync (same pattern as :func:`expire_stale_proposals`).
+
+    Returns count of auto-tabled proposals.
+    """
+    now = datetime.now(UTC).isoformat()
+    threshold = f"-{max_age_days} days"
+
+    # Get IDs first so we can update journal too
+    cursor = await db.execute(
+        "SELECT id FROM ego_proposals "
+        "WHERE status = 'pending' AND created_at < datetime('now', ?)",
+        (threshold,),
+    )
+    rows = await cursor.fetchall()
+    if not rows:
+        return 0
+
+    ids = [r[0] for r in rows]
+    # Table proposals
+    await db.execute(
+        "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
+        "resolved_at = ? "
+        "WHERE status = 'pending' AND created_at < datetime('now', ?)",
+        (now, threshold),
+    )
+    # Update matching journal entries
+    placeholders = ",".join("?" * len(ids))
+    await db.execute(
+        f"UPDATE intervention_journal SET outcome_status = 'tabled', "
+        f"resolved_at = ? WHERE proposal_id IN ({placeholders}) "
+        f"AND outcome_status = 'pending'",
+        (now, *ids),
+    )
+    await db.commit()
+    logger.info("Auto-tabled %d stale proposal(s) (>%dd)", len(ids), max_age_days)
+    return len(ids)
+
+
 async def get_board(
     db: aiosqlite.Connection,
     *,

@@ -396,6 +396,18 @@ class EgoSession:
                             except Exception:
                                 pass
 
+            # 9b-2. Process unboarded proposals (remove from board, keep pending)
+            unboarded_ids = parsed.get("unboarded", [])
+            if isinstance(unboarded_ids, list):
+                for pid in unboarded_ids:
+                    if isinstance(pid, str) and pid:
+                        ok = await ego_crud.unboard_proposal(self._db, pid)
+                        if ok:
+                            logger.info(
+                                "Proposal %s unboarded by ego (remains pending)",
+                                pid,
+                            )
+
             # 9c. Process execution briefs (ego-as-executor)
             execution_briefs = parsed.get("execution_briefs", [])
             if isinstance(execution_briefs, list) and execution_briefs:

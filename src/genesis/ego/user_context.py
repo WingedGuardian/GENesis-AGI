@@ -791,34 +791,85 @@ class UserEgoContextBuilder:
 
         return "\n".join(lines)
 
+    @staticmethod
+    def _proposal_age(iso_timestamp: str | None) -> str:
+        """Short age label for a proposal: '<1h', '4h', '2d', etc."""
+        if not iso_timestamp:
+            return "?"
+        try:
+            dt = datetime.fromisoformat(iso_timestamp)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=UTC)
+            delta = datetime.now(UTC) - dt
+            if delta.days >= 1:
+                return f"{delta.days}d"
+            hours = int(delta.total_seconds() / 3600)
+            if hours >= 1:
+                return f"{hours}h"
+            return "<1h"
+        except (ValueError, TypeError):
+            return "?"
+
     async def _proposal_board_section(self) -> str:
-        """Current board state + approved proposals ready for execution."""
+        """Board (focus) + queue (pending) + approved + deferred."""
         from genesis.db.crud import ego as ego_crud
 
-        lines = ["## Proposal Board\n"]
+        lines: list[str] = []
 
+        # ---- Fetch all pending proposals ----
         try:
-            board = await ego_crud.get_board(self._db, board_size=10)
+            all_pending = await ego_crud.get_pending_queue(self._db)
         except Exception:
-            logger.error("Failed to query proposal board", exc_info=True)
-            lines.append("*Could not query proposal board.*\n")
+            logger.error("Failed to query pending proposals", exc_info=True)
+            lines.append("## Proposal Board\n")
+            lines.append("*Could not query pending proposals.*\n")
             return "\n".join(lines)
 
-        if not board:
-            lines.append("*Board is empty — no pending proposals.*\n")
-        else:
-            lines.append(f"**{len(board)} pending proposals** (your active board):\n")
+        board = [p for p in all_pending if p.get("rank") is not None]
+        queue = [p for p in all_pending if p.get("rank") is None]
+
+        # ---- Board (ranked focus) ----
+        lines.append("## Proposal Board (Focus)\n")
+        if board:
+            lines.append(
+                f"**{len(board)} proposal{'s' if len(board) != 1 else ''}** "
+                f"on your board (ranked focus):\n"
+            )
             for p in board:
-                rank = p.get("rank")
-                rank_str = f"#{rank}" if rank else "unranked"
-                content = (p.get("content") or "")[:150]
-                content = content.replace("\n", " ")
+                age = self._proposal_age(p.get("created_at"))
+                content = (p.get("content") or "")[:150].replace("\n", " ")
                 lines.append(
-                    f"- [{rank_str}] **{p.get('action_type', '?')}** "
-                    f"(id:{p['id']}): {content}"
+                    f"- [#{p['rank']}] **{p.get('action_type', '?')}** "
+                    f"(id:{p['id']}) [{age}]: {content}"
+                )
+        else:
+            lines.append("*Board is empty — no ranked focus items.*\n")
+
+        # ---- Pending queue (unranked) ----
+        if queue:
+            lines.append("\n## Pending Queue\n")
+            lines.append(
+                f"**{len(queue)} more proposal{'s' if len(queue) != 1 else ''}** "
+                f"awaiting user decision (unranked):\n"
+            )
+            for p in queue:
+                age = self._proposal_age(p.get("created_at"))
+                content = (p.get("content") or "")[:150].replace("\n", " ")
+                lines.append(
+                    f"- (id:{p['id']}) [{age}] "
+                    f"**{p.get('action_type', '?')}**: {content}"
                 )
 
-        # Approved proposals ready for execution
+        # Queue health
+        total = len(all_pending)
+        if total > 0:
+            lines.append(f"\nQueue: {total} total pending.")
+        if total > 10:
+            lines.append(
+                "Queue growing — consider tabling items you no longer recommend."
+            )
+
+        # ---- Approved proposals ready for execution ----
         try:
             approved = await ego_crud.list_proposals(self._db, status="approved", limit=5)
         except Exception:
@@ -827,8 +878,7 @@ class UserEgoContextBuilder:
         if approved:
             lines.append(f"\n**{len(approved)} approved proposals** (ready for execution):\n")
             for p in approved:
-                content = (p.get("content") or "")[:150]
-                content = content.replace("\n", " ")
+                content = (p.get("content") or "")[:150].replace("\n", " ")
                 lines.append(
                     f"- **{p.get('action_type', '?')}** (id:{p['id']}): {content}"
                 )
@@ -839,7 +889,7 @@ class UserEgoContextBuilder:
         else:
             lines.append("\n*No approved proposals awaiting execution.*\n")
 
-        # Deferred (tabled) proposals — ego can resurface or withdraw
+        # ---- Deferred (tabled) proposals ----
         try:
             tabled = await ego_crud.get_tabled(self._db)
         except Exception:
@@ -849,16 +899,15 @@ class UserEgoContextBuilder:
             shown = tabled[:8]
             lines.append(f"\n**Deferred ({len(tabled)} tabled)**:\n")
             for p in shown:
-                content = (p.get("content") or "")[:120]
-                content = content.replace("\n", " ")
+                content = (p.get("content") or "")[:120].replace("\n", " ")
                 lines.append(
                     f"- (id:{p['id']}) **{p.get('action_type', '?')}**: {content}"
                 )
             if len(tabled) > 8:
                 lines.append(f"- ... and {len(tabled) - 8} more")
             lines.append(
-                "\nReview deferred items each cycle. Withdraw if stale, "
-                "resurface if conditions changed.\n"
+                "\nReview deferred items each cycle. Withdraw if genuinely "
+                "stale, resurface to re-board if conditions changed.\n"
             )
 
         lines.append("")
