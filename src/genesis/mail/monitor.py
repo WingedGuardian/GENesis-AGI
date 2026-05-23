@@ -26,7 +26,7 @@ from genesis.security.sanitizer import ContentSanitizer, ContentSource
 if TYPE_CHECKING:
     import aiosqlite
 
-    from genesis.cc.invoker import CCInvoker
+    from genesis.cc import AgentProvider
     from genesis.cc.session_manager import SessionManager
     from genesis.mail.imap_client import IMAPClient
     from genesis.observability.events import GenesisEventBus
@@ -47,7 +47,7 @@ class MailMonitor:
         config: MailConfig,
         imap_client: IMAPClient,
         router: Router,
-        invoker: CCInvoker,
+        invoker: AgentProvider,
         session_manager: SessionManager,
         event_bus: GenesisEventBus | None = None,
         triage_pipeline=None,

@@ -33,7 +33,7 @@ from genesis.sentinel.state import (
 
 if TYPE_CHECKING:
     from genesis.autonomy.remediation import RemediationRegistry
-    from genesis.cc.invoker import CCInvoker
+    from genesis.cc import AgentProvider
     from genesis.cc.session_manager import SessionManager
     from genesis.observability.events import GenesisEventBus
     from genesis.observability.health_data import HealthDataService
@@ -185,7 +185,7 @@ class SentinelDispatcher:
         self,
         *,
         session_manager: SessionManager | None = None,
-        invoker: CCInvoker | None = None,
+        invoker: AgentProvider | None = None,
         remediation_registry: RemediationRegistry | None = None,
         db=None,
         event_bus: GenesisEventBus | None = None,

@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     import aiosqlite
 
     from genesis.awareness.loop import AwarenessLoop
+    from genesis.cc import AgentProvider
     from genesis.cc.checkpoint import CheckpointManager
     from genesis.cc.context_injector import ContextInjector
-    from genesis.cc.invoker import CCInvoker
     from genesis.cc.reflection_bridge import CCReflectionBridge
     from genesis.cc.session_manager import SessionManager
     from genesis.inbox.monitor import InboxMonitor
@@ -175,7 +175,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._awareness_loop: AwarenessLoop | None = None
         self._router: Router | None = None
         self._reflection_engine: object | None = None
-        self._cc_invoker: CCInvoker | None = None
+        self._cc_invoker: AgentProvider | None = None
         self._session_manager: SessionManager | None = None
         self._checkpoint_manager: CheckpointManager | None = None
         self._cc_reflection_bridge: CCReflectionBridge | None = None

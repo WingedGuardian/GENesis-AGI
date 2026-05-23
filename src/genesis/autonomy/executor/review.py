@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from genesis.cc.invoker import CCInvoker
+    from genesis.cc import AgentProvider
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +120,7 @@ class TaskReviewer:
         self,
         *,
         router: _Router,
-        invoker: CCInvoker | None = None,
+        invoker: AgentProvider | None = None,
     ) -> None:
         self._router = router
         self._invoker = invoker
