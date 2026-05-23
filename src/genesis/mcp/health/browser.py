@@ -1005,22 +1005,47 @@ async def _vnc_click_turnstile(page) -> bool:
         # Uses JS to get the browser's own screen offset and chrome height,
         # avoiding fragile hardcoded pixel offsets.
         coords = await page.evaluate("""() => {
+            // Try iframe-based Turnstile first
             const iframe = document.querySelector(
                 'iframe[src*="challenges.cloudflare"]'
             );
-            if (!iframe) return null;
-            const rect = iframe.getBoundingClientRect();
+            if (iframe) {
+                const rect = iframe.getBoundingClientRect();
+                const chromeH = window.outerHeight - window.innerHeight;
+                return {
+                    x: Math.round(window.screenX + rect.left + 28),
+                    y: Math.round(
+                        window.screenY + chromeH + rect.top + rect.height / 2
+                    ),
+                };
+            }
+            // Managed challenge: look for any visible interactive element
+            // (checkbox, verify button) in the challenge page
+            const verify = document.querySelector(
+                '#challenge-stage input[type="button"], '
+                + '.cf-turnstile, '
+                + '[id*="turnstile"] input'
+            );
+            if (verify) {
+                const rect = verify.getBoundingClientRect();
+                const chromeH = window.outerHeight - window.innerHeight;
+                return {
+                    x: Math.round(window.screenX + rect.left + rect.width / 2),
+                    y: Math.round(
+                        window.screenY + chromeH + rect.top + rect.height / 2
+                    ),
+                };
+            }
+            // Last resort: click center of page (managed challenges
+            // sometimes just need any interaction to proceed)
             const chromeH = window.outerHeight - window.innerHeight;
             return {
-                // 28px ≈ horizontal offset to checkbox center within Turnstile iframe
-                x: Math.round(window.screenX + rect.left + 28),
-                y: Math.round(
-                    window.screenY + chromeH + rect.top + rect.height / 2
-                ),
+                x: Math.round(window.screenX + window.innerWidth / 2),
+                y: Math.round(window.screenY + chromeH + window.innerHeight / 2),
             };
         }""")
         if coords is None:
-            logger.warning("VNC Turnstile click: iframe not found via JS")
+            logger.warning("VNC Turnstile click: no clickable element found")
             return False
 
         click_x, click_y = coords["x"], coords["y"]
@@ -1088,14 +1113,23 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     Returns None if no Turnstile detected, or a status dict.
     """
     try:
-        # Brief delay for SPA-injected Turnstile iframes
+        # Brief delay for SPA-injected Turnstile iframes/widgets
         await asyncio.sleep(0.8)
 
+        # Detect both iframe-based and managed (inline) Turnstile variants.
+        # Managed challenges embed cf-turnstile-response directly in the page
+        # without an iframe (e.g., Medium's "Just a moment..." interstitial).
         turnstile = await page.query_selector(
             'iframe[src*="challenges.cloudflare.com"]'
         )
         if turnstile is None:
-            return None
+            # Check for managed challenge (no iframe, inline widget)
+            managed = await page.query_selector(
+                'input[name="cf-turnstile-response"]'
+            )
+            if managed is None:
+                return None
+            logger.info("Managed Turnstile challenge detected (no iframe)")
 
         logger.info("Turnstile challenge detected — waiting for auto-resolve")
 
