@@ -306,15 +306,24 @@ class EgoCadenceManager:
     # -- Sweep helpers -----------------------------------------------------
 
     async def _sweep_with_expiry(self) -> None:
-        """Expire stale proposals, dispatch approved, check deadlines."""
+        """Expire stale proposals, auto-table old ones, dispatch approved, check deadlines."""
         try:
             from genesis.db.crud import ego as ego_crud
 
             expired = await ego_crud.expire_stale_proposals(self._session._db)
             if expired:
                 logger.info("Pre-sweep expiry: %d proposal(s) expired", expired)
+
+            auto_tabled = await ego_crud.auto_table_stale_proposals(
+                self._session._db,
+            )
+            if auto_tabled:
+                logger.info(
+                    "Pre-sweep auto-table: %d proposal(s) tabled (>14d)",
+                    auto_tabled,
+                )
         except Exception:
-            logger.warning("Pre-sweep expiry failed", exc_info=True)
+            logger.warning("Pre-sweep expiry/auto-table failed", exc_info=True)
 
         await self._session.sweep_approved_proposals()
 

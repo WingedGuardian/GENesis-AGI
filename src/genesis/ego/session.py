@@ -348,6 +348,22 @@ class EgoSession:
             if isinstance(tabled_ids, list):
                 for pid in tabled_ids:
                     if isinstance(pid, str) and pid:
+                        # 24h guard: don't table proposals delivered < 24h ago
+                        prop = await ego_crud.get_proposal(self._db, pid)
+                        if prop:
+                            created = prop.get("created_at", "")
+                            if created:
+                                try:
+                                    age = datetime.now(UTC) - datetime.fromisoformat(created)
+                                    if age.total_seconds() < 86400:  # 24 hours
+                                        logger.info(
+                                            "Proposal %s tabling blocked (%.1fh old, <24h guard)",
+                                            pid, age.total_seconds() / 3600,
+                                        )
+                                        continue
+                                except (ValueError, TypeError):
+                                    pass  # Unparseable timestamp — allow tabling
+
                         ok = await ego_crud.table_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s tabled by ego", pid)
@@ -395,6 +411,18 @@ class EgoSession:
                                 )
                             except Exception:
                                 pass
+
+            # 9b-2. Process unboarded proposals (remove from board, keep pending)
+            unboarded_ids = parsed.get("unboarded", [])
+            if isinstance(unboarded_ids, list):
+                for pid in unboarded_ids:
+                    if isinstance(pid, str) and pid:
+                        ok = await ego_crud.unboard_proposal(self._db, pid)
+                        if ok:
+                            logger.info(
+                                "Proposal %s unboarded by ego (remains pending)",
+                                pid,
+                            )
 
             # 9c. Process execution briefs (ego-as-executor)
             execution_briefs = parsed.get("execution_briefs", [])
@@ -1268,6 +1296,13 @@ proposal and return a JSON array of verdicts.
 5. **Err on the side of passing.** When in doubt, PASS. The user is the
    final gate. Your job is to catch clear issues, not second-guess
    creative proposals.
+
+6. **Do not confabulate system state.** You only know what is in the
+   history table above. Do NOT make claims about whether infrastructure,
+   pipelines, or capabilities are "broken" or "working" based on
+   patterns in the history. A proposal that failed before may succeed
+   now — circumstances change. Judge the proposal on its own merits,
+   not on inferred system state.
 
 ## Recent Proposal History (48h)
 {chr(10).join(history_lines)}

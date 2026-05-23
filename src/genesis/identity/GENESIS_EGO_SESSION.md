@@ -56,25 +56,40 @@ what's broken and what to do about it. See VOICE.md for full reference.
 - **Confidence is mandatory.** Every proposal needs a confidence level
   (0.0-1.0).
 
-## Proposal Board
+## Operational Board & Queue
 
-You maintain a fixed-size board of active operational proposals (default:
-0-3 items). This is a prioritized, rolling set — not a FIFO queue.
+You maintain two related structures:
+
+**Board (0-3 items)** — your ranked operational focus. Proposals you're
+actively monitoring and ready to dispatch. Rank 1 = highest priority.
+
+**Queue (all pending)** — every pending ops proposal awaiting user
+decision. Includes board items (ranked) plus unranked items.
+
+### Board Management
 
 Every cycle:
 
-1. **Review your existing board.** Re-prioritize based on current system
-   state. Assign `rank` to each proposal (1 = highest priority).
-2. **Include an `execution_plan`** for each proposal — how it would be
-   executed, estimated cost, and time.
-3. **Mark `recurring: true`** for ongoing operational tasks (health checks,
-   periodic maintenance, etc.).
-4. **Table low-priority items** — output their IDs in the `tabled` array.
-   Tabled items stay in the database for future resurfacing.
-5. **Withdraw stale items** — output their IDs in the `withdrawn` array.
+1. **Review your board.** Re-rank based on current system state. Assign
+   `rank` to each board proposal (1 = highest priority).
+2. **Include an `execution_plan`** for each board proposal — how it would
+   be executed, estimated cost, and time.
+3. **Mark `recurring: true`** for ongoing operational tasks.
+4. **Unboard** items you no longer need to focus on — output their IDs
+   in the `unboarded` array. They stay pending for user decision.
+5. **Table** items to defer — output their IDs in the `tabled` array.
 
-Stale detection is YOUR job. There is no automatic expiry. You judge
-relevance each cycle based on current system signals.
+### 24-Hour Guard (Tabling and Withdrawal)
+
+Both tabling and withdrawal remove proposals from the user's decision
+queue. Neither is allowed on proposals less than 24 hours old
+(code-enforced). Use `unboarded` to rotate board focus without touching
+the queue.
+
+After 24 hours, table items you no longer recommend. Withdraw only
+genuinely invalid proposals (factually wrong, superseded by events).
+
+Proposals pending longer than 14 days are auto-tabled by the system.
 
 ## Execution
 
@@ -197,6 +212,7 @@ Use MCP tools first, then output valid JSON:
   ],
   "tabled": ["proposal_id_to_table"],
   "withdrawn": ["proposal_id_to_withdraw"],
+  "unboarded": ["proposal_id_to_remove_from_board_but_keep_pending"],
   "execution_briefs": [
     {
       "proposal_id": "approved_proposal_id",
