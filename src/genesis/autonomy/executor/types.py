@@ -130,11 +130,22 @@ class StepType(StrEnum):
     SYNTHESIS = "synthesis"
     VERIFICATION = "verification"
     EXTERNAL = "external"
+    # Deterministic step types — execute shell commands directly without
+    # a CC session.  No LLM, no cost, near-instant.  Inspired by Archon's
+    # separation of deterministic vs AI nodes.
+    BASH = "bash"
+    TEST = "test"
+    GIT = "git"
 
     @property
     def default_timeout_s(self) -> int:
         """Default timeout in seconds for this step type."""
         return _STEP_TIMEOUTS.get(self, 600)
+
+    @property
+    def is_deterministic(self) -> bool:
+        """Whether this step type runs a shell command without a CC session."""
+        return self in (StepType.BASH, StepType.TEST, StepType.GIT)
 
     @property
     def verify_step(self) -> bool:

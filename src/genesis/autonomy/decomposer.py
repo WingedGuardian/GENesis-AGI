@@ -26,6 +26,7 @@ _CALL_SITE = "27_pre_execution_assessment"
 
 _VALID_STEP_TYPES = frozenset({
     "research", "code", "analysis", "synthesis", "verification", "external",
+    "bash", "test", "git",  # deterministic — run shell commands, no CC session
 })
 _VALID_COMPLEXITIES = frozenset({"low", "medium", "high"})
 _MAX_STEPS = 8
@@ -230,10 +231,23 @@ class TaskDecomposer:
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         """Validate and normalize step dicts. Clamp to MAX_STEPS."""
         validated: list[dict] = []
+        _DETERMINISTIC_TYPES = frozenset({"bash", "test", "git"})
 
         for i, step in enumerate(steps[:_MAX_STEPS]):
             step_type = str(step.get("type", "code")).lower()
             if step_type not in _VALID_STEP_TYPES:
+                step_type = "code"
+
+            # Deterministic steps MUST have a command field;
+            # fall back to "code" if missing so the CC session can
+            # figure out what to do from the description.
+            command = step.get("command", "")
+            if step_type in _DETERMINISTIC_TYPES and not command:
+                logger.warning(
+                    "Step %d has deterministic type %r but no command — "
+                    "falling back to 'code'",
+                    i, step_type,
+                )
                 step_type = "code"
 
             complexity = str(step.get("complexity", "medium")).lower()
@@ -246,7 +260,7 @@ class TaskDecomposer:
             # Filter deps to valid prior indices only (acyclic)
             deps = [d for d in deps if isinstance(d, int) and 0 <= d < i]
 
-            validated.append({
+            entry: dict = {
                 "idx": i,
                 "type": step_type,
                 "description": str(step.get("description", f"Step {i}")),
@@ -272,7 +286,13 @@ class TaskDecomposer:
                     if isinstance(step.get("mcp_guidance"), list)
                     else []
                 ),
-            })
+            }
+
+            # Preserve command field for deterministic steps
+            if command and step_type in _DETERMINISTIC_TYPES:
+                entry["command"] = str(command)
+
+            validated.append(entry)
 
         # Ensure last step is verification (append if not)
         if (

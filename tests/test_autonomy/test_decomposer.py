@@ -194,6 +194,66 @@ class TestDecompose:
         assert steps[1]["procedures"] == []
         assert steps[1]["mcp_guidance"] == []
 
+    async def test_deterministic_step_with_command_preserved(self) -> None:
+        """Deterministic steps with a command field are preserved."""
+        steps_json = json.dumps([
+            {
+                "idx": 0,
+                "type": "bash",
+                "description": "Lint the code",
+                "command": "ruff check src/",
+            },
+            {
+                "idx": 1,
+                "type": "test",
+                "description": "Run tests",
+                "command": "pytest tests/test_foo.py -v",
+                "dependencies": [0],
+            },
+        ])
+        router = _make_router(steps_json)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Lint and test")
+
+        assert steps[0]["type"] == "bash"
+        assert steps[0]["command"] == "ruff check src/"
+        assert steps[1]["type"] == "test"
+        assert steps[1]["command"] == "pytest tests/test_foo.py -v"
+
+    async def test_deterministic_step_without_command_falls_back_to_code(self) -> None:
+        """Deterministic steps missing command fall back to 'code'."""
+        steps_json = json.dumps([
+            {
+                "idx": 0,
+                "type": "bash",
+                "description": "Do something",
+                # no command field
+            },
+        ])
+        router = _make_router(steps_json)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task")
+
+        assert steps[0]["type"] == "code"
+        assert "command" not in steps[0]
+
+    async def test_git_step_type_valid(self) -> None:
+        """Git step type is accepted."""
+        steps_json = json.dumps([
+            {
+                "idx": 0,
+                "type": "git",
+                "description": "Commit changes",
+                "command": "git commit -m 'feat: add feature'",
+            },
+        ])
+        router = _make_router(steps_json)
+        d = TaskDecomposer(router=router)
+        steps = await d.decompose("plan", "Task")
+
+        assert steps[0]["type"] == "git"
+        assert steps[0]["command"] == "git commit -m 'feat: add feature'"
+
     async def test_resource_fields_invalid_types_default_empty(self) -> None:
         """Non-list resource fields default to empty lists."""
         steps_bad = json.dumps([
