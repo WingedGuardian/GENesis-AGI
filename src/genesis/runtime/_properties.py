@@ -28,9 +28,9 @@ if TYPE_CHECKING:
     import aiosqlite
 
     from genesis.awareness.loop import AwarenessLoop
+    from genesis.cc import AgentProvider
     from genesis.cc.checkpoint import CheckpointManager
     from genesis.cc.context_injector import ContextInjector
-    from genesis.cc.invoker import CCInvoker
     from genesis.cc.reflection_bridge import CCReflectionBridge
     from genesis.cc.session_manager import SessionManager
     from genesis.inbox.monitor import InboxMonitor
@@ -81,7 +81,7 @@ class _RuntimeProperties:
         return self._reflection_engine
 
     @property
-    def cc_invoker(self) -> CCInvoker | None:
+    def cc_invoker(self) -> AgentProvider | None:
         return self._cc_invoker
 
     @property

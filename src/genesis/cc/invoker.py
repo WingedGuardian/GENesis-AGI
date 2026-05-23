@@ -129,6 +129,10 @@ class CCInvoker:
         env["GENESIS_CC_SESSION"] = "1"
         if inv and inv.stream_idle_timeout_ms is not None:
             env["CLAUDE_STREAM_IDLE_TIMEOUT_MS"] = str(inv.stream_idle_timeout_ms)
+        if inv and inv.anthropic_base_url:
+            env["ANTHROPIC_BASE_URL"] = inv.anthropic_base_url
+        else:
+            env.pop("ANTHROPIC_BASE_URL", None)
         # Move CC's Bash sandbox off /tmp (512MB tmpfs) onto persistent disk.
         # CC reads CLAUDE_CODE_TMPDIR to choose where it creates
         # /claude-<uid>/<cwd>/<session-id>/ for each Bash invocation.
@@ -548,6 +552,7 @@ class CCInvoker:
             duration_ms=elapsed,
             exit_code=proc.returncode or 0,
             model_requested=str(invocation.model),
+            via_proxy=bool(invocation.anthropic_base_url),
         )
         await self._fire_downgrade_callback(output)
         return output
@@ -589,6 +594,7 @@ class CCInvoker:
             is_error=result_data.get("is_error", False),
             model_requested=str(inv.model),
             downgraded=downgraded,
+            via_proxy=bool(inv.anthropic_base_url),
         )
 
     def _parse_output(self, raw: str, inv: CCInvocation, elapsed_ms: int) -> CCOutput:
@@ -643,4 +649,5 @@ class CCInvoker:
             duration_ms=elapsed_ms,
             exit_code=0,
             model_requested=str(inv.model),
+            via_proxy=bool(inv.anthropic_base_url),
         )

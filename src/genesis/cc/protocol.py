@@ -1,7 +1,7 @@
 """AgentProvider protocol — abstract interface for agent invocation.
 
-CCInvoker implements this today. SDK/ACP backends can be added in V5
-(see docs/plans/v5-hybrid-agent-protocol.md).
+CCInvoker implements this today. Alternative backends (Codex CLI, Pi)
+can implement this protocol to become swappable agent providers.
 """
 
 from __future__ import annotations

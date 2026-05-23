@@ -40,7 +40,7 @@ from genesis.observability.session_context import set_session_id as _set_obs_ses
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
-    from genesis.cc.invoker import CCInvoker
+    from genesis.cc import AgentProvider
     from genesis.cc.session_config import SessionConfigBuilder
     from genesis.cc.session_manager import SessionManager
 
@@ -214,7 +214,7 @@ class DirectSessionRunner:
     def __init__(
         self,
         *,
-        invoker: CCInvoker,
+        invoker: AgentProvider,
         session_manager: SessionManager,
         config_builder: SessionConfigBuilder,
         runtime: object,
