@@ -348,6 +348,22 @@ class EgoSession:
             if isinstance(tabled_ids, list):
                 for pid in tabled_ids:
                     if isinstance(pid, str) and pid:
+                        # 24h guard: don't table proposals delivered < 24h ago
+                        prop = await ego_crud.get_proposal(self._db, pid)
+                        if prop:
+                            created = prop.get("created_at", "")
+                            if created:
+                                try:
+                                    age = datetime.now(UTC) - datetime.fromisoformat(created)
+                                    if age.total_seconds() < 86400:  # 24 hours
+                                        logger.info(
+                                            "Proposal %s tabling blocked (%.1fh old, <24h guard)",
+                                            pid, age.total_seconds() / 3600,
+                                        )
+                                        continue
+                                except (ValueError, TypeError):
+                                    pass  # Unparseable timestamp — allow tabling
+
                         ok = await ego_crud.table_proposal(self._db, pid)
                         if ok:
                             logger.info("Proposal %s tabled by ego", pid)

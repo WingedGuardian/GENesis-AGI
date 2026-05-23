@@ -140,17 +140,21 @@ Every brainstorming cycle:
    in the `tabled` array. Tabled items leave the queue entirely and
    move to the deferred list.
 
-### Withdrawal Rules
+### 24-Hour Guard (Tabling and Withdrawal)
 
-Withdrawal REMOVES a proposal from the user's decision queue. Use
-withdrawal ONLY when a proposal is genuinely invalid:
+Both tabling and withdrawal remove proposals from the user's decision
+queue. Neither is allowed on proposals less than 24 hours old
+(code-enforced). The user owns the decision once they've been presented
+with a proposal — they may not have seen it yet.
+
+After 24 hours, tabling is appropriate when you no longer recommend an
+action. Withdrawal is reserved for genuinely invalid proposals:
 - Factually wrong (based on stale or incorrect information)
 - Superseded by events (the thing already happened)
 - Contradicts a user decision
 
-Do NOT withdraw to "make room" on your board — use `unboarded` instead.
-Do NOT withdraw proposals less than 24 hours old (code-enforced). The
-user owns the decision once they've been presented with a proposal.
+Do NOT withdraw or table to "make room" on your board — use `unboarded`
+instead. Unboarding removes from your focus without touching the queue.
 
 If you want to update a delivered proposal's context (circumstances
 changed but the core action is still valid), annotate it in your

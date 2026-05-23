@@ -79,12 +79,15 @@ Every cycle:
    in the `unboarded` array. They stay pending for user decision.
 5. **Table** items to defer — output their IDs in the `tabled` array.
 
-### Withdrawal Rules
+### 24-Hour Guard (Tabling and Withdrawal)
 
-Withdrawal removes a proposal from the user's decision queue. Only
-withdraw when a proposal is genuinely invalid (factually wrong,
-superseded by events). Do NOT withdraw to make room — use `unboarded`.
-Do NOT withdraw proposals less than 24 hours old (code-enforced).
+Both tabling and withdrawal remove proposals from the user's decision
+queue. Neither is allowed on proposals less than 24 hours old
+(code-enforced). Use `unboarded` to rotate board focus without touching
+the queue.
+
+After 24 hours, table items you no longer recommend. Withdraw only
+genuinely invalid proposals (factually wrong, superseded by events).
 
 Proposals pending longer than 14 days are auto-tabled by the system.
 
