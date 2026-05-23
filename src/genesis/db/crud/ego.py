@@ -139,6 +139,69 @@ async def count_uncompacted(db: aiosqlite.Connection) -> int:
 
 
 # ---------------------------------------------------------------------------
+# ego_cycle_outcomes  (unified cognitive loop — Learn phase)
+# ---------------------------------------------------------------------------
+
+
+async def create_cycle_outcome(
+    db: aiosqlite.Connection,
+    *,
+    cycle_id: str,
+    focus_type: str,
+    focus_id: str | None = None,
+    num_proposals: int = 0,
+    num_dispatches: int = 0,
+    assessment: str | None = None,
+    signals_consumed: str | None = None,
+    perception_rationale: str | None = None,
+    perceive_cost_usd: float = 0.0,
+) -> str:
+    """Record a cycle outcome for the Learn phase."""
+    from datetime import UTC, datetime
+
+    await db.execute(
+        """INSERT INTO ego_cycle_outcomes
+           (cycle_id, focus_type, focus_id, num_proposals, num_dispatches,
+            assessment, signals_consumed, perception_rationale,
+            perceive_cost_usd, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            cycle_id,
+            focus_type,
+            focus_id,
+            num_proposals,
+            num_dispatches,
+            assessment,
+            signals_consumed,
+            perception_rationale,
+            perceive_cost_usd,
+            datetime.now(UTC).isoformat(),
+        ),
+    )
+    await db.commit()
+    return cycle_id
+
+
+async def list_cycle_outcomes(
+    db: aiosqlite.Connection,
+    *,
+    limit: int = 10,
+) -> list[dict]:
+    """List recent cycle outcomes (newest first)."""
+    cursor = await db.execute(
+        """SELECT cycle_id, focus_type, focus_id, num_proposals,
+                  num_dispatches, assessment, signals_consumed,
+                  perception_rationale, perceive_cost_usd, created_at
+           FROM ego_cycle_outcomes
+           ORDER BY created_at DESC
+           LIMIT ?""",
+        (limit,),
+    )
+    rows = await cursor.fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # ego_state  (key-value store)
 # ---------------------------------------------------------------------------
 

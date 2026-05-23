@@ -1144,6 +1144,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # World model tables: user goals and contacts for ego world model.
     await _migrate_world_model_tables(db)
 
+    # Unified cognitive loop: ego cycle outcomes for the Learn phase.
+    # Tracks focus selection decisions and cycle results for feedback.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS ego_cycle_outcomes (
+            cycle_id            TEXT PRIMARY KEY,
+            focus_type          TEXT NOT NULL,
+            focus_id            TEXT,
+            num_proposals       INTEGER DEFAULT 0,
+            num_dispatches      INTEGER DEFAULT 0,
+            assessment          TEXT,
+            signals_consumed    TEXT,
+            perception_rationale TEXT,
+            perceive_cost_usd   REAL DEFAULT 0.0,
+            created_at          TEXT NOT NULL
+        )
+    """)
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

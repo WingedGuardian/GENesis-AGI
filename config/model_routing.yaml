@@ -420,6 +420,12 @@ call_sites:
     - groq-free
     default_paid: true
     description: Extract reusable procedures from interaction outcomes
+  40_ego_focus_selection:
+    chain:
+    - groq-free
+    - mistral-small-free
+    - gemini-free
+    description: "Unified cognitive loop focus selector — picks ego attention direction from pending signals"
   43_task_retrospective:
     chain:
     - openrouter-deepseek-v4

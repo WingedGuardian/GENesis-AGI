@@ -47,7 +47,9 @@ if TYPE_CHECKING:
     from genesis.ego.compaction import CompactionEngine
     from genesis.ego.context import EgoContextBuilder
     from genesis.ego.dispatch import EgoDispatcher
+    from genesis.ego.focus import FocusResult
     from genesis.ego.proposals import ProposalWorkflow
+    from genesis.ego.signals import EgoSignal
     from genesis.observability.events import GenesisEventBus
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,10 @@ class EgoSession:
         session_id_key: str | None = None,
         focus_summary_key: str | None = None,
         source_tag: str | None = None,
+        # Unified cognitive loop — optional router for focus selector (PR 1).
+        # Wired in PR 2 via init/ego.py. When None, focus selection
+        # falls back to highest-priority signal (no LLM call).
+        router: object | None = None,
     ) -> None:
         self._invoker = invoker
         self._session_manager = session_manager
@@ -118,6 +124,8 @@ class EgoSession:
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
         self._source_tag = source_tag or "ego_cycle"
+        self._router = router  # For unified cognitive loop focus selector
+        self._focus_selector = None  # Lazy-init in _perceive
         self._sweep_lock = asyncio.Lock()
         self._last_realist_cost_usd = 0.0  # accumulated by _filter_proposals
         # Cache the static system prompt (read once, not every cycle)
@@ -269,6 +277,263 @@ class EgoSession:
                     logger.error("Session fail() also errored", exc_info=True)
             return None
 
+        return await self._process_cycle_output(output, model, session_id)
+
+    async def run_unified_cycle(
+        self,
+        signals: list[EgoSignal],
+        *,
+        model_override: str | None = None,
+    ) -> EgoCycle | None:
+        """Execute one ego cycle via the unified perceive→think→act→learn pipeline.
+
+        This is the new entry point for the unified cognitive loop.
+        It coexists with ``run_cycle()`` during migration (PRs 1-4).
+        After PR 5, ``run_cycle()`` is removed and this becomes the
+        sole cycle method.
+
+        Parameters
+        ----------
+        signals:
+            List of ``EgoSignal`` objects drained from the SignalQueue.
+        model_override:
+            Override model selection (takes precedence over config).
+
+        Returns the stored EgoCycle, or None if perception found nothing
+        actionable or the CC invocation failed.
+
+        Raises:
+            BudgetExceededError: Daily budget cap exceeded.
+            CycleBlockedError: Approval gate blocked the cycle.
+        """
+        if not signals:
+            return None
+
+        # 1. PERCEIVE — focus selection
+        focus = await self._perceive(signals)
+        if focus is None:
+            return None
+
+        # 2. THINK — budget, context, prompt, invoke
+
+        # Budget check
+        if not await self._check_budget():
+            raise BudgetExceededError(
+                f"Daily ego thinking spend exceeds cap "
+                f"${self._config.ego_thinking_budget_usd}"
+            )
+
+        # Context assembly — uses assemble_context() as-is.
+        # Context weights are DEFINED in focus.py lookup table but NOT
+        # wired to build() until PR 3 adds the context_weights param.
+        # PR 1: focus affects the PROMPT, not context assembly.
+        dynamic_context = await self._compaction.assemble_context(
+            context_builder=self._context_builder,
+        )
+
+        # Focus-specific prompt
+        user_prompt = self._build_focused_prompt(
+            dynamic_context=dynamic_context,
+            focus=focus,
+        )
+
+        # Model + effort from config (no cycle-type overrides in unified loop)
+        model = CCModel(model_override or self._config.model)
+        effort = EffortLevel(self._config.default_effort)
+
+        # System prompt is identity ONLY (cacheable)
+        system_prompt = self._static_prompt
+
+        # Build invocation — same pattern as run_cycle
+        invocation = CCInvocation(
+            prompt=user_prompt,
+            model=model,
+            effort=effort,
+            resume_session_id=None,
+            append_system_prompt=True,
+            system_prompt=system_prompt,
+            timeout_s=2400,
+            skip_permissions=True,
+            working_dir=background_session_dir(),
+            mcp_config=self._mcp_config_path,
+        )
+
+        # Autonomous dispatch check
+        output = None
+        session_id: str | None = None
+        if self._autonomous_dispatcher is not None:
+            decision = await self._autonomous_dispatcher.route(
+                AutonomousDispatchRequest(
+                    subsystem="ego",
+                    policy_id=self._source_tag,
+                    action_label=self._source_tag.replace("_", " "),
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    cli_invocation=invocation,
+                    dispatch_mode="cli",
+                    cli_fallback_allowed=True,
+                    approval_required_for_cli=True,
+                    approval_key_stable=True,
+                ),
+            )
+            if decision.mode == "blocked":
+                logger.warning("Ego unified cycle blocked: %s", decision.reason)
+                raise CycleBlockedError(decision.reason or "approval pending")
+
+        if output is None:
+            try:
+                sess = await self._session_manager.create_background(
+                    session_type=SessionType.BACKGROUND_TASK,
+                    model=model,
+                    effort=effort,
+                    source_tag=self._source_tag,
+                )
+                session_id = sess["id"]
+                _set_obs_session(session_id)
+            except Exception:
+                logger.error(
+                    "Failed to create ego background session (unified)",
+                    exc_info=True,
+                )
+                return None
+
+            try:
+                output = await self._invoker.run(invocation)
+            except Exception:
+                logger.error("Ego CC invocation failed (unified)", exc_info=True)
+                try:
+                    await self._session_manager.fail(
+                        session_id, reason="CC invocation error",
+                    )
+                except Exception:
+                    logger.error("Session fail() also errored", exc_info=True)
+                return None
+
+        if output.is_error:
+            logger.error(
+                "Ego CC session returned error (unified): %s",
+                output.error_message,
+            )
+            if session_id is not None:
+                try:
+                    await self._session_manager.fail(
+                        session_id, reason=output.error_message,
+                    )
+                except Exception:
+                    logger.error("Session fail() also errored", exc_info=True)
+            return None
+
+        # 3. ACT — shared output processing
+        cycle = await self._process_cycle_output(output, model, session_id)
+
+        # 4. LEARN — record cycle outcome
+        await self._record_cycle_outcome(cycle, focus)
+
+        return cycle
+
+    async def _perceive(self, signals: list[EgoSignal]) -> FocusResult | None:
+        """Focus selection — perceive phase of the unified cognitive loop.
+
+        Returns a FocusResult or None if no actionable signals.
+        """
+        from genesis.ego.focus import FocusResult, FocusSelector
+
+        if not signals:
+            return None
+
+        # Lazy-init focus selector
+        if self._focus_selector is None:
+            if self._router is not None:
+                self._focus_selector = FocusSelector(self._router)
+            else:
+                # No router → always return highest-priority signal directly.
+                # This is the expected state in PR 1 (router wired in PR 2).
+                sig = signals[0]
+                weights = FocusSelector.get_context_weights(sig.focus_category)
+                return FocusResult(
+                    focus_type=sig.focus_category,
+                    focus_id=sig.focus_id,
+                    rationale="direct selection (no router available)",
+                    signals_consumed=[s.id for s in signals],
+                    context_weights=weights,
+                )
+
+        # Fetch recent focuses from ego_cycle_outcomes for context
+        recent_focuses: list[dict[str, str]] = []
+        try:
+            rows = await ego_crud.list_cycle_outcomes(
+                self._db, limit=5,
+            )
+            recent_focuses = [
+                {
+                    "focus_type": r.get("focus_type", ""),
+                    "focus_id": r.get("focus_id", ""),
+                    "rationale": r.get("perception_rationale", ""),
+                    "created_at": r.get("created_at", ""),
+                }
+                for r in rows
+            ]
+        except Exception:
+            # Table may not exist yet (migration not applied),
+            # or no data yet. Both are fine.
+            logger.debug("No recent focuses available", exc_info=True)
+
+        return await self._focus_selector.select(signals, recent_focuses)
+
+    async def _record_cycle_outcome(
+        self,
+        cycle: EgoCycle,
+        focus: FocusResult,
+    ) -> None:
+        """Record cycle outcome for the Learn phase (ego_cycle_outcomes table)."""
+        try:
+            proposals = json.loads(cycle.proposals_json) if cycle.proposals_json else []
+            # GROUNDWORK(unified-loop-dispatches): num_dispatches is always 0
+            # here because dispatch count isn't known at cycle-completion time.
+            # PR 2+ should wire the on_end hook to update this column after
+            # dispatched sessions complete.
+            await ego_crud.create_cycle_outcome(
+                self._db,
+                cycle_id=cycle.id,
+                focus_type=focus.focus_type,
+                focus_id=focus.focus_id,
+                num_proposals=len(proposals),
+                signals_consumed=json.dumps(focus.signals_consumed),
+                perception_rationale=focus.rationale,
+                perceive_cost_usd=focus.perceive_cost_usd,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record cycle outcome for %s",
+                cycle.id,
+                exc_info=True,
+            )
+
+    # -- Output processing (shared by run_cycle and run_unified_cycle) -----
+
+    async def _process_cycle_output(
+        self,
+        output: object,
+        model: CCModel,
+        session_id: str | None,
+    ) -> EgoCycle:
+        """Post-invocation processing shared by run_cycle and run_unified_cycle.
+
+        Handles: parse → focus sanitize → store cycle → complete session →
+        record last_run → realist gate → proposals → table/withdraw/unboard →
+        execution briefs → follow-ups → directives → knowledge → escalations.
+
+        Parameters
+        ----------
+        output:
+            CC output object with .text, .cost_usd, .input_tokens, etc.
+        model:
+            CCModel used for the invocation (fallback for model_used).
+        session_id:
+            Background session ID, or None if dispatched via autonomous route.
+        """
         # 6. Parse output
         parsed = self._parse_output(output.text)
 
@@ -547,6 +812,63 @@ class EgoSession:
                 "\n\nThis is a MORNING REPORT cycle. Include the morning_report "
                 "field with your daily briefing for the user."
             )
+        return f"{directive}\n\n---\n\n{dynamic_context}"
+
+    def _build_focused_prompt(
+        self,
+        *,
+        dynamic_context: str,
+        focus: FocusResult,
+    ) -> str:
+        """Build a focus-specific user message for the unified cognitive loop.
+
+        Similar to ``_build_user_prompt`` but with a focus directive instead
+        of the generic "run your ego cycle" directive. The focus comes from
+        the perceive phase (FocusSelector output).
+
+        Parameters
+        ----------
+        dynamic_context:
+            Assembled operational context from compaction engine.
+        focus:
+            FocusResult with focus_type, focus_id, rationale.
+        """
+        directive = (
+            f"Your focus this cycle: **{focus.focus_type}** — {focus.rationale}\n\n"
+            "Review the operational context below with this focus in mind. "
+            "Check your open threads and use your MCP tools to verify "
+            "any beliefs before proposing actions. End with valid JSON "
+            "matching the ego output schema."
+        )
+
+        # Focus-specific instructions
+        if focus.focus_type == "daily_briefing":
+            directive += (
+                "\n\nThis is a DAILY BRIEFING cycle. Include the morning_report "
+                "field with your daily briefing for the user."
+            )
+        elif focus.focus_type == "goal_review":
+            directive += (
+                "\n\nThis is a GOAL REVIEW cycle. Assess progress on the "
+                "focused goal, identify blockers, and propose goal-advancing "
+                "actions. Include the goal_assessment field."
+            )
+        elif focus.focus_type == "reactive":
+            directive += (
+                "\n\nThis is a REACTIVE cycle. Respond to the event(s) that "
+                "triggered this cycle."
+            )
+        elif focus.focus_type == "dispatch_outcome":
+            directive += (
+                "\n\nThis cycle was triggered by a dispatch outcome. "
+                "Assess the result and determine next steps."
+            )
+        elif focus.focus_type == "escalation":
+            directive += (
+                "\n\nThis is an ESCALATION cycle. Assess the health issue "
+                "or system alert and propose remediation actions."
+            )
+
         return f"{directive}\n\n---\n\n{dynamic_context}"
 
     # -- Output parsing ----------------------------------------------------

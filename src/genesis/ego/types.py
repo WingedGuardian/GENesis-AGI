@@ -9,12 +9,31 @@ from enum import StrEnum
 
 
 class CycleType(StrEnum):
-    """Types of ego thinking cycles."""
+    """Types of ego thinking cycles.
+
+    DEPRECATED: will be removed in PR 5 when all cycle types are
+    migrated to the unified cognitive loop (FocusCategory).
+    """
 
     PROACTIVE = "proactive"        # Regular brainstorming (uses config model/effort)
     MORNING_REPORT = "morning_report"  # Daily briefing (always Sonnet, Low)
     REACTIVE = "reactive"          # User message response (uses config model/effort)
     ESCALATION = "escalation"      # Health/escalation eval (always Sonnet, Medium)
+
+
+class FocusCategory(StrEnum):
+    """Focus categories for the unified cognitive loop.
+
+    Replaces CycleType — signals carry a focus_category that determines
+    context weighting and prompt specialization.
+    """
+
+    PROACTIVE = "proactive"
+    DAILY_BRIEFING = "daily_briefing"
+    REACTIVE = "reactive"
+    GOAL_REVIEW = "goal_review"
+    DISPATCH_OUTCOME = "dispatch_outcome"
+    ESCALATION = "escalation"
 
 
 # Per-cycle-type model/effort OVERRIDES.  Only cycle types listed here
@@ -132,5 +151,7 @@ class EgoConfig:
     failure_backoff_minutes: int = 60  # pause after N failures
     batch_digest: bool = True  # send proposals as daily batch
     shadow_morning_report: bool = True  # shadow mode for morning reports
+    # Unified cognitive loop — goal review staleness threshold
+    goal_review_staleness_days: int = 10  # trigger goal_review after N days without progress
 
 
