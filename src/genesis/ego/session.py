@@ -1297,6 +1297,13 @@ proposal and return a JSON array of verdicts.
    final gate. Your job is to catch clear issues, not second-guess
    creative proposals.
 
+6. **Do not confabulate system state.** You only know what is in the
+   history table above. Do NOT make claims about whether infrastructure,
+   pipelines, or capabilities are "broken" or "working" based on
+   patterns in the history. A proposal that failed before may succeed
+   now — circumstances change. Judge the proposal on its own merits,
+   not on inferred system state.
+
 ## Recent Proposal History (48h)
 {chr(10).join(history_lines)}
 
