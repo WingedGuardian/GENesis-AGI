@@ -42,28 +42,6 @@ _ARCH_REVIEW = (
     "catching real issues, not ceremony."
 )
 
-
-# Standalone reminders kept for backward compatibility with other hooks
-# that may import them, but no longer emitted separately — they are
-# incorporated into _EXECUTION_PROTOCOL above.
-_WORKTREE_REMINDER = (
-    "MANDATORY: Before writing any code, create a git worktree for isolation. "
-    "Run: git worktree add .claude/worktrees/<scope>-<desc> -b <scope>/<desc> "
-    "then work inside the worktree directory. Commit on the branch, merge to "
-    "main when done. NEVER commit directly to main."
-)
-
-_CONFIDENCE_REMINDER = (
-    "MANDATORY: Before starting implementation, state explicit confidence "
-    "percentages for each part of the plan with rationale. Anything below 90% "
-    "needs investigation to raise it first."
-)
-
-_DUE_DILIGENCE_REMINDER = (
-    "MANDATORY: Before starting implementation, verify your plan against actual "
-    "code. For each file you plan to modify: READ IT FIRST."
-)
-
 _EXECUTION_PROTOCOL = (
     "EXECUTION PROTOCOL — You MUST follow these steps IN ORDER before "
     "writing any code:\n"
@@ -111,30 +89,6 @@ def _classify_plan_complexity(plan_path: str) -> str:
     else:
         return "large"
 
-
-def _is_in_worktree() -> bool:
-    """Check if the current working directory is inside a git worktree."""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode != 0:
-            return False
-        # Check if it's a worktree (not the main working tree)
-        result2 = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=2,
-        )
-        result3 = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True, text=True, timeout=2,
-        )
-        # In a worktree, --git-dir != --git-common-dir
-        return result2.stdout.strip() != result3.stdout.strip()
-    except Exception:
-        return False
 
 
 def _extract_plan_info(hook_input: dict) -> tuple[str, str]:

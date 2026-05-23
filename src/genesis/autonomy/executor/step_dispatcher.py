@@ -134,8 +134,10 @@ class StepDispatcher:
         except ValueError:
             step_type = StepType.CODE
 
-        # Deterministic steps bypass CC entirely
-        if step_type.is_deterministic:
+        # Deterministic steps bypass CC entirely — UNLESS a workaround
+        # is provided (from the recovery pipeline), in which case the
+        # LLM needs to adapt the command, so we fall through to CC.
+        if step_type.is_deterministic and not workaround:
             from genesis.autonomy.executor.deterministic import (
                 execute_deterministic_step,
             )
