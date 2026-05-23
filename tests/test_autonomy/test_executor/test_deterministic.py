@@ -189,6 +189,23 @@ class TestExecuteDeterministicStep:
         assert "git version" in result.result
 
 
+    async def test_timeout_kills_hung_process(self) -> None:
+        """A command exceeding the timeout is terminated and returns failed."""
+        from genesis.autonomy.executor import deterministic as det
+
+        original = det._HARD_TIMEOUT_S
+        try:
+            det._HARD_TIMEOUT_S = 1  # 1 second for test
+            step = {"idx": 0, "type": "bash", "command": "sleep 30"}
+            result = await execute_deterministic_step(step)
+            assert result.status == "failed"
+            assert "timed out" in result.blocker_description.lower()
+            assert result.duration_s >= 1.0
+            assert result.cost_usd == 0.0
+        finally:
+            det._HARD_TIMEOUT_S = original
+
+
 class TestStepTypeProperties:
     """Verify the new StepType properties."""
 

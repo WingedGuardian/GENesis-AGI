@@ -64,6 +64,14 @@ _INTERPRETER_PREFIXES = frozenset({
 # Prevents memory exhaustion from commands like ``yes`` or verbose tests.
 _MAX_STREAM_BYTES = 2 * 1024 * 1024  # 2 MiB
 
+# Hard timeout for deterministic subprocesses (seconds).
+# This is a last-resort safety net for subprocesses that hang forever
+# (git waiting for credentials, test with infinite loop, etc.).
+# A hung subprocess blocks the executor semaphore indefinitely — cancel
+# only fires between steps, not during.  2 hours is generous enough to
+# never interfere with legitimate work.
+_HARD_TIMEOUT_S = 7200  # 2 hours
+
 
 def validate_command(command: str) -> str | None:
     """Check *command* against safety guardrails.
@@ -205,11 +213,42 @@ async def execute_deterministic_step(
             cwd=str(cwd),
         )
         # Read with stream limit to prevent memory exhaustion
-        stdout_bytes, stderr_bytes = await asyncio.gather(
-            _read_limited(proc.stdout),
-            _read_limited(proc.stderr),
-        )
-        await proc.wait()
+        # Hard timeout prevents a hung subprocess from blocking the
+        # executor semaphore indefinitely.
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                asyncio.gather(
+                    _read_limited(proc.stdout),
+                    _read_limited(proc.stderr),
+                ),
+                timeout=_HARD_TIMEOUT_S,
+            )
+            await proc.wait()
+        except TimeoutError:
+            duration = time.monotonic() - start
+            # Kill the hung process
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            logger.warning(
+                "Deterministic step %d timed out after %.0fs",
+                idx, duration,
+            )
+            return StepResult(
+                idx=idx,
+                status="failed",
+                result=f"Command timed out after {_HARD_TIMEOUT_S}s",
+                cost_usd=0.0,
+                model_used="deterministic",
+                duration_s=duration,
+                blocker_description=(
+                    f"Command timed out after {_HARD_TIMEOUT_S}s. "
+                    f"This is a hard safety limit to prevent hung "
+                    f"subprocesses from blocking the executor."
+                ),
+            )
     except OSError as exc:
         duration = time.monotonic() - start
         return StepResult(
