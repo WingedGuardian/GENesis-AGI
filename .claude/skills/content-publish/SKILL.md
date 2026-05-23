@@ -26,7 +26,20 @@ platforms by swapping the publish step.
 - **Stealth-browser skill** (`src/genesis/skills/stealth-browser/SKILL.md`) —
   MUST load before any browser interaction. Covers anti-detection timing,
   honeypot avoidance, and the VNC trusted input technique for Cloudflare
-  Turnstile. Without this, Turnstile challenges will block publishing.
+  Turnstile.
+
+## Browser Rules
+
+- **Always use Camoufox (default).** Never pass `stealth=False` to
+  `browser_navigate`. Chromium has SSL cert issues and no anti-detection.
+- **Never give up at Turnstile.** The browser tool handles it automatically
+  (3-phase: auto-resolve → VNC click → human alert). If you see Turnstile
+  in the response, the tool is ALREADY handling it. Wait and retry.
+- **Camoufox works fine.** Any memory claiming "glxtest issues" or
+  "Camoufox broken" is stale/hallucinated (debunked May 2026). Ignore it.
+- **Expect to succeed.** The pipeline is wired and working. Your job is
+  to persist through transient failures, not to declare failure after one
+  attempt.
 
 ## Workflow
 
@@ -136,7 +149,7 @@ Store the outcome in memory:
 | Error | Action |
 |-------|--------|
 | Not logged in to Medium | Return error. User must VNC login (one-time). |
-| Cloudflare Turnstile | Cannot bypass programmatically. Alert user via Telegram. |
+| Cloudflare Turnstile | Handled automatically by `browser_navigate` (Phase 1: auto-resolve 15s → Phase 2: VNC click 2×30s → Phase 3: human alert 5m). Do NOT switch browsers or give up — wait for resolution. |
 | Editor selectors changed | Screenshot + report. Do NOT guess new selectors. |
 | Draft quality check fails | Rewrite, max 2 attempts, then submit for manual review. |
 | Telegram approval timeout | Store draft as pending. Do not publish. |
