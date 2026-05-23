@@ -4,9 +4,16 @@ Inspired by Archon's separation of deterministic vs AI nodes.  Steps of
 type bash/test/git execute a shell command directly via asyncio subprocess.
 No LLM inference, no cost, near-instant.
 
+Uses ``create_subprocess_exec`` (not shell) to prevent shell injection
+and indirection (``bash -c``, ``eval``, pipe chains).  Commands are
+split via ``shlex.split`` and executed directly.
+
 Safety guardrails block obviously destructive command patterns.
 No timeout is applied — the subprocess runs to completion.  If a
 subprocess hangs, cancel the task via ``cancel_task(task_id)``.
+
+Output is capped at 2 MiB per stream (stdout/stderr) to prevent
+memory exhaustion from verbose commands.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import shlex
 import time
 from pathlib import Path
 
@@ -40,7 +48,21 @@ _BLOCKED_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\bkillall\b"),
     re.compile(r"\bpkill\s+-9\b"),
     re.compile(r"\bchmod\s+-R\s+777\b"),
+    re.compile(r"\bfind\b.*\s-delete\b"),                       # find -delete
+    re.compile(r"\bfind\b.*-exec\s+rm\b"),                      # find -exec rm
 ]
+
+# Commands that invoke another interpreter — blocked because they enable
+# arbitrary code execution that bypasses the guardrail patterns above.
+_INTERPRETER_PREFIXES = frozenset({
+    "bash", "sh", "zsh", "dash", "ksh", "csh", "tcsh",
+    "python", "python3", "python2", "perl", "ruby", "node",
+    "eval",
+})
+
+# Maximum bytes to read from each output stream (stdout/stderr).
+# Prevents memory exhaustion from commands like ``yes`` or verbose tests.
+_MAX_STREAM_BYTES = 2 * 1024 * 1024  # 2 MiB
 
 
 def validate_command(command: str) -> str | None:
@@ -49,10 +71,52 @@ def validate_command(command: str) -> str | None:
     Returns ``None`` if the command is safe, or a human-readable reason
     string if it should be blocked.
     """
+    # Pattern-based blocking
     for pattern in _BLOCKED_PATTERNS:
         if pattern.search(command):
             return f"Command blocked by safety guardrail: matches pattern {pattern.pattern!r}"
+
+    # Block interpreter indirection (e.g. bash -c "rm -rf /")
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return "Command blocked: unparseable shell syntax"
+
+    if argv and argv[0] in _INTERPRETER_PREFIXES:
+        return (
+            f"Command blocked: interpreter indirection via '{argv[0]}' is not "
+            f"allowed in deterministic steps"
+        )
+
     return None
+
+
+# ---------------------------------------------------------------------------
+# Output-limited stream reader
+# ---------------------------------------------------------------------------
+
+
+async def _read_limited(
+    stream: asyncio.StreamReader,
+    limit: int = _MAX_STREAM_BYTES,
+) -> bytes:
+    """Read up to *limit* bytes from *stream*, discarding the rest."""
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await stream.read(8192)
+        if not chunk:
+            break
+        remaining = limit - total
+        if remaining <= 0:
+            continue
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            total = limit
+        else:
+            chunks.append(chunk)
+            total += len(chunk)
+    return b"".join(chunks)
 
 
 # ---------------------------------------------------------------------------
@@ -68,9 +132,10 @@ async def execute_deterministic_step(
 ) -> StepResult:
     """Execute a deterministic step by running its ``command`` field.
 
+    Uses ``create_subprocess_exec`` (not shell) to prevent injection.
     Returns a :class:`StepResult` with ``cost_usd=0.0`` and
-    ``model_used="deterministic"``.  Exit code 0 → completed,
-    non-zero → failed.
+    ``model_used="deterministic"``.  Exit code 0 -> completed,
+    non-zero -> failed.
     """
     idx = step.get("idx", 0)
     command = step.get("command", "")
@@ -97,6 +162,27 @@ async def execute_deterministic_step(
             blocker_description=blocked,
         )
 
+    # Parse command into argv for exec-mode
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        return StepResult(
+            idx=idx,
+            status="failed",
+            result=f"Failed to parse command: {exc}",
+            model_used="deterministic",
+            blocker_description=f"Unparseable command: {exc}",
+        )
+
+    if not argv:
+        return StepResult(
+            idx=idx,
+            status="failed",
+            result="Command parsed to empty argv",
+            model_used="deterministic",
+            blocker_description="Empty command after parsing",
+        )
+
     # Resolve working directory
     try:
         step_type = StepType(step_type_str)
@@ -112,13 +198,18 @@ async def execute_deterministic_step(
 
     start = time.monotonic()
     try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
         )
-        stdout_bytes, stderr_bytes = await proc.communicate()
+        # Read with stream limit to prevent memory exhaustion
+        stdout_bytes, stderr_bytes = await asyncio.gather(
+            _read_limited(proc.stdout),
+            _read_limited(proc.stderr),
+        )
+        await proc.wait()
     except OSError as exc:
         duration = time.monotonic() - start
         return StepResult(
@@ -134,7 +225,7 @@ async def execute_deterministic_step(
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
 
-    # Cap output to avoid memory bloat in result_json
+    # Cap stored output for result_json
     max_output = 50_000
     if len(stdout) > max_output:
         stdout = stdout[:max_output] + f"\n... (truncated, {len(stdout_bytes)} bytes total)"

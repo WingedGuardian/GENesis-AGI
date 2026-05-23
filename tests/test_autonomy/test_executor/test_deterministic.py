@@ -83,6 +83,36 @@ class TestValidateCommand:
         result = validate_command("TRUNCATE TABLE sessions")
         assert result is not None
 
+    def test_find_delete_blocked(self) -> None:
+        result = validate_command("find . -name '*.pyc' -delete")
+        assert result is not None
+
+    def test_find_exec_rm_blocked(self) -> None:
+        result = validate_command("find /tmp -exec rm {} ;")
+        assert result is not None
+
+    def test_bash_c_blocked(self) -> None:
+        """Interpreter indirection is blocked."""
+        # Use a command that doesn't match other patterns so the
+        # interpreter check is what catches it
+        result = validate_command("bash -c 'echo hello'")
+        assert result is not None
+        assert "interpreter" in result.lower()
+
+    def test_python_c_blocked(self) -> None:
+        result = validate_command("python -c 'import os; os.remove(\"/\")'")
+        assert result is not None
+        assert "interpreter" in result.lower()
+
+    def test_eval_blocked(self) -> None:
+        result = validate_command("eval 'dangerous command'")
+        assert result is not None
+        assert "interpreter" in result.lower()
+
+    def test_node_blocked(self) -> None:
+        result = validate_command("node -e 'process.exit(1)'")
+        assert result is not None
+
 
 @pytest.mark.asyncio
 class TestExecuteDeterministicStep:
@@ -131,10 +161,12 @@ class TestExecuteDeterministicStep:
         assert result.duration_s >= 0.0
 
     async def test_stderr_captured(self) -> None:
-        step = {"idx": 0, "type": "bash", "command": "echo err >&2"}
+        # Use a command that writes to stderr without shell redirection
+        # (since we use exec-mode, not shell)
+        step = {"idx": 0, "type": "bash", "command": "ls /nonexistent_path_for_test"}
         result = await execute_deterministic_step(step)
-        assert result.status == "completed"
-        assert "err" in result.result
+        assert result.status == "failed"
+        assert "STDERR" in result.result
 
     async def test_worktree_path_used(self, tmp_path: Path) -> None:
         step = {"idx": 0, "type": "bash", "command": "pwd"}
