@@ -10,13 +10,12 @@ Budget: <50ms (JSON file read + keyword match).
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
-# Skip in dispatched sessions
-if os.environ.get("GENESIS_CC_SESSION") == "1":
-    sys.exit(0)
+# Skill injection fires for ALL sessions (foreground + dispatched).
+# Background sessions need skill nudges just as much — without them,
+# dispatched sessions have tools but no knowledge of how to use them.
 
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h

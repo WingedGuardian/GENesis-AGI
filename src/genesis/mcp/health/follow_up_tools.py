@@ -55,12 +55,20 @@ async def _impl_follow_up_create(
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
 
     try:
+        import os
+
         from genesis.db.crud import follow_ups
+
+        # Detect dispatched session context for proper source attribution
+        if os.environ.get("GENESIS_CC_SESSION") == "1":
+            source = "ego_dispatch"
+        else:
+            source = "foreground_session"
 
         fid = await follow_ups.create(
             db,
             content=content,
-            source="foreground_session",
+            source=source,
             source_session=source_session,
             reason=reason,
             strategy=strategy,

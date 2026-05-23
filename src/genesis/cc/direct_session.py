@@ -376,7 +376,7 @@ class DirectSessionRunner:
             db = getattr(self._rt, "_db", None)
             if db is None:
                 return
-            summary = (result.output_text or result.error or "")[:200]
+            summary = (result.output_text or result.error or "")[:1000]
             await update_proposal_outcome(
                 db, proposal_id, success=result.success, summary=summary,
             )
