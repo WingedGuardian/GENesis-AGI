@@ -286,10 +286,14 @@ async def init(rt: GenesisRuntime) -> None:
                                 # Extract outcome summary from session
                                 # metadata (stored by DirectSessionRunner
                                 # at direct_session.py:479,483).
-                                if status in ("completed", "success"):
-                                    _outcome = (_meta.get("output_text") or "")[:120]
+                                # Prefer error when present — DirectSession
+                                # calls complete() even on is_error=True;
+                                # only Python exceptions trigger fail().
+                                _error = (_meta.get("error") or "").strip()
+                                if _error:
+                                    _outcome = _error[:120]
                                 else:
-                                    _outcome = (_meta.get("error") or "")[:120]
+                                    _outcome = (_meta.get("output_text") or "")[:120]
                                 _outcome = _outcome.replace("\n", " ").strip()
                                 if _outcome:
                                     _note = (

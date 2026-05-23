@@ -40,10 +40,10 @@ async def test_enriched_note_includes_output_text():
     content = proposal["content"][:60]
 
     # Replicate the enriched note logic from init/ego.py
-    if status in ("completed", "success"):
-        outcome = (meta.get("output_text") or "")[:120]
-    else:
-        outcome = (meta.get("error") or "")[:120]
+    # Error-first: prefer error when present (completed sessions
+    # can have is_error=True without triggering fail()).
+    _error = (meta.get("error") or "").strip()
+    outcome = _error[:120] if _error else (meta.get("output_text") or "")[:120]
     outcome = outcome.replace("\n", " ").strip()
 
     if outcome:
@@ -71,10 +71,8 @@ async def test_enriched_note_failed_dispatch_includes_error():
     status = "failed"
     content = "Submit job application via browser"[:60]
 
-    if status in ("completed", "success"):
-        outcome = (meta.get("output_text") or "")[:120]
-    else:
-        outcome = (meta.get("error") or "")[:120]
+    _error = (meta.get("error") or "").strip()
+    outcome = _error[:120] if _error else (meta.get("output_text") or "")[:120]
     outcome = outcome.replace("\n", " ").strip()
 
     if outcome:
@@ -85,6 +83,29 @@ async def test_enriched_note_failed_dispatch_includes_error():
     assert "[failed]" in note
     assert "Submit job application via browser" in note
     assert "Browser session timed out after 120s" in note
+
+
+@pytest.mark.asyncio
+async def test_enriched_note_completed_but_errored_uses_error():
+    """Completed session with is_error=True should use error, not output_text.
+
+    DirectSessionRunner calls complete() even when output.is_error=True;
+    only Python exceptions trigger fail(). So status can be 'completed'
+    while error is populated.
+    """
+    meta = {
+        "output_text": "Some irrelevant partial output",
+        "error": "Tool execution failed: permission denied",
+    }
+
+    # Error-first logic: error takes priority regardless of status
+    _error = (meta.get("error") or "").strip()
+    outcome = _error[:120] if _error else (meta.get("output_text") or "")[:120]
+    outcome = outcome.replace("\n", " ").strip()
+
+    assert outcome == "Tool execution failed: permission denied"
+    # Crucially, it should NOT contain the irrelevant output_text
+    assert "irrelevant partial output" not in outcome
 
 
 @pytest.mark.asyncio
@@ -99,10 +120,8 @@ async def test_enriched_note_no_outcome_falls_back():
     status = "completed"
     content = "Investigate memory drift"[:60]
 
-    if status in ("completed", "success"):
-        outcome = (meta.get("output_text") or "")[:120]
-    else:
-        outcome = (meta.get("error") or "")[:120]
+    _error = (meta.get("error") or "").strip()
+    outcome = _error[:120] if _error else (meta.get("output_text") or "")[:120]
     outcome = outcome.replace("\n", " ").strip()
 
     if outcome:
