@@ -98,6 +98,7 @@ class CCInvocation:
     bare: bool = False
     append_system_prompt: bool = False
     stream_idle_timeout_ms: int | None = None
+    anthropic_base_url: str | None = None  # Proxy URL override (ANTHROPIC_BASE_URL)
     on_spawn: Callable[[int], Awaitable[None]] | None = field(
         default=None, compare=False, repr=False,
     )
@@ -135,6 +136,7 @@ class CCOutput:
     error_message: str | None = None
     model_requested: str = ""
     downgraded: bool = False
+    via_proxy: bool = False
 
 
 @dataclass(frozen=True)

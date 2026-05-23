@@ -68,6 +68,22 @@ def test_build_env_strips_claudecode(invoker):
         assert env["HOME"] == "/home/test"
 
 
+def test_build_env_sets_anthropic_base_url(invoker):
+    inv = CCInvocation(prompt="hello", anthropic_base_url="http://localhost:8100")
+    env = invoker._build_env(inv)
+    assert env["ANTHROPIC_BASE_URL"] == "http://localhost:8100"
+
+
+def test_build_env_omits_anthropic_base_url_when_none(invoker):
+    inv = CCInvocation(prompt="hello")
+    with patch.dict("os.environ", {}, clear=False):
+        # Ensure no ANTHROPIC_BASE_URL leaks from parent env
+        import os
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        env = invoker._build_env(inv)
+        assert "ANTHROPIC_BASE_URL" not in env
+
+
 @pytest.mark.asyncio
 async def test_run_success(invoker):
     # Match real CLI JSON shape (verified 2026-03-08)
@@ -109,6 +125,38 @@ async def test_run_success(invoker):
     assert output.model_used == "claude-sonnet-4-6"
     assert output.exit_code == 0
     assert not output.is_error
+    assert not output.via_proxy
+
+
+@pytest.mark.asyncio
+async def test_run_via_proxy_sets_flag(invoker):
+    """When anthropic_base_url is set, output.via_proxy should be True."""
+    result_line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "proxied response",
+            "session_id": "sess-proxy-1",
+            "total_cost_usd": 0.05,
+            "duration_ms": 1000,
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        }
+    )
+    mock_proc = AsyncMock()
+    mock_proc.communicate = AsyncMock(return_value=(result_line.encode(), b""))
+    mock_proc.returncode = 0
+
+    with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+        output = await invoker.run(
+            CCInvocation(
+                prompt="hello",
+                anthropic_base_url="http://localhost:8100",
+            )
+        )
+    assert output.via_proxy is True
+    assert output.text == "proxied response"
 
 
 @pytest.mark.asyncio
