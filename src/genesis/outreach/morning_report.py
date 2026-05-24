@@ -41,6 +41,14 @@ def _relative_age(iso_ts: str) -> str:
         return "unknown age"
 
 
+def _age_seconds(iso_ts: str) -> float:
+    """Return seconds since the given ISO timestamp, or 0 on error."""
+    try:
+        return (datetime.now(UTC) - datetime.fromisoformat(iso_ts)).total_seconds()
+    except (ValueError, TypeError):
+        return 0
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -184,6 +192,14 @@ class MorningReportGenerator:
         except Exception:
             logger.warning("Morning report: observation insights unavailable", exc_info=True)
 
+        # 9. Standing Items (observations surfaced 3+ times, still unresolved)
+        try:
+            standing = await self._get_standing_items()
+            if standing:
+                sections.append(f"## Standing Items\n{standing}")
+        except Exception:
+            logger.warning("Morning report: standing items unavailable", exc_info=True)
+
         return "\n\n".join(sections)
 
     async def _emit_warning(self, section: str, message: str) -> None:
@@ -220,6 +236,16 @@ class MorningReportGenerator:
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
+        # Top cost drivers (data already in the snapshot, just not displayed)
+        by_provider = cost.get("cost_by_provider", [])
+        if by_provider:
+            top = [
+                f"{p['provider']}: ${p['month_usd']:.2f}"
+                for p in by_provider[:3]
+                if p.get("month_usd", 0) > 0.01
+            ]
+            if top:
+                lines.append(f"- Top cost drivers (month): {', '.join(top)}")
         return "\n".join(lines)
 
     async def _get_activity_summary(self) -> str:
@@ -312,8 +338,12 @@ class MorningReportGenerator:
             "'Genesis is tracking N internal items.' Skip entirely if nothing\n"
             "requires user awareness.\n"
         )
-        entries = "\n".join(f"- [{r[0]}] {r[1][:300]} (as of {r[2]})" for r in rows)
-        return header + "\n" + entries
+        entry_lines = []
+        for r in rows:
+            age = _relative_age(r[2])
+            aging_tag = " [AGING]" if _age_seconds(r[2]) > 43200 else ""  # >12h
+            entry_lines.append(f"- [{r[0]}]{aging_tag} {r[1][:300]} ({age})")
+        return header + "\n" + "\n".join(entry_lines)
 
     async def _get_pending_items(self) -> str:
         lines: list[str] = []
@@ -521,4 +551,29 @@ class MorningReportGenerator:
         # If delivery fails, these observations re-appear in the next report.
         self._pending_surface_ids = [obs["id"] for obs in observations]
 
+        return "\n".join(lines)
+
+    async def _get_standing_items(self) -> str | None:
+        """Return observations surfaced 3+ times but still unresolved.
+
+        These are known conditions — demoted to end of report.
+        """
+        from genesis.db.crud.observations import get_standing
+
+        items = await get_standing(
+            self._db,
+            priority_filter=("critical", "high", "medium"),
+            exclude_types=_INTERNAL_OBS_TYPES,
+            threshold=3,
+            limit=5,
+        )
+        if not items:
+            return None
+
+        lines = []
+        for obs in items:
+            content = obs["content"][:150].replace("\n", " ")
+            count = obs.get("surfaced_count", 0)
+            age = _relative_age(obs.get("created_at", ""))
+            lines.append(f"- {content} (surfaced {count}x, {age})")
         return "\n".join(lines)
