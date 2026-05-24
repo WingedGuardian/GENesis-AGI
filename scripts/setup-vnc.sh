@@ -81,7 +81,7 @@ Requires=genesis-xvfb.service
 [Service]
 Type=simple
 Environment=DISPLAY=:99
-ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5900 -xdamage -threads
+ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5999 -xdamage -threads
 Restart=on-failure
 RestartSec=3
 
@@ -98,7 +98,7 @@ Requires=genesis-vnc.service
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 6080 localhost:5900
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 6080 localhost:5999
 Restart=on-failure
 RestartSec=3
 
@@ -136,10 +136,10 @@ else
     OK=false
 fi
 
-if ss -tlnp | grep -q ':5900'; then
-    echo "✓ VNC server listening on port 5900"
+if ss -tlnp | grep -q ':5999'; then
+    echo "✓ VNC server listening on port 5999"
 else
-    echo "✗ VNC server not listening on port 5900"
+    echo "✗ VNC server not listening on port 5999"
     OK=false
 fi
 

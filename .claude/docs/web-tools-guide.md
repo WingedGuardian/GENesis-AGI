@@ -38,6 +38,27 @@ Bash for structured JSON / `site:` filtering. Tavily for AI-optimized
 agent search (free tier). Exa for semantic/conceptual discovery. Perplexity
 when synthesis from multiple sources justifies the cost.
 
+## GitHub Search — "I need to find repos, code, or libraries"
+
+When searching for open-source projects, implementation patterns, or
+libraries on GitHub, use these INSTEAD of generic web search:
+
+| Tool | Context | Use when... |
+|------|---------|-------------|
+| **`gh search repos "query"`** | Both (via Bash) | Find repos by topic, description, language |
+| **`gh search code "query"`** | Both (via Bash) | Search code across all public repos |
+| **grep.app** | Both | `web_fetch("https://grep.app/search?q=QUERY")` — semantic code search, better than GitHub native |
+| **`gh api search/repositories?q=QUERY`** | Both | Structured JSON results with star counts, dates |
+| **Exa** with GitHub filter | Both | `web_search(query, backend="exa")` with `include_domains: ["github.com"]` |
+
+**When to use:** Any task involving "search GitHub," "find a library,"
+"how do other projects handle X," or "what open-source tools exist for Y."
+Generic web search returns blog posts ABOUT GitHub projects; these tools
+search GitHub directly. grep.app is especially valuable for finding
+implementation patterns across repos.
+
+---
+
 ## Fetch — "I have a URL, get the content"
 
 | Tool | Context | Use when... |
