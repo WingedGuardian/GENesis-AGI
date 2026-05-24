@@ -46,10 +46,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # ── Signal change detection for Light reflections ─────────────────────
-# Only these signals carry actionable information — changes here mean
-# something actually happened. Continuous-drift noise (container_memory_pct,
-# micro_count_since_light, time_since_last_strategic, light_count_since_deep,
-# budget_pct_consumed, user_session_pattern) is excluded.
+# Signals whose changes indicate something actionable happened.
+# Continuous-drift noise (container_memory_pct, micro_count_since_light,
+# time_since_last_strategic, light_count_since_deep, budget_pct_consumed,
+# user_session_pattern) is excluded.
+# NOTE: software_error_spike and critical_failure primarily drive Micro
+# scoring, but they're included here because if they change 0→1, we want
+# the Light gate to open so the anomaly focus path can fire.
 _MATERIAL_SIGNALS = frozenset({
     "software_error_spike", "critical_failure", "sentinel_activity",
     "guardian_activity", "conversations_since_reflection",

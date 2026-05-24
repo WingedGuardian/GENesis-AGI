@@ -100,20 +100,17 @@ class MorningReportGenerator:
         Called by the scheduler after the pipeline confirms delivery.
         Observations collected during generate() are only marked surfaced
         here — if delivery fails, they re-appear in the next report.
+
+        Only calls mark_surfaced — retrieved/influenced tracking is
+        handled by _get_activity_summary to avoid double-counting.
         """
         ids = self._pending_surface_ids
         if not ids:
             return
-        from genesis.db.crud.observations import (
-            increment_retrieved_batch,
-            mark_influenced_batch,
-            mark_surfaced,
-        )
+        from genesis.db.crud.observations import mark_surfaced
 
         now = datetime.now(UTC).isoformat()
         await mark_surfaced(self._db, ids, now)
-        await increment_retrieved_batch(self._db, ids)
-        await mark_influenced_batch(self._db, ids)
         self._pending_surface_ids = []
 
     @staticmethod

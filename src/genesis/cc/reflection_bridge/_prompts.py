@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid as _uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -121,8 +122,6 @@ def _light_focus_area(tick: TickResult) -> str:
         return "anomaly"
 
     # Normal rotation: alternate situation / user_impact
-    import uuid as _uuid
-
     try:
         tick_number = _uuid.UUID(tick.tick_id).int % 10000
     except ValueError:
