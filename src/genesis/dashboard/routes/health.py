@@ -271,6 +271,19 @@ async def guardian_dialogue():
             }), 200
         except Exception:
             logger.warning("Sentinel dispatch failed — falling back to need_help", exc_info=True)
+    elif sentinel is not None and sentinel.is_active:
+        # Sentinel is already mid-remediation — tell Guardian to wait.
+        # Without this, Guardian interprets the fallthrough as "need_help"
+        # and escalates, causing competing restart attempts.
+        current = getattr(sentinel, "_state", None)
+        state_str = current.current_state if current else "active"
+        return jsonify({
+            "acknowledged": True,
+            "status": "handling",
+            "action": "sentinel_already_active",
+            "eta_s": 600,
+            "context": f"Sentinel already remediating ({state_str})",
+        }), 200
 
     return jsonify({
         "acknowledged": True,
