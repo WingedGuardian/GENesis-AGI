@@ -36,9 +36,7 @@ class OutreachConfig:
         "cc:quota_exhausted",
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
-        "provider:credit_exhaustion:episodic_memory_embedding",
-        "provider:credit_exhaustion:qdrant.search",
-        "provider:credit_exhaustion:qdrant.upsert",
+        "provider:credit_exhaustion",  # Prefix — matches any provider
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
     )
@@ -68,9 +66,7 @@ _DEFAULTS = OutreachConfig(
         "cc:quota_exhausted",
         "provider:embedding_failing",
         "provider:qdrant_unreachable",
-        "provider:credit_exhaustion:episodic_memory_embedding",
-        "provider:credit_exhaustion:qdrant.search",
-        "provider:credit_exhaustion:qdrant.upsert",
+        "provider:credit_exhaustion",  # Prefix — matches any provider
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
     ),
