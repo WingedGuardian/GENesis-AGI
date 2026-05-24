@@ -583,7 +583,7 @@ async def _ensure_vnc():
         # the systemd service from starting (common after session restart).
         try:
             r = _sp.run(
-                ["fuser", "5900/tcp"],
+                ["fuser", "5999/tcp"],
                 capture_output=True, text=True, timeout=3,
             )
             if r.stdout.strip():
@@ -595,10 +595,10 @@ async def _ensure_vnc():
                 if svc.stdout.strip() != "active":
                     # Stale process — kill it so systemd can bind
                     _sp.run(
-                        ["fuser", "-k", "5900/tcp"],
+                        ["fuser", "-k", "5999/tcp"],
                         capture_output=True, timeout=3,
                     )
-                    logger.info("Killed stale process holding VNC port 5900")
+                    logger.info("Killed stale process holding VNC port 5999")
                     import time
                     time.sleep(1)
         except FileNotFoundError:
@@ -637,7 +637,7 @@ async def _ensure_vnc():
                 )
                 _sp2.Popen(
                     ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                     "-rfbport", "5900", "-bg"] + auth_arg,
+                     "-rfbport", "5999", "-bg"] + auth_arg,
                     stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
                 )
                 started = True
@@ -1074,9 +1074,10 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare Turnstile challenge "
-                f"that didn't auto-resolve or respond to automated VNC click.\n\n"
-                f"Open VNC to solve it: {vnc_url}"
+                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Auto-resolve and VNC click both failed after multiple attempts. "
+                f"Genesis will retry on next navigation.\n\n"
+                f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
@@ -1101,8 +1102,46 @@ async def _poll_turnstile_token(page, timeout_s: float, interval_s: float) -> bo
     return False
 
 
+async def _solve_with_playwright_captcha(page) -> bool:
+    """Solve Cloudflare challenge using playwright-captcha Shadow DOM traversal.
+
+    Primary solver — navigates the closed Shadow DOM to find and click the
+    actual Turnstile checkbox element.  No coordinates, no VNC, no guessing.
+    Falls back to False if the library is not installed or fails.
+    """
+    try:
+        from playwright_captcha import CaptchaType, ClickSolver
+
+        solver = ClickSolver()
+        await solver.prepare()
+
+        # Try interstitial first (full-page challenge), then turnstile (embedded)
+        for captcha_type in [CaptchaType.CLOUDFLARE_INTERSTITIAL, CaptchaType.CLOUDFLARE_TURNSTILE]:
+            try:
+                result = await solver.solve_captcha(page, captcha_type=captcha_type)
+                if result:
+                    logger.info(
+                        "playwright-captcha solved %s challenge", captcha_type.value,
+                    )
+                    return True
+            except Exception as e:
+                logger.debug(
+                    "playwright-captcha %s failed: %s", captcha_type.value, e,
+                )
+                continue
+
+        await solver.cleanup()
+        return False
+    except ImportError:
+        logger.debug("playwright-captcha not installed — skipping")
+        return False
+    except Exception as e:
+        logger.debug("playwright-captcha error: %s", e)
+        return False
+
+
 async def _vnc_click_turnstile(page) -> bool:
-    """Click the Turnstile checkbox via VNC trusted input.
+    """Click the Turnstile checkbox via VNC trusted input (fallback).
 
     Uses vncdotool to send a mouse click through the VNC protocol, producing
     real X11 input events with network-realistic timing that passes
@@ -1114,51 +1153,63 @@ async def _vnc_click_turnstile(page) -> bool:
         # Calculate screen coordinates from browser position + iframe rect.
         # Uses JS to get the browser's own screen offset and chrome height,
         # avoiding fragile hardcoded pixel offsets.
-        coords = await page.evaluate("""() => {
+        # Get REAL window position from xdotool (not spoofed JS screenX/screenY).
+        # Camoufox's BrowserForge randomizes window.screenX/screenY for
+        # anti-fingerprinting, making JS-based coordinates useless for VNC.
+        try:
+            xdo = await asyncio.create_subprocess_exec(
+                "xdotool", "getactivewindow", "getwindowgeometry",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "DISPLAY": _VNC_DISPLAY},
+            )
+            xdo_out, _ = await asyncio.wait_for(xdo.communicate(), timeout=3)
+            xdo_text = xdo_out.decode()
+            # Parse "Position: X,Y (screen: 0)\n  Geometry: WxH"
+            import re
+            pos_match = re.search(r"Position:\s*(\d+),(\d+)", xdo_text)
+            if pos_match:
+                win_x, win_y = int(pos_match.group(1)), int(pos_match.group(2))
+            else:
+                win_x, win_y = 0, 0
+        except Exception:
+            win_x, win_y = 0, 0
+            logger.debug("xdotool failed — using (0,0) for window position")
+
+        # Get element position from page coordinates (these are NOT spoofed)
+        page_coords = await page.evaluate("""() => {
             // Try iframe-based Turnstile first
             const iframe = document.querySelector(
                 'iframe[src*="challenges.cloudflare"]'
             );
             if (iframe) {
                 const rect = iframe.getBoundingClientRect();
-                const chromeH = window.outerHeight - window.innerHeight;
-                return {
-                    x: Math.round(window.screenX + rect.left + 28),
-                    y: Math.round(
-                        window.screenY + chromeH + rect.top + rect.height / 2
-                    ),
-                };
+                return { left: rect.left + 28, top: rect.top + rect.height / 2 };
             }
-            // Managed challenge: look for any visible interactive element
-            // (checkbox, verify button) in the challenge page
-            const verify = document.querySelector(
-                '#challenge-stage input[type="button"], '
-                + '.cf-turnstile, '
-                + '[id*="turnstile"] input'
+            // Managed challenge: find the Turnstile container
+            const container = document.querySelector(
+                '[style*="display: grid"], .cf-turnstile, #turnstile-wrapper'
             );
-            if (verify) {
-                const rect = verify.getBoundingClientRect();
-                const chromeH = window.outerHeight - window.innerHeight;
-                return {
-                    x: Math.round(window.screenX + rect.left + rect.width / 2),
-                    y: Math.round(
-                        window.screenY + chromeH + rect.top + rect.height / 2
-                    ),
-                };
+            if (container) {
+                const rect = container.getBoundingClientRect();
+                // Checkbox is ~20px from left edge, vertically centered
+                return { left: rect.left + 20, top: rect.top + rect.height / 2 };
             }
-            // Last resort: click center of page (managed challenges
-            // sometimes just need any interaction to proceed)
-            const chromeH = window.outerHeight - window.innerHeight;
+            // Last resort: center of viewport
             return {
-                x: Math.round(window.screenX + window.innerWidth / 2),
-                y: Math.round(window.screenY + chromeH + window.innerHeight / 2),
+                left: document.documentElement.clientWidth / 2,
+                top: document.documentElement.clientHeight / 2,
             };
         }""")
-        if coords is None:
-            logger.warning("VNC Turnstile click: no clickable element found")
+        if page_coords is None:
+            logger.warning("VNC Turnstile click: no page coordinates found")
             return False
 
-        click_x, click_y = coords["x"], coords["y"]
+        # Chrome height ~34px for Camoufox (per proven procedure)
+        chrome_h = 34
+        click_x = win_x + int(page_coords["left"])
+        click_y = win_y + chrome_h + int(page_coords["top"])
+
         logger.info("VNC Turnstile click: targeting (%d, %d)", click_x, click_y)
 
         # Human-like pre-click delay
@@ -1169,8 +1220,7 @@ async def _vnc_click_turnstile(page) -> bool:
         # asyncio.create_subprocess_exec is the safe path (no shell).
         proc = await asyncio.create_subprocess_exec(
             "vncdo",
-            "-s", "localhost::5900",
-            "-p", _VNC_PASSWORD,
+            "-s", "localhost::5999",
             "--delay=300",
             "move", str(click_x), str(click_y),
             "click", "1",
@@ -1259,10 +1309,19 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 2: VNC click — with self-repair on failure
+        # Phase 1.5: playwright-captcha (Shadow DOM click — primary solver)
+        logger.info("Trying playwright-captcha Shadow DOM solver")
+        if await _solve_with_playwright_captcha(page):
+            if await _poll_turnstile_token(page, 10, 1.0):
+                logger.info("Challenge resolved via playwright-captcha")
+                return {"status": "resolved", "method": "playwright_captcha"}
+            # Page may have navigated — check if challenge is gone
+            if not await _detect_challenge(page):
+                return {"status": "resolved", "method": "playwright_captcha"}
+
+        # Phase 2: VNC click — fallback with self-repair
         logger.warning(
-            "Challenge did NOT auto-resolve in %dms — trying VNC click",
-            timeout_ms,
+            "playwright-captcha failed — falling back to VNC click",
         )
         vnc_failed_count = 0
         for attempt in range(1, 4):  # up to 3 attempts

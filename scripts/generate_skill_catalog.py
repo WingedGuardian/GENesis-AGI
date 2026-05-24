@@ -83,7 +83,23 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                 else:
                     description = val
 
-    return {"name": name, "description": description}
+    keywords = []
+    if content.startswith("---"):
+        end = content.find("---", 3)
+        if end > 0:
+            frontmatter = content[3:end]
+            kw_match = re.search(
+                r"keywords:\s*\[([^\]]*)\]", frontmatter
+            )
+            if kw_match:
+                raw = kw_match.group(1)
+                keywords = [
+                    k.strip().strip("'\"")
+                    for k in raw.split(",")
+                    if k.strip()
+                ]
+
+    return {"name": name, "description": description, "keywords": keywords}
 
 
 def _scan_tier(tier_dir: Path, tier_num: int, repo_root: Path | None) -> list[dict]:

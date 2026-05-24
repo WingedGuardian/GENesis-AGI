@@ -6,6 +6,7 @@ description: >
   publishes to Medium via browser automation. Invoke with "publish a post
   about X", "write and publish to Medium", "content-publish", or when an
   ego-dispatched session needs to create and distribute content.
+keywords: [medium, publish, article, blog, post, content, write, draft, distribution, marketing]
 ---
 
 ## Overview

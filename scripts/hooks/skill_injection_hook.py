@@ -20,8 +20,10 @@ from pathlib import Path
 CATALOG_PATH = Path.home() / ".genesis" / "skill_catalog.json"
 _CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h
 
-# Minimum confidence threshold — keyword overlap score must exceed this
-_MIN_CONFIDENCE = 0.3
+# Minimum confidence threshold — even 1-2 keyword matches should surface
+# the skill. With 10 prompt keywords, a single keyword match = 0.1 (name)
+# or 0.05 (desc). Threshold of 0.1 means 1 name/keyword match suffices.
+_MIN_CONFIDENCE = 0.1
 # Max nudges per prompt
 _MAX_NUDGES = 1
 
@@ -117,12 +119,15 @@ def _score_skill(skill: dict, keywords: list[str]) -> float:
 
     name_lower = skill.get("name", "").lower().replace("-", " ").replace("_", " ")
     desc_lower = skill.get("description", "").lower()
+    skill_kws = {kw.lower() for kw in skill.get("keywords", [])}
 
     matches = 0
     for kw in keywords:
         kw_lower = kw.lower()
         if kw_lower in name_lower:
             matches += 2  # Name match weighted 2x
+        elif kw_lower in skill_kws:
+            matches += 2  # Explicit keyword match weighted 2x
         elif kw_lower in desc_lower:
             matches += 1
 
