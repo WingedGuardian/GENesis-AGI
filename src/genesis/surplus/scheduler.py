@@ -323,6 +323,16 @@ class SurplusScheduler:
         except Exception:
             logger.warning("Could not emit initial heartbeat", exc_info=True)
 
+        # Check for incomplete dream cycle runs from previous process.
+        try:
+            from genesis.memory.dream_cycle import check_incomplete_runs
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.db is not None:
+                await check_incomplete_runs(rt.db)
+        except Exception:
+            logger.debug("Dream cycle integrity check skipped", exc_info=True)
+
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —

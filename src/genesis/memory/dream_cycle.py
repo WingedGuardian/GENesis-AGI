@@ -647,6 +647,64 @@ async def rollback(
     return report
 
 
+# ── Startup Integrity Check ──────────────────────────────────────────────
+
+
+async def check_incomplete_runs(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Detect dream cycle runs that may have left inconsistent state.
+
+    If the process was killed mid-merge, some originals may be deprecated
+    in SQLite without a corresponding synthesis, or vice versa. This check
+    runs at startup and logs warnings — it does NOT auto-rollback (that
+    needs user confirmation).
+
+    Returns list of {run_id, deprecated_count} for suspicious runs.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT dream_cycle_run_id, COUNT(*) as cnt "
+            "FROM memory_metadata "
+            "WHERE deprecated = 1 AND dream_cycle_run_id IS NOT NULL "
+            "AND dream_cycle_run_id NOT LIKE 'synthesis:%' "
+            "GROUP BY dream_cycle_run_id"
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        logger.debug("Dream cycle integrity check skipped (query failed)", exc_info=True)
+        return []
+
+    suspicious: list[dict[str, Any]] = []
+    for row in rows:
+        run_id = row[0]
+        count = row[1]
+        # Check if synthesis exists for this run
+        try:
+            synth_cursor = await db.execute(
+                "SELECT COUNT(*) FROM memory_metadata "
+                "WHERE dream_cycle_run_id = ?",
+                (f"synthesis:{run_id}",),
+            )
+            synth_count = (await synth_cursor.fetchone())[0]
+        except Exception:
+            synth_count = -1
+
+        if synth_count == 0:
+            logger.warning(
+                "Dream cycle run %s: %d deprecated memories with NO synthesis — "
+                "possible incomplete run. Use dream_cycle.rollback('%s') to restore.",
+                run_id[:8], count, run_id,
+            )
+            suspicious.append({"run_id": run_id, "deprecated_count": count})
+
+    if suspicious:
+        logger.warning(
+            "Found %d potentially incomplete dream cycle run(s)", len(suspicious),
+        )
+    return suspicious
+
+
 # ── Prompt and Parsing ───────────────────────────────────────────────────
 
 _SYNTHESIS_PROMPT = """\
