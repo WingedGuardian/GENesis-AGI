@@ -677,7 +677,28 @@ async def _execute_recovery_with_approval(
         )
 
         if approved:
-            logger.info("Recovery approved by user")
+            # Re-verify signals before executing — Sentinel may have
+            # fixed the issue while the user was deciding on approval.
+            try:
+                recheck = await collect_all_signals(config)
+                if not recheck.failed_signals:
+                    logger.info(
+                        "All signals healthy at approval time — skipping recovery"
+                    )
+                    sm.process(recheck)  # Transitions to HEALTHY
+                    await dispatcher.send(Alert(
+                        severity=AlertSeverity.INFO,
+                        title="Recovery cancelled — Genesis recovered",
+                        body="All health signals passed when re-verified after approval. "
+                             "No recovery action was executed.",
+                    ))
+                    return
+            except Exception:
+                logger.warning(
+                    "Re-verify failed — proceeding with approved recovery",
+                    exc_info=True,
+                )
+            logger.info("Recovery approved by user — signals still failing, executing")
             await recovery_engine.execute(diagnosis)
         else:
             logger.warning("Recovery approval timed out — no action taken")
