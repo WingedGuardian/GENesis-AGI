@@ -1179,7 +1179,12 @@ async def _click_turnstile_iframe(page) -> bool:
             if frame.url.startswith("https://challenges.cloudflare.com"):
                 _ts_log.info("FOUND CF iframe: %s", frame.url[:120])
                 logger.info("Found Cloudflare challenge iframe: %s", frame.url[:120])
-                el = await frame.frame_locator(":root").locator("body").element_handle()
+                _ts_log.info("Attempting frame.frame_locator(':root').locator('body').element_handle()")
+                try:
+                    el = await frame.frame_locator(":root").locator("body").element_handle()
+                except Exception as fle:
+                    _ts_log.info("element_handle EXCEPTION: %s: %s", type(fle).__name__, fle)
+                    el = None
                 if el is None:
                     _ts_log.info("iframe body element_handle=None, trying query_selector")
                     logger.info("Iframe body element_handle returned None — trying query_selector")
@@ -1681,6 +1686,9 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
         await _send_turnstile_alert(page.url)
         return {"status": "blocked", "method": "timeout"}
     except Exception as e:
+        _ts_log.info("OUTER EXCEPTION in _wait_for_turnstile: %s: %s", type(e).__name__, e)
+        import traceback
+        _ts_log.info("Traceback: %s", traceback.format_exc())
         logger.debug("Challenge detection error: %s", e)
         return None
 
