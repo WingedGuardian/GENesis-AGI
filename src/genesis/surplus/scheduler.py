@@ -920,9 +920,10 @@ class SurplusScheduler:
                 pass
         finally:
             # Always clear heavy workload flag, even on failure.
+            # Use the captured `rt` reference (line 859) — re-looking up
+            # GenesisRuntime.instance() here introduces a second failure
+            # mode during shutdown races.
             try:
-                from genesis.runtime import GenesisRuntime
-                rt = GenesisRuntime.instance()
                 rt._heavy_workload = None
                 rt._heavy_workload_since = None
             except Exception:
