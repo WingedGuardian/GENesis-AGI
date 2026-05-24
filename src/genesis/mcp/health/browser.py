@@ -39,19 +39,37 @@ if _mcp_log_dir.is_dir():
     # Attach to root logger so ALL genesis.* logs are captured
     logging.getLogger("genesis").addHandler(_mcp_fh)
 
-# Dedicated Turnstile debug logger — flushes after every write so
-# output is visible even if the process is killed by timeout.
-_ts_log = logging.getLogger("genesis.turnstile_debug")
-_ts_log.setLevel(logging.DEBUG)
-_ts_log.propagate = False
-if _mcp_log_dir.is_dir():
-    _ts_fh = logging.FileHandler(
-        _mcp_log_dir / "turnstile_debug.log", delay=False,
-    )
-    _ts_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    _ts_log.addHandler(_ts_fh)
-    # Force immediate flush on every log call
-    _ts_fh.flush = _ts_fh.stream.flush  # type: ignore[assignment]
+# Direct file-write debug log for Turnstile — bypasses logging framework
+# entirely to guarantee output is visible. The logging.FileHandler approach
+# produced empty files despite correct setup (likely a process/import issue).
+_TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
+
+
+def _ts_log_write(msg: str) -> None:
+    """Write a timestamped line directly to the Turnstile debug log."""
+    try:
+        from datetime import UTC, datetime
+
+        ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
+        with open(_TS_LOG_PATH, "a") as f:
+            f.write(f"{ts} {msg}\n")
+            f.flush()
+    except Exception:
+        pass  # debug logging must never crash the tool
+
+
+class _TsLog:
+    """Minimal logger-like interface that writes directly to file."""
+
+    @staticmethod
+    def info(msg: str, *args: object) -> None:
+        _ts_log_write(msg % args if args else msg)
+
+    debug = info
+    warning = info
+
+
+_ts_log = _TsLog()
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
@@ -1681,6 +1699,7 @@ async def _impl_browser_navigate(
     """Navigate to a URL and return the page snapshot."""
     global _collaborate_mode, _remote_last_url
     _touch()
+    _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
@@ -1705,14 +1724,18 @@ async def _impl_browser_navigate(
         # (it already navigated on creation). Subsequent navigations must goto.
         skip_goto = is_new_tinyfish and url
         if not skip_goto:
+            _ts_log.info("page.goto starting: %s", url)
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            _ts_log.info("page.goto completed — title: %s", await page.title())
 
         # Challenge detection for local browsers (Camoufox + Chromium).
         # Skip for TinyFish (cloud browser, clean IP) and remote CDP
         # (user watching their own screen — they can handle challenges).
         turnstile_result = None
         if not tinyfish and not remote:
+            _ts_log.info("calling _wait_for_turnstile")
             turnstile_result = await _wait_for_turnstile(page)
+            _ts_log.info("_wait_for_turnstile returned: %s", turnstile_result)
 
         # Track URL for drift detection on remote sessions
         if remote:
