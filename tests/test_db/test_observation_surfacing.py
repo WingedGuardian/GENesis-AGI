@@ -8,6 +8,7 @@ import aiosqlite
 import pytest
 
 from genesis.db.crud.observations import (
+    get_standing,
     get_unsurfaced,
     mark_surfaced,
     unsurfaced_counts_by_priority,
@@ -16,7 +17,7 @@ from genesis.db.crud.observations import (
 
 @pytest.fixture
 async def db(tmp_path):
-    """In-memory DB with observations table including surfaced_at."""
+    """In-memory DB with observations table including surfaced_at and surfaced_count."""
     db_path = str(tmp_path / "test.db")
     async with aiosqlite.connect(db_path) as conn:
         await conn.execute("""
@@ -37,7 +38,8 @@ async def db(tmp_path):
                 created_at TEXT,
                 expires_at TEXT,
                 content_hash TEXT,
-                surfaced_at TEXT
+                surfaced_at TEXT,
+                surfaced_count INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Seed test data
@@ -126,6 +128,105 @@ class TestMarkSurfaced:
     async def test_empty_list(self, db):
         count = await mark_surfaced(db, [], datetime.now(UTC).isoformat())
         assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_surfaced_count_increments(self, db):
+        """Verify surfaced_count increments on each mark_surfaced call."""
+        now = datetime.now(UTC).isoformat()
+        await mark_surfaced(db, ["obs-1"], now)
+
+        cursor = await db.execute(
+            "SELECT surfaced_count FROM observations WHERE id = 'obs-1'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 1
+
+        # Call again — count should increment, surfaced_at preserved
+        await mark_surfaced(db, ["obs-1"], datetime.now(UTC).isoformat())
+        cursor = await db.execute(
+            "SELECT surfaced_count, surfaced_at FROM observations WHERE id = 'obs-1'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 2
+        assert row[1] == now  # original surfaced_at preserved via COALESCE
+
+    @pytest.mark.asyncio
+    async def test_surfaced_count_preserves_original_timestamp(self, db):
+        """COALESCE preserves first surfaced_at on re-surfacing."""
+        first_ts = "2026-05-20T10:00:00+00:00"
+        await mark_surfaced(db, ["obs-2"], first_ts)
+
+        second_ts = "2026-05-21T10:00:00+00:00"
+        await mark_surfaced(db, ["obs-2"], second_ts)
+
+        cursor = await db.execute(
+            "SELECT surfaced_at, surfaced_count FROM observations WHERE id = 'obs-2'"
+        )
+        row = await cursor.fetchone()
+        assert row[0] == first_ts  # first timestamp preserved
+        assert row[1] == 2
+
+
+class TestGetStanding:
+    @pytest.mark.asyncio
+    async def test_returns_standing_items(self, db):
+        """Items surfaced >= threshold times are returned."""
+        now = datetime.now(UTC).isoformat()
+        # Surface obs-1 three times
+        for _ in range(3):
+            await mark_surfaced(db, ["obs-1"], now)
+
+        items = await get_standing(db, threshold=3)
+        ids = [r["id"] for r in items]
+        assert "obs-1" in ids
+
+    @pytest.mark.asyncio
+    async def test_excludes_below_threshold(self, db):
+        """Items surfaced fewer than threshold times are excluded."""
+        now = datetime.now(UTC).isoformat()
+        await mark_surfaced(db, ["obs-2"], now)  # only 1 time
+
+        items = await get_standing(db, threshold=3)
+        ids = [r["id"] for r in items]
+        assert "obs-2" not in ids
+
+    @pytest.mark.asyncio
+    async def test_excludes_resolved(self, db):
+        """Resolved items are excluded even if surfaced enough times."""
+        now = datetime.now(UTC).isoformat()
+        # obs-6 is already resolved
+        await db.execute(
+            "UPDATE observations SET surfaced_count = 5 WHERE id = 'obs-6'"
+        )
+        await db.commit()
+
+        items = await get_standing(db, threshold=3)
+        ids = [r["id"] for r in items]
+        assert "obs-6" not in ids
+
+    @pytest.mark.asyncio
+    async def test_exclude_types(self, db):
+        """Excluded types are filtered out."""
+        now = datetime.now(UTC).isoformat()
+        # Surface obs-5 (micro_reflection) 5 times
+        for _ in range(5):
+            await mark_surfaced(db, ["obs-5"], now)
+
+        items = await get_standing(db, exclude_types=("micro_reflection",), threshold=3)
+        ids = [r["id"] for r in items]
+        assert "obs-5" not in ids
+
+    @pytest.mark.asyncio
+    async def test_includes_surfaced_count(self, db):
+        """Returned items include surfaced_count field."""
+        now = datetime.now(UTC).isoformat()
+        for _ in range(4):
+            await mark_surfaced(db, ["obs-3"], now)
+
+        items = await get_standing(db, threshold=3)
+        obs3 = [r for r in items if r["id"] == "obs-3"]
+        assert len(obs3) == 1
+        assert obs3[0]["surfaced_count"] == 4
 
 
 class TestUnsurfacedCounts:
