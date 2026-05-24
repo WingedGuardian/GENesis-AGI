@@ -1180,9 +1180,13 @@ async def _click_turnstile_iframe(page) -> bool:
         if container:
             # If we found the hidden input, walk up to its parent container
             if matched_selector == 'input[name="cf-turnstile-response"]':
-                container = await container.evaluate_handle(
+                handle = await container.evaluate_handle(
                     "el => el.closest('.cf-turnstile') || el.parentElement"
                 )
+                container = handle.as_element()
+                if container is None:
+                    logger.warning("cf-turnstile-response parent is not an element")
+                    container = None  # fall through to "no container" warning
 
             box = await container.bounding_box()
             if box:
@@ -1237,7 +1241,7 @@ async def _solve_with_playwright_captcha(page) -> bool:
                     )
                     return True
             except Exception as e:
-                logger.debug(
+                logger.warning(
                     "playwright-captcha %s failed: %s", captcha_type.value, e,
                 )
                 continue
@@ -1248,7 +1252,7 @@ async def _solve_with_playwright_captcha(page) -> bool:
         logger.debug("playwright-captcha not installed — skipping")
         return False
     except Exception as e:
-        logger.debug("playwright-captcha error: %s", e)
+        logger.warning("playwright-captcha error: %s", e)
         return False
 
 
