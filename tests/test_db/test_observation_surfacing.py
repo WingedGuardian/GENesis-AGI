@@ -193,7 +193,6 @@ class TestGetStanding:
     @pytest.mark.asyncio
     async def test_excludes_resolved(self, db):
         """Resolved items are excluded even if surfaced enough times."""
-        now = datetime.now(UTC).isoformat()
         # obs-6 is already resolved
         await db.execute(
             "UPDATE observations SET surfaced_count = 5 WHERE id = 'obs-6'"
