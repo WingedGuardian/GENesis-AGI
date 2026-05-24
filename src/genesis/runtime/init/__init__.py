@@ -22,6 +22,7 @@ from genesis.runtime.init import (
     secrets,
     surplus,
     tasks,
+    user_jobs,
 )
 
 __all__ = [
@@ -44,6 +45,7 @@ __all__ = [
     "mail",
     "health_data",
     "outreach",
+    "user_jobs",
     "autonomy",
     "tasks",
 ]
