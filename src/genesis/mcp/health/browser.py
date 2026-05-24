@@ -32,9 +32,11 @@ logger = logging.getLogger(__name__)
 _ts_log = logging.getLogger("genesis.turnstile_debug")
 _ts_log.setLevel(logging.DEBUG)
 _ts_log.propagate = False
-_ts_fh = logging.FileHandler(Path.home() / "tmp" / "turnstile_debug.log")
-_ts_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-_ts_log.addHandler(_ts_fh)
+_ts_log_dir = Path.home() / "tmp"
+if _ts_log_dir.is_dir():
+    _ts_fh = logging.FileHandler(_ts_log_dir / "turnstile_debug.log")
+    _ts_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _ts_log.addHandler(_ts_fh)
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
