@@ -11,11 +11,12 @@ Respond with a JSON array of steps. Each step has these fields:
 [
   {
     "idx": 0,
-    "type": "research|code|analysis|synthesis|verification|external",
+    "type": "research|code|analysis|synthesis|verification|external|bash|test|git",
     "description": "What this step accomplishes",
     "required_tools": ["list", "of", "tool", "names"],
     "complexity": "low|medium|high",
     "dependencies": [],
+    "command": "shell command (REQUIRED for bash/test/git types)",
     "skills": ["skill-name"],
     "procedures": ["procedure-task-type"],
     "mcp_guidance": ["category"]
@@ -38,12 +39,25 @@ a step needs no special resources.
 
 ## Step Types
 
+### AI Steps (use a CC session with LLM reasoning)
+
 - **research** --- gather information (web search, file reading, API queries)
 - **code** --- write, edit, or refactor code (requires CC session with tool access)
 - **analysis** --- analyze data, compare options, evaluate tradeoffs
 - **synthesis** --- combine results from prior steps into a deliverable
 - **verification** --- validate that prior work meets success criteria
 - **external** --- interact with external services (deploy, configure, submit)
+
+### Deterministic Steps (run a shell command directly, no LLM)
+
+- **bash** --- run a shell command with known expected behavior.  REQUIRES ``command`` field.
+- **test** --- run a test suite or test file.  REQUIRES ``command`` field.
+- **git** --- run a git command (commit, diff, status, branch).  REQUIRES ``command`` field.
+
+Use deterministic types when the exact command is known upfront and needs
+no LLM reasoning.  Use ``code`` when the LLM needs to decide what to
+write or how to approach a problem.  Example: ``pytest tests/test_foo.py``
+is deterministic; "fix the failing test" is a code step.
 
 ## Rules
 

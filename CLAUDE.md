@@ -319,9 +319,11 @@ To send the user a future Telegram reminder, use `mcp__genesis-outreach__outreac
   Prior approval does not carry forward. The only exception is a
   dedicated account the user has explicitly authorized for autonomous
   spending within stated limits.
-- **No silent timeouts.** Never add a timeout (`asyncio.wait_for`,
-  `asyncio.timeout`, stream idle timeout, subprocess timeout, watchdog
-  threshold, etc.) to Genesis without explicit user approval.
+- **Timeout policy.** Burden of proof is on you to justify any timeout.
+  Identify the specific failure mode, justify the specific value, and
+  surface the request to the user. Default floor: 2 hours (7200s) when
+  no stronger justification exists. Full policy in genesis-development
+  skill.
 - **Verify the outcome, not just the tests.** End-to-end verification
   required — "if the system restarts now, will this work?" Details in
   genesis-development skill.

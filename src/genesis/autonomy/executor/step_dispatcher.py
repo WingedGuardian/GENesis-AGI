@@ -119,10 +119,11 @@ class StepDispatcher:
         workaround: str | None = None,
         worktree_path: Path | None = None,
     ) -> StepResult:
-        """Dispatch step to a CC session.
+        """Dispatch step to a CC session or deterministic executor.
 
-        All V3 steps use CC sessions. Multi-model router dispatch
-        for research/analysis steps is deferred to V4.
+        Deterministic step types (bash, test, git) run shell commands
+        directly — no CC session, no LLM, no cost.  All other types
+        use CC sessions via the invoker/autonomous dispatcher.
         """
         from genesis.cc.types import CCInvocation, CCModel, EffortLevel, background_session_dir
 
@@ -132,6 +133,20 @@ class StepDispatcher:
             step_type = StepType(step_type_str)
         except ValueError:
             step_type = StepType.CODE
+
+        # Deterministic steps bypass CC entirely — UNLESS a workaround
+        # is provided (from the recovery pipeline), in which case the
+        # LLM needs to adapt the command, so we fall through to CC.
+        if step_type.is_deterministic and not workaround:
+            from genesis.autonomy.executor.deterministic import (
+                execute_deterministic_step,
+            )
+
+            return await execute_deterministic_step(
+                step,
+                worktree_path=worktree_path,
+                prior_results=prior_results,
+            )
 
         # Load assigned resources (skills, procedures) for this step
         resources: str | None = None

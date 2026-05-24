@@ -50,17 +50,29 @@ changes), dispatch a `genesis-architect` subagent before implementation
 to check dependencies, edge cases, and DRY violations. Small targeted
 changes skip this.
 
-### No Silent Timeouts
+### Timeout Policy
 
-Never add a timeout (`asyncio.wait_for`, `asyncio.timeout`, stream idle
-timeout, subprocess timeout, watchdog threshold, etc.) without explicit
-user approval. Timeouts on reflections, CC calls, cognitive paths, and
-long-thinking work fight Genesis instead of helping it — they cap
-legitimate long thinking and add speculative defense against rare hangs.
-If a timeout is genuinely needed, surface the request to the user first
-with the specific value, the failure mode it addresses, and the evidence
-that the failure is real. Never build one as a "small improvement" or
-"defense in depth."
+The burden of proof is on you to justify why a timeout should exist.
+Do not default to "add a timeout for safety." Instead:
+
+1. **Identify the specific failure mode.** What hangs? Why? Is there
+   evidence this actually happens, or is it speculative?
+2. **Justify the specific value.** Why this number and not another?
+   What legitimate work would be killed at a lower value?
+3. **If you have no strong justification for a specific value, default
+   to 2 hours (7200s).** This is the project floor — generous enough to
+   never interfere with legitimate work while preventing permanent
+   resource lockout from truly hung processes.
+4. **Surface the request to the user** with the value, the failure mode,
+   and the evidence. Never add a timeout as a "small improvement" or
+   "defense in depth."
+
+Timeouts on reflections, CC calls, cognitive paths, and long-thinking
+work fight Genesis instead of helping it — they cap legitimate long
+thinking and add speculative defense against rare hangs. The exception
+is raw subprocess calls with no external watchdog (e.g., deterministic
+executor steps), where a hung process blocks shared resources (executor
+semaphore) with no other recovery mechanism.
 
 ### Verify Outcomes, Not Just Tests
 

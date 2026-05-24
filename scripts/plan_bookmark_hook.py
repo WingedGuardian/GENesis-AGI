@@ -42,58 +42,53 @@ _ARCH_REVIEW = (
     "catching real issues, not ceremony."
 )
 
-_WORKTREE_REMINDER = (
-    "MANDATORY: Before writing any code, create a git worktree for isolation. "
-    "Run: git worktree add .claude/worktrees/<scope>-<desc> -b <scope>/<desc> "
-    "then work inside the worktree directory. Commit on the branch, merge to "
-    "main when done. NEVER commit directly to main. This is enforced by "
-    "project convention — skipping it risks cross-session contamination."
-)
-
-_CONFIDENCE_REMINDER = (
-    "MANDATORY: Before starting implementation, state explicit confidence "
-    "percentages for each part of the plan with rationale. Anything below 90% "
-    "needs investigation to raise it first. Separate root-cause confidence from "
-    "fix confidence when they differ. State what information would move each "
-    "item to 100%."
-)
-
-_DUE_DILIGENCE_REMINDER = (
-    "MANDATORY: Before starting implementation, verify your plan against actual "
-    "code. For each file you plan to modify: READ IT FIRST. Confirm the "
-    "functions/classes you plan to change actually exist and work the way you "
-    "think. Check for recent changes (git log) that might conflict. If your "
-    "plan references a table, query its schema. If it references a config, "
-    "read the file. 'I assume' is not due diligence — 'I verified' is."
+_EXECUTION_PROTOCOL = (
+    "EXECUTION PROTOCOL — You MUST follow these steps IN ORDER before "
+    "writing any code:\n"
+    "1. CREATE WORKTREE — git worktree add .claude/worktrees/<scope>-<desc> "
+    "-b <scope>/<desc>. Work inside the worktree. NEVER commit to main.\n"
+    "2. STATE CONFIDENCE — Explicit percentages for each part of the plan. "
+    "Anything below 90% needs investigation first.\n"
+    "3. DUE DILIGENCE — Read every file you plan to modify. Verify functions "
+    "and classes exist as expected. Check git log for recent conflicts.\n"
+    "4. CONFIRM PLAN VALIDITY — Verify plan is still valid against current "
+    "code. If anything changed since planning, update the plan first.\n"
+    "5. INVOKE EXECUTION SKILL — Use superpowers:executing-plans or "
+    "superpowers:subagent-driven-development to execute.\n\n"
+    "DETERMINISTIC CHECKPOINTS — After completing each task:\n"
+    "- Run: ruff check <modified_files>\n"
+    "- Run: pytest <relevant_test_file> -v\n"
+    "- Commit: git commit with conventional prefix — uncommitted work is "
+    "invisible work.\n"
+    "- Review: if the task changed more than 3 files, dispatch a "
+    "code-reviewer agent.\n"
+    "Do NOT skip these checkpoints. They are the minimum bar for quality."
 )
 
 _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
 
-def _is_in_worktree() -> bool:
-    """Check if the current working directory is inside a git worktree."""
-    import subprocess
+def _classify_plan_complexity(plan_path: str) -> str:
+    """Classify plan as small/medium/large based on task and step count."""
+    if not plan_path:
+        return "unknown"
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--is-inside-work-tree"],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode != 0:
-            return False
-        # Check if it's a worktree (not the main working tree)
-        result2 = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            capture_output=True, text=True, timeout=2,
-        )
-        result3 = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True, text=True, timeout=2,
-        )
-        # In a worktree, --git-dir != --git-common-dir
-        return result2.stdout.strip() != result3.stdout.strip()
-    except Exception:
-        return False
+        content = Path(plan_path).read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+
+    # Count tasks (### Task headers) and steps (- [ ] checkboxes)
+    task_count = content.count("### Task")
+    step_count = content.count("- [ ]")
+
+    if task_count <= 2 and step_count <= 6:
+        return "small"
+    elif task_count <= 5 and step_count <= 15:
+        return "medium"
+    else:
+        return "large"
+
 
 
 def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
@@ -198,10 +193,30 @@ def main() -> int:
     except OSError as exc:
         print(f"plan_bookmark_hook: failed to write pending file: {exc}", file=sys.stderr)
 
-    # Build implementation checklist
-    reminders = [_ARCH_REVIEW, _CONFIDENCE_REMINDER, _DUE_DILIGENCE_REMINDER]
-    if not _is_in_worktree():
-        reminders.append(_WORKTREE_REMINDER)
+    # Classify plan complexity for review depth guidance
+    complexity = _classify_plan_complexity(plan_path)
+    complexity_note = ""
+    if complexity == "small":
+        complexity_note = (
+            "PLAN COMPLEXITY: small (1-2 tasks). A single code-architect "
+            "agent review is sufficient before implementation."
+        )
+    elif complexity == "medium":
+        complexity_note = (
+            "PLAN COMPLEXITY: medium (3-5 tasks). Run a focused architecture "
+            "review (CEO premise challenge + eng review) before implementation."
+        )
+    elif complexity == "large":
+        complexity_note = (
+            "PLAN COMPLEXITY: large (5+ tasks). Run the full /autoplan pipeline "
+            "(CEO -> design -> eng review) before implementation."
+        )
+
+    # Build structured execution protocol
+    reminders = [_EXECUTION_PROTOCOL]
+    if complexity_note:
+        reminders.append(complexity_note)
+    reminders.append(_ARCH_REVIEW)
 
     # Output all reminders
     output = {
