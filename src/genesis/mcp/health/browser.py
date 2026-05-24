@@ -1102,12 +1102,79 @@ async def _poll_turnstile_token(page, timeout_s: float, interval_s: float) -> bo
     return False
 
 
-async def _solve_with_playwright_captcha(page) -> bool:
-    """Solve Cloudflare challenge using playwright-captcha Shadow DOM traversal.
+async def _click_turnstile_iframe(page) -> bool:
+    """Click the Turnstile checkbox via iframe bounding-box technique.
 
-    Primary solver — navigates the closed Shadow DOM to find and click the
-    actual Turnstile checkbox element.  No coordinates, no VNC, no guessing.
-    Falls back to False if the library is not installed or fails.
+    Primary solver — finds the Cloudflare challenge iframe by URL, gets its
+    bounding box via Playwright's frame API, and clicks at the checkbox
+    position (width/9, height/2).  This is the consensus approach across all
+    Camoufox-compatible Turnstile solvers on GitHub.
+
+    Camoufox's Juggler protocol sends clicks through Firefox's native input
+    handlers — Cloudflare cannot detect these as synthetic (unlike CDP clicks
+    which expose screenX/screenY discrepancies in cross-origin iframes).
+
+    No VNC, no coordinates, no xdotool, no port numbers needed.
+    """
+    try:
+        for frame in page.frames:
+            if frame.url.startswith("https://challenges.cloudflare.com"):
+                el = await frame.frame_locator(":root").locator("body").element_handle()
+                if el is None:
+                    # Try getting bounding box directly from the frame element
+                    iframe_el = await page.query_selector(
+                        'iframe[src*="challenges.cloudflare.com"]'
+                    )
+                    if iframe_el is None:
+                        continue
+                    box = await iframe_el.bounding_box()
+                else:
+                    box = await el.bounding_box()
+
+                if box is None:
+                    continue
+
+                # Click at checkbox position: width/9 from left, vertically centered
+                click_x = box["x"] + box["width"] / 9
+                click_y = box["y"] + box["height"] / 2
+                logger.info(
+                    "Turnstile iframe click: (%.0f, %.0f) in %dx%d box at (%.0f, %.0f)",
+                    click_x, click_y, box["width"], box["height"], box["x"], box["y"],
+                )
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await page.mouse.click(click_x, click_y)
+                return True
+
+        # No iframe found — try managed challenge (no iframe, inline widget)
+        # Fall back to clicking the container element directly
+        container = await page.query_selector(
+            '[style*="display: grid"], .cf-turnstile, #turnstile-wrapper'
+        )
+        if container:
+            box = await container.bounding_box()
+            if box:
+                # Checkbox is near the left edge of the container
+                click_x = box["x"] + 20
+                click_y = box["y"] + box["height"] / 2
+                logger.info(
+                    "Managed challenge click: (%.0f, %.0f)", click_x, click_y,
+                )
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+                await page.mouse.click(click_x, click_y)
+                return True
+
+        logger.debug("No Turnstile iframe or container found for click")
+        return False
+    except Exception as e:
+        logger.debug("Turnstile iframe click failed: %s", e)
+        return False
+
+
+async def _solve_with_playwright_captcha(page) -> bool:
+    """Solve Cloudflare challenge using playwright-captcha library (fallback).
+
+    Uses Shadow DOM traversal with forceScopeAccess.  Falls back to False
+    if the library is not installed or fails.
     """
     try:
         from playwright_captcha import CaptchaType, ClickSolver
@@ -1115,7 +1182,6 @@ async def _solve_with_playwright_captcha(page) -> bool:
         solver = ClickSolver()
         await solver.prepare()
 
-        # Try interstitial first (full-page challenge), then turnstile (embedded)
         for captcha_type in [CaptchaType.CLOUDFLARE_INTERSTITIAL, CaptchaType.CLOUDFLARE_TURNSTILE]:
             try:
                 result = await solver.solve_captcha(page, captcha_type=captcha_type)
@@ -1309,19 +1375,34 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 1.5: playwright-captcha (Shadow DOM click — primary solver)
+        # Phase 1.5: Iframe bounding-box click (primary — no VNC needed)
+        # Consensus approach: find challenge iframe, click at width/9, height/2.
+        # Camoufox Juggler sends trusted native input — not detectable as synthetic.
+        logger.info("Trying iframe bounding-box click")
+        for click_attempt in range(1, 4):
+            if await _click_turnstile_iframe(page):
+                if await _poll_turnstile_token(page, 10, 1.0):
+                    logger.info("Challenge resolved via iframe click (attempt %d)", click_attempt)
+                    return {"status": "resolved", "method": "iframe_click"}
+                if not await _detect_challenge(page):
+                    return {"status": "resolved", "method": "iframe_click"}
+                logger.info("Iframe click %d sent but not yet resolved", click_attempt)
+                await asyncio.sleep(random.uniform(2, 4))
+            else:
+                break  # No iframe found — skip remaining attempts
+
+        # Phase 1.75: playwright-captcha (Shadow DOM traversal — secondary)
         logger.info("Trying playwright-captcha Shadow DOM solver")
         if await _solve_with_playwright_captcha(page):
             if await _poll_turnstile_token(page, 10, 1.0):
                 logger.info("Challenge resolved via playwright-captcha")
                 return {"status": "resolved", "method": "playwright_captcha"}
-            # Page may have navigated — check if challenge is gone
             if not await _detect_challenge(page):
                 return {"status": "resolved", "method": "playwright_captcha"}
 
-        # Phase 2: VNC click — fallback with self-repair
+        # Phase 2: VNC click — last resort fallback
         logger.warning(
-            "playwright-captcha failed — falling back to VNC click",
+            "Iframe + playwright-captcha failed — falling back to VNC click",
         )
         vnc_failed_count = 0
         for attempt in range(1, 4):  # up to 3 attempts
