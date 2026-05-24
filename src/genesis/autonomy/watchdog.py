@@ -157,6 +157,26 @@ class WatchdogChecker:
             # Check for zombie schedulers: process alive but scheduler dead.
             zombie = self._check_scheduler_heartbeats(status)
             if zombie:
+                # Don't restart during heavy workload — staleness is expected
+                # (dream cycle runs 15-35 min, during which surplus doesn't dispatch).
+                heavy = status.get("heavy_workload")
+                if heavy:
+                    logger.info(
+                        "Zombie detected (%s) but heavy workload active (%s) — skipping",
+                        ", ".join(zombie), heavy,
+                    )
+                    return WatchdogAction.SKIP
+
+                # Don't restart if server just started — timestamps are stale
+                # from the previous process and will be refreshed shortly.
+                uptime = status.get("uptime_s")
+                if uptime is not None and uptime < self._stabilization_s:
+                    logger.info(
+                        "Zombie detected but server just started (%.0fs < %ds) — skipping",
+                        uptime, self._stabilization_s,
+                    )
+                    return WatchdogAction.SKIP
+
                 logger.warning(
                     "Zombie scheduler detected: %s — triggering restart",
                     ", ".join(zombie),
