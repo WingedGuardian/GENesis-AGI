@@ -43,28 +43,20 @@ async def ego_status():
     with contextlib.suppress(Exception):
         dispatch_cost = await ego_crud.daily_dispatch_cost(rt._db)
 
+    # Rolling 7-day average (observational only — no gating)
+    rolling_avg = 0.0
+    with contextlib.suppress(Exception):
+        rolling_avg = await ego_crud.rolling_daily_ego_cost(rt._db, days=7)
+
     return jsonify({
         "enabled": config.enabled,
         "model": config.model,
         "default_effort": config.default_effort,
         "morning_report_effort": config.morning_report_effort,
         "cadence_minutes": config.cadence_minutes,
-        "ego_thinking_budget_usd": config.ego_thinking_budget_usd,
-        "ego_dispatch_budget_usd": config.ego_dispatch_budget_usd,
         "daily_cost_usd": round(daily_cost, 4),
         "daily_dispatch_cost_usd": round(dispatch_cost, 4),
-        "thinking_budget_remaining_usd": round(
-            max(0, config.ego_thinking_budget_usd - daily_cost), 4,
-        ),
-        "dispatch_budget_remaining_usd": round(
-            max(0, config.ego_dispatch_budget_usd - dispatch_cost), 4,
-        ),
-        # Backwards compat: total budget view
-        "daily_budget_cap_usd": config.ego_thinking_budget_usd + config.ego_dispatch_budget_usd,
-        "budget_remaining_usd": round(
-            max(0, (config.ego_thinking_budget_usd - daily_cost)
-                + (config.ego_dispatch_budget_usd - dispatch_cost)), 4,
-        ),
+        "rolling_daily_avg_usd": round(rolling_avg, 4),
         "focus_summary": focus,
         "last_cycle": last_cycle,
         "pending_proposals": len(pending),

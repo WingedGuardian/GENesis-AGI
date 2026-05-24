@@ -1455,8 +1455,6 @@
           activity_threshold_minutes: 'Activity Threshold (min)',
           max_interval_minutes: 'Max Interval (min)', backoff_multiplier: 'Backoff Multiplier',
           board_size: 'Board Size', batch_digest: 'Batch Digest',
-          ego_thinking_budget_usd: 'Thinking Budget ($)',
-          ego_dispatch_budget_usd: 'Dispatch Budget ($)',
           morning_report_hour: 'Morning Report Hour', morning_report_minute: 'Morning Report Minute',
           shadow_morning_report: 'Shadow Morning Report',
           consecutive_failure_limit: 'Failure Limit', failure_backoff_minutes: 'Failure Backoff (min)',
@@ -1524,8 +1522,6 @@
           backoff_multiplier: 'How much to increase interval on idle cycles',
           board_size: 'Max active proposals on the bulletin board (ego tables excess)',
           batch_digest: 'Bundle ego proposals into periodic digests instead of individual messages',
-          ego_thinking_budget_usd: 'Daily cap for ego cycle (thinking) costs',
-          ego_dispatch_budget_usd: 'Daily cap for dispatched background sessions',
           morning_report_hour: 'Hour (0\u201323) to send the daily morning report',
           morning_report_minute: 'Minute (0\u201359) for morning report delivery',
           shadow_morning_report: 'Send reports to a test topic for validation before going live',
@@ -2490,14 +2486,6 @@
             if (cadence.is_paused) {
               return { state: "degraded", reason: "ego paused" };
             }
-          }
-          // Budget exhausted
-          if (ego.daily_budget_cap_usd > 0 && ego.budget_remaining_usd <= 0) {
-            return { state: "error", reason: "daily budget exhausted" };
-          }
-          // Budget >80%
-          if (ego.daily_budget_cap_usd > 0 && ego.daily_cost_usd / ego.daily_budget_cap_usd > 0.8) {
-            return { state: "degraded", reason: `budget ${Math.round(ego.daily_cost_usd / ego.daily_budget_cap_usd * 100)}% used` };
           }
           // Proposals piling up
           if (ego.pending_proposals > 5) {
@@ -4157,13 +4145,10 @@
                         :style="`background: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"></span>
                   <span style="font-size: 0.82rem"
                         x-text="$store.genesisDashboard.egoStatus?.focus_summary || 'no focus'"></span>
-                  <!-- Budget gauge -->
-                  <div style="margin-top: 0.3rem; display: flex; align-items: center; gap: 0.4rem;">
-                    <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden;">
-                      <div :style="`width: ${Math.min(100, ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) * 100)}%; height: 100%; border-radius: 2px; background: ${($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) > 0.8 ? '#d9534f' : ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) > 0.5 ? '#f0ad4e' : '#4caf50'}`"></div>
-                    </div>
+                  <!-- Daily cost (observational) -->
+                  <div style="margin-top: 0.3rem;">
                     <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
-                          x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' / $' + ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 0).toFixed(2)"></span>
+                          x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' today (avg: $' + ($store.genesisDashboard.egoStatus?.rolling_daily_avg_usd || 0).toFixed(2) + '/day)'"></span>
                   </div>
                   <div class="health-card-detail" style="font-size: 0.72rem;"
                        x-text="($store.genesisDashboard.egoStatus?.pending_proposals || 0) + ' pending proposals'"></div>
@@ -6563,17 +6548,14 @@
                     <span style="font-size: 0.82rem; color: var(--color-text-secondary);">Cadence manager not available</span>
                   </template>
                 </div>
-                <!-- Budget -->
+                <!-- Daily Cost (observational) -->
                 <div style="background: rgba(255,255,255,0.03); border: 1px solid var(--color-border); border-radius: 6px; padding: 0.8rem;">
-                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.3rem;">Daily Budget</div>
+                  <div style="font-size: 0.72rem; color: var(--color-text-secondary); font-weight: 600; margin-bottom: 0.3rem;">Daily Cost</div>
                   <div style="display: flex; align-items: center; gap: 0.5rem;">
                     <span style="font-size: 1.1rem; font-weight: 600;"
                           x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2)"></span>
                     <span style="font-size: 0.78rem; color: var(--color-text-secondary);"
-                          x-text="'/ $' + ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 0).toFixed(2)"></span>
-                  </div>
-                  <div style="margin-top: 0.4rem; height: 6px; background: rgba(255,255,255,0.1); border-radius: 3px; overflow: hidden;">
-                    <div :style="`width: ${Math.min(100, ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) * 100)}%; height: 100%; border-radius: 3px; transition: width 0.3s; background: ${($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) > 0.8 ? '#d9534f' : ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0) / ($store.genesisDashboard.egoStatus?.daily_budget_cap_usd || 1) > 0.5 ? '#f0ad4e' : '#4caf50'}`"></div>
+                          x-text="'avg $' + ($store.genesisDashboard.egoStatus?.rolling_daily_avg_usd || 0).toFixed(2) + '/day'"></span>
                   </div>
                 </div>
                 <!-- Quick stats -->
@@ -6604,7 +6586,7 @@
                   </select>
                 </div>
               </div>
-              <!-- Model / Cadence / Budget controls -->
+              <!-- Model / Cadence controls -->
               <div style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px; display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem;">
                 <!-- Model -->
                 <div>
@@ -6619,7 +6601,7 @@
                 </div>
                 <!-- Cadence -->
                 <div>
-                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Cadence (min)</div>
+                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Base Cadence</div>
                   <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                           @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cadence_minutes: parseInt($event.target.value)}) })">
                     <template x-for="c in [30, 60, 120, 240]" :key="c">
@@ -6628,31 +6610,9 @@
                     </template>
                   </select>
                 </div>
-                <!-- Thinking Budget -->
-                <div>
-                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Think Budget</div>
-                  <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
-                          @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ego_thinking_budget_usd: parseFloat($event.target.value)}) })">
-                    <template x-for="b in [2, 5, 10, 15, 20]" :key="b">
-                      <option :value="b" x-text="'$' + b + '/day'"
-                              :selected="b === ($store.genesisDashboard.egoStatus?.ego_thinking_budget_usd || 10)"></option>
-                    </template>
-                  </select>
-                </div>
-                <!-- Dispatch Budget -->
-                <div>
-                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Dispatch Budget</div>
-                  <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
-                          @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ego_dispatch_budget_usd: parseFloat($event.target.value)}) })">
-                    <template x-for="b in [1, 2.5, 5, 10]" :key="b">
-                      <option :value="b" x-text="'$' + b + '/day'"
-                              :selected="b === ($store.genesisDashboard.egoStatus?.ego_dispatch_budget_usd || 2.5)"></option>
-                    </template>
-                  </select>
-                </div>
               </div>
               <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-top: 0.3rem; padding: 0 0.8rem;">
-                Changes saved to local overlay. Restart server to apply.
+                Adaptive cadence: runs at base interval when active, backs off up to 4h when idle. Currently every <span x-text="$store.genesisDashboard.egoCadence?.current_interval_minutes || '?'"></span>min. Changes saved to local overlay. Restart server to apply.
               </div>
               <!-- Last cycle -->
               <template x-if="$store.genesisDashboard.egoStatus?.last_cycle">

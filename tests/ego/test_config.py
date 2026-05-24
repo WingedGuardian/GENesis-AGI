@@ -25,19 +25,14 @@ class TestLoadEgoConfig:
         assert config.enabled is True
         assert config.cadence_minutes == 60
         assert config.model == "opus"
-        assert config.ego_thinking_budget_usd == 10.0
-        assert config.ego_dispatch_budget_usd == 2.50
-
     def test_loads_from_yaml(self, tmp_config):
         tmp_config.write_text(yaml.dump({
             "cadence_minutes": 30,
             "model": "sonnet",
-            "ego_thinking_budget_usd": 5.0,
         }))
         config = load_ego_config(tmp_config)
         assert config.cadence_minutes == 30
         assert config.model == "sonnet"
-        assert config.ego_thinking_budget_usd == 5.0
         # Unspecified fields keep defaults
         assert config.enabled is True
         assert config.activity_threshold_minutes == 30
@@ -63,14 +58,12 @@ class TestSaveEgoConfig:
         original = EgoConfig(
             cadence_minutes=45,
             model="sonnet",
-            ego_thinking_budget_usd=5.0,
         )
         save_ego_config(original, tmp_config)
 
         loaded = load_ego_config(tmp_config)
         assert loaded.cadence_minutes == 45
         assert loaded.model == "sonnet"
-        assert loaded.ego_thinking_budget_usd == 5.0
 
     def test_creates_file(self, tmp_config):
         assert not tmp_config.exists()
@@ -88,7 +81,6 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({
             "cadence_minutes": 30,
             "model": "sonnet",
-            "ego_thinking_budget_usd": 5.0,
         })
         assert errors == []
 
@@ -101,10 +93,6 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({"model": "gpt-4"})
         assert len(errors) == 1
         assert "model" in errors[0]
-
-    def test_invalid_budget(self):
-        errors = validate_ego_config({"ego_thinking_budget_usd": -1})
-        assert len(errors) == 1
 
     def test_invalid_morning_hour(self):
         errors = validate_ego_config({"morning_report_hour": 25})
@@ -128,9 +116,8 @@ class TestValidateEgoConfig:
         errors = validate_ego_config({
             "cadence_minutes": -1,
             "model": "invalid",
-            "ego_thinking_budget_usd": -5,
         })
-        assert len(errors) == 3
+        assert len(errors) == 2
 
     def test_empty_changes_valid(self):
         assert validate_ego_config({}) == []

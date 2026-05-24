@@ -18,7 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from genesis.ego.session import BudgetExceededError, CycleBlockedError
+from genesis.ego.session import CycleBlockedError
 from genesis.ego.types import EgoConfig
 from genesis.env import user_timezone
 
@@ -279,7 +279,7 @@ class EgoCadenceManager:
                         cycle = await self._session.run_cycle(
                             cycle_type=CycleType.REACTIVE,
                         )
-                    except (BudgetExceededError, CycleBlockedError) as exc:
+                    except CycleBlockedError as exc:
                         logger.info("Reactive cycle gated: %s", exc)
                         continue
                     except Exception:
@@ -389,11 +389,6 @@ class EgoCadenceManager:
                 cycle = await self._session.run_cycle(
                     model_override=model_override,
                 )
-            except BudgetExceededError:
-                # Budget exhaustion is intentional, not a failure.
-                # Don't trip the circuit breaker.
-                logger.info("Ego cycle skipped — budget exceeded")
-                return
             except CycleBlockedError as exc:
                 # Approval gate is a gate, not a failure.
                 # Don't trip the circuit breaker.
@@ -434,9 +429,6 @@ class EgoCadenceManager:
 
             try:
                 cycle = await self._session.run_cycle(is_morning_report=True)
-            except BudgetExceededError:
-                logger.info("Ego morning report skipped — budget exceeded")
-                return
             except CycleBlockedError as exc:
                 logger.info("Ego morning report gated: %s", exc)
                 return

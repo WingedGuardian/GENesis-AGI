@@ -59,10 +59,6 @@ _DEFAULT_CALL_SITE = "7_ego_cycle"
 _DEFAULT_FOCUS_SUMMARY_KEY = "ego_focus_summary"
 
 
-class BudgetExceededError(Exception):
-    """Raised when the ego's daily budget cap is exceeded."""
-
-
 class CycleBlockedError(Exception):
     """Raised when the ego cycle is blocked by an approval gate.
 
@@ -168,7 +164,6 @@ class EgoSession:
         Returns the stored EgoCycle, or None if the cycle failed (CC error).
 
         Raises:
-            BudgetExceededError: Daily budget cap exceeded (not a failure).
             CycleBlockedError: Approval gate blocked the cycle (not a failure).
         """
         # Resolve cycle type
@@ -186,13 +181,7 @@ class EgoSession:
         if model_override:
             model = CCModel(model_override)
 
-        # 1. Budget check — raises BudgetExceededError (not a failure)
-        if not await self._check_budget():
-            raise BudgetExceededError(
-                f"Daily ego thinking spend exceeds cap ${self._config.ego_thinking_budget_usd}"
-            )
-
-        # 2. Assemble operational context (previous focus + fresh context)
+        # 1. Assemble operational context (previous focus + fresh context)
         dynamic_context = await self._compaction.assemble_context(
             context_builder=self._context_builder,
         )
@@ -315,13 +304,6 @@ class EgoSession:
             return None
 
         # 2. THINK — budget, context, prompt, invoke
-
-        # Budget check
-        if not await self._check_budget():
-            raise BudgetExceededError(
-                f"Daily ego thinking spend exceeds cap "
-                f"${self._config.ego_thinking_budget_usd}"
-            )
 
         # Context assembly — uses assemble_context() as-is.
         # Context weights are DEFINED in focus.py lookup table but NOT
@@ -1102,11 +1084,6 @@ class EgoSession:
             logger.warning("No DirectSessionRunner — cannot dispatch execution briefs")
             return
 
-        # Check dispatch budget before spawning any sessions
-        if not await self._check_dispatch_budget():
-            logger.warning("Dispatch budget exceeded — skipping execution briefs")
-            return
-
         from genesis.cc.direct_session import VALID_PROFILES, DirectSessionRequest
         from genesis.cc.types import CCModel, EffortLevel
 
@@ -1365,10 +1342,6 @@ class EgoSession:
         if self._direct_session_runner is None:
             return []
 
-        if not await self._check_dispatch_budget():
-            logger.info("Sweep skipped — dispatch budget exceeded")
-            return []
-
         from genesis.cc.direct_session import DirectSessionRequest
 
         approved = await ego_crud.list_proposals(
@@ -1527,36 +1500,6 @@ class EgoSession:
             await tm.send_to_category("ego_proposals", msg)
         except Exception:
             logger.debug("Failed to send execution notification", exc_info=True)
-
-    async def _check_budget(self) -> bool:
-        """True if daily ego thinking spend is under the budget cap."""
-        try:
-            daily = await ego_crud.daily_ego_cost(self._db)
-            if daily >= self._config.ego_thinking_budget_usd:
-                logger.warning(
-                    "Ego thinking spend $%.2f exceeds cap $%.2f",
-                    daily,
-                    self._config.ego_thinking_budget_usd,
-                )
-                return False
-        except Exception:
-            logger.warning("Budget check failed — allowing cycle", exc_info=True)
-        return True
-
-    async def _check_dispatch_budget(self) -> bool:
-        """True if daily ego dispatch spend is under the budget cap."""
-        try:
-            daily = await ego_crud.daily_dispatch_cost(self._db)
-            if daily >= self._config.ego_dispatch_budget_usd:
-                logger.warning(
-                    "Ego dispatch spend $%.2f exceeds cap $%.2f",
-                    daily,
-                    self._config.ego_dispatch_budget_usd,
-                )
-                return False
-        except Exception:
-            logger.warning("Dispatch budget check failed — allowing", exc_info=True)
-        return True
 
 
 # -- Realist prompt & parser -----------------------------------------------
