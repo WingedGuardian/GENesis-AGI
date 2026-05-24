@@ -589,7 +589,7 @@ class TestAsyncYielding:
                 [],  # _cluster_bucket result (no clusters)
             ]
 
-            report = await run(
+            await run(
                 qdrant=mock_qdrant,
                 db=mock_db,
                 router=mock_router,

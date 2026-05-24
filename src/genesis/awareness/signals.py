@@ -489,6 +489,43 @@ class SchedulerLivenessCollector:
         )
 
 
+class EventLoopLatencyCollector:
+    """Measures event loop responsiveness.
+
+    Schedules a yield via asyncio.sleep(0) and measures round-trip time.
+    If the event loop is starved (e.g. sync Qdrant calls blocking it),
+    the latency will spike. Signal value is latency/threshold, clamped
+    to 1.0. Added after the 2026-05-24 incident where event loop
+    starvation went undetected until external probes failed.
+    """
+
+    signal_name = "event_loop_latency"
+
+    def __init__(self, *, threshold_ms: float = 500) -> None:
+        self._threshold_ms = threshold_ms
+
+    async def collect(self) -> SignalReading:
+        import time
+
+        start = time.monotonic()
+        await asyncio.sleep(0)
+        latency_ms = (time.monotonic() - start) * 1000
+
+        value = min(1.0, latency_ms / self._threshold_ms) if latency_ms > self._threshold_ms else 0.0
+
+        return SignalReading(
+            name=self.signal_name,
+            value=round(value, 3),
+            source="event_loop",
+            collected_at=datetime.now(UTC).isoformat(),
+            baseline_note=(
+                f"0.0=responsive (<{self._threshold_ms}ms). "
+                "Rises with event loop starvation"
+            ),
+            metadata={"latency_ms": round(latency_ms, 2)} if latency_ms > 10 else None,
+        )
+
+
 async def collect_all(collectors: list) -> list[SignalReading]:
     """Run all collectors concurrently. Failures return 0.0, never propagate."""
 
