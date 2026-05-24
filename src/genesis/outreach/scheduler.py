@@ -171,6 +171,13 @@ class OutreachScheduler:
             result = await self._pipeline.submit(req)
             logger.info("Morning report: %s", result.status.value)
 
+            # Confirm observation surfacing after successful delivery.
+            if result.status.value == "delivered":
+                try:
+                    await self._morning.confirm_delivery()
+                except Exception:
+                    logger.warning("Failed to confirm morning report delivery", exc_info=True)
+
             # Auto-acknowledge digest so it doesn't appear as "urgent unread"
             if result.outreach_id and result.status.value == "delivered":
                 try:

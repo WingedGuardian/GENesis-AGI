@@ -1141,6 +1141,20 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN dream_cycle_run_id TEXT",
         "memory_metadata.dream_cycle_run_id")
 
+    # Observation de-escalation: track how many times an observation has
+    # been surfaced (morning report, dashboard, critical alerting).
+    await _try_alter(db,
+        "ALTER TABLE observations ADD COLUMN surfaced_count INTEGER NOT NULL DEFAULT 0",
+        "observations.surfaced_count")
+
+    # Dream cycle fix (PR #385): reset consecutive_failures since the
+    # underlying code bug (rt.qdrant → store.qdrant_client) is fixed.
+    await db.execute(
+        "UPDATE job_health SET consecutive_failures = 0, "
+        "last_error = 'reset: code fix merged (PR #385)' "
+        "WHERE job_name = 'dream_cycle' AND consecutive_failures > 0"
+    )
+
     # World model tables: user goals and contacts for ego world model.
     await _migrate_world_model_tables(db)
 

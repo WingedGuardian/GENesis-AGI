@@ -54,7 +54,9 @@ TABLES = {
             resolution_notes TEXT,
             created_at       TEXT NOT NULL,
             expires_at       TEXT,
-            content_hash     TEXT
+            content_hash     TEXT,
+            surfaced_at      TEXT,
+            surfaced_count   INTEGER NOT NULL DEFAULT 0
         )
     """,
     "execution_traces": """

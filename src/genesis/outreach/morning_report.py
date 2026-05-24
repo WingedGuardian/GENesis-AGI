@@ -22,6 +22,25 @@ _INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
 
 
+def _relative_age(iso_ts: str) -> str:
+    """Convert an ISO timestamp to a human-readable relative age string."""
+    if not iso_ts:
+        return "unknown age"
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+        delta = datetime.now(UTC) - ts
+        total_s = delta.total_seconds()
+        if total_s < 0:
+            return "just now"
+        if total_s < 3600:
+            return f"{int(total_s / 60)}m ago"
+        if total_s < 86400:
+            return f"{total_s / 3600:.0f}h ago"
+        return f"{total_s / 86400:.0f}d ago"
+    except (ValueError, TypeError):
+        return "unknown age"
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -37,6 +56,7 @@ class MorningReportGenerator:
         self._db = db
         self._drafter = drafter
         self._event_bus = event_bus
+        self._pending_surface_ids: list[str] = []
 
     async def generate(self) -> OutreachRequest:
         context = await self._assemble_context()
@@ -65,6 +85,28 @@ class MorningReportGenerator:
             salience_score=0.0,
             signal_type="morning_report",
         )
+
+    async def confirm_delivery(self) -> None:
+        """Mark observations as surfaced after successful delivery.
+
+        Called by the scheduler after the pipeline confirms delivery.
+        Observations collected during generate() are only marked surfaced
+        here — if delivery fails, they re-appear in the next report.
+        """
+        ids = self._pending_surface_ids
+        if not ids:
+            return
+        from genesis.db.crud.observations import (
+            increment_retrieved_batch,
+            mark_influenced_batch,
+            mark_surfaced,
+        )
+
+        now = datetime.now(UTC).isoformat()
+        await mark_surfaced(self._db, ids, now)
+        await increment_retrieved_batch(self._db, ids)
+        await mark_influenced_batch(self._db, ids)
+        self._pending_surface_ids = []
 
     @staticmethod
     def _load_system_prompt() -> str | None:
@@ -452,17 +494,11 @@ class MorningReportGenerator:
     async def _get_observation_insights(self) -> str | None:
         """Surface unsurfaced observations that deserve user attention.
 
-        Returns None if no unsurfaced observations exist. Marks delivered
-        observations as surfaced to prevent re-delivery.
+        Returns None if no unsurfaced observations exist. Observation IDs
+        are collected in _pending_surface_ids and confirmed via
+        confirm_delivery() after successful pipeline delivery.
         """
-        from datetime import UTC, datetime
-
-        from genesis.db.crud.observations import (
-            get_unsurfaced,
-            increment_retrieved_batch,
-            mark_influenced_batch,
-            mark_surfaced,
-        )
+        from genesis.db.crud.observations import get_unsurfaced
 
         observations = await get_unsurfaced(
             self._db,
@@ -478,15 +514,11 @@ class MorningReportGenerator:
             prio = obs["priority"]
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
-            lines.append(f"- {badge} **{prio}**: {content}")
+            age = _relative_age(obs.get("created_at", ""))
+            lines.append(f"- {badge} **{prio}** ({age}): {content}")
 
-        # Mark surfaced during assembly (before delivery confirmation).
-        # Trade-off: if delivery fails, these observations won't re-surface.
-        # Acceptable for v1 — the dashboard can always show them.
-        ids = [obs["id"] for obs in observations]
-        now = datetime.now(UTC).isoformat()
-        await mark_surfaced(self._db, ids, now)
-        await increment_retrieved_batch(self._db, ids)
-        await mark_influenced_batch(self._db, ids)
+        # Defer surfacing until delivery is confirmed via confirm_delivery().
+        # If delivery fails, these observations re-appear in the next report.
+        self._pending_surface_ids = [obs["id"] for obs in observations]
 
         return "\n".join(lines)
