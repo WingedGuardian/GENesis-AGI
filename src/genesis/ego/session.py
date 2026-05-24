@@ -292,7 +292,6 @@ class EgoSession:
         actionable or the CC invocation failed.
 
         Raises:
-            BudgetExceededError: Daily budget cap exceeded.
             CycleBlockedError: Approval gate blocked the cycle.
         """
         if not signals:
@@ -303,7 +302,7 @@ class EgoSession:
         if focus is None:
             return None
 
-        # 2. THINK — budget, context, prompt, invoke
+        # 2. THINK — context, prompt, invoke
 
         # Context assembly — uses assemble_context() as-is.
         # Context weights are DEFINED in focus.py lookup table but NOT
