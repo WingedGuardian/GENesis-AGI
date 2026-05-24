@@ -19,7 +19,7 @@
   <script type="module" src="/js/initFw.js"></script>
 
   <script type="module">
-    import { fetchApi } from "/js/api.js";
+    import { fetchApi, getBackoffFailures } from "/js/api.js";
 
     document.addEventListener("alpine:init", () => {
       Alpine.store("genesisDashboard", {
@@ -428,8 +428,15 @@
 
           this.loading = false;
 
-          // Always-on polling: health snapshot drives the attention strip on all tabs
+          // Always-on polling: health snapshot drives the attention strip on all tabs.
+          // Uses probabilistic skip when server is failing to reduce load during
+          // recovery (exponential backoff is in api.js; this reduces poll frequency).
           this._healthInterval = setInterval(() => {
+            const failures = typeof getBackoffFailures === "function" ? getBackoffFailures() : 0;
+            if (failures > 0) {
+              const skipProb = 1 - (1 / Math.pow(2, Math.min(failures, 6)));
+              if (Math.random() < skipProb) return;
+            }
             this.fetchHealth();
             this.fetchErrorSummary();
             this.fetchPauseState();
