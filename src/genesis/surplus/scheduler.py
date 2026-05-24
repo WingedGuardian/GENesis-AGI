@@ -255,11 +255,11 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Dream cycle: weekly Sunday 3am — episodic memory consolidation
+        # Dream cycle: weekly Sunday 4am — episodic memory consolidation
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.run_dream_cycle,
-            CronTrigger(day_of_week="sun", hour=3),
+            CronTrigger(day_of_week="sun", hour=4),
             id="dream_cycle",
             max_instances=1,
             misfire_grace_time=3600,
