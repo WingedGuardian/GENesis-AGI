@@ -36,6 +36,7 @@
         // providerActivity moved to operationalVitals
         errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
         budgets: [],
+        providerHealthSummary: { status: "unknown", providers: [] },
         routingConfig: null,
         approvals: [],
         queueReview: {
@@ -418,6 +419,7 @@
             this.fetchUpdateStatus(),
             this.fetchEgoStatus(),
             this.fetchApprovals(),
+            this.fetchProviderHealth(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -432,6 +434,7 @@
             this.fetchErrorSummary();
             this.fetchPauseState();
             this.fetchEgoStatus();
+            this.fetchProviderHealth();
           }, 15000);
         },
 
@@ -466,6 +469,17 @@
         get healthStale() {
           if (!this.lastHealthUpdate) return false;
           return (Date.now() - this.lastHealthUpdate) > 60000;
+        },
+
+        async fetchProviderHealth() {
+          try {
+            const resp = await fetchApi("/api/genesis/provider-health");
+            if (resp && resp.ok) {
+              this.providerHealthSummary = await resp.json();
+            }
+          } catch (e) {
+            // Non-critical — Overview card will show "unknown"
+          }
         },
 
         async fetchActivity() {
@@ -2381,6 +2395,21 @@
           return { state: "healthy", reason: "cost usage is within current limits" };
         },
 
+        providerHealthSemantic() {
+          const ph = this.providerHealthSummary;
+          if (!ph || ph.status === "unknown") return { state: "unknown", reason: "provider health data unavailable" };
+          if (ph.status === "critical") {
+            const failing = (ph.providers || []).filter(p => p.tier === "CRITICAL" && (p.status === "down" || p.status === "degraded"));
+            const names = failing.map(p => p.display_name).join(", ");
+            return { state: "error", reason: names ? names + " failing" : "critical provider failing" };
+          }
+          if (ph.status === "degraded") {
+            const degraded = (ph.providers || []).filter(p => p.status !== "healthy" && p.status !== "no_data");
+            return { state: "degraded", reason: degraded.length + " provider(s) degraded" };
+          }
+          return { state: "healthy", reason: "all tracked providers healthy" };
+        },
+
         queuesSemantic() {
           const queues = this.health.queues;
           if (!queues) return { state: "unknown", reason: "queue data unavailable" };
@@ -2590,6 +2619,7 @@
           // Aggregate all semantic health signals into one overall status
           const checks = [
             this.infrastructureSemantic(),
+            this.providerHealthSemantic(),
             this.servicesSemantic(),
             this.awarenessSemantic(),
             this.surplusSemantic(),
@@ -3766,6 +3796,44 @@
               </template>
             </div>
             <div class="health-card-reason" x-text="$store.genesisDashboard.infrastructureSemantic().reason"></div>
+          </div>
+
+          <!-- Provider Health -->
+          <div class="health-card" title="API provider health — circuit breaker states and error rates for critical services.">
+            <div class="health-card-header">
+              <div class="health-card-title">Providers</div>
+              <span class="status-chip"
+                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.providerHealthSemantic().state)}`"
+                    x-text="$store.genesisDashboard.providerHealthSemantic().state"></span>
+            </div>
+            <div class="health-card-value">
+              <template x-if="$store.genesisDashboard.providerHealthSummary.providers.length > 0">
+                <div>
+                  <template x-for="p in $store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier === 'CRITICAL' || p.status !== 'healthy')" :key="p.name">
+                    <div style="margin-bottom: 0.15rem; cursor: default;"
+                         :title="p.name + ': ' + p.status + (p.calls > 0 ? ' (' + (p.error_rate * 100).toFixed(0) + '% errors, ' + p.calls + ' calls)' : '')">
+                      <span class="status-dot"
+                            :style="`background: ${p.status === 'down' ? '#d9534f' : p.status === 'degraded' ? '#d9534f' : p.status === 'recovering' ? '#f0ad4e' : p.status === 'warning' ? '#f0ad4e' : p.status === 'no_data' ? '#888' : '#4caf50'}`"></span>
+                      <span x-text="p.display_name" style="font-size: 0.82rem"></span>
+                      <template x-if="p.tier === 'CRITICAL'">
+                        <span style="font-size: 0.65rem; opacity: 0.7; margin-left: 0.2rem;">CRIT</span>
+                      </template>
+                      <template x-if="p.calls > 0 && p.error_rate > 0">
+                        <span style="opacity: 0.6; font-size: 0.72rem;" x-text="'(' + (p.error_rate * 100).toFixed(0) + '% err)'"></span>
+                      </template>
+                    </div>
+                  </template>
+                  <template x-if="$store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier !== 'CRITICAL' && p.status === 'healthy').length > 0">
+                    <div style="font-size: 0.72rem; opacity: 0.6; margin-top: 0.2rem;"
+                         x-text="$store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier !== 'CRITICAL' && p.status === 'healthy').length + ' other(s) healthy'"></div>
+                  </template>
+                </div>
+              </template>
+              <template x-if="$store.genesisDashboard.providerHealthSummary.providers.length === 0">
+                <div style="font-size: 0.82rem; opacity: 0.6;">No activity data</div>
+              </template>
+            </div>
+            <div class="health-card-reason" x-text="$store.genesisDashboard.providerHealthSemantic().reason"></div>
           </div>
 
           <!-- CC Sessions -->

@@ -89,6 +89,109 @@ async def provider_activity():
     return jsonify(result)
 
 
+@blueprint.route("/api/genesis/provider-health")
+@_async_route
+async def provider_health_summary():
+    """Aggregated provider health for the Overview card.
+
+    Returns per-provider status (CB state, error rate, tier) plus an
+    overall status (healthy/degraded/critical) for the card color.
+    """
+    from genesis.routing.provider_tiers import (
+        ProviderTier,
+        get_display_name,
+        get_tier,
+    )
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped:
+        return jsonify({"status": "unknown", "providers": []}), 503
+
+    # Collect CB states — iterate the routing config's provider list
+    # (public API) rather than the registry's internal dict.
+    cb_states: dict[str, str] = {}
+    if rt.router and rt.router.config and rt.router.breakers:
+        for name in rt.router.config.providers:
+            try:
+                cb = rt.router.breakers.get(name)
+                cb_states[name] = cb.state.value if hasattr(cb, "state") else "closed"
+            except (KeyError, AttributeError):
+                cb_states[name] = "closed"
+
+    # Collect activity summaries
+    activity: dict[str, dict] = {}
+    if rt.activity_tracker:
+        all_summaries = rt.activity_tracker.summary()
+        if isinstance(all_summaries, list):
+            for s in all_summaries:
+                activity[s["provider"]] = s
+        elif isinstance(all_summaries, dict):
+            activity[all_summaries["provider"]] = all_summaries
+
+    # Build per-provider health entries — only include providers that have
+    # activity data OR are in the tier registry (skip unknown idle ones)
+    from genesis.routing.provider_tiers import PROVIDER_TIERS
+
+    tracked_providers = set(activity.keys()) | set(PROVIDER_TIERS.keys())
+
+    providers = []
+    worst_tier_failing = ProviderTier.INFO
+    any_degraded = False
+
+    for prov_name in sorted(tracked_providers):
+        tier = get_tier(prov_name)
+        act = activity.get(prov_name, {})
+        calls = act.get("calls", 0)
+        error_rate = act.get("error_rate", 0.0)
+
+        # Determine status from CB state or error rate
+        cb_state = cb_states.get(prov_name, "")
+        if cb_state == "open":
+            status = "down"
+        elif cb_state == "half_open":
+            status = "recovering"
+        elif calls > 0 and error_rate > 0.5:
+            status = "degraded"
+        elif calls > 0 and error_rate > 0.1:
+            status = "warning"
+        elif calls == 0 and tier >= ProviderTier.WARNING:
+            status = "no_data"
+        else:
+            status = "healthy"
+
+        if status in ("down", "degraded"):
+            if tier > worst_tier_failing:
+                worst_tier_failing = tier
+            any_degraded = True
+        elif status in ("warning", "recovering"):
+            any_degraded = True
+
+        providers.append({
+            "name": prov_name,
+            "display_name": get_display_name(prov_name),
+            "tier": tier.name,
+            "status": status,
+            "calls": calls,
+            "error_rate": error_rate,
+            "avg_latency_ms": act.get("avg_latency_ms", 0.0),
+            "cb_state": cb_state or "closed",
+        })
+
+    # Overall status for card color
+    if worst_tier_failing >= ProviderTier.CRITICAL:
+        overall = "critical"
+    elif worst_tier_failing >= ProviderTier.WARNING or any_degraded:
+        overall = "degraded"
+    else:
+        overall = "healthy"
+
+    return jsonify({
+        "status": overall,
+        "providers": providers,
+    })
+
+
 # GROUNDWORK(guardian-dialogue): Self-heal protocol endpoint.
 # V4 Step 1: acknowledge concern + respond need_help (no self-healing yet).
 # V4.5+: Genesis inspects its own state and attempts self-repair.

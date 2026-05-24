@@ -425,6 +425,77 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             })
             current_ids.add(alert_id)
 
+    # ── Credit exhaustion detection ─────────────────────────────────
+    # A provider that had >95% success over 7 days but dropped to <50%
+    # in the last hour likely ran out of credits/quota (not a transient
+    # error).  Only check CRITICAL and WARNING tier providers.
+    if _service and _service._db:
+        try:
+            from datetime import timedelta as _td2
+
+            from genesis.routing.provider_tiers import ProviderTier, get_tier
+
+            now_utc = datetime.now(UTC)
+            recent_cutoff = (now_utc - _td2(hours=1)).isoformat()
+            baseline_cutoff = (now_utc - _td2(days=7)).isoformat()
+
+            # Recent window: last 1 hour
+            cursor = await _service._db.execute(
+                "SELECT provider, COUNT(*) as calls, "
+                "SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as errors "
+                "FROM activity_log WHERE created_at >= ? "
+                "GROUP BY provider HAVING calls >= 5",
+                (recent_cutoff,),
+            )
+            recent_rows = await cursor.fetchall()
+
+            for row in recent_rows:
+                prov, recent_calls, recent_errors = row
+                tier = get_tier(prov)
+                if tier < ProviderTier.WARNING:
+                    continue  # Skip INFO-tier providers
+
+                recent_error_rate = recent_errors / recent_calls if recent_calls else 0
+                if recent_error_rate < 0.5:
+                    continue  # Not failing enough to suspect exhaustion
+
+                # Check 7-day baseline for this provider
+                baseline_cursor = await _service._db.execute(
+                    "SELECT COUNT(*) as calls, "
+                    "SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as errors "
+                    "FROM activity_log WHERE created_at >= ? AND created_at < ? "
+                    "AND provider = ?",
+                    (baseline_cutoff, recent_cutoff, prov),
+                )
+                baseline_row = await baseline_cursor.fetchone()
+                if not baseline_row:
+                    continue
+
+                baseline_calls, baseline_errors = baseline_row
+                if baseline_calls < 10:
+                    continue  # Not enough baseline data
+
+                baseline_error_rate = baseline_errors / baseline_calls
+                if baseline_error_rate > 0.05:
+                    continue  # Wasn't healthy before — not credit exhaustion
+
+                # Was healthy (>95% success) over 7 days, now failing (>50% errors)
+                alert_id = f"provider:credit_exhaustion:{prov}"
+                severity = "CRITICAL" if tier >= ProviderTier.CRITICAL else "WARNING"
+                alerts.append({
+                    "id": alert_id,
+                    "severity": severity,
+                    "message": (
+                        f"Suspected credit/quota exhaustion for {prov}: "
+                        f"was {1 - baseline_error_rate:.0%} success over 7d, "
+                        f"now {recent_error_rate:.0%} errors in last hour "
+                        f"({recent_errors}/{recent_calls} calls)"
+                    ),
+                })
+                current_ids.add(alert_id)
+        except Exception:
+            logger.debug("Credit exhaustion detection failed", exc_info=True)
+
     if _job_retry_registry is not None:
         for job_name in _job_retry_registry.list_registered():
             if _job_retry_registry.is_quarantined(job_name):
