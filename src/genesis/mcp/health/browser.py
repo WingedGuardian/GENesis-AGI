@@ -1173,13 +1173,18 @@ async def _click_turnstile_iframe(page) -> bool:
 async def _solve_with_playwright_captcha(page) -> bool:
     """Solve Cloudflare challenge using playwright-captcha library (fallback).
 
-    Uses Shadow DOM traversal with forceScopeAccess.  Falls back to False
-    if the library is not installed or fails.
+    Uses Shadow DOM traversal via add_init_script to unlock closed shadow roots.
+    Explicitly supports Camoufox via FrameworkType.CAMOUFOX.
+    Falls back to False if the library is not installed or fails.
     """
     try:
         from playwright_captcha import CaptchaType, ClickSolver
+        from playwright_captcha.types import FrameworkType
 
-        solver = ClickSolver()
+        solver = ClickSolver(
+            framework=FrameworkType.CAMOUFOX,
+            page=page,
+        )
         await solver.prepare()
 
         for captcha_type in [CaptchaType.CLOUDFLARE_INTERSTITIAL, CaptchaType.CLOUDFLARE_TURNSTILE]:
