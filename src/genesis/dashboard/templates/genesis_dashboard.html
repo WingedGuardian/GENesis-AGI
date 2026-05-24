@@ -36,7 +36,7 @@
         // providerActivity moved to operationalVitals
         errorSummary: { groups: [], active_alerts: [], totals: { events: 0, dead_letters: 0, deferred_failures: 0 } },
         budgets: [],
-        providerHealthSummary: { status: "unknown", providers: [] },
+        // providerHealthSummary removed — provider data now in health.api_keys
         routingConfig: null,
         approvals: [],
         queueReview: {
@@ -421,7 +421,6 @@
             this.fetchUpdateStatus(),
             this.fetchEgoStatus(),
             this.fetchApprovals(),
-            this.fetchProviderHealth(),
           ]);
 
           // Initialize tab from URL hash and fetch tab-specific data
@@ -436,7 +435,6 @@
             this.fetchErrorSummary();
             this.fetchPauseState();
             this.fetchEgoStatus();
-            this.fetchProviderHealth();
           }, 15000);
         },
 
@@ -473,16 +471,7 @@
           return (Date.now() - this.lastHealthUpdate) > 60000;
         },
 
-        async fetchProviderHealth() {
-          try {
-            const resp = await fetchApi("/api/genesis/provider-health");
-            if (resp && resp.ok) {
-              this.providerHealthSummary = await resp.json();
-            }
-          } catch (e) {
-            // Non-critical — Overview card will show "unknown"
-          }
-        },
+        // fetchProviderHealth() removed — provider data now in health.api_keys
 
         async fetchActivity() {
           this.startFetch("activity");
@@ -2422,18 +2411,19 @@
         },
 
         providerHealthSemantic() {
-          const ph = this.providerHealthSummary;
-          if (!ph || ph.status === "unknown") return { state: "unknown", reason: "provider health data unavailable" };
-          if (ph.status === "critical") {
-            const failing = (ph.providers || []).filter(p => p.tier === "CRITICAL" && (p.status === "down" || p.status === "degraded"));
-            const names = failing.map(p => p.display_name).join(", ");
-            return { state: "error", reason: names ? names + " failing" : "critical provider failing" };
+          // Provider health now derived from api_keys alerts
+          const apiKeys = this.health.api_keys;
+          if (!apiKeys) return { state: "unknown", reason: "provider data unavailable" };
+          const alerts = apiKeys.alerts || [];
+          const critical = alerts.filter(a => a.severity === "critical");
+          if (critical.length > 0) {
+            return { state: "error", reason: critical.map(a => a.message).join("; ") };
           }
-          if (ph.status === "degraded") {
-            const degraded = (ph.providers || []).filter(p => p.status !== "healthy" && p.status !== "no_data");
-            return { state: "degraded", reason: degraded.length + " provider(s) degraded" };
+          const warnings = alerts.filter(a => a.severity === "warning");
+          if (warnings.length > 0) {
+            return { state: "degraded", reason: warnings.length + " provider warning(s)" };
           }
-          return { state: "healthy", reason: "all tracked providers healthy" };
+          return { state: "healthy", reason: "all providers healthy" };
         },
 
         queuesSemantic() {
@@ -2622,8 +2612,9 @@
         },
 
         apiKeysSemantic() {
-          const keys = this.health.api_keys;
-          if (!keys) return { state: "unknown", reason: "API key data unavailable" };
+          const apiKeys = this.health.api_keys;
+          if (!apiKeys) return { state: "unknown", reason: "API key data unavailable" };
+          const keys = apiKeys.providers || apiKeys;
           const bad = Object.entries(keys).filter(([, info]) => info.status === "missing" || info.status === "failed");
           if (!bad.length) return { state: "healthy", reason: "required provider keys are available" };
           const blocking = bad.filter(([name]) => !this.providerFallbackActive(name));
@@ -2891,7 +2882,8 @@
         },
 
         get badApiKeyCount() {
-          const keys = this.health.api_keys || {};
+          const apiKeysData = this.health.api_keys || {};
+          const keys = apiKeysData.providers || apiKeysData;
           const sites = this.health.call_sites || {};
           // "failed" keys always count. "missing" keys only count if they
           // are causing a specific call site to be degraded/down/on-fallback.
@@ -3754,6 +3746,15 @@
              x-text="'Resilience: ' + $store.genesisDashboard.health.resilience.level + ' — ' + ($store.genesisDashboard.health.resilience.summary || 'system is operating in degraded mode')">
         </div>
       </template>
+      <!-- Provider alert banners (credit exhaustion, missing critical keys) -->
+      <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'critical')" :key="'prov-crit-' + alert.provider_type">
+        <div style="background: rgba(217,83,79,0.15); border: 1px solid #d9534f; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #d9534f; text-align: center;"
+             x-text="alert.message"></div>
+      </template>
+      <template x-for="alert in ($store.genesisDashboard.health.api_keys?.alerts || []).filter(a => a.severity === 'warning')" :key="'prov-warn-' + alert.provider_type">
+        <div style="background: rgba(240,173,78,0.15); border: 1px solid #f0ad4e; border-radius: 6px; padding: 0.5rem 1rem; margin: 0.25rem 0.5rem; font-size: 0.82rem; font-weight: 600; color: #f0ad4e; text-align: center;"
+             x-text="alert.message"></div>
+      </template>
       <div class="panel-body">
         <template x-if="$store.genesisDashboard.panelStatusDetail('health')">
           <div class="panel-status-detail" x-text="$store.genesisDashboard.panelStatusDetail('health')"></div>
@@ -3814,44 +3815,6 @@
               </template>
             </div>
             <div class="health-card-reason" x-text="$store.genesisDashboard.infrastructureSemantic().reason"></div>
-          </div>
-
-          <!-- Provider Health -->
-          <div class="health-card" title="API provider health — circuit breaker states and error rates for critical services.">
-            <div class="health-card-header">
-              <div class="health-card-title">Providers</div>
-              <span class="status-chip"
-                    :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.providerHealthSemantic().state)}`"
-                    x-text="$store.genesisDashboard.providerHealthSemantic().state"></span>
-            </div>
-            <div class="health-card-value">
-              <template x-if="$store.genesisDashboard.providerHealthSummary.providers.length > 0">
-                <div>
-                  <template x-for="p in $store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier === 'CRITICAL' || p.status !== 'healthy')" :key="p.name">
-                    <div style="margin-bottom: 0.15rem; cursor: default;"
-                         :title="p.name + ': ' + p.status + (p.calls > 0 ? ' (' + (p.error_rate * 100).toFixed(0) + '% errors, ' + p.calls + ' calls)' : '')">
-                      <span class="status-dot"
-                            :style="`background: ${p.status === 'down' ? '#d9534f' : p.status === 'degraded' ? '#d9534f' : p.status === 'recovering' ? '#f0ad4e' : p.status === 'warning' ? '#f0ad4e' : p.status === 'no_data' ? '#888' : '#4caf50'}`"></span>
-                      <span x-text="p.display_name" style="font-size: 0.82rem"></span>
-                      <template x-if="p.tier === 'CRITICAL'">
-                        <span style="font-size: 0.65rem; opacity: 0.7; margin-left: 0.2rem;">CRIT</span>
-                      </template>
-                      <template x-if="p.calls > 0 && p.error_rate > 0">
-                        <span style="opacity: 0.6; font-size: 0.72rem;" x-text="'(' + (p.error_rate * 100).toFixed(0) + '% err)'"></span>
-                      </template>
-                    </div>
-                  </template>
-                  <template x-if="$store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier !== 'CRITICAL' && p.status === 'healthy').length > 0">
-                    <div style="font-size: 0.72rem; opacity: 0.6; margin-top: 0.2rem;"
-                         x-text="$store.genesisDashboard.providerHealthSummary.providers.filter(p => p.tier !== 'CRITICAL' && p.status === 'healthy').length + ' other(s) healthy'"></div>
-                  </template>
-                </div>
-              </template>
-              <template x-if="$store.genesisDashboard.providerHealthSummary.providers.length === 0">
-                <div style="font-size: 0.82rem; opacity: 0.6;">No activity data</div>
-              </template>
-            </div>
-            <div class="health-card-reason" x-text="$store.genesisDashboard.providerHealthSemantic().reason"></div>
           </div>
 
           <!-- CC Sessions -->
@@ -4461,7 +4424,7 @@
                 <div>
                   <span style="font-size: 0.82rem"
                         x-text="(() => {
-                          const keys = $store.genesisDashboard.health.api_keys;
+                          const keys = ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {});
                           const total = Object.keys(keys).length;
                           const missing = Object.values(keys).filter(k => k.status === 'missing').length;
                           const failed = Object.values(keys).filter(k => k.status === 'failed').length;
@@ -4470,7 +4433,7 @@
                           if (missing > 0 || failed > 0) return validated + ' ok, ' + (missing + failed) + ' bad / ' + (total - local);
                           return validated + '/' + (total - local) + ' validated';
                         })()"></span>
-                  <template x-for="(info, name) in $store.genesisDashboard.health.api_keys" :key="name">
+                  <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
                     <template x-if="info.status === 'missing' || info.status === 'failed'">
                       <div style="font-size: 0.72rem; margin-top: 0.1rem;"
                            :style="`color: ${info.status === 'missing' ? '#d9534f' : '#f0ad4e'}`"
@@ -6983,7 +6946,7 @@
             <div style="font-size: 0.72rem; color: var(--color-text-secondary); margin-bottom: 0.75rem;">
               Keys are read from environment variables. Configure in <a href="#" @click.prevent="$store.genesisDashboard.activeTab = 'config'; $store.genesisDashboard.fetchSecrets()" style="color:var(--color-primary);">Settings &rarr; Provider Keys</a>.
             </div>
-            <template x-for="(info, name) in $store.genesisDashboard.health.api_keys" :key="name">
+            <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
               <div style="display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0; border-bottom: 1px solid var(--color-border); font-size: 0.78rem; flex-wrap: wrap;">
                 <span class="status-dot" :style="`background: ${$store.genesisDashboard.probeStatusColor(info)}`"></span>
                 <span style="font-weight: 600; min-width: 100px;" x-text="name"></span>
@@ -7019,7 +6982,7 @@
               <div style="margin-top: 1rem;">
                 <div style="font-size: 0.78rem; font-weight: 600; margin-bottom: 0.3rem;">Provider → Call Site Usage</div>
                 <div style="font-size: 0.72rem; color: var(--color-text-secondary);">
-                  <template x-for="(info, name) in $store.genesisDashboard.health.api_keys" :key="'usage-' + name">
+                  <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="'usage-' + name">
                     <div style="margin-bottom: 0.15rem;">
                       <span style="font-weight: 600;" x-text="name"></span>:
                       <span x-text="(() => { const sites = $store.genesisDashboard.providerCallSites(name); return sites.length ? sites.join(', ') : '(no call sites)'; })()"></span>
