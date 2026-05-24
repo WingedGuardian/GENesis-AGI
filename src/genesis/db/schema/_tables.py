@@ -1088,6 +1088,42 @@ TABLES = {
                               DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """,
+    "user_jobs": """
+        CREATE TABLE IF NOT EXISTS user_jobs (
+            id                TEXT PRIMARY KEY,
+            title             TEXT NOT NULL,
+            description       TEXT,
+            cron_expression   TEXT NOT NULL,
+            job_type          TEXT NOT NULL DEFAULT 'generic',
+            config_json       TEXT,
+            dispatch_prompt   TEXT NOT NULL,
+            profile           TEXT NOT NULL DEFAULT 'observe',
+            model             TEXT NOT NULL DEFAULT 'sonnet',
+            effort            TEXT NOT NULL DEFAULT 'medium',
+            status            TEXT NOT NULL DEFAULT 'active'
+                              CHECK (status IN ('active', 'paused', 'disabled')),
+            last_run_at       TEXT,
+            last_status       TEXT CHECK (last_status IN ('passed', 'failed', 'running', NULL)),
+            last_result_json  TEXT,
+            next_run_at       TEXT,
+            failure_count     INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """,
+    "user_job_runs": """
+        CREATE TABLE IF NOT EXISTS user_job_runs (
+            id                TEXT PRIMARY KEY,
+            job_id            TEXT NOT NULL REFERENCES user_jobs(id),
+            status            TEXT NOT NULL DEFAULT 'running'
+                              CHECK (status IN ('running', 'passed', 'failed')),
+            session_id        TEXT,
+            started_at        TEXT NOT NULL DEFAULT (datetime('now')),
+            completed_at      TEXT,
+            result_json       TEXT,
+            error_message     TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1300,6 +1336,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_memory_events_date ON memory_events(event_date)",
     "CREATE INDEX IF NOT EXISTS idx_memory_events_subject ON memory_events(subject)",
     "CREATE INDEX IF NOT EXISTS idx_memory_events_verb ON memory_events(verb)",
+    # user jobs
+    "CREATE INDEX IF NOT EXISTS idx_user_jobs_status ON user_jobs(status)",
+    "CREATE INDEX IF NOT EXISTS idx_user_jobs_next_run ON user_jobs(next_run_at)",
+    "CREATE INDEX IF NOT EXISTS idx_user_job_runs_job ON user_job_runs(job_id, started_at DESC)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

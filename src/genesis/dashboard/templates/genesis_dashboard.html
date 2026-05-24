@@ -131,6 +131,8 @@
         essentialKnowledge: null,
         awarenessSignals: null,
         jobHealth: null,
+        schedulerData: { subsystems: [], total_jobs: 0 },
+        userJobs: { jobs: [] },
         evalMetrics: null,
         autonomyConfig: null,
         approvalActions: {},
@@ -347,10 +349,10 @@
               this._modulesInterval = setInterval(() => { this.fetchModules(); this.fetchProvidersDetail(); }, 30000);
               break;
             case "internals":
-              if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchEvalMetrics(); this.fetchApprovals(); this.fetchActivity(); this.fetchSessions(); }
+              if (first) { this.fetchAwarenessSignals(); this.fetchOperationalVitals(); this.fetchAutonomyConfig(); this.fetchAutonomousCliPolicy(); this.fetchRoutingConfig(); this.fetchJobHealth(); this.fetchSchedulerData(); this.fetchEvalMetrics(); this.fetchApprovals(); this.fetchActivity(); this.fetchSessions(); }
               this._awarenessInterval = setInterval(() => this.fetchAwarenessSignals(), 30000);
               this._routingInterval = setInterval(() => this.fetchRoutingConfig(), 15000);
-              this._jobHealthInterval = setInterval(() => this.fetchJobHealth(), 60000);
+              this._jobHealthInterval = setInterval(() => { this.fetchJobHealth(); this.fetchSchedulerData(); }, 60000);
               this._activityInterval = setInterval(() => this.fetchActivity(), 10000);
               this._sessionsInterval = setInterval(() => this.fetchSessions(), 30000);
               break;
@@ -1741,6 +1743,34 @@
           } catch (e) {
             console.warn("Job health fetch failed:", e);
             this.failFetch("jobHealth", "Job health unavailable");
+          }
+        },
+
+        async fetchSchedulerData() {
+          try {
+            const [sysResp, userResp] = await Promise.all([
+              fetchApi("/api/genesis/scheduler/system"),
+              fetchApi("/api/genesis/scheduler/user"),
+            ]);
+            if (sysResp && sysResp.ok) this.schedulerData = await sysResp.json();
+            if (userResp && userResp.ok) this.userJobs = await userResp.json();
+          } catch (e) {
+            // Non-critical
+          }
+        },
+
+        async userJobAction(jobId, action) {
+          try {
+            const resp = await fetchApi(`/api/genesis/scheduler/user/${jobId}/control`, {
+              method: 'POST',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ action }),
+            });
+            if (resp && resp.ok) {
+              await this.fetchSchedulerData();
+            }
+          } catch (e) {
+            console.warn("User job action failed:", e);
           }
         },
 
@@ -4852,6 +4882,119 @@
         <template x-if="!$store.genesisDashboard.health.call_sites || Object.keys($store.genesisDashboard.health.call_sites).length === 0">
           <div class="empty-state">No call site data available.</div>
         </template>
+      </div>
+    </div>
+
+    <!-- Panel: Scheduler Overview [Tab: internals] -->
+    <div class="panel" x-data="{ schedOpen: true }" x-show="$store.genesisDashboard.activeTab === 'internals'">
+      <div class="panel-header" style="cursor: pointer;" @click="schedOpen = !schedOpen">
+        <span class="material-symbols-outlined" :style="schedOpen ? 'transform: rotate(90deg)' : ''" style="transition: transform 0.2s">chevron_right</span>
+        <span class="material-symbols-outlined">event_repeat</span>
+        Scheduler
+        <span class="panel-status">
+          <span style="font-size: 0.68rem; opacity: 0.7;"
+                x-text="($store.genesisDashboard.userJobs?.jobs?.length || 0) + ' user · ' + ($store.genesisDashboard.schedulerData?.total_jobs || 0) + ' system'"></span>
+        </span>
+      </div>
+      <div class="panel-body" x-show="schedOpen" x-transition>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem;">
+
+          <!-- User Jobs Card -->
+          <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.75rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.3rem;">
+              <span class="material-symbols-outlined" style="font-size: 1rem;">person</span>
+              User Jobs
+              <span style="font-weight: 400; opacity: 0.6; margin-left: auto;" x-text="($store.genesisDashboard.userJobs?.jobs?.length || 0)"></span>
+            </div>
+            <template x-if="!$store.genesisDashboard.userJobs?.jobs?.length">
+              <div style="font-size: 0.76rem; opacity: 0.5; padding: 0.5rem 0;">No user jobs. Create one via <code>user_job_create</code> MCP tool.</div>
+            </template>
+            <template x-if="$store.genesisDashboard.userJobs?.jobs?.length > 0">
+              <div>
+                <template x-for="job in $store.genesisDashboard.userJobs.jobs" :key="job.id">
+                  <div style="margin-bottom: 0.5rem; padding: 0.4rem 0.5rem; border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; font-size: 0.76rem;">
+                    <div style="display: flex; align-items: center; gap: 0.3rem;">
+                      <span class="status-dot" :style="`background: ${job.status === 'active' ? (job.last_status === 'failed' ? '#d9534f' : '#4caf50') : '#888'}`"></span>
+                      <strong x-text="job.title" style="font-size: 0.78rem;"></strong>
+                      <span style="margin-left: auto; font-size: 0.65rem; opacity: 0.6; font-family: monospace;" x-text="job.cron_expression"></span>
+                    </div>
+                    <div style="font-size: 0.68rem; opacity: 0.6; margin-top: 0.15rem;">
+                      <span x-text="job.profile + ' · ' + job.model"></span>
+                      <template x-if="job.last_run_at">
+                        <span x-text="' · last: ' + new Date(job.last_run_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
+                      </template>
+                      <template x-if="job.failure_count > 0">
+                        <span style="color: #d9534f;" x-text="' · ' + job.failure_count + ' fail(s)'"></span>
+                      </template>
+                    </div>
+                    <div style="margin-top: 0.3rem; display: flex; gap: 0.3rem;">
+                      <button @click="$store.genesisDashboard.userJobAction(job.id, 'run_now')"
+                              style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(76,175,80,0.1); cursor: pointer; color: inherit;">
+                        Run Now
+                      </button>
+                      <template x-if="job.status === 'active'">
+                        <button @click="$store.genesisDashboard.userJobAction(job.id, 'pause')"
+                                style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(240,173,78,0.1); cursor: pointer; color: inherit;">
+                          Pause
+                        </button>
+                      </template>
+                      <template x-if="job.status === 'paused'">
+                        <button @click="$store.genesisDashboard.userJobAction(job.id, 'resume')"
+                                style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(76,175,80,0.1); cursor: pointer; color: inherit;">
+                          Resume
+                        </button>
+                      </template>
+                      <button @click="if(confirm('Delete this job?')) $store.genesisDashboard.userJobAction(job.id, 'delete')"
+                              style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(217,83,79,0.1); cursor: pointer; color: inherit;">
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+          <!-- System Jobs Card -->
+          <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.75rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.3rem;">
+              <span class="material-symbols-outlined" style="font-size: 1rem;">settings</span>
+              System Jobs
+              <span style="font-weight: 400; opacity: 0.6; margin-left: auto;" x-text="($store.genesisDashboard.schedulerData?.total_jobs || 0)"></span>
+            </div>
+            <template x-if="!$store.genesisDashboard.schedulerData?.subsystems?.length">
+              <div style="font-size: 0.76rem; opacity: 0.5; padding: 0.5rem 0;">No scheduler data available.</div>
+            </template>
+            <template x-if="$store.genesisDashboard.schedulerData?.subsystems?.length > 0">
+              <div>
+                <template x-for="sub in $store.genesisDashboard.schedulerData.subsystems" :key="sub.name">
+                  <div x-data="{ open: false }" style="margin-bottom: 0.3rem;">
+                    <div @click="open = !open" style="cursor: pointer; display: flex; align-items: center; gap: 0.3rem; padding: 0.25rem 0.3rem; border-radius: 3px; font-size: 0.76rem;"
+                         :style="open ? 'background: rgba(255,255,255,0.04)' : ''">
+                      <span class="material-symbols-outlined" style="font-size: 0.8rem; transition: transform 0.15s;" :style="open ? 'transform:rotate(90deg)' : ''">chevron_right</span>
+                      <span class="status-dot" :style="`background: ${sub.jobs.some(j => j.consecutive_failures > 0) ? '#d9534f' : '#4caf50'}`"></span>
+                      <span x-text="sub.name" style="font-weight: 500;"></span>
+                      <span style="opacity: 0.5; font-size: 0.65rem; margin-left: auto;" x-text="'(' + sub.count + ')'"></span>
+                    </div>
+                    <div x-show="open" x-transition style="margin-left: 1.5rem; font-size: 0.7rem;">
+                      <template x-for="job in sub.jobs" :key="job.id">
+                        <div style="padding: 0.15rem 0; opacity: 0.8; display: flex; gap: 0.4rem; align-items: baseline;">
+                          <span class="status-dot" style="flex-shrink: 0;"
+                                :style="`background: ${job.consecutive_failures > 0 ? '#d9534f' : '#4caf50'}; margin-top: 0.2rem;`"></span>
+                          <span x-text="job.id" style="font-family: monospace; font-size: 0.65rem; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;"></span>
+                          <span style="opacity: 0.5; font-size: 0.6rem; flex-shrink: 0;" x-text="job.trigger_type"></span>
+                          <span style="opacity: 0.5; font-size: 0.6rem; font-family: monospace; flex-shrink: 0;"
+                                x-text="job.next_run_time ? new Date(job.next_run_time).toLocaleString([], {hour:'2-digit',minute:'2-digit'}) : '—'"></span>
+                        </div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </template>
+          </div>
+
+        </div>
       </div>
     </div>
 

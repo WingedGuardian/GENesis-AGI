@@ -48,6 +48,7 @@ from genesis.runtime.init import (
     secrets,
     surplus,
     tasks,
+    user_jobs,
 )
 
 logger = logging.getLogger("genesis.runtime")
@@ -118,6 +119,9 @@ class _InitDelegatesMixin:
 
     async def _init_outreach(self) -> None:
         await outreach.init(self)
+
+    async def _init_user_jobs(self) -> None:
+        await user_jobs.init(self)
 
     async def _init_autonomy(self) -> None:
         await autonomy.init(self)

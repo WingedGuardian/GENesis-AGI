@@ -204,6 +204,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._outreach_pipeline: OutreachPipeline | None = None
         self._outreach_scheduler: OutreachScheduler | None = None
         self._engagement_tracker = None
+        self._user_job_scheduler: object | None = None
         self._autonomy_manager: object | None = None
         self._action_classifier: object | None = None
         self._task_verifier: object | None = None
@@ -378,6 +379,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         if _full:
             await self._run_init_step_async("outreach", self._init_outreach)
 
+        if _full:
+            await self._run_init_step_async("user_jobs", self._init_user_jobs)
+
         await self._run_init_step_async("autonomy", self._init_autonomy)
 
         if _full:
@@ -441,6 +445,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("user_ego_cadence", self._ego_cadence_manager),
             ("genesis_ego_cadence", self._genesis_ego_cadence_manager),
             ("outreach_scheduler", self._outreach_scheduler),
+            ("user_job_scheduler", self._user_job_scheduler),
             ("reflection_scheduler", self._reflection_scheduler),
             ("inbox_monitor", self._inbox_monitor),
             ("mail_monitor", self._mail_monitor),
@@ -500,6 +505,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "reflection": "_reflection_scheduler",
         "health_data": "_health_data",
         "outreach": "_outreach_scheduler",
+        "user_jobs": "_user_job_scheduler",
         "autonomy": "_autonomy_manager",
         "modules": "_module_registry",
         "pipeline": "_pipeline_orchestrator",
