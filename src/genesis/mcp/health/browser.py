@@ -1074,9 +1074,10 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare Turnstile challenge "
-                f"that didn't auto-resolve or respond to automated VNC click.\n\n"
-                f"Open VNC to solve it: {vnc_url}"
+                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Auto-resolve and VNC click both failed after multiple attempts. "
+                f"Genesis will retry on next navigation.\n\n"
+                f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)

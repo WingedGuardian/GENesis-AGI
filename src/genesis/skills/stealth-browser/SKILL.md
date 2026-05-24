@@ -3,6 +3,7 @@ name: stealth-browser
 description: Anti-detection behavioral rules for stealth browser automation
 consumer: cc_any
 phase: execution
+keywords: [browser, stealth, camoufox, cloudflare, turnstile, captcha, anti-bot, navigate, automation, vnc, click, medium, publish]
 ---
 
 # Stealth Browser Skill

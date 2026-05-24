@@ -4,6 +4,7 @@ description: Web automation with 4-layer escalation (Fetch, Genesis Browser, On-
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
+keywords: [browser, navigate, click, fill, form, submit, login, scrape, automate, web, page, site, url]
 ---
 
 # Browser Automation
