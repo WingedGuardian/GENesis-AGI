@@ -497,6 +497,13 @@ class EventLoopLatencyCollector:
     the latency will spike. Signal value is latency/threshold, clamped
     to 1.0. Added after the 2026-05-24 incident where event loop
     starvation went undetected until external probes failed.
+
+    Known limitation: this collector runs as an async coroutine, so it
+    can only execute when the event loop is responsive. Under total
+    starvation it cannot be scheduled at all — the external watchdog
+    (status.json staleness) remains the primary detection mechanism for
+    complete event loop blockage. This collector catches partial
+    degradation where the loop is slow but not completely blocked.
     """
 
     signal_name = "event_loop_latency"

@@ -245,6 +245,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Heavy workload flag — set by long-running batch jobs (e.g. dream
         # cycle) so Sentinel and watchdog defer restart-type remediation.
         self._heavy_workload: str | None = None
+        self._heavy_workload_since: datetime | None = None
 
         # Timestamp when bootstrap completed — used for grace periods.
         self._bootstrap_completed_at: datetime | None = None
@@ -265,7 +266,20 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
     @property
     def heavy_workload(self) -> str | None:
-        """Name of the currently running heavy workload, or None."""
+        """Name of the currently running heavy workload, or None.
+
+        Auto-expires after 2 hours to prevent permanent flag from a hung
+        process (e.g. dream cycle blocked on unresponsive Qdrant).
+        """
+        if self._heavy_workload and self._heavy_workload_since:
+            age = (datetime.now(UTC) - self._heavy_workload_since).total_seconds()
+            if age > 7200:  # 2 hours — no legitimate batch job runs longer
+                logger.warning(
+                    "Heavy workload '%s' expired after %.0fs — auto-clearing",
+                    self._heavy_workload, age,
+                )
+                self._heavy_workload = None
+                self._heavy_workload_since = None
         return self._heavy_workload
 
     def record_job_success(self, job_name: str) -> None:

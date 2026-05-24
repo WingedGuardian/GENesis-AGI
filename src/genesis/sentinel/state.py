@@ -165,6 +165,7 @@ def load_state(path: Path | None = None) -> SentinelStateData:
                         SentinelState.HEALTHY,
                         reason=f"post-restart reset from {state.current_state}",
                     )
+                    save_state(state, state_path)
                 return state
     except Exception:
         logger.warning("Failed to load sentinel state — resetting to HEALTHY", exc_info=True)

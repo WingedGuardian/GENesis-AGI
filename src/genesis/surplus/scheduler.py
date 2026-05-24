@@ -870,6 +870,7 @@ class SurplusScheduler:
 
             # Signal heavy workload so Sentinel and watchdog defer restarts.
             rt._heavy_workload = "dream_cycle"
+            rt._heavy_workload_since = datetime.now(UTC)
 
             # Default dry-run until user enables live mode.
             # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
@@ -921,7 +922,9 @@ class SurplusScheduler:
             # Always clear heavy workload flag, even on failure.
             try:
                 from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance()._heavy_workload = None
+                rt = GenesisRuntime.instance()
+                rt._heavy_workload = None
+                rt._heavy_workload_since = None
             except Exception:
                 pass
 
