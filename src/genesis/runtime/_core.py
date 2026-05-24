@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -242,6 +242,13 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._pause_reason: str | None = None
         self._paused_since: datetime | None = None
 
+        # Heavy workload flag — set by long-running batch jobs (e.g. dream
+        # cycle) so Sentinel and watchdog defer restart-type remediation.
+        self._heavy_workload: str | None = None
+
+        # Timestamp when bootstrap completed — used for grace periods.
+        self._bootstrap_completed_at: datetime | None = None
+
         self._bootstrap_manifest: dict[str, str] = {}
         self._job_health: dict[str, dict] = {}
         self._job_retry_registry = None
@@ -255,6 +262,11 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
     @property
     def bootstrap_mode(self) -> str:
         return getattr(self, "_bootstrap_mode", "not_bootstrapped")
+
+    @property
+    def heavy_workload(self) -> str | None:
+        """Name of the currently running heavy workload, or None."""
+        return self._heavy_workload
 
     def record_job_success(self, job_name: str) -> None:
         record_job_success(self, job_name)
@@ -410,6 +422,8 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 if self._bootstrap_manifest.get(name) != "ok"
             ]
             logger.error("Bootstrap incomplete — critical subsystems failed: %s", failed)
+        if critical_ok:
+            self._bootstrap_completed_at = datetime.now(UTC)
         ok = sum(1 for v in self._bootstrap_manifest.values() if v == "ok")
         total = len(self._bootstrap_manifest)
         logger.info("GenesisRuntime bootstrap complete: %d/%d subsystems ok (bootstrapped=%s)", ok, total, critical_ok)

@@ -336,6 +336,19 @@ class SentinelDispatcher:
                 reason=f"Sentinel awaiting approval ({self._state.pending_policy_id})",
             )
 
+        # Gate 2.5: Heavy workload — defer restart-type remediation while
+        # a long-running batch job (e.g. dream cycle) is in progress.
+        try:
+            from genesis.runtime import GenesisRuntime
+            wl = GenesisRuntime.instance().heavy_workload
+            if wl:
+                return SentinelResult(
+                    dispatched=False,
+                    reason=f"Heavy workload active ({wl}) — deferring dispatch",
+                )
+        except Exception:
+            pass
+
         # Gate 3: Concurrent limit
         if self._active_session_id is not None:
             return SentinelResult(

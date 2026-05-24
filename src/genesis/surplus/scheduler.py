@@ -847,6 +847,9 @@ class SurplusScheduler:
                 logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
                 return
 
+            # Signal heavy workload so Sentinel and watchdog defer restarts.
+            rt._heavy_workload = "dream_cycle"
+
             # Default dry-run until user enables live mode.
             # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
             import os
@@ -891,6 +894,13 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("dream_cycle", str(exc))
+            except Exception:
+                pass
+        finally:
+            # Always clear heavy workload flag, even on failure.
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance()._heavy_workload = None
             except Exception:
                 pass
 
