@@ -67,6 +67,9 @@ _IDLE_TIMEOUT_S = 3600  # 1 hour
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
 _VNC_PASSWORD = os.environ.get("GENESIS_VNC_PASSWORD", "genesis")
+# vncdotool server format: display-number notation (display 99 = port 5999).
+# "localhost::5999" causes Connection Lost due to IPv6 resolution.
+_VNC_SERVER = "127.0.0.1:99"
 
 # VNC infrastructure state — verified once per session
 _vnc_verified = False
@@ -1117,21 +1120,32 @@ async def _click_turnstile_iframe(page) -> bool:
     No VNC, no coordinates, no xdotool, no port numbers needed.
     """
     try:
+        # Log frame inventory for debugging
+        frame_urls = [f.url[:80] for f in page.frames]
+        logger.info(
+            "Turnstile iframe scan: %d frames: %s",
+            len(page.frames), frame_urls,
+        )
+
         for frame in page.frames:
             if frame.url.startswith("https://challenges.cloudflare.com"):
+                logger.info("Found Cloudflare challenge iframe: %s", frame.url[:120])
                 el = await frame.frame_locator(":root").locator("body").element_handle()
                 if el is None:
+                    logger.info("Iframe body element_handle returned None — trying query_selector")
                     # Try getting bounding box directly from the frame element
                     iframe_el = await page.query_selector(
                         'iframe[src*="challenges.cloudflare.com"]'
                     )
                     if iframe_el is None:
+                        logger.info("iframe query_selector also returned None")
                         continue
                     box = await iframe_el.bounding_box()
                 else:
                     box = await el.bounding_box()
 
                 if box is None:
+                    logger.info("Iframe bounding_box returned None")
                     continue
 
                 # Click at checkbox position: width/9 from left, vertically centered
@@ -1146,27 +1160,54 @@ async def _click_turnstile_iframe(page) -> bool:
                 return True
 
         # No iframe found — try managed challenge (no iframe, inline widget)
-        # Fall back to clicking the container element directly
-        container = await page.query_selector(
-            '[style*="display: grid"], .cf-turnstile, #turnstile-wrapper'
-        )
+        # Try selectors individually to log which matches
+        _managed_selectors = [
+            ".cf-turnstile",
+            "#turnstile-wrapper",
+            '[style*="display: grid"]',
+            "#cf-challenge-running",
+            'input[name="cf-turnstile-response"]',
+        ]
+        container = None
+        matched_selector = None
+        for sel in _managed_selectors:
+            container = await page.query_selector(sel)
+            if container:
+                matched_selector = sel
+                logger.info("Managed challenge matched selector: %s", sel)
+                break
+
         if container:
+            # If we found the hidden input, walk up to its parent container
+            if matched_selector == 'input[name="cf-turnstile-response"]':
+                container = await container.evaluate_handle(
+                    "el => el.closest('.cf-turnstile') || el.parentElement"
+                )
+
             box = await container.bounding_box()
             if box:
                 # Checkbox is near the left edge of the container
                 click_x = box["x"] + 20
                 click_y = box["y"] + box["height"] / 2
                 logger.info(
-                    "Managed challenge click: (%.0f, %.0f)", click_x, click_y,
+                    "Managed challenge click: (%.0f, %.0f) in %dx%d box at (%.0f, %.0f)",
+                    click_x, click_y, box["width"], box["height"], box["x"], box["y"],
                 )
                 await asyncio.sleep(random.uniform(0.3, 0.8))
                 await page.mouse.click(click_x, click_y)
                 return True
+            logger.warning(
+                "Managed selector %s matched but bounding_box was None",
+                matched_selector,
+            )
 
-        logger.debug("No Turnstile iframe or container found for click")
+        logger.warning(
+            "No Turnstile iframe or container found — tried %d selectors",
+            len(_managed_selectors),
+        )
         return False
     except Exception as e:
-        logger.debug("Turnstile iframe click failed: %s", e)
+        logger.warning("Turnstile iframe click failed: %s", e)
         return False
 
 
@@ -1247,78 +1288,108 @@ async def _vnc_click_turnstile(page) -> bool:
             win_x, win_y = 0, 0
             logger.debug("xdotool failed — using (0,0) for window position")
 
-        # Get element position from page coordinates (these are NOT spoofed)
+        # Get element position from page coordinates (these are NOT spoofed).
+        # Try multiple selectors — same set used in _click_turnstile_iframe().
         page_coords = await page.evaluate("""() => {
-            // Try iframe-based Turnstile first
             const iframe = document.querySelector(
                 'iframe[src*="challenges.cloudflare"]'
             );
             if (iframe) {
                 const rect = iframe.getBoundingClientRect();
-                return { left: rect.left + 28, top: rect.top + rect.height / 2 };
+                return { left: rect.left + 28, top: rect.top + rect.height / 2,
+                         matched: 'iframe' };
             }
-            // Managed challenge: find the Turnstile container
-            const container = document.querySelector(
-                '[style*="display: grid"], .cf-turnstile, #turnstile-wrapper'
-            );
-            if (container) {
-                const rect = container.getBoundingClientRect();
-                // Checkbox is ~20px from left edge, vertically centered
-                return { left: rect.left + 20, top: rect.top + rect.height / 2 };
+            const selectors = [
+                '.cf-turnstile', '#turnstile-wrapper',
+                '[style*="display: grid"]', '#cf-challenge-running',
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const rect = el.getBoundingClientRect();
+                    return { left: rect.left + 20, top: rect.top + rect.height / 2,
+                             matched: sel };
+                }
             }
-            // Last resort: center of viewport
-            return {
-                left: document.documentElement.clientWidth / 2,
-                top: document.documentElement.clientHeight / 2,
-            };
+            const input = document.querySelector('input[name="cf-turnstile-response"]');
+            if (input) {
+                const parent = input.closest('.cf-turnstile') || input.parentElement;
+                if (parent) {
+                    const rect = parent.getBoundingClientRect();
+                    return { left: rect.left + 20, top: rect.top + rect.height / 2,
+                             matched: 'cf-turnstile-response parent' };
+                }
+            }
+            return null;
         }""")
         if page_coords is None:
-            logger.warning("VNC Turnstile click: no page coordinates found")
+            logger.warning(
+                "VNC click: no element found by any selector — "
+                "cannot determine click coordinates"
+            )
             return False
 
-        # Chrome height ~34px for Camoufox (per proven procedure)
         chrome_h = 34
         click_x = win_x + int(page_coords["left"])
         click_y = win_y + chrome_h + int(page_coords["top"])
 
-        logger.info("VNC Turnstile click: targeting (%d, %d)", click_x, click_y)
+        logger.info(
+            "VNC click: targeting (%d, %d) — matched '%s', "
+            "win=(%d,%d) chrome=%d page=(%.0f,%.0f)",
+            click_x, click_y, page_coords.get("matched", "?"),
+            win_x, win_y, chrome_h,
+            page_coords["left"], page_coords["top"],
+        )
 
-        # Human-like pre-click delay
         await asyncio.sleep(random.uniform(0.5, 1.5))
 
-        # Send mouse move + click via VNC protocol (trusted input).
-        # vncdo handles VNC auth (DES key derivation) internally.
-        # asyncio.create_subprocess_exec is the safe path (no shell).
-        proc = await asyncio.create_subprocess_exec(
-            "vncdo",
-            "-s", "localhost::5999",
-            "--delay=300",
+        # VNC move — separate from click (combined calls timeout).
+        # Display-number notation: 127.0.0.1:99 = port 5999.
+        move_proc = await asyncio.create_subprocess_exec(
+            "vncdo", "-s", _VNC_SERVER, "-p", _VNC_PASSWORD,
             "move", str(click_x), str(click_y),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, move_err = await asyncio.wait_for(
+                move_proc.communicate(), timeout=8,
+            )
+        except TimeoutError:
+            move_proc.kill()
+            logger.warning("VNC move timed out")
+            return False
+        if move_proc.returncode != 0:
+            err_text = move_err.decode()[:200]
+            logger.warning("VNC move failed (rc=%d): %s", move_proc.returncode, err_text)
+            if "Connection refused" in err_text or "Connection was refused" in err_text:
+                global _vnc_verified
+                _vnc_verified = False
+            return False
+
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+
+        # VNC click at current position
+        click_proc = await asyncio.create_subprocess_exec(
+            "vncdo", "-s", _VNC_SERVER, "-p", _VNC_PASSWORD,
             "click", "1",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except TimeoutError:
-            proc.kill()
-            logger.warning("VNC Turnstile click: vncdo timed out after 10s")
-            return False
-        if proc.returncode != 0:
-            global _vnc_verified
-            err_text = stderr.decode()[:200]
-            logger.warning(
-                "VNC Turnstile click: vncdo failed (rc=%d): %s",
-                proc.returncode,
-                err_text,
+            _, click_err = await asyncio.wait_for(
+                click_proc.communicate(), timeout=8,
             )
-            # Reset VNC verified flag if connection refused — infra may
-            # have died mid-session and needs restart on next attempt.
-            if "Connection refused" in err_text or "Connection was refused" in err_text:
-                _vnc_verified = False
+        except TimeoutError:
+            click_proc.kill()
+            logger.warning("VNC click timed out")
+            return False
+        if click_proc.returncode != 0:
+            err_text = click_err.decode()[:200]
+            logger.warning("VNC click failed (rc=%d): %s", click_proc.returncode, err_text)
             return False
 
-        logger.info("VNC Turnstile click sent at (%d, %d)", click_x, click_y)
+        logger.info("VNC click sent at (%d, %d)", click_x, click_y)
         return True
 
     except FileNotFoundError:
