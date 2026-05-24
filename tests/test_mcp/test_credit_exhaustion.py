@@ -2,12 +2,64 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 
-def _make_mock_service(*, rows_recent=None, rows_baseline=None):
+@dataclass(frozen=True)
+class _ProviderCfg:
+    name: str = ""
+    provider_type: str = ""
+    model_id: str = ""
+    is_free: bool = False
+    rpm_limit: int | None = None
+    open_duration_s: int = 30
+    enabled: bool = True
+    has_api_key: bool = True
+    profile: str | None = None
+    base_url: str | None = None
+    keep_alive: str | int | None = None
+
+
+@dataclass(frozen=True)
+class _CallSiteCfg:
+    id: str = ""
+    chain: list[str] = field(default_factory=list)
+    dispatch: str = "dual"
+    default_paid: bool = False
+    never_pays: bool = False
+    retry_profile: str = "default"
+
+
+@dataclass(frozen=True)
+class _RoutingCfg:
+    providers: dict = field(default_factory=dict)
+    call_sites: dict = field(default_factory=dict)
+    retry_profiles: dict = field(default_factory=dict)
+    disabled_providers: dict = field(default_factory=dict)
+
+
+def _mock_routing_config(*provider_names, sole=False):
+    """Build a mock routing config where named providers are in chains.
+
+    By default, adds a dummy fallback so providers are "active" not "sole".
+    Set sole=True to make single-provider chains.
+    """
+    providers = {}
+    for name in provider_names:
+        providers[name] = _ProviderCfg(name=name, provider_type=name)
+    if not sole:
+        providers["_fallback"] = _ProviderCfg(name="_fallback", provider_type="_fallback")
+    call_sites = {}
+    for i, name in enumerate(provider_names):
+        chain = [name] if sole else [name, "_fallback"]
+        call_sites[f"site_{i}"] = _CallSiteCfg(id=f"site_{i}", chain=chain)
+    return _RoutingCfg(providers=providers, call_sites=call_sites)
+
+
+def _make_mock_service(*, rows_recent=None, rows_baseline=None, provider_names=None):
     """Build a mock HealthDataService with a mock DB."""
     svc = MagicMock()
     svc._db = AsyncMock()
@@ -48,6 +100,16 @@ def _make_mock_service(*, rows_recent=None, rows_baseline=None):
         return update_cursor
 
     svc._db.execute = mock_execute
+
+    # Build a routing config with the provider names in chains so
+    # derive_criticality() classifies them as active (not dormant).
+    if provider_names is None:
+        provider_names = [r[0] for r in (rows_recent or [])]
+    if provider_names:
+        mock_rt = MagicMock()
+        mock_rt._routing_config = _mock_routing_config(*provider_names)
+        svc._mock_rt = mock_rt  # stash for patching
+
     return svc
 
 
@@ -57,14 +119,15 @@ async def test_credit_exhaustion_detected():
     # Provider had 100 calls, 2 errors over 7d (98% success)
     # Now has 20 calls, 15 errors in last hour (75% error rate)
     svc = _make_mock_service(
-        rows_recent=[("episodic_memory_embedding", 20, 15)],
+        rows_recent=[("deepinfra", 20, 15)],
         rows_baseline=(100, 2),
     )
 
     with patch("genesis.mcp.health_mcp._service", svc), \
          patch("genesis.mcp.health_mcp._activity_tracker", None), \
          patch("genesis.mcp.health_mcp._job_retry_registry", None), \
-         patch("genesis.mcp.health_mcp._alert_history", {}):
+         patch("genesis.mcp.health_mcp._alert_history", {}), \
+         patch("genesis.runtime.GenesisRuntime.instance", return_value=svc._mock_rt):
 
         from genesis.mcp.health.errors import _impl_health_alerts
         alerts = await _impl_health_alerts(active_only=True)
@@ -72,8 +135,8 @@ async def test_credit_exhaustion_detected():
     credit_alerts = [a for a in alerts if "credit_exhaustion" in a.get("id", "")]
     assert len(credit_alerts) == 1
     alert = credit_alerts[0]
-    assert alert["severity"] == "CRITICAL"
-    assert "episodic_memory_embedding" in alert["id"]
+    assert alert["severity"] == "WARNING"  # sole provider = WARNING (is_free=False but active, not systemic)
+    assert "deepinfra" in alert["id"]
     assert "credit" in alert["message"].lower() or "exhaustion" in alert["message"].lower()
 
 
@@ -82,14 +145,15 @@ async def test_no_alert_when_baseline_was_unhealthy():
     """No alert if the provider was already failing in the 7-day baseline."""
     # Provider had 100 calls, 30 errors over 7d (70% success — already bad)
     svc = _make_mock_service(
-        rows_recent=[("episodic_memory_embedding", 20, 15)],
+        rows_recent=[("deepinfra", 20, 15)],
         rows_baseline=(100, 30),  # >5% baseline error rate
     )
 
     with patch("genesis.mcp.health_mcp._service", svc), \
          patch("genesis.mcp.health_mcp._activity_tracker", None), \
          patch("genesis.mcp.health_mcp._job_retry_registry", None), \
-         patch("genesis.mcp.health_mcp._alert_history", {}):
+         patch("genesis.mcp.health_mcp._alert_history", {}), \
+         patch("genesis.runtime.GenesisRuntime.instance", return_value=svc._mock_rt):
 
         from genesis.mcp.health.errors import _impl_health_alerts
         alerts = await _impl_health_alerts(active_only=True)
@@ -119,8 +183,8 @@ async def test_no_alert_for_info_tier_provider():
 
 
 @pytest.mark.asyncio
-async def test_warning_severity_for_warning_tier():
-    """WARNING-tier providers get WARNING severity, not CRITICAL."""
+async def test_warning_severity_for_active_provider():
+    """Active (non-sole, non-systemic) providers get WARNING severity."""
     svc = _make_mock_service(
         rows_recent=[("web_search", 20, 15)],
         rows_baseline=(100, 2),
@@ -129,7 +193,8 @@ async def test_warning_severity_for_warning_tier():
     with patch("genesis.mcp.health_mcp._service", svc), \
          patch("genesis.mcp.health_mcp._activity_tracker", None), \
          patch("genesis.mcp.health_mcp._job_retry_registry", None), \
-         patch("genesis.mcp.health_mcp._alert_history", {}):
+         patch("genesis.mcp.health_mcp._alert_history", {}), \
+         patch("genesis.runtime.GenesisRuntime.instance", return_value=svc._mock_rt):
 
         from genesis.mcp.health.errors import _impl_health_alerts
         alerts = await _impl_health_alerts(active_only=True)
@@ -143,14 +208,15 @@ async def test_warning_severity_for_warning_tier():
 async def test_no_alert_when_recent_rate_is_low():
     """No alert if recent error rate is below 50%."""
     svc = _make_mock_service(
-        rows_recent=[("episodic_memory_embedding", 20, 5)],  # 25% error rate
+        rows_recent=[("deepinfra", 20, 5)],  # 25% error rate
         rows_baseline=(100, 2),
     )
 
     with patch("genesis.mcp.health_mcp._service", svc), \
          patch("genesis.mcp.health_mcp._activity_tracker", None), \
          patch("genesis.mcp.health_mcp._job_retry_registry", None), \
-         patch("genesis.mcp.health_mcp._alert_history", {}):
+         patch("genesis.mcp.health_mcp._alert_history", {}), \
+         patch("genesis.runtime.GenesisRuntime.instance", return_value=svc._mock_rt):
 
         from genesis.mcp.health.errors import _impl_health_alerts
         alerts = await _impl_health_alerts(active_only=True)
@@ -163,14 +229,15 @@ async def test_no_alert_when_recent_rate_is_low():
 async def test_no_alert_with_insufficient_baseline():
     """No alert if baseline has fewer than 10 calls."""
     svc = _make_mock_service(
-        rows_recent=[("episodic_memory_embedding", 20, 15)],
+        rows_recent=[("deepinfra", 20, 15)],
         rows_baseline=(5, 0),  # Only 5 baseline calls
     )
 
     with patch("genesis.mcp.health_mcp._service", svc), \
          patch("genesis.mcp.health_mcp._activity_tracker", None), \
          patch("genesis.mcp.health_mcp._job_retry_registry", None), \
-         patch("genesis.mcp.health_mcp._alert_history", {}):
+         patch("genesis.mcp.health_mcp._alert_history", {}), \
+         patch("genesis.runtime.GenesisRuntime.instance", return_value=svc._mock_rt):
 
         from genesis.mcp.health.errors import _impl_health_alerts
         alerts = await _impl_health_alerts(active_only=True)
