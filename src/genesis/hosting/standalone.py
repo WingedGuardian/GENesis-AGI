@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -231,6 +232,7 @@ class StandaloneAdapter:
             return
 
         try:
+            from genesis.channels.voice.adapter import VoiceChannelAdapter
             from genesis.channels.voice.handler import VoiceConversationHandler
             from genesis.channels.voice.sessions import VoiceSessionManager
 
@@ -243,6 +245,18 @@ class StandaloneAdapter:
 
             self._app.config["VOICE_HANDLER"] = handler
             logger.info("Voice conversation handler initialized")
+
+            # Outbound voice adapter — Genesis speaking through HA speakers
+            ha_url = os.environ.get("HA_URL", "")
+            ha_token = os.environ.get("HA_LONG_LIVED_TOKEN", "")
+            if ha_url and ha_token:
+                voice_adapter = VoiceChannelAdapter(
+                    ha_url=ha_url, ha_token=ha_token,
+                )
+                self._app.config["VOICE_ADAPTER"] = voice_adapter
+                logger.info("Voice adapter initialized (outbound TTS via HA)")
+            else:
+                logger.info("Voice adapter skipped — HA_URL or HA_LONG_LIVED_TOKEN not set")
         except Exception:
             logger.exception("Failed to initialize voice handler")
 
