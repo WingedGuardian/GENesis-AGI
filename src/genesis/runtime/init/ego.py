@@ -153,8 +153,6 @@ async def init(rt: GenesisRuntime) -> None:
             default_effort="high",
             cadence_minutes=max(config.cadence_minutes, 60),
             morning_report_enabled=False,
-            ego_thinking_budget_usd=2.0,
-            ego_dispatch_budget_usd=1.0,
         )
 
         # NOTE: "8_genesis_ego_compaction" is an OBSERVABILITY LABEL only

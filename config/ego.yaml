@@ -21,10 +21,6 @@ morning_report_effort: low   # effort for morning reports
 board_size: 3                # max active proposals on the bulletin board
 batch_digest: true           # send proposals as batch (vs individual)
 
-# Budget
-ego_thinking_budget_usd: 10.0  # daily cap for ego cycle (thinking) costs — shadow API pricing, not real spend on subscription
-ego_dispatch_budget_usd: 2.50 # daily cap for dispatched background sessions
-
 # Morning report
 morning_report_hour: 8       # 24h format, local time
 morning_report_minute: 0

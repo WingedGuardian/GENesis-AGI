@@ -125,7 +125,7 @@ def dispatcher(db):
 
 @pytest.fixture
 def config():
-    return EgoConfig(ego_thinking_budget_usd=10.0, ego_dispatch_budget_usd=5.0)
+    return EgoConfig()
 
 
 @pytest.fixture
@@ -195,21 +195,6 @@ class TestEgoSession:
 
         call_args = mock_invoker.run.call_args_list[0][0][0]
         assert "MORNING REPORT" in call_args.prompt
-
-    async def test_run_cycle_budget_exceeded(
-        self, ego_session, mock_invoker, db, config,
-    ):
-        """Cycle raises BudgetExceededError when budget is exceeded."""
-        from genesis.ego.session import BudgetExceededError
-
-        # Insert a costly cycle to exhaust budget
-        await ego_crud.create_cycle(
-            db, id="expensive", output_text="x",
-            cost_usd=config.ego_thinking_budget_usd + 1.0,
-        )
-        with pytest.raises(BudgetExceededError):
-            await ego_session.run_cycle()
-        mock_invoker.run.assert_not_called()
 
     async def test_run_cycle_cc_error(
         self, ego_session, mock_invoker, mock_session_manager,
@@ -438,19 +423,6 @@ class TestProcessExecutionBriefs:
 
         # Proposal unchanged (no runner to dispatch)
         prop = await ego_crud.get_proposal(db, "prop_005")
-        assert prop["status"] == "approved"
-
-    async def test_dispatch_budget_exceeded(self, ego_with_runner, mock_direct_runner, db, config):
-        """Dispatch budget exhausted → no spawns."""
-        config.ego_dispatch_budget_usd = 0.0  # Exhausted
-        await self._insert_proposal(db, "prop_006")
-
-        briefs = [{"proposal_id": "prop_006", "prompt": "Do the thing"}]
-        await ego_with_runner._process_execution_briefs(briefs)
-
-        mock_direct_runner.spawn.assert_not_called()
-        # Proposal unchanged
-        prop = await ego_crud.get_proposal(db, "prop_006")
         assert prop["status"] == "approved"
 
     async def test_profile_mapping(self, ego_with_runner, mock_direct_runner, db):

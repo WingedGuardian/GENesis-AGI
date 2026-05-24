@@ -749,6 +749,30 @@ async def daily_dispatch_cost(
         return 0.0
 
 
+async def rolling_daily_ego_cost(
+    db: aiosqlite.Connection,
+    *,
+    days: int = 7,
+) -> float:
+    """Average daily ego cycle cost over the last N days.
+
+    Returns 0.0 if no cycles found. Used for observational display only.
+    """
+    from datetime import timedelta
+
+    end_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    start_date = (datetime.now(UTC) - timedelta(days=days)).strftime("%Y-%m-%d")
+    async with db.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ego_cycles "
+        "WHERE created_at >= ? || 'T00:00:00' "
+        "AND created_at < ? || 'T00:00:00'",
+        (start_date, end_date),
+    ) as cur:
+        row = await cur.fetchone()
+        total = float(row[0]) if row else 0.0
+    return round(total / max(days, 1), 4)
+
+
 # ---------------------------------------------------------------------------
 # ego_directives
 # ---------------------------------------------------------------------------
