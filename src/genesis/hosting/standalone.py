@@ -93,6 +93,9 @@ class StandaloneAdapter:
         # wiring (TTS, reply waiter, etc.).
         self._init_openclaw_conversation_loop()
 
+        # Voice conversation handler — lightweight path for HA voice
+        self._init_voice_handler()
+
         # Flask in daemon thread
         flask_thread = threading.Thread(
             target=self._run_flask,
@@ -212,6 +215,37 @@ class StandaloneAdapter:
         except Exception:
             logger.exception("Failed to initialize OpenClaw ConversationLoop")
 
+    def _init_voice_handler(self) -> None:
+        """Create VoiceConversationHandler for the voice API endpoint.
+
+        Stored in Flask app config so the voice_api blueprint can access
+        it from request context.  Does NOT register with outreach pipeline
+        (Finding 5 from architecture review — avoids 3am TTS side effects).
+        """
+        if self._app is None or self._runtime is None:
+            return
+
+        rt = self._runtime
+        if rt.hybrid_retriever is None or rt.router is None:
+            logger.warning("Memory retriever or router unavailable — voice handler skipped")
+            return
+
+        try:
+            from genesis.channels.voice.handler import VoiceConversationHandler
+            from genesis.channels.voice.sessions import VoiceSessionManager
+
+            session_manager = VoiceSessionManager()
+            handler = VoiceConversationHandler(
+                retriever=rt.hybrid_retriever,
+                router=rt.router,
+                session_manager=session_manager,
+            )
+
+            self._app.config["VOICE_HANDLER"] = handler
+            logger.info("Voice conversation handler initialized")
+        except Exception:
+            logger.exception("Failed to initialize voice handler")
+
     def _create_flask_app(self) -> Flask:
         """Create Flask app with vendored static assets."""
         webui_dir = _WEBUI_DIR if _WEBUI_DIR.exists() else None
@@ -322,6 +356,16 @@ class StandaloneAdapter:
             OpenClawAdapter().register_blueprints(app)
         except Exception:
             logger.exception("OpenClaw adapter registration failed")
+
+        # Voice API blueprint
+        try:
+            from genesis.dashboard.routes.voice_api import voice_api_bp
+
+            if "voice_api" not in app.blueprints:
+                app.register_blueprint(voice_api_bp)
+                logger.info("Voice API blueprint registered")
+        except Exception:
+            logger.exception("Failed to register voice API blueprint")
 
     def _run_flask(self) -> None:
         """Run Flask in a thread (called from daemon thread)."""

@@ -49,6 +49,7 @@ class ChannelType(StrEnum):
     TELEGRAM = "telegram"
     WHATSAPP = "whatsapp"
     WEB = "web"
+    VOICE = "voice"
 
 
 class CCModel(StrEnum):
