@@ -242,10 +242,13 @@ async def run(
 # ── Phase 1: Scroll and Group ────────────────────────────────────────────
 
 
-async def _scroll_and_group(
+def _scroll_and_group_sync(
     qdrant: QdrantClient,
 ) -> dict[tuple[str, str], list[dict]]:
     """Scroll all episodic_memory points, group by (wing, room).
+
+    Synchronous — runs in a thread pool via ``_scroll_and_group()`` so
+    the blocking Qdrant I/O never starves the async event loop.
 
     Skips already-deprecated points.
     """
@@ -277,10 +280,17 @@ async def _scroll_and_group(
     return buckets
 
 
+async def _scroll_and_group(
+    qdrant: QdrantClient,
+) -> dict[tuple[str, str], list[dict]]:
+    """Async wrapper — offloads blocking Qdrant scroll I/O to thread pool."""
+    return await asyncio.to_thread(_scroll_and_group_sync, qdrant)
+
+
 # ── Phase 2: Cluster ────────────────────────────────────────────────────
 
 
-async def _cluster_bucket(
+def _cluster_bucket_sync(
     qdrant: QdrantClient,
     points: list[dict],
     wing: str,
@@ -289,6 +299,9 @@ async def _cluster_bucket(
     threshold: float,
 ) -> list[list[dict]]:
     """Find connected components of similar memories within a (wing, room) bucket.
+
+    Synchronous — runs in a thread pool via ``_cluster_bucket()`` so the
+    blocking Qdrant search I/O never starves the async event loop.
 
     For each point, searches Qdrant for neighbors above threshold,
     then extracts connected components via union-find.
@@ -332,15 +345,11 @@ async def _cluster_bucket(
             if score >= threshold:
                 uf.union(pid, nid)
 
-        # Yield to the event loop periodically so other coroutines
-        # (health probes, scheduler heartbeats) stay alive.
-        if (idx + 1) % _YIELD_EVERY == 0:
-            if (idx + 1) % 100 == 0:
-                logger.info(
-                    "Bucket (%s, %s): searched %d/%d points",
-                    wing, room, idx + 1, n_points,
-                )
-            await asyncio.sleep(0)
+        if (idx + 1) % 100 == 0:
+            logger.info(
+                "Bucket (%s, %s): searched %d/%d points",
+                wing, room, idx + 1, n_points,
+            )
 
     # Extract components with >= 2 members
     clusters: list[list[dict]] = []
@@ -355,6 +364,20 @@ async def _cluster_bucket(
                 clusters.append(cluster)
 
     return clusters
+
+
+async def _cluster_bucket(
+    qdrant: QdrantClient,
+    points: list[dict],
+    wing: str,
+    room: str,
+    *,
+    threshold: float,
+) -> list[list[dict]]:
+    """Async wrapper — offloads blocking Qdrant search I/O to thread pool."""
+    return await asyncio.to_thread(
+        _cluster_bucket_sync, qdrant, points, wing, room, threshold=threshold,
+    )
 
 
 def _batch_get_vectors(
