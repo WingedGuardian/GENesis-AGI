@@ -214,7 +214,7 @@ class TestUserJobScheduler:
         assert len(jobs) == 1
         assert jobs[0].id.startswith("user_job:")
 
-        scheduler.stop()
+        await scheduler.stop()
         assert not scheduler.is_running
 
     @pytest.mark.asyncio
@@ -243,7 +243,7 @@ class TestUserJobScheduler:
         assert job["status"] == "active"
         assert len(scheduler._scheduler.get_jobs()) == 1
 
-        scheduler.stop()
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_add_and_remove(self, db) -> None:
@@ -271,7 +271,7 @@ class TestUserJobScheduler:
         job = await crud.get_job(db, job_id)
         assert job is None
 
-        scheduler.stop()
+        await scheduler.stop()
 
     @pytest.mark.asyncio
     async def test_invalid_cron_does_not_crash(self, db) -> None:
@@ -289,4 +289,4 @@ class TestUserJobScheduler:
         # The invalid job should not be registered
         assert len(scheduler._scheduler.get_jobs()) == 0
 
-        scheduler.stop()
+        await scheduler.stop()

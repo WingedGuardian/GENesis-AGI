@@ -55,7 +55,7 @@ class UserJobScheduler:
         self._scheduler.start()
         logger.info("User job scheduler started with %d active job(s)", len(jobs))
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Shut down the APScheduler."""
         if self._scheduler and self._scheduler.running:
             self._scheduler.shutdown(wait=False)
@@ -149,6 +149,7 @@ class UserJobScheduler:
             logger.error("User job %s not found for dispatch", job_id[:8])
             return None
 
+        run_id: str | None = None
         try:
             from genesis.cc.direct_session import DirectSessionRequest
             from genesis.cc.types import CCModel, EffortLevel
@@ -197,20 +198,25 @@ class UserJobScheduler:
 
         except Exception as exc:
             logger.exception("User job dispatch failed for %s", job_id[:8])
-            # Record failure
+            # Record failure — reuse existing run_id if we already started one
             try:
-                run_id_var = await crud.record_run_start(self._db, job_id=job_id)
-                await crud.record_run_complete(
-                    self._db, run_id_var, status="failed",
-                    error_message=str(exc),
-                )
+                if run_id:
+                    await crud.record_run_complete(
+                        self._db, run_id, status="failed",
+                        error_message=str(exc),
+                    )
+                else:
+                    run_id = await crud.record_run_start(self._db, job_id=job_id)
+                    await crud.record_run_complete(
+                        self._db, run_id, status="failed",
+                        error_message=str(exc),
+                    )
             except Exception:
                 logger.debug("Failed to record run failure", exc_info=True)
 
-            try:
+            with contextlib.suppress(Exception):
+                from genesis.runtime import GenesisRuntime
                 rt = GenesisRuntime.instance()
                 rt.record_job_failure(f"user_job:{job_id[:8]}", str(exc))
-            except Exception:
-                pass
 
             return None

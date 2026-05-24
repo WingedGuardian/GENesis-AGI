@@ -50,6 +50,25 @@ async def user_job_create(
     if _scheduler is None:
         return {"error": "User job scheduler not initialized"}
 
+    # Validate inputs before persisting
+    _VALID_PROFILES = {"observe", "interact", "research"}
+    _VALID_MODELS = {"sonnet", "opus", "haiku"}
+    _VALID_EFFORTS = {"low", "medium", "high"}
+
+    if profile not in _VALID_PROFILES:
+        return {"error": f"Invalid profile '{profile}'. Must be one of: {', '.join(sorted(_VALID_PROFILES))}"}
+    if model not in _VALID_MODELS:
+        return {"error": f"Invalid model '{model}'. Must be one of: {', '.join(sorted(_VALID_MODELS))}"}
+    if effort not in _VALID_EFFORTS:
+        return {"error": f"Invalid effort '{effort}'. Must be one of: {', '.join(sorted(_VALID_EFFORTS))}"}
+
+    # Validate cron expression
+    try:
+        from apscheduler.triggers.cron import CronTrigger
+        CronTrigger.from_crontab(cron_expression)
+    except (ValueError, KeyError) as e:
+        return {"error": f"Invalid cron expression '{cron_expression}': {e}"}
+
     from genesis.db.crud import user_jobs as crud
 
     try:
@@ -157,7 +176,7 @@ async def user_job_control(
         logger.error("User job control failed: %s", exc, exc_info=True)
         return {"error": f"Failed to {action} job: {exc}"}
 
-    return {"error": "Unknown action"}
+    return {"error": "Unknown action"}  # pragma: no cover — guarded by valid_actions check
 
 
 @mcp.tool()
