@@ -579,6 +579,31 @@ async def _ensure_vnc():
         nonlocal started
         import subprocess as _sp
 
+        # Kill stale x11vnc processes that hold port 5900 and prevent
+        # the systemd service from starting (common after session restart).
+        try:
+            r = _sp.run(
+                ["fuser", "5900/tcp"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.stdout.strip():
+                # Port is held — check if it's the systemd-managed process
+                svc = _sp.run(
+                    ["systemctl", "--user", "is-active", "genesis-vnc"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if svc.stdout.strip() != "active":
+                    # Stale process — kill it so systemd can bind
+                    _sp.run(
+                        ["fuser", "-k", "5900/tcp"],
+                        capture_output=True, timeout=3,
+                    )
+                    logger.info("Killed stale process holding VNC port 5900")
+                    import time
+                    time.sleep(1)
+        except FileNotFoundError:
+            pass  # fuser not available, proceed anyway
+
         try:
             r = _sp.run(
                 ["systemctl", "--user", "is-active", "genesis-vnc"],
@@ -1206,21 +1231,16 @@ async def _detect_challenge(page) -> bool:
 async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
     """Detect and handle Cloudflare challenge (Turnstile or managed).
 
-    Phase 1 (auto-resolve): Polls for up to ``timeout_ms`` for the challenge
-    to resolve automatically.  Trusted browsers on residential IPs typically
-    auto-resolve in 3-5 seconds.
+    Phase 1 (auto-resolve): Polls for ``timeout_ms`` for automatic resolution.
 
-    Phase 2 (VNC click): Sends a real mouse click through VNC protocol
-    during the checkbox window.  The Turnstile widget cycles between
-    spinner (~10s) and checkbox (~30-60s) phases — clicks must land
-    during the checkbox phase.  Up to 3 attempts.
+    Phase 2 (VNC click): Sends real mouse clicks through VNC during the
+    checkbox window.  If VNC fails (connection refused), repairs VNC infra
+    and retries.  Up to 3 rounds of: wait-for-checkbox → click → poll.
 
-    Phase 2.5 (reload): If VNC clicks fail, reloads the page.  Research
-    shows this predictably escalates from spinner to interactive checkbox.
+    Phase 3 (reload + retry): Reloads the page (triggers different challenge
+    variant) then repeats VNC click.
 
-    Phase 3 (human escalation): Sends a Telegram alert and polls for up to
-    5 minutes.  The browser is always headed on :99, so the human can see
-    and interact immediately.
+    No human escalation — Genesis handles this itself.
 
     Returns None if no challenge detected, or a status dict.
     """
@@ -1239,18 +1259,15 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 2: VNC click — checkbox-aware with retry
-        # The Turnstile widget cycles: spinner (~10s) → checkbox (~30-60s).
-        # We must click during the checkbox window, not during spinner.
+        # Phase 2: VNC click — with self-repair on failure
         logger.warning(
             "Challenge did NOT auto-resolve in %dms — trying VNC click",
             timeout_ms,
         )
+        vnc_failed_count = 0
         for attempt in range(1, 4):  # up to 3 attempts
-            # Wait for spinner to finish (checkbox to appear)
-            for _ in range(10):  # poll every 2s for up to 20s
-                # Check if challenge already resolved (e.g., auto-resolved
-                # during a re-evaluation cycle)
+            # Brief wait for checkbox to appear (spinner → checkbox cycle)
+            for _ in range(5):  # poll every 2s for up to 10s
                 if await _poll_turnstile_token(page, 1, 0.5):
                     logger.info(
                         "Challenge resolved during wait (attempt %d)", attempt,
@@ -1258,15 +1275,16 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
                     await asyncio.sleep(random.uniform(1.0, 3.0))
                     return {"status": "resolved", "method": "auto_delayed"}
 
-                # Check if we're still on a challenge page
                 if not await _detect_challenge(page):
-                    logger.info("Challenge page gone — resolved externally")
+                    logger.info("Challenge page gone — resolved")
                     return {"status": "resolved", "method": "external"}
 
                 await asyncio.sleep(2)
 
             # Attempt VNC click
-            if await _vnc_click_turnstile(page):
+            click_ok = await _vnc_click_turnstile(page)
+            if click_ok:
+                vnc_failed_count = 0  # reset on success
                 if await _poll_turnstile_token(page, 15, 1.0):
                     logger.info(
                         "Challenge resolved via VNC click (attempt %d)",
@@ -1279,31 +1297,48 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
                     attempt,
                 )
             else:
-                logger.warning("VNC click attempt %d failed to send", attempt)
+                vnc_failed_count += 1
+                logger.warning(
+                    "VNC click attempt %d failed — repairing VNC infra",
+                    attempt,
+                )
+                # Self-repair: reset VNC verified flag and re-ensure
+                global _vnc_verified
+                _vnc_verified = False
+                await _ensure_vnc()
+                if vnc_failed_count >= 2:
+                    # VNC is persistently broken — skip to reload
+                    logger.warning("VNC persistently failing — skipping to reload")
+                    break
 
-        # Phase 2.5: Reload and retry — triggers different challenge variant
-        logger.info("VNC clicks exhausted — trying page reload")
+        # Phase 3: Reload and retry with fresh VNC clicks
+        logger.info("Trying page reload to trigger different challenge variant")
         try:
             await page.reload(wait_until="domcontentloaded", timeout=15000)
             await asyncio.sleep(2)
             if await _poll_turnstile_token(page, 15, 1.0):
                 logger.info("Challenge resolved after reload")
                 return {"status": "resolved", "method": "reload"}
+
+            # Post-reload VNC click attempts
+            for attempt in range(1, 3):
+                await asyncio.sleep(5)  # let new challenge render
+                if (
+                    await _vnc_click_turnstile(page)
+                    and await _poll_turnstile_token(page, 15, 1.0)
+                ):
+                    logger.info(
+                        "Challenge resolved via VNC click after reload "
+                        "(attempt %d)", attempt,
+                    )
+                    return {"status": "resolved", "method": "vnc_click_reload"}
         except Exception:
             logger.debug("Reload failed", exc_info=True)
 
-        # Phase 3: human escalation (last resort)
-        logger.warning(
-            "Challenge NOT resolved via VNC/reload — escalating to human"
-        )
+        # Final: send a Telegram notification but keep the result as blocked
+        # so the caller knows the challenge was not resolved.
+        logger.warning("Challenge NOT resolved after all attempts")
         await _send_turnstile_alert(page.url)
-
-        if await _poll_turnstile_token(page, 300, 5.0):  # 5 minutes
-            logger.info("Challenge resolved by human intervention")
-            await asyncio.sleep(random.uniform(1.0, 2.0))
-            return {"status": "resolved", "method": "human"}
-
-        logger.warning("Challenge NOT resolved after 5 min escalation")
         return {"status": "blocked", "method": "timeout"}
     except Exception as e:
         logger.debug("Challenge detection error: %s", e)
