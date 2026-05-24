@@ -240,9 +240,9 @@ call_sites:
     retry_profile: background
   4_light_reflection:
     chain:
+    - gemini-free
     - groq-free
     - mistral-large-free
-    - gemini-free
     default_paid: false
     never_pays: true
   5_deep_reflection:

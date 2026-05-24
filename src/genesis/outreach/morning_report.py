@@ -22,6 +22,33 @@ _INTERNAL_OBS_TYPES = tuple(_INTERNAL_OBS_TYPES_SET)
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "MORNING_REPORT.md"
 
 
+def _relative_age(iso_ts: str) -> str:
+    """Convert an ISO timestamp to a human-readable relative age string."""
+    if not iso_ts:
+        return "unknown age"
+    try:
+        ts = datetime.fromisoformat(iso_ts)
+        delta = datetime.now(UTC) - ts
+        total_s = delta.total_seconds()
+        if total_s < 0:
+            return "just now"
+        if total_s < 3600:
+            return f"{int(total_s / 60)}m ago"
+        if total_s < 86400:
+            return f"{total_s / 3600:.0f}h ago"
+        return f"{total_s / 86400:.0f}d ago"
+    except (ValueError, TypeError):
+        return "unknown age"
+
+
+def _age_seconds(iso_ts: str) -> float:
+    """Return seconds since the given ISO timestamp, or 0 on error."""
+    try:
+        return (datetime.now(UTC) - datetime.fromisoformat(iso_ts)).total_seconds()
+    except (ValueError, TypeError):
+        return 0
+
+
 class MorningReportGenerator:
     """Synthesizes system state into a daily morning report."""
 
@@ -37,6 +64,7 @@ class MorningReportGenerator:
         self._db = db
         self._drafter = drafter
         self._event_bus = event_bus
+        self._pending_surface_ids: list[str] = []
 
     async def generate(self) -> OutreachRequest:
         context = await self._assemble_context()
@@ -65,6 +93,25 @@ class MorningReportGenerator:
             salience_score=0.0,
             signal_type="morning_report",
         )
+
+    async def confirm_delivery(self) -> None:
+        """Mark observations as surfaced after successful delivery.
+
+        Called by the scheduler after the pipeline confirms delivery.
+        Observations collected during generate() are only marked surfaced
+        here — if delivery fails, they re-appear in the next report.
+
+        Only calls mark_surfaced — retrieved/influenced tracking is
+        handled by _get_activity_summary to avoid double-counting.
+        """
+        ids = self._pending_surface_ids
+        if not ids:
+            return
+        from genesis.db.crud.observations import mark_surfaced
+
+        now = datetime.now(UTC).isoformat()
+        await mark_surfaced(self._db, ids, now)
+        self._pending_surface_ids = []
 
     @staticmethod
     def _load_system_prompt() -> str | None:
@@ -142,6 +189,14 @@ class MorningReportGenerator:
         except Exception:
             logger.warning("Morning report: observation insights unavailable", exc_info=True)
 
+        # 9. Standing Items (observations surfaced 3+ times, still unresolved)
+        try:
+            standing = await self._get_standing_items()
+            if standing:
+                sections.append(f"## Standing Items\n{standing}")
+        except Exception:
+            logger.warning("Morning report: standing items unavailable", exc_info=True)
+
         return "\n\n".join(sections)
 
     async def _emit_warning(self, section: str, message: str) -> None:
@@ -178,6 +233,16 @@ class MorningReportGenerator:
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:
             lines.append(f"- **Embedding queue elevated**: {pending_embed} pending")
+        # Top cost drivers (data already in the snapshot, just not displayed)
+        by_provider = cost.get("cost_by_provider", [])
+        if by_provider:
+            top = [
+                f"{p['provider']}: ${p['month_usd']:.2f}"
+                for p in by_provider[:3]
+                if p.get("month_usd", 0) > 0.01
+            ]
+            if top:
+                lines.append(f"- Top cost drivers (month): {', '.join(top)}")
         return "\n".join(lines)
 
     async def _get_activity_summary(self) -> str:
@@ -270,8 +335,12 @@ class MorningReportGenerator:
             "'Genesis is tracking N internal items.' Skip entirely if nothing\n"
             "requires user awareness.\n"
         )
-        entries = "\n".join(f"- [{r[0]}] {r[1][:300]} (as of {r[2]})" for r in rows)
-        return header + "\n" + entries
+        entry_lines = []
+        for r in rows:
+            age = _relative_age(r[2])
+            aging_tag = " [AGING]" if _age_seconds(r[2]) > 43200 else ""  # >12h
+            entry_lines.append(f"- [{r[0]}]{aging_tag} {r[1][:300]} ({age})")
+        return header + "\n" + "\n".join(entry_lines)
 
     async def _get_pending_items(self) -> str:
         lines: list[str] = []
@@ -452,17 +521,11 @@ class MorningReportGenerator:
     async def _get_observation_insights(self) -> str | None:
         """Surface unsurfaced observations that deserve user attention.
 
-        Returns None if no unsurfaced observations exist. Marks delivered
-        observations as surfaced to prevent re-delivery.
+        Returns None if no unsurfaced observations exist. Observation IDs
+        are collected in _pending_surface_ids and confirmed via
+        confirm_delivery() after successful pipeline delivery.
         """
-        from datetime import UTC, datetime
-
-        from genesis.db.crud.observations import (
-            get_unsurfaced,
-            increment_retrieved_batch,
-            mark_influenced_batch,
-            mark_surfaced,
-        )
+        from genesis.db.crud.observations import get_unsurfaced
 
         observations = await get_unsurfaced(
             self._db,
@@ -478,15 +541,36 @@ class MorningReportGenerator:
             prio = obs["priority"]
             badge = {"critical": "🔴", "high": "🟠", "medium": "🟡"}.get(prio, "")
             content = obs["content"][:200].replace("\n", " ")
-            lines.append(f"- {badge} **{prio}**: {content}")
+            age = _relative_age(obs.get("created_at", ""))
+            lines.append(f"- {badge} **{prio}** ({age}): {content}")
 
-        # Mark surfaced during assembly (before delivery confirmation).
-        # Trade-off: if delivery fails, these observations won't re-surface.
-        # Acceptable for v1 — the dashboard can always show them.
-        ids = [obs["id"] for obs in observations]
-        now = datetime.now(UTC).isoformat()
-        await mark_surfaced(self._db, ids, now)
-        await increment_retrieved_batch(self._db, ids)
-        await mark_influenced_batch(self._db, ids)
+        # Defer surfacing until delivery is confirmed via confirm_delivery().
+        # If delivery fails, these observations re-appear in the next report.
+        self._pending_surface_ids = [obs["id"] for obs in observations]
 
+        return "\n".join(lines)
+
+    async def _get_standing_items(self) -> str | None:
+        """Return observations surfaced 3+ times but still unresolved.
+
+        These are known conditions — demoted to end of report.
+        """
+        from genesis.db.crud.observations import get_standing
+
+        items = await get_standing(
+            self._db,
+            priority_filter=("critical", "high", "medium"),
+            exclude_types=_INTERNAL_OBS_TYPES,
+            threshold=3,
+            limit=5,
+        )
+        if not items:
+            return None
+
+        lines = []
+        for obs in items:
+            content = obs["content"][:150].replace("\n", " ")
+            count = obs.get("surfaced_count", 0)
+            age = _relative_age(obs.get("created_at", ""))
+            lines.append(f"- {content} (surfaced {count}x, {age})")
         return "\n".join(lines)

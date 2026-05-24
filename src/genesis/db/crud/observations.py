@@ -539,16 +539,67 @@ async def mark_surfaced(
     ids: list[str],
     surfaced_at: str,
 ) -> int:
-    """Mark observations as surfaced. Returns count updated."""
+    """Mark observations as surfaced and increment surfaced_count.
+
+    Uses COALESCE to preserve the original surfaced_at timestamp on
+    re-surfacing while always incrementing the count.
+    """
     if not ids:
         return 0
     placeholders = ",".join("?" for _ in ids)
     cursor = await db.execute(
-        f"UPDATE observations SET surfaced_at = ? WHERE id IN ({placeholders})",
+        f"UPDATE observations SET surfaced_at = COALESCE(surfaced_at, ?), "
+        f"surfaced_count = surfaced_count + 1 "
+        f"WHERE id IN ({placeholders})",
         [surfaced_at, *ids],
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def get_standing(
+    db: aiosqlite.Connection,
+    *,
+    priority_filter: tuple[str, ...] = ("critical", "high", "medium"),
+    exclude_types: tuple[str, ...] | frozenset[str] = (),
+    threshold: int = 3,
+    limit: int = 5,
+) -> list[dict]:
+    """Return observations surfaced >= threshold times but still unresolved.
+
+    These are "standing items" — known conditions that have been brought
+    to attention multiple times without being resolved.
+    """
+    prio_placeholders = ",".join("?" for _ in priority_filter)
+    sql = (
+        "SELECT id, source, type, category, content, priority, "
+        "created_at, surfaced_count "
+        f"FROM observations WHERE surfaced_count >= ? AND resolved = 0 "
+        f"AND priority IN ({prio_placeholders})"
+    )
+    params: list = [threshold, *priority_filter]
+    if exclude_types:
+        type_placeholders = ",".join("?" for _ in exclude_types)
+        sql += f" AND type NOT IN ({type_placeholders})"
+        params.extend(exclude_types)
+    sql += (
+        " ORDER BY CASE priority "
+        "  WHEN 'critical' THEN 0 WHEN 'high' THEN 1 "
+        "  WHEN 'medium' THEN 2 ELSE 3 END, "
+        "surfaced_count DESC, created_at DESC "
+        "LIMIT ?"
+    )
+    params.append(limit)
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    return [
+        {
+            "id": r[0], "source": r[1], "type": r[2], "category": r[3],
+            "content": r[4], "priority": r[5], "created_at": r[6],
+            "surfaced_count": r[7],
+        }
+        for r in rows
+    ]
 
 
 async def unsurfaced_counts_by_priority(db: aiosqlite.Connection) -> dict[str, int]:

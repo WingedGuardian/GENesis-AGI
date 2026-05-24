@@ -160,7 +160,11 @@ class ContextAssembler:
             except Exception:
                 logger.debug("Could not load signal_weights for Micro filtering")
 
-        signals_text = self._format_signals(tick, excluded_signals=excluded_signals)
+        # For Light reflections, filter out zero-value bootstrap placeholder signals
+        _min_val = 0.001 if depth == Depth.LIGHT else 0.0
+        signals_text = self._format_signals(
+            tick, excluded_signals=excluded_signals, min_value=_min_val,
+        )
         tick_number = self._extract_tick_number(tick)
 
         user_profile = None
@@ -431,12 +435,15 @@ class ContextAssembler:
         self,
         tick: TickResult,
         excluded_signals: set[str] | None = None,
+        min_value: float = 0.0,
     ) -> str:
         staleness = tick.signal_staleness or {}
         tick_interval_min = 5  # awareness loop tick interval
         lines = []
         for s in tick.signals:
             if excluded_signals is not None and s.name in excluded_signals:
+                continue
+            if min_value > 0 and s.value <= min_value:
                 continue
             line = f"{s.name}: {s.value} (source={s.source})"
             if s.normal_max is not None:

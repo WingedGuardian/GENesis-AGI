@@ -45,6 +45,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ── Signal change detection for Light reflections ─────────────────────
+# Signals whose changes indicate something actionable happened.
+# Continuous-drift noise (container_memory_pct, micro_count_since_light,
+# time_since_last_strategic, light_count_since_deep, budget_pct_consumed,
+# user_session_pattern) is excluded.
+# NOTE: software_error_spike and critical_failure primarily drive Micro
+# scoring, but they're included here because if they change 0→1, we want
+# the Light gate to open so the anomaly focus path can fire.
+_MATERIAL_SIGNALS = frozenset({
+    "software_error_spike", "critical_failure", "sentinel_activity",
+    "guardian_activity", "conversations_since_reflection",
+    "stale_browser_processes", "stale_pending_items",
+    "autonomy_activity", "genesis_version_changed",
+})
+
+_last_light_signals: dict[str, float] | None = None
+
+
+def _signals_materially_changed(tick, *, threshold: float = 0.05) -> bool:
+    """Check if any material signal changed since the last light reflection."""
+    global _last_light_signals  # noqa: PLW0603
+    current = {s.name: s.value for s in tick.signals if s.name in _MATERIAL_SIGNALS}
+    if _last_light_signals is None:
+        return True  # first run after restart — always allow
+    return any(
+        abs(current.get(k, 0) - _last_light_signals.get(k, 0)) >= threshold
+        for k in _MATERIAL_SIGNALS
+    )
+
+
+def _update_light_signal_snapshot(tick) -> None:
+    """Update the saved signal snapshot after a successful light dispatch."""
+    global _last_light_signals  # noqa: PLW0603
+    _last_light_signals = {s.name: s.value for s in tick.signals if s.name in _MATERIAL_SIGNALS}
+
 
 _DEPTH_MODEL = {
     Depth.LIGHT: CCModel.HAIKU,
@@ -201,6 +236,11 @@ class CCReflectionBridge:
         skip_approval: bool = False,
     ) -> ReflectionResult:
         """Run Deep or Strategic reflection via CC background session."""
+        # Light reflection: skip if no material signals changed since last dispatch
+        if depth == Depth.LIGHT and not _signals_materially_changed(tick):
+            logger.info("Light reflection skipped — no material signal change")
+            return ReflectionResult(success=True, reason="no_material_change")
+
         # Check CC budget before proceeding
         throttle_result = await self._check_throttle(priority=2, work_type="reflection")
         if throttle_result is not None:
@@ -449,6 +489,10 @@ class CCReflectionBridge:
                 success=False,
                 reason=f"{depth.value} reflection output was unparseable or empty — recorded as failure",
             )
+
+        # Update signal snapshot after successful Light reflection
+        if depth == Depth.LIGHT:
+            _update_light_signal_snapshot(tick)
 
         return ReflectionResult(
             success=True,

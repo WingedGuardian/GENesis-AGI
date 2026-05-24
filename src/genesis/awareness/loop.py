@@ -10,6 +10,7 @@ via DeferredTask, matching AZ's job_loop.py pattern. Phase 1 tests run standalon
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -878,6 +879,14 @@ class AwarenessLoop:
         if depth == Depth.LIGHT and self._cc_reflection_bridge is None and self._reflection_engine is not None:
             try:
                 await self._reflection_engine.reflect(depth, result, db=db)
+                # Emit reflection heartbeat so subsystem_heartbeats doesn't
+                # report overdue when only the API path fires.
+                if self._event_bus:
+                    with contextlib.suppress(Exception):
+                        await self._event_bus.emit(
+                            Subsystem.REFLECTION, Severity.DEBUG,
+                            "heartbeat", "light-reflection completed (API)",
+                        )
             except Exception:
                 logger.exception("Light reflection fallback (API) failed for tick %s", tick_id)
                 if self._deferred_queue:
@@ -913,6 +922,16 @@ class AwarenessLoop:
                         await awareness_ticks.mark_dispatched(db, tick_id)
                     except Exception:
                         logger.warning("Failed to mark tick %s dispatched", tick_id[:8])
+                    # Emit reflection heartbeat so subsystem_heartbeats
+                    # tracks Light/Deep/Strategic dispatches, not just
+                    # micro-reflection anomaly ticks and weekly jobs.
+                    if self._event_bus:
+                        with contextlib.suppress(Exception):
+                            await self._event_bus.emit(
+                                Subsystem.REFLECTION, Severity.DEBUG,
+                                "heartbeat",
+                                f"{depth.value.lower()}-reflection completed",
+                            )
                 # Fix 3B: resolve escalation AFTER successful dispatch
                 if result.escalation_pending_id and depth == Depth.DEEP:
                     await self._resolve_escalation(result.escalation_pending_id, result.timestamp)

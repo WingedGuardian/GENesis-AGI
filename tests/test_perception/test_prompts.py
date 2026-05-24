@@ -105,7 +105,7 @@ def test_light_focus_area_rotation():
         results_quiet.add(_light_focus_area(tick))
     assert results_quiet == {"situation", "user_impact"}
 
-    # With a critical signal, anomaly can fire.
+    # With a critical signal, anomaly fires on every tick (event-driven).
     results_critical = set()
     critical_signal = SignalReading(
         name="software_error_spike", value=1.0, source="test",
@@ -119,7 +119,7 @@ def test_light_focus_area_rotation():
             classified_depth=Depth.LIGHT, trigger_reason="test",
         )
         results_critical.add(_light_focus_area(tick))
-    assert results_critical == {"situation", "user_impact", "anomaly"}
+    assert results_critical == {"anomaly"}
 
 
 def test_variable_substitution():

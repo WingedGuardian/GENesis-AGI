@@ -92,6 +92,10 @@ Use these sections in order. Skip any that are empty/normal:
    noting. Only include genuinely useful insights.
 4. **System Health** — one line if normal. Detail only if something broke.
 5. **Open Items** — pending items requiring user input (inbox, approvals)
+6. **Standing Items** — only if provided. These are known conditions
+   surfaced 3+ times without being resolved. They are NOT urgent —
+   compress to a brief list. If unchanged since last report, write
+   "N standing items unchanged." Do not lead the report with these.
 
 ## Memory Attribution
 
