@@ -1,6 +1,6 @@
 # PRD: Genesis Voice Interface & Ambient Awareness
 
-**Status:** Draft v3 (with due diligence)
+**Status:** Draft v4 (Phase 0a+0b complete, Phase 1 in progress)
 **Author:** Genesis + User
 **Date:** 2026-05-23
 
@@ -450,16 +450,25 @@ Understand exactly what the Gatekeeper does and what we want to keep.
 Effort: Small-Medium (day). Dependencies: VMs running.
 
 ### Phase 1: Genesis-Connected Voice (Reactive)
-**Goal:** Replace the Gatekeeper's OpenRouter backend with Genesis. When you
-talk to the voice assistant, Genesis answers — with full memory, knowledge,
-and context. Still reactive (wake word → 45s session), not ambient.
-**Scope:**
-- New Gatekeeper backend module: instead of calling OpenRouter, call Genesis
-  HTTP Tool API (memory_recall, knowledge_recall, web_search, etc.)
-- Genesis Voice Channel Adapter: extends ChannelAdapter, receives requests from
-  Gatekeeper, routes through ConversationLoop
-- Wire Gatekeeper's session/redaction/event infrastructure to Genesis
-- Keep existing HA integration unchanged (wake word + Whisper + Piper)
+**Goal:** Skip the Gatekeeper entirely. Genesis exposes an OpenAI-compatible
+endpoint. HA sends transcripts directly to Genesis. Genesis answers with full
+memory and context. Still reactive (wake word → 45s session), not ambient.
+**Architecture (revised from audit):**
+- Gatekeeper SKIPPED — Genesis IS the brain, no middleware needed
+- `VoiceConversationHandler`: fast path bypassing CC — memory recall + direct
+  router call for <5s latency (CC takes 10-60s, unacceptable for voice)
+- OpenAI-compatible endpoint at `/v1/voice/chat/completions` (distinct from
+  OpenClaw's `/v1/chat/completions`)
+- HA's HACS `openai-compatible-conversation` integration sends transcripts
+- `VoiceSessionManager`: in-memory 45s sustain timer (from Gatekeeper pattern)
+- `VoiceChannelAdapter`: outbound TTS via HA REST API (not registered with
+  outreach pipeline — avoids 3am TTS side effects)
+- `voice_conversation` call site: groq→gemini→mistral (free, fast)
+**Implementation:**
+- `src/genesis/channels/voice/` — handler, sessions, adapter
+- `src/genesis/dashboard/routes/voice_api.py` — Flask blueprint
+- `config/model_routing.yaml` — voice_conversation call site
+**Status:** Genesis-side code complete. HA integration pending (HACS setup).
 **Quality gate:** Say "Genesis, what did we discuss yesterday?" → Genesis
 recalls from memory → speaks answer via HA speaker. Full round trip <5s.
 **Dependencies:** Phase 0a + 0b
