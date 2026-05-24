@@ -119,7 +119,7 @@ class HealthDataService:
             "awareness": await awareness(self._db),
             "outreach_stats": await outreach_stats(self._db),
             "services": services(),
-            "api_keys": api_key_health(self._routing_config),
+            "api_keys": api_key_health(self._routing_config, breakers=self._breakers),
             "mcp_servers": await mcp_status(),
             "conversation": conversation_activity(),
             "provider_activity": await provider_activity(self._activity_tracker),

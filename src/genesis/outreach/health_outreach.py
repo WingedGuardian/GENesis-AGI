@@ -46,11 +46,16 @@ class HealthOutreachBridge:
         if not alerts:
             return []
 
-        # Filter to CRITICAL + in the escalation whitelist
+        # Filter to CRITICAL + in the escalation whitelist.
+        # Supports prefix matching: "provider:credit_exhaustion" matches
+        # "provider:credit_exhaustion:deepinfra".
         immediate_alerts = [
             a for a in alerts
             if a.get("severity", "").upper() == "CRITICAL"
-            and a.get("id", "") in self._escalation_ids
+            and any(
+                a.get("id", "").startswith(eid)
+                for eid in self._escalation_ids
+            )
         ]
 
         suppressed = len(alerts) - len(immediate_alerts)

@@ -47,8 +47,21 @@ def has_api_key(provider_cfg) -> bool:
     return False
 
 
-def api_key_health(routing_config: RoutingConfig | None) -> dict:
-    """Check which configured providers have API keys present + validation status."""
+def api_key_health(
+    routing_config: RoutingConfig | None,
+    breakers: object | None = None,
+) -> dict:
+    """Provider API key health with chain-aware criticality and CB state.
+
+    Returns ``{"providers": {name: entry}, "alerts": [...]}``.
+
+    Each provider entry includes the original fields (status, provider_type)
+    plus chain_count, criticality, is_free, cb_state, cb_reason, and
+    alert_severity — derived from the routing config and circuit breakers.
+
+    The ``alerts`` list contains pre-computed attention-strip items for
+    critical/warning conditions (credit exhaustion, missing critical keys).
+    """
     if not routing_config:
         known_keys = {
             "groq": "API_KEY_GROQ",
@@ -57,7 +70,7 @@ def api_key_health(routing_config: RoutingConfig | None) -> dict:
             "deepseek": "API_KEY_DEEPSEEK",
             "google": "GOOGLE_API_KEY",
         }
-        results = {}
+        results: dict = {}
         for name, env_var in known_keys.items():
             val = os.environ.get(env_var)
             if val and val not in ("None", "NA", ""):
@@ -70,7 +83,34 @@ def api_key_health(routing_config: RoutingConfig | None) -> dict:
                     results[name] = {"status": "configured", "provider_type": name}
             else:
                 results[name] = {"status": "missing", "provider_type": name}
-        return results
+        return {"providers": results, "alerts": []}
+
+    # Compute criticality per provider type
+    from genesis.routing.provider_criticality import derive_criticality
+
+    crit_map = derive_criticality(routing_config)
+
+    # Aggregate CB state per provider type
+    cb_by_type: dict[str, tuple[str, str | None]] = {}
+    if breakers:
+        registry = getattr(breakers, "_breakers", None) or {}
+        if isinstance(breakers, dict):
+            registry = breakers
+        for prov_name, cb in registry.items():
+            pcfg = routing_config.providers.get(prov_name)
+            if not pcfg:
+                continue
+            ptype = pcfg.provider_type
+            state_str = str(cb.state.value) if hasattr(cb.state, "value") else str(cb.state)
+            reason = None
+            if cb.last_failure_category is not None:
+                reason = cb.last_failure_category.value if hasattr(cb.last_failure_category, "value") else str(cb.last_failure_category)
+
+            # Keep worst state per type (open > half_open > closed)
+            _SEVERITY = {"open": 3, "half_open": 2, "closed": 1}
+            existing = cb_by_type.get(ptype)
+            if existing is None or _SEVERITY.get(state_str, 0) > _SEVERITY.get(existing[0], 0):
+                cb_by_type[ptype] = (state_str, reason)
 
     results = {}
     for name, provider_cfg in routing_config.providers.items():
@@ -102,15 +142,138 @@ def api_key_health(routing_config: RoutingConfig | None) -> dict:
                 entry["validated_at"] = cached.get("checked_at")
             else:
                 entry["status"] = "configured"
+
+        # Enrich with criticality + CB state
+        crit_info = crit_map.get(ptype, {})
+        entry["chain_count"] = crit_info.get("chain_count", 0)
+        entry["chain_usage"] = crit_info.get("chain_usage", [])
+        entry["criticality"] = crit_info.get("criticality", "dormant")
+        entry["is_free"] = crit_info.get("is_free", False)
+        entry["sole_sites"] = crit_info.get("sole_sites", [])
+
+        cb_state, cb_reason = cb_by_type.get(ptype, ("closed", None))
+        entry["cb_state"] = cb_state
+        entry["cb_reason"] = cb_reason
+
+        entry["alert_severity"] = _compute_alert_severity(
+            status=entry["status"],
+            criticality=entry["criticality"],
+            is_free=entry["is_free"],
+            cb_state=cb_state,
+            cb_reason=cb_reason,
+        )
         results[name] = entry
 
-    # Include providers that were disabled at config load (no API key, etc.)
-    # so they still appear in the dashboard as "not configured".
+    # Include disabled providers as dormant
     for name, ptype in getattr(routing_config, "disabled_providers", {}).items():
         if name not in results:
-            results[name] = {"status": "missing", "provider_type": ptype}
+            crit_info = crit_map.get(ptype, {})
+            results[name] = {
+                "status": "missing",
+                "provider_type": ptype,
+                "chain_count": crit_info.get("chain_count", 0),
+                "chain_usage": crit_info.get("chain_usage", []),
+                "criticality": crit_info.get("criticality", "dormant"),
+                "is_free": crit_info.get("is_free", False),
+                "sole_sites": crit_info.get("sole_sites", []),
+                "cb_state": "closed",
+                "cb_reason": None,
+                "alert_severity": _compute_alert_severity(
+                    status="missing",
+                    criticality=crit_info.get("criticality", "dormant"),
+                    is_free=crit_info.get("is_free", False),
+                    cb_state="closed",
+                    cb_reason=None,
+                ),
+            }
 
-    return results
+    # Build attention-strip alerts
+    alerts = _build_alerts(results)
+
+    return {"providers": results, "alerts": alerts}
+
+
+def _compute_alert_severity(
+    *,
+    status: str,
+    criticality: str,
+    is_free: bool,
+    cb_state: str,
+    cb_reason: str | None,
+) -> str | None:
+    """Compute alert severity from the intersection of criticality and state.
+
+    Returns "critical", "warning", "info", or None.
+    """
+    if criticality == "dormant":
+        return None
+
+    is_exhausted = cb_state == "open" and cb_reason == "quota_exhausted"
+    is_cb_open = cb_state == "open"
+    is_missing = status == "missing"
+
+    if is_exhausted and not is_free:
+        return "critical" if criticality in ("sole", "systemic") else "warning"
+
+    if is_cb_open and not is_free:
+        return "critical" if criticality == "sole" else "warning"
+
+    if is_cb_open and is_free:
+        return "warning" if criticality == "sole" else "info"
+
+    if is_missing and not is_free:
+        return "warning" if criticality in ("sole", "systemic") else "info"
+
+    if is_missing and is_free:
+        return "info"
+
+    return None
+
+
+def _build_alerts(providers: dict) -> list[dict]:
+    """Build attention-strip alerts from enriched provider entries."""
+    alerts: list[dict] = []
+    # Group by provider_type to avoid duplicate alerts for same type
+    seen_types: set[str] = set()
+    for name, info in providers.items():
+        severity = info.get("alert_severity")
+        if severity not in ("critical", "warning"):
+            continue
+        ptype = info.get("provider_type", name)
+        if ptype in seen_types:
+            continue
+        seen_types.add(ptype)
+
+        cb_reason = info.get("cb_reason")
+        chain_count = info.get("chain_count", 0)
+
+        if cb_reason == "quota_exhausted":
+            reason = "credit_exhaustion"
+            message = f"{ptype.title()} credits depleted — {chain_count} call site(s) affected"
+        elif info.get("cb_state") == "open":
+            reason = "provider_down"
+            message = f"{ptype.title()} down (circuit breaker open) — {chain_count} call site(s) affected"
+        elif info.get("status") == "missing":
+            sole = info.get("sole_sites", [])
+            reason = "missing_key"
+            if sole:
+                message = f"{ptype.title()} API key missing — sole provider for {sole[0]}"
+            else:
+                message = f"{ptype.title()} API key missing — {chain_count} call site(s) affected"
+        else:
+            continue
+
+        alerts.append({
+            "provider_type": ptype,
+            "severity": severity,
+            "reason": reason,
+            "affected_sites": chain_count,
+            "message": message,
+        })
+
+    # Sort: critical first, then warning
+    alerts.sort(key=lambda a: (0 if a["severity"] == "critical" else 1, a["provider_type"]))
+    return alerts
 
 
 async def validate_api_keys(routing_config: RoutingConfig | None) -> None:

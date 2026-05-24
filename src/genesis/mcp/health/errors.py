@@ -428,12 +428,22 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     # ── Credit exhaustion detection ─────────────────────────────────
     # A provider that had >95% success over 7 days but dropped to <50%
     # in the last hour likely ran out of credits/quota (not a transient
-    # error).  Only check CRITICAL and WARNING tier providers.
+    # error).  Only check providers that are in active routing chains.
     if _service and _service._db:
         try:
             from datetime import timedelta as _td2
 
-            from genesis.routing.provider_tiers import ProviderTier, get_tier
+            from genesis.routing.provider_criticality import derive_criticality
+
+            routing_config = None
+            try:
+                from genesis.runtime import GenesisRuntime
+                rt = GenesisRuntime.instance()
+                routing_config = getattr(rt, "_routing_config", None)
+            except Exception:
+                pass
+
+            crit_map = derive_criticality(routing_config) if routing_config else {}
 
             now_utc = datetime.now(UTC)
             recent_cutoff = (now_utc - _td2(hours=1)).isoformat()
@@ -451,9 +461,10 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
             for row in recent_rows:
                 prov, recent_calls, recent_errors = row
-                tier = get_tier(prov)
-                if tier < ProviderTier.WARNING:
-                    continue  # Skip INFO-tier providers
+                prov_crit = crit_map.get(prov, {})
+                criticality = prov_crit.get("criticality", "dormant")
+                if criticality == "dormant":
+                    continue  # Skip providers not in any chain
 
                 recent_error_rate = recent_errors / recent_calls if recent_calls else 0
                 if recent_error_rate < 0.5:
@@ -481,7 +492,13 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
                 # Was healthy (>95% success) over 7 days, now failing (>50% errors)
                 alert_id = f"provider:credit_exhaustion:{prov}"
-                severity = "CRITICAL" if tier >= ProviderTier.CRITICAL else "WARNING"
+                is_free = prov_crit.get("is_free", False)
+                if criticality in ("sole", "systemic") and not is_free:
+                    severity = "CRITICAL"
+                elif criticality == "sole" and is_free:
+                    severity = "WARNING"
+                else:
+                    severity = "WARNING"
                 alerts.append({
                     "id": alert_id,
                     "severity": severity,

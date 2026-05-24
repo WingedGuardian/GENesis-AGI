@@ -364,6 +364,38 @@ class EmbeddingProvider:
             "remote_calls": self._remote_calls,
         }
 
+    @property
+    def backends(self) -> list[EmbeddingBackend]:
+        """Backend chain in priority order."""
+        return list(self._backends)
+
+    def chain_health(self) -> list[dict]:
+        """Return backend chain health in neural-monitor chain_health format.
+
+        Each entry has: provider, state (derived from activity tracker error
+        rate), failures, type, model, has_api_key — matching the shape
+        expected by the call_sites snapshot for rendering chain health dots.
+        """
+        result = []
+        for backend in self._backends:
+            state = "closed"  # default healthy
+            if self._tracker:
+                summary = self._tracker.summary(backend.name)
+                if isinstance(summary, dict) and summary.get("calls", 0) > 0:
+                    if summary["error_rate"] > 0.5:
+                        state = "open"
+                    elif summary["error_rate"] > 0.1:
+                        state = "half_open"
+            result.append({
+                "provider": backend.name,
+                "state": state,
+                "failures": self._consecutive_backend_failures.get(backend.name, 0),
+                "type": "embedding",
+                "model": getattr(backend, "_model", "unknown"),
+                "has_api_key": True,
+            })
+        return result
+
     # -- Public API --
 
     async def is_available(self) -> bool:
