@@ -87,6 +87,9 @@ async def init(rt: GenesisRuntime) -> None:
             activity_tracker=rt._activity_tracker,
             event_bus=rt._event_bus,
         )
+        # Expose on runtime for neural monitor chain health rendering
+        rt._storage_embedder = storage_embedder
+        rt._recall_embedder = recall_embedder
 
         linker = MemoryLinker(qdrant_client=qdrant, db=rt._db)
         rt._memory_store = MemoryStore(

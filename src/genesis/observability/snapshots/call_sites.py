@@ -315,7 +315,58 @@ async def call_sites(
             else:
                 site_data["status"] = "down"
 
+    # ── Embedding call sites ──────────────────────────────────────────
+    # Embeddings bypass routing — get chain health from EmbeddingProvider
+    _EMBEDDING_SITES = {
+        "21_embeddings": "_storage_embedder",
+        "21b_query_embedding": "_recall_embedder",
+    }
+    try:
+        from genesis.runtime import GenesisRuntime
+
+        rt = GenesisRuntime.instance()
+        for site_id, attr in _EMBEDDING_SITES.items():
+            if site_id in result:
+                continue  # Already populated (shouldn't happen)
+            embedder = getattr(rt, attr, None)
+            if not embedder:
+                continue
+            meta = _CALL_SITE_META.get(site_id, {})
+            chain = embedder.chain_health()
+            status = _embedding_status(chain)
+            result[site_id] = {
+                "status": status,
+                "active_provider": chain[0]["provider"] if chain else None,
+                "chain_health": chain,
+                "recent_failures": None,
+                "last_failure_at": None,
+                "last_run_at": None,
+                "last_run_provider": chain[0]["provider"] if chain else None,
+                "last_run_model": chain[0].get("model", "") if chain else "",
+                "last_response": None,
+                "last_run_tokens": 0,
+                "last_run_success": True,
+                "description": meta.get("description", ""),
+                "category": meta.get("category", "embedding"),
+                "frequency": meta.get("frequency", ""),
+                "cost_policy": meta.get("cost_policy", ""),
+                "model_tier": meta.get("model_tier", "embedding"),
+            }
+    except Exception:
+        logger.debug("Embedding chain health unavailable", exc_info=True)
+
     return result
+
+
+def _embedding_status(chain: list[dict]) -> str:
+    """Derive overall status from an embedding chain_health list."""
+    if not chain:
+        return "disabled"
+    if all(e.get("state") == "open" for e in chain):
+        return "down"
+    if chain[0].get("state") != "closed":
+        return "degraded"
+    return "healthy"
 
 
 def _provider_health(entry: dict) -> str:
