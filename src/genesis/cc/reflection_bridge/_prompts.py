@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 
 from genesis.awareness.types import Depth, SignalReading, TickResult
 from genesis.cc.types import CCModel
-from genesis.perception.types import LIGHT_FOCUS_ROTATION
 
 if TYPE_CHECKING:
     from genesis.perception.context import ContextAssembler
@@ -46,12 +45,19 @@ def _format_signal(s: SignalReading, *, unchanged_ticks: int = 0) -> str:
     return base
 
 
-def _format_signals_from_tick(tick: TickResult, *, limit: int = 10) -> str:
-    """Format signals with staleness annotations from a TickResult."""
+def _format_signals_from_tick(
+    tick: TickResult, *, limit: int = 10, min_value: float = 0.0,
+) -> str:
+    """Format signals with staleness annotations from a TickResult.
+
+    When min_value > 0, signals at or below that value are excluded.
+    This filters out bootstrap placeholder signals that always return 0.0.
+    """
     staleness = tick.signal_staleness or {}
     parts = [
         _format_signal(s, unchanged_ticks=staleness.get(s.name, 0))
         for s in tick.signals[:limit]
+        if s.value > min_value or min_value == 0.0
     ]
     return ", ".join(parts) if parts else "none"
 
@@ -98,8 +104,23 @@ _SENTINEL_ANOMALY_THRESHOLD = 0.7
 
 
 def _light_focus_area(tick: TickResult) -> str:
-    """Derive focus area from tick_id.  Anomaly is event-driven — falls back
-    to situation when no critical operational signals are active."""
+    """Derive focus area from tick_id.
+
+    Anomaly is event-driven: fires only when critical signals are active.
+    Normal ticks alternate 50/50 between situation and user_impact.
+    """
+    # Event-driven anomaly — only when critical signals are active
+    has_critical = any(
+        s.value > 0 for s in tick.signals
+        if s.name in _ANOMALY_RELEVANT_SIGNALS
+    ) or any(
+        s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in tick.signals
+        if s.name == "sentinel_activity"
+    )
+    if has_critical:
+        return "anomaly"
+
+    # Normal rotation: alternate situation / user_impact
     import uuid as _uuid
 
     try:
@@ -107,20 +128,7 @@ def _light_focus_area(tick: TickResult) -> str:
     except ValueError:
         tick_number = int.from_bytes(tick.tick_id.encode()[:8], "big") % 10000
 
-    candidate = LIGHT_FOCUS_ROTATION[tick_number % len(LIGHT_FOCUS_ROTATION)]
-
-    if candidate == "anomaly":
-        has_critical = any(
-            s.value > 0 for s in tick.signals
-            if s.name in _ANOMALY_RELEVANT_SIGNALS
-        ) or any(
-            s.value >= _SENTINEL_ANOMALY_THRESHOLD for s in tick.signals
-            if s.name == "sentinel_activity"
-        )
-        if not has_critical:
-            return "situation"
-
-    return candidate
+    return ["situation", "user_impact"][tick_number % 2]
 
 
 # ── Observation formatting ───────────────────────────────────────────
@@ -261,7 +269,10 @@ async def build_reflection_prompt(
     # Legacy simple path
     from genesis.db.crud import cognitive_state
 
-    signals_summary = _format_signals_from_tick(tick)
+    # For Light reflections, filter out zero-value bootstrap placeholder signals
+    signals_summary = _format_signals_from_tick(
+        tick, min_value=0.001 if depth == Depth.LIGHT else 0.0,
+    )
 
     scores_summary = ", ".join(
         f"{s.depth.value}={s.final_score:.2f}" for s in tick.scores
