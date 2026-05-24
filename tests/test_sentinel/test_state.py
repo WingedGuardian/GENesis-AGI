@@ -94,15 +94,39 @@ class TestAutoReset:
 
 class TestPersistence:
     def test_save_and_load(self, tmp_path: Path):
+        """Saved ESCALATED state persists through load (non-active states survive)."""
         state_file = tmp_path / "sentinel_state.json"
-        data = SentinelStateData(current_state="investigating")
-        data.transition(SentinelState.REMEDIATING, reason="test")
+        data = SentinelStateData()
+        data.transition(SentinelState.ESCALATED, reason="test")
 
         save_state(data, state_file)
         loaded = load_state(state_file)
 
-        assert loaded.state == SentinelState.REMEDIATING
+        assert loaded.state == SentinelState.ESCALATED
         assert loaded.last_trigger_reason == "test"
+
+    def test_load_resets_remediating_on_restart(self, tmp_path: Path):
+        """REMEDIATING state resets to HEALTHY on load (CC session is lost)."""
+        state_file = tmp_path / "sentinel_state.json"
+        data = SentinelStateData()
+        data.transition(SentinelState.REMEDIATING, reason="guardian concern")
+
+        save_state(data, state_file)
+        loaded = load_state(state_file)
+
+        assert loaded.state == SentinelState.HEALTHY
+        assert "post-restart reset" in loaded.last_trigger_reason
+
+    def test_load_resets_investigating_on_restart(self, tmp_path: Path):
+        """INVESTIGATING state also resets to HEALTHY on load."""
+        state_file = tmp_path / "sentinel_state.json"
+        data = SentinelStateData()
+        data.transition(SentinelState.INVESTIGATING, reason="fire alarm")
+
+        save_state(data, state_file)
+        loaded = load_state(state_file)
+
+        assert loaded.state == SentinelState.HEALTHY
 
     def test_load_missing_file_returns_healthy(self, tmp_path: Path):
         loaded = load_state(tmp_path / "nonexistent.json")

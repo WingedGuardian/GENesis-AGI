@@ -144,10 +144,28 @@ def load_state(path: Path | None = None) -> SentinelStateData:
         if state_path.exists():
             raw = json.loads(state_path.read_text())
             if isinstance(raw, dict):
-                return SentinelStateData(**{
+                state = SentinelStateData(**{
                     k: v for k, v in raw.items()
                     if k in SentinelStateData.__dataclass_fields__
                 })
+                # Post-restart fixup: if the process died while Sentinel
+                # was mid-remediation (e.g. SIGKILL during dream cycle),
+                # the CC session is gone. Reset to HEALTHY and let the
+                # fire alarm check re-evaluate on the next awareness tick.
+                if state.current_state in (
+                    SentinelState.REMEDIATING.value,
+                    SentinelState.INVESTIGATING.value,
+                ):
+                    logger.info(
+                        "Sentinel loaded in '%s' state after restart — "
+                        "resetting to HEALTHY (CC session lost)",
+                        state.current_state,
+                    )
+                    state.transition(
+                        SentinelState.HEALTHY,
+                        reason=f"post-restart reset from {state.current_state}",
+                    )
+                return state
     except Exception:
         logger.warning("Failed to load sentinel state — resetting to HEALTHY", exc_info=True)
     return SentinelStateData()
