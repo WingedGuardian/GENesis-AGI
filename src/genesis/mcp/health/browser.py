@@ -79,8 +79,9 @@ _CHALLENGE_SELECTORS = [
     "#cf-challenge-running",
     "#challenge-spinner",
     "#turnstile-wrapper",
-    ".ray_id",
     "#cf-please-wait",
+    # NOTE: .ray_id excluded — appears on non-challenge Cloudflare error
+    # pages (403, 502, 520) and would cause false-positive blocking.
 ]
 
 
@@ -565,42 +566,67 @@ async def _ensure_vnc():
     """Verify x11vnc + websockify are running for local browser VNC access.
 
     Uses systemd services (genesis-vnc, genesis-novnc) as primary mechanism.
-    Falls back to raw subprocess if systemctl fails.  Checks once per
-    session (module-level ``_vnc_verified`` flag).
+    Falls back to raw subprocess if systemctl fails.  Only marks verified
+    on confirmed success — retries on next call if setup failed.
     """
     global _vnc_verified
     if _vnc_verified:
         return
 
-    import subprocess as _sp
+    started = False
 
-    # Check and start x11vnc
-    try:
-        r = _sp.run(
-            ["systemctl", "--user", "is-active", "genesis-vnc"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if r.stdout.strip() != "active":
+    def _check_and_start():
+        nonlocal started
+        import subprocess as _sp
+
+        try:
+            r = _sp.run(
+                ["systemctl", "--user", "is-active", "genesis-vnc"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.stdout.strip() == "active":
+                started = True
+                return
             _sp.run(
                 ["systemctl", "--user", "start", "genesis-vnc", "genesis-novnc"],
                 capture_output=True, timeout=5,
             )
-            logger.info("Started genesis-vnc + genesis-novnc via systemctl")
-    except Exception:
-        # Fallback: start x11vnc directly if systemctl unavailable
-        try:
-            vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
-            auth_arg = ["-rfbauth", str(vnc_passwd)] if vnc_passwd.exists() else ["-nopw"]
-            _sp.Popen(
-                ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
-                 "-rfbport", "5900", "-bg"] + auth_arg,
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            # Verify it actually started
+            r2 = _sp.run(
+                ["systemctl", "--user", "is-active", "genesis-vnc"],
+                capture_output=True, text=True, timeout=3,
             )
-            logger.info("Started x11vnc directly (systemctl fallback)")
-        except FileNotFoundError:
-            logger.debug("x11vnc not installed — VNC click unavailable")
+            if r2.stdout.strip() == "active":
+                started = True
+                logger.info("Started genesis-vnc + genesis-novnc via systemctl")
+        except Exception:
+            # Fallback: start x11vnc directly if systemctl unavailable
+            try:
+                import subprocess as _sp2
 
-    _vnc_verified = True
+                vnc_passwd = Path.home() / ".genesis" / "vnc_passwd"
+                auth_arg = (
+                    ["-rfbauth", str(vnc_passwd)]
+                    if vnc_passwd.exists()
+                    else ["-nopw"]
+                )
+                _sp2.Popen(
+                    ["x11vnc", "-display", _VNC_DISPLAY, "-forever", "-shared",
+                     "-rfbport", "5900", "-bg"] + auth_arg,
+                    stdout=_sp2.DEVNULL, stderr=_sp2.DEVNULL,
+                )
+                started = True
+                logger.info("Started x11vnc directly (systemctl fallback)")
+            except FileNotFoundError:
+                logger.debug("x11vnc not installed — VNC click unavailable")
+
+    # Run blocking subprocess calls off the event loop
+    await asyncio.get_running_loop().run_in_executor(None, _check_and_start)
+
+    if started:
+        _vnc_verified = True
+    else:
+        logger.warning("VNC setup failed — will retry on next browser launch")
 
 
 async def _get_page(
@@ -1133,11 +1159,17 @@ async def _vnc_click_turnstile(page) -> bool:
             logger.warning("VNC Turnstile click: vncdo timed out after 10s")
             return False
         if proc.returncode != 0:
+            global _vnc_verified
+            err_text = stderr.decode()[:200]
             logger.warning(
                 "VNC Turnstile click: vncdo failed (rc=%d): %s",
                 proc.returncode,
-                stderr.decode()[:200],
+                err_text,
             )
+            # Reset VNC verified flag if connection refused — infra may
+            # have died mid-session and needs restart on next attempt.
+            if "Connection refused" in err_text or "Connection was refused" in err_text:
+                _vnc_verified = False
             return False
 
         logger.info("VNC Turnstile click sent at (%d, %d)", click_x, click_y)
