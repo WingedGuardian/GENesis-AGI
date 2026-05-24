@@ -32,12 +32,16 @@ _FUTURE_TIMEOUT_SECONDS = 8.0
 
 
 def _check_voice_token() -> str | None:
-    """Validate Bearer token. Returns error response or None if OK."""
+    """Validate Bearer token. Returns error message or None if OK.
+
+    When ``GENESIS_MCP_HTTP_TOKEN`` is not set, requests are allowed
+    through without auth (Tailscale-only network, local dev).  Set
+    the token in ``secrets.env`` to enforce auth in production.
+    """
     token = os.environ.get("GENESIS_MCP_HTTP_TOKEN", "")
     if not token:
-        # No token configured — reject all requests
-        logger.warning("Voice API called but GENESIS_MCP_HTTP_TOKEN not set")
-        return None  # Let it through if unconfigured (local dev)
+        # No token configured — allow through (Tailscale-only network)
+        return None
 
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
@@ -92,6 +96,11 @@ def voice_chat_completions():
         return jsonify({
             "error": {"message": "No user message in request", "type": "invalid_request_error"},
         }), 400
+
+    # Cap transcript length — voice transcripts are typically 1-100 words
+    _MAX_TRANSCRIPT_CHARS = 2000
+    if len(transcript) > _MAX_TRANSCRIPT_CHARS:
+        transcript = transcript[:_MAX_TRANSCRIPT_CHARS]
 
     # Derive session ID from HA's conversation_id or generate one
     # HA sends conversation_id in the messages metadata or we use a default

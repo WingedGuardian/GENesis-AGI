@@ -15,14 +15,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import TYPE_CHECKING
 
 import httpx
 
 from genesis.channels.base import ChannelAdapter
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 

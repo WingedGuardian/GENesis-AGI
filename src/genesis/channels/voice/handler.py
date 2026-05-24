@@ -75,9 +75,7 @@ class VoiceConversationHandler:
         # 2. Memory recall (best-effort — don't fail the whole request)
         memories_text = ""
         try:
-            results = await self._retriever.recall(
-                transcript, limit=5, include_graph=False,
-            )
+            results = await self._retriever.recall(transcript, limit=5)
             if results:
                 snippets = []
                 for r in results[:5]:
@@ -131,7 +129,7 @@ class VoiceConversationHandler:
                     "Voice router call failed: %s", result.error,
                 )
                 return "I'm having trouble thinking right now. Try again in a moment."
-            response = result.content or ""
+            response = result.content or "I processed your request but don't have a response."
         except Exception:
             logger.error(
                 "Voice handler exception for session %s",

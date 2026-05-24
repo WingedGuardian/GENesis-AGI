@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -12,7 +10,6 @@ import pytest
 from genesis.channels.voice.adapter import VoiceChannelAdapter
 from genesis.channels.voice.handler import VoiceConversationHandler
 from genesis.channels.voice.sessions import VoiceSessionManager
-
 
 # ── Session Manager ──────────────────────────────────────────────────
 
@@ -248,22 +245,26 @@ class TestVoiceAPI:
         loop.close()
 
     def test_no_auth_header(self, app):
-        with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}):
-            with app.test_client() as client:
-                resp = client.post("/v1/voice/chat/completions", json={
-                    "messages": [{"role": "user", "content": "hello"}],
-                })
-                assert resp.status_code == 401
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}),
+            app.test_client() as client,
+        ):
+            resp = client.post("/v1/voice/chat/completions", json={
+                "messages": [{"role": "user", "content": "hello"}],
+            })
+            assert resp.status_code == 401
 
     def test_wrong_token(self, app):
-        with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}):
-            with app.test_client() as client:
-                resp = client.post(
-                    "/v1/voice/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hello"}]},
-                    headers={"Authorization": "Bearer wrong"},
-                )
-                assert resp.status_code == 401
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}),
+            app.test_client() as client,
+        ):
+            resp = client.post(
+                "/v1/voice/chat/completions",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+                headers={"Authorization": "Bearer wrong"},
+            )
+            assert resp.status_code == 401
 
     def test_no_user_message(self, app):
         import threading
@@ -277,32 +278,34 @@ class TestVoiceAPI:
         t = threading.Thread(target=run_loop, daemon=True)
         t.start()
         try:
-            with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False):
-                with app.test_client() as client:
-                    resp = client.post(
-                        "/v1/voice/chat/completions",
-                        json={"messages": [{"role": "system", "content": "you are helpful"}]},
-                    )
-                    assert resp.status_code == 400
+            with (
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                app.test_client() as client,
+            ):
+                resp = client.post(
+                    "/v1/voice/chat/completions",
+                    json={"messages": [{"role": "system", "content": "you are helpful"}]},
+                )
+                assert resp.status_code == 400
         finally:
             loop.call_soon_threadsafe(loop.stop)
             t.join(timeout=2)
 
     def test_handler_not_initialized(self, app):
         app.config["VOICE_HANDLER"] = None
-        with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False):
-            with app.test_client() as client:
-                resp = client.post(
-                    "/v1/voice/chat/completions",
-                    json={"messages": [{"role": "user", "content": "hello"}]},
-                )
-                assert resp.status_code == 503
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.post(
+                "/v1/voice/chat/completions",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+            assert resp.status_code == 503
 
     def test_successful_response_format(self, app):
         """Verify OpenAI-compatible response structure."""
         with patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False):
-            # Run the handler in the test event loop
-            handler = app.config["VOICE_HANDLER"]
             loop = app.config["GENESIS_EVENT_LOOP"]
 
             # Override to use synchronous mock
