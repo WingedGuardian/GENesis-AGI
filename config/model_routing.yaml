@@ -586,6 +586,17 @@ call_sites:
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
       \ Single-model chain by design: if the judge model is unavailable,\
       \ fail loudly rather than silently swap models and corrupt calibration."
+  voice_conversation:
+    chain:
+    - groq-free
+    - gemini-free
+    - mistral-large-free
+    default_paid: false
+    retry_profile: user_facing
+    dispatch: api
+    description: "Voice channel conversation \u2014 low-latency free-tier chain\
+      \ for HA voice assistant. Groq first for speed (~1s), Gemini/Mistral\
+      \ as fallbacks."
 retry:
   default:
     max_retries: 3
