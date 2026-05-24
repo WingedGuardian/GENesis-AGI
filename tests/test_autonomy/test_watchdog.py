@@ -409,3 +409,48 @@ class TestMemoryPressureCheck:
         checker = _make_checker(tmp_path, fresh_status)
         with patch("genesis.autonomy.watchdog.get_container_anon_memory", return_value=None):
             checker._check_memory_pressure()  # Should not raise
+
+
+class TestZombieSuppressionDuringHeavyWorkload:
+    """Zombie scheduler detection should be suppressed during heavy workloads."""
+
+    def _write_status_with_zombie(
+        self, path: Path, *, heavy_workload=None, uptime_s=None,
+    ) -> Path:
+        """Write a fresh status.json with stale surplus heartbeat (zombie)."""
+        old_time = datetime.now(UTC) - timedelta(minutes=20)
+        data = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "resilience_state": {"cloud": "NORMAL", "memory": "NORMAL"},
+            "human_summary": "All systems normal.",
+            "scheduler_heartbeats": {
+                "surplus": old_time.isoformat(),  # 20 min stale = zombie
+            },
+        }
+        if heavy_workload is not None:
+            data["heavy_workload"] = heavy_workload
+        if uptime_s is not None:
+            data["uptime_s"] = uptime_s
+        status_file = path / "status.json"
+        status_file.write_text(json.dumps(data))
+        return status_file
+
+    def test_zombie_skipped_during_heavy_workload(self, tmp_path: Path):
+        status = self._write_status_with_zombie(tmp_path, heavy_workload="dream_cycle")
+        checker = _make_checker(tmp_path, status)
+        result = checker.check()
+        assert result == WatchdogAction.SKIP
+
+    def test_zombie_restarts_without_heavy_workload(self, tmp_path: Path):
+        status = self._write_status_with_zombie(tmp_path)
+        secrets = tmp_path / "secrets.env"
+        secrets.write_text("TELEGRAM_BOT_TOKEN=12345:ABC\n")
+        checker = _make_checker(tmp_path, status, secrets_path=secrets)
+        result = checker.check()
+        assert result == WatchdogAction.RESTART
+
+    def test_zombie_skipped_during_stabilization(self, tmp_path: Path):
+        status = self._write_status_with_zombie(tmp_path, uptime_s=30)
+        checker = _make_checker(tmp_path, status, stabilization_s=120)
+        result = checker.check()
+        assert result == WatchdogAction.SKIP

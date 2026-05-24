@@ -429,6 +429,20 @@ class SchedulerLivenessCollector:
             return _bootstrap_placeholder_reading(self.signal_name, "runtime")
 
         now = datetime.now(UTC)
+
+        # Grace period after server restart — job timestamps are stale
+        # from the previous process and will be refreshed by the first
+        # surplus dispatch cycle. Don't flag as zombie during bootstrap.
+        bootstrap_at = getattr(self._runtime, "_bootstrap_completed_at", None)
+        if bootstrap_at is not None:
+            age = (now - bootstrap_at).total_seconds()
+            if age < 300:  # 5 min grace
+                return SignalReading(
+                    name=self.signal_name, value=0.0, source="runtime",
+                    collected_at=now.isoformat(),
+                    baseline_note="Bootstrap grace period (< 5 min uptime)",
+                )
+
         stale_schedulers: list[str] = []
 
         # Check surplus scheduler liveness via job_health timestamps
@@ -472,6 +486,50 @@ class SchedulerLivenessCollector:
             source="runtime",
             collected_at=now.isoformat(),
             metadata={"stale": stale_schedulers},
+        )
+
+
+class EventLoopLatencyCollector:
+    """Measures event loop responsiveness.
+
+    Schedules a yield via asyncio.sleep(0) and measures round-trip time.
+    If the event loop is starved (e.g. sync Qdrant calls blocking it),
+    the latency will spike. Signal value is latency/threshold, clamped
+    to 1.0. Added after the 2026-05-24 incident where event loop
+    starvation went undetected until external probes failed.
+
+    Known limitation: this collector runs as an async coroutine, so it
+    can only execute when the event loop is responsive. Under total
+    starvation it cannot be scheduled at all — the external watchdog
+    (status.json staleness) remains the primary detection mechanism for
+    complete event loop blockage. This collector catches partial
+    degradation where the loop is slow but not completely blocked.
+    """
+
+    signal_name = "event_loop_latency"
+
+    def __init__(self, *, threshold_ms: float = 500) -> None:
+        self._threshold_ms = threshold_ms
+
+    async def collect(self) -> SignalReading:
+        import time
+
+        start = time.monotonic()
+        await asyncio.sleep(0)
+        latency_ms = (time.monotonic() - start) * 1000
+
+        value = min(1.0, latency_ms / self._threshold_ms) if latency_ms > self._threshold_ms else 0.0
+
+        return SignalReading(
+            name=self.signal_name,
+            value=round(value, 3),
+            source="event_loop",
+            collected_at=datetime.now(UTC).isoformat(),
+            baseline_note=(
+                f"0.0=responsive (<{self._threshold_ms}ms). "
+                "Rises with event loop starvation"
+            ),
+            metadata={"latency_ms": round(latency_ms, 2)} if latency_ms > 10 else None,
         )
 
 

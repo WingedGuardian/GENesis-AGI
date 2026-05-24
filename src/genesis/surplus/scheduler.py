@@ -255,11 +255,11 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Dream cycle: weekly Sunday 3am — episodic memory consolidation
+        # Dream cycle: weekly Sunday 4am — episodic memory consolidation
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.run_dream_cycle,
-            CronTrigger(day_of_week="sun", hour=3),
+            CronTrigger(day_of_week="sun", hour=4),
             id="dream_cycle",
             max_instances=1,
             misfire_grace_time=3600,
@@ -312,6 +312,27 @@ class SurplusScheduler:
                 misfire_grace_time=60,
             )
         self._scheduler.start()
+
+        # Emit initial heartbeats so the watchdog doesn't see stale
+        # timestamps from the previous process and trigger a restart.
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            rt.record_job_success("surplus_dispatch")
+            logger.info("Surplus scheduler: initial heartbeat emitted")
+        except Exception:
+            logger.warning("Could not emit initial heartbeat", exc_info=True)
+
+        # Check for incomplete dream cycle runs from previous process.
+        try:
+            from genesis.memory.dream_cycle import check_incomplete_runs
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.db is not None:
+                await check_incomplete_runs(rt.db)
+        except Exception:
+            logger.debug("Dream cycle integrity check skipped", exc_info=True)
+
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —
@@ -847,6 +868,10 @@ class SurplusScheduler:
                 logger.warning("Dream cycle skipped — MemoryStore has no Qdrant client")
                 return
 
+            # Signal heavy workload so Sentinel and watchdog defer restarts.
+            rt._heavy_workload = "dream_cycle"
+            rt._heavy_workload_since = datetime.now(UTC)
+
             # Default dry-run until user enables live mode.
             # Set GENESIS_DREAM_CYCLE_LIVE=1 to enable actual merges.
             import os
@@ -891,6 +916,16 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("dream_cycle", str(exc))
+            except Exception:
+                pass
+        finally:
+            # Always clear heavy workload flag, even on failure.
+            # Use the captured `rt` reference (line 859) — re-looking up
+            # GenesisRuntime.instance() here introduces a second failure
+            # mode during shutdown races.
+            try:
+                rt._heavy_workload = None
+                rt._heavy_workload_since = None
             except Exception:
                 pass
 

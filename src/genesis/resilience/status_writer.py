@@ -83,7 +83,7 @@ class StatusFileWriter:
         if failing_jobs:
             data["failing_jobs"] = failing_jobs
 
-        # Pause state (if runtime available)
+        # Pause state and workload info (if runtime available)
         try:
             from genesis.runtime import GenesisRuntime
             rt = GenesisRuntime.instance()
@@ -92,6 +92,13 @@ class StatusFileWriter:
                 "reason": rt.pause_reason,
                 "since": rt.paused_since.isoformat() if rt.paused_since else None,
             }
+            # Heavy workload flag — read by watchdog to defer restarts
+            data["heavy_workload"] = rt.heavy_workload
+            # Uptime since bootstrap — read by watchdog for stabilization
+            if rt._bootstrap_completed_at is not None:
+                data["uptime_s"] = (
+                    datetime.now(UTC) - rt._bootstrap_completed_at
+                ).total_seconds()
         except Exception:
             pass
 

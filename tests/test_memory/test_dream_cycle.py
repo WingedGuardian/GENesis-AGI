@@ -554,15 +554,14 @@ class TestMemoryPreflight:
 
 class TestAsyncYielding:
     @pytest.mark.asyncio
-    async def test_yields_during_search_loop(self):
-        """asyncio.sleep(0) is called periodically during clustering."""
+    async def test_clustering_runs_in_thread_pool(self):
+        """Clustering runs via asyncio.to_thread to avoid event loop starvation."""
         mock_qdrant = MagicMock()
         mock_db = AsyncMock()
         mock_router = AsyncMock()
         mock_store = AsyncMock()
 
-        # Create exactly 100 points to trigger 2 yields (at 50 and 100)
-        n_points = 100
+        n_points = 10
         points = [
             {
                 "id": f"p{i}",
@@ -577,11 +576,18 @@ class TestAsyncYielding:
         with patch(_SCROLL) as mock_scroll, \
              patch(_SEARCH, return_value=[]), \
              patch(_BATCH_VEC) as mock_vec, \
-             patch("genesis.memory.dream_cycle.asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+             patch("genesis.memory.dream_cycle.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
             mock_scroll.return_value = (points, None)
             mock_vec.return_value = {
                 f"p{i}": [0.1] * 768 for i in range(n_points)
             }
+            # to_thread wraps both _scroll_and_group_sync and _cluster_bucket_sync
+            # First call: _scroll_and_group → return buckets
+            # Second call: _cluster_bucket → return empty clusters
+            mock_to_thread.side_effect = [
+                {("memory", "store"): points},  # _scroll_and_group result
+                [],  # _cluster_bucket result (no clusters)
+            ]
 
             await run(
                 qdrant=mock_qdrant,
@@ -591,6 +597,8 @@ class TestAsyncYielding:
                 dry_run=True,
             )
 
-        # With 100 points and _YIELD_EVERY=50, sleep(0) called twice
-        assert mock_sleep.call_count == 2
-        mock_sleep.assert_called_with(0)
+        # Both scroll-and-group and cluster-bucket should use to_thread
+        assert mock_to_thread.call_count == 2
+        # First call should be _scroll_and_group_sync
+        first_call_fn = mock_to_thread.call_args_list[0][0][0]
+        assert first_call_fn.__name__ == "_scroll_and_group_sync"

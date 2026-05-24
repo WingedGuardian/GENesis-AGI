@@ -242,10 +242,13 @@ async def run(
 # ── Phase 1: Scroll and Group ────────────────────────────────────────────
 
 
-async def _scroll_and_group(
+def _scroll_and_group_sync(
     qdrant: QdrantClient,
 ) -> dict[tuple[str, str], list[dict]]:
     """Scroll all episodic_memory points, group by (wing, room).
+
+    Synchronous — runs in a thread pool via ``_scroll_and_group()`` so
+    the blocking Qdrant I/O never starves the async event loop.
 
     Skips already-deprecated points.
     """
@@ -277,10 +280,17 @@ async def _scroll_and_group(
     return buckets
 
 
+async def _scroll_and_group(
+    qdrant: QdrantClient,
+) -> dict[tuple[str, str], list[dict]]:
+    """Async wrapper — offloads blocking Qdrant scroll I/O to thread pool."""
+    return await asyncio.to_thread(_scroll_and_group_sync, qdrant)
+
+
 # ── Phase 2: Cluster ────────────────────────────────────────────────────
 
 
-async def _cluster_bucket(
+def _cluster_bucket_sync(
     qdrant: QdrantClient,
     points: list[dict],
     wing: str,
@@ -289,6 +299,9 @@ async def _cluster_bucket(
     threshold: float,
 ) -> list[list[dict]]:
     """Find connected components of similar memories within a (wing, room) bucket.
+
+    Synchronous — runs in a thread pool via ``_cluster_bucket()`` so the
+    blocking Qdrant search I/O never starves the async event loop.
 
     For each point, searches Qdrant for neighbors above threshold,
     then extracts connected components via union-find.
@@ -332,15 +345,11 @@ async def _cluster_bucket(
             if score >= threshold:
                 uf.union(pid, nid)
 
-        # Yield to the event loop periodically so other coroutines
-        # (health probes, scheduler heartbeats) stay alive.
-        if (idx + 1) % _YIELD_EVERY == 0:
-            if (idx + 1) % 100 == 0:
-                logger.info(
-                    "Bucket (%s, %s): searched %d/%d points",
-                    wing, room, idx + 1, n_points,
-                )
-            await asyncio.sleep(0)
+        if (idx + 1) % 100 == 0:
+            logger.info(
+                "Bucket (%s, %s): searched %d/%d points",
+                wing, room, idx + 1, n_points,
+            )
 
     # Extract components with >= 2 members
     clusters: list[list[dict]] = []
@@ -355,6 +364,20 @@ async def _cluster_bucket(
                 clusters.append(cluster)
 
     return clusters
+
+
+async def _cluster_bucket(
+    qdrant: QdrantClient,
+    points: list[dict],
+    wing: str,
+    room: str,
+    *,
+    threshold: float,
+) -> list[list[dict]]:
+    """Async wrapper — offloads blocking Qdrant search I/O to thread pool."""
+    return await asyncio.to_thread(
+        _cluster_bucket_sync, qdrant, points, wing, room, threshold=threshold,
+    )
 
 
 def _batch_get_vectors(
@@ -622,6 +645,64 @@ async def rollback(
         len(report["errors"]),
     )
     return report
+
+
+# ── Startup Integrity Check ──────────────────────────────────────────────
+
+
+async def check_incomplete_runs(
+    db: aiosqlite.Connection,
+) -> list[dict[str, Any]]:
+    """Detect dream cycle runs that may have left inconsistent state.
+
+    If the process was killed mid-merge, some originals may be deprecated
+    in SQLite without a corresponding synthesis, or vice versa. This check
+    runs at startup and logs warnings — it does NOT auto-rollback (that
+    needs user confirmation).
+
+    Returns list of {run_id, deprecated_count} for suspicious runs.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT dream_cycle_run_id, COUNT(*) as cnt "
+            "FROM memory_metadata "
+            "WHERE deprecated = 1 AND dream_cycle_run_id IS NOT NULL "
+            "AND dream_cycle_run_id NOT LIKE 'synthesis:%' "
+            "GROUP BY dream_cycle_run_id"
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        logger.debug("Dream cycle integrity check skipped (query failed)", exc_info=True)
+        return []
+
+    suspicious: list[dict[str, Any]] = []
+    for row in rows:
+        run_id = row[0]
+        count = row[1]
+        # Check if synthesis exists for this run
+        try:
+            synth_cursor = await db.execute(
+                "SELECT COUNT(*) FROM memory_metadata "
+                "WHERE dream_cycle_run_id = ?",
+                (f"synthesis:{run_id}",),
+            )
+            synth_count = (await synth_cursor.fetchone())[0]
+        except Exception:
+            synth_count = -1
+
+        if synth_count == 0:
+            logger.warning(
+                "Dream cycle run %s: %d deprecated memories with NO synthesis — "
+                "possible incomplete run. Use dream_cycle.rollback('%s') to restore.",
+                run_id[:8], count, run_id,
+            )
+            suspicious.append({"run_id": run_id, "deprecated_count": count})
+
+    if suspicious:
+        logger.warning(
+            "Found %d potentially incomplete dream cycle run(s)", len(suspicious),
+        )
+    return suspicious
 
 
 # ── Prompt and Parsing ───────────────────────────────────────────────────
