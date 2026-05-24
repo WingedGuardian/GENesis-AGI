@@ -312,6 +312,17 @@ class SurplusScheduler:
                 misfire_grace_time=60,
             )
         self._scheduler.start()
+
+        # Emit initial heartbeats so the watchdog doesn't see stale
+        # timestamps from the previous process and trigger a restart.
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            rt.record_job_success("surplus_dispatch")
+            logger.info("Surplus scheduler: initial heartbeat emitted")
+        except Exception:
+            logger.warning("Could not emit initial heartbeat", exc_info=True)
+
         # Run brainstorm check immediately on startup
         await self.brainstorm_check()
         # Run remaining jobs immediately on startup —

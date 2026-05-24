@@ -429,6 +429,20 @@ class SchedulerLivenessCollector:
             return _bootstrap_placeholder_reading(self.signal_name, "runtime")
 
         now = datetime.now(UTC)
+
+        # Grace period after server restart — job timestamps are stale
+        # from the previous process and will be refreshed by the first
+        # surplus dispatch cycle. Don't flag as zombie during bootstrap.
+        bootstrap_at = getattr(self._runtime, "_bootstrap_completed_at", None)
+        if bootstrap_at is not None:
+            age = (now - bootstrap_at).total_seconds()
+            if age < 300:  # 5 min grace
+                return SignalReading(
+                    name=self.signal_name, value=0.0, source="runtime",
+                    collected_at=now.isoformat(),
+                    baseline_note="Bootstrap grace period (< 5 min uptime)",
+                )
+
         stale_schedulers: list[str] = []
 
         # Check surplus scheduler liveness via job_health timestamps
