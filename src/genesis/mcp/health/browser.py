@@ -26,17 +26,32 @@ from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
 
-# File-based debug logger for Turnstile resolution — persists across the
-# 300s timeout so we can read it after the fact. MCP server logs go to
-# CC's stderr capture which is inaccessible after timeout.
+# File-based logging for the entire MCP health server — routes ALL log
+# output to ~/tmp/mcp_health.log so it's readable after timeouts.
+# The MCP server runs as a CC child process; its stderr is inaccessible.
+_mcp_log_dir = Path.home() / "tmp"
+if _mcp_log_dir.is_dir():
+    _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
+    _mcp_fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    ))
+    _mcp_fh.setLevel(logging.DEBUG)
+    # Attach to root logger so ALL genesis.* logs are captured
+    logging.getLogger("genesis").addHandler(_mcp_fh)
+
+# Dedicated Turnstile debug logger — flushes after every write so
+# output is visible even if the process is killed by timeout.
 _ts_log = logging.getLogger("genesis.turnstile_debug")
 _ts_log.setLevel(logging.DEBUG)
 _ts_log.propagate = False
-_ts_log_dir = Path.home() / "tmp"
-if _ts_log_dir.is_dir():
-    _ts_fh = logging.FileHandler(_ts_log_dir / "turnstile_debug.log")
+if _mcp_log_dir.is_dir():
+    _ts_fh = logging.FileHandler(
+        _mcp_log_dir / "turnstile_debug.log", delay=False,
+    )
     _ts_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
     _ts_log.addHandler(_ts_fh)
+    # Force immediate flush on every log call
+    _ts_fh.flush = _ts_fh.stream.flush  # type: ignore[assignment]
 
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
@@ -1514,7 +1529,11 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
         # Brief delay for SPA-injected widgets to load
         await asyncio.sleep(0.8)
 
+        _ts_log.info("_wait_for_turnstile called — checking for challenge")
+        _ts_log.info("Page URL: %s | Title: %s", page.url, await page.title())
+
         if not await _detect_challenge(page):
+            _ts_log.info("_detect_challenge returned False — no challenge found")
             return None
 
         _ts_log.info("=== CHALLENGE DETECTED — starting resolution ===")
