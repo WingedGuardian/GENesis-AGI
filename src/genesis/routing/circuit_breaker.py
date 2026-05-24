@@ -66,6 +66,11 @@ class CircuitBreaker:
         """Number of consecutive trips without recovery."""
         return self._trip_count
 
+    @property
+    def last_failure_category(self) -> ErrorCategory | None:
+        """Category of the most recent failure that tripped the breaker."""
+        return self._last_failure_category
+
     def _effective_open_duration(self) -> float:
         """Open duration with escalating backoff.
 
