@@ -11,8 +11,8 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
-from genesis.guardian.health_signals import _run_subprocess
 
 logger = logging.getLogger(__name__)
 

@@ -18,11 +18,12 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
-from genesis.guardian.health_signals import _run_subprocess, collect_all_signals
+from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 

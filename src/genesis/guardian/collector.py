@@ -160,9 +160,9 @@ async def _incus_exec(
     container: str, *cmd: str, timeout: float = _INCUS_TIMEOUT,
 ) -> tuple[int, str]:
     """Run a command inside the container. Returns (rc, stdout)."""
-    from genesis.guardian.health_signals import _run_subprocess
+    from genesis.guardian._subprocess import run_subprocess
 
-    rc, stdout, _stderr = await _run_subprocess(
+    rc, stdout, _stderr = await run_subprocess(
         "incus", "exec", container, "--", *cmd,
         timeout=timeout,
     )
@@ -173,9 +173,9 @@ async def _incus_exec_user(
     container: str, cmd_str: str, timeout: float = _INCUS_TIMEOUT,
 ) -> tuple[int, str]:
     """Run a command as the ubuntu user inside the container."""
-    from genesis.guardian.health_signals import _run_subprocess
+    from genesis.guardian._subprocess import run_subprocess
 
-    rc, stdout, _stderr = await _run_subprocess(
+    rc, stdout, _stderr = await run_subprocess(
         "incus", "exec", container, "--",
         "su", "-", "ubuntu", "-c", cmd_str,
         timeout=timeout,
@@ -189,8 +189,8 @@ async def _incus_exec_user(
 async def _collect_container_info(config: GuardianConfig) -> tuple[str, str]:
     """Collect container status and uptime."""
     try:
-        from genesis.guardian.health_signals import _run_subprocess
-        rc, stdout, _ = await _run_subprocess(
+        from genesis.guardian._subprocess import run_subprocess
+        rc, stdout, _ = await run_subprocess(
             "incus", "info", config.container_name,
             timeout=_INCUS_TIMEOUT,
         )

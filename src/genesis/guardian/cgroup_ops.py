@@ -21,7 +21,7 @@ import logging
 import signal
 from pathlib import Path
 
-from genesis.guardian.health_signals import _run_subprocess
+from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 
 logger = logging.getLogger(__name__)
 
