@@ -319,6 +319,12 @@ class TestYamlLoading:
 
 
 class TestPageCacheReclaim:
+    @pytest.fixture(autouse=True)
+    def _reset_reclaim_cooldown(self):
+        """Reset the module-level cooldown so each test starts fresh."""
+        import genesis.autonomy.watchdog as w
+        w._last_reclaim_time = 0.0
+
     def test_reclaim_succeeds_when_path_exists(self, tmp_path: Path):
         reclaim_file = tmp_path / "memory.reclaim"
         reclaim_file.write_text("")
