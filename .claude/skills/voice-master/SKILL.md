@@ -9,6 +9,22 @@ description: >
   or any output the user hasn't asked to be written in their voice.
 ---
 
+## THIS IS A TWO-PART SKILL — BOTH PARTS ARE MANDATORY
+
+1. **Voice matching** — use exemplars to match tone, vocabulary, rhythm
+2. **Anti-AI-slop pass** — review output for AI tells and fix them
+
+You MUST apply BOTH passes on every use. Never apply exemplar matching
+without the slop pass. Never skip the slop pass because "the voice sounds
+right." The slop pass catches what exemplars can't — structural patterns,
+banned words, em dash abuse, uniform sentence length.
+
+If you are editing existing text (not generating): run the full Step 6
+audit. If generating: Steps 1-5 produce the draft, Step 6 audits it.
+Both paths end with the audit. No exceptions.
+
+---
+
 ## Companion Files
 
 This is the **project-level** skill (workflow + AI-tell audit rules). The
@@ -120,14 +136,15 @@ Before delivering, scan the output and eliminate any of the following:
 - Passive voice overuse ("it was determined," "it should be noted")
 - Rhetorical questions that aren't genuinely rhetorical
 - Em-dash overuse and wrong format. Two rules, both hard:
-  1. **Format:** `--` with NO spaces on either side. Not `--` with spaces.
-     Not the Unicode `—`. Not ` — `. Just `--` butted up against the words.
-     Wrong: `the memory, the learning loop, the reflection cycles -- Get those`
-     Right: `the memory, the learning loop, the reflection cycles--Get those`
-     Actually: don't write that at all. Use a period instead.
+  1. **Format:** NEVER spaced. `word — word` is the #1 AI punctuation tell.
+     Acceptable: `word—word` (bare unicode) or `word--word` (double hyphen).
+     Preferred: restructure the sentence to use a period, comma, colon, or
+     semicolon instead. If you must use an em dash, no spaces touching it.
   2. **Frequency:** Reach for a comma, period, colon, or semicolon first.
      Every time. Em-dashes are for emphasis or asides where nothing else fits.
      Max 1-2 per page, not per paragraph. Stacking them is an AI fingerprint.
+  The anti-slop pass MUST catch and fix any spaced em dashes. This is a
+  hard fail — if ` — ` appears anywhere in the output, the audit failed.
 - Hedging openers ("It's worth considering that...")
 - Sycophantic acknowledgments before answering
 - "Importance" sentences — delete sentences stating impact, legacy,
