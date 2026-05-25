@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -195,5 +196,31 @@ async def comms_resolve_proposal(proposal_id: str):
         )
     except Exception:
         logger.warning("Journal resolve failed for proposal %s", proposal_id)
+
+    # Trigger delayed sweep on approval — same 5-min grace as Telegram,
+    # so the user can revoke before dispatch fires.
+    if status == "approved" and rt.ego_session:
+        try:
+            from genesis.util.tasks import tracked_task
+
+            async def _dashboard_delayed_sweep() -> None:
+                await asyncio.sleep(300)  # 5-min grace period
+                if rt.ego_session:
+                    await rt.ego_session.sweep_approved_proposals()
+
+            tracked_task(
+                _dashboard_delayed_sweep(),
+                name="dashboard_proposal_sweep",
+            )
+            logger.info(
+                "Dashboard approval — sweep scheduled in 5 min for proposal %s",
+                proposal_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to schedule sweep after dashboard approval for %s",
+                proposal_id,
+                exc_info=True,
+            )
 
     return jsonify({"id": proposal_id, "status": status})

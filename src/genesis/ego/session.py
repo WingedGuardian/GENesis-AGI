@@ -1328,8 +1328,9 @@ class EgoSession:
         """Mechanically dispatch approved proposals via DirectSessionRunner.
 
         Called on a fixed 30-minute interval by EgoCadenceManager AND
-        immediately after user approval via Telegram.  The sweep lock
-        prevents concurrent execution (double-dispatch guard).
+        after user approval via Telegram or dashboard (5-min grace).
+        The sweep lock prevents concurrent execution (double-dispatch
+        guard).
 
         Returns list of dispatched proposal IDs.
         """
@@ -1363,6 +1364,32 @@ class EgoSession:
             except (KeyError, TypeError, ValueError):
                 continue
 
+            # Self-notification shortcut: outreach proposals whose execution
+            # plan indicates a zero-cost Telegram message to the user were
+            # already delivered via the proposal digest.  Auto-complete them
+            # instead of spawning an expensive CC session.
+            exec_plan = (prop.get("execution_plan") or "").lower()
+            if (
+                prop.get("action_type") == "outreach"
+                and "telegram" in exec_plan
+                and ("$0" in exec_plan or "~$0" in exec_plan)
+            ):
+                cursor = await self._db.execute(
+                    "UPDATE ego_proposals SET status = 'executed', "
+                    "user_response = 'auto-completed: delivered via proposal digest' "
+                    "WHERE id = ? AND status = 'approved'",
+                    (prop["id"],),
+                )
+                await self._db.commit()
+                if cursor.rowcount > 0:
+                    dispatched.append(prop["id"])
+                    logger.info(
+                        "Proposal %s auto-completed (self-notification — "
+                        "already delivered via digest)",
+                        prop["id"],
+                    )
+                continue
+
             prompt = await self._build_dispatch_prompt(prop)
             profile = _infer_profile(prop.get("action_type", ""))
 
@@ -1382,7 +1409,7 @@ class EgoSession:
             )
             await self._db.commit()
             if cursor.rowcount == 0:
-                logger.info(
+                logger.debug(
                     "Proposal %s already claimed — skipping",
                     prop["id"],
                 )
