@@ -1175,6 +1175,25 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         )
     """)
 
+    # Self-learning validation gate: watermarks table + procedural_memory columns.
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS task_type_watermarks (
+            task_type            TEXT PRIMARY KEY,
+            best_outcome         TEXT NOT NULL,
+            best_outcome_at      TEXT NOT NULL,
+            total_sessions       INTEGER NOT NULL DEFAULT 0,
+            successful_sessions  INTEGER NOT NULL DEFAULT 0,
+            last_session_at      TEXT NOT NULL,
+            updated_at           TEXT NOT NULL
+        )
+    """)
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN extraction_context TEXT",
+        "procedural_memory.extraction_context")
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN first_mover INTEGER NOT NULL DEFAULT 0",
+        "procedural_memory.first_mover")
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

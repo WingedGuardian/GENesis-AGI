@@ -40,6 +40,8 @@ async def store_procedure(
     confidence: float = 0.0,
     source: dict | None = None,
     principle_embedding: bytes | None = None,
+    extraction_context: str | None = None,
+    first_mover: int = 0,
 ) -> str:
     """Create a new procedure and return its ID.
 
@@ -52,6 +54,11 @@ async def store_procedure(
     `principle_embedding` is the packed BLOB returned by
     `procedural.embedding.pack_embedding`. Optional — when None, the
     proactive procedure hook skips this row.
+
+    `extraction_context` is a JSON blob from the validation gate recording
+    the gate's decision flags and modifiers (audit trail).
+
+    `first_mover` is 1 when this is the first extraction for this task_type.
     """
     proc_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
@@ -71,6 +78,8 @@ async def store_procedure(
         confidence=confidence,
         source=json.dumps(source) if source else None,
         principle_embedding=principle_embedding,
+        extraction_context=extraction_context,
+        first_mover=first_mover,
     )
     return proc_id
 

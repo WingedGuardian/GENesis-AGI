@@ -134,6 +134,33 @@ async def emit_procedure_outcome(
         logger.debug("eval: failed to emit procedure_outcome", exc_info=True)
 
 
+async def emit_gate_decision(
+    db: aiosqlite.Connection,
+    *,
+    task_type: str,
+    outcome: str,
+    allowed: bool,
+    confidence: float,
+    flags: list[str],
+) -> None:
+    """Log a validation gate decision for procedural extraction."""
+    try:
+        await j9_eval.insert_event(
+            db,
+            dimension="procedure",
+            event_type="gate_decision",
+            metrics={
+                "task_type": task_type,
+                "outcome": outcome,
+                "allowed": allowed,
+                "confidence": confidence,
+                "flags": flags[:5],
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit gate_decision", exc_info=True)
+
+
 async def emit_recall_diagnostics(
     db: aiosqlite.Connection,
     *,

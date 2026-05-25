@@ -182,6 +182,7 @@ def build_triage_pipeline(
                     summary_text=summary_text,
                     outcome=outcome.value,
                     router=router,
+                    session_tools_count=len(summary.tool_calls),
                 )
             except Exception:
                 logger.error("Procedure extraction failed (non-fatal)", exc_info=True)
