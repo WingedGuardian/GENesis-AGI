@@ -181,6 +181,9 @@ class SnapshotManager:
         if label:
             name = f"{name}-{label}"
 
+        # Measure pool free before snapshot (for size estimation after)
+        pre_info = await self._get_pool_free_bytes()
+
         rc, stdout, stderr = await _run_subprocess(
             "incus", "snapshot", "create", self._container, name,
             timeout=120.0,  # BTRFS is instant, dir is slow — compromise
@@ -190,6 +193,23 @@ class SnapshotManager:
             return None
 
         logger.info("Created snapshot: %s", name)
+
+        # Record snapshot size estimate (delta in pool free space)
+        if snapshot_size_history is not None and pre_info is not None:
+            post_info = await self._get_pool_free_bytes()
+            if post_info is not None:
+                _, pre_free = pre_info
+                _, post_free = post_info
+                size_estimate = max(0, pre_free - post_free)
+                if size_estimate > 0:
+                    snapshot_size_history.append(size_estimate)
+                    # Keep last 5 entries
+                    del snapshot_size_history[:-5]
+                    logger.info(
+                        "Snapshot size estimate: %d bytes (%d samples in history)",
+                        size_estimate, len(snapshot_size_history),
+                    )
+
         return name
 
     async def restore(self, name: str) -> bool:
