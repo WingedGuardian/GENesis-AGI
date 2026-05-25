@@ -168,6 +168,52 @@ class TestRecoveryResourceClear:
         assert result.success is True
 
 
+class TestRecoveryIOTriage:
+
+    @pytest.mark.asyncio
+    async def test_io_triage_kills_top_consumer(self, engine: RecoveryEngine) -> None:
+        """IO_TRIAGE should kill the top I/O consumer when PSI is not dropping."""
+        with (
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "safe_to_snapshot", return_value=True),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("genesis.guardian.recovery.RecoveryEngine._io_triage") as mock_triage,
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_triage.return_value = (True, "Killed PID 1234 (claude)")
+            result = await engine.execute(_diagnosis(RecoveryAction.IO_TRIAGE))
+        assert result.success is True
+        assert result.action == RecoveryAction.IO_TRIAGE
+
+    @pytest.mark.asyncio
+    async def test_io_triage_stands_down_when_recovering(self, engine: RecoveryEngine) -> None:
+        """IO_TRIAGE should stand down when PSI trend shows recovery."""
+        with (
+            patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
+            patch.object(engine._snapshots, "safe_to_snapshot", return_value=True),
+            patch.object(engine._snapshots, "take", return_value="pre-recovery"),
+            patch("genesis.guardian.recovery.RecoveryEngine._io_triage") as mock_triage,
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_triage.return_value = (True, "I/O pressure recovering — standing down")
+            result = await engine.execute(_diagnosis(RecoveryAction.IO_TRIAGE))
+        assert result.success is True
+        assert "recovering" in result.detail.lower() or result.detail  # stood down
+
+    @pytest.mark.asyncio
+    async def test_io_triage_separate_counter(self, engine: RecoveryEngine) -> None:
+        """IO_TRIAGE should use io_triage_attempts, not recovery_attempts."""
+        # Record an IO_TRIAGE attempt
+        engine._sm.record_recovery_attempt("IO_TRIAGE")
+        assert engine._sm.state.io_triage_attempts == 1
+        assert engine._sm.state.recovery_attempts == 0  # Separate counter
+
+        # Record a regular recovery attempt
+        engine._sm.record_recovery_attempt("RESTART_SERVICES")
+        assert engine._sm.state.io_triage_attempts == 1  # Unchanged
+        assert engine._sm.state.recovery_attempts == 1
+
+
 class TestRecoveryRevertCode:
 
     @pytest.mark.asyncio

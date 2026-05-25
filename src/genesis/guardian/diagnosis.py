@@ -29,9 +29,12 @@ from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
 
-# Pre-flight memory warning threshold.  Guardian must always attempt
-# diagnosis — refusing means Genesis stays down with no information.
-# We log a warning when memory is low but never block the attempt.
+# Pre-flight memory thresholds.  Guardian must always attempt diagnosis
+# above the hard floor.  The systemd MemoryMax=6G cap on the Guardian
+# service is the real safety boundary — Python-level checks are advisory.
+# Hard floor: refuse only at catastrophic levels (host is almost dead).
+# Warn floor: log warning but proceed (Guardian's job is to diagnose).
+_CC_PREFLIGHT_HARD_FLOOR_GiB = 2.0
 _CC_PREFLIGHT_WARN_GiB = 8.0
 
 
@@ -387,16 +390,29 @@ class DiagnosisEngine:
         except Exception as exc:
             logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
-        # Pre-flight: log host memory for observability.
-        # Guardian must always attempt diagnosis — its one job.  A failed
-        # attempt with an error log is more useful than no attempt at all.
+        # Pre-flight: check host memory.  The systemd MemoryMax=6G on the
+        # Guardian service is the real safety boundary — this Python check
+        # is advisory.  Only refuse at catastrophic levels (< 2 GiB means
+        # the host is almost dead, not just Genesis).
         effective_model = self._config.cc.model
         available_gib = _host_mem_available_gib()
         if available_gib is not None:
+            if available_gib < _CC_PREFLIGHT_HARD_FLOOR_GiB:
+                logger.error(
+                    "Host memory catastrophically low (%.1f GiB free < %.0f GiB) "
+                    "— refusing CC diagnosis (host is near death, not just Genesis)",
+                    available_gib, _CC_PREFLIGHT_HARD_FLOOR_GiB,
+                )
+                raise CCDiagnosisError(
+                    f"Host memory catastrophically low: "
+                    f"{available_gib:.1f} GiB free < "
+                    f"{_CC_PREFLIGHT_HARD_FLOOR_GiB:.0f} GiB — "
+                    f"host VM itself is at risk"
+                )
             if available_gib < _CC_PREFLIGHT_WARN_GiB:
                 logger.warning(
                     "Host memory low (%.1f GiB free < %.0f GiB) "
-                    "— proceeding with CC diagnosis anyway",
+                    "— proceeding with CC diagnosis (MemoryMax=6G caps usage)",
                     available_gib, _CC_PREFLIGHT_WARN_GiB,
                 )
         else:
