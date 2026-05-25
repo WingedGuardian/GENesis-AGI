@@ -42,7 +42,7 @@ CONFIDENCE_THRESHOLD = 75
 # Fallback model chain when routing config is unavailable.
 # Production can override by passing `model=...` to `check_version_gate()`.
 _FALLBACK_MODELS = [
-    ("anthropic/claude-haiku-4-5", "ANTHROPIC_API_KEY"),
+    ("openrouter/anthropic/claude-haiku-4.5", "API_KEY_OPENROUTER"),
     ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
     ("gemini/gemini-2.0-flash", "GEMINI_API_KEY"),
 ]
@@ -300,10 +300,10 @@ def _load_models_from_config() -> list[tuple[str, str]]:
         if site is None:
             return []
         # Map provider type to litellm prefix
-        _PREFIX = {"anthropic": "anthropic", "groq": "groq", "google": "gemini"}
+        _PREFIX = {"openrouter": "openrouter", "groq": "groq", "google": "gemini"}
         # Map provider type to conventional env var for API key
         _ENV = {
-            "anthropic": "ANTHROPIC_API_KEY",
+            "openrouter": "API_KEY_OPENROUTER",
             "groq": "GROQ_API_KEY",
             "google": "GEMINI_API_KEY",
         }

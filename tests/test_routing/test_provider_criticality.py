@@ -70,14 +70,14 @@ class TestCallSitesForProviderType:
     def test_excludes_cc_dispatched(self):
         config = _make_config(
             providers=[
-                _ProviderCfg(name="claude-opus", provider_type="anthropic"),
+                _ProviderCfg(name="openrouter-opus", provider_type="openrouter"),
             ],
             call_sites=[
-                _CallSiteCfg(id="ego", chain=["claude-opus"], dispatch="cli"),
-                _CallSiteCfg(id="compact", chain=["claude-opus"], dispatch="dual"),
+                _CallSiteCfg(id="ego", chain=["openrouter-opus"], dispatch="cli"),
+                _CallSiteCfg(id="compact", chain=["openrouter-opus"], dispatch="dual"),
             ],
         )
-        result = call_sites_for_provider_type(config, "anthropic")
+        result = call_sites_for_provider_type(config, "openrouter")
         assert result == ["compact"]
 
     def test_empty_for_unknown_type(self):
@@ -157,13 +157,13 @@ class TestDeriveCriticality:
         config = _make_config(
             providers=[
                 _ProviderCfg(name="groq-free", provider_type="groq", is_free=True),
-                _ProviderCfg(name="claude-sonnet", provider_type="anthropic", is_free=False),
+                _ProviderCfg(name="openrouter-sonnet", provider_type="openrouter", is_free=False),
             ],
             call_sites=[],
         )
         result = derive_criticality(config)
         assert result["groq"]["is_free"] is True
-        assert result["anthropic"]["is_free"] is False
+        assert result["openrouter"]["is_free"] is False
 
     def test_mixed_free_paid_same_type(self):
         """If any provider of a type is paid, the type is not free."""

@@ -178,3 +178,7 @@ New behaviour: keyless providers stay registered in `cfg.providers` with `has_ap
 Call site `11_user_model_synthesis` was originally marked wired (commit `eb5c350`, 2026-04-06) when the surrounding pipeline got wired, but the actual `router.route_call()` invocation was missing — the synthesis path used pure-Python rules-based dict rendering instead.
 
 This was caught during the Sentinel spam investigation: ghost-down status on call site 11 (because Anthropic providers report unreachable without an `ANTHROPIC_API_KEY`) was waking the Sentinel every 5 minutes. The fix: (1) actually wire the LLM call in `runtime/init/learning.py` via `UserModelEvolver.synthesize_narrative()` with a free-first chain (mistral-small → groq → gemini → openrouter), (2) teach the call_sites snapshot to distinguish `not_configured` providers from `unreachable` ones, (3) skip alerts for `disabled` and `wired=False` sites in `health_alerts()`. Call site 11 now does what its name says.
+
+### 2026-05-25 — Remove direct Anthropic providers, route through OpenRouter
+
+All three direct `type: anthropic` providers (`claude-haiku`, `claude-sonnet`, `claude-opus`) removed. Claude models now route through OpenRouter as `openrouter-haiku`, `openrouter-sonnet`, `openrouter-opus`. This eliminates the `ANTHROPIC_API_KEY` dependency for LiteLLM routing — the key is retained only for CC background sessions (which bypass the provider chain entirely via `dispatch: cli`). The ghost-down issue described above is now structurally impossible.

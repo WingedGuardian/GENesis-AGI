@@ -277,14 +277,13 @@ class TestProviderHealth:
 class TestDisabledChainSemantics:
     """Disabled providers must be filtered, not treated as failures.
 
-    The bug this addresses: Anthropic providers (claude-sonnet, claude-opus,
-    claude-haiku) have no ANTHROPIC_API_KEY in this deployment because Genesis
-    accesses Claude only via Claude Code background sessions. The probe
-    correctly returned configured=False, but the call_sites snapshot then
-    treated them as "unreachable → down → CRITICAL alert → Sentinel wake."
+    The bug this originally addressed: providers with missing API keys were
+    treated as "unreachable → down → CRITICAL alert → Sentinel wake."
     The fix: filter disabled providers out of the chain walk, and if every
     provider is disabled, mark the site itself "disabled" (config state, not
-    alert condition).
+    alert condition). Note: direct Anthropic providers were removed in PR #447
+    (all Claude models now route through OpenRouter), but the logic remains
+    important for any keyless provider.
     """
 
     @pytest.mark.asyncio
@@ -333,27 +332,27 @@ class TestDisabledChainSemantics:
         from genesis.observability.snapshots.call_sites import call_sites
 
         providers = {
-            "claude-sonnet": _make_provider("claude-sonnet"),
-            "claude-opus": _make_provider("claude-opus"),
+            "openrouter-sonnet": _make_provider("openrouter-sonnet"),
+            "openrouter-opus": _make_provider("openrouter-opus"),
         }
         config = _make_config(providers, {
             "11_user_model_synthesis": CallSiteConfig(
                 id="11_user_model_synthesis",
-                chain=["claude-sonnet", "claude-opus"],
+                chain=["openrouter-sonnet", "openrouter-opus"],
             ),
         })
         breakers = _mock_registry({
-            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
-            "claude-opus": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-sonnet": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-opus": _mock_breaker(ProviderState.CLOSED),
         })
         probe_results = {
-            "claude-sonnet": ProviderProbeResult(
-                provider_name="claude-sonnet",
+            "openrouter-sonnet": ProviderProbeResult(
+                provider_name="openrouter-sonnet",
                 reachable=False, configured=False,
                 error="no API key configured",
             ),
-            "claude-opus": ProviderProbeResult(
-                provider_name="claude-opus",
+            "openrouter-opus": ProviderProbeResult(
+                provider_name="openrouter-opus",
                 reachable=False, configured=False,
                 error="no API key configured",
             ),
@@ -372,16 +371,16 @@ class TestDisabledChainSemantics:
         from genesis.observability.provider_health import ProviderProbeResult
         from genesis.observability.snapshots.call_sites import call_sites
 
-        providers = {"claude-sonnet": _make_provider("claude-sonnet")}
+        providers = {"openrouter-sonnet": _make_provider("openrouter-sonnet")}
         config = _make_config(providers, {
-            "test_site": CallSiteConfig(id="test_site", chain=["claude-sonnet"]),
+            "test_site": CallSiteConfig(id="test_site", chain=["openrouter-sonnet"]),
         })
         breakers = _mock_registry({
-            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-sonnet": _mock_breaker(ProviderState.CLOSED),
         })
         probe_results = {
-            "claude-sonnet": ProviderProbeResult(
-                provider_name="claude-sonnet",
+            "openrouter-sonnet": ProviderProbeResult(
+                provider_name="openrouter-sonnet",
                 reachable=False, configured=False,
                 error="no API key configured",
             ),
@@ -405,17 +404,17 @@ class TestDisabledChainSemantics:
         from genesis.observability.snapshots.call_sites import call_sites
 
         providers = {
-            "claude-sonnet": dataclasses.replace(
-                _make_provider("claude-sonnet"),
-                provider_type="anthropic",
+            "openrouter-sonnet": dataclasses.replace(
+                _make_provider("openrouter-sonnet"),
+                provider_type="openrouter",
                 has_api_key=False,
             ),
         }
         config = _make_config(providers, {
-            "test_site": CallSiteConfig(id="test_site", chain=["claude-sonnet"]),
+            "test_site": CallSiteConfig(id="test_site", chain=["openrouter-sonnet"]),
         })
         breakers = _mock_registry({
-            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-sonnet": _mock_breaker(ProviderState.CLOSED),
         })
         # No probe_results — cold-start condition
         result = await call_sites(
@@ -424,7 +423,7 @@ class TestDisabledChainSemantics:
         )
         chain = result["test_site"]["chain_health"]
         assert chain[0]["has_api_key"] is False
-        assert chain[0]["missing_env_var"] == "API_KEY_ANTHROPIC"
+        assert chain[0]["missing_env_var"] == "API_KEY_OPENROUTER"
 
     @pytest.mark.asyncio
     async def test_keyless_chain_cascades_to_disabled_no_probes(self):
@@ -444,18 +443,18 @@ class TestDisabledChainSemantics:
             "p_zenmux": dataclasses.replace(
                 _make_provider("p_zenmux"), provider_type="zenmux", has_api_key=False,
             ),
-            "p_anthropic": dataclasses.replace(
-                _make_provider("p_anthropic"), provider_type="anthropic", has_api_key=False,
+            "p_openrouter": dataclasses.replace(
+                _make_provider("p_openrouter"), provider_type="openrouter", has_api_key=False,
             ),
         }
         config = _make_config(providers, {
             "active_site_with_no_keys": CallSiteConfig(
-                id="active_site_with_no_keys", chain=["p_zenmux", "p_anthropic"],
+                id="active_site_with_no_keys", chain=["p_zenmux", "p_openrouter"],
             ),
         })
         breakers = _mock_registry({
             "p_zenmux": _mock_breaker(ProviderState.CLOSED),
-            "p_anthropic": _mock_breaker(ProviderState.CLOSED),
+            "p_openrouter": _mock_breaker(ProviderState.CLOSED),
         })
         result = await call_sites(
             db=None, routing_config=config, breakers=breakers,
@@ -467,7 +466,7 @@ class TestDisabledChainSemantics:
         assert site["status_reason"] == "NO_API_KEYS"
         # Both chain entries must surface their missing env var
         env_vars = {c["missing_env_var"] for c in site["chain_health"]}
-        assert env_vars == {"API_KEY_ZENMUX", "API_KEY_ANTHROPIC"}
+        assert env_vars == {"API_KEY_ZENMUX", "API_KEY_OPENROUTER"}
 
     @pytest.mark.asyncio
     async def test_intrinsic_status_reason_wins_over_no_api_keys(self):
@@ -482,18 +481,18 @@ class TestDisabledChainSemantics:
         from genesis.observability.snapshots.call_sites import call_sites
 
         providers = {
-            "claude-sonnet": dataclasses.replace(
-                _make_provider("claude-sonnet"),
-                provider_type="anthropic", has_api_key=False,
+            "openrouter-sonnet": dataclasses.replace(
+                _make_provider("openrouter-sonnet"),
+                provider_type="openrouter", has_api_key=False,
             ),
         }
         config = _make_config(providers, {
             "future_site": CallSiteConfig(
-                id="future_site", chain=["claude-sonnet"],
+                id="future_site", chain=["openrouter-sonnet"],
             ),
         })
         breakers = _mock_registry({
-            "claude-sonnet": _mock_breaker(ProviderState.CLOSED),
+            "openrouter-sonnet": _mock_breaker(ProviderState.CLOSED),
         })
         # Inject intrinsic meta entry. wired=True so idle override
         # doesn't short-circuit the chain walk before NO_API_KEYS would

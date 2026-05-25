@@ -188,7 +188,7 @@ async def test_no_api_key_fails_open(monkeypatch):
     fake_commits = [{"sha": "x", "subject": "unrelated", "body": ""}]
     monkeypatch.setattr(version_gate, "fetch_upstream_log", lambda *a, **k: fake_commits)
     # Clear all known keys
-    for var in ("ANTHROPIC_API_KEY", "GROQ_API_KEY", "GEMINI_API_KEY"):
+    for var in ("API_KEY_OPENROUTER", "GROQ_API_KEY", "GEMINI_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     r = await version_gate.check_version_gate(
         user_subject="s", user_body="b", user_diff="d",

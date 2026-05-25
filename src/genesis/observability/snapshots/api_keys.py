@@ -15,12 +15,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _LOCAL_TYPES = frozenset({"ollama", "lmstudio"})
-# Anthropic providers require ANTHROPIC_API_KEY when configured as direct
-# API providers (via LiteLLM).  CC-dispatched call sites (dispatch=cli)
-# bypass the provider chain entirely and work regardless.  Previously
-# "anthropic" was exempted here, which caused phantom circuit-breaker
-# failures: providers registered without keys, failed every API call,
-# and counted as "down" — triggering false L2 resilience state.
+# Previously Anthropic providers required ANTHROPIC_API_KEY as direct API
+# providers (via LiteLLM).  As of PR #447, all Claude models route through
+# OpenRouter, eliminating the direct Anthropic dependency.  CC-dispatched
+# call sites (dispatch=cli) bypass the provider chain entirely regardless.
 _CC_MANAGED_TYPES: frozenset[str] = frozenset()
 
 

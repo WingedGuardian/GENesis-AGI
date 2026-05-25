@@ -149,7 +149,7 @@ async def test_dispatch_router_uses_api_first(approval_gate):
     router.route_call = AsyncMock(return_value=SimpleNamespace(
         success=True,
         content="api-response",
-        provider_used="claude-sonnet",
+        provider_used="openrouter-sonnet",
         model_id="claude-sonnet-4",
         cost_usd=0.12,
         input_tokens=10,
@@ -779,7 +779,7 @@ def _router_with_dispatch(call_site_id: str, dispatch: str) -> AsyncMock:
     from genesis.routing.types import CallSiteConfig
     site = CallSiteConfig(
         id=call_site_id,
-        chain=["claude-sonnet"],
+        chain=["openrouter-sonnet"],
         dispatch=dispatch,
     )
     router = AsyncMock()
@@ -827,7 +827,7 @@ async def test_dispatch_api_blocks_on_exhaustion(approval_gate):
     router.route_call = AsyncMock(return_value=SimpleNamespace(
         success=False,
         content=None,
-        provider_used="claude-sonnet",
+        provider_used="openrouter-sonnet",
         model_id=None,
         cost_usd=0.0,
         input_tokens=0,
@@ -866,7 +866,7 @@ async def test_dispatch_dual_default_preserves_existing_behavior(approval_gate):
     router.route_call = AsyncMock(return_value=SimpleNamespace(
         success=True,
         content="dual-mode api response",
-        provider_used="claude-sonnet",
+        provider_used="openrouter-sonnet",
         model_id="claude-sonnet-4",
         cost_usd=0.05,
         input_tokens=10,

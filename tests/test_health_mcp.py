@@ -163,9 +163,9 @@ class TestHealthAlerts:
     async def test_disabled_call_site_alert_suppressed(self):
         """Sites with status='disabled' (no API key) MUST NOT emit alerts.
 
-        This is the root-cause fix for the Sentinel spam loop: Anthropic
-        providers without ANTHROPIC_API_KEY → call site marked disabled
-        (config state, not outage) → no alert → no Sentinel wake.
+        This is the root-cause fix for the Sentinel spam loop: providers
+        without API keys → call site marked disabled (config state, not
+        outage) → no alert → no Sentinel wake.
         """
         svc = _mock_service({
             "call_sites": {
