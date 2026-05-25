@@ -178,11 +178,11 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     if config is None:
         config = load_config()
 
-    maintenance_file = Path("/var/lib/guardian-snapshots/.guardian-maintenance")
-    if maintenance_file.exists():
+    maintenance_path = Path(config.maintenance_file)
+    if maintenance_path.exists():
         logger.info(
             "Maintenance mode active — standing down (remove %s to resume)",
-            maintenance_file,
+            maintenance_path,
         )
         return
 
