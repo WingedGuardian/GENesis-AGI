@@ -147,6 +147,21 @@ PYEOF
                     fi
                 done
                 systemctl --user daemon-reload 2>/dev/null || true
+                # Refresh host sysctl/udev configs (I/O tuning, BFQ scheduler)
+                if sudo -n true 2>/dev/null; then
+                    if [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
+                        sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/ 2>/dev/null
+                        sudo udevadm control --reload-rules 2>/dev/null || true
+                    fi
+                    # Regenerate I/O sysctl from canonical values
+                    sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null 2>&1 << 'IOSYSCTL'
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 3
+vm.vfs_cache_pressure = 50
+IOSYSCTL
+                    sudo sysctl --system > /dev/null 2>&1 || true
+                fi
                 # Restart timer so new check.py code takes effect immediately
                 systemctl --user restart genesis-guardian.timer 2>/dev/null || true
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
