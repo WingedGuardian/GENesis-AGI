@@ -2,11 +2,12 @@
 
 Recovery actions in escalation order:
 1. RESTART_SERVICES  — systemctl restart genesis-bridge
-2. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
-3. REVERT_CODE       — git stash && git revert HEAD, restart
-4. RESTART_CONTAINER — incus restart genesis
-5. SNAPSHOT_ROLLBACK — incus snapshot restore genesis {last_healthy}
-6. ESCALATE          — alert user, stop automated recovery
+2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
+3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
+4. REVERT_CODE       — git stash && git revert HEAD, restart
+5. RESTART_CONTAINER — incus restart genesis
+6. SNAPSHOT_ROLLBACK — incus snapshot restore genesis {last_healthy}
+7. ESCALATE          — alert user, stop automated recovery
 
 Each step: pre-alert → pre-snapshot → execute → wait → verify → post-alert.
 """
