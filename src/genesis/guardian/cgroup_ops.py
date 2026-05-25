@@ -76,9 +76,10 @@ async def relieve_io_max(container: str) -> bool:
             current = io_max_path.read_text().strip()
             logger.info("Current io.max for %s: %s", container, current)
 
-        # Write via sudo bash -c (cgroup files are root-owned)
+        # Write via sudo sh -c with quoted path (prevents shell injection)
+        import shlex
         rc, stdout, stderr = await _run_subprocess(
-            "sudo", "bash", "-c", f'echo "max" > {io_max_path}',
+            "sudo", "sh", "-c", f'echo max > {shlex.quote(str(io_max_path))}',
             timeout=10.0,
         )
         if rc != 0:

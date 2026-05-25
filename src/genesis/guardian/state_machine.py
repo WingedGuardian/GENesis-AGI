@@ -581,6 +581,7 @@ class ConfirmationStateMachine:
         self._state.first_failure_at = None
         self._state.last_healthy_at = now
         self._state.recovery_attempts = 0
+        self._state.last_recovery_at = None
         self._clear_dialogue_state()
         self.clear_cc_unavailable()
 

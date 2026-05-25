@@ -38,7 +38,7 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
         logger.debug("Set oom_score_adj=%d for PID %d", score, pid)
     except OSError as exc:
-        logger.debug("Could not set oom_score_adj for PID %d: %s", pid, exc)
+        logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
 
 
 class CCInvoker:
