@@ -57,7 +57,6 @@ logger = logging.getLogger(__name__)
 _UNIVERSAL_DISALLOW = [
     "Bash",
     "Edit",
-    "Write",
     "NotebookEdit",
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
@@ -94,6 +93,10 @@ _NO_BROWSER_INTERACTION = [
     "mcp__genesis-health__browser_collaborate",
 ]
 
+_NO_FILE_WRITE = [
+    "Write",  # Moved out of _UNIVERSAL_DISALLOW so interact/research can use it
+]
+
 _NO_MEMORY_WRITES = [
     # memory_store/synthesize/extract + knowledge_ingest* are in
     # _UNIVERSAL_DISALLOW (vector store isolation).
@@ -123,9 +126,9 @@ _NO_RECON_WRITES = [
 
 PROFILES: dict[str, list[str]] = {
     "observe": (
-        _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION
-        + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS + _NO_OUTREACH_ENGAGEMENT
-        + _NO_RECON_WRITES
+        _UNIVERSAL_DISALLOW + _NO_FILE_WRITE + _NO_OUTREACH_SEND
+        + _NO_BROWSER_INTERACTION + _NO_MEMORY_WRITES + _NO_FOLLOW_UPS
+        + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
@@ -137,6 +140,99 @@ PROFILES: dict[str, list[str]] = {
 }
 
 VALID_PROFILES = frozenset(PROFILES.keys())
+
+
+# ---------------------------------------------------------------------------
+# Profile addendum + skill auto-injection
+# ---------------------------------------------------------------------------
+
+_PROFILE_ADDENDA: dict[str, str] = {
+    "interact": """
+
+## Session Profile: interact
+
+You have access to: browser MCP tools, memory MCP tools, outreach send.
+You do NOT have: Write, Edit, Bash, NotebookEdit.
+
+**Output rules:**
+- Your final message IS your deliverable. Write it clearly and completely.
+- If you need to persist data, use observation_write, reference_store, or
+  procedure_store MCP tools (SQLite-backed, not file-based).
+- Write files ONLY to `~/.genesis/output/` if absolutely necessary (via
+  browser_run_js or clipboard methods, not Write tool).
+- Do NOT waste time searching for Write/Edit/Bash tools. They are not
+  available to you. Do NOT spawn subagents to work around this.
+""",
+    "research": """
+
+## Session Profile: research
+
+You have access to: memory MCP tools, web tools (web_search, web_fetch),
+observation_write, procedure_store, reference_store, follow_up_create.
+You do NOT have: Write, Edit, Bash, NotebookEdit, browser tools.
+
+**Output rules:**
+- Your final message IS your deliverable. Write it clearly and completely.
+- Use observation_write for findings that should persist beyond this session.
+- Use reference_store for URLs, credentials, or identifiers discovered.
+- Do NOT waste time searching for Write/Edit/Bash/browser tools. They are
+  not available to you. Do NOT spawn subagents to work around this.
+""",
+    "observe": """
+
+## Session Profile: observe
+
+You are in read-only mode. You can read, search, and analyze but cannot
+modify anything.
+You do NOT have: Write, Edit, Bash, NotebookEdit, browser interaction,
+memory writes, outreach send, follow-up creation.
+
+**Output rules:**
+- Your final message IS your deliverable. Write it clearly and completely.
+- You cannot persist anything. Your message is the only output.
+- Do NOT waste time searching for Write/Edit/Bash tools. They are not
+  available to you. Do NOT spawn subagents to work around this.
+""",
+}
+
+# Skills auto-injected by profile (always loaded for that profile)
+_PROFILE_SKILLS: dict[str, list[str]] = {
+    "interact": ["stealth-browser"],
+    "research": [],
+    "observe": [],
+}
+
+# Keyword triggers for content-related skills (scanned against prompt)
+_CONTENT_SKILL_TRIGGERS: list[tuple[list[str], list[str]]] = [
+    (
+        ["publish", "article", "medium", "content", "post", "draft", "blog"],
+        ["content-publish", "voice-master"],
+    ),
+]
+
+
+def _build_profile_addendum(profile: str) -> str:
+    """Return the profile constraint addendum for background sessions."""
+    return _PROFILE_ADDENDA.get(profile, _PROFILE_ADDENDA["observe"])
+
+
+def _resolve_skills(request: DirectSessionRequest) -> list[str]:
+    """Determine which skills to inject: explicit > profile + auto-detect."""
+    if request.skills is not None:
+        return request.skills
+
+    # Start with profile-bound skills
+    skills = list(_PROFILE_SKILLS.get(request.profile, []))
+
+    # Scan prompt for keyword triggers
+    prompt_lower = request.prompt.lower()
+    for keywords, skill_names in _CONTENT_SKILL_TRIGGERS:
+        if any(kw in prompt_lower for kw in keywords):
+            for name in skill_names:
+                if name not in skills:
+                    skills.append(name)
+
+    return skills
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +255,7 @@ class DirectSessionRequest:
     source_tag: str = "direct_session"
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
     planning_instruction: str | None = None  # opt-in: prepended to prompt
+    skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
@@ -410,6 +507,20 @@ class DirectSessionRunner:
             # Use the surplus config's system prompt (which loads SOUL.md)
             surplus_config = self._config_builder.build_surplus_config()
             system_prompt = surplus_config.get("system_prompt", "")
+
+        # Inject profile addendum (tells session its constraints upfront)
+        system_prompt += _build_profile_addendum(request.profile)
+
+        # Inject skills (explicit from request, auto-detected from prompt keywords)
+        skill_names = _resolve_skills(request)
+        if skill_names:
+            from genesis.learning.skills.wiring import load_skill
+
+            for name in skill_names:
+                content = load_skill(name)
+                if content:
+                    system_prompt += f"\n\n## Skill: {name}\n{content}"
+
         disallowed = PROFILES.get(request.profile, PROFILES["observe"])
 
         # Give background sessions access to Genesis MCP servers (health + memory).
