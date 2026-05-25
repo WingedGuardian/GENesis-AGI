@@ -70,6 +70,7 @@ class StateData:
     last_cc_unavailable_alert_at: str | None = None
     auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
     last_recovery_at: str | None = None  # ISO8601 timestamp of last recovery attempt
+    snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
 
     def to_dict(self) -> dict:
         return {
@@ -91,6 +92,7 @@ class StateData:
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
             "auto_reset_count": self.auto_reset_count,
             "last_recovery_at": self.last_recovery_at,
+            "snapshot_size_history": self.snapshot_size_history[-5:],
         }
 
     @classmethod
@@ -118,6 +120,7 @@ class StateData:
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
             auto_reset_count=data.get("auto_reset_count", 0),
             last_recovery_at=data.get("last_recovery_at"),
+            snapshot_size_history=data.get("snapshot_size_history", []),
         )
 
 

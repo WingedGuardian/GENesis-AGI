@@ -91,12 +91,16 @@ class RecoveryEngine:
         self._sm.set_recovering()
 
         # Pre-recovery snapshot (gated on config flag and disk space)
+        snap_history = self._sm.state.snapshot_size_history
         if (
             action != RecoveryAction.SNAPSHOT_ROLLBACK
             and self._config.snapshots.take_pre_recovery
-            and await self._snapshots.safe_to_snapshot()
+            and await self._snapshots.safe_to_snapshot(snap_history)
         ):
-            snap_name = await self._snapshots.take(label="pre-recovery")
+            snap_name = await self._snapshots.take(
+                label="pre-recovery",
+                snapshot_size_history=snap_history,
+            )
             if snap_name:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
 

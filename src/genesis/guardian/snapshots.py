@@ -60,25 +60,107 @@ class SnapshotManager:
             logger.warning("Failed to parse pool space output: %s", stdout)
             return 100.0
 
-    async def safe_to_snapshot(self) -> bool:
-        """Check if it's safe to take a snapshot (pool usage below threshold)."""
-        max_pct = self._config.snapshots.max_pool_usage_pct
-        usage = await self.check_pool_space()
-        if usage > max_pct:
+    async def _get_pool_free_bytes(self) -> tuple[int, int] | None:
+        """Get (total_bytes, free_bytes) for the storage pool. None on failure."""
+        rc, pool_name, _ = await _run_subprocess(
+            "incus", "config", "device", "get", self._container, "root", "pool",
+            timeout=10.0,
+        )
+        if rc != 0 or not pool_name.strip():
+            return None
+
+        pool_path = f"/var/lib/incus/storage-pools/{pool_name.strip()}"
+        rc, stdout, stderr = await _run_subprocess(
+            "df", "--output=size,avail", "--block-size=1", pool_path,
+            timeout=10.0,
+        )
+        if rc != 0:
+            logger.warning("Failed to get pool bytes at %s: %s", pool_path, stderr)
+            return None
+
+        try:
+            lines = stdout.strip().splitlines()
+            if len(lines) < 2:
+                return None
+            parts = lines[-1].split()
+            if len(parts) < 2:
+                return None
+            return int(parts[0]), int(parts[1])
+        except (ValueError, IndexError):
+            return None
+
+    async def safe_to_snapshot(
+        self, snapshot_size_history: list[int] | None = None,
+    ) -> bool:
+        """Check if it's safe to take a snapshot using headroom-based gating.
+
+        Strategy:
+        - With snapshot size history: require free > max(min_headroom_gb, 2x avg
+          of last 3 snapshot sizes). Adapts to actual snapshot sizes.
+        - Without history: require at least 10% of pool free (safe default for
+          first snapshots before any size data is available).
+        - If pool detection fails entirely: fall back to percentage threshold
+          (max_pool_usage_pct) for robustness.
+        """
+        pool_info = await self._get_pool_free_bytes()
+        if pool_info is None:
+            # Can't get byte-level info — fall back to percentage check
+            max_pct = self._config.snapshots.max_pool_usage_pct
+            usage = await self.check_pool_space()
+            if usage > max_pct:
+                logger.error(
+                    "Pool usage %.0f%% exceeds %.0f%% threshold — refusing snapshot",
+                    usage, max_pct,
+                )
+                return False
+            return True
+
+        total_bytes, free_bytes = pool_info
+        min_headroom = int(self._config.snapshots.min_headroom_gb * 1024**3)
+
+        history = snapshot_size_history or []
+        if not history:
+            # No history — require at least 10% of pool free
+            threshold = int(total_bytes * 0.10)
+            if free_bytes < threshold:
+                logger.error(
+                    "Pool free %d bytes < 10%% threshold %d bytes — refusing snapshot",
+                    free_bytes, threshold,
+                )
+                return False
+            return True
+
+        # History available — require free > max(min_headroom, 2x avg last 3)
+        recent = history[-3:]
+        avg_size = sum(recent) // len(recent)
+        required = max(min_headroom, 2 * avg_size)
+
+        if free_bytes < required:
             logger.error(
-                "Pool usage %.0f%% exceeds %.0f%% threshold — refusing snapshot",
-                usage, max_pct,
+                "Pool free %d bytes < required headroom %d bytes "
+                "(min_headroom=%d, 2x_avg=%d, history=%d samples) — refusing snapshot",
+                free_bytes, required, min_headroom, 2 * avg_size, len(recent),
             )
             return False
+
+        logger.info(
+            "Headroom check passed: %d bytes free, %d required "
+            "(avg snapshot %d bytes, %d samples)",
+            free_bytes, required, avg_size, len(recent),
+        )
         return True
 
-    async def take(self, label: str = "") -> str | None:
+    async def take(
+        self,
+        label: str = "",
+        snapshot_size_history: list[int] | None = None,
+    ) -> str | None:
         """Create a snapshot. Returns the snapshot name or None on failure.
 
         Checks disk space before proceeding. Deletes excess snapshots
         before creating the new one to stay within retention limit.
         """
-        if not await self.safe_to_snapshot():
+        if not await self.safe_to_snapshot(snapshot_size_history):
             return None
 
         # Delete-before-create: remove excess snapshots to stay within retention
@@ -175,9 +257,13 @@ class SnapshotManager:
 
         return deleted
 
-    async def mark_healthy(self) -> str | None:
+    async def mark_healthy(
+        self, snapshot_size_history: list[int] | None = None,
+    ) -> str | None:
         """Take a snapshot labeled 'healthy'."""
-        return await self.take(label="healthy")
+        return await self.take(
+            label="healthy", snapshot_size_history=snapshot_size_history,
+        )
 
     async def get_latest_healthy(self) -> str | None:
         """Get the name of the most recent 'healthy' snapshot."""
