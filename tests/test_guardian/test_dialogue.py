@@ -242,14 +242,14 @@ class TestDialogueStateMachineIntegration:
         assert t.new_state == GuardianState.HEALTHY
         assert "self-healed" in t.reason
 
-    def test_awaiting_self_heal_eta_expires(self) -> None:
+    def test_awaiting_self_heal_sentinel_escalated(self) -> None:
+        """Sentinel escalated → Guardian proceeds to diagnosis."""
         from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
         config = GuardianConfig()
         sm = ConfirmationStateMachine(config)
-        sm.set_awaiting_self_heal(action="restarting bridge", eta_s=60)
-        # Set dialogue_sent_at to the past so ETA is expired
-        sm._state.dialogue_sent_at = "2026-03-25T11:00:00+00:00"
+        sm.set_awaiting_self_heal(action="sentinel_dispatched", eta_s=0)
+        sm.update_sentinel_state("escalated")
 
         dead = HealthSnapshot(
             signals={
@@ -260,19 +260,17 @@ class TestDialogueStateMachineIntegration:
         )
         t = sm.process(dead)
         assert t.new_state == GuardianState.CONFIRMED_DEAD
-        assert "ETA expired" in t.reason
+        assert "escalated" in t.reason
         assert t.action_needed is True
 
-    def test_awaiting_self_heal_still_waiting(self) -> None:
-        from datetime import UTC, datetime
-
+    def test_awaiting_self_heal_sentinel_active(self) -> None:
+        """Sentinel investigating → Guardian waits (event-driven, no timeout)."""
         from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
         config = GuardianConfig()
         sm = ConfirmationStateMachine(config)
-        sm.set_awaiting_self_heal(action="restarting bridge", eta_s=300)
-        # ETA is 5 min, set sent_at to now so it hasn't expired
-        sm._state.dialogue_sent_at = datetime.now(UTC).isoformat()
+        sm.set_awaiting_self_heal(action="sentinel_dispatched", eta_s=0)
+        sm.update_sentinel_state("investigating")
 
         dead = HealthSnapshot(
             signals={
@@ -284,3 +282,45 @@ class TestDialogueStateMachineIntegration:
         t = sm.process(dead)
         assert t.new_state == GuardianState.AWAITING_SELF_HEAL
         assert "waiting" in t.reason.lower()
+
+    def test_awaiting_self_heal_awaiting_approval_indefinitely(self) -> None:
+        """User sovereignty: Sentinel awaiting approval → Guardian waits forever."""
+        from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
+
+        config = GuardianConfig()
+        sm = ConfirmationStateMachine(config)
+        sm.set_awaiting_self_heal(action="sentinel_dispatched", eta_s=0)
+        sm.update_sentinel_state("awaiting_action_approval")
+        # Even with a very old dialogue_sent_at, Guardian does NOT timeout
+        sm._state.dialogue_sent_at = "2026-01-01T00:00:00+00:00"
+
+        dead = HealthSnapshot(
+            signals={
+                "container_exists": SignalResult("container_exists", True, 1.0, "ok", "t"),
+                "health_api": SignalResult("health_api", False, 1.0, "down", "t"),
+            },
+            pause_state=PauseState(paused=False),
+        )
+        t = sm.process(dead)
+        assert t.new_state == GuardianState.AWAITING_SELF_HEAL
+        assert "waiting" in t.reason.lower()
+
+    def test_awaiting_self_heal_unreachable(self) -> None:
+        """Genesis unreachable (empty sentinel_state) → proceed to diagnosis."""
+        from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
+
+        config = GuardianConfig()
+        sm = ConfirmationStateMachine(config)
+        sm.set_awaiting_self_heal(action="sentinel_dispatched", eta_s=0)
+        # sentinel_state empty = unreachable
+        sm.update_sentinel_state("")
+
+        dead = HealthSnapshot(
+            signals={
+                "container_exists": SignalResult("container_exists", False, 1.0, "down", "t"),
+            },
+            pause_state=PauseState(paused=False),
+        )
+        t = sm.process(dead)
+        assert t.new_state == GuardianState.CONFIRMED_DEAD
+        assert t.action_needed is True

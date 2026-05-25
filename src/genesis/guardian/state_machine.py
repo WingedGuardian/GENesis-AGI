@@ -66,6 +66,7 @@ class StateData:
     dialogue_sent_at: str | None = None
     dialogue_eta_s: int = 0
     dialogue_action: str | None = None
+    sentinel_state: str = ""  # Latest Sentinel state from dialogue response
     cc_unavailable_since: str | None = None
     last_cc_unavailable_alert_at: str | None = None
     auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
@@ -89,6 +90,7 @@ class StateData:
             "dialogue_sent_at": self.dialogue_sent_at,
             "dialogue_eta_s": self.dialogue_eta_s,
             "dialogue_action": self.dialogue_action,
+            "sentinel_state": self.sentinel_state,
             "cc_unavailable_since": self.cc_unavailable_since,
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
             "auto_reset_count": self.auto_reset_count,
@@ -118,6 +120,7 @@ class StateData:
             dialogue_sent_at=data.get("dialogue_sent_at"),
             dialogue_eta_s=data.get("dialogue_eta_s", 0),
             dialogue_action=data.get("dialogue_action"),
+            sentinel_state=data.get("sentinel_state", ""),
             cc_unavailable_since=data.get("cc_unavailable_since"),
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
             auto_reset_count=data.get("auto_reset_count", 0),
@@ -303,19 +306,26 @@ class ConfirmationStateMachine:
                     new_state=GuardianState.HEALTHY,
                     reason="Genesis self-healed successfully",
                 )
-            # Check if ETA has expired
-            if self._dialogue_eta_expired():
+            # Event-driven: check Sentinel state, not wall-clock timeout
+            if self._should_proceed_past_self_heal():
+                reason = (
+                    f"Sentinel state '{self._state.sentinel_state or 'unreachable'}' "
+                    f"— proceeding to diagnosis"
+                )
                 self._state.current_state = GuardianState.CONFIRMED_DEAD
                 return Transition(
                     old_state=old_state,
                     new_state=GuardianState.CONFIRMED_DEAD,
-                    reason="Genesis self-heal ETA expired, still unhealthy",
+                    reason=reason,
                     action_needed=True,
                 )
             return Transition(
                 old_state=old_state,
                 new_state=GuardianState.AWAITING_SELF_HEAL,
-                reason=f"waiting for Genesis self-heal: {self._state.dialogue_action}",
+                reason=(
+                    f"waiting for Sentinel ({self._state.sentinel_state}): "
+                    f"{self._state.dialogue_action}"
+                ),
             )
         elif old_state == GuardianState.CONFIRMED_DEAD:
             if snapshot.all_alive:
@@ -615,22 +625,37 @@ class ConfirmationStateMachine:
 
     # ── External state manipulation (called by recovery engine) ────────
 
-    def _dialogue_eta_expired(self) -> bool:
-        """Check if the self-heal ETA has passed."""
-        if not self._state.dialogue_sent_at or not self._state.dialogue_eta_s:
-            return True
-        try:
-            sent = datetime.fromisoformat(self._state.dialogue_sent_at)
-            elapsed = (datetime.now(UTC) - sent).total_seconds()
-            return elapsed > self._state.dialogue_eta_s
-        except (ValueError, TypeError):
-            return True
+    def _should_proceed_past_self_heal(self) -> bool:
+        """Check if Guardian should stop waiting for Sentinel.
+
+        Event-driven standing — NO wall-clock timeout. Proceeds ONLY when:
+        - Sentinel state is empty (Genesis unreachable, no state reported)
+        - Sentinel transitioned to "escalated" (explicitly gave up)
+        - Sentinel returned to "healthy" (thinks it fixed it — but probes
+          say otherwise, so Guardian should proceed to its own diagnosis)
+
+        NEVER proceeds based on elapsed time. If Sentinel is investigating
+        or awaiting approval for 8 hours, Guardian waits 8 hours. User
+        sovereignty is absolute.
+        """
+        state = self._state.sentinel_state
+        if not state:
+            return True  # No state = Genesis unreachable
+        if state == "escalated":
+            return True  # Sentinel explicitly gave up
+        # "healthy" = Sentinel thinks it fixed it, but probes still fail
+        return state == "healthy"
 
     def _clear_dialogue_state(self) -> None:
         """Clear dialogue tracking fields."""
         self._state.dialogue_sent_at = None
         self._state.dialogue_eta_s = 0
         self._state.dialogue_action = None
+        self._state.sentinel_state = ""
+
+    def update_sentinel_state(self, state: str) -> None:
+        """Update the latest Sentinel state (called by check.py on re-query)."""
+        self._state.sentinel_state = state
 
     # ── External state manipulation (called by check.py) ───────────────
 
