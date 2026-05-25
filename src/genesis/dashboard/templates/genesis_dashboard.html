@@ -2474,15 +2474,29 @@
           const ego = this.egoStatus;
           if (!ego || ego.status === "not_bootstrapped") return { state: "unknown", reason: "ego data unavailable" };
           if (!ego.enabled) return { state: "unknown", reason: "ego disabled by config" };
-          // Circuit breaker / cadence check
+          // Check both egos' cadence state via the per-ego data
+          const ue = ego.egos?.user_ego;
+          const ge = ego.egos?.genesis_ego;
+          const ueCad = ue?.cadence;
+          const geCad = ge?.cadence;
+          // Circuit breaker on either ego
+          if (ueCad?.consecutive_failures >= 3 || geCad?.consecutive_failures >= 3) {
+            const which = (ueCad?.consecutive_failures >= 3 ? "CEO" : "") +
+                          (geCad?.consecutive_failures >= 3 ? (ueCad?.consecutive_failures >= 3 ? " + COO" : "COO") : "");
+            return { state: "error", reason: `circuit open (${which})` };
+          }
+          // Fallback to modal cadence if per-ego data not available yet
           const cadence = this.egoModal.cadence;
-          if (cadence && cadence.available) {
-            if (cadence.consecutive_failures >= 3) {
-              return { state: "error", reason: `circuit open (${cadence.consecutive_failures} consecutive failures)` };
-            }
-            if (cadence.is_paused) {
-              return { state: "degraded", reason: "ego paused" };
-            }
+          if (!ue && cadence?.available) {
+            if (cadence.consecutive_failures >= 3) return { state: "error", reason: `circuit open (${cadence.consecutive_failures} failures)` };
+            if (cadence.is_paused) return { state: "degraded", reason: "ego paused" };
+          }
+          if (ueCad?.is_paused && geCad?.is_paused) {
+            return { state: "degraded", reason: "both egos paused" };
+          }
+          if (ueCad?.is_paused || geCad?.is_paused) {
+            const which = ueCad?.is_paused ? "CEO" : "COO";
+            return { state: "degraded", reason: `${which} paused` };
           }
           // Proposals piling up
           if (ego.pending_proposals > 5) {
@@ -4099,9 +4113,9 @@
             <div class="health-card-reason" x-text="$store.genesisDashboard.surplusSemantic().reason"></div>
           </div>
 
-          <!-- Ego -->
+          <!-- Ego — dual-ego display -->
           <template x-if="$store.genesisDashboard.egoStatus?.enabled">
-            <div class="health-card" title="Ego: autonomous decision-making cycle with adaptive cadence and budget controls."
+            <div class="health-card" title="Ego: dual autonomous decision-making cycles with adaptive cadence."
                  style="cursor: pointer;" @click="$store.genesisDashboard.egoModal.open = true; $store.genesisDashboard.fetchEgoDetail()">
               <div class="health-card-header">
                 <div class="health-card-title">Ego <span style="font-size: 0.6rem; opacity: 0.5;">click for details</span></div>
@@ -4109,19 +4123,65 @@
                       :style="`color:${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"
                       x-text="$store.genesisDashboard.egoSemantic().state"></span>
               </div>
-              <div class="health-card-value">
-                <div>
-                  <span class="status-dot"
-                        :style="`background: ${$store.genesisDashboard.semanticStateColor($store.genesisDashboard.egoSemantic().state)}`"></span>
-                  <span style="font-size: 0.82rem"
-                        x-text="$store.genesisDashboard.egoStatus?.focus_summary || 'no focus'"></span>
-                  <!-- Daily cost (observational) -->
-                  <div style="margin-top: 0.3rem;">
-                    <span style="font-size: 0.68rem; color: var(--color-text-secondary);"
-                          x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' today (avg: $' + ($store.genesisDashboard.egoStatus?.rolling_daily_avg_usd || 0).toFixed(2) + '/day)'"></span>
+              <div class="health-card-value" style="width: 100%;">
+                <!-- User Ego (CEO) row -->
+                <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }" style="margin-bottom: 0.4rem;">
+                  <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc; min-width: 2.8rem;">CEO</span>
+                    <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ue?.model || '?'"></span>
+                    <template x-if="ue?.pending_proposals > 0">
+                      <span style="font-size: 0.62rem; background: rgba(192,132,252,0.2); color: #c084fc; padding: 0 0.3rem; border-radius: 3px;"
+                            x-text="ue.pending_proposals + ' pending'"></span>
+                    </template>
                   </div>
-                  <div class="health-card-detail" style="font-size: 0.72rem;"
-                       x-text="($store.genesisDashboard.egoStatus?.pending_proposals || 0) + ' pending proposals'"></div>
+                  <!-- Cadence progress bar -->
+                  <div style="display: flex; align-items: center; gap: 0.3rem;">
+                    <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
+                         :title="'Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max'">
+                      <div :style="(() => {
+                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 60;
+                        const base = ue?.cadence_minutes || 60;
+                        const max = ue?.max_interval_minutes || 240;
+                        const pct = Math.min(100, (cur / max) * 100);
+                        const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
+                        return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
+                      })()"></div>
+                    </div>
+                    <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
+                          x-text="(ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'm'"></span>
+                  </div>
+                </div>
+                <!-- Genesis Ego (COO) row -->
+                <div x-data="{ ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }">
+                  <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa; min-width: 2.8rem;">COO</span>
+                    <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ge?.model || '?'"></span>
+                    <template x-if="ge?.pending_proposals > 0">
+                      <span style="font-size: 0.62rem; background: rgba(96,165,250,0.2); color: #60a5fa; padding: 0 0.3rem; border-radius: 3px;"
+                            x-text="ge.pending_proposals + ' pending'"></span>
+                    </template>
+                  </div>
+                  <!-- Cadence progress bar -->
+                  <div style="display: flex; align-items: center; gap: 0.3rem;">
+                    <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
+                         :title="'Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max'">
+                      <div :style="(() => {
+                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 60;
+                        const base = ge?.cadence_minutes || 60;
+                        const max = ge?.max_interval_minutes || 240;
+                        const pct = Math.min(100, (cur / max) * 100);
+                        const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
+                        return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
+                      })()"></div>
+                    </div>
+                    <span style="font-size: 0.6rem; color: var(--color-text-secondary); min-width: 2.2rem; text-align: right;"
+                          x-text="(ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'm'"></span>
+                  </div>
+                </div>
+                <!-- Cost footer -->
+                <div style="margin-top: 0.35rem; border-top: 1px solid rgba(255,255,255,0.05); padding-top: 0.25rem;">
+                  <span style="font-size: 0.62rem; color: var(--color-text-secondary);"
+                        x-text="'$' + ($store.genesisDashboard.egoStatus?.daily_cost_usd || 0).toFixed(2) + ' today'"></span>
                 </div>
               </div>
               <div class="health-card-reason" x-text="$store.genesisDashboard.egoSemantic().reason"></div>

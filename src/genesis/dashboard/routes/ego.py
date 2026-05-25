@@ -10,7 +10,13 @@ from genesis.dashboard._blueprint import _async_route, blueprint
 @blueprint.route("/api/genesis/ego/status")
 @_async_route
 async def ego_status():
-    """Return ego subsystem status: config, recent activity, daily cost."""
+    """Return ego subsystem status: config, recent activity, daily cost.
+
+    Includes per-ego breakdown (user ego + genesis ego) for dual-ego
+    dashboard display.
+    """
+    import contextlib
+
     from genesis.db.crud import ego as ego_crud
     from genesis.ego.config import load_ego_config
     from genesis.runtime import GenesisRuntime
@@ -38,7 +44,6 @@ async def ego_status():
         }
 
     # Dispatch cost from cc_sessions
-    import contextlib
     dispatch_cost = 0.0
     with contextlib.suppress(Exception):
         dispatch_cost = await ego_crud.daily_dispatch_cost(rt._db)
@@ -47,6 +52,64 @@ async def ego_status():
     rolling_avg = 0.0
     with contextlib.suppress(Exception):
         rolling_avg = await ego_crud.rolling_daily_ego_cost(rt._db, days=7)
+
+    # ── Per-ego breakdown ──────────────────────────────────────────────
+    # Split pending proposals by ego_source for per-ego counts
+    user_pending = [p for p in pending if p.get("ego_source") == "user_ego_cycle"]
+    genesis_pending = [p for p in pending if p.get("ego_source") == "genesis_ego_cycle"]
+
+    # Genesis ego focus summary (separate state key)
+    genesis_focus = await ego_crud.get_state(rt._db, "genesis_ego_focus_summary")
+
+    # Cadence state from runtime managers
+    def _cadence_snapshot(mgr) -> dict:
+        if mgr is None:
+            return {"available": False}
+        return {
+            "available": True,
+            "is_running": mgr.is_running,
+            "is_paused": mgr.is_paused,
+            "current_interval_minutes": mgr.current_interval_minutes,
+            "consecutive_failures": mgr.consecutive_failures,
+        }
+
+    user_cadence = _cadence_snapshot(rt._ego_cadence_manager)
+    genesis_cadence = _cadence_snapshot(rt._genesis_ego_cadence_manager)
+
+    # Genesis ego config (derived from base config in init/ego.py)
+    genesis_ego_config = {
+        "model": "sonnet",
+        "default_effort": "high",
+        "cadence_minutes": max(config.cadence_minutes, 60),
+        "morning_report_enabled": False,
+    }
+
+    egos = {
+        "user_ego": {
+            "label": "User Ego",
+            "role": "CEO",
+            "model": config.model,
+            "effort": config.default_effort,
+            "focus_summary": focus or "no focus",
+            "pending_proposals": len(user_pending),
+            "cadence": user_cadence,
+            "cadence_minutes": config.cadence_minutes,
+            "max_interval_minutes": config.max_interval_minutes,
+            "morning_report": config.morning_report_enabled,
+        },
+        "genesis_ego": {
+            "label": "Genesis Ego",
+            "role": "COO",
+            "model": genesis_ego_config["model"],
+            "effort": genesis_ego_config["default_effort"],
+            "focus_summary": genesis_focus or "no focus",
+            "pending_proposals": len(genesis_pending),
+            "cadence": genesis_cadence,
+            "cadence_minutes": genesis_ego_config["cadence_minutes"],
+            "max_interval_minutes": config.max_interval_minutes,
+            "morning_report": False,
+        },
+    }
 
     return jsonify({
         "enabled": config.enabled,
@@ -63,6 +126,7 @@ async def ego_status():
         "uncompacted_cycles": uncompacted,
         "shadow_morning_report": config.shadow_morning_report,
         "board_size": config.board_size,
+        "egos": egos,
     })
 
 
