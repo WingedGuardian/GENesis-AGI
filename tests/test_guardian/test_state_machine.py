@@ -179,9 +179,13 @@ class TestRecoveryStates:
 
     def test_recovered_fails_verification(self, sm: ConfirmationStateMachine) -> None:
         sm._state.current_state = GuardianState.RECOVERED
+        # Simulate that record_recovery_attempt() was called during execute()
+        sm.record_recovery_attempt()
+        assert sm.state.recovery_attempts == 1
         t = sm.process(_dead_snapshot(["container_exists"]))
         assert t.new_state == GuardianState.CONFIRMED_DEAD
         assert t.action_needed is True
+        # recovery_attempts unchanged by _from_recovered — only record_recovery_attempt increments
         assert sm.state.recovery_attempts == 1
 
     def test_escalation_check(self, sm: ConfirmationStateMachine) -> None:

@@ -1,0 +1,3 @@
+# BFQ I/O scheduler — fairer queue discipline for mixed container workloads.
+# install_guardian.sh auto-deploys this to /etc/udev/rules.d/ when sudo is available.
+ACTION=="add|change", KERNEL=="sd*", ATTR{queue/scheduler}="bfq"

@@ -1,4 +1,4 @@
-"""Health signal collection — HOST-SIDE. 5 probes + 7 suspicious checks.
+"""Health signal collection — HOST-SIDE. 6 probes + 7 suspicious checks.
 
 Each probe runs independently with its own timeout. A probe failure returns
 alive=False but never crashes the check. All probes run in parallel via
@@ -10,14 +10,15 @@ Probes:
   3. Health API           — HTTP GET :5000/api/genesis/health (retries once on 503)
   4. Heartbeat canary     — HTTP GET :5000/api/genesis/heartbeat
   5. Log freshness        — incus exec journalctl last line timestamp
+  6. I/O saturation       — cgroup io.pressure full avg10 > 50%
 
-Suspicious checks (run when all 5 probes pass):
+Suspicious checks (run when all 6 probes pass):
   1. Tick regularity      — sqlite3 query for interval gaps
-  2. Memory pressure      — cgroup memory.current vs max
+  2. Memory pressure      — cgroup memory.stat anon+kernel vs max
   3. /tmp usage           — df /tmp
-  4. CC tmp usage         — watchgod_state.json tier check
-  5. Restart count        — systemctl NRestarts
-  6. Error spike          — journalctl error count in window
+  4. Restart count        — systemctl NRestarts
+  5. Error spike          — journalctl error count in window
+  6. I/O pressure         — cgroup io.pressure full avg10 early warning
   7. Health API depth     — parse response body for degraded metrics
 """
 
@@ -31,6 +32,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
@@ -92,40 +94,34 @@ class HealthSnapshot:
         return [s for s in self.suspicious.values() if not s.ok]
 
 
-async def _run_subprocess(
-    *args: str, timeout: float = 10.0,
-) -> tuple[int, str, str]:
-    """Run a subprocess with timeout. Returns (returncode, stdout, stderr)."""
-    proc = None
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
-        )
-        return (
-            proc.returncode or 0,
-            stdout.decode("utf-8", errors="replace").strip(),
-            stderr.decode("utf-8", errors="replace").strip(),
-        )
-    except TimeoutError:
-        # Kill if still running
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
-        return -1, "", "timeout"
-    except OSError as exc:
-        logger.warning("Subprocess exec failed for %s: %s", args[0] if args else "?", exc)
-        return -1, "", str(exc)
-    except Exception as exc:
-        logger.error("Unexpected subprocess error: %s", exc, exc_info=True)
-        return -1, "", str(exc)
+
+# _run_subprocess is re-exported for backward compatibility with external callers.
+# Canonical definition: genesis.guardian._subprocess.run_subprocess
+
+
+def parse_psi_content(content: str) -> dict[str, float]:
+    """Parse a PSI pressure file into a flat dict of metrics.
+
+    Handles both io.pressure and memory.pressure format:
+        some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+        full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+    Returns keys like 'some_avg10', 'full_avg60', etc.
+    """
+    result: dict[str, float] = {}
+    for line in content.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        prefix = parts[0]  # "some" or "full"
+        for part in parts[1:]:
+            if "=" in part:
+                key, _, val = part.partition("=")
+                try:
+                    result[f"{prefix}_{key}"] = float(val)
+                except ValueError:
+                    continue
+    return result
 
 
 def _http_get(url: str, timeout: float = 10.0) -> tuple[int, str]:
@@ -347,6 +343,61 @@ async def probe_log_freshness(config: GuardianConfig) -> SignalResult:
         )
 
 
+async def probe_io_saturation(config: GuardianConfig) -> SignalResult:
+    """Check container I/O pressure via host-side cgroup PSI.
+
+    Reads /sys/fs/cgroup/lxc.payload.{container}/io.pressure directly from
+    the host filesystem — no incus exec needed. Returns alive=False if
+    full avg10 > 50% (severe I/O stall indicating potential D-state freeze).
+    """
+    name = "io_saturation"
+    t0 = datetime.now(UTC)
+    psi_path = f"/sys/fs/cgroup/lxc.payload.{config.container_name}/io.pressure"
+    try:
+        with open(psi_path) as f:
+            content = f.read()
+        latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+
+        # Parse "full avg10=X.XX avg60=Y.YY avg300=Z.ZZ total=NNNNN"
+        full_avg10 = _parse_psi_avg10(content, "full")
+        if full_avg10 is None:
+            return SignalResult(
+                name=name, alive=True, latency_ms=latency,
+                detail=f"could not parse io.pressure: {content[:200]}",
+                collected_at=t0.isoformat(),
+            )
+
+        # Threshold: > 50% full avg10 means severe I/O stall
+        alive = full_avg10 <= 50.0
+        detail = f"io.pressure full avg10={full_avg10:.2f}%"
+        return SignalResult(
+            name=name, alive=alive, latency_ms=latency,
+            detail=detail, collected_at=t0.isoformat(),
+        )
+    except FileNotFoundError:
+        latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+        return SignalResult(
+            name=name, alive=True, latency_ms=latency,
+            detail="io.pressure file not found (container may be stopped)",
+            collected_at=t0.isoformat(),
+        )
+    except Exception as exc:
+        latency = (datetime.now(UTC) - t0).total_seconds() * 1000
+        return SignalResult(
+            name=name, alive=True, latency_ms=latency,
+            detail=f"exception: {exc}", collected_at=t0.isoformat(),
+        )
+
+
+def _parse_psi_avg10(content: str, line_prefix: str) -> float | None:
+    """Parse avg10 value from a PSI pressure file line.
+
+    Example line: 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0'
+    Returns the avg10 float value, or None if not found.
+    """
+    return parse_psi_content(content).get(f"{line_prefix}_avg10")
+
+
 # ── Suspicious check implementations ───────────────────────────────────
 
 
@@ -501,41 +552,6 @@ async def check_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
         )
 
 
-async def check_cc_tmp_usage(config: GuardianConfig) -> SuspiciousResult:
-    """Check CC temp directory usage via watchgod state file."""
-    name = "cc_tmp_usage"
-    t0 = datetime.now(UTC)
-    try:
-        rc, stdout, stderr = await _run_subprocess(
-            "incus", "exec", config.container_name, "--",
-            "su", "-", "ubuntu", "-c",
-            "cat ~/.genesis/watchgod_state.json 2>/dev/null || echo '{}'",
-            timeout=config.probes.probe_timeout_s,
-        )
-        if rc != 0:
-            return SuspiciousResult(
-                name=name, ok=True, detail=f"read failed: {stderr[:200]}",
-                collected_at=t0.isoformat(),
-            )
-        import json
-
-        data = json.loads(stdout.strip() or "{}")
-        cc_tier = data.get("cc_tmp", {}).get("tier", "unknown")
-        sys_tier = data.get("system_tmp", {}).get("tier", "unknown")
-        used_mb = data.get("cc_tmp", {}).get("used_mb", 0)
-
-        ok = cc_tier in ("green", "yellow") and sys_tier in ("green", "yellow")
-        detail = f"cc_tmp: {cc_tier} ({used_mb}MB), /tmp: {sys_tier}"
-        return SuspiciousResult(
-            name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
-        )
-    except Exception as exc:
-        return SuspiciousResult(
-            name=name, ok=True, detail=f"exception: {exc}",
-            collected_at=t0.isoformat(),
-        )
-
-
 async def check_restart_count(config: GuardianConfig) -> SuspiciousResult:
     """Check genesis-bridge systemd restart count (crash loop detection)."""
     name = "restart_count"
@@ -590,6 +606,46 @@ async def check_error_spike(config: GuardianConfig) -> SuspiciousResult:
         detail = f"{count} errors in last {window}min"
         return SuspiciousResult(
             name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
+        )
+    except Exception as exc:
+        return SuspiciousResult(
+            name=name, ok=True, detail=f"exception: {exc}",
+            collected_at=t0.isoformat(),
+        )
+
+
+async def check_io_pressure(config: GuardianConfig) -> SuspiciousResult:
+    """Check container I/O pressure for early warning (lower threshold than probe).
+
+    Uses the configurable io_pressure_threshold_pct (default 10%) for early
+    detection of I/O saturation before it becomes critical.
+    """
+    name = "io_pressure"
+    t0 = datetime.now(UTC)
+    psi_path = f"/sys/fs/cgroup/lxc.payload.{config.container_name}/io.pressure"
+    try:
+        with open(psi_path) as f:
+            content = f.read()
+
+        full_avg10 = _parse_psi_avg10(content, "full")
+        if full_avg10 is None:
+            return SuspiciousResult(
+                name=name, ok=True,
+                detail=f"could not parse io.pressure: {content[:200]}",
+                collected_at=t0.isoformat(),
+            )
+
+        threshold = config.suspicious.io_pressure_threshold_pct
+        ok = full_avg10 <= threshold
+        detail = f"io.pressure full avg10={full_avg10:.2f}% (threshold={threshold}%)"
+        return SuspiciousResult(
+            name=name, ok=ok, detail=detail, collected_at=t0.isoformat(),
+        )
+    except FileNotFoundError:
+        return SuspiciousResult(
+            name=name, ok=True,
+            detail="io.pressure file not found (container may be stopped)",
+            collected_at=t0.isoformat(),
         )
     except Exception as exc:
         return SuspiciousResult(
@@ -689,16 +745,17 @@ async def check_pause_state(config: GuardianConfig) -> PauseState:
 
 
 async def collect_all_signals(config: GuardianConfig) -> HealthSnapshot:
-    """Run all 5 probes in parallel, then suspicious checks if healthy."""
+    """Run all 6 probes in parallel, then suspicious checks if healthy."""
     now = datetime.now(UTC).isoformat()
 
-    # Run all 5 probes in parallel
+    # Run all 6 probes in parallel
     probe_results = await asyncio.gather(
         probe_container_exists(config),
         probe_icmp_reachable(config),
         probe_health_api(config),
         probe_heartbeat_canary(config),
         probe_log_freshness(config),
+        probe_io_saturation(config),
         return_exceptions=True,
     )
 
@@ -720,9 +777,9 @@ async def collect_all_signals(config: GuardianConfig) -> HealthSnapshot:
             check_tick_regularity(config),
             check_memory_pressure(config),
             check_tmp_usage(config),
-            check_cc_tmp_usage(config),
             check_restart_count(config),
             check_error_spike(config),
+            check_io_pressure(config),
             check_health_api_depth(config),
             return_exceptions=True,
         )

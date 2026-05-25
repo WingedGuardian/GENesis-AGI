@@ -15,8 +15,10 @@ from genesis.guardian.health_signals import (
     PauseState,
     SignalResult,
     SuspiciousResult,
+    _parse_psi_avg10,
     check_error_spike,
     check_health_api_depth,
+    check_io_pressure,
     check_memory_pressure,
     check_pause_state,
     check_restart_count,
@@ -27,6 +29,7 @@ from genesis.guardian.health_signals import (
     probe_health_api,
     probe_heartbeat_canary,
     probe_icmp_reachable,
+    probe_io_saturation,
     probe_log_freshness,
 )
 
@@ -584,6 +587,93 @@ class TestCheckPauseState:
         assert result.reason == "via file"
 
 
+# ── I/O Saturation Probe ───────────────────────────────────────────────
+
+
+class TestProbeIoSaturation:
+
+    @pytest.mark.asyncio
+    async def test_normal_io(self, config: GuardianConfig) -> None:
+        psi_content = "some avg10=0.50 avg60=0.30 avg300=0.10 total=12345\nfull avg10=0.25 avg60=0.10 avg300=0.05 total=6789\n"
+        with patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = lambda s, *a: None
+            mock_open.return_value.read = lambda: psi_content
+            result = await probe_io_saturation(config)
+        assert result.alive is True
+        assert result.name == "io_saturation"
+        assert "0.25%" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_severe_io_stall(self, config: GuardianConfig) -> None:
+        psi_content = "some avg10=60.00 avg60=40.00 avg300=20.00 total=12345\nfull avg10=55.00 avg60=30.00 avg300=15.00 total=6789\n"
+        with patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = lambda s, *a: None
+            mock_open.return_value.read = lambda: psi_content
+            result = await probe_io_saturation(config)
+        assert result.alive is False
+        assert "55.00%" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_file_not_found(self, config: GuardianConfig) -> None:
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            result = await probe_io_saturation(config)
+        assert result.alive is True
+        assert "not found" in result.detail
+
+
+class TestCheckIoPressure:
+
+    @pytest.mark.asyncio
+    async def test_normal_io(self, config: GuardianConfig) -> None:
+        psi_content = "some avg10=1.00 avg60=0.50 avg300=0.10 total=12345\nfull avg10=0.50 avg60=0.20 avg300=0.05 total=6789\n"
+        with patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = lambda s, *a: None
+            mock_open.return_value.read = lambda: psi_content
+            result = await check_io_pressure(config)
+        assert result.ok is True
+        assert "0.50%" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_elevated_io(self, config: GuardianConfig) -> None:
+        psi_content = "some avg10=20.00 avg60=15.00 avg300=10.00 total=12345\nfull avg10=15.00 avg60=10.00 avg300=5.00 total=6789\n"
+        with patch("builtins.open", create=True) as mock_open:
+            mock_open.return_value.__enter__ = lambda s: s
+            mock_open.return_value.__exit__ = lambda s, *a: None
+            mock_open.return_value.read = lambda: psi_content
+            result = await check_io_pressure(config)
+        assert result.ok is False
+        assert "15.00%" in result.detail
+
+    @pytest.mark.asyncio
+    async def test_file_not_found(self, config: GuardianConfig) -> None:
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            result = await check_io_pressure(config)
+        assert result.ok is True
+        assert "not found" in result.detail
+
+
+class TestParsePsiAvg10:
+
+    def test_parse_full_line(self) -> None:
+        content = "some avg10=1.50 avg60=0.50 avg300=0.10 total=12345\nfull avg10=0.25 avg60=0.10 avg300=0.05 total=6789\n"
+        assert _parse_psi_avg10(content, "full") == 0.25
+        assert _parse_psi_avg10(content, "some") == 1.50
+
+    def test_missing_prefix(self) -> None:
+        content = "some avg10=1.00 avg60=0.50 avg300=0.10 total=12345\n"
+        assert _parse_psi_avg10(content, "full") is None
+
+    def test_malformed_value(self) -> None:
+        content = "full avg10=bad avg60=0.50 avg300=0.10 total=12345\n"
+        assert _parse_psi_avg10(content, "full") is None
+
+    def test_empty_content(self) -> None:
+        assert _parse_psi_avg10("", "full") is None
+
+
 # ── HealthSnapshot ──────────────────────────────────────────────────────
 
 
@@ -637,20 +727,21 @@ class TestCollectAllSignals:
             patch("genesis.guardian.health_signals.probe_health_api", return_value=SignalResult("health_api", True, 1.0, "healthy", "t")),
             patch("genesis.guardian.health_signals.probe_heartbeat_canary", return_value=SignalResult("heartbeat_canary", True, 1.0, "alive", "t")),
             patch("genesis.guardian.health_signals.probe_log_freshness", return_value=SignalResult("log_freshness", True, 1.0, "fresh", "t")),
+            patch("genesis.guardian.health_signals.probe_io_saturation", return_value=SignalResult("io_saturation", True, 1.0, "io.pressure full avg10=0.00%", "t")),
             patch("genesis.guardian.health_signals.check_pause_state", return_value=PauseState(paused=False)),
             patch("genesis.guardian.health_signals.check_tick_regularity", return_value=SuspiciousResult("tick_regularity", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_memory_pressure", return_value=SuspiciousResult("memory_pressure", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_tmp_usage", return_value=SuspiciousResult("tmp_usage", True, "ok", "t")),
-            patch("genesis.guardian.health_signals.check_cc_tmp_usage", return_value=SuspiciousResult("cc_tmp_usage", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_restart_count", return_value=SuspiciousResult("restart_count", True, "ok", "t")),
             patch("genesis.guardian.health_signals.check_error_spike", return_value=SuspiciousResult("error_spike", True, "ok", "t")),
+            patch("genesis.guardian.health_signals.check_io_pressure", return_value=SuspiciousResult("io_pressure", True, "io.pressure full avg10=0.00%", "t")),
             patch("genesis.guardian.health_signals.check_health_api_depth", return_value=SuspiciousResult("health_api_depth", True, "all metrics healthy", "t")),
         ):
             snapshot = await collect_all_signals(config)
 
         assert snapshot.all_alive is True
-        assert len(snapshot.signals) == 5
-        # Suspicious checks run when all alive (7 checks: 6 original + health_api_depth)
+        assert len(snapshot.signals) == 6
+        # Suspicious checks run when all alive (7 checks)
         assert len(snapshot.suspicious) == 7
 
     @pytest.mark.asyncio
@@ -661,6 +752,7 @@ class TestCollectAllSignals:
             patch("genesis.guardian.health_signals.probe_health_api", return_value=SignalResult("health_api", True, 1.0, "ok", "t")),
             patch("genesis.guardian.health_signals.probe_heartbeat_canary", return_value=SignalResult("heartbeat_canary", True, 1.0, "ok", "t")),
             patch("genesis.guardian.health_signals.probe_log_freshness", return_value=SignalResult("log_freshness", True, 1.0, "ok", "t")),
+            patch("genesis.guardian.health_signals.probe_io_saturation", return_value=SignalResult("io_saturation", True, 1.0, "ok", "t")),
             patch("genesis.guardian.health_signals.check_pause_state", return_value=PauseState(paused=False)),
         ):
             snapshot = await collect_all_signals(config)

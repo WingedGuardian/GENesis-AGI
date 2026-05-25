@@ -18,11 +18,12 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
+from genesis.guardian._subprocess import run_subprocess as _run_subprocess
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.diagnosis import DiagnosisResult, RecoveryAction
-from genesis.guardian.health_signals import _run_subprocess, collect_all_signals
+from genesis.guardian.health_signals import collect_all_signals
 from genesis.guardian.snapshots import SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
@@ -62,6 +63,20 @@ class RecoveryEngine:
         if action == RecoveryAction.ESCALATE:
             return await self._escalate(diagnosis)
 
+        # Check exponential backoff before proceeding
+        backoff_s = self._sm.recovery_backoff_remaining_s()
+        if backoff_s > 0:
+            logger.warning(
+                "Recovery backoff: %.0fs remaining before attempt %d — deferring",
+                backoff_s, self._sm.state.recovery_attempts + 1,
+            )
+            return RecoveryResult(
+                action=action,
+                success=False,
+                detail=f"Recovery deferred: {backoff_s:.0f}s backoff remaining",
+                duration_s=0.0,
+            )
+
         # Pre-recovery alert
         await self._dispatcher.send(Alert(
             severity=AlertSeverity.CRITICAL,
@@ -75,8 +90,12 @@ class RecoveryEngine:
         # Mark state as recovering
         self._sm.set_recovering()
 
-        # Pre-recovery snapshot (unless we're rolling back TO a snapshot)
-        if action != RecoveryAction.SNAPSHOT_ROLLBACK:
+        # Pre-recovery snapshot (gated on config flag and disk space)
+        if (
+            action != RecoveryAction.SNAPSHOT_ROLLBACK
+            and self._config.snapshots.take_pre_recovery
+            and await self._snapshots.safe_to_snapshot()
+        ):
             snap_name = await self._snapshots.take(label="pre-recovery")
             if snap_name:
                 logger.info("Pre-recovery snapshot: %s", snap_name)
@@ -88,6 +107,9 @@ class RecoveryEngine:
             logger.error("Recovery action %s failed: %s", action, exc, exc_info=True)
             success = False
             detail = str(exc)
+
+        # Record attempt timestamp for backoff tracking
+        self._sm.record_recovery_attempt()
 
         duration = (datetime.now(UTC) - t0).total_seconds()
 

@@ -468,6 +468,42 @@ else
     echo "  WARN  Cannot determine host RAM — skipping OOM tuning"
 fi
 
+# ── Step 9b: I/O tuning & BFQ scheduler ─────────────────────────────────
+# Post-incident hardening (2026-05-25): reduce dirty page cache pressure
+# and enable the BFQ I/O scheduler for fairer queue discipline.
+# Reference configs: config/99-container-host.conf, config/60-ioscheduler.rules
+
+if sudo -n true 2>/dev/null; then
+    # I/O sysctl — only the settings not handled by 99-genesis-oom-tuning.conf
+    if [ ! -f /etc/sysctl.d/99-genesis-io-tuning.conf ]; then
+        sudo tee /etc/sysctl.d/99-genesis-io-tuning.conf > /dev/null << 'SYSCTL'
+# Genesis — I/O pressure reduction (installed by install_guardian.sh)
+# Reduces dirty page cache to prevent I/O death spirals under sustained write load.
+vm.swappiness = 10
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 3
+vm.vfs_cache_pressure = 50
+SYSCTL
+        sudo sysctl --system > /dev/null 2>&1
+        echo "  + I/O tuning applied (swappiness=10, dirty_ratio=10)"
+    else
+        echo "  I/O tuning already installed"
+    fi
+
+    # BFQ I/O scheduler — fairer than mq-deadline for mixed workloads
+    if [ ! -f /etc/udev/rules.d/60-ioscheduler.rules ]; then
+        if [ -d "$INSTALL_DIR/config" ] && [ -f "$INSTALL_DIR/config/60-ioscheduler.rules" ]; then
+            sudo cp "$INSTALL_DIR/config/60-ioscheduler.rules" /etc/udev/rules.d/
+            sudo udevadm control --reload-rules 2>/dev/null || true
+            echo "  + BFQ I/O scheduler rule installed"
+        fi
+    else
+        echo "  BFQ scheduler rule already installed"
+    fi
+else
+    echo "  SKIP  I/O tuning (no passwordless sudo). See config/99-container-host.conf"
+fi
+
 # ── Step 10: Install gateway script ────────────────────────────────────
 
 echo ""

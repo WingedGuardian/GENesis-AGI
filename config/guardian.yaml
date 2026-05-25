@@ -26,6 +26,7 @@ suspicious:
   tick_history_count: 10
   error_spike_window_min: 30
   error_spike_threshold: 50
+  io_pressure_threshold_pct: 10.0
 
 confirmation:
   recheck_delay_s: 30
@@ -44,6 +45,7 @@ cc:
   timeout_s: 3600    # 60 min — runaway guard, not operational limit
   max_turns: 50      # runaway guard — legitimate investigation is ~15-30 turns
   path: "claude"
+  work_dir: "/var/lib/guardian-snapshots/cc-sessions"
 
 briefing:
   enabled: true
@@ -52,8 +54,10 @@ briefing:
   max_age_s: 600
 
 snapshots:
-  retention: 5
+  retention: 1
   prefix: "guardian-"
+  take_pre_recovery: false
+  max_pool_usage_pct: 80
 
 recovery:
   verification_delay_s: 30
