@@ -183,7 +183,7 @@
         commsPendingApprovals: [],
         commsCounts: {},
         commsView: 'pending',
-        commsTab: 'outreach',
+        commsTab: 'proposals',
         commsProposalFilter: null,
         commsCategoryFilter: null,
         commsRejectingId: null,
@@ -7430,9 +7430,6 @@
         <!-- Sub-tabs -->
         <div style="display:flex; gap:0.25rem; margin-bottom:0.75rem;">
           <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
-                  :style="$store.genesisDashboard.commsTab === 'outreach' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
-                  @click="$store.genesisDashboard.commsTab = 'outreach'">Outreach</button>
-          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
                   :style="$store.genesisDashboard.commsTab === 'proposals' ? 'background:#ce93d833; border:1px solid #ce93d8; color:#ce93d8; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
                   @click="$store.genesisDashboard.commsTab = 'proposals'">
             Proposals
@@ -7441,6 +7438,9 @@
                     x-text="$store.genesisDashboard.commsCounts.proposals_pending"></span>
             </template>
           </button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
+                  :style="$store.genesisDashboard.commsTab === 'outreach' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.commsTab = 'outreach'">Outreach</button>
           <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer;"
                   :style="$store.genesisDashboard.commsTab === 'approvals' ? 'background:#4caf5033; border:1px solid #4caf50; color:#4caf50; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
                   @click="$store.genesisDashboard.commsTab = 'approvals'; $store.genesisDashboard.fetchApprovals()">
