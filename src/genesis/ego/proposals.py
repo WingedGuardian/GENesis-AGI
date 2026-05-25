@@ -296,16 +296,26 @@ class ProposalWorkflow:
             warn_lines = "\n".join(f"  - {w}" for w in validation_warnings)
             digest_html = f"\u26a0\ufe0f <b>Validation:</b>\n{warn_lines}\n\n{digest_html}"
 
-        # Show pending count from other batches (same ego only) for visibility
+        # Show pending backlog from other batches (same ego only)
         try:
             all_pending = await ego_crud.list_pending_proposals(
                 self._db, ego_source=ego_source,
             )
             other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
             if other_pending:
+                summary_lines = []
+                for op in other_pending[:5]:
+                    preview = op.get("content", "")[:60]
+                    if len(op.get("content", "")) > 60:
+                        preview += "\u2026"
+                    action = op.get("action_type", "?")
+                    summary_lines.append(f"  \u2022 [{_ESC(action)}] {_ESC(preview)}")
+                backlog_text = "\n".join(summary_lines)
                 digest_html = (
-                    f"<i>{len(other_pending)} proposal(s) pending from previous "
-                    f"batches. Reply 'approve all pending' to resolve all.</i>\n\n" + digest_html
+                    f"<i>\U0001f4cb {len(other_pending)} older proposal(s) still "
+                    f"awaiting response:</i>\n{backlog_text}\n"
+                    f"<i>Reply 'approve all pending' to resolve all.</i>\n\n"
+                    + digest_html
                 )
         except Exception:
             pass  # Non-critical; skip header on error
