@@ -48,9 +48,9 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
         CURRENT=$(python3 -c "import json; print(json.load(open('$STATE_FILE')).get('current_state','unknown'))" 2>/dev/null || echo "unknown")
         case "$CURRENT" in
             confirmed_dead|recovering|recovered)
-                # Read-modify-write: preserve any future fields added to state.json
+                # Read-modify-write with atomic rename (matches state_machine.py save_state)
                 python3 << PYEOF
-import json
+import json, os, tempfile
 from datetime import datetime, timezone
 sf = "$STATE_FILE"
 with open(sf) as f:
@@ -61,9 +61,15 @@ d.update(current_state="healthy", consecutive_failures=0, recheck_count=0,
          first_failure_at=None, recovery_attempts=0, last_healthy_at=now,
          last_check_at=now, auto_reset_count=0, dialogue_sent_at=None,
          dialogue_eta_s=0, dialogue_action=None, cc_unavailable_since=None,
-         last_cc_unavailable_alert_at=None)
-with open(sf, "w") as f:
-    json.dump(d, f, indent=2)
+         last_cc_unavailable_alert_at=None, io_triage_attempts=0,
+         sentinel_state="")
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(sf), suffix=".tmp")
+try:
+    os.write(fd, json.dumps(d, indent=2).encode())
+    os.fsync(fd)
+finally:
+    os.close(fd)
+os.rename(tmp, sf)
 print(json.dumps({"ok": True, "action": "reset-state", "previous_state": prev}))
 PYEOF
                 ;;
@@ -100,11 +106,13 @@ PYEOF
             fi
             if git pull --ff-only 2>/dev/null; then
                 # Restore local config changes
+                CONFIG_RESET=0
                 if [ "$STASHED" -eq 1 ]; then
                     if ! git stash pop --quiet 2>/dev/null; then
                         # Conflict — drop the stash and warn (config can be re-set)
                         git checkout -- . 2>/dev/null || true
                         git stash drop --quiet 2>/dev/null || true
+                        CONFIG_RESET=1
                     fi
                 fi
                 # Regenerate Guardian CLAUDE.md from template (never use repo version)
@@ -165,7 +173,11 @@ IOSYSCTL
                 # Restart timer so new check.py code takes effect immediately
                 systemctl --user restart genesis-guardian.timer 2>/dev/null || true
                 NEW=$(git rev-parse --short HEAD 2>/dev/null)
-                printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
+                if [ "$CONFIG_RESET" -eq 1 ]; then
+                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s", "warning": "local config changes were discarded due to merge conflict — re-run install_guardian.sh to regenerate"}\n' "$OLD" "$NEW"
+                else
+                    printf '{"ok": true, "action": "update", "old": "%s", "new": "%s"}\n' "$OLD" "$NEW"
+                fi
             else
                 [ "$STASHED" -eq 1 ] && git stash pop --quiet 2>/dev/null || true
                 printf '{"ok": false, "action": "update", "error": "git pull failed"}\n' >&2
