@@ -44,7 +44,7 @@ CONFIDENCE_THRESHOLD = 75
 _FALLBACK_MODELS = [
     ("openrouter/anthropic/claude-haiku-4.5", "API_KEY_OPENROUTER"),
     ("groq/llama-3.3-70b-versatile", "GROQ_API_KEY"),
-    ("gemini/gemini-2.0-flash", "GEMINI_API_KEY"),
+    ("gemini/gemini-2.0-flash", "GOOGLE_API_KEY"),
 ]
 
 # contribution_gate — gates community contribution submissions (Phase 6 pipeline).
@@ -305,7 +305,7 @@ def _load_models_from_config() -> list[tuple[str, str]]:
         _ENV = {
             "openrouter": "API_KEY_OPENROUTER",
             "groq": "GROQ_API_KEY",
-            "google": "GEMINI_API_KEY",
+            "google": "GOOGLE_API_KEY",
         }
         result = []
         for pname in site.chain:
