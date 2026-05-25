@@ -121,12 +121,13 @@ def test_load_full_yaml(monkeypatch):
 
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
-    # lmstudio-30b, github-o3mini, openrouter-deepseek-r1, deepseek-chat disabled → 27 enabled
-    # (31 total - 4 disabled; 3 direct anthropic providers removed, 2 openrouter added)
+    # lmstudio-30b, github-o3mini, deepseek-chat disabled → 27 enabled
+    # (3 direct anthropic providers removed, 2 openrouter added;
+    # openrouter-deepseek-r1 removed entirely 2026-05-24)
     assert len(cfg.providers) == 27
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
-    assert "openrouter-deepseek-r1" not in cfg.providers
+    assert "openrouter-deepseek-r1" not in cfg.providers  # removed from config
     # Call sites evolve — assert actual count matches config, and lock in
     # a few load-bearing ids rather than chasing the total on every edit.
     # 2026-05-10: 44 → 43 after net change (judge added by #304, 2_triage +
@@ -137,7 +138,9 @@ def test_load_full_yaml(monkeypatch):
     # 2026-05-22: 46 → 47 after models_md_synthesis added by #410.
     # 2026-05-23: 47 → 48 after 40_ego_focus_selection added by #420.
     # 2026-05-23: 48 → 49 after voice_conversation added by #422.
-    assert len(cfg.call_sites) == 49
+    # 2026-05-24: 49 → 48 after models_md_synthesis removed (converted to CC session dispatch).
+    assert len(cfg.call_sites) == 48
+    assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)
     assert "background" in cfg.retry_profiles

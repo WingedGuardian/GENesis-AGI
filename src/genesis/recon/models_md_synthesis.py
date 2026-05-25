@@ -148,6 +148,7 @@ class ModelsMdSynthesisJob:
             notify_on_failure_only=True,
             source_tag="models_md_synthesis",
             caller_context="schedule:models_md_synthesis",
+            tool_exceptions=("Write", "Bash"),
         )
 
         session_id = await runner.spawn(request)
@@ -195,6 +196,38 @@ class ModelsMdSynthesisJob:
             return json.loads(match.group())
         except (json.JSONDecodeError, ValueError):
             return None
+
+    # Structural markers that the CC session must preserve.
+    # Kept as class state for testability — the prompt embeds these rules.
+    _REQUIRED_MARKERS = (
+        "## THE HEAVY LIFTERS",
+        "## THE ALL-ROUNDERS",
+        "## THE SPECIALISTS",
+    )
+
+    @staticmethod
+    def _validate_output(output: str, original: str) -> str | None:
+        """Validate LLM output before writing. Returns error string or None.
+
+        NOTE: In the CC-session model this validation is expressed as prompt
+        instructions rather than code-enforced.  The method is retained for
+        unit testing and as the canonical definition of the validation rules.
+        """
+        if not output:
+            return "empty output"
+
+        for marker in ModelsMdSynthesisJob._REQUIRED_MARKERS:
+            if marker not in output:
+                return f"missing structural marker: {marker}"
+
+        orig_len = len(original)
+        out_len = len(output)
+        if out_len < orig_len * 0.5:
+            return f"too short ({out_len} vs {orig_len} original, <50%)"
+        if out_len > orig_len * 2.0:
+            return f"too long ({out_len} vs {orig_len} original, >200%)"
+
+        return None
 
     @staticmethod
     def _serialize_findings(findings: list[dict]) -> str:
