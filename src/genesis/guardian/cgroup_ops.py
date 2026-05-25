@@ -153,16 +153,30 @@ def find_top_io_pids(container: str, top_n: int = 5) -> list[dict]:
     return io_data[:top_n]
 
 
-async def kill_pid(pid: int, sig: int = signal.SIGKILL) -> bool:
+async def kill_pid(
+    pid: int, sig: int = signal.SIGKILL, *, container: str = "",
+) -> bool:
     """Kill a process via sudo kill.
 
     Uses sudo because container processes are owned by the container's
-    uid mapping. Validates pid > 1 to prevent catastrophic kills.
+    uid mapping. Safety checks:
+      - pid > 1 (prevents init kill)
+      - If container is specified, verifies the PID belongs to that
+        container's cgroup before killing (prevents host process kill)
     Returns True on success.
     """
     if pid <= 1:
         logger.error("Refusing to kill pid %d — too dangerous", pid)
         return False
+
+    if container:
+        cgroup_pids = list_container_pids(container)
+        if pid not in cgroup_pids:
+            logger.error(
+                "Refusing to kill pid %d — not in container %s cgroup (%d pids listed)",
+                pid, container, len(cgroup_pids),
+            )
+            return False
 
     try:
         rc, stdout, stderr = await _run_subprocess(
