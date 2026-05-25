@@ -462,4 +462,4 @@ class TestEgoSourceIsolation:
 
         sent_html = mock_tm.send_to_category.call_args[0][1]
         # Should show 1 pending from old user batch, not 2 (which would include genesis)
-        assert "1 proposal(s) pending" in sent_html
+        assert "1 older proposal(s) still awaiting response" in sent_html

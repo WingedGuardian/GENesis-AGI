@@ -323,7 +323,7 @@ class TestPendingCountHeader:
         assert delivery_id is not None
         # Check that the sent HTML contains the pending count
         sent_html = mock_tm.send_to_category.call_args[0][1]
-        assert "1 proposal(s) pending from previous batches" in sent_html
+        assert "1 older proposal(s) still awaiting response" in sent_html
         assert "approve all pending" in sent_html
 
 
