@@ -68,8 +68,10 @@ class TestGuardianConfigDefaults:
 
     def test_snapshot_defaults(self) -> None:
         cfg = GuardianConfig()
-        assert cfg.snapshots.retention == 5
+        assert cfg.snapshots.retention == 1
         assert cfg.snapshots.prefix == "guardian-"
+        assert cfg.snapshots.take_pre_recovery is True
+        assert cfg.snapshots.max_pool_usage_pct == 80.0
 
 
 class TestLoadConfig:

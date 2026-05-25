@@ -22,8 +22,29 @@ def manager(config: GuardianConfig) -> SnapshotManager:
 
 
 def _mock_subprocess(rc: int = 0, stdout: str = "", stderr: str = ""):
+    """Simple mock that returns the same result for all subprocess calls."""
     async def mock(*args, **kwargs):
         return (rc, stdout, stderr)
+    return mock
+
+
+def _mock_subprocess_smart(
+    snapshot_rc: int = 0,
+    snapshot_stdout: str = "",
+    pool_usage_pct: int = 20,
+):
+    """Mock that handles pool detection, df, and snapshot operations."""
+    async def mock(*args, **kwargs):
+        cmd = args[0] if args else ""
+        if cmd == "incus" and len(args) > 3 and args[1] == "config":
+            # Pool detection: incus config device get ...
+            return (0, "genesis-pool\n", "")
+        if cmd == "df":
+            # Disk space check
+            return (0, f"Use%\n {pool_usage_pct}%\n", "")
+        if cmd == "incus" and len(args) > 2 and args[1] == "snapshot":
+            return (snapshot_rc, snapshot_stdout, "")
+        return (snapshot_rc, snapshot_stdout, "")
     return mock
 
 
@@ -33,7 +54,7 @@ class TestSnapshotTake:
     async def test_take_success(self, manager: SnapshotManager) -> None:
         with patch(
             "genesis.guardian.snapshots._run_subprocess",
-            _mock_subprocess(0, ""),
+            _mock_subprocess_smart(snapshot_rc=0),
         ):
             name = await manager.take(label="test")
         assert name is not None
@@ -44,7 +65,7 @@ class TestSnapshotTake:
     async def test_take_failure(self, manager: SnapshotManager) -> None:
         with patch(
             "genesis.guardian.snapshots._run_subprocess",
-            _mock_subprocess(1, "", "error"),
+            _mock_subprocess_smart(snapshot_rc=1),
         ):
             name = await manager.take()
         assert name is None
@@ -53,11 +74,20 @@ class TestSnapshotTake:
     async def test_take_no_label(self, manager: SnapshotManager) -> None:
         with patch(
             "genesis.guardian.snapshots._run_subprocess",
-            _mock_subprocess(0, ""),
+            _mock_subprocess_smart(snapshot_rc=0),
         ):
             name = await manager.take()
         assert name is not None
         assert "-test" not in name
+
+    @pytest.mark.asyncio
+    async def test_take_refuses_when_pool_full(self, manager: SnapshotManager) -> None:
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_smart(pool_usage_pct=95),
+        ):
+            name = await manager.take()
+        assert name is None
 
 
 class TestSnapshotRestore:
@@ -124,8 +154,8 @@ class TestSnapshotPrune:
 
     @pytest.mark.asyncio
     async def test_prune_over_retention(self, manager: SnapshotManager) -> None:
-        """Should prune oldest snapshots past retention (5)."""
-        snapshots = [f"guardian-{i}" for i in range(7, 0, -1)]
+        """Should prune oldest snapshots past retention (1)."""
+        snapshots = [f"guardian-{i}" for i in range(3, 0, -1)]
         with (
             patch.object(manager, "list_snapshots", return_value=snapshots),
             patch(
@@ -134,7 +164,7 @@ class TestSnapshotPrune:
             ),
         ):
             deleted = await manager.prune()
-        assert deleted == 2  # 7 - 5 = 2
+        assert deleted == 2  # 3 - 1 = 2
 
     @pytest.mark.asyncio
     async def test_prune_preserves_healthy(self, manager: SnapshotManager) -> None:
@@ -160,7 +190,7 @@ class TestMarkHealthy:
     async def test_mark_healthy(self, manager: SnapshotManager) -> None:
         with patch(
             "genesis.guardian.snapshots._run_subprocess",
-            _mock_subprocess(0, ""),
+            _mock_subprocess_smart(snapshot_rc=0),
         ):
             name = await manager.mark_healthy()
         assert name is not None

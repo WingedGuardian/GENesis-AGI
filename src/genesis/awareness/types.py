@@ -29,6 +29,7 @@ class SignalReading:
     warning_threshold: float | None = None  # values at or above this warrant attention
     critical_threshold: float | None = None  # values at or above this are critical
     baseline_note: str | None = None  # human-readable "what's normal" for LLM context
+    metadata: dict | None = None  # optional diagnostic metadata (latency values, stale jobs, etc.)
 
 
 @dataclass(frozen=True)

@@ -69,6 +69,7 @@ class StateData:
     cc_unavailable_since: str | None = None
     last_cc_unavailable_alert_at: str | None = None
     auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
+    last_recovery_at: str | None = None  # ISO8601 timestamp of last recovery attempt
 
     def to_dict(self) -> dict:
         return {
@@ -89,6 +90,7 @@ class StateData:
             "cc_unavailable_since": self.cc_unavailable_since,
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
             "auto_reset_count": self.auto_reset_count,
+            "last_recovery_at": self.last_recovery_at,
         }
 
     @classmethod
@@ -115,6 +117,7 @@ class StateData:
             cc_unavailable_since=data.get("cc_unavailable_since"),
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
             auto_reset_count=data.get("auto_reset_count", 0),
+            last_recovery_at=data.get("last_recovery_at"),
         )
 
 
@@ -174,6 +177,32 @@ class ConfirmationStateMachine:
             tmp.replace(path)
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
+
+    def recovery_backoff_remaining_s(self) -> float:
+        """Seconds remaining before next recovery attempt is allowed.
+
+        Exponential backoff: 120s, 300s, 900s (2min, 5min, 15min).
+        Returns 0 if no backoff needed, inf if already escalated.
+        """
+        if self._state.recovery_attempts == 0:
+            return 0.0
+        if self._state.recovery_attempts >= self._config.recovery.max_escalations:
+            return float("inf")
+
+        backoff_s = 120.0 * (2.5 ** (self._state.recovery_attempts - 1))
+
+        if not self._state.last_recovery_at:
+            return backoff_s
+        try:
+            last = datetime.fromisoformat(self._state.last_recovery_at)
+            elapsed = (datetime.now(UTC) - last).total_seconds()
+            return max(0.0, backoff_s - elapsed)
+        except (ValueError, TypeError):
+            return backoff_s
+
+    def record_recovery_attempt(self) -> None:
+        """Record that a recovery attempt was made (for backoff tracking)."""
+        self._state.last_recovery_at = datetime.now(UTC).isoformat()
 
     def process(self, snapshot: HealthSnapshot) -> Transition:
         """Process a health snapshot and return the state transition.

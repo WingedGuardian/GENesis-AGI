@@ -40,6 +40,7 @@ class SuspiciousChecksConfig:
     error_spike_window_min: int = 30
     error_spike_threshold: int = 50
     db_latency_warning_ms: float = 5000.0  # Normal is <100ms; 5s = serious degradation
+    io_pressure_threshold_pct: float = 10.0  # PSI full avg10 above this → warning
 
 
 @dataclass
@@ -87,6 +88,7 @@ class CCConfig:
     timeout_s: int = 3600  # 60 min — must not clip downloads or deep investigation
     max_turns: int = 50    # Runaway guard — legitimate work is ~15-30 turns
     path: str = "claude"
+    work_dir: str = "/var/lib/guardian-snapshots/cc-sessions"
 
 
 @dataclass
@@ -108,8 +110,10 @@ class BriefingConfig:
 class SnapshotConfig:
     """Incus snapshot management settings."""
 
-    retention: int = 5
+    retention: int = 1
     prefix: str = "guardian-"
+    take_pre_recovery: bool = True  # Take snapshot before recovery action
+    max_pool_usage_pct: float = 80.0  # Refuse snapshots if pool above this
 
 
 @dataclass

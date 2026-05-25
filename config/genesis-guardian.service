@@ -28,3 +28,10 @@ TimeoutStartSec=3900
 MemoryMax=6G
 MemorySwapMax=0
 OOMScoreAdjust=500
+
+# I/O limits — prevent Guardian's own diagnosis (CC session, log collection)
+# from contributing to I/O saturation on the genesis storage device.
+# NOTE: Device path is install-specific. install_guardian.sh detects this
+# automatically. The values below are for a typical Incus genesis LV.
+# IOReadBandwidthMax=/dev/ubuntu-vg/genesis-lv 50M
+# IOWriteBandwidthMax=/dev/ubuntu-vg/genesis-lv 20M

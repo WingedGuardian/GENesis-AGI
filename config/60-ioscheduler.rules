@@ -1,0 +1,1 @@
+ACTION=="add|change", KERNEL=="sd*", ATTR{queue/scheduler}="bfq"
