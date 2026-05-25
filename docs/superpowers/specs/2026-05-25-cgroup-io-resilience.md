@@ -109,6 +109,41 @@ os.stat("/").st_dev  # -> major:minor of root filesystem device
 - Container-level freezes from host-side operations (Incus maintenance, etc.)
 - Memory exhaustion without I/O pressure (needs separate memory limits)
 
+### Memory Limits on genesis-background
+
+In addition to I/O isolation, genesis-background gets memory.high (soft limit):
+```
+memory.high = 20G   # triggers kernel reclaim before OOM
+memory.max  = 24G   # hard ceiling -- OOM killer targets background first
+```
+
+genesis-critical gets reserved memory:
+```
+memory.min = 2G     # kernel will not reclaim this, even under pressure
+```
+
+This prevents the scenario where 10 concurrent CC sessions exhaust all 36GB
+of container memory and trigger a system-wide OOM that kills the server.
+
+### CC Session Pressure Management
+
+When genesis-background approaches its memory.high limit, Genesis must manage
+session count rather than let the kernel randomly OOM-kill sessions.
+
+**Background sessions (Genesis-managed):**
+- Monitor genesis-background memory.current vs memory.high
+- When usage > 80% of memory.high: stop accepting new background dispatches
+- When usage > 90% of memory.high: kill the oldest/lowest-priority background
+  session. Genesis owns these sessions and can make informed priority decisions.
+- This is autonomous -- no user approval needed for managing background sessions
+  Genesis started.
+
+**Foreground sessions (user-managed):**
+- When memory pressure is elevated and foreground session count > threshold:
+  alert user via Telegram: "You have N foreground CC sessions open. Container
+  memory at X%. Consider closing some."
+- Genesis does NOT kill foreground sessions. Those belong to the user.
+
 ### Failure Modes Introduced
 
 - **Cgroup delegation lost on restart** if boot unit fails -> CC sessions run
@@ -146,8 +181,11 @@ Guardian proceeds only when:
 - Sentinel transitions to ESCALATED (explicitly gave up)
 - Sentinel returns to HEALTHY but health probes still fail (fixed wrong thing)
 - Genesis becomes completely unreachable (dialogue endpoint itself dies)
-- A maximum wall-clock timeout expires (configurable, default 2 hours -- the "user
-  is unreachable, we need SOME upper bound" case)
+
+**No wall-clock timeout.** If Sentinel is parked on approval and the user is asleep
+for 8 hours, Guardian waits 8 hours. User sovereignty is absolute -- neither
+Guardian nor Sentinel should take major actions just because time passed. The
+approval gate is the designed behavior, not a bottleneck to work around.
 
 ### Implementation
 
