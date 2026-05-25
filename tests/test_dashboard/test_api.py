@@ -457,16 +457,16 @@ def test_routing_config_read_includes_call_sites(client):
     mock_cfg = SimpleNamespace()
     mock_cfg.disabled_providers = {}
     mock_cfg.providers = {
-        "claude-sonnet": SimpleNamespace(
-            name="claude-sonnet",
-            provider_type="anthropic",
-            model_id="claude-sonnet-4-6-20250514",
+        "openrouter-sonnet": SimpleNamespace(
+            name="openrouter-sonnet",
+            provider_type="openrouter",
+            model_id="anthropic/claude-sonnet-4-6-20250514",
             is_free=False,
         ),
     }
     mock_cfg.call_sites = {
         "autonomous_executor_reasoning": SimpleNamespace(
-            chain=["claude-sonnet"],
+            chain=["openrouter-sonnet"],
             default_paid=True,
             never_pays=False,
             retry_profile="background",
@@ -474,7 +474,7 @@ def test_routing_config_read_includes_call_sites(client):
     }
     mock_router = MagicMock()
     mock_router.config = mock_cfg
-    mock_router.breakers = {"claude-sonnet": MagicMock(state=MagicMock(value="closed"))}
+    mock_router.breakers = {"openrouter-sonnet": MagicMock(state=MagicMock(value="closed"))}
     mock_rt = MagicMock()
     mock_rt.is_bootstrapped = True
     mock_rt.router = mock_router
@@ -486,7 +486,7 @@ def test_routing_config_read_includes_call_sites(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert "autonomous_executor_reasoning" in data["call_sites"]
-    assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["claude-sonnet"]
+    assert data["call_sites"]["autonomous_executor_reasoning"]["chain"] == ["openrouter-sonnet"]
     assert data["call_sites"]["autonomous_executor_reasoning"]["default_paid"] is True
 
 

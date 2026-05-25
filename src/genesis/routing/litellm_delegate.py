@@ -37,7 +37,6 @@ def _should_log_failure(provider: str) -> bool:
 # Maps our config 'type' field to LiteLLM model prefix.
 # See https://docs.litellm.ai/docs/providers
 _TYPE_TO_PREFIX: dict[str, str] = {
-    "anthropic": "anthropic",
     "groq": "groq",
     "mistral": "mistral",
     "google": "gemini",

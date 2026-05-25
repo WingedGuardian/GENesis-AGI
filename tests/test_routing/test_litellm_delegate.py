@@ -55,7 +55,6 @@ def _mock_response(content="Hello", prompt_tokens=10, completion_tokens=5):
     ("provider_type", "model_id", "expected"),
     [
         ("groq", "llama-3.3-70b-versatile", "groq/llama-3.3-70b-versatile"),
-        ("anthropic", "claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
         ("google", "gemini-2.5-flash", "gemini/gemini-2.5-flash"),
         ("openai", "gpt-5-nano", "gpt-5-nano"),  # no prefix
         ("ollama", "qwen2.5:3b", "ollama/qwen2.5:3b"),

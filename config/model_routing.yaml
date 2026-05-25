@@ -58,6 +58,20 @@ providers:
     free: false
     rpm_limit: 20
     open_duration_s: 120
+  openrouter-sonnet:
+    type: openrouter
+    model: anthropic/claude-sonnet-4-6-20250514
+    profile: claude-sonnet-4.6
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
+  openrouter-opus:
+    type: openrouter
+    model: anthropic/claude-opus-4-6-20250514
+    profile: claude-opus-4.6
+    free: false
+    rpm_limit: 20
+    open_duration_s: 120
   # ── Phase 2 providers (gated on eval before chain promotion) ──
   cerebras-qwen:
     type: cerebras
@@ -154,24 +168,6 @@ providers:
     profile: qwen-3.5-plus
     free: false
     open_duration_s: 120
-  claude-haiku:
-    type: anthropic
-    model: claude-haiku-4-5-20251001
-    profile: claude-haiku-4.5
-    free: false
-    open_duration_s: 120
-  claude-sonnet:
-    type: anthropic
-    model: claude-sonnet-4-6-20250514
-    profile: claude-sonnet-4.6
-    free: false
-    open_duration_s: 120
-  claude-opus:
-    type: anthropic
-    model: claude-opus-4-6-20250514
-    profile: claude-opus-4.6
-    free: false
-    open_duration_s: 120
   glm51:
     type: zenmux
     model: z-ai/glm-5.1
@@ -247,28 +243,28 @@ call_sites:
     never_pays: true
   5_deep_reflection:
     chain:
-    - claude-sonnet
+    - openrouter-sonnet
     default_paid: true
     retry_profile: background
     cc_model: Sonnet
     dispatch: cli
   6_strategic_reflection:
     chain:
-    - claude-opus
+    - openrouter-opus
     default_paid: true
     retry_profile: background
     cc_model: Opus
     dispatch: cli
   7_ego_cycle:
     chain:
-    - claude-opus
+    - openrouter-opus
     default_paid: true
     retry_profile: background
     dispatch: cli
     cc_model: Opus
   8_ego_compaction:
     chain:
-    - claude-haiku
+    - openrouter-haiku
     - mistral-large-free
     default_paid: true
   9_fact_extraction:
@@ -284,7 +280,7 @@ call_sites:
   10_cognitive_state:
     chain:
     - glm51
-    - claude-sonnet
+    - openrouter-sonnet
     default_paid: true
   11_user_model_synthesis:
     chain:
@@ -309,13 +305,13 @@ call_sites:
     - openrouter-free
   14_weekly_self_assessment:
     chain:
-    - claude-opus
+    - openrouter-opus
     default_paid: true
     dispatch: cli
     cc_model: Opus
   16_quality_calibration:
     chain:
-    - claude-sonnet
+    - openrouter-sonnet
     default_paid: true
     dispatch: cli
     cc_model: Sonnet
@@ -531,7 +527,7 @@ call_sites:
       \ (cheap periodic ticks, quality not critical)"
   autonomous_executor_reasoning:
     chain:
-    - claude-sonnet
+    - openrouter-sonnet
     - openrouter-qwen36plus
     - gpt-5.4
     default_paid: true
@@ -539,7 +535,7 @@ call_sites:
     description: Autonomous executor non-tooling reasoning via API
   failure_exit_gate:
     chain:
-    - claude-sonnet
+    - openrouter-sonnet
     - openrouter-qwen36plus
     default_paid: true
     retry_profile: background
@@ -554,7 +550,7 @@ call_sites:
     description: Analyze CC version changes for impact on Genesis
   models_md_synthesis:
     chain:
-    - claude-sonnet
+    - openrouter-sonnet
     default_paid: true
     retry_profile: background
     description: "Weekly models.md synthesis \u2014 updates model catalog from recon findings"
@@ -570,7 +566,7 @@ call_sites:
       \ 29_retrospective_triage and 30_triage_calibration in the learning domain)."
   contribution_gate:
     chain:
-    - claude-haiku
+    - openrouter-haiku
     - groq-free
     - gemini-free
     default_paid: true

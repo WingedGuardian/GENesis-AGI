@@ -39,7 +39,7 @@ def sample_providers():
     return {
         "free-1": ProviderConfig(name="free-1", provider_type="mistral", model_id="mistral-large", is_free=True, rpm_limit=2, open_duration_s=120),
         "free-2": ProviderConfig(name="free-2", provider_type="groq", model_id="llama-70b", is_free=True, rpm_limit=30, open_duration_s=120),
-        "paid-1": ProviderConfig(name="paid-1", provider_type="anthropic", model_id="claude-haiku", is_free=False, rpm_limit=None, open_duration_s=120),
+        "paid-1": ProviderConfig(name="paid-1", provider_type="openrouter", model_id="anthropic/claude-haiku-4.5", is_free=False, rpm_limit=None, open_duration_s=120),
         "paid-2": ProviderConfig(name="paid-2", provider_type="openai", model_id="gpt-5-nano", is_free=False, rpm_limit=None, open_duration_s=120),
     }
 

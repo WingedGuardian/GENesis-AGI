@@ -90,8 +90,8 @@ about what they can do, not which API to call.
 
 #### Anthropic (Claude API)
 - **Capability:** Heavyweight autonomous reasoning.
-- **What it unlocks:** 13 call sites — deep/strategic reflection, user model
-  synthesis, pre-execution assessment. The tasks that require careful, nuanced thinking.
+- **What it unlocks:** Claude Code background sessions only. All LiteLLM
+  call sites now route Claude models through OpenRouter.
 - **Signup:** console.anthropic.com
 - **Pricing:** Per-token. Higher cost, highest quality.
 - **Important distinction:** Claude Code sessions use the user's CC
