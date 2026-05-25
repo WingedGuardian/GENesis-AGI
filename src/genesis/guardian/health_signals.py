@@ -99,6 +99,31 @@ class HealthSnapshot:
 # Canonical definition: genesis.guardian._subprocess.run_subprocess
 
 
+def parse_psi_content(content: str) -> dict[str, float]:
+    """Parse a PSI pressure file into a flat dict of metrics.
+
+    Handles both io.pressure and memory.pressure format:
+        some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+        full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+    Returns keys like 'some_avg10', 'full_avg60', etc.
+    """
+    result: dict[str, float] = {}
+    for line in content.strip().splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        prefix = parts[0]  # "some" or "full"
+        for part in parts[1:]:
+            if "=" in part:
+                key, _, val = part.partition("=")
+                try:
+                    result[f"{prefix}_{key}"] = float(val)
+                except ValueError:
+                    continue
+    return result
+
+
 def _http_get(url: str, timeout: float = 10.0) -> tuple[int, str]:
     """Synchronous HTTP GET via stdlib. Returns (status_code, body)."""
     req = urllib.request.Request(url, method="GET")
@@ -370,15 +395,7 @@ def _parse_psi_avg10(content: str, line_prefix: str) -> float | None:
     Example line: 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0'
     Returns the avg10 float value, or None if not found.
     """
-    for line in content.strip().splitlines():
-        if line.startswith(line_prefix):
-            for part in line.split():
-                if part.startswith("avg10="):
-                    try:
-                        return float(part.split("=", 1)[1])
-                    except (ValueError, IndexError):
-                        return None
-    return None
+    return parse_psi_content(content).get(f"{line_prefix}_avg10")
 
 
 # ── Suspicious check implementations ───────────────────────────────────

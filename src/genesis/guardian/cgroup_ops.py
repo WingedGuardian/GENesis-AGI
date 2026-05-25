@@ -22,6 +22,7 @@ import signal
 from pathlib import Path
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
+from genesis.guardian.health_signals import parse_psi_content
 
 logger = logging.getLogger(__name__)
 
@@ -42,17 +43,7 @@ def read_io_pressure(container: str) -> dict[str, float] | None:
     psi_path = _cgroup_path(container) / "io.pressure"
     try:
         content = psi_path.read_text()
-        result: dict[str, float] = {}
-        for line in content.strip().splitlines():
-            parts = line.split()
-            if not parts:
-                continue
-            prefix = parts[0]  # "some" or "full"
-            for part in parts[1:]:
-                if "=" in part:
-                    key, _, val = part.partition("=")
-                    with contextlib.suppress(ValueError):
-                        result[f"{prefix}_{key}"] = float(val)
+        result = parse_psi_content(content)
         return result if result else None
     except (OSError, ValueError) as exc:
         logger.warning("Failed to read io.pressure for %s: %s", container, exc)
