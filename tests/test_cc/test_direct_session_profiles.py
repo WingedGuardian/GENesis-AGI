@@ -22,9 +22,12 @@ def test_all_expected_profiles_exist():
 
 
 # --- Universal safety blocks (all profiles) ---
+# Note: Write is NOT universally blocked — it's allowed for interact/research
+# (scoped to ~/.genesis/output/ via profile addendum instruction) but blocked
+# for observe via _NO_FILE_WRITE.
 
 _UNIVERSAL_BLOCKED = {
-    "Bash", "Edit", "Write", "NotebookEdit",
+    "Bash", "Edit", "NotebookEdit",
     "mcp__genesis-health__task_submit",
     "mcp__genesis-health__settings_update",
     "mcp__genesis-health__direct_session_run",
@@ -53,6 +56,23 @@ def test_interact_blocks_universal():
 def test_research_blocks_universal():
     for tool in _UNIVERSAL_BLOCKED:
         assert tool in PROFILES["research"], f"research should block {tool}"
+
+
+# --- Write tool scoping ---
+
+def test_observe_blocks_write():
+    """Observe is read-only — Write is blocked."""
+    assert "Write" in PROFILES["observe"]
+
+
+def test_interact_allows_write():
+    """Interact allows Write (scoped to ~/.genesis/output/ via instruction)."""
+    assert "Write" not in PROFILES["interact"]
+
+
+def test_research_allows_write():
+    """Research allows Write (scoped to ~/.genesis/output/ via instruction)."""
+    assert "Write" not in PROFILES["research"]
 
 
 # --- Observe: most restrictive ---

@@ -9,6 +9,22 @@ description: >
 keywords: [medium, publish, article, blog, post, content, write, draft, distribution, marketing]
 ---
 
+## Voice (MANDATORY — NON-NEGOTIABLE)
+
+EVERY piece of content MUST go through the voice-master skill before
+publishing. This is a hard requirement, not a suggestion. The voice-master
+skill is TWO parts — both must be applied:
+
+1. **Exemplar matching** (tone, vocabulary, rhythm from real user writing)
+2. **Anti-AI-slop pass** (em dashes, hedge words, uniform structure, banned phrases)
+
+If content was not drafted with voice-master, apply it NOW before
+publishing. Do NOT publish content that hasn't passed both checks.
+Invoke the voice-master skill explicitly — do not attempt to apply
+voice rules from memory or inline.
+
+---
+
 ## Overview
 
 Single skill that covers the full publish pipeline: topic → research →
@@ -119,20 +135,28 @@ If the user says no, stop. Store the draft in memory for potential future use.
 
 Follow the stored procedure (`medium_browser_publish`). The key steps:
 
-1. Navigate to `https://medium.com/new-story`
+1. Navigate to `https://medium.com/new-story` (Camoufox, always)
 2. Verify editor loaded (snapshot should show "Title" heading)
-3. Focus the h3 title element via JS:
+3. Click the h3 title element, type title via `browser_fill`
+4. Press Enter to move to body
+5. Build full article HTML in JS on `window.__articleHTML`
+6. Use clipboard API to write content:
+   ```js
+   navigator.clipboard.write([new ClipboardItem({
+     'text/html': new Blob([window.__articleHTML], {type: 'text/html'}),
+     'text/plain': new Blob([plainText], {type: 'text/plain'})
+   })])
    ```
-   document.querySelector('h3').click();
-   document.querySelector('h3').focus();
-   ```
-4. Insert title: `document.execCommand('insertText', false, 'Title text')`
-5. Press Enter to move to body
-6. Insert body: `document.execCommand('insertText', false, 'Body text')`
-7. Verify content with screenshot before proceeding
-8. Click `text=Publish` (top-right button)
-9. In publish dialog, click the final `button:has-text("Publish")` to confirm
-10. Capture the post URL from the redirected page
+7. Focus body paragraph, paste via `browser_press_key("Control+v")`
+8. Verify content with snapshot before proceeding
+9. Click Publish button, add topics if desired, confirm publish
+10. Verify via URL change to `?postPublishedType=initial`
+
+**CRITICAL: What does NOT work (do not attempt):**
+- `document.execCommand('insertText')` — silently fails in Medium editor
+- `document.execCommand('insertHTML')` — stripped by Medium's sanitizer
+- Synthetic `ClipboardEvent` dispatch — Medium ignores synthetic events
+- Only real clipboard paste via `navigator.clipboard.write()` + `Ctrl+V` works
 
 **If any step fails:** Take a screenshot, report the error, do NOT retry
 blindly. The editor selectors may have changed.
@@ -150,7 +174,7 @@ Store the outcome in memory:
 | Error | Action |
 |-------|--------|
 | Not logged in to Medium | Return error. User must VNC login (one-time). |
-| Cloudflare Turnstile | Handled automatically by `browser_navigate` (Phase 1: auto-resolve 15s → Phase 2: VNC click 2×30s → Phase 3: human alert 5m). Do NOT switch browsers or give up — wait for resolution. |
+| Cloudflare Turnstile | Handled automatically by `browser_navigate`. The solver cascade (auto-resolve → widget click → VNC fallback) runs without intervention. Do NOT switch browsers, try TinyFish, or give up — Camoufox resolves it. |
 | Editor selectors changed | Screenshot + report. Do NOT guess new selectors. |
 | Draft quality check fails | Rewrite, max 2 attempts, then submit for manual review. |
 | Telegram approval timeout | Store draft as pending. Do not publish. |
