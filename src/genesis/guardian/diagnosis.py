@@ -348,8 +348,26 @@ class DiagnosisEngine:
             diagnostic, signal_summary, container_name, briefing_context,
         )
         cc_path = str(Path(self._config.cc.path).expanduser())
-        work_dir = Path("~/.local/share/genesis-guardian").expanduser()
+        work_dir = Path(self._config.cc.work_dir).expanduser()
         work_dir.mkdir(parents=True, exist_ok=True)
+
+        # Pre-flight: check disk space before launching CC.
+        # CC diagnosis generates significant I/O against the genesis pool.
+        # Refuse to launch if pool is dangerously full.
+        try:
+            from genesis.guardian.snapshots import SnapshotManager
+            snap_mgr = SnapshotManager(self._config)
+            pool_usage = await snap_mgr.check_pool_space()
+            if pool_usage > 90.0:
+                raise CCDiagnosisError(
+                    f"Genesis pool usage {pool_usage:.0f}% exceeds 90% — "
+                    f"refusing CC diagnosis to prevent disk exhaustion"
+                )
+            logger.info("Disk space preflight: pool usage %.0f%%", pool_usage)
+        except CCDiagnosisError:
+            raise
+        except Exception as exc:
+            logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
         # Pre-flight: check host memory before launching CC.
         # CC + its tool subprocesses run on the host unconstrained by any

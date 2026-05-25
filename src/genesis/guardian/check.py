@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 
 from genesis.guardian.alert.base import Alert, AlertSeverity
 from genesis.guardian.alert.dispatcher import AlertDispatcher
@@ -176,6 +177,14 @@ async def run_check(config: GuardianConfig | None = None) -> None:
     """
     if config is None:
         config = load_config()
+
+    maintenance_file = Path("/var/lib/guardian-snapshots/.guardian-maintenance")
+    if maintenance_file.exists():
+        logger.info(
+            "Maintenance mode active — standing down (remove %s to resume)",
+            maintenance_file,
+        )
+        return
 
     state_path = config.state_path / "state.json"
     config.state_path.mkdir(parents=True, exist_ok=True)
