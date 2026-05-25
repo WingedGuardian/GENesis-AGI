@@ -151,47 +151,25 @@ _PROFILE_ADDENDA: dict[str, str] = {
 
 ## Session Profile: interact
 
-You have access to: browser MCP tools, memory MCP tools, outreach send.
-You do NOT have: Write, Edit, Bash, NotebookEdit.
-
-**Output rules:**
-- Your final message IS your deliverable. Write it clearly and completely.
-- If you need to persist data, use observation_write, reference_store, or
-  procedure_store MCP tools (SQLite-backed, not file-based).
-- Write files ONLY to `~/.genesis/output/` if absolutely necessary (via
-  browser_run_js or clipboard methods, not Write tool).
-- Do NOT waste time searching for Write/Edit/Bash tools. They are not
-  available to you. Do NOT spawn subagents to work around this.
+You have: Write, browser MCP tools, memory MCP tools, outreach send.
+You do NOT have: Edit, Bash, NotebookEdit.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`.
 """,
     "research": """
 
 ## Session Profile: research
 
-You have access to: memory MCP tools, web tools (web_search, web_fetch),
-observation_write, procedure_store, reference_store, follow_up_create.
-You do NOT have: Write, Edit, Bash, NotebookEdit, browser tools.
-
-**Output rules:**
-- Your final message IS your deliverable. Write it clearly and completely.
-- Use observation_write for findings that should persist beyond this session.
-- Use reference_store for URLs, credentials, or identifiers discovered.
-- Do NOT waste time searching for Write/Edit/Bash/browser tools. They are
-  not available to you. Do NOT spawn subagents to work around this.
+You have: Write, memory MCP tools, web tools (web_search, web_fetch).
+You do NOT have: Edit, Bash, NotebookEdit, browser tools.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`.
 """,
     "observe": """
 
 ## Session Profile: observe
 
-You are in read-only mode. You can read, search, and analyze but cannot
-modify anything.
-You do NOT have: Write, Edit, Bash, NotebookEdit, browser interaction,
-memory writes, outreach send, follow-up creation.
-
-**Output rules:**
-- Your final message IS your deliverable. Write it clearly and completely.
-- You cannot persist anything. Your message is the only output.
-- Do NOT waste time searching for Write/Edit/Bash tools. They are not
-  available to you. Do NOT spawn subagents to work around this.
+You have: memory MCP tools (read-only).
+You do NOT have: Write, Edit, Bash, NotebookEdit, browser tools.
+Your final message IS your deliverable.
 """,
 }
 
@@ -533,9 +511,16 @@ class DirectSessionRunner:
         if request.planning_instruction:
             prompt = f"{request.planning_instruction}\n\n{prompt}"
 
+        # Interact profile requires Opus — browser reasoning is complex and
+        # ATS anti-bot detection demands higher capability.
+        model = request.model
+        if request.profile == "interact" and model != CCModel.OPUS:
+            logger.info("interact profile: upgrading model %s → opus", model)
+            model = CCModel.OPUS
+
         return CCInvocation(
             prompt=prompt,
-            model=request.model,
+            model=model,
             effort=request.effort,
             system_prompt=system_prompt,
             append_system_prompt=True,
@@ -634,7 +619,7 @@ class DirectSessionRunner:
         body = (
             f"<b>Direct Session FAILED</b>\n\n"
             f"Profile: {request.profile} | "
-            f"Model: {request.model} | "
+            f"Model: {result.model_used or request.model} | "
             f"Duration: {result.duration_s:.0f}s\n\n"
             f"Error: {result.error or 'unknown'}\n\n"
             f"Tools before failure: {tools_str}"

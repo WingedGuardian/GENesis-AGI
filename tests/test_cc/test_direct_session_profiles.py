@@ -3,10 +3,17 @@
 Validates that profile changes don't accidentally grant or revoke tool access.
 """
 
+from unittest.mock import MagicMock
+
 from genesis.cc.direct_session import (
+    _PROFILE_ADDENDA,
     PROFILES,
     VALID_PROFILES,
+    DirectSessionRequest,
+    DirectSessionRunner,
+    _build_profile_addendum,
 )
+from genesis.cc.types import CCModel
 
 # --- Profile existence ---
 
@@ -187,3 +194,79 @@ def test_interact_and_research_share_universal_base():
     research_set = set(PROFILES["research"])
     assert _UNIVERSAL_BLOCKED.issubset(interact_set)
     assert _UNIVERSAL_BLOCKED.issubset(research_set)
+
+
+# --- Profile addendum correctness ---
+
+def test_interact_addendum_mentions_write_available():
+    """Interact addendum must tell session Write is available."""
+    addendum = _build_profile_addendum("interact")
+    assert "You have: Write" in addendum
+
+
+def test_research_addendum_mentions_write_available():
+    """Research addendum must tell session Write is available."""
+    addendum = _build_profile_addendum("research")
+    assert "You have: Write" in addendum
+
+
+def test_observe_addendum_does_not_mention_write_available():
+    """Observe addendum must NOT claim Write is available."""
+    addendum = _build_profile_addendum("observe")
+    assert "You have: Write" not in addendum
+
+
+def test_addenda_do_not_mention_reference_store_for_persistence():
+    """Addenda must NOT direct sessions to use reference_store for persistence."""
+    for profile, addendum in _PROFILE_ADDENDA.items():
+        assert "reference_store" not in addendum, (
+            f"{profile} addendum should not mention reference_store"
+        )
+
+
+# --- Model override for interact profile ---
+
+def _make_runner():
+    """Construct a DirectSessionRunner with mock dependencies."""
+    config_builder = MagicMock()
+    surplus_cfg = {"system_prompt": "test"}
+    config_builder.build_surplus_config.return_value = surplus_cfg
+    config_builder.build_mcp_config.return_value = None
+    return DirectSessionRunner(
+        invoker=MagicMock(),
+        session_manager=MagicMock(),
+        config_builder=config_builder,
+        runtime=MagicMock(),
+    )
+
+
+def test_interact_profile_upgrades_model_to_opus():
+    """Interact sessions must always use Opus regardless of requested model."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="interact", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.OPUS
+
+
+def test_interact_profile_keeps_opus_when_already_opus():
+    """Opus request + interact should stay Opus (idempotent)."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="interact", model=CCModel.OPUS)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.OPUS
+
+
+def test_research_profile_does_not_upgrade_model():
+    """Non-interact profiles must NOT override the requested model."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="research", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.SONNET
+
+
+def test_observe_profile_does_not_upgrade_model():
+    """Observe profile must NOT override the requested model."""
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="observe", model=CCModel.HAIKU)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.HAIKU
