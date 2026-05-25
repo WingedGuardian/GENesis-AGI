@@ -129,6 +129,9 @@ class WatchdogChecker:
         # 0.25. Proactive memory pressure check — reclaim before OOM fires
         self._check_memory_pressure()
 
+        # 0.3. I/O pressure check — detect thrashing before it freezes the container
+        self._check_io_pressure()
+
         # 0.5. Quick check: is the bridge process even running?
         bridge_active = self._is_bridge_active()
         if bridge_active is False:
@@ -304,6 +307,42 @@ class WatchdogChecker:
                 pct, anon_kernel / (1024**3), limit / (1024**3),
             )
             reclaim_page_cache("128M")
+
+    def _check_io_pressure(self) -> None:
+        """Check container I/O pressure via PSI.
+
+        Reads /sys/fs/cgroup/io.pressure (container-scoped). When full
+        avg10 exceeds 25%, the container is experiencing significant I/O
+        stalls — log a warning. This is the leading indicator for the
+        page cache thrashing cascade that caused the 2026-05-25 incident.
+        """
+        psi_path = Path("/sys/fs/cgroup/io.pressure")
+        try:
+            content = psi_path.read_text()
+        except OSError:
+            return  # PSI not available — skip silently
+
+        for line in content.splitlines():
+            if not line.startswith("full"):
+                continue
+            for part in line.split():
+                if part.startswith("avg10="):
+                    try:
+                        avg10 = float(part.split("=")[1])
+                    except (ValueError, IndexError):
+                        break
+                    if avg10 > 50:
+                        logger.error(
+                            "I/O pressure CRITICAL: full avg10=%.1f%% — "
+                            "container approaching freeze",
+                            avg10,
+                        )
+                    elif avg10 > 25:
+                        logger.warning(
+                            "I/O pressure elevated: full avg10=%.1f%%",
+                            avg10,
+                        )
+                    break
 
     def _record_check(self) -> None:
         """Record that the watchdog ran (even on SKIP). Enables staleness detection."""

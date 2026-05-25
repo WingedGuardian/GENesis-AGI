@@ -26,6 +26,21 @@ from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent
 logger = logging.getLogger(__name__)
 
 
+def set_oom_score_adj(pid: int, score: int = 500) -> None:
+    """Set OOM score adjustment for a process.
+
+    Higher scores make the process more likely to be OOM-killed.
+    CC subprocesses get +500 so the kernel kills them before genesis-server
+    (-500) or qdrant. This is the container-side complement to the
+    host VM's cgroup OOM scoring.
+    """
+    try:
+        Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
+        logger.debug("Set oom_score_adj=%d for PID %d", score, pid)
+    except OSError as exc:
+        logger.debug("Could not set oom_score_adj for PID %d: %s", pid, exc)
+
+
 class CCInvoker:
     """Invokes claude CLI as async subprocess."""
 
@@ -259,6 +274,7 @@ class CCInvoker:
             )
             self._active_proc = proc
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
+            set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
                 try:
                     await invocation.on_spawn(proc.pid)
@@ -389,6 +405,7 @@ class CCInvoker:
             ) from None
         self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
+        set_oom_score_adj(proc.pid, 500)
         if invocation.on_spawn is not None:
             try:
                 await invocation.on_spawn(proc.pid)
