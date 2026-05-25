@@ -70,6 +70,7 @@ class StateData:
     last_cc_unavailable_alert_at: str | None = None
     auto_reset_count: int = 0  # Oscillation guard for confirmed_dead timeout
     last_recovery_at: str | None = None  # ISO8601 timestamp of last recovery attempt
+    io_triage_attempts: int = 0  # Separate counter for IO_TRIAGE (low-risk, repeatable)
     snapshot_size_history: list[int] = field(default_factory=list)  # Last N snapshot sizes in bytes
 
     def to_dict(self) -> dict:
@@ -92,6 +93,7 @@ class StateData:
             "last_cc_unavailable_alert_at": self.last_cc_unavailable_alert_at,
             "auto_reset_count": self.auto_reset_count,
             "last_recovery_at": self.last_recovery_at,
+            "io_triage_attempts": self.io_triage_attempts,
             "snapshot_size_history": self.snapshot_size_history[-5:],
         }
 
@@ -120,6 +122,7 @@ class StateData:
             last_cc_unavailable_alert_at=data.get("last_cc_unavailable_alert_at"),
             auto_reset_count=data.get("auto_reset_count", 0),
             last_recovery_at=data.get("last_recovery_at"),
+            io_triage_attempts=data.get("io_triage_attempts", 0),
             snapshot_size_history=data.get("snapshot_size_history", []),
         )
 
@@ -181,18 +184,31 @@ class ConfirmationStateMachine:
         except OSError as exc:
             logger.error("Failed to save state: %s", exc, exc_info=True)
 
-    def recovery_backoff_remaining_s(self) -> float:
+    def recovery_backoff_remaining_s(self, action: str = "") -> float:
         """Seconds remaining before next recovery attempt is allowed.
 
-        Exponential backoff: 100s, 300s, 900s (~2min, 5min, 15min).
+        IO_TRIAGE has a separate counter (low-risk, one kill per cycle).
+        All other actions share the main counter with exponential backoff:
+        100s, 300s, 900s (~2min, 5min, 15min).
+
         Returns 0 if no backoff needed, inf if already escalated.
         """
-        if self._state.recovery_attempts == 0:
-            return 0.0
-        if self._state.recovery_attempts >= self._config.recovery.max_escalations:
-            return float("inf")
-
-        backoff_s = 100.0 * (3.0 ** (self._state.recovery_attempts - 1))
+        if action == "IO_TRIAGE":
+            max_io = getattr(self._config.recovery, "max_io_triage_attempts", 5)
+            attempts = self._state.io_triage_attempts
+            if attempts == 0:
+                return 0.0
+            if attempts >= max_io:
+                return float("inf")
+            # Shorter backoff for IO_TRIAGE: 30s base, 2x multiplier
+            backoff_s = 30.0 * (2.0 ** (attempts - 1))
+        else:
+            attempts = self._state.recovery_attempts
+            if attempts == 0:
+                return 0.0
+            if attempts >= self._config.recovery.max_escalations:
+                return float("inf")
+            backoff_s = 100.0 * (3.0 ** (attempts - 1))
 
         if not self._state.last_recovery_at:
             return backoff_s
@@ -203,17 +219,17 @@ class ConfirmationStateMachine:
         except (ValueError, TypeError):
             return backoff_s
 
-    def record_recovery_attempt(self) -> None:
+    def record_recovery_attempt(self, action: str = "") -> None:
         """Record that a recovery attempt was made (for backoff tracking).
 
-        Advances both the timestamp AND the attempt counter. The counter
-        must advance on every attempt — including action failures — so that
-        backoff grows even when recovery never reaches the RECOVERED state.
-        Without this, action-failure loops retry at the 30s check interval
-        with no backoff (the exact cascade pattern from the 2026-05-25 incident).
+        IO_TRIAGE increments its own counter. All other actions increment
+        the main counter. Both share the last_recovery_at timestamp.
         """
         self._state.last_recovery_at = datetime.now(UTC).isoformat()
-        self._state.recovery_attempts += 1
+        if action == "IO_TRIAGE":
+            self._state.io_triage_attempts += 1
+        else:
+            self._state.recovery_attempts += 1
 
     def process(self, snapshot: HealthSnapshot) -> Transition:
         """Process a health snapshot and return the state transition.
@@ -592,6 +608,7 @@ class ConfirmationStateMachine:
         self._state.first_failure_at = None
         self._state.last_healthy_at = now
         self._state.recovery_attempts = 0
+        self._state.io_triage_attempts = 0
         self._state.last_recovery_at = None
         self._clear_dialogue_state()
         self.clear_cc_unavailable()

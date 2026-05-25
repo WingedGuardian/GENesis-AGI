@@ -61,6 +61,7 @@ class RecoveryAction(StrEnum):
     """Available recovery actions, in escalation order."""
 
     RESTART_SERVICES = "RESTART_SERVICES"
+    IO_TRIAGE = "IO_TRIAGE"
     RESOURCE_CLEAR = "RESOURCE_CLEAR"
     REVERT_CODE = "REVERT_CODE"
     RESTART_CONTAINER = "RESTART_CONTAINER"
@@ -100,6 +101,7 @@ Known failure mode inventory (from real incidents):
 | killpg(1) | All processes dead simultaneously | Bad PGID in test/code | RESTART_CONTAINER |
 | Systemd user manager death | All user services dead, systemd --user gone | OOM cascading | RESTART_CONTAINER |
 | Page cache I/O storm | D-state processes, high io.pressure | Memory pressure cascade | RESTART_CONTAINER |
+| I/O saturation | io.pressure full avg10 high, system partially responsive | CC sessions saturating I/O bandwidth | IO_TRIAGE (kill top I/O consumer, one per cycle) |
 """
 
 
@@ -235,6 +237,23 @@ Run these via Bash:
 - `incus info {container_name}` — Container status and resource usage
 - `incus restart {container_name}` — Restart the entire container (last resort)
 - `incus snapshot create {container_name} guardian-pre-recovery` — Snapshot BEFORE recovery
+- `cat /sys/fs/cgroup/lxc.payload.{container_name}/io.pressure` — I/O pressure (direct host read, works when incus exec is unresponsive)
+- `cat /sys/fs/cgroup/lxc.payload.{container_name}/cgroup.procs` — All container PIDs (host read)
+
+## IO_TRIAGE Guidance
+
+When I/O pressure is the root cause (`io.pressure full avg10` is high), recommend
+IO_TRIAGE instead of RESTART_CONTAINER. IO_TRIAGE kills the single highest I/O
+consumer (one process per cycle) and reassesses. This is less destructive than a
+full container restart.
+
+**Before recommending IO_TRIAGE**, check the PSI trend:
+- `full avg10 > avg60 > avg300` = accelerating pressure → IO_TRIAGE appropriate
+- `full avg10 < avg60` = pressure dropping → stand down, let it recover naturally
+- Read I/O pressure: `cat /sys/fs/cgroup/lxc.payload.{container_name}/io.pressure`
+  Format: `full avg10=X avg60=X avg300=X total=N` (avg values are percentages)
+
+**Never touch host io.max** — it is a safety boundary to prevent disk corruption.
 
 ## Investigation Protocol
 
@@ -276,7 +295,7 @@ report as a JSON block:
 ```
 
 Field values:
-- `recommended_action`: RESTART_SERVICES | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
+- `recommended_action`: RESTART_SERVICES | IO_TRIAGE | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
 - `actions_taken`: what you actually did (investigation steps + recovery actions)
 - `outcome`: "resolved" (you fixed it), "partially_resolved" (improved but not fully), or "escalate" (needs human)
 

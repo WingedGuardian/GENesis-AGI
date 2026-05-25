@@ -232,13 +232,15 @@ class TestRecoveryAction:
 
     def test_all_actions_defined(self) -> None:
         actions = list(RecoveryAction)
-        assert len(actions) == 6
+        assert len(actions) == 7
         assert RecoveryAction.RESTART_SERVICES in actions
+        assert RecoveryAction.IO_TRIAGE in actions
         assert RecoveryAction.ESCALATE in actions
 
     def test_escalation_order(self) -> None:
         ordered = [
             RecoveryAction.RESTART_SERVICES,
+            RecoveryAction.IO_TRIAGE,
             RecoveryAction.RESOURCE_CLEAR,
             RecoveryAction.REVERT_CODE,
             RecoveryAction.RESTART_CONTAINER,

@@ -64,11 +64,16 @@ class RecoveryEngine:
             return await self._escalate(diagnosis)
 
         # Check exponential backoff before proceeding
-        backoff_s = self._sm.recovery_backoff_remaining_s()
+        backoff_s = self._sm.recovery_backoff_remaining_s(action.value)
         if backoff_s > 0:
+            attempts = (
+                self._sm.state.io_triage_attempts
+                if action == RecoveryAction.IO_TRIAGE
+                else self._sm.state.recovery_attempts
+            )
             logger.warning(
                 "Recovery backoff: %.0fs remaining before attempt %d — deferring",
-                backoff_s, self._sm.state.recovery_attempts + 1,
+                backoff_s, attempts + 1,
             )
             return RecoveryResult(
                 action=action,
@@ -113,7 +118,7 @@ class RecoveryEngine:
             detail = str(exc)
 
         # Record attempt timestamp for backoff tracking
-        self._sm.record_recovery_attempt()
+        self._sm.record_recovery_attempt(action.value)
 
         duration = (datetime.now(UTC) - t0).total_seconds()
 
@@ -162,6 +167,8 @@ class RecoveryEngine:
 
         if action == RecoveryAction.RESTART_SERVICES:
             return await self._restart_services(container)
+        elif action == RecoveryAction.IO_TRIAGE:
+            return await self._io_triage(container)
         elif action == RecoveryAction.RESOURCE_CLEAR:
             return await self._resource_clear(container)
         elif action == RecoveryAction.REVERT_CODE:
@@ -184,6 +191,59 @@ class RecoveryEngine:
         if rc != 0:
             return False, f"systemctl restart failed: {stderr}"
         return True, "genesis-bridge restarted"
+
+    async def _io_triage(self, container: str) -> tuple[bool, str]:
+        """Kill the top I/O consumer. One process per cycle — reassess after.
+
+        Checks PSI trend before acting: if pressure is already dropping,
+        stands down and lets the system recover naturally.
+        Never touches io.max (host safety boundary).
+        """
+        from genesis.guardian.cgroup_ops import (
+            find_top_io_pids,
+            kill_pid,
+            read_io_pressure,
+        )
+
+        # 1. Collect diagnostics — find top 5 I/O consumers
+        top_pids = find_top_io_pids(container, top_n=5)
+        if not top_pids:
+            return False, "No I/O consuming processes found in container cgroup"
+
+        # Log all candidates for observability
+        for entry in top_pids:
+            logger.info(
+                "IO_TRIAGE candidate: PID %d (%s) "
+                "read=%d write=%d total=%d bytes",
+                entry["pid"], entry["comm"],
+                entry["read_bytes"], entry["write_bytes"],
+                entry["total_bytes"],
+            )
+
+        # 2. Assess PSI trend — is pressure accelerating or recovering?
+        pressure = read_io_pressure(container)
+        if pressure:
+            avg10 = pressure.get("full_avg10", 0)
+            avg60 = pressure.get("full_avg60", 0)
+            if avg10 < avg60:
+                # Pressure is dropping — stand down
+                return True, (
+                    f"I/O pressure recovering (avg10={avg10:.1f}%, "
+                    f"avg60={avg60:.1f}%) — standing down"
+                )
+
+        # 3. Kill top consumer only (one per cycle)
+        target = top_pids[0]
+        killed = await kill_pid(target["pid"], container=container)
+        if not killed:
+            return False, (
+                f"Failed to kill PID {target['pid']} ({target['comm']})"
+            )
+
+        return True, (
+            f"Killed top I/O consumer: PID {target['pid']} "
+            f"({target['comm']}) total_bytes={target['total_bytes']}"
+        )
 
     async def _resource_clear(self, container: str) -> tuple[bool, str]:
         """Clear /tmp and reclaim page cache, then restart services."""

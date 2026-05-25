@@ -123,6 +123,7 @@ class RecoveryConfig:
 
     verification_delay_s: int = 30
     max_escalations: int = 3
+    max_io_triage_attempts: int = 5  # Separate budget for IO_TRIAGE (low-risk)
 
 
 @dataclass
