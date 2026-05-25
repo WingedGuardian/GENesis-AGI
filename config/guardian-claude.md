@@ -26,6 +26,7 @@ data and signal history. DO NOT stop at that data — investigate:
 
 ## Available Commands
 
+Container inspection (via incus exec):
 - `incus exec genesis -- su - ubuntu -c "<cmd>"` — Run as ubuntu user
 - `incus exec genesis -- su - ubuntu -c "systemctl --user restart genesis-bridge"` — Restart main service
 - `incus exec genesis -- su - ubuntu -c "journalctl --user -n 200 --no-pager"` — Read logs
@@ -38,13 +39,70 @@ data and signal history. DO NOT stop at that data — investigate:
 - `incus restart genesis` — Restart container (last resort)
 - `incus snapshot create genesis guardian-pre-recovery` — Snapshot BEFORE recovery
 
+Direct host reads (work when container is frozen/D-state and incus exec is unresponsive):
+- `cat /sys/fs/cgroup/lxc.payload.genesis/io.pressure` — I/O pressure (PSI)
+- `cat /sys/fs/cgroup/lxc.payload.genesis/cgroup.procs` — All container PIDs
+- `cat /proc/{pid}/io` — Per-process I/O stats (container PIDs visible on host)
+- `cat /sys/fs/cgroup/lxc.payload.genesis/memory.pressure` — Memory pressure
+
 ## Rules
 
 - ALWAYS take an Incus snapshot before destructive recovery actions
-- Prefer least destructive: restart service > clear resources > restart container > rollback
+- Prefer least destructive: restart service > IO_TRIAGE > clear resources > restart container > rollback
 - Never raise resource limits — fix root causes
 - Never work around symptoms — diagnose the actual problem
+- Never touch host io.max — it is a safety boundary to prevent disk corruption
 - Check temporal patterns: what changed? what degraded first?
+- IO_TRIAGE kills ONE process per cycle. Check PSI trend before killing.
+
+## I/O Pressure (PSI) Guide
+
+The host can read container I/O pressure directly from the cgroup filesystem.
+Format: `some avg10=X avg60=X avg300=X total=N` and `full avg10=X avg60=X avg300=X total=N`
+(avg values are percentages of time tasks were stalled).
+
+- `full avg10 > 50%` = critical I/O saturation (container may be freezing)
+- `full avg10 > 10%` = warning (early I/O pressure)
+- Trend: avg10 > avg60 > avg300 = accelerating — intervention needed
+- Trend: avg10 < avg60 = recovering — let it resolve naturally
+
+## Sentinel Awareness
+
+Genesis has a container-side health guardian called the Sentinel. Before you
+act, check if the Sentinel has already tried to fix the problem:
+
+- `cat ~/.local/state/genesis-guardian/shared/sentinel/last_run.json` — what Sentinel tried
+- `cat ~/.local/state/genesis-guardian/shared/sentinel/sentinel_state.json` — current Sentinel state
+
+If the Sentinel already diagnosed and attempted to fix this problem, do NOT
+repeat the same actions. Either try something different or escalate.
+
+Guardian coordinates with Sentinel via event-driven standing: as long as
+Sentinel is actively investigating or awaiting user approval, Guardian waits.
+Guardian proceeds only when Sentinel escalates, reports healthy (but probes
+disagree), or becomes unreachable.
+
+## IO_TRIAGE
+
+When I/O pressure is the root cause, recommend IO_TRIAGE instead of
+RESTART_CONTAINER. IO_TRIAGE kills the single highest I/O consumer (one process
+per cycle) and reassesses. Less destructive than a full container restart.
+
+Before recommending IO_TRIAGE, check the PSI trend:
+- `full avg10 > avg60 > avg300` = accelerating → IO_TRIAGE appropriate
+- `full avg10 < avg60` = pressure dropping → stand down, let it recover
+
+## Operational Context
+
+- Recovery uses exponential backoff (100s base, 3x multiplier, max 3 attempts)
+- IO_TRIAGE has a separate counter (max 5 attempts, 30s base, 2x multiplier)
+- Maintenance mode: if `/var/lib/guardian-snapshots/.guardian-maintenance` exists,
+  check cycle is skipped entirely
+- CC diagnosis runs in `/var/lib/guardian-snapshots/cc-sessions` (isolated work dir)
+- Diagnosis refused if pool usage > 90% (disk space preflight)
+- Guardian service limited to 6GB memory (MemoryMax=6G), OOMScoreAdjust=500
+- Snapshot gating: headroom-based check (requires free > max(5GB, 2x avg recent
+  snapshots)), not fixed percentage
 
 ## Genesis Context
 
@@ -63,6 +121,7 @@ A shared mount connects Genesis (container) and Guardian (host):
 Subdirectories:
 - briefing/ — Genesis writes curated briefings here (service baselines, incidents, metric norms)
 - findings/ — Guardian writes diagnosis results here for Genesis to ingest on recovery
+- sentinel/ — Sentinel state and run logs (last_run.json, sentinel_state.json, sentinel_log.jsonl)
 
 The briefing file (guardian_briefing.md) is injected into your prompt automatically
 when available. It gives you context about what Genesis was doing before it went down.
@@ -83,5 +142,5 @@ When done (resolved or escalating), output a JSON block at the end:
 }
 ```
 
-Actions: RESTART_SERVICES | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
+Actions: RESTART_SERVICES | IO_TRIAGE | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
 Outcomes: "resolved" | "partially_resolved" | "escalate"

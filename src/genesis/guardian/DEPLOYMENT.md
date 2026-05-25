@@ -14,12 +14,14 @@ CLAUDE.md: Generated from `config/guardian-claude.md` (NOT the repo root CLAUDE.
 - `diagnosis.py` — CC diagnosis engine (invokes `claude -p` on host)
 - `diagnosis_writer.py` — writes diagnosis results to shared mount
 - `collector.py` — gathers diagnostic metrics (memory, disk, processes, journal)
-- `recovery.py` — executes recovery actions (restart, revert, rollback)
-- `health_signals.py` — 5 probes + 6 suspicious checks
-- `state_machine.py` — confirmation protocol (prevents false positives)
-- `snapshots.py` — Incus snapshot management
+- `recovery.py` — executes recovery actions (restart, IO_TRIAGE, revert, rollback)
+- `health_signals.py` — 5 probes + 6 suspicious checks (including I/O pressure)
+- `state_machine.py` — confirmation protocol with event-driven Sentinel coordination
+- `snapshots.py` — Incus snapshot management with headroom-based gating
+- `_subprocess.py` — shared async subprocess runner (used by 5+ modules)
+- `cgroup_ops.py` — host-side cgroup operations (I/O pressure, PID enumeration, process kill)
 - `approval.py` — HTTP approval server for recovery confirmation
-- `dialogue.py` — Guardian↔Genesis dialogue protocol
+- `dialogue.py` — Guardian↔Genesis dialogue protocol (sentinel_state aware)
 - `alert/` — alert channels (Telegram, journal)
 
 ## CONTAINER-SIDE (runs inside Genesis container via awareness loop)
@@ -48,3 +50,4 @@ Subdirectories:
 - `briefing/` — Genesis→Guardian (service baselines, metric norms, recent activity)
 - `findings/` — Guardian→Genesis (diagnosis results for post-recovery learning)
 - `guardian/` — Genesis→Guardian (Telegram credentials)
+- `sentinel/` — Sentinel→Guardian (state, last run, logs)
