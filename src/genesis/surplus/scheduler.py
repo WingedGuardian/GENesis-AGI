@@ -785,7 +785,12 @@ class SurplusScheduler:
                 pass
 
     async def run_models_md_synthesis(self) -> None:
-        """Run weekly models.md synthesis (Sunday 8am UTC)."""
+        """Run weekly models.md synthesis (Sunday 8am UTC).
+
+        Dispatches a CC background session to update docs/reference/models.md
+        from recent model intelligence findings.  Fire-and-forget: job health
+        records the dispatch outcome, not the session completion.
+        """
         try:
             from genesis.runtime import GenesisRuntime
             if GenesisRuntime.instance().paused:
@@ -809,14 +814,14 @@ class SurplusScheduler:
                 logger.info("Models.md synthesis skipped: %s", result.get("reason"))
             else:
                 logger.info(
-                    "Models.md synthesis: %d findings applied (cost $%.4f)",
+                    "Models.md synthesis dispatched: %d findings (session=%s)",
                     result.get("findings_count", 0),
-                    result.get("cost_usd", 0),
+                    result.get("session_id", "?"),
                 )
             if self._event_bus:
                 await self._event_bus.emit(
                     Subsystem.RECON, Severity.DEBUG,
-                    "heartbeat", "models_md_synthesis completed",
+                    "heartbeat", "models_md_synthesis dispatched",
                 )
             try:
                 from genesis.runtime import GenesisRuntime

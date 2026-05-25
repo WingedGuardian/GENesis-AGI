@@ -539,12 +539,6 @@ call_sites:
     - gemini-free
     default_paid: true
     description: Analyze CC version changes for impact on Genesis
-  models_md_synthesis:
-    chain:
-    - openrouter-sonnet
-    default_paid: true
-    retry_profile: background
-    description: "Weekly models.md synthesis \u2014 updates model catalog from recon findings"
   outreach_email_triage:
     chain:
     - gemini-free
