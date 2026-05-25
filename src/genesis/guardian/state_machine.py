@@ -181,7 +181,7 @@ class ConfirmationStateMachine:
     def recovery_backoff_remaining_s(self) -> float:
         """Seconds remaining before next recovery attempt is allowed.
 
-        Exponential backoff: 120s, 300s, 900s (2min, 5min, 15min).
+        Exponential backoff: 100s, 300s, 900s (~2min, 5min, 15min).
         Returns 0 if no backoff needed, inf if already escalated.
         """
         if self._state.recovery_attempts == 0:
@@ -189,7 +189,7 @@ class ConfirmationStateMachine:
         if self._state.recovery_attempts >= self._config.recovery.max_escalations:
             return float("inf")
 
-        backoff_s = 120.0 * (2.5 ** (self._state.recovery_attempts - 1))
+        backoff_s = 100.0 * (3.0 ** (self._state.recovery_attempts - 1))
 
         if not self._state.last_recovery_at:
             return backoff_s
@@ -201,8 +201,16 @@ class ConfirmationStateMachine:
             return backoff_s
 
     def record_recovery_attempt(self) -> None:
-        """Record that a recovery attempt was made (for backoff tracking)."""
+        """Record that a recovery attempt was made (for backoff tracking).
+
+        Advances both the timestamp AND the attempt counter. The counter
+        must advance on every attempt — including action failures — so that
+        backoff grows even when recovery never reaches the RECOVERED state.
+        Without this, action-failure loops retry at the 30s check interval
+        with no backoff (the exact cascade pattern from the 2026-05-25 incident).
+        """
         self._state.last_recovery_at = datetime.now(UTC).isoformat()
+        self._state.recovery_attempts += 1
 
     def process(self, snapshot: HealthSnapshot) -> Transition:
         """Process a health snapshot and return the state transition.
@@ -547,9 +555,9 @@ class ConfirmationStateMachine:
                 reason="recovery verified — all probes healthy",
             )
 
-        # Recovery failed — back to CONFIRMED_DEAD for escalation
+        # Recovery failed — back to CONFIRMED_DEAD for escalation.
+        # recovery_attempts already incremented by record_recovery_attempt().
         self._state.current_state = GuardianState.CONFIRMED_DEAD
-        self._state.recovery_attempts += 1
         failed_names = [s.name for s in snapshot.failed_signals]
         return Transition(
             old_state=GuardianState.RECOVERED,
