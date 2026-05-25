@@ -130,7 +130,7 @@ fi
 # Untracked files (^??) are excluded — merge/reset never touches them.
 # git reset --hard in _do_rollback would silently discard uncommitted work.
 if [[ "$POST_MERGE" == "false" ]]; then
-    DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v "^??")
+    DIRTY_FILES=$(git -C "$GENESIS_ROOT" status --porcelain 2>/dev/null | grep -v "^??" || true)
     if [[ -n "$DIRTY_FILES" ]]; then
         echo "ERROR: Working tree has uncommitted changes. Clean them up first:"
         echo "$DIRTY_FILES"
