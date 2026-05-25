@@ -162,27 +162,22 @@ def api_key_health(
         )
         results[name] = entry
 
-    # Include disabled providers as dormant
+    # Include disabled providers for visibility — but mark as "disabled",
+    # not "missing".  A deliberately disabled provider must not generate
+    # alerts or poison the aggregate for its provider type.
     for name, ptype in getattr(routing_config, "disabled_providers", {}).items():
         if name not in results:
-            crit_info = crit_map.get(ptype, {})
             results[name] = {
-                "status": "missing",
+                "status": "disabled",
                 "provider_type": ptype,
-                "chain_count": crit_info.get("chain_count", 0),
-                "chain_usage": crit_info.get("chain_usage", []),
-                "criticality": crit_info.get("criticality", "dormant"),
-                "is_free": crit_info.get("is_free", False),
-                "sole_sites": crit_info.get("sole_sites", []),
+                "chain_count": 0,
+                "chain_usage": [],
+                "criticality": "dormant",
+                "is_free": True,
+                "sole_sites": [],
                 "cb_state": "closed",
                 "cb_reason": None,
-                "alert_severity": _compute_alert_severity(
-                    status="missing",
-                    criticality=crit_info.get("criticality", "dormant"),
-                    is_free=crit_info.get("is_free", False),
-                    cb_state="closed",
-                    cb_reason=None,
-                ),
+                "alert_severity": None,
             }
 
     # Build attention-strip alerts

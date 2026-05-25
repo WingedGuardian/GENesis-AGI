@@ -57,6 +57,12 @@ class DialogueRequest:
         }
 
 
+_ACTIVE_SENTINEL_STATES = frozenset({
+    "investigating", "remediating",
+    "awaiting_dispatch_approval", "awaiting_action_approval",
+})
+
+
 @dataclass(frozen=True)
 class DialogueResponse:
     """What Genesis sends back to the Guardian."""
@@ -66,6 +72,12 @@ class DialogueResponse:
     action: str
     eta_s: int
     context: str
+    sentinel_state: str = ""
+
+    @property
+    def sentinel_active(self) -> bool:
+        """True if Sentinel is in an active state (Guardian should wait)."""
+        return self.sentinel_state in _ACTIVE_SENTINEL_STATES
 
     @classmethod
     def unreachable(cls) -> DialogueResponse:
@@ -76,6 +88,7 @@ class DialogueResponse:
             action="",
             eta_s=0,
             context="Genesis unreachable — no response to dialogue",
+            sentinel_state="",
         )
 
     @classmethod
@@ -87,6 +100,7 @@ class DialogueResponse:
             action="",
             eta_s=0,
             context=f"Genesis responded with error: {detail}",
+            sentinel_state="",
         )
 
 
@@ -186,6 +200,7 @@ async def send_dialogue(
             action=data.get("action", ""),
             eta_s=int(data.get("eta_s", 0)),
             context=data.get("context", ""),
+            sentinel_state=data.get("sentinel_state", ""),
         )
 
     except json.JSONDecodeError as exc:

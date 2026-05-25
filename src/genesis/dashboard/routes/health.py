@@ -144,7 +144,9 @@ async def guardian_dialogue():
     except (ValueError, TypeError, AttributeError) as exc:
         logger.debug("Failed to parse Guardian concern payload: %s", exc, exc_info=True)
 
-    # Dispatch Sentinel if available — container-side guardian handles it
+    # Dispatch Sentinel if available — container-side guardian handles it.
+    # Guardian uses sentinel_state for event-driven standing (no wall-clock
+    # timeout). As long as Sentinel is active, Guardian waits indefinitely.
     sentinel = getattr(rt, "_sentinel", None)
     if sentinel is not None and not sentinel.is_active:
         try:
@@ -160,12 +162,16 @@ async def guardian_dialogue():
                 )),
                 name="sentinel-guardian-dialogue",
             )
+            # Sentinel just dispatched — report its initial state
+            s_state = getattr(sentinel, "_state", None)
+            state_val = s_state.current_state if s_state else "investigating"
             return jsonify({
                 "acknowledged": True,
                 "status": "handling",
                 "action": "sentinel_dispatched",
-                "eta_s": 300,
-                "context": "Sentinel dispatched to diagnose and fix",
+                "eta_s": 0,
+                "sentinel_state": state_val,
+                "context": f"Sentinel dispatched ({state_val})",
             }), 200
         except Exception:
             logger.warning("Sentinel dispatch failed — falling back to need_help", exc_info=True)
@@ -173,14 +179,15 @@ async def guardian_dialogue():
         # Sentinel is already mid-remediation — tell Guardian to wait.
         # Without this, Guardian interprets the fallthrough as "need_help"
         # and escalates, causing competing restart attempts.
-        current = getattr(sentinel, "_state", None)
-        state_str = current.current_state if current else "active"
+        s_state = getattr(sentinel, "_state", None)
+        state_val = s_state.current_state if s_state else "investigating"
         return jsonify({
             "acknowledged": True,
             "status": "handling",
             "action": "sentinel_already_active",
-            "eta_s": 600,
-            "context": f"Sentinel already remediating ({state_str})",
+            "eta_s": 0,
+            "sentinel_state": state_val,
+            "context": f"Sentinel active ({state_val})",
         }), 200
 
     return jsonify({

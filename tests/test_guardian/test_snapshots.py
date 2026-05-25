@@ -197,6 +197,143 @@ class TestMarkHealthy:
         assert name.endswith("-healthy")
 
 
+def _mock_subprocess_headroom(
+    total_bytes: int = 300 * 1024**3,
+    free_bytes: int = 100 * 1024**3,
+    snapshot_rc: int = 0,
+    post_free_bytes: int | None = None,
+):
+    """Mock that returns byte-level pool info for headroom tests."""
+    state = {"snapshot_created": False}
+
+    async def mock(*args, **kwargs):
+        cmd = args[0] if args else ""
+        all_args = " ".join(str(a) for a in args)
+        if cmd == "incus" and len(args) > 3 and args[1] == "config":
+            return (0, "genesis-pool\n", "")
+        if cmd == "df" and "--block-size=1" in all_args:
+            # After snapshot create, return post_free_bytes
+            if state["snapshot_created"] and post_free_bytes is not None:
+                return (0, f"1B-blocks Avail\n{total_bytes} {post_free_bytes}\n", "")
+            return (0, f"1B-blocks Avail\n{total_bytes} {free_bytes}\n", "")
+        if cmd == "df":
+            # Percentage-based (check_pool_space fallback)
+            pct = int((1 - free_bytes / total_bytes) * 100) if total_bytes else 100
+            return (0, f"Use%\n {pct}%\n", "")
+        if cmd == "incus" and len(args) > 2 and args[1] == "snapshot":
+            if args[2] == "list":
+                return (0, "[]", "")
+            if args[2] == "create":
+                state["snapshot_created"] = True
+            return (snapshot_rc, "", "")
+        return (snapshot_rc, "", "")
+    return mock
+
+
+class TestHeadroomGating:
+    """Tests for headroom-based snapshot gating."""
+
+    @pytest.mark.asyncio
+    async def test_no_history_requires_10pct_free(self, manager: SnapshotManager) -> None:
+        """Without snapshot size history, require 10% of pool free."""
+        # 300GB pool, 100GB free = 33% free → should pass
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_headroom(
+                total_bytes=300 * 1024**3, free_bytes=100 * 1024**3,
+            ),
+        ):
+            ok = await manager.safe_to_snapshot(snapshot_size_history=[])
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_no_history_rejects_low_free(self, manager: SnapshotManager) -> None:
+        """Without history, reject if < 10% free."""
+        # 300GB pool, 5GB free = 1.7% → should fail
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_headroom(
+                total_bytes=300 * 1024**3, free_bytes=5 * 1024**3,
+            ),
+        ):
+            ok = await manager.safe_to_snapshot(snapshot_size_history=[])
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_with_history_uses_headroom(self, manager: SnapshotManager) -> None:
+        """With history, require free > max(5GB, 2x avg last 3 snapshots)."""
+        # History: 3 snapshots averaging 2GB each → need max(5GB, 4GB) = 5GB
+        # 300GB pool, 10GB free → should pass (10GB > 5GB)
+        history = [2 * 1024**3, 2 * 1024**3, 2 * 1024**3]
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_headroom(
+                total_bytes=300 * 1024**3, free_bytes=10 * 1024**3,
+            ),
+        ):
+            ok = await manager.safe_to_snapshot(snapshot_size_history=history)
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_with_history_rejects_tight_headroom(self, manager: SnapshotManager) -> None:
+        """Reject when free space < required headroom."""
+        # History: 3 snapshots averaging 10GB each → need max(5GB, 20GB) = 20GB
+        # 300GB pool, 15GB free → should fail (15GB < 20GB)
+        history = [10 * 1024**3, 10 * 1024**3, 10 * 1024**3]
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_headroom(
+                total_bytes=300 * 1024**3, free_bytes=15 * 1024**3,
+            ),
+        ):
+            ok = await manager.safe_to_snapshot(snapshot_size_history=history)
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_pool_detection_failure_falls_back_to_percentage(
+        self, manager: SnapshotManager,
+    ) -> None:
+        """If _get_pool_free_bytes returns None, fall back to old pct check."""
+        call_count = {"pool": 0}
+
+        async def mock(*args, **kwargs):
+            cmd = args[0] if args else ""
+            all_args = " ".join(str(a) for a in args)
+            if cmd == "incus" and len(args) > 3 and args[1] == "config":
+                call_count["pool"] += 1
+                if "--block-size=1" in all_args or call_count["pool"] <= 1:
+                    # First pool detection (for _get_pool_free_bytes) fails
+                    return (1, "", "error")
+                # Second pool detection (for check_pool_space) succeeds
+                return (0, "genesis-pool\n", "")
+            if cmd == "df":
+                return (0, "Use%\n 20%\n", "")
+            return (0, "", "")
+
+        with patch("genesis.guardian.snapshots._run_subprocess", mock):
+            ok = await manager.safe_to_snapshot(snapshot_size_history=[1024])
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_take_records_size_to_history(self, manager: SnapshotManager) -> None:
+        """After successful take(), snapshot size should be appended to history."""
+        history: list[int] = []
+        free_before = 100 * 1024**3
+        free_after = 98 * 1024**3  # 2GB snapshot
+        with patch(
+            "genesis.guardian.snapshots._run_subprocess",
+            _mock_subprocess_headroom(
+                total_bytes=300 * 1024**3,
+                free_bytes=free_before,
+                post_free_bytes=free_after,
+            ),
+        ):
+            name = await manager.take(label="test", snapshot_size_history=history)
+        assert name is not None
+        assert len(history) == 1
+        assert history[0] == free_before - free_after
+
+
 class TestGetLatestHealthy:
 
     @pytest.mark.asyncio

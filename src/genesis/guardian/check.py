@@ -411,11 +411,20 @@ async def _handle_awaiting_self_heal(
     recovery_engine: RecoveryEngine,
     snapshot: object,
 ) -> None:
-    """Check if Genesis's self-heal worked. If ETA expired and still down, proceed.
+    """Event-driven self-heal check. Re-queries Sentinel state each tick.
 
-    Uses the snapshot already collected and processed by _check_cycle.
-    The state machine transition was already computed — we act on the current state.
+    Guardian waits as long as Sentinel is in an active state (investigating,
+    remediating, awaiting approval). No wall-clock timeout. User sovereignty
+    is absolute — if Sentinel is parked on approval for 8 hours, Guardian
+    waits 8 hours.
+
+    Proceeds to diagnosis ONLY when:
+    - Sentinel escalated (explicitly gave up)
+    - Sentinel healthy but probes still fail (fixed wrong thing)
+    - Genesis unreachable (Sentinel is down too)
     """
+    from genesis.guardian.health_signals import HealthSnapshot
+
     current = sm.current_state
 
     if current == GuardianState.HEALTHY:
@@ -427,10 +436,34 @@ async def _handle_awaiting_self_heal(
         ))
         return
 
+    # Re-query Genesis for updated Sentinel state on each tick.
+    # The dialogue endpoint is safe to re-POST: the is_active check
+    # prevents re-dispatching Sentinel when it's already running.
+    first_failure = sm.state.first_failure_at or datetime.now(UTC).isoformat()
+    try:
+        duration = (datetime.now(UTC) - datetime.fromisoformat(first_failure)).total_seconds()
+    except (ValueError, TypeError):
+        duration = 0.0
+
+    request = build_request(
+        snapshot=snapshot if isinstance(snapshot, HealthSnapshot) else HealthSnapshot(),
+        duration_s=duration,
+        guardian_state="awaiting_self_heal",
+    )
+    response = await send_dialogue(config, request)
+
+    if response.acknowledged and response.sentinel_state:
+        sm.update_sentinel_state(response.sentinel_state)
+    elif not response.acknowledged:
+        # Genesis unreachable — Sentinel is down too
+        sm.update_sentinel_state("")
+
     if current == GuardianState.CONFIRMED_DEAD:
-        # ETA expired, Genesis failed to self-heal
+        # State machine already decided to proceed (Sentinel escalated,
+        # healthy-but-failing, or unreachable)
         logger.warning(
-            "Genesis self-heal failed (ETA expired for: %s)",
+            "Sentinel state '%s' — proceeding to diagnosis (was: %s)",
+            sm.state.sentinel_state or "unreachable",
             sm.state.dialogue_action,
         )
         await _proceed_to_diagnosis(
@@ -438,9 +471,10 @@ async def _handle_awaiting_self_heal(
         )
         return
 
-    # Still waiting — ETA not expired yet
+    # Still waiting — Sentinel is active
     logger.info(
-        "Waiting for Genesis self-heal: %s",
+        "Waiting for Sentinel (%s): %s",
+        sm.state.sentinel_state,
         sm.state.dialogue_action,
     )
 

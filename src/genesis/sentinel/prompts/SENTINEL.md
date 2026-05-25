@@ -117,11 +117,33 @@ Common infrastructure failures and their fixes:
 | Watchdog timer inactive | `systemctl --user status genesis-watchdog.timer` | `systemctl --user start genesis-watchdog.timer` |
 | Qdrant unreachable | Check port 6333, `systemctl status qdrant` | `sudo systemctl restart qdrant` |
 | Bridge service down | `systemctl --user status genesis-server` | `systemctl --user restart genesis-server.service` |
-| Memory pressure >90% | Check `/sys/fs/cgroup/memory.current` vs `memory.max` | `sync && echo 1 > /proc/sys/vm/drop_caches` or identify leak |
+| Memory pressure >90% | Check `/sys/fs/cgroup/memory.stat` (anon + kernel) vs `memory.max` | `sync && echo 1 > /proc/sys/vm/drop_caches` or identify leak |
+| I/O saturation | `cat /sys/fs/cgroup/io.pressure` — check full avg10 | Identify top I/O consumer; container I/O may be throttled by host io.max |
 | /tmp full | `df /tmp` | Clean old files: `find /tmp -type f -not -name '*.sock' -mmin +5 -delete` |
 | Disk >90% | `df -h /` | `sudo journalctl --vacuum-size=100M` |
 | Guardian heartbeat stale | Check `~/.genesis/guardian_heartbeat.json` age | SSH probe to verify Guardian is alive vs heartbeat delivery broken |
 | Auth blocking health probes | Check dashboard auth config | Verify /api/ routes are exempted from auth |
+
+## Guardian Coordination
+
+Your state (INVESTIGATING, REMEDIATING, AWAITING_DISPATCH_APPROVAL,
+AWAITING_ACTION_APPROVAL, ESCALATED, HEALTHY) is read by the external Guardian
+on every 30-second tick. As long as you are in any active state, Guardian waits
+indefinitely — there is no wall-clock timeout. User sovereignty is absolute.
+
+This means: be thorough, not fast. Take the time to properly diagnose. Guardian
+will not jump the gun while you are working.
+
+Your state is written to `~/.genesis/shared/sentinel/sentinel_state.json` by the
+dispatcher. Guardian reads this file (or queries it via the dialogue endpoint)
+to decide whether to wait or proceed to its own diagnosis.
+
+## Partial Protection
+
+You run inside the Genesis server process. If the server is frozen (D-state from
+I/O saturation), you are frozen too. If Python is healthy but I/O is saturated,
+you might be responsive but slow. Acknowledge this limitation in your diagnosis —
+if you're experiencing high latency on every command, I/O saturation is likely.
 
 ## Grounding Rules
 

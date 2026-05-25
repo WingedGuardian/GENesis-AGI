@@ -29,11 +29,13 @@ from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
 
-# Pre-flight memory thresholds for CC launch decisions.
-# Hard floor: refuse to launch CC entirely (OOM risk too high).
-# Soft floor: downgrade to sonnet (smaller CC footprint).
-_CC_PREFLIGHT_HARD_FLOOR_GiB = 8.0
-_CC_PREFLIGHT_SOFT_FLOOR_GiB = 14.0
+# Pre-flight memory thresholds.  Guardian must always attempt diagnosis
+# above the hard floor.  The systemd MemoryMax=6G cap on the Guardian
+# service is the real safety boundary — Python-level checks are advisory.
+# Hard floor: refuse only at catastrophic levels (host is almost dead).
+# Warn floor: log warning but proceed (Guardian's job is to diagnose).
+_CC_PREFLIGHT_HARD_FLOOR_GiB = 2.0
+_CC_PREFLIGHT_WARN_GiB = 8.0
 
 
 def _host_mem_available_gib() -> float | None:
@@ -62,6 +64,7 @@ class RecoveryAction(StrEnum):
     """Available recovery actions, in escalation order."""
 
     RESTART_SERVICES = "RESTART_SERVICES"
+    IO_TRIAGE = "IO_TRIAGE"
     RESOURCE_CLEAR = "RESOURCE_CLEAR"
     REVERT_CODE = "REVERT_CODE"
     RESTART_CONTAINER = "RESTART_CONTAINER"
@@ -101,6 +104,7 @@ Known failure mode inventory (from real incidents):
 | killpg(1) | All processes dead simultaneously | Bad PGID in test/code | RESTART_CONTAINER |
 | Systemd user manager death | All user services dead, systemd --user gone | OOM cascading | RESTART_CONTAINER |
 | Page cache I/O storm | D-state processes, high io.pressure | Memory pressure cascade | RESTART_CONTAINER |
+| I/O saturation | io.pressure full avg10 high, system partially responsive | CC sessions saturating I/O bandwidth | IO_TRIAGE (kill top I/O consumer, one per cycle) |
 """
 
 
@@ -236,6 +240,23 @@ Run these via Bash:
 - `incus info {container_name}` — Container status and resource usage
 - `incus restart {container_name}` — Restart the entire container (last resort)
 - `incus snapshot create {container_name} guardian-pre-recovery` — Snapshot BEFORE recovery
+- `cat /sys/fs/cgroup/lxc.payload.{container_name}/io.pressure` — I/O pressure (direct host read, works when incus exec is unresponsive)
+- `cat /sys/fs/cgroup/lxc.payload.{container_name}/cgroup.procs` — All container PIDs (host read)
+
+## IO_TRIAGE Guidance
+
+When I/O pressure is the root cause (`io.pressure full avg10` is high), recommend
+IO_TRIAGE instead of RESTART_CONTAINER. IO_TRIAGE kills the single highest I/O
+consumer (one process per cycle) and reassesses. This is less destructive than a
+full container restart.
+
+**Before recommending IO_TRIAGE**, check the PSI trend:
+- `full avg10 > avg60 > avg300` = accelerating pressure → IO_TRIAGE appropriate
+- `full avg10 < avg60` = pressure dropping → stand down, let it recover naturally
+- Read I/O pressure: `cat /sys/fs/cgroup/lxc.payload.{container_name}/io.pressure`
+  Format: `full avg10=X avg60=X avg300=X total=N` (avg values are percentages)
+
+**Never touch host io.max** — it is a safety boundary to prevent disk corruption.
 
 ## Investigation Protocol
 
@@ -277,7 +298,7 @@ report as a JSON block:
 ```
 
 Field values:
-- `recommended_action`: RESTART_SERVICES | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
+- `recommended_action`: RESTART_SERVICES | IO_TRIAGE | RESOURCE_CLEAR | REVERT_CODE | RESTART_CONTAINER | SNAPSHOT_ROLLBACK | ESCALATE
 - `actions_taken`: what you actually did (investigation steps + recovery actions)
 - `outcome`: "resolved" (you fixed it), "partially_resolved" (improved but not fully), or "escalate" (needs human)
 
@@ -369,32 +390,31 @@ class DiagnosisEngine:
         except Exception as exc:
             logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
-        # Pre-flight: check host memory before launching CC.
-        # CC + its tool subprocesses run on the host unconstrained by any
-        # container cgroup. Launching during memory pressure risks a VM freeze
-        # (incident 2026-05-15: min_free_kbytes too low → kernel death spiral).
+        # Pre-flight: check host memory.  The systemd MemoryMax=6G on the
+        # Guardian service is the real safety boundary — this Python check
+        # is advisory.  Only refuse at catastrophic levels (< 2 GiB means
+        # the host is almost dead, not just Genesis).
         effective_model = self._config.cc.model
         available_gib = _host_mem_available_gib()
         if available_gib is not None:
             if available_gib < _CC_PREFLIGHT_HARD_FLOOR_GiB:
                 logger.error(
-                    "Host memory critically low (%.1f GiB free < %.0f GiB floor) "
-                    "— refusing CC diagnosis to prevent OOM",
+                    "Host memory catastrophically low (%.1f GiB free < %.0f GiB) "
+                    "— refusing CC diagnosis (host is near death, not just Genesis)",
                     available_gib, _CC_PREFLIGHT_HARD_FLOOR_GiB,
                 )
                 raise CCDiagnosisError(
-                    f"Host memory too low for CC diagnosis: "
+                    f"Host memory catastrophically low: "
                     f"{available_gib:.1f} GiB free < "
-                    f"{_CC_PREFLIGHT_HARD_FLOOR_GiB:.0f} GiB minimum"
+                    f"{_CC_PREFLIGHT_HARD_FLOOR_GiB:.0f} GiB — "
+                    f"host VM itself is at risk"
                 )
-            if available_gib < _CC_PREFLIGHT_SOFT_FLOOR_GiB:
+            if available_gib < _CC_PREFLIGHT_WARN_GiB:
                 logger.warning(
                     "Host memory low (%.1f GiB free < %.0f GiB) "
-                    "— downgrading CC model from %s to sonnet",
-                    available_gib, _CC_PREFLIGHT_SOFT_FLOOR_GiB,
-                    self._config.cc.model,
+                    "— proceeding with CC diagnosis (MemoryMax=6G caps usage)",
+                    available_gib, _CC_PREFLIGHT_WARN_GiB,
                 )
-                effective_model = "sonnet"
         else:
             logger.warning("Cannot read /proc/meminfo — skipping memory preflight")
 

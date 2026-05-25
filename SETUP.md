@@ -34,7 +34,7 @@ Genesis needs at least one LLM provider. The cheapest path:
 
 Add keys to `secrets.env`:
 ```
-GEMINI_API_KEY=your-key-here
+GOOGLE_API_KEY=your-key-here
 GROQ_API_KEY=your-key-here
 ```
 

@@ -113,7 +113,8 @@ class SnapshotConfig:
     retention: int = 1
     prefix: str = "guardian-"
     take_pre_recovery: bool = True  # Take snapshot before recovery action
-    max_pool_usage_pct: float = 80.0  # Refuse snapshots if pool above this
+    max_pool_usage_pct: float = 80.0  # Fallback threshold if headroom check unavailable
+    min_headroom_gb: float = 5.0  # Minimum free space floor for headroom check
 
 
 @dataclass
@@ -122,6 +123,7 @@ class RecoveryConfig:
 
     verification_delay_s: int = 30
     max_escalations: int = 3
+    max_io_triage_attempts: int = 5  # Separate budget for IO_TRIAGE (low-risk)
 
 
 @dataclass
