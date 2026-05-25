@@ -29,11 +29,10 @@ from genesis.guardian.config import GuardianConfig
 
 logger = logging.getLogger(__name__)
 
-# Pre-flight memory thresholds for CC launch decisions.
-# Hard floor: refuse to launch CC entirely (OOM risk too high).
-# Soft floor: downgrade to sonnet (smaller CC footprint).
-_CC_PREFLIGHT_HARD_FLOOR_GiB = 8.0
-_CC_PREFLIGHT_SOFT_FLOOR_GiB = 14.0
+# Pre-flight memory warning threshold.  Guardian must always attempt
+# diagnosis — refusing means Genesis stays down with no information.
+# We log a warning when memory is low but never block the attempt.
+_CC_PREFLIGHT_WARN_GiB = 8.0
 
 
 def _host_mem_available_gib() -> float | None:
@@ -369,32 +368,18 @@ class DiagnosisEngine:
         except Exception as exc:
             logger.warning("Disk space preflight failed (non-fatal): %s", exc)
 
-        # Pre-flight: check host memory before launching CC.
-        # CC + its tool subprocesses run on the host unconstrained by any
-        # container cgroup. Launching during memory pressure risks a VM freeze
-        # (incident 2026-05-15: min_free_kbytes too low → kernel death spiral).
+        # Pre-flight: log host memory for observability.
+        # Guardian must always attempt diagnosis — its one job.  A failed
+        # attempt with an error log is more useful than no attempt at all.
         effective_model = self._config.cc.model
         available_gib = _host_mem_available_gib()
         if available_gib is not None:
-            if available_gib < _CC_PREFLIGHT_HARD_FLOOR_GiB:
-                logger.error(
-                    "Host memory critically low (%.1f GiB free < %.0f GiB floor) "
-                    "— refusing CC diagnosis to prevent OOM",
-                    available_gib, _CC_PREFLIGHT_HARD_FLOOR_GiB,
-                )
-                raise CCDiagnosisError(
-                    f"Host memory too low for CC diagnosis: "
-                    f"{available_gib:.1f} GiB free < "
-                    f"{_CC_PREFLIGHT_HARD_FLOOR_GiB:.0f} GiB minimum"
-                )
-            if available_gib < _CC_PREFLIGHT_SOFT_FLOOR_GiB:
+            if available_gib < _CC_PREFLIGHT_WARN_GiB:
                 logger.warning(
                     "Host memory low (%.1f GiB free < %.0f GiB) "
-                    "— downgrading CC model from %s to sonnet",
-                    available_gib, _CC_PREFLIGHT_SOFT_FLOOR_GiB,
-                    self._config.cc.model,
+                    "— proceeding with CC diagnosis anyway",
+                    available_gib, _CC_PREFLIGHT_WARN_GiB,
                 )
-                effective_model = "sonnet"
         else:
             logger.warning("Cannot read /proc/meminfo — skipping memory preflight")
 
