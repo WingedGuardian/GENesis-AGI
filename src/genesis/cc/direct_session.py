@@ -146,30 +146,41 @@ VALID_PROFILES = frozenset(PROFILES.keys())
 # Profile addendum + skill auto-injection
 # ---------------------------------------------------------------------------
 
+_MISSION_INJECTION = (
+    "If it's digital, it's within reach. Adapt and overcome. "
+    "Don't conclude \"impossible\" — conclude \"blocked by X\" and identify what would unblock it."
+)
+
 _PROFILE_ADDENDA: dict[str, str] = {
-    "interact": """
+    "interact": f"""
 
 ## Session Profile: interact
 
 You have: Write, browser MCP tools, memory MCP tools, outreach send.
 You do NOT have: Edit, Bash, NotebookEdit.
 Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+
+{_MISSION_INJECTION}
 """,
-    "research": """
+    "research": f"""
 
 ## Session Profile: research
 
 You have: Write, memory MCP tools, web tools (web_search, web_fetch).
 You do NOT have: Edit, Bash, NotebookEdit, browser tools.
 Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+
+{_MISSION_INJECTION}
 """,
-    "observe": """
+    "observe": f"""
 
 ## Session Profile: observe
 
 You have: memory MCP tools (read-only).
 You do NOT have: Write, Edit, Bash, NotebookEdit, browser tools.
 Your final message IS your deliverable.
+
+{_MISSION_INJECTION}
 """,
 }
 

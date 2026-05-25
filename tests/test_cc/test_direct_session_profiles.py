@@ -224,6 +224,14 @@ def test_addenda_do_not_mention_reference_store_for_persistence():
         )
 
 
+def test_all_addenda_include_mission_injection():
+    """All profiles must include the adapt-and-overcome mission text."""
+    for profile, addendum in _PROFILE_ADDENDA.items():
+        assert "Adapt and overcome" in addendum, (
+            f"{profile} addendum should include mission injection"
+        )
+
+
 # --- Model override for interact profile ---
 
 def _make_runner():

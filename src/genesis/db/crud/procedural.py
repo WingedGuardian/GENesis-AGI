@@ -28,21 +28,24 @@ async def create(
     source: str | None = None,
     promotion_history: str | None = None,
     principle_embedding: bytes | None = None,
+    extraction_context: str | None = None,
+    first_mover: int = 0,
 ) -> str:
     await db.execute(
         """INSERT INTO procedural_memory
            (id, person_id, task_type, principle, steps, tools_used, context_tags,
             speculative, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
-            source, promotion_history, principle_embedding)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            source, promotion_history, principle_embedding,
+            extraction_context, first_mover)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,
          json.dumps(tool_trigger) if tool_trigger else None,
          success_count, confidence, source, promotion_history,
-         principle_embedding),
+         principle_embedding, extraction_context, first_mover),
     )
     await db.commit()
     return id

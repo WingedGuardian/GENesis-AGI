@@ -1126,6 +1126,17 @@ TABLES = {
             error_message     TEXT
         )
     """,
+    "task_type_watermarks": """
+        CREATE TABLE IF NOT EXISTS task_type_watermarks (
+            task_type            TEXT PRIMARY KEY,
+            best_outcome         TEXT NOT NULL,
+            best_outcome_at      TEXT NOT NULL,
+            total_sessions       INTEGER NOT NULL DEFAULT 0,
+            successful_sessions  INTEGER NOT NULL DEFAULT 0,
+            last_session_at      TEXT NOT NULL,
+            updated_at           TEXT NOT NULL
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)

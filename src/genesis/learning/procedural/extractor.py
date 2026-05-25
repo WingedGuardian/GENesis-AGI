@@ -194,6 +194,7 @@ async def extract_procedure(
     outcome: str,
     router: _Router,
     embedding_provider: EmbeddingProvider | None = None,
+    session_tools_count: int = 0,
 ) -> str | None:
     """Extract a procedure from an interaction summary via LLM.
 
@@ -346,6 +347,41 @@ async def extract_procedure(
                 exc_info=True,
             )
 
+    # ── Validation gate ───────────────────────────────────────────────────
+    from genesis.learning.procedural.validation_gate import validate_extraction
+
+    gate_result = await validate_extraction(
+        db,
+        task_type=data["task_type"],
+        principle=data["principle"],
+        steps=data["steps"],
+        tools_used=data["tools_used"],
+        outcome=outcome,
+        summary_text=summary_text,
+        session_tools_count=session_tools_count,
+    )
+
+    if not gate_result.allowed:
+        logger.info(
+            "Validation gate blocked extraction: task_type=%s flags=%s",
+            data["task_type"], gate_result.flags,
+        )
+        # Emit J9 event for monitoring
+        try:
+            from genesis.eval.j9_hooks import emit_gate_decision
+
+            await emit_gate_decision(
+                db,
+                task_type=data["task_type"],
+                outcome=outcome,
+                allowed=False,
+                confidence=0.0,
+                flags=gate_result.flags,
+            )
+        except Exception:
+            pass  # Fire-and-forget
+        return None
+
     try:
         proc_id = await store_procedure(
             db,
@@ -357,11 +393,28 @@ async def extract_procedure(
             tool_trigger=data.get("tool_trigger"),
             activation_tier="L3",
             speculative=1,
-            confidence=0.5,
+            confidence=gate_result.adjusted_confidence,
             source={"type": "auto_extracted", "triage_outcome": outcome},
             principle_embedding=principle_blob,
+            extraction_context=gate_result.extraction_context,
+            first_mover=1 if gate_result.first_mover else 0,
         )
-        logger.info("Extracted procedure %s: %s", proc_id, data["task_type"])
+        logger.info("Extracted procedure %s: %s (conf=%.2f)",
+                    proc_id, data["task_type"], gate_result.adjusted_confidence)
+        # Emit J9 event
+        try:
+            from genesis.eval.j9_hooks import emit_gate_decision
+
+            await emit_gate_decision(
+                db,
+                task_type=data["task_type"],
+                outcome=outcome,
+                allowed=True,
+                confidence=gate_result.adjusted_confidence,
+                flags=gate_result.flags,
+            )
+        except Exception:
+            pass  # Fire-and-forget
         return proc_id
     except Exception:
         logger.error("Procedure extraction: failed to store procedure", exc_info=True)
