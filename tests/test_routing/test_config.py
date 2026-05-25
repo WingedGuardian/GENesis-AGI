@@ -121,10 +121,9 @@ def test_load_full_yaml(monkeypatch):
 
     path = Path(__file__).resolve().parents[2] / "config" / "model_routing.yaml"
     cfg = load_config(path)
-    # lmstudio-30b, github-o3mini, openrouter-deepseek-r1 disabled → 27 enabled providers
-    # (32 total - 4 disabled; added openrouter-deepseek-v4, openrouter-gpt55 for
-    # executor review gates)
-    assert len(cfg.providers) == 28
+    # lmstudio-30b, github-o3mini, openrouter-deepseek-r1, deepseek-chat disabled → 27 enabled
+    # (31 total - 4 disabled; 3 direct anthropic providers removed, 2 openrouter added)
+    assert len(cfg.providers) == 27
     assert "lmstudio-30b" not in cfg.providers
     assert "github-o3mini" not in cfg.providers
     assert "openrouter-deepseek-r1" not in cfg.providers
