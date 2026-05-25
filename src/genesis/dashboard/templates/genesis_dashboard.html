@@ -2933,10 +2933,15 @@
 
         get attentionItems() {
           const items = [];
-          const activeAlerts = (this.errorSummary.active_alerts || []).length;
+          const allAlerts = this.errorSummary.active_alerts || [];
+          const criticalAlerts = allAlerts.filter(a => a.severity === "CRITICAL");
+          const warningAlerts = allAlerts.filter(a => a.severity === "WARNING");
           const activeGroups = (this.errorSummary.groups || []).filter(g => g.still_active).length;
-          if (activeAlerts > 0) {
-            items.push({ level: "critical", title: `${activeAlerts} active alert${activeAlerts === 1 ? "" : "s"}`, detail: "health alerts need operator review", href: "/genesis/errors" });
+          if (criticalAlerts.length > 0) {
+            items.push({ level: "critical", title: `${criticalAlerts.length} critical alert${criticalAlerts.length === 1 ? "" : "s"}`, detail: criticalAlerts.map(a => a.message).slice(0, 3).join("; "), href: "/genesis/errors" });
+          }
+          if (warningAlerts.length > 0) {
+            items.push({ level: "warning", title: `${warningAlerts.length} system warning${warningAlerts.length === 1 ? "" : "s"}`, detail: `${warningAlerts.length} call site${warningAlerts.length === 1 ? "" : "s"} on fallback or degraded`, href: "/genesis/errors" });
           }
           if (activeGroups > 0) {
             items.push({ level: "warning", title: `${activeGroups} active error group${activeGroups === 1 ? "" : "s"}`, detail: "grouped warnings/errors across events, dead letters, or deferred work", href: "/genesis/errors" });
@@ -2947,10 +2952,11 @@
           if ((this.health.queues?.discarded_items?.length || 0) > 0) {
             items.push({ level: "warning", title: `${this.health.queues.discarded_items.length} discarded item${this.health.queues.discarded_items.length === 1 ? "" : "s"}`, detail: "work was dropped and can be reviewed or cleared below", href: "#queue-review", tab: "overview", anchor: "queue-review" });
           }
-          if (this.fallbackCallSiteCount > 0) {
-            const names = this.fallbackCallSites.join(", ");
-            items.push({ level: "warning", title: `${this.fallbackCallSiteCount} call site${this.fallbackCallSiteCount === 1 ? "" : "s"} on fallback`, detail: names, href: "#routing-health", tab: "internals", anchor: "routing-health" });
-          }
+          // Fallback call sites are already captured in the warningAlerts
+          // bucket above (severity=WARNING from health_alerts). The dedicated
+          // card was removed to avoid duplication — "14 warnings" + "14 on
+          // fallback" was confusing. Click the warnings card → /genesis/errors
+          // for details.
           if (this.pendingApprovalCount > 0) {
             items.push({ level: "warning", title: `${this.pendingApprovalCount} pending approval${this.pendingApprovalCount === 1 ? "" : "s"}`, detail: "autonomous CLI fallbacks are waiting for operator action", href: "#chat", tab: "chat", onClick: () => { this.commsTab = 'approvals'; this.fetchApprovals(); } });
           }
