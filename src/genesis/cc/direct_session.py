@@ -245,6 +245,7 @@ class DirectSessionRequest:
     caller_context: str | None = None  # "follow_up:<id>", "schedule:<id>"
     planning_instruction: str | None = None  # opt-in: prepended to prompt
     skills: list[str] | None = None  # explicit skill injection (overrides auto-detect)
+    tool_exceptions: tuple[str, ...] = ()  # tools to UN-block from the profile disallow list
 
     def __post_init__(self) -> None:
         if self.profile not in VALID_PROFILES:
@@ -510,7 +511,14 @@ class DirectSessionRunner:
                 if content:
                     system_prompt += f"\n\n## Skill: {name}\n{content}"
 
-        disallowed = PROFILES.get(request.profile, PROFILES["observe"])
+        disallowed = list(PROFILES.get(request.profile, PROFILES["observe"]))
+
+        # Per-request tool exceptions: remove specific tools from the disallow
+        # list so the session can use them.  Used for scoped jobs that need
+        # narrow file-write or shell access (e.g., models.md weekly synthesis).
+        if request.tool_exceptions:
+            exceptions = set(request.tool_exceptions)
+            disallowed = [t for t in disallowed if t not in exceptions]
 
         # Give background sessions access to Genesis MCP servers (health + memory).
         # Without this, the spawned CC process has no MCP tools (no browser, no
