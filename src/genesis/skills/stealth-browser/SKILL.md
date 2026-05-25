@@ -123,21 +123,39 @@ mousedown/mouseup gap when Camoufox is active. Clicks land within the
 central 60% of elements, not dead center. The Camoufox `humanize=2.5`
 setting provides native Bézier cursor movement at the browser level.
 
-### Turnstile/CAPTCHA Auto-Escalation (active)
+### Turnstile/CAPTCHA Auto-Resolution (active)
 
-After `browser_navigate`, Turnstile is automatically detected. If it
-doesn't auto-resolve in 15 seconds, try the Layer 3 VNC trusted input
-technique (below) before escalating to human. If VNC click also fails,
-a Telegram alert is sent and the system polls for human resolution via
-VNC for up to 5 minutes. No browser restart needed — always headed.
+After `browser_navigate`, Turnstile is automatically detected and
+resolved. The resolution cascade runs without any manual intervention:
+
+1. **Auto-resolve** (15s) — trusted browsers with cf_clearance clear instantly
+2. **Widget click** — finds challenge container via DOM selectors and clicks
+   with Camoufox's native Juggler input. This is the primary solver.
+3. **playwright-captcha** — Shadow DOM traversal fallback
+4. **VNC click** — real X11 input events via vncdotool (last resort)
+
+**You do NOT need to:**
+- Manually find or click Turnstile elements
+- Use VNC/vncdotool yourself
+- Write any challenge-bypass code
+- Escalate to the user
+
+Simply call `browser_navigate(url)` and check the response. If
+`turnstile.status == "resolved"`, the page is ready. If `"blocked"`,
+a Telegram alert was already sent.
 
 ---
 
-## Layer 3: VNC Trusted Input Bridge
+## Layer 3: VNC Trusted Input Bridge (automatic fallback)
 
-When Turnstile or other anti-bot checkboxes won't auto-resolve, use the
-VNC protocol to inject real input events. This bypasses detection of
-synthetic events (XTest, CDP, Playwright mouse).
+VNC click is the LAST fallback in the automated cascade (Phase 2 in
+`_wait_for_turnstile`). You should almost never need to invoke it
+manually — `browser_navigate` handles it automatically after the widget
+click and playwright-captcha both fail.
+
+This section documents the mechanism for debugging only. The VNC
+protocol injects real input events, bypassing detection of synthetic
+events (XTest, CDP, Playwright mouse).
 
 ### Why It Works
 

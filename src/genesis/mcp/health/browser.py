@@ -1150,79 +1150,46 @@ async def _poll_turnstile_token(page, timeout_s: float, interval_s: float) -> bo
     return False
 
 
-async def _click_turnstile_iframe(page) -> bool:
-    """Click the Turnstile checkbox via iframe bounding-box technique.
+async def _click_turnstile_widget(page) -> bool:
+    """Click the Turnstile/managed challenge widget via DOM selectors.
 
-    Primary solver — finds the Cloudflare challenge iframe by URL, gets its
-    bounding box via Playwright's frame API, and clicks at the checkbox
-    position (width/9, height/2).  This is the consensus approach across all
-    Camoufox-compatible Turnstile solvers on GitHub.
+    Primary solver — finds the challenge container on the page and clicks
+    at the checkbox position using page.mouse.click(). Camoufox's Juggler
+    protocol sends clicks through Firefox's native input handlers, which
+    Cloudflare cannot detect as synthetic.
 
-    Camoufox's Juggler protocol sends clicks through Firefox's native input
-    handlers — Cloudflare cannot detect these as synthetic (unlike CDP clicks
-    which expose screenX/screenY discrepancies in cross-origin iframes).
+    Strategy 1: Find the CF iframe element on the parent page and click
+    within its bounding box (works when iframe has a src attribute).
+
+    Strategy 2: Find the inline managed challenge widget via CSS selectors
+    (works for Medium, most CF managed challenges where the widget is
+    rendered directly in the page DOM).
 
     No VNC, no coordinates, no xdotool, no port numbers needed.
     """
     try:
-        # Log frame inventory for debugging
-        frame_urls = [f.url[:80] for f in page.frames]
-        _ts_log.info(
-            "IFRAME SCAN: %d frames: %s", len(page.frames), frame_urls,
+        # Strategy 1: Iframe element on parent page (by src attribute)
+        iframe_el = await page.query_selector(
+            'iframe[src*="challenges.cloudflare.com"]'
         )
-        logger.info(
-            "Turnstile iframe scan: %d frames: %s",
-            len(page.frames), frame_urls,
-        )
-
-        for frame in page.frames:
-            if frame.url.startswith("https://challenges.cloudflare.com"):
-                _ts_log.info("FOUND CF iframe: %s", frame.url[:120])
-                logger.info("Found Cloudflare challenge iframe: %s", frame.url[:120])
-                _ts_log.info("Attempting frame.frame_locator(':root').locator('body').element_handle()")
-                try:
-                    el = await frame.frame_locator(":root").locator("body").element_handle()
-                except Exception as fle:
-                    _ts_log.info("element_handle EXCEPTION: %s: %s", type(fle).__name__, fle)
-                    el = None
-                if el is None:
-                    _ts_log.info("iframe body element_handle=None, trying query_selector")
-                    logger.info("Iframe body element_handle returned None — trying query_selector")
-                    # Try getting bounding box directly from the frame element
-                    iframe_el = await page.query_selector(
-                        'iframe[src*="challenges.cloudflare.com"]'
-                    )
-                    if iframe_el is None:
-                        _ts_log.info("iframe query_selector=None")
-                        logger.info("iframe query_selector also returned None")
-                        continue
-                    box = await iframe_el.bounding_box()
-                    _ts_log.info("iframe element bounding_box=%s", box)
-                else:
-                    box = await el.bounding_box()
-                    _ts_log.info("iframe body bounding_box=%s", box)
-
-                if box is None:
-                    _ts_log.info("bounding_box is None — skipping")
-                    logger.info("Iframe bounding_box returned None")
-                    continue
-
-                # Click at checkbox position: width/9 from left, vertically centered
+        if iframe_el:
+            box = await iframe_el.bounding_box()
+            if box:
                 click_x = box["x"] + box["width"] / 9
                 click_y = box["y"] + box["height"] / 2
                 _ts_log.info(
                     "IFRAME CLICK: (%.1f, %.1f) box=%s", click_x, click_y, box,
                 )
                 logger.info(
-                    "Turnstile iframe click: (%.0f, %.0f) in %dx%d box at (%.0f, %.0f)",
-                    click_x, click_y, box["width"], box["height"], box["x"], box["y"],
+                    "Turnstile iframe click: (%.0f, %.0f) in %dx%d box",
+                    click_x, click_y, box["width"], box["height"],
                 )
                 await asyncio.sleep(random.uniform(0.3, 0.8))
                 await page.mouse.click(click_x, click_y)
                 return True
+            _ts_log.info("iframe element found but bounding_box=None")
 
-        # No iframe found — try managed challenge (no iframe, inline widget)
-        # Try selectors individually to log which matches
+        # Strategy 2: Managed challenge selectors (inline widget)
         _managed_selectors = [
             ".cf-turnstile",
             "#turnstile-wrapper",
@@ -1241,55 +1208,49 @@ async def _click_turnstile_iframe(page) -> bool:
                 break
 
         if not container:
-            _ts_log.info(
-                "NO iframe or managed selector matched (tried %d)",
+            _ts_log.info("No selector matched (tried %d)", len(_managed_selectors))
+            logger.warning(
+                "No Turnstile widget found — tried %d selectors",
                 len(_managed_selectors),
             )
+            return False
 
-        if container:
-            # If we found the hidden input, walk up to its parent container
-            if matched_selector == 'input[name="cf-turnstile-response"]':
-                handle = await container.evaluate_handle(
-                    "el => el.closest('.cf-turnstile') || el.parentElement"
-                )
-                container = handle.as_element()
-                if container is None:
-                    logger.warning("cf-turnstile-response parent is not an element")
-                    container = None  # fall through to "no container" warning
+        # If we found the hidden input, walk up to its parent container
+        if matched_selector == 'input[name="cf-turnstile-response"]':
+            handle = await container.evaluate_handle(
+                "el => el.closest('.cf-turnstile') || el.parentElement"
+            )
+            container = handle.as_element()
+            if container is None:
+                logger.warning("cf-turnstile-response parent is not an element")
+                return False
 
-            if container:
-                box = await container.bounding_box()
-                if box:
-                    # Checkbox is near the left edge of the container
-                    click_x = box["x"] + 20
-                    click_y = box["y"] + box["height"] / 2
-                    _ts_log.info(
-                        "MANAGED CLICK: (%.1f, %.1f) selector=%s box=%s",
-                        click_x, click_y, matched_selector, box,
-                    )
-                    logger.info(
-                        "Managed challenge click: (%.0f, %.0f) in %dx%d box at (%.0f, %.0f)",
-                        click_x, click_y, box["width"], box["height"], box["x"], box["y"],
-                    )
-                    await asyncio.sleep(random.uniform(0.3, 0.8))
-                    await page.mouse.click(click_x, click_y)
-                    return True
-                _ts_log.info(
-                    "MANAGED selector %s: bounding_box=None", matched_selector,
-                )
-                logger.warning(
-                    "Managed selector %s matched but bounding_box was None",
-                    matched_selector,
-                )
+        box = await container.bounding_box()
+        if not box:
+            _ts_log.info("MANAGED selector %s: bounding_box=None", matched_selector)
+            logger.warning(
+                "Managed selector %s matched but bounding_box was None",
+                matched_selector,
+            )
+            return False
 
-        logger.warning(
-            "No Turnstile iframe or container found — tried %d selectors",
-            len(_managed_selectors),
+        # Checkbox is near the left edge of the container
+        click_x = box["x"] + 20
+        click_y = box["y"] + box["height"] / 2
+        _ts_log.info(
+            "MANAGED CLICK: (%.1f, %.1f) selector=%s box=%s",
+            click_x, click_y, matched_selector, box,
         )
-        return False
+        logger.info(
+            "Managed challenge click: (%.0f, %.0f) in %dx%d box at (%.0f, %.0f)",
+            click_x, click_y, box["width"], box["height"], box["x"], box["y"],
+        )
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+        await page.mouse.click(click_x, click_y)
+        return True
     except Exception as e:
-        _ts_log.info("IFRAME CLICK EXCEPTION: %s", e, exc_info=True)
-        logger.warning("Turnstile iframe click failed: %s", e)
+        _ts_log.info("WIDGET CLICK EXCEPTION: %s: %s", type(e).__name__, e)
+        logger.warning("Turnstile widget click failed: %s", e)
         return False
 
 
@@ -1371,7 +1332,7 @@ async def _vnc_click_turnstile(page) -> bool:
             logger.debug("xdotool failed — using (0,0) for window position")
 
         # Get element position from page coordinates (these are NOT spoofed).
-        # Try multiple selectors — same set used in _click_turnstile_iframe().
+        # Try multiple selectors — same set used in _click_turnstile_widget().
         page_coords = await page.evaluate("""() => {
             const iframe = document.querySelector(
                 'iframe[src*="challenges.cloudflare"]'
@@ -1572,25 +1533,25 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
             await asyncio.sleep(random.uniform(1.0, 3.0))
             return {"status": "resolved", "method": "auto"}
 
-        # Phase 1.5: Iframe bounding-box click (primary — no VNC needed)
-        _ts_log.info("PHASE 1.5: iframe bounding-box click")
-        logger.info("Trying iframe bounding-box click")
+        # Phase 1.5: Widget click (primary — no VNC needed)
+        _ts_log.info("PHASE 1.5: widget click")
+        logger.info("Trying Turnstile widget click")
         for click_attempt in range(1, 4):
-            _ts_log.info("Iframe click attempt %d/3", click_attempt)
-            if await _click_turnstile_iframe(page):
+            _ts_log.info("Widget click attempt %d/3", click_attempt)
+            if await _click_turnstile_widget(page):
                 if await _poll_turnstile_token(page, 10, 1.0):
-                    _ts_log.info("RESOLVED: iframe_click (attempt %d)", click_attempt)
-                    logger.info("Challenge resolved via iframe click (attempt %d)", click_attempt)
+                    _ts_log.info("RESOLVED: widget_click (attempt %d)", click_attempt)
+                    logger.info("Challenge resolved via widget click (attempt %d)", click_attempt)
                     return {"status": "resolved", "method": "iframe_click"}
                 if not await _detect_challenge(page):
-                    _ts_log.info("RESOLVED: iframe_click (challenge gone)")
+                    _ts_log.info("RESOLVED: widget_click (challenge gone)")
                     return {"status": "resolved", "method": "iframe_click"}
-                _ts_log.info("Iframe click %d: sent but not resolved", click_attempt)
-                logger.info("Iframe click %d sent but not yet resolved", click_attempt)
+                _ts_log.info("Widget click %d: sent but not resolved", click_attempt)
+                logger.info("Widget click %d sent but not yet resolved", click_attempt)
                 await asyncio.sleep(random.uniform(2, 4))
             else:
-                _ts_log.info("Iframe click: no target found, breaking")
-                break  # No iframe found — skip remaining attempts
+                _ts_log.info("Widget click: no target found, breaking")
+                break  # No widget found — skip remaining attempts
 
         # Phase 1.75: playwright-captcha (Shadow DOM traversal — secondary)
         _ts_log.info("PHASE 1.75: playwright-captcha")
@@ -1686,10 +1647,10 @@ async def _wait_for_turnstile(page, timeout_ms: int = 15000) -> dict | None:
         await _send_turnstile_alert(page.url)
         return {"status": "blocked", "method": "timeout"}
     except Exception as e:
-        _ts_log.info("OUTER EXCEPTION in _wait_for_turnstile: %s: %s", type(e).__name__, e)
-        import traceback
-        _ts_log.info("Traceback: %s", traceback.format_exc())
-        logger.debug("Challenge detection error: %s", e)
+        _ts_log.info(
+            "OUTER EXCEPTION in _wait_for_turnstile: %s: %s", type(e).__name__, e,
+        )
+        logger.warning("Challenge detection error: %s: %s", type(e).__name__, e)
         return None
 
 
