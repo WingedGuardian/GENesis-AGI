@@ -182,8 +182,7 @@ async def _validate_inner(
 def _check_evidence(principle: str, summary_text: str, flags: list[str]) -> float:
     """Check 1: impossibility claims need evidence.
 
-    Returns 0.0 (block) if impossibility without evidence, else 1.0.
-    In v1 this is a penalty (conf=0.1) rather than hard block — see caller.
+    Returns 0.0 if impossibility without evidence (caller blocks), else 1.0.
     """
     has_impossibility = any(p.search(principle) for p in _IMPOSSIBILITY_PATTERNS)
     if not has_impossibility:

@@ -273,13 +273,16 @@ async def test_gate_watermark_ratchets_upward(db):
 
 
 @pytest.mark.asyncio
-async def test_gate_fail_open_on_error(db):
+async def test_gate_fail_open_on_error():
     """Gate returns allowed=True on internal error (fail-open)."""
-    # Close DB to force an error
-    await db.close()
+    import aiosqlite
+
+    # Use a separate connection that we close (won't affect fixture)
+    broken_db = await aiosqlite.connect(":memory:")
+    await broken_db.close()
 
     result = await validate_extraction(
-        db,
+        broken_db,
         task_type="error-task",
         principle="something",
         steps=["step"],
