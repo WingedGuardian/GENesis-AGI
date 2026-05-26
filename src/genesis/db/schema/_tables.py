@@ -753,7 +753,8 @@ TABLES = {
             created_at      TEXT NOT NULL,
             compacted_into  TEXT,                    -- set when folded into compacted summary
             output_hash     TEXT,                    -- SHA-256 of output_text for audit trail
-            output_size     INTEGER                  -- byte count of output_text
+            output_size     INTEGER,                 -- byte count of output_text
+            ego_source      TEXT                     -- 'user_ego_cycle' or 'genesis_ego_cycle'
         )
     """,
     "ego_proposals": """
