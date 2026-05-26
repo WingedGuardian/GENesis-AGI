@@ -377,13 +377,16 @@ class ProposalWorkflow:
         # GROUNDWORK(digest-rate-limit): record delivery timestamp for
         # rate limiting. Written even when gate is disabled so the
         # timestamp is ready when the gate is flipped on.
-        if ego_source:
-            from datetime import UTC, datetime
-            await ego_crud.set_state(
-                self._db,
-                key=f"last_digest_delivery:{ego_source}",
-                value=datetime.now(UTC).isoformat(),
-            )
+        try:
+            if ego_source:
+                from datetime import UTC, datetime
+                await ego_crud.set_state(
+                    self._db,
+                    key=f"last_digest_delivery:{ego_source}",
+                    value=datetime.now(UTC).isoformat(),
+                )
+        except Exception:
+            pass  # Non-critical — don't let timestamp failure block delivery
 
         logger.info(
             "Sent ego digest for batch %s (delivery_id=%s, %d proposals)",

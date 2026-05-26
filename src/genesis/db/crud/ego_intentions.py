@@ -89,22 +89,24 @@ async def increment_cycle_count(
     that source (cross-ego isolation).
     """
     if ego_source:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE ego_intentions SET cycle_count = cycle_count + 1 "
             "WHERE id = ? AND status = 'active' AND ego_source = ?",
             (intention_id, ego_source),
         )
     else:
-        await db.execute(
+        cursor = await db.execute(
             "UPDATE ego_intentions SET cycle_count = cycle_count + 1 "
             "WHERE id = ? AND status = 'active'",
             (intention_id,),
         )
-    cursor = await db.execute(
+    if cursor.rowcount == 0:
+        return 0  # No row matched — wrong source or not active
+    result = await db.execute(
         "SELECT cycle_count FROM ego_intentions WHERE id = ?",
         (intention_id,),
     )
-    row = await cursor.fetchone()
+    row = await result.fetchone()
     return row[0] if row else 0
 
 
