@@ -1451,7 +1451,7 @@ class EgoSession:
             # Log-only for now; tighten to a gate if we see real degradation.
             stored_hash = prop.get("content_hash")
             stored_size = prop.get("content_size")
-            if stored_hash and stored_size:
+            if stored_hash is not None and stored_size is not None:
                 from genesis.ego.integrity import content_hash as _chash
                 from genesis.ego.integrity import content_size as _csize
 

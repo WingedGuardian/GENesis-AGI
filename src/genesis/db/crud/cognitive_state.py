@@ -392,7 +392,10 @@ async def expire_old(db: aiosqlite.Connection) -> int:
     cursor = await db.execute(
         "DELETE FROM cognitive_state WHERE "
         "(expires_at IS NOT NULL AND expires_at < ?) OR "
-        "(expires_at IS NULL AND created_at < ?)",
+        "(expires_at IS NULL AND created_at < ? AND section IN ("
+        "  'active_context', 'pending_actions', 'state_flags',"
+        "  'resilience_degradation'"
+        "))",
         (now, seven_days_ago),
     )
     await db.commit()
