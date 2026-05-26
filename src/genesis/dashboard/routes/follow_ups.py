@@ -31,14 +31,22 @@ async def follow_up_list():
         return jsonify({"follow_ups": [], "counts": {}})
 
     status_filter = request.args.get("status", "").strip() or None
+    source_filter = request.args.get("source", "").strip() or None
     limit = min(request.args.get("limit", 30, type=int), 200)
+
+    # source=user excludes ego-generated follow-ups from the view
+    exclude_source = "ego" if source_filter == "user" else None
 
     try:
         if status_filter:
             items = await follow_ups.get_by_status(rt.db, status_filter)
+            if exclude_source:
+                items = [i for i in items if exclude_source not in i.get("source", "")]
             items = items[:limit]
         else:
-            items = await follow_ups.get_recent(rt.db, limit=limit)
+            items = await follow_ups.get_recent(
+                rt.db, limit=limit, exclude_source=exclude_source,
+            )
 
         counts = await follow_ups.get_summary_counts(rt.db)
     except Exception:

@@ -220,12 +220,28 @@ async def get_recent(
     db: aiosqlite.Connection,
     *,
     limit: int = 20,
+    exclude_source: str | None = None,
 ) -> list[dict]:
-    """Get recent follow-ups for dashboard display."""
-    cursor = await db.execute(
-        "SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT ?",
-        (limit,),
-    )
+    """Get recent follow-ups for dashboard display.
+
+    Parameters
+    ----------
+    exclude_source:
+        If set, exclude rows where ``source LIKE %{exclude_source}%``.
+        Use ``"ego"`` to hide ego-generated follow-ups from the user view.
+    """
+    if exclude_source:
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups "
+            "WHERE source NOT LIKE ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (f"%{exclude_source}%", limit),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
     return [dict(row) for row in await cursor.fetchall()]
 
 
