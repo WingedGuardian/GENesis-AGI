@@ -4148,8 +4148,8 @@
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
                          :title="'Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max'">
                       <div :style="(() => {
-                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 60;
-                        const base = ue?.cadence_minutes || 60;
+                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 90;
+                        const base = ue?.cadence_minutes || 90;
                         const max = ue?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
                         const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
@@ -4175,8 +4175,8 @@
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
                          :title="'Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max'">
                       <div :style="(() => {
-                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 60;
-                        const base = ge?.cadence_minutes || 60;
+                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 90;
+                        const base = ge?.cadence_minutes || 90;
                         const max = ge?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
                         const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
@@ -6643,9 +6643,9 @@
                   <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Base Cadence</div>
                   <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
                           @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cadence_minutes: parseInt($event.target.value)}) })">
-                    <template x-for="c in [30, 60, 120, 240]" :key="c">
+                    <template x-for="c in [30, 60, 90, 120, 180, 240]" :key="c">
                       <option :value="c" x-text="c + 'min'"
-                              :selected="c === ($store.genesisDashboard.egoStatus?.cadence_minutes || 60)"></option>
+                              :selected="c === ($store.genesisDashboard.egoStatus?.cadence_minutes || 90)"></option>
                     </template>
                   </select>
                 </div>
