@@ -948,7 +948,7 @@ class EgoSession:
             invocation = CCInvocation(
                 prompt=prompt,
                 model=CCModel.SONNET,
-                effort=EffortLevel.LOW,
+                effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
             )
