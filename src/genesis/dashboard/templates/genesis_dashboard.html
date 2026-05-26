@@ -4136,8 +4136,7 @@
                 <!-- User Ego (CEO) row -->
                 <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }" style="margin-bottom: 0.4rem;">
                   <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
-                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc; min-width: 2.8rem;">CEO <span style="font-weight: 400; opacity: 0.7;">(User)</span></span>
-                    <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ue?.model || '?'"></span>
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc;">CEO <span style="font-weight: 400; opacity: 0.7;">(User Ego)</span></span>
                     <template x-if="ue?.pending_proposals > 0">
                       <span style="font-size: 0.62rem; background: rgba(192,132,252,0.2); color: #c084fc; padding: 0 0.3rem; border-radius: 3px;"
                             x-text="ue.pending_proposals + ' pending'"></span>
@@ -4163,8 +4162,7 @@
                 <!-- Genesis Ego (COO) row -->
                 <div x-data="{ ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }">
                   <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
-                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa; min-width: 2.8rem;">COO <span style="font-weight: 400; opacity: 0.7;">(Genesis)</span></span>
-                    <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ge?.model || '?'"></span>
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa;">COO <span style="font-weight: 400; opacity: 0.7;">(Genesis Ego)</span></span>
                     <template x-if="ge?.pending_proposals > 0">
                       <span style="font-size: 0.62rem; background: rgba(96,165,250,0.2); color: #60a5fa; padding: 0 0.3rem; border-radius: 3px;"
                             x-text="ge.pending_proposals + ' pending'"></span>
