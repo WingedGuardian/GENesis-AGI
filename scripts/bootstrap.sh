@@ -608,14 +608,8 @@ else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi
 
-# Install tmp watchgod service (OS-level temp protection)
-WATCHGOD_SRC="$GENESIS_ROOT/config/genesis-tmp-watchgod.service"
-if [[ -f "$WATCHGOD_SRC" ]]; then
-    cp "$WATCHGOD_SRC" "$SYSTEMD_USER_DIR/"
-    systemctl --user daemon-reload 2>/dev/null || true
-    systemctl --user enable --now genesis-tmp-watchgod.service 2>/dev/null && \
-        echo "  genesis-tmp-watchgod.service enabled + started" || true
-fi
+# tmp-watchgod and cgroup-setup are now templates in scripts/systemd/
+# and handled by the template loop above — no separate install needed.
 
 # --- VNC stack (collaborative browser mode) ---
 echo "--- Setting up VNC stack ---"

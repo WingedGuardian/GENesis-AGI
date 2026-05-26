@@ -1,0 +1,15 @@
+[Unit]
+Description=Genesis cgroup v2 I/O isolation setup
+# Ordering only — no Requires=. If this oneshot fails, the server
+# still starts (it has its own redundant cgroup init in bootstrap).
+Before=genesis-server.service
+
+[Service]
+Type=oneshot
+ExecStart=__VENV__/bin/python -c "from genesis.runtime.cgroup import CgroupManager; CgroupManager().setup()"
+RemainAfterExit=yes
+Environment=HOME=__HOME__
+WorkingDirectory=__REPO_DIR__
+
+[Install]
+WantedBy=default.target
