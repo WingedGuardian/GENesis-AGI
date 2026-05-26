@@ -168,6 +168,16 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
 vm.vfs_cache_pressure = 50
 IOSYSCTL
+                    # Regenerate OOM sysctl (same formula as install_guardian.sh Step 9)
+                    _HOST_RAM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+                    _MIN_FREE=$(( _HOST_RAM_KB / 100 ))
+                    [ "$_MIN_FREE" -lt 131072 ] && _MIN_FREE=131072
+                    [ "$_MIN_FREE" -gt 1048576 ] && _MIN_FREE=1048576
+                    sudo tee /etc/sysctl.d/99-genesis-oom-tuning.conf > /dev/null 2>&1 << OOMSYSCTL
+vm.min_free_kbytes = $_MIN_FREE
+vm.watermark_scale_factor = 50
+vm.oom_kill_allocating_task = 1
+OOMSYSCTL
                     sudo sysctl --system > /dev/null 2>&1 || true
                 fi
                 # Restart timer so new check.py code takes effect immediately
