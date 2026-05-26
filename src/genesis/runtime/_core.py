@@ -354,6 +354,11 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         self._run_init_step("providers", self._init_providers)
 
+        # Cgroup I/O isolation — must be active before any CC sessions spawn
+        # (awareness loop, surplus scheduler, ego dispatches all use CC).
+        # Graceful degradation: if setup fails, system runs without isolation.
+        self._run_init_step("cgroup_isolation", self._init_cgroup)
+
         await self._run_init_step_async("modules", self._init_modules)
 
         if _full:

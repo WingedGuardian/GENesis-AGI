@@ -39,7 +39,7 @@ _write_status() {
     _safe_reason=$(printf '%s' "$_FAILURE_REASON" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\n/\\n/g')
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason"}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","tier2_status":"${_T2_STATUS:-unknown}"}
 STATUSEOF
 }
 trap '_write_status' EXIT
@@ -305,7 +305,75 @@ else
     log "WARNING: secrets file not found at $SECRETS_FILE"
 fi
 
-# --- Commit and push ---
+# --- Tier 2: Upload large files to NAS (Qdrant, SQL, transcripts) ---
+_NAS_TARGET="${GENESIS_BACKUP_NAS:-}"
+_T2_STATUS="skipped"
+if [ -n "$_NAS_TARGET" ]; then
+    _NAS_USER="${GENESIS_BACKUP_NAS_USER:-}"
+    _NAS_PASS="${GENESIS_BACKUP_NAS_PASS:-}"
+    _NAS_DIR="Genesis/$(hostname)"
+
+    if ! command -v smbclient >/dev/null 2>&1; then
+        log "WARNING: smbclient not installed — Tier 2 backup skipped"
+        _T2_STATUS="no_smbclient"
+    else
+        # Create directory structure on NAS
+        smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
+            -c "mkdir Genesis 2>/dev/null; mkdir ${_NAS_DIR} 2>/dev/null; mkdir ${_NAS_DIR}/qdrant 2>/dev/null; mkdir ${_NAS_DIR}/data 2>/dev/null" \
+            2>/dev/null || true
+
+        _T2_OK=true
+
+        # Upload Qdrant snapshots
+        for f in data/qdrant/*.gpg; do
+            [ -f "$f" ] || continue
+            fname=$(basename "$f")
+            if smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
+                -c "cd ${_NAS_DIR}/qdrant; put $f $fname" 2>/dev/null; then
+                log "  NAS: uploaded $fname"
+            else
+                log "WARNING: NAS upload failed for $fname"
+                _T2_OK=false
+            fi
+        done
+
+        # Upload SQL dump
+        if [ -f data/genesis.sql.gpg ]; then
+            if smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
+                -c "cd ${_NAS_DIR}/data; put data/genesis.sql.gpg genesis.sql.gpg" 2>/dev/null; then
+                log "  NAS: uploaded genesis.sql.gpg"
+            else
+                log "WARNING: NAS upload failed for genesis.sql.gpg"
+                _T2_OK=false
+            fi
+        fi
+
+        if [ "$_T2_OK" = true ]; then
+            _T2_STATUS="ok"
+            log "Tier 2 backup copied to NAS ($_NAS_TARGET)"
+        else
+            _T2_STATUS="partial"
+            log "WARNING: Tier 2 backup partially failed"
+        fi
+    fi
+else
+    log "Tier 2 backup target not configured — large files are local-only"
+    _T2_STATUS="not_configured"
+fi
+
+# --- Ensure .gitignore excludes Tier 2 files ---
+# Tier 1 (git): memory/, config_overrides/, secrets/
+# Tier 2 (NAS): data/, transcripts/
+if ! grep -q '^data/$' .gitignore 2>/dev/null; then
+    cat >> .gitignore << 'GITIGNORE'
+# Tier 2 files — backed up to NAS, not GitHub
+data/
+transcripts/
+GITIGNORE
+    log "Added Tier 2 exclusions to .gitignore"
+fi
+
+# --- Commit and push (Tier 1 only) ---
 log "Committing backup..."
 git add -A
 if git diff --cached --quiet; then

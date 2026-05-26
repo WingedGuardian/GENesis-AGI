@@ -41,6 +41,21 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
         logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
 
 
+def _move_to_background_cgroup(pid: int) -> None:
+    """Move a CC subprocess to the genesis-background cgroup (I/O throttled).
+
+    Best-effort — if cgroup isolation isn't active, this is a no-op.
+    """
+    try:
+        from genesis.runtime._core import GenesisRuntime
+
+        rt = GenesisRuntime.peek()
+        if rt and rt.cgroup_manager and rt.cgroup_manager.available:
+            rt.cgroup_manager.move_to_background(pid)
+    except Exception:
+        pass
+
+
 class CCInvoker:
     """Invokes claude CLI as async subprocess."""
 
@@ -275,6 +290,7 @@ class CCInvoker:
             self._active_proc = proc
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
+            _move_to_background_cgroup(proc.pid)
             if invocation.on_spawn is not None:
                 try:
                     await invocation.on_spawn(proc.pid)
@@ -406,6 +422,7 @@ class CCInvoker:
         self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
         set_oom_score_adj(proc.pid, 500)
+        _move_to_background_cgroup(proc.pid)
         if invocation.on_spawn is not None:
             try:
                 await invocation.on_spawn(proc.pid)

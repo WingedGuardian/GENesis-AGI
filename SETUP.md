@@ -100,6 +100,26 @@ Populates the voice exemplar library with samples of your writing style.
 | `.claude/settings.json` | Hook configuration (portable, tracked in git) |
 | `config/cc-global-settings.yaml` | Recommended Claude Code global settings |
 
+## Backups
+
+Backups run every 6 hours via cron and split into two tiers:
+
+- **Tier 1** (git → GitHub): Memory files, configs, secrets (~1MB). Automatic.
+- **Tier 2** (smbclient → NAS/remote): Qdrant snapshots, SQL dumps (~200MB+). Opt-in.
+
+Tier 2 keeps large binary files off GitHub (which has a 100MB file limit).
+Without Tier 2 configured, large files are local-only and the dashboard shows
+a yellow warning.
+
+To configure Tier 2, add to `secrets.env`:
+```
+GENESIS_BACKUP_NAS="//your-nas-ip/share-name"
+GENESIS_BACKUP_NAS_USER=username
+GENESIS_BACKUP_NAS_PASS=password
+```
+
+Requires `smbclient` (`sudo apt-get install smbclient`).
+
 ## Verify Installation
 
 ```bash
