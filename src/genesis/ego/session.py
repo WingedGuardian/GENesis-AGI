@@ -536,6 +536,7 @@ class EgoSession:
             input_tokens=output.input_tokens,
             output_tokens=output.output_tokens,
             duration_ms=output.duration_ms,
+            ego_source=self._source_tag,
         )
         await self._compaction.store_cycle(cycle)
 
@@ -712,10 +713,10 @@ class EgoSession:
                                 rd.get("id"), exc_info=True,
                             )
 
-            # 10d. Process knowledge notepad updates (user ego only)
-            knowledge_updates = parsed.get("knowledge_updates", [])
-            if knowledge_updates and self._source_tag == "user_ego_cycle":
-                await self._apply_knowledge_updates(knowledge_updates)
+            # 10d. Process deferred intentions (both egos)
+            intentions_data = parsed.get("intentions")
+            if intentions_data and isinstance(intentions_data, dict):
+                await self._process_intentions(intentions_data)
 
             # 11. Compute and store factual focus summary.
             # The ego's authored focus is already logged in ego_cycles
@@ -1296,6 +1297,92 @@ class EgoSession:
                 deduped,
             )
 
+    # -- Deferred intentions ------------------------------------------------
+
+    async def _process_intentions(
+        self,
+        intentions_data: dict,
+    ) -> None:
+        """Process the ego's intentions output: review existing + create new.
+
+        Actions in review: keep (increment cycle_count), fire (mark fired),
+        withdraw (mark withdrawn), renew (reset cycle_count).
+        """
+        from genesis.db.crud import ego_intentions
+
+        # 1. Review existing intentions
+        reviews = intentions_data.get("review", [])
+        if isinstance(reviews, list):
+            for entry in reviews:
+                if not isinstance(entry, dict):
+                    continue
+                iid = entry.get("id")
+                action = entry.get("action")
+                if not iid or action not in ("keep", "fire", "withdraw", "renew"):
+                    continue
+
+                if action == "keep":
+                    new_count = await ego_intentions.increment_cycle_count(
+                        self._db, iid,
+                    )
+                    logger.debug("Intention %s kept (cycle %d)", iid, new_count)
+                elif action == "fire":
+                    ok = await ego_intentions.fire(self._db, iid)
+                    if ok:
+                        logger.info("Intention %s fired", iid)
+                    else:
+                        logger.warning("Intention %s fire failed (not active?)", iid)
+                elif action == "withdraw":
+                    ok = await ego_intentions.withdraw(self._db, iid)
+                    if ok:
+                        logger.info("Intention %s withdrawn", iid)
+                elif action == "renew":
+                    ok = await ego_intentions.renew(self._db, iid)
+                    if ok:
+                        logger.info("Intention %s renewed (counter reset)", iid)
+
+        # 2. Auto-expire overdue intentions
+        expired = await ego_intentions.expire_overdue(
+            self._db, self._source_tag,
+        )
+        if expired:
+            logger.info(
+                "Auto-expired %d intention(s) for %s",
+                expired, self._source_tag,
+            )
+
+        # 3. Create new intentions
+        new_intentions = intentions_data.get("new", [])
+        if isinstance(new_intentions, list):
+            for item in new_intentions:
+                if not isinstance(item, dict):
+                    continue
+                content = (item.get("content") or "").strip()[:500]
+                trigger = (item.get("trigger_condition") or "").strip()[:500]
+                if not content or not trigger:
+                    logger.warning("Skipping intention with empty content/trigger")
+                    continue
+
+                max_cycles = min(int(item.get("max_cycles", 20)), 50)
+                priority = item.get("priority", "normal")
+                if priority not in ("low", "normal", "high"):
+                    priority = "normal"
+
+                iid = await ego_intentions.create(
+                    self._db,
+                    content=content,
+                    trigger_condition=trigger,
+                    ego_source=self._source_tag,
+                    reasoning=str(item.get("reasoning", ""))[:500],
+                    priority=priority,
+                    max_cycles=max_cycles,
+                )
+                if iid:
+                    logger.info("Created intention %s for %s", iid, self._source_tag)
+                # None return means cap reached — already logged by CRUD
+
+        await self._db.commit()
+
     # -- Knowledge notepad --------------------------------------------------
 
     _NOTEPAD_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_NOTEPAD.md"
@@ -1792,20 +1879,43 @@ def _validate_output(data: dict) -> dict | None:
         except (ValueError, TypeError):
             p["confidence"] = 0.0
 
-    # Sanitize knowledge_updates — filter malformed entries.
+    # Sanitize knowledge_updates — legacy field, log if ego still outputs it.
     if "knowledge_updates" in data:
         raw = data["knowledge_updates"]
-        if not isinstance(raw, list):
-            data["knowledge_updates"] = []
+        if isinstance(raw, list) and raw:
+            logger.info(
+                "Ego output contains %d knowledge_updates (notepad removed, ignored)",
+                len(raw),
+            )
+        del data["knowledge_updates"]
+
+    # Sanitize intentions — validate structure.
+    if "intentions" in data:
+        raw = data["intentions"]
+        if not isinstance(raw, dict):
+            data["intentions"] = {"review": [], "new": []}
         else:
-            data["knowledge_updates"] = [
-                u
-                for u in raw
-                if isinstance(u, dict)
-                and isinstance(u.get("section"), str)
-                and u.get("action") in _VALID_NOTEPAD_ACTIONS
-                and isinstance(u.get("content"), str)
+            # Sanitize review entries
+            review = raw.get("review", [])
+            if not isinstance(review, list):
+                review = []
+            raw["review"] = [
+                r for r in review
+                if isinstance(r, dict)
+                and isinstance(r.get("id"), str)
+                and r.get("action") in ("keep", "fire", "withdraw", "renew")
             ]
+            # Sanitize new entries
+            new = raw.get("new", [])
+            if not isinstance(new, list):
+                new = []
+            raw["new"] = [
+                n for n in new
+                if isinstance(n, dict)
+                and isinstance(n.get("content"), str)
+                and isinstance(n.get("trigger_condition"), str)
+            ]
+            data["intentions"] = raw
 
     # Sanitize resolved_directives — filter malformed entries.
     if "resolved_directives" in data:

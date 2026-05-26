@@ -340,3 +340,92 @@ class TestContextInjection:
         )
         text = await build_intentions_section(db, "genesis_ego_cycle")
         assert "No active intentions" in text
+
+
+# ---------------------------------------------------------------------------
+# Validation tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateOutput:
+    def test_sanitizes_intentions(self):
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "intentions": {
+                "review": [
+                    {"id": "abc", "action": "keep"},  # valid
+                    {"id": "def", "action": "invalid"},  # invalid action
+                    {"action": "fire"},  # missing id
+                    "not a dict",  # not a dict
+                ],
+                "new": [
+                    {"content": "X", "trigger_condition": "Y"},  # valid
+                    {"content": "Z"},  # missing trigger_condition
+                    "not a dict",
+                ],
+            },
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert len(result["intentions"]["review"]) == 1
+        assert result["intentions"]["review"][0]["id"] == "abc"
+        assert len(result["intentions"]["new"]) == 1
+
+    def test_non_dict_intentions_normalized(self):
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "intentions": "not a dict",
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert result["intentions"] == {"review": [], "new": []}
+
+    def test_no_intentions_is_fine(self):
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert "intentions" not in result
+
+    def test_legacy_knowledge_updates_removed(self):
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "knowledge_updates": [
+                {"section": "Open Questions", "action": "add", "content": "test"},
+            ],
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert "knowledge_updates" not in result
+
+    def test_renew_action_accepted(self):
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "test",
+            "follow_ups": [],
+            "intentions": {
+                "review": [{"id": "abc", "action": "renew"}],
+                "new": [],
+            },
+        }
+        result = _validate_output(data)
+        assert len(result["intentions"]["review"]) == 1
