@@ -148,6 +148,28 @@ class CgroupManager:
             logger.warning("cgroup: scope path %s doesn't exist", self._scope)
             return False
 
+        # Check if already set up (idempotent — survives server restart
+        # when the boot unit or a prior server run already configured cgroups)
+        critical = self._scope / "genesis-critical"
+        background = self._scope / "genesis-background"
+        if critical.is_dir() and background.is_dir():
+            try:
+                child_ctrl = (critical / "cgroup.controllers").read_text()
+                if "io" in child_ctrl:
+                    self._critical = critical
+                    self._background = background
+                    self._init = self._scope / "genesis-init"
+                    # Move server PID to critical if not already there
+                    server_pid = str(os.getpid())
+                    _sudo_write(critical / "cgroup.procs", server_pid + "\n")
+                    self._ready = True
+                    logger.info(
+                        "cgroup: I/O isolation already active — reusing existing subtrees",
+                    )
+                    return True
+            except OSError:
+                pass  # Fall through to fresh setup
+
         # Check if io controller is available
         try:
             controllers = (self._scope / "cgroup.controllers").read_text()
