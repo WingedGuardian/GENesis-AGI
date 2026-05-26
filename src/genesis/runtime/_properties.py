@@ -89,6 +89,11 @@ class _RuntimeProperties:
         return self._session_manager
 
     @property
+    def cgroup_manager(self) -> object | None:
+        """CgroupManager instance or None if not initialized."""
+        return getattr(self, "_cgroup_manager", None)
+
+    @property
     def checkpoint_manager(self) -> CheckpointManager | None:
         return self._checkpoint_manager
 

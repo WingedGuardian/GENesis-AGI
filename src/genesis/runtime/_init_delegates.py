@@ -72,6 +72,17 @@ class _InitDelegatesMixin:
     def _init_providers(self) -> None:
         providers.init(self)
 
+    def _init_cgroup(self) -> None:
+        from genesis.runtime.cgroup import CgroupManager
+
+        self._cgroup_manager = CgroupManager()
+        if self._cgroup_manager.setup():
+            logger.info("Cgroup I/O isolation active")
+        else:
+            logger.warning(
+                "Cgroup setup unavailable — running without I/O isolation",
+            )
+
     async def _init_modules(self) -> None:
         await modules.init(self)
 
