@@ -63,6 +63,40 @@ async def load_persisted_job_health(rt: GenesisRuntime) -> None:
         logger.error("Failed to load persisted job health", exc_info=True)
 
 
+def clear_stale_job_failures(rt: GenesisRuntime) -> int:
+    """Reset consecutive_failures for jobs that last failed before this startup.
+
+    After a code fix + deploy, pre-restart failures are stale — the code
+    that caused them no longer exists.  Resetting gives the job a clean
+    slate to prove itself on the new code.
+
+    Returns count of jobs cleared.
+    """
+    if not rt._job_health:
+        return 0
+
+    now_iso = datetime.now(UTC).isoformat()
+    cleared = 0
+
+    for job_name, entry in rt._job_health.items():
+        if entry.get("consecutive_failures", 0) == 0:
+            continue
+        last_failure = entry.get("last_failure")
+        if not last_failure:
+            continue
+        logger.info(
+            "Cleared stale failures for job %s (last_failure=%s, was=%d)",
+            job_name, last_failure, entry["consecutive_failures"],
+        )
+        entry["consecutive_failures"] = 0
+        entry.pop("last_failure", None)
+        entry.pop("last_error", None)
+        persist_job_health(rt, job_name, entry, now_iso)
+        cleared += 1
+
+    return cleared
+
+
 def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str) -> None:
     """Schedule a background write of the current job_health entry to the DB.
 

@@ -87,6 +87,7 @@ async def test_light_context_includes_user_and_cognitive_state(db, identity_dir)
         db, id="cs-1", content="Working on Phase 4.",
         section="active_context", generated_by="glm5",
         created_at="2026-03-05T10:00:00+00:00",
+        expires_at="2099-01-01T00:00:00+00:00",
     )
 
     loader = IdentityLoader(identity_dir)

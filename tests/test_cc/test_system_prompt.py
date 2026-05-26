@@ -54,6 +54,7 @@ async def test_assemble_includes_cognitive_state(assembler, db):
         content="Working on vehicle registration.",
         generated_by="test",
         created_at="2026-03-08T12:00:00",
+        expires_at="2099-01-01T00:00:00+00:00",
     )
     result = await assembler.assemble(db=db)
     assert "Working on vehicle registration." in result

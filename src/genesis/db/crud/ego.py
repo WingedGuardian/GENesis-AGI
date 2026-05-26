@@ -296,6 +296,7 @@ async def create_proposal(
     ego_source: str | None = None,
     goal_id: str | None = None,
     content_hash: str | None = None,
+    content_size: int | None = None,
     original_content: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
@@ -307,8 +308,8 @@ async def create_proposal(
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
-            ego_source, goal_id, content_hash, original_content)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ego_source, goal_id, content_hash, content_size, original_content)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             action_type,
@@ -332,6 +333,7 @@ async def create_proposal(
             ego_source,
             goal_id,
             content_hash,
+            content_size,
             original_content,
         ),
     )

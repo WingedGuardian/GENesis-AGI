@@ -71,12 +71,12 @@ async def test_render_active_tier_shows_only_flags_and_patches(db, tmp_path):
     await cognitive_state.create(
         db, id="cs-1", content="Big stale narrative about old bugs.",
         section="active_context", generated_by="deep_reflection",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     await cognitive_state.create(
         db, id="cs-2", content="Do X, Y, Z.",
         section="pending_actions", generated_by="deep_reflection",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     patches_file = tmp_path / "session_patches.json"
     patches_file.write_text(json.dumps([
@@ -99,12 +99,12 @@ async def test_render_returning_tier_skips_active_context(db, tmp_path):
     await cognitive_state.create(
         db, id="cs-1", content="Big stale narrative.",
         section="active_context", generated_by="deep_reflection",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     await cognitive_state.create(
         db, id="cs-2", content="Do X, Y, Z.",
         section="pending_actions", generated_by="deep_reflection",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     patches_file = tmp_path / "session_patches.json"
     patches_file.write_text(json.dumps([
@@ -127,7 +127,7 @@ async def test_render_away_tier_shows_everything(db, tmp_path):
     await cognitive_state.create(
         db, id="cs-1", content="Full catch-up narrative.",
         section="active_context", generated_by="deep_reflection",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     patches_file = tmp_path / "session_patches.json"
     patches_file.write_text(json.dumps([
@@ -149,7 +149,7 @@ async def test_render_default_tier_is_away(db):
     await cognitive_state.create(
         db, id="cs-1", content="Full narrative.",
         section="active_context", generated_by="test",
-        created_at="2026-03-25T10:00:00+00:00",
+        created_at="2026-03-25T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     rendered = await cognitive_state.render(db)
     assert "Full narrative" in rendered
@@ -163,7 +163,7 @@ async def test_render_active_tier_shows_fresh_narrative(db, tmp_path):
     await cognitive_state.create(
         db, id="cs-1", content="Fresh narrative from mid-day reflection.",
         section="active_context", generated_by="deep_reflection",
-        created_at="2026-03-26T08:00:00+00:00",
+        created_at="2026-03-26T08:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     patches_file = tmp_path / "session_patches.json"
     patches_file.write_text(json.dumps([
@@ -187,7 +187,7 @@ async def test_create_and_get(db):
     row_id = await cognitive_state.create(
         db, id="cs-1", content="User is working on Genesis Phase 4.",
         section="active_context", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     assert row_id == "cs-1"
     row = await cognitive_state.get_by_id(db, "cs-1")
@@ -202,12 +202,12 @@ async def test_get_by_section(db):
     await cognitive_state.create(
         db, id="cs-1", content="Active context here.",
         section="active_context", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     await cognitive_state.create(
         db, id="cs-2", content="Pending actions here.",
         section="pending_actions", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     rows = await cognitive_state.get_by_section(db, "active_context")
     assert len(rows) == 1
@@ -225,7 +225,7 @@ async def test_get_current_returns_latest(db):
     await cognitive_state.create(
         db, id="cs-new", content="New context.",
         section="active_context", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     row = await cognitive_state.get_current(db, "active_context")
     assert row is not None
@@ -239,19 +239,19 @@ async def test_render_includes_stored_sections_and_focus(db):
     await cognitive_state.create(
         db, id="cs-1", content="Working on Phase 4.",
         section="active_context", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     await cognitive_state.create(
         db, id="cs-2", content="Draft user.md after Phase 4.",
         section="pending_actions", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     # Focus directive stored in state_flags section
     await cognitive_state.create(
         db, id="cs-3",
         content="## Deep Reflection Focus Directive\nFix memory retrieval.",
         section="state_flags", generated_by="deep_reflection",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     rendered = await cognitive_state.render(db)
     assert "Working on Phase 4." in rendered
@@ -273,7 +273,7 @@ async def test_delete(db):
     await cognitive_state.create(
         db, id="cs-1", content="temp",
         section="active_context", generated_by="glm5",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     deleted = await cognitive_state.delete(db, "cs-1")
     assert deleted is True
@@ -291,7 +291,7 @@ async def test_replace_section(db):
     await cognitive_state.replace_section(
         db, section="active_context", id="cs-new",
         content="Replaced.", generated_by="claude-sonnet",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     rows = await cognitive_state.get_by_section(db, "active_context")
     assert len(rows) == 1
@@ -311,7 +311,7 @@ async def test_compute_flags_memory_retrieval_failure(db):
         await observations.create(
             db, id=f"obs-{i}", source="test", type="test",
             content=f"Test observation {i}", priority="medium",
-            created_at="2026-03-05T10:00:00+00:00",
+            created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
         )
 
     flags = await cognitive_state.compute_state_flags(db)
@@ -326,7 +326,7 @@ async def test_compute_flags_memory_retrieval_ok(db):
     await observations.create(
         db, id="obs-1", source="test", type="test",
         content="Test observation", priority="medium",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     # Simulate retrieval
     await observations.increment_retrieved(db, "obs-1")
@@ -399,14 +399,14 @@ async def test_render_includes_computed_flags(db):
     await cognitive_state.create(
         db, id="cs-1", content="Active context.",
         section="active_context", generated_by="test",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
     # Create observations that will trigger the retrieval flag
     for i in range(3):
         await observations.create(
             db, id=f"obs-{i}", source="test", type="test",
             content=f"Obs {i}", priority="medium",
-            created_at="2026-03-05T10:00:00+00:00",
+            created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
         )
 
     rendered = await cognitive_state.render(db)
@@ -422,7 +422,7 @@ async def test_render_auto_clears_resolved_flags(db):
     await observations.create(
         db, id="obs-1", source="test", type="test",
         content="Test", priority="medium",
-        created_at="2026-03-05T10:00:00+00:00",
+        created_at="2026-03-05T10:00:00+00:00", expires_at="2099-01-01T00:00:00+00:00",
     )
 
     # Before retrieval — flag present

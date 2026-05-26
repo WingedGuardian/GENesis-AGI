@@ -427,6 +427,25 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         await self._load_persisted_job_health()
 
+        # Clear stale failure counts from pre-restart failures so the
+        # dashboard starts clean after a code fix + deploy.
+        from genesis.runtime._job_health import clear_stale_job_failures
+
+        cleared = clear_stale_job_failures(self)
+        if cleared:
+            logger.info("Cleared stale failures from %d jobs on startup", cleared)
+
+        # Expire stale cognitive state entries (TTL-based + legacy NULL cleanup)
+        if self._db is not None:
+            try:
+                from genesis.db.crud import cognitive_state
+
+                expired = await cognitive_state.expire_old(self._db)
+                if expired:
+                    logger.info("Expired %d stale cognitive state entries", expired)
+            except Exception:
+                logger.warning("Failed to expire cognitive state entries", exc_info=True)
+
         self._wire_job_retry_registry()
 
         critical_ok = all(
