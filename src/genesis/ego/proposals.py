@@ -266,6 +266,9 @@ class ProposalWorkflow:
 
     # -- Delivery ----------------------------------------------------------
 
+    # Minimum hours between digest deliveries per ego source.
+    _DIGEST_RATE_LIMIT_HOURS = 6
+
     async def send_digest(
         self,
         batch_id: str,
@@ -275,6 +278,9 @@ class ProposalWorkflow:
     ) -> str | None:
         """Send the batch digest to Telegram. Returns delivery_id or None.
 
+        Rate-limited: at most one delivery per ego source every 6 hours.
+        Proposals are still stored; only Telegram delivery is gated.
+
         TODO(batch-4): Register ReplyWaiter BEFORE sending to close the
         race window where a fast reply arrives before wait_for_reply is
         called.  Currently the window is milliseconds (negligible for a
@@ -283,6 +289,31 @@ class ProposalWorkflow:
         if self._topic_manager is None:
             logger.warning("No topic_manager — cannot send ego digest")
             return None
+
+        # Rate limit: check last delivery timestamp for this ego source
+        try:
+            from datetime import UTC, datetime, timedelta
+
+            from genesis.db.crud import ego as _ego_crud
+
+            rate_key = f"last_digest_delivery:{ego_source or 'default'}"
+            last_ts = await _ego_crud.get_state(self._db, rate_key)
+            if last_ts:
+                last_dt = datetime.fromisoformat(last_ts)
+                cutoff = datetime.now(UTC) - timedelta(
+                    hours=self._DIGEST_RATE_LIMIT_HOURS,
+                )
+                if last_dt > cutoff:
+                    logger.info(
+                        "Digest rate-limited for %s — last delivery %s, "
+                        "minimum interval %dh. Proposals stored, not sent.",
+                        ego_source,
+                        last_ts[:19],
+                        self._DIGEST_RATE_LIMIT_HOURS,
+                    )
+                    return None
+        except Exception:
+            pass  # Fail open — send if rate check errors
 
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         if not proposals:
@@ -340,6 +371,19 @@ class ProposalWorkflow:
             key=f"batch_delivery:{batch_id}",
             value=delivery_id,
         )
+
+        # Record delivery timestamp for rate limiting
+        try:
+            from datetime import UTC, datetime
+
+            rate_key = f"last_digest_delivery:{ego_source or 'default'}"
+            await ego_crud.set_state(
+                self._db,
+                key=rate_key,
+                value=datetime.now(UTC).isoformat(),
+            )
+        except Exception:
+            pass  # Non-critical
 
         logger.info(
             "Sent ego digest for batch %s (delivery_id=%s, %d proposals)",

@@ -518,14 +518,10 @@ class EgoSession:
         # 6. Parse output
         parsed = self._parse_output(output.text)
 
-        # 6b. If focus was sanitized, try previous legitimate focus as fallback
-        if parsed and parsed.get("_focus_violation"):
-            prev = await ego_crud.get_state(
-                self._db,
-                self._focus_summary_key,
-            )
-            if prev and not _BEHAVIORAL_FOCUS_RE.search(prev):
-                parsed["focus_summary"] = prev
+        # 6b. (Removed) Focus sanitization no longer needed — focus_summary
+        # is system-computed from DB state, not ego-authored. The ego's
+        # output focus is logged in ego_cycles for audit but not persisted
+        # to ego_state. See computed_focus.py.
 
         # 7. Store cycle (realist cost added below after _filter_proposals)
         self._last_realist_cost_usd = 0.0
@@ -570,6 +566,8 @@ class EgoSession:
         # 9. Process proposals
         if parsed:
             proposals = parsed.get("proposals", [])
+            # communication_decision is intentionally per-cycle and NOT
+            # persisted to ego_state. It controls THIS cycle's delivery only.
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
                 # Realist gate — LLM evaluates proposals against history
@@ -582,6 +580,12 @@ class EgoSession:
                         self._last_realist_cost_usd,
                         cycle.cost_usd,
                     )
+                # Domain enforcement: Genesis ego can only propose on
+                # infrastructure/operations. User-domain proposals
+                # (content, career, etc.) are rejected and auto-escalated.
+                if proposals and self._source_tag == "genesis_ego_cycle":
+                    proposals = self._enforce_domain_boundary(proposals)
+
                 if proposals:
                     await self._process_proposals(
                         proposals,
@@ -713,41 +717,25 @@ class EgoSession:
             if knowledge_updates and self._source_tag == "user_ego_cycle":
                 await self._apply_knowledge_updates(knowledge_updates)
 
-            # 11. Store focus summary for reflection injection
-            if focus:
+            # 11. Compute and store factual focus summary.
+            # The ego's authored focus is already logged in ego_cycles
+            # (step 7 above). We compute a DB-derived factual summary
+            # to prevent self-reinforcing behavioral loops.
+            try:
+                from genesis.ego.computed_focus import compute_focus_summary
+
+                computed = await compute_focus_summary(
+                    self._db, self._focus_summary_key,
+                )
                 await ego_crud.set_state(
                     self._db,
                     key=self._focus_summary_key,
-                    value=focus,
+                    value=computed,
                 )
-
-            # 11b. Record violation if focus was behavioral self-assignment
-            if parsed.get("_focus_violation"):
-                import uuid
-
-                from genesis.db.crud import observations as obs_crud
-
-                try:
-                    await obs_crud.create(
-                        self._db,
-                        id=str(uuid.uuid4()),
-                        source="ego_session",
-                        type="ego_focus_violation",
-                        content=(
-                            f"Ego attempted behavioral self-assignment in "
-                            f"focus_summary. Original: "
-                            f"{parsed.get('_original_focus', 'unknown')[:200]}. "
-                            f"Sanitized to: {focus}"
-                        ),
-                        priority="medium",
-                        created_at=datetime.now(UTC).isoformat(),
-                        category="system_health",
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to record focus violation observation",
-                        exc_info=True,
-                    )
+            except Exception:
+                logger.warning(
+                    "Failed to compute focus summary", exc_info=True,
+                )
 
             # 12. Process escalations (Genesis ego → observations for user ego)
             escalations = parsed.get("escalations", [])
@@ -948,7 +936,7 @@ class EgoSession:
             invocation = CCInvocation(
                 prompt=prompt,
                 model=CCModel.SONNET,
-                effort=EffortLevel.LOW,
+                effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
             )
@@ -997,6 +985,37 @@ class EgoSession:
         except Exception:
             logger.warning("Realist filter failed, passing through", exc_info=True)
             return proposals
+
+    # Genesis ego allowed action categories (infrastructure/operations only)
+    _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
+        "system_health", "infrastructure", "performance",
+        "maintenance", "security",
+    })
+
+    def _enforce_domain_boundary(
+        self,
+        proposals: list[dict],
+    ) -> list[dict]:
+        """Filter out-of-domain proposals from the Genesis ego.
+
+        The Genesis ego (COO) may only propose on infrastructure and
+        operations. User-domain proposals (content, career, communication)
+        are logged as domain violations and dropped. The ego's prompt
+        already states this boundary; this is the architectural backstop.
+        """
+        allowed = []
+        for p in proposals:
+            category = p.get("action_category", "")
+            if category in self._GENESIS_EGO_ALLOWED_CATEGORIES:
+                allowed.append(p)
+            else:
+                logger.warning(
+                    "Genesis ego domain violation: proposal with "
+                    "action_category=%r dropped (content: %s)",
+                    category,
+                    p.get("content", "")[:80],
+                )
+        return allowed
 
     async def _process_proposals(
         self,
@@ -1198,11 +1217,32 @@ class EgoSession:
         Only the Genesis ego produces escalations. Each escalation becomes
         an observation with type='escalation_to_user_ego' so the user ego
         context builder can query and display them.
+
+        Deduplication: before creating a new escalation, check if an
+        unresolved one with similar content exists in the last 24 hours.
+        This prevents the Genesis ego from re-escalating the same issue
+        every cycle (e.g., 3 "backup failing" escalations in 30 minutes).
         """
         import uuid
 
         from genesis.db.crud import observations as obs_crud
 
+        # Fetch recent unresolved escalations for dedup (24h window)
+        try:
+            cursor = await self._db.execute(
+                "SELECT content FROM observations "
+                "WHERE type = 'escalation_to_user_ego' "
+                "AND resolved_at IS NULL "
+                "AND created_at > datetime('now', '-24 hours')"
+            )
+            recent_contents = [
+                row[0].lower()[:100] for row in await cursor.fetchall()
+            ]
+        except Exception:
+            recent_contents = []  # Fail open — allow all escalations
+
+        created = 0
+        deduped = 0
         for esc in escalations:
             if not isinstance(esc, dict):
                 continue
@@ -1214,17 +1254,32 @@ class EgoSession:
             if suggested:
                 content_parts.append(f"Suggested: {suggested}")
 
+            full_content = "\n".join(content_parts)
+
+            # Dedup: check if the first 100 chars (lowered) of the main
+            # content match any recent unresolved escalation.
+            main_content_prefix = esc.get("content", "").lower()[:100]
+            if any(
+                main_content_prefix and existing.startswith(main_content_prefix[:50])
+                for existing in recent_contents
+            ):
+                deduped += 1
+                continue
+
             try:
                 await obs_crud.create(
                     self._db,
                     id=str(uuid.uuid4()),
                     source="genesis_ego",
                     type="escalation_to_user_ego",
-                    content="\n".join(content_parts),
+                    content=full_content,
                     priority="high",
                     created_at=datetime.now(UTC).isoformat(),
                     category="escalation",
                 )
+                # Add to recent for intra-batch dedup
+                recent_contents.append(main_content_prefix)
+                created += 1
             except Exception:
                 logger.error(
                     "Failed to write escalation from cycle %s",
@@ -1234,9 +1289,11 @@ class EgoSession:
 
         if escalations:
             logger.info(
-                "Genesis ego cycle %s produced %d escalation(s)",
+                "Genesis ego cycle %s: %d escalation(s) — %d created, %d deduped",
                 cycle_id,
                 len(escalations),
+                created,
+                deduped,
             )
 
     # -- Knowledge notepad --------------------------------------------------
@@ -1677,76 +1734,12 @@ _VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 # focus_summary must describe a TOPIC the ego is thinking about, never a
 # BEHAVIORAL state.  This is a broad structural safety net — it catches
 # any focus starting with a self-referential behavioral verb (holding,
-# waiting, stepping, etc.) regardless of what follows.  The primary fix
-# is removing the signals that trigger self-suppression (user activity
-# metrics, proposal engagement data, communication_decision lever).
-# This regex is the last line of defense.
+# Focus sanitization removed — focus_summary is now system-computed
+# from DB state (computed_focus.py), not ego-authored. The ego cannot
+# encode behavioral states into focus because it doesn't write it.
 #
-# Keep in sync with essential_knowledge._BEHAVIORAL_FOCUS_RE.
-_BEHAVIORAL_FOCUS_RE = re.compile(
-    r"(?i)"
-    # Any focus starting with a self-referential behavioral verb.
-    # These describe what the ego IS DOING, not a topic.
-    r"(?:^(?:holding|waiting|stepping|standing|lying|staying|backing|"
-    r"keeping|pausing|going|hibernating|letting|until|not)\s"
-    # Explicit non-action / dormancy phrasing
-    r"|^observing\s+(?:only|quietly)"
-    r"|^passive\s+(?:mode|watch)"
-    r"|^minimal\s+(?:engagement|activity)"
-    r"|^reduced\s+(?:activity|engagement)"
-    r"|quiet\s+mode"
-    # Dormancy keywords anywhere
-    r"|(?:self-|going\s+|entering\s+)dormant"
-    r"|(?:going|entering)\s+fallow"
-    # Proposal suppression
-    r"|no\s+proposals?\s+(?:until|for\s+now))"
-)
-
-# Catches engagement-conditional language anywhere in focus text, e.g.
-# "CC upgrade proposal held pending for when engagement resumes."
-# This is separate from _BEHAVIORAL_FOCUS_RE because it matches mid-text
-# clauses, not just the beginning of the focus string.  Matches from
-# the trigger word through end of string (engagement clauses are tails).
-_ENGAGEMENT_SUPPRESSION_RE = re.compile(
-    r"(?i)\s*\b(?:held|deferred|delayed|postponed|tabled|shelved)\s+"
-    r"(?:pending|until|for\s+when)\b.*$"
-)
-
-
-def _sanitize_focus_summary(
-    focus: str,
-    *,
-    previous_focus: str | None = None,
-) -> tuple[str, bool]:
-    """Validate focus_summary describes a TOPIC, not a BEHAVIOR.
-
-    Returns (sanitized_focus, was_violated).
-    If the focus is behavioral, returns the previous legitimate focus
-    or a generic fallback, plus was_violated=True.  If engagement-
-    suppression language appears mid-text, that clause is stripped
-    rather than replacing the entire focus.
-    """
-    if _BEHAVIORAL_FOCUS_RE.search(focus):
-        fallback = previous_focus or "general system awareness"
-        logger.warning(
-            "Ego focus_summary contains behavioral self-assignment: %r — replacing with %r",
-            focus[:120],
-            fallback,
-        )
-        return fallback, True
-
-    # Strip engagement-conditional clauses from mid-text without
-    # replacing the entire focus (the topic portion may be valid).
-    cleaned = _ENGAGEMENT_SUPPRESSION_RE.sub("", focus).strip().rstrip(";,")
-    if cleaned != focus:
-        logger.warning(
-            "Ego focus_summary contains engagement-suppression clause: %r — stripped to %r",
-            focus[:120],
-            cleaned[:120],
-        )
-        return cleaned or (previous_focus or "general system awareness"), True
-
-    return focus, False
+# essential_knowledge.py retains its own copy of _BEHAVIORAL_FOCUS_RE
+# as defense-in-depth for the essential knowledge injection path.
 
 
 _INTERACT_TYPES = frozenset({"outreach", "dispatch", "publish"})
@@ -1775,16 +1768,18 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("focus_summary"), str):
         logger.warning("Ego output missing or invalid 'focus_summary' field")
         return None
-    if not isinstance(data.get("follow_ups"), list):
-        logger.warning("Ego output missing or invalid 'follow_ups' field")
-        return None
+    # follow_ups is no longer required — ego cannot create them.
+    # If present, log a warning (ego still trying to create follow-ups).
+    follow_ups = data.get("follow_ups")
+    if follow_ups and isinstance(follow_ups, list) and len(follow_ups) > 0:
+        logger.info(
+            "Ego output contains %d follow_ups (creation disabled, ignored)",
+            len(follow_ups),
+        )
 
-    # Sanitize focus_summary — must describe a TOPIC, not a BEHAVIOR.
-    sanitized, violated = _sanitize_focus_summary(data["focus_summary"])
-    if violated:
-        data["_original_focus"] = data["focus_summary"]
-        data["focus_summary"] = sanitized
-        data["_focus_violation"] = True
+    # Focus sanitization removed — focus_summary is system-computed
+    # (computed_focus.py). The ego's authored focus is logged in
+    # ego_cycles for audit but not persisted to ego_state.
 
     # Sanitize individual proposals to prevent DB constraint violations.
     for p in data["proposals"]:

@@ -40,19 +40,13 @@ async def _impl_ego_focus_reset(
     import aiosqlite
 
     from genesis.db.crud import ego as ego_crud
-    from genesis.ego.session import _BEHAVIORAL_FOCUS_RE
 
     default_focus = "general system awareness"
     focus_to_set = new_focus.strip() if new_focus else default_focus
 
-    if _BEHAVIORAL_FOCUS_RE.search(focus_to_set):
-        return {
-            "status": "rejected",
-            "reason": (
-                "The provided focus describes a behavioral state, not a topic. "
-                "Focus must describe what to think ABOUT, not how to behave."
-            ),
-        }
+    # Note: focus_summary is now system-computed each ego cycle
+    # (computed_focus.py). Manual resets are temporary one-cycle
+    # overrides — the next ego cycle will recompute from DB state.
 
     results = {}
     db_path = _get_db_path()
