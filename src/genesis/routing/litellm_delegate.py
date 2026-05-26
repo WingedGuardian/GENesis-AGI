@@ -53,6 +53,7 @@ _TYPE_TO_PREFIX: dict[str, str] = {
     "cerebras": "cerebras",  # Cerebras — native LiteLLM support
     "github": "github",  # GitHub Models — native LiteLLM support (Azure-backed)
     "sambanova": "sambanova",  # SambaNova — native LiteLLM support
+    "nvidia_nim": "nvidia_nim",  # NVIDIA NIM API Catalog — native LiteLLM support
 }
 
 
