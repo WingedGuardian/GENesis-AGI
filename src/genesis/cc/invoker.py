@@ -41,19 +41,35 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
         logger.warning("Could not set oom_score_adj for PID %d: %s", pid, exc)
 
 
-def _move_to_background_cgroup(pid: int) -> None:
-    """Move a CC subprocess to the genesis-background cgroup (I/O throttled).
+def _build_scope_args() -> list[str]:
+    """Build systemd-run prefix for CC subprocess I/O isolation.
 
-    Best-effort — if cgroup isolation isn't active, this is a no-op.
+    Wraps the CC subprocess in a transient systemd scope with resource
+    limits.  Each session gets its own cgroup under app.slice/run-XXXX.scope,
+    separate from genesis-server.service.
+
+    Returns an empty list if systemd-run is unavailable (graceful degradation).
     """
-    try:
-        from genesis.runtime._core import GenesisRuntime
+    if not shutil.which("systemd-run"):
+        return []
+    return [
+        "systemd-run", "--user", "--scope", "--quiet",
+        "-p", "IOWeight=100",
+        "-p", "MemoryHigh=22G",
+        "-p", "MemoryMax=27G",
+        "--",
+    ]
 
-        rt = GenesisRuntime.peek()
-        if rt and rt.cgroup_manager and rt.cgroup_manager.available:
-            rt.cgroup_manager.move_to_background(pid)
-    except Exception:
-        pass
+
+# Cache the scope args — they don't change during a process's lifetime.
+_SCOPE_ARGS: list[str] | None = None
+
+
+def _get_scope_args() -> list[str]:
+    global _SCOPE_ARGS  # noqa: PLW0603
+    if _SCOPE_ARGS is None:
+        _SCOPE_ARGS = _build_scope_args()
+    return _SCOPE_ARGS
 
 
 class CCInvoker:
@@ -278,8 +294,9 @@ class CCInvoker:
 
         proc = None
         try:
+            scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
-                *args,
+                *scope_args, *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -290,7 +307,6 @@ class CCInvoker:
             self._active_proc = proc
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
-            _move_to_background_cgroup(proc.pid)
             if invocation.on_spawn is not None:
                 try:
                     await invocation.on_spawn(proc.pid)
@@ -398,8 +414,9 @@ class CCInvoker:
         )
 
         try:
+            scope_args = _get_scope_args()
             proc = await asyncio.create_subprocess_exec(
-                *args,
+                *scope_args, *args,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -422,7 +439,6 @@ class CCInvoker:
         self._active_proc = proc
         logger.info("CC streaming subprocess spawned (PID %s)", proc.pid)
         set_oom_score_adj(proc.pid, 500)
-        _move_to_background_cgroup(proc.pid)
         if invocation.on_spawn is not None:
             try:
                 await invocation.on_spawn(proc.pid)

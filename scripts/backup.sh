@@ -93,33 +93,6 @@ encrypt_file() {
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
 }
 
-# ── Encryption helpers ───────────────────────────────────────────────
-# All PII-bearing payloads (SQLite dump, transcripts, memory) use the
-# same GPG symmetric passphrase as secrets. If the passphrase is unset,
-# encrypted sections are SKIPPED rather than falling back to plaintext
-# (the memory system is designed to hold credentials — plaintext leak
-# to a private repo is not acceptable).
-_BACKUP_PASSPHRASE="${GENESIS_BACKUP_PASSPHRASE:-}"
-_ENCRYPT_READY=false
-if [ -n "$_BACKUP_PASSPHRASE" ]; then
-    _ENCRYPT_READY=true
-fi
-
-# encrypt_stdin <output_path> — read plaintext from stdin, write <output_path>.
-encrypt_stdin() {
-    local out="$1"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$out" 2>/dev/null
-}
-
-# encrypt_file <src> <dst> — encrypt file contents to <dst> (e.g. *.gpg).
-encrypt_file() {
-    local src="$1"
-    local dst="$2"
-    printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --passphrase-fd 0 \
-        --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
-}
-
 # --- Clone or pull backup repo ---
 if [ ! -d "$BACKUP_DIR/.git" ]; then
     # Determine backup repo URL: env var → auto-detect from existing clone → fail
@@ -317,9 +290,16 @@ if [ -n "$_NAS_TARGET" ]; then
         log "WARNING: smbclient not installed — Tier 2 backup skipped"
         _T2_STATUS="no_smbclient"
     else
+        # Write credentials to a temp file instead of passing on command line
+        # (avoids exposure in /proc/*/cmdline and ps output)
+        _SMB_CREDS=$(mktemp)
+        chmod 600 "$_SMB_CREDS"
+        printf 'username=%s\npassword=%s\n' "$_NAS_USER" "$_NAS_PASS" > "$_SMB_CREDS"
+
+        _smb() { smbclient "$_NAS_TARGET" -A "$_SMB_CREDS" "$@"; }
+
         # Create directory structure on NAS
-        smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
-            -c "mkdir Genesis 2>/dev/null; mkdir ${_NAS_DIR} 2>/dev/null; mkdir ${_NAS_DIR}/qdrant 2>/dev/null; mkdir ${_NAS_DIR}/data 2>/dev/null" \
+        _smb -c "mkdir Genesis; mkdir \"${_NAS_DIR}\"; mkdir \"${_NAS_DIR}/qdrant\"; mkdir \"${_NAS_DIR}/data\"" \
             2>/dev/null || true
 
         _T2_OK=true
@@ -328,8 +308,7 @@ if [ -n "$_NAS_TARGET" ]; then
         for f in data/qdrant/*.gpg; do
             [ -f "$f" ] || continue
             fname=$(basename "$f")
-            if smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
-                -c "cd ${_NAS_DIR}/qdrant; put $f $fname" 2>/dev/null; then
+            if _smb -c "cd \"${_NAS_DIR}/qdrant\"; put \"$f\" \"$fname\"" 2>/dev/null; then
                 log "  NAS: uploaded $fname"
             else
                 log "WARNING: NAS upload failed for $fname"
@@ -339,14 +318,15 @@ if [ -n "$_NAS_TARGET" ]; then
 
         # Upload SQL dump
         if [ -f data/genesis.sql.gpg ]; then
-            if smbclient "$_NAS_TARGET" -U "${_NAS_USER}%${_NAS_PASS}" \
-                -c "cd ${_NAS_DIR}/data; put data/genesis.sql.gpg genesis.sql.gpg" 2>/dev/null; then
+            if _smb -c "cd \"${_NAS_DIR}/data\"; put data/genesis.sql.gpg genesis.sql.gpg" 2>/dev/null; then
                 log "  NAS: uploaded genesis.sql.gpg"
             else
                 log "WARNING: NAS upload failed for genesis.sql.gpg"
                 _T2_OK=false
             fi
         fi
+
+        rm -f "$_SMB_CREDS"
 
         if [ "$_T2_OK" = true ]; then
             _T2_STATUS="ok"

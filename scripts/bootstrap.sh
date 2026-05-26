@@ -608,8 +608,17 @@ else
     echo "  Template directory $SYSTEMD_TEMPLATE_DIR not found — skipping"
 fi
 
-# tmp-watchgod and cgroup-setup are now templates in scripts/systemd/
-# and handled by the template loop above — no separate install needed.
+# tmp-watchgod is now a template in scripts/systemd/ — handled by the loop above.
+
+# Check smbclient for Tier 2 backup (optional — only if NAS configured in secrets.env)
+if [ -f "$GENESIS_ROOT/secrets.env" ]; then
+    if grep -q 'GENESIS_BACKUP_NAS=' "$GENESIS_ROOT/secrets.env" 2>/dev/null; then
+        if ! command -v smbclient >/dev/null 2>&1; then
+            echo "  WARNING: smbclient not installed — Tier 2 backup to NAS won't work"
+            echo "  Install with: sudo apt-get install -y smbclient"
+        fi
+    fi
+fi
 
 # --- VNC stack (collaborative browser mode) ---
 echo "--- Setting up VNC stack ---"
