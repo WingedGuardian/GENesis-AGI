@@ -498,9 +498,15 @@ class TestOutputParsing:
         assert result["focus_summary"] == "investigating backlog growth"
 
     def test_missing_required_field(self):
+        raw = json.dumps({"focus_summary": "test"})
+        result = EgoSession._parse_output(raw)
+        assert result is None  # missing proposals
+
+    def test_follow_ups_no_longer_required(self):
+        """follow_ups field removed from contract — output without it parses fine."""
         raw = json.dumps({"proposals": [], "focus_summary": "test"})
         result = EgoSession._parse_output(raw)
-        assert result is None  # missing follow_ups
+        assert result is not None
 
     def test_garbage_input(self):
         assert EgoSession._parse_output("hello world") is None

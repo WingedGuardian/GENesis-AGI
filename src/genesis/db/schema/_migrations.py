@@ -1194,6 +1194,23 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE procedural_memory ADD COLUMN first_mover INTEGER NOT NULL DEFAULT 0",
         "procedural_memory.first_mover")
 
+    # 2026-05-26: Bulk-resolve legacy ego-generated follow-ups.
+    # Follow-up creation was disabled for ego on 2026-05-16 (dispatch.py).
+    # The remaining pending ego_judgment items are stale inter-cycle memos
+    # that will never be actioned. Resolve them to declutter the dashboard.
+    with contextlib.suppress(Exception):
+        await db.execute(
+            "UPDATE follow_ups SET "
+            "  status = 'completed', "
+            "  resolution_notes = 'Bulk-resolved: legacy ego-generated "
+            "(creation disabled 2026-05-16)', "
+            "  completed_at = datetime('now') "
+            "WHERE source LIKE '%ego%' "
+            "  AND strategy = 'ego_judgment' "
+            "  AND status = 'pending' "
+            "  AND pinned = 0"
+        )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

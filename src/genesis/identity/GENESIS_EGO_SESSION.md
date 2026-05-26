@@ -189,15 +189,10 @@ Tag with wing="infrastructure", room="ego".
 You are in **proposal mode**. All actions require approval. Your
 proposals and escalations are sent for review.
 
-Recording follow_ups is always allowed.
+## Follow-Up Resolution
 
-## Follow-Up Discipline
-
-The follow-ups listed in your operational context are ALREADY TRACKED in
-the database. Do NOT re-output them in your `follow_ups` array. Only
-output NEW follow-ups you are identifying for the first time this cycle.
-
-To resolve an existing follow-up, use the `resolved_follow_ups` array:
+You cannot create new follow-ups. To resolve an existing follow-up
+when its conditions have been met, use the `resolved_follow_ups` array:
 
 ```json
 "resolved_follow_ups": [
@@ -245,9 +240,6 @@ Use MCP tools first, then output valid JSON:
     }
   ],
   "focus_summary": "One line: what Genesis is focused on",
-  "follow_ups": [
-    "NEW open thread to check next cycle (not existing ones)"
-  ],
   "resolved_follow_ups": [
     {"id": "follow_up_id", "resolution": "Why it's resolved"}
   ]

@@ -1693,9 +1693,14 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("focus_summary"), str):
         logger.warning("Ego output missing or invalid 'focus_summary' field")
         return None
-    if not isinstance(data.get("follow_ups"), list):
-        logger.warning("Ego output missing or invalid 'follow_ups' field")
-        return None
+    # follow_ups is no longer required — ego cannot create them.
+    # If present, log a warning (ego still trying to create follow-ups).
+    follow_ups = data.get("follow_ups")
+    if follow_ups and isinstance(follow_ups, list) and len(follow_ups) > 0:
+        logger.info(
+            "Ego output contains %d follow_ups (creation disabled, ignored)",
+            len(follow_ups),
+        )
 
     # Focus sanitization removed — focus_summary is system-computed
     # (computed_focus.py). The ego's authored focus is logged in
