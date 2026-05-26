@@ -108,7 +108,7 @@ class TestQueryFindings:
         mock_db = AsyncMock()
         mock_db.execute = AsyncMock(return_value=mock_cursor)
 
-        job = ModelsMdSynthesisJob(db=mock_db, router=AsyncMock())
+        job = ModelsMdSynthesisJob(db=mock_db)
         findings = await job._query_findings()
 
         # Should include pricing_change and new_free_model, exclude new_model and benchmark_unmatched

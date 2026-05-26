@@ -1,28 +1,24 @@
 """Weekly models.md synthesis — updates the model catalog from recon findings.
 
-Reads recent model intelligence findings from knowledge_units, feeds them
-alongside the current docs/reference/models.md to Sonnet, and writes
-back the updated file with a git commit.
+Reads recent model intelligence findings from knowledge_units, builds a
+prompt, and dispatches a CC background session to update
+docs/reference/models.md with a git commit.
 
 Scheduled via SurplusScheduler: Sunday 8am UTC, 2h after model intelligence.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from genesis.env import repo_root
 
 if TYPE_CHECKING:
     import aiosqlite
-
-    from genesis.routing.router import Router
 
 logger = logging.getLogger(__name__)
 
@@ -38,16 +34,18 @@ _ACTIONABLE_TYPES = frozenset({
     "stale_profile",
 })
 
-# Structural markers that must be present in the output to pass validation.
-_REQUIRED_MARKERS = (
-    "## THE HEAVY LIFTERS",
-    "## THE ALL-ROUNDERS",
-    "## THE SPECIALISTS",
-)
+# Path to the models.md file (relative to repo root, for the CC session prompt).
+_MODELS_MD_REL = "docs/reference/models.md"
 
-_SYSTEM_PROMPT = """\
-You maintain a model catalog (models.md) for an AI agent system called Genesis.
-You receive the current file and recent model intelligence findings. Your job:
+_SESSION_PROMPT_TEMPLATE = """\
+You are updating the Genesis model catalog.
+
+## Task
+
+Read the file `{models_md_path}`, apply the intelligence findings below,
+and write the updated file back. Then git commit the change.
+
+## Rules
 
 1. UPDATE structured fields when findings provide new data:
    - Pricing (the **Cost:** line)
@@ -65,86 +63,104 @@ You receive the current file and recent model intelligence findings. Your job:
    Genesis-specific notes. Do NOT reorder sections.
 5. Do NOT change: Effort Level Assignments, routing recommendations, the HTML
    comment header at the top of the file.
-6. Return the COMPLETE updated file contents. Do not truncate or summarize.
-   If nothing material changed, return the file unchanged except for updating
-   the Last Reviewed date.
+
+## Validation (you MUST verify before writing)
+
+- The output MUST contain these section headers:
+  "## THE HEAVY LIFTERS"
+  "## THE ALL-ROUNDERS"
+  "## THE SPECIALISTS"
+- Output length must be between 50% and 200% of the original file length.
+- If no material changes are needed, update only the Last Reviewed date.
+
+## Workflow
+
+1. Read `{models_md_path}` with the Read tool
+2. Apply the findings below to produce the updated content
+3. Verify your output meets the validation rules above
+4. Write the updated file with the Write tool
+5. Run: `cd {repo_root} && git add {models_md_rel} && git commit -m "docs(models): weekly synthesis update"`
+
+If the file is unchanged (no material findings to apply), skip steps 3-5
+and report "no changes needed."
+
+## Intelligence Findings (last 7 days)
+
+{findings}
 """
 
 
 class ModelsMdSynthesisJob:
-    """Weekly job: synthesize recon findings into docs/reference/models.md."""
+    """Weekly job: synthesize recon findings into docs/reference/models.md.
 
-    def __init__(self, *, db: aiosqlite.Connection, router: Router):
+    Dispatches a CC background session to perform the update, rather than
+    calling the LLM router directly.  This gives natural resilience (no
+    single-provider dependency) and lets the session use tools for file
+    I/O and git operations.
+    """
+
+    def __init__(self, *, db: aiosqlite.Connection):
         self._db = db
-        self._router = router
 
     async def run(self) -> dict:
-        """Run the synthesis. Returns a summary dict."""
+        """Query findings and dispatch a CC session. Returns summary dict."""
         # 1. Query recent findings
         findings = await self._query_findings()
         if not findings:
             logger.info("Models.md synthesis: no actionable findings in last 7 days")
             return {"skipped": True, "reason": "no_findings"}
 
-        # 2. Read current models.md
-        models_md_path = repo_root() / "docs" / "reference" / "models.md"
+        # 2. Build session prompt
+        serialized = self._serialize_findings(findings)
+        root = repo_root()
+        models_md_path = root / _MODELS_MD_REL
         if not models_md_path.exists():
             logger.error("Models.md not found at %s", models_md_path)
             return {"skipped": True, "reason": "file_not_found"}
-        current_content = models_md_path.read_text(encoding="utf-8")
 
-        # 3. Build LLM prompt
-        serialized = self._serialize_findings(findings)
-        user_prompt = (
-            f"## Recent Intelligence Findings (last 7 days)\n\n"
-            f"{serialized}\n\n"
-            f"## Current models.md\n\n"
-            f"{current_content}"
+        prompt = _SESSION_PROMPT_TEMPLATE.format(
+            models_md_path=str(models_md_path),
+            models_md_rel=_MODELS_MD_REL,
+            repo_root=str(root),
+            findings=serialized,
         )
 
-        # 4. Call Sonnet via router
-        messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ]
-        result = await self._router.route_call(
-            "models_md_synthesis", messages, max_tokens=16384,
+        # 3. Dispatch CC session
+        from genesis.cc.direct_session import (
+            CCModel,
+            DirectSessionRequest,
+            EffortLevel,
         )
-        if not result.success:
-            logger.error(
-                "Models.md synthesis LLM call failed: %s", result.error,
-            )
-            raise RuntimeError(f"LLM call failed: {result.error}")
+        from genesis.runtime import GenesisRuntime
 
-        updated_content = (result.content or "").strip()
+        rt = GenesisRuntime.instance()
+        runner = rt._direct_session_runner
+        if runner is None:
+            raise RuntimeError("DirectSessionRunner not available")
 
-        # 5. Validate output
-        validation_error = self._validate_output(updated_content, current_content)
-        if validation_error:
-            logger.warning(
-                "Models.md synthesis validation failed: %s", validation_error,
-            )
-            return {"skipped": True, "reason": f"validation_failed: {validation_error}"}
+        request = DirectSessionRequest(
+            prompt=prompt,
+            profile="interact",
+            model=CCModel.SONNET,
+            effort=EffortLevel.HIGH,
+            timeout_s=3600,
+            notify=True,
+            notify_on_failure_only=True,
+            source_tag="models_md_synthesis",
+            caller_context="schedule:models_md_synthesis",
+            tool_exceptions=("Write", "Bash"),
+        )
 
-        # 6. Check for meaningful changes
-        if updated_content.strip() == current_content.strip():
-            logger.info("Models.md synthesis: no changes detected")
-            return {"skipped": True, "reason": "no_changes"}
-
-        # 7. Write file
-        models_md_path.write_text(updated_content + "\n", encoding="utf-8")
-        logger.info("Models.md updated (%d -> %d bytes)", len(current_content), len(updated_content))
-
-        # 8. Git commit
-        committed = await self._git_commit(models_md_path)
+        session_id = await runner.spawn(request)
+        logger.info(
+            "Models.md synthesis dispatched (%d findings, session=%s)",
+            len(findings), session_id,
+        )
 
         return {
+            "dispatched": True,
+            "session_id": session_id,
             "findings_count": len(findings),
-            "updated": True,
-            "committed": committed,
-            "input_tokens": result.input_tokens,
-            "output_tokens": result.output_tokens,
-            "cost_usd": result.cost_usd,
         }
 
     async def _query_findings(self) -> list[dict]:
@@ -181,30 +197,26 @@ class ModelsMdSynthesisJob:
         except (json.JSONDecodeError, ValueError):
             return None
 
-    @staticmethod
-    def _serialize_findings(findings: list[dict]) -> str:
-        """Render findings as compact text blocks for the LLM prompt."""
-        parts = []
-        for f in findings:
-            ftype = f.get("type", "unknown")
-            title = f.get("title", ftype)
-            # Remove the "Model intelligence: " prefix for readability
-            title = title.replace("Model intelligence: ", "")
-            details = json.dumps(
-                {k: v for k, v in f.items() if k not in ("title", "type")},
-                indent=2,
-                default=str,
-            )
-            parts.append(f"### {title} ({ftype})\n```json\n{details}\n```")
-        return "\n\n".join(parts)
+    # Structural markers that the CC session must preserve.
+    # Kept as class state for testability — the prompt embeds these rules.
+    _REQUIRED_MARKERS = (
+        "## THE HEAVY LIFTERS",
+        "## THE ALL-ROUNDERS",
+        "## THE SPECIALISTS",
+    )
 
     @staticmethod
     def _validate_output(output: str, original: str) -> str | None:
-        """Validate LLM output before writing. Returns error string or None."""
+        """Validate LLM output before writing. Returns error string or None.
+
+        NOTE: In the CC-session model this validation is expressed as prompt
+        instructions rather than code-enforced.  The method is retained for
+        unit testing and as the canonical definition of the validation rules.
+        """
         if not output:
             return "empty output"
 
-        for marker in _REQUIRED_MARKERS:
+        for marker in ModelsMdSynthesisJob._REQUIRED_MARKERS:
             if marker not in output:
                 return f"missing structural marker: {marker}"
 
@@ -218,38 +230,18 @@ class ModelsMdSynthesisJob:
         return None
 
     @staticmethod
-    async def _git_commit(file_path: Path) -> bool:
-        """Stage and commit the updated file. Returns True if committed."""
-        repo = repo_root()
-        try:
-            # git add — uses create_subprocess_exec (no shell injection risk)
-            proc = await asyncio.create_subprocess_exec(
-                "git", "add", str(file_path.relative_to(repo)),
-                cwd=str(repo),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+    def _serialize_findings(findings: list[dict]) -> str:
+        """Render findings as compact text blocks for the session prompt."""
+        parts = []
+        for f in findings:
+            ftype = f.get("type", "unknown")
+            title = f.get("title", ftype)
+            # Remove the "Model intelligence: " prefix for readability
+            title = title.replace("Model intelligence: ", "")
+            details = json.dumps(
+                {k: v for k, v in f.items() if k not in ("title", "type")},
+                indent=2,
+                default=str,
             )
-            await proc.wait()
-
-            # git commit
-            proc = await asyncio.create_subprocess_exec(
-                "git", "commit", "-m",
-                "docs(models): weekly synthesis update\n\n"
-                "Auto-generated from model intelligence recon findings.",
-                cwd=str(repo),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                msg = stderr.decode(errors="replace").strip()
-                if "nothing to commit" in msg:
-                    logger.info("Models.md commit: no changes to commit")
-                else:
-                    logger.warning("Models.md commit failed: %s", msg)
-                return False
-            logger.info("Models.md committed to git")
-            return True
-        except Exception:
-            logger.exception("Failed to git commit models.md update")
-            return False
+            parts.append(f"### {title} ({ftype})\n```json\n{details}\n```")
+        return "\n\n".join(parts)

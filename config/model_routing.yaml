@@ -105,15 +105,6 @@ providers:
     free: true
     rpm_limit: 8  # Actual OpenRouter limit (high-demand Venice backend)
     open_duration_s: 120
-  openrouter-deepseek-r1:
-    type: openrouter
-    model: deepseek/deepseek-r1:free
-    profile: deepseek-r1
-    free: true
-    # Free endpoint removed from OpenRouter as of 2026-04-15; disable until restored
-    enabled: false
-    rpm_limit: 20
-    open_duration_s: 120
   openrouter-deepseek-v4:
     type: openrouter
     model: deepseek/deepseek-v4-pro
@@ -548,12 +539,6 @@ call_sites:
     - gemini-free
     default_paid: true
     description: Analyze CC version changes for impact on Genesis
-  models_md_synthesis:
-    chain:
-    - openrouter-sonnet
-    default_paid: true
-    retry_profile: background
-    description: "Weekly models.md synthesis \u2014 updates model catalog from recon findings"
   outreach_email_triage:
     chain:
     - gemini-free
