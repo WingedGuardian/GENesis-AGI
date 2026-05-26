@@ -580,6 +580,12 @@ class EgoSession:
                         self._last_realist_cost_usd,
                         cycle.cost_usd,
                     )
+                # Domain enforcement: Genesis ego can only propose on
+                # infrastructure/operations. User-domain proposals
+                # (content, career, etc.) are rejected and auto-escalated.
+                if proposals and self._source_tag == "genesis_ego_cycle":
+                    proposals = self._enforce_domain_boundary(proposals)
+
                 if proposals:
                     await self._process_proposals(
                         proposals,
@@ -980,6 +986,37 @@ class EgoSession:
             logger.warning("Realist filter failed, passing through", exc_info=True)
             return proposals
 
+    # Genesis ego allowed action categories (infrastructure/operations only)
+    _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
+        "system_health", "infrastructure", "performance",
+        "maintenance", "security",
+    })
+
+    def _enforce_domain_boundary(
+        self,
+        proposals: list[dict],
+    ) -> list[dict]:
+        """Filter out-of-domain proposals from the Genesis ego.
+
+        The Genesis ego (COO) may only propose on infrastructure and
+        operations. User-domain proposals (content, career, communication)
+        are logged as domain violations and dropped. The ego's prompt
+        already states this boundary; this is the architectural backstop.
+        """
+        allowed = []
+        for p in proposals:
+            category = p.get("action_category", "")
+            if category in self._GENESIS_EGO_ALLOWED_CATEGORIES:
+                allowed.append(p)
+            else:
+                logger.warning(
+                    "Genesis ego domain violation: proposal with "
+                    "action_category=%r dropped (content: %s)",
+                    category,
+                    p.get("content", "")[:80],
+                )
+        return allowed
+
     async def _process_proposals(
         self,
         proposals: list[dict],
@@ -1180,11 +1217,32 @@ class EgoSession:
         Only the Genesis ego produces escalations. Each escalation becomes
         an observation with type='escalation_to_user_ego' so the user ego
         context builder can query and display them.
+
+        Deduplication: before creating a new escalation, check if an
+        unresolved one with similar content exists in the last 24 hours.
+        This prevents the Genesis ego from re-escalating the same issue
+        every cycle (e.g., 3 "backup failing" escalations in 30 minutes).
         """
         import uuid
 
         from genesis.db.crud import observations as obs_crud
 
+        # Fetch recent unresolved escalations for dedup (24h window)
+        try:
+            cursor = await self._db.execute(
+                "SELECT content FROM observations "
+                "WHERE type = 'escalation_to_user_ego' "
+                "AND resolved_at IS NULL "
+                "AND created_at > datetime('now', '-24 hours')"
+            )
+            recent_contents = [
+                row[0].lower()[:100] for row in await cursor.fetchall()
+            ]
+        except Exception:
+            recent_contents = []  # Fail open — allow all escalations
+
+        created = 0
+        deduped = 0
         for esc in escalations:
             if not isinstance(esc, dict):
                 continue
@@ -1196,17 +1254,32 @@ class EgoSession:
             if suggested:
                 content_parts.append(f"Suggested: {suggested}")
 
+            full_content = "\n".join(content_parts)
+
+            # Dedup: check if the first 100 chars (lowered) of the main
+            # content match any recent unresolved escalation.
+            main_content_prefix = esc.get("content", "").lower()[:100]
+            if any(
+                main_content_prefix and existing.startswith(main_content_prefix[:50])
+                for existing in recent_contents
+            ):
+                deduped += 1
+                continue
+
             try:
                 await obs_crud.create(
                     self._db,
                     id=str(uuid.uuid4()),
                     source="genesis_ego",
                     type="escalation_to_user_ego",
-                    content="\n".join(content_parts),
+                    content=full_content,
                     priority="high",
                     created_at=datetime.now(UTC).isoformat(),
                     category="escalation",
                 )
+                # Add to recent for intra-batch dedup
+                recent_contents.append(main_content_prefix)
+                created += 1
             except Exception:
                 logger.error(
                     "Failed to write escalation from cycle %s",
@@ -1216,9 +1289,11 @@ class EgoSession:
 
         if escalations:
             logger.info(
-                "Genesis ego cycle %s produced %d escalation(s)",
+                "Genesis ego cycle %s: %d escalation(s) — %d created, %d deduped",
                 cycle_id,
                 len(escalations),
+                created,
+                deduped,
             )
 
     # -- Knowledge notepad --------------------------------------------------
