@@ -4,11 +4,15 @@
 
 enabled: true
 
-# Scheduling
+# Scheduling — User Ego (CEO)
 cadence_minutes: 90          # base interval between cycles
 activity_threshold_minutes: 30  # min time since last user message
 max_interval_minutes: 240    # backoff cap (4 hours)
 backoff_multiplier: 2.5      # interval multiplier on idle cycles
+
+# Scheduling — Genesis Ego (COO)
+genesis_cadence_minutes: 90          # base interval for infrastructure monitoring
+genesis_max_interval_minutes: 240    # backoff cap for genesis ego
 
 # Model
 model: opus                  # default model for ego cycles

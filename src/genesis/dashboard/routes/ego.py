@@ -76,11 +76,12 @@ async def ego_status():
     user_cadence = _cadence_snapshot(rt._ego_cadence_manager)
     genesis_cadence = _cadence_snapshot(rt._genesis_ego_cadence_manager)
 
-    # Genesis ego config (derived from base config in init/ego.py)
+    # Genesis ego config — uses dedicated config fields
     genesis_ego_config = {
         "model": "sonnet",
         "default_effort": "high",
-        "cadence_minutes": max(config.cadence_minutes, 60),
+        "cadence_minutes": config.genesis_cadence_minutes,
+        "max_interval_minutes": config.genesis_max_interval_minutes,
         "morning_report_enabled": False,
     }
 
@@ -106,7 +107,7 @@ async def ego_status():
             "pending_proposals": len(genesis_pending),
             "cadence": genesis_cadence,
             "cadence_minutes": genesis_ego_config["cadence_minutes"],
-            "max_interval_minutes": config.max_interval_minutes,
+            "max_interval_minutes": genesis_ego_config["max_interval_minutes"],
             "morning_report": False,
         },
     }

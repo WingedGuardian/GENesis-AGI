@@ -119,4 +119,12 @@ def validate_ego_config(changes: dict) -> list[str]:
         errors.append(f"default_effort must be one of {_VALID_EFFORTS}")
     if "morning_report_effort" in changes and changes["morning_report_effort"] not in _VALID_EFFORTS:
         errors.append(f"morning_report_effort must be one of {_VALID_EFFORTS}")
+    if "genesis_cadence_minutes" in changes:
+        v = changes["genesis_cadence_minutes"]
+        if not isinstance(v, (int, float)) or v < 30:
+            errors.append("genesis_cadence_minutes must be >= 30")
+    if "genesis_max_interval_minutes" in changes:
+        v = changes["genesis_max_interval_minutes"]
+        if not isinstance(v, (int, float)) or v < 60:
+            errors.append("genesis_max_interval_minutes must be >= 60")
     return errors
