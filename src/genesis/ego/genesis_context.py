@@ -649,8 +649,9 @@ class GenesisEgoContextBuilder:
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what Genesis is focused on",\n'
-            '  "follow_ups": [],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
+            '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
+            '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
             '  "communication_decision": "send_digest|urgent_notify|stay_quiet"\n'
             "}\n"
             "```\n\n"

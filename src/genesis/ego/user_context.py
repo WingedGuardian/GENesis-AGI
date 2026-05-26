@@ -1129,9 +1129,10 @@ class UserEgoContextBuilder:
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
-            '  "follow_ups": [],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'
+            '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
+            '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
             '  "morning_report": "only if this is a morning trigger"\n'
             "}\n"
             "```\n\n"
