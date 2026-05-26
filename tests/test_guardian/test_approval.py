@@ -1,7 +1,6 @@
 """Tests for guardian approval server singleton fix."""
 from __future__ import annotations
 
-import threading
 import time
 from unittest.mock import MagicMock
 
@@ -155,7 +154,7 @@ class TestApprovalServerHTTP:
         server_b = ApprovalServer(self._make_config(18891))
         try:
             url_a = server_a.start()
-            url_b = server_b.start()
+            server_b.start()  # Start but don't need its URL
 
             # Approve server A
             with urllib.request.urlopen(url_a, timeout=5) as resp:
