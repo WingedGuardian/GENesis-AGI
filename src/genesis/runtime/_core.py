@@ -427,6 +427,14 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
 
         await self._load_persisted_job_health()
 
+        # Clear stale failure counts from pre-restart failures so the
+        # dashboard starts clean after a code fix + deploy.
+        from genesis.runtime._job_health import clear_stale_job_failures
+
+        cleared = clear_stale_job_failures(self)
+        if cleared:
+            logger.info("Cleared stale failures from %d jobs on startup", cleared)
+
         self._wire_job_retry_registry()
 
         critical_ok = all(
