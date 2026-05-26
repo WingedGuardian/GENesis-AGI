@@ -5,10 +5,10 @@
 enabled: true
 
 # Scheduling
-cadence_minutes: 60          # base interval between cycles
+cadence_minutes: 90          # base interval between cycles
 activity_threshold_minutes: 30  # min time since last user message
 max_interval_minutes: 240    # backoff cap (4 hours)
-backoff_multiplier: 2.0      # interval doubles on idle cycles
+backoff_multiplier: 2.5      # interval multiplier on idle cycles
 
 # Model
 model: opus                  # default model for ego cycles
