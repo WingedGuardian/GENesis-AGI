@@ -153,6 +153,7 @@ async def ego_cycles():
             "output_tokens": c["output_tokens"],
             "duration_ms": c["duration_ms"],
             "compacted_into": c["compacted_into"],
+            "ego_source": c.get("ego_source", ""),
         }
         for c in cycles
     ])

@@ -6776,6 +6776,9 @@
                          @click="$store.genesisDashboard.egoModal.expandedCycle = $store.genesisDashboard.egoModal.expandedCycle === c.id ? null : c.id">
                       <span style="font-size: 0.72rem; color: var(--color-text-secondary); min-width: 120px;"
                             x-text="$store.genesisDashboard.formatDateTime(c.created_at)"></span>
+                      <span style="font-size: 0.62rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; min-width: 28px; text-align: center;"
+                            :style="(c.ego_source || '').includes('genesis') ? 'background: rgba(59,130,246,0.15); color: #60a5fa;' : (c.ego_source ? 'background: rgba(168,85,247,0.15); color: #c084fc;' : 'background: rgba(136,136,136,0.1); color: #888;')"
+                            x-text="(c.ego_source || '').includes('genesis') ? 'COO' : (c.ego_source ? 'CEO' : '?')"></span>
                       <span style="font-size: 0.82rem; flex: 1;" x-text="c.focus_summary || 'No summary'"></span>
                       <span style="font-size: 0.72rem; color: var(--color-text-secondary);"
                             x-text="'$' + (c.cost_usd || 0).toFixed(4)"></span>
