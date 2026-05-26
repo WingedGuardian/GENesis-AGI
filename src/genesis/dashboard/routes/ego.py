@@ -131,6 +131,43 @@ async def ego_status():
     })
 
 
+@blueprint.route("/api/genesis/ego/trigger", methods=["POST"])
+@_async_route
+async def ego_trigger():
+    """Manually trigger a user ego cycle.
+
+    Invokes the cadence manager's _on_tick() which respects the
+    asyncio lock (no concurrent cycles) and circuit breaker state.
+    Returns the cycle result or an error.
+    """
+    import logging
+
+    from genesis.runtime import GenesisRuntime
+
+    logger = logging.getLogger(__name__)
+    rt = GenesisRuntime.instance()
+
+    if not rt.is_bootstrapped:
+        return jsonify({"error": "not bootstrapped"}), 503
+
+    mgr = rt._ego_cadence_manager
+    if mgr is None:
+        return jsonify({"error": "ego cadence manager not available"}), 503
+
+    target = request.args.get("ego", "user")
+    if target == "genesis":
+        mgr = rt._genesis_ego_cadence_manager
+        if mgr is None:
+            return jsonify({"error": "genesis ego cadence manager not available"}), 503
+
+    try:
+        await mgr._on_tick()
+        return jsonify({"status": "ok", "message": f"{target} ego cycle triggered"})
+    except Exception as e:
+        logger.error("Manual ego trigger failed", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @blueprint.route("/api/genesis/ego/cycles")
 @_async_route
 async def ego_cycles():

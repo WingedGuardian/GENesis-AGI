@@ -4510,9 +4510,9 @@
                   <template x-for="(info, name) in ($store.genesisDashboard.health.api_keys?.providers || $store.genesisDashboard.health.api_keys || {})" :key="name">
                     <template x-if="info.status === 'missing' || info.status === 'failed'">
                       <div style="font-size: 0.72rem; margin-top: 0.1rem;"
-                           :style="`color: ${info.status === 'missing' ? '#d9534f' : '#f0ad4e'}`"
+                           :style="`color: ${info.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"
                            :title="info.error || ''">
-                        <span class="status-dot" :style="`background: ${info.status === 'missing' ? '#d9534f' : '#f0ad4e'}`"></span>
+                        <span class="status-dot" :style="`background: ${info.status === 'failed' ? '#d9534f' : '#f0ad4e'}`"></span>
                         <span x-text="name + ' (' + (info.error ? info.error.substring(0, 40) : info.status) + ')'"></span>
                       </div>
                     </template>
