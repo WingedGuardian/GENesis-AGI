@@ -73,6 +73,20 @@ providers:
     rpm_limit: 20
     open_duration_s: 120
   # ── Phase 2 providers (gated on eval before chain promotion) ──
+  nvidia-nim-deepseek:
+    type: nvidia_nim
+    model: deepseek-ai/deepseek-v4-pro
+    profile: nvidia-nim-deepseek-v4-pro
+    free: true
+    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
+    open_duration_s: 120
+  nvidia-nim-kimi:
+    type: nvidia_nim
+    model: moonshotai/kimi-k2.6
+    profile: nvidia-nim-kimi-k2.6
+    free: true
+    rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
+    open_duration_s: 120
   cerebras-qwen:
     type: cerebras
     model: qwen-3-235b-a22b-instruct-2507
@@ -263,6 +277,7 @@ call_sites:
     - groq-free
     - gemini-free
     - cerebras-qwen
+    - nvidia-nim-deepseek
     - mistral-large-free
     - openrouter-deepseek-v4-flash
   # V4 placeholder: cognitive state IS actively maintained today, but via direct
@@ -287,6 +302,8 @@ call_sites:
     - mistral-large-free
     - groq-free
     - openrouter-free
+    - nvidia-nim-deepseek
+    - nvidia-nim-kimi
     never_pays: true
   13_morning_report:
     chain:
@@ -343,6 +360,7 @@ call_sites:
   # Free-tier only. Separate from 22_tagging (entity extraction).
   dream_cycle_synthesis:
     chain:
+    - nvidia-nim-kimi
     - groq-free
     - mistral-small-free
     - openrouter-free
@@ -393,12 +411,16 @@ call_sites:
     chain:
     - gemini-free
     - groq-free
+    - nvidia-nim-deepseek
+    - mistral-large-free
     description: LLM-driven skill improvement proposals
   34_research_synthesis:
     chain:
     - gemini-free
     - groq-free
     - mistral-large-free
+    - nvidia-nim-deepseek
+    - nvidia-nim-kimi
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
@@ -471,6 +493,7 @@ call_sites:
     description: "Proactive infrastructure monitoring \u2014 trend detection and forecasting"
   40_knowledge_distillation:
     chain:
+    - nvidia-nim-deepseek
     - cerebras-qwen
     - groq-free
     - gemini-free
