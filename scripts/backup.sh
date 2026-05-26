@@ -315,10 +315,12 @@ else
     # Without this, a corrupt git repo silently kills the script
     # (as happened 2026-05-08 through 2026-05-25: 17 days unnoticed).
     if git commit -m "backup: $(date -Iseconds)" --quiet 2>&1; then
-        git push --quiet || {
-            log "WARNING: git push failed — backup committed locally only"
-        }
-        log "Backup committed and pushed"
+        if ! git push --quiet 2>&1; then
+            _FAILURE_REASON="git push failed — backup exists locally only (not replicated to remote)"
+            log "ERROR: $_FAILURE_REASON"
+        else
+            log "Backup committed and pushed"
+        fi
     else
         _FAILURE_REASON="git commit failed (corrupt repo or index error)"
         log "ERROR: git commit failed — repository may need re-clone from remote"
