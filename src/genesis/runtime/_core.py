@@ -435,6 +435,17 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         if cleared:
             logger.info("Cleared stale failures from %d jobs on startup", cleared)
 
+        # Expire stale cognitive state entries (TTL-based + legacy NULL cleanup)
+        if self._db is not None:
+            try:
+                from genesis.db.crud import cognitive_state
+
+                expired = await cognitive_state.expire_old(self._db)
+                if expired:
+                    logger.info("Expired %d stale cognitive state entries", expired)
+            except Exception:
+                logger.warning("Failed to expire cognitive state entries", exc_info=True)
+
         self._wire_job_retry_registry()
 
         critical_ok = all(

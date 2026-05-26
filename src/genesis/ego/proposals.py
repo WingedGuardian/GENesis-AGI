@@ -171,6 +171,7 @@ class ProposalWorkflow:
                 )
 
         from genesis.ego.integrity import content_hash as _content_hash
+        from genesis.ego.integrity import content_size as _content_size
 
         ids: list[str] = []
         for p in proposals:
@@ -218,6 +219,7 @@ class ProposalWorkflow:
                 ego_source=ego_source,
                 goal_id=goal_id,
                 content_hash=_content_hash(proposal_content),
+                content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
             )
             ids.append(pid)

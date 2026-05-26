@@ -1447,6 +1447,31 @@ class EgoSession:
                     )
                 continue
 
+            # Content integrity check — detect degradation since creation.
+            # Log-only for now; tighten to a gate if we see real degradation.
+            stored_hash = prop.get("content_hash")
+            stored_size = prop.get("content_size")
+            if stored_hash and stored_size:
+                from genesis.ego.integrity import content_hash as _chash
+                from genesis.ego.integrity import content_size as _csize
+
+                current_hash = _chash(prop["content"])
+                current_size = _csize(prop["content"])
+                if current_hash != stored_hash:
+                    logger.warning(
+                        "Proposal %s content hash mismatch — content may "
+                        "have been modified since creation",
+                        prop["id"],
+                    )
+                if stored_size > 0:
+                    shrinkage = (stored_size - current_size) / stored_size * 100
+                    if shrinkage > 15:
+                        logger.warning(
+                            "Proposal %s content shrank %.0f%% "
+                            "(was %d, now %d bytes)",
+                            prop["id"], shrinkage, stored_size, current_size,
+                        )
+
             prompt = await self._build_dispatch_prompt(prop)
             profile = _infer_profile(prop.get("action_type", ""))
 

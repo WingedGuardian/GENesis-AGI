@@ -1211,6 +1211,18 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
             "  AND pinned = 0"
         )
 
+    # Ego proposals: content integrity tracking (content_hash existed in
+    # CREATE TABLE but lacked ALTER TABLE migration for existing installs).
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN content_hash TEXT",
+        "ego_proposals.content_hash")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN original_content TEXT",
+        "ego_proposals.original_content")
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN content_size INTEGER",
+        "ego_proposals.content_size")
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

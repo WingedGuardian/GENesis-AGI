@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
+
+# Default TTL per section type (hours).  When expires_at is not explicitly
+# provided, these values are used to auto-compute it from created_at.
+_SECTION_TTL_HOURS: dict[str, int] = {
+    "active_context": 72,           # 3 days — deep reflection refreshes
+    "pending_actions": 72,          # 3 days — strategic reflection refreshes
+    "state_flags": 24,              # 1 day — stale flags are the main problem
+    "resilience_degradation": 6,    # 6 hours — awareness loop refreshes
+}
 
 # Canonical location — also duplicated in scripts/genesis_session_end.py (keep in sync).
 _PATCHES_FILE = Path.home() / ".genesis" / "session_patches.json"
@@ -41,6 +51,22 @@ def clear_session_patches(patches_file: Path | None = None) -> None:
         logger.debug("Failed to clear session patches", exc_info=True)
 
 
+def _auto_expires_at(section: str, created_at: str, expires_at: str | None) -> str | None:
+    """Compute expires_at from section TTL if not explicitly provided."""
+    if expires_at is not None:
+        return expires_at
+    ttl_hours = _SECTION_TTL_HOURS.get(section)
+    if ttl_hours is None:
+        return None
+    try:
+        created_dt = datetime.fromisoformat(created_at)
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=UTC)
+        return (created_dt + timedelta(hours=ttl_hours)).isoformat()
+    except (ValueError, TypeError):
+        return None
+
+
 async def create(
     db: aiosqlite.Connection,
     *,
@@ -51,6 +77,7 @@ async def create(
     created_at: str,
     expires_at: str | None = None,
 ) -> str:
+    expires_at = _auto_expires_at(section, created_at, expires_at)
     await db.execute(
         """INSERT INTO cognitive_state
            (id, content, section, generated_by, created_at, expires_at)
@@ -71,16 +98,20 @@ async def get_by_id(db: aiosqlite.Connection, id: str) -> dict | None:
 
 async def get_by_section(db: aiosqlite.Connection, section: str) -> list[dict]:
     cursor = await db.execute(
-        "SELECT * FROM cognitive_state WHERE section = ? ORDER BY created_at DESC",
-        (section,),
+        "SELECT * FROM cognitive_state WHERE section = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY created_at DESC",
+        (section, datetime.now(UTC).isoformat()),
     )
     return [dict(r) for r in await cursor.fetchall()]
 
 
 async def get_current(db: aiosqlite.Connection, section: str) -> dict | None:
     cursor = await db.execute(
-        "SELECT * FROM cognitive_state WHERE section = ? ORDER BY created_at DESC LIMIT 1",
-        (section,),
+        "SELECT * FROM cognitive_state WHERE section = ? "
+        "AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY created_at DESC LIMIT 1",
+        (section, datetime.now(UTC).isoformat()),
     )
     row = await cursor.fetchone()
     return dict(row) if row else None
@@ -327,6 +358,7 @@ async def replace_section(
     expires_at: str | None = None,
 ) -> str:
     """Delete all rows for a section, then insert a new one."""
+    expires_at = _auto_expires_at(section, created_at, expires_at)
     await db.execute(
         "DELETE FROM cognitive_state WHERE section = ?", (section,),
     )
@@ -346,3 +378,22 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def expire_old(db: aiosqlite.Connection) -> int:
+    """Delete cognitive_state entries past their expires_at.
+
+    Also removes entries older than 7 days that were created before
+    TTL auto-computation was added (expires_at IS NULL).
+    """
+    now = datetime.now(UTC).isoformat()
+    seven_days_ago = (datetime.now(UTC) - timedelta(days=7)).isoformat()
+
+    cursor = await db.execute(
+        "DELETE FROM cognitive_state WHERE "
+        "(expires_at IS NOT NULL AND expires_at < ?) OR "
+        "(expires_at IS NULL AND created_at < ?)",
+        (now, seven_days_ago),
+    )
+    await db.commit()
+    return cursor.rowcount
