@@ -52,16 +52,18 @@ class TestEgoFocusReset:
         assert result["status"] == "reset"
         assert result["focus_set_to"] == "monitoring API costs"
 
-    async def test_reset_rejects_behavioral_focus(self, db):
+    async def test_reset_accepts_any_focus(self, db):
+        """Focus reset is a simple write-through — behavioral regex removed
+        in PR #456 (computed focus makes it unnecessary)."""
         _conn, db_path = db
 
         from genesis.mcp.health.ego_tools import _impl_ego_focus_reset
 
-        with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path):
+        with patch("genesis.mcp.health.ego_tools._get_db_path", return_value=db_path), \
+             patch("genesis.memory.essential_knowledge.generate_and_write", new_callable=AsyncMock):
             result = await _impl_ego_focus_reset("holding back until user is ready")
 
-        assert result["status"] == "rejected"
-        assert "behavioral" in result["reason"].lower()
+        assert result["status"] == "reset"
 
     async def test_reset_both_ego_keys(self, db):
         conn, db_path = db
