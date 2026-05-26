@@ -112,12 +112,25 @@ class CompactionEngine:
             f"to think about, not how to operate.\n"
         )
 
-        # Previous focus — one-line continuity from last cycle.
-        focus = await ego_crud.get_state(
+        # System-computed focus — factual summary from DB state.
+        computed_focus = await ego_crud.get_state(
             self._db, self._focus_summary_key,
         )
-        if focus:
-            sections.append(f"## Previous Focus\n{focus}\n")
+        if computed_focus:
+            sections.append(f"## Current System State\n{computed_focus}\n")
+
+        # Ego's own previous assessment — from last cycle's ego_cycles
+        # record. Provides continuity without self-reinforcing loops
+        # (this is read-only context, not persisted to ego_state).
+        try:
+            recent = await ego_crud.list_recent_cycles(self._db, limit=1)
+            if recent and recent[0].get("focus_summary"):
+                prev_assessment = recent[0]["focus_summary"]
+                sections.append(
+                    f"## Your Previous Assessment\n{prev_assessment}\n"
+                )
+        except Exception:
+            pass  # Non-critical — skip if unavailable
 
         # Fresh situational context from the context builder.
         sections.append("## Operational Context\n")

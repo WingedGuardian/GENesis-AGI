@@ -90,15 +90,15 @@ class TestAssembleContext:
         """Fresh system: no previous focus, just context builder output."""
         ctx = await engine.assemble_context(context_builder=mock_context_builder)
         assert "Capabilities" in ctx  # from mock builder
-        assert "Previous Focus" not in ctx  # no stored focus
+        assert "Current System State" not in ctx  # no stored focus
 
     async def test_with_previous_focus(self, engine, db, mock_context_builder):
-        """When a previous focus exists, it appears in context."""
+        """When a computed focus exists, it appears in context."""
         await ego_crud.set_state(
             db, key="ego_focus_summary", value="investigating backlog",
         )
         ctx = await engine.assemble_context(context_builder=mock_context_builder)
-        assert "Previous Focus" in ctx
+        assert "Current System State" in ctx
         assert "investigating backlog" in ctx
         assert "Capabilities" in ctx  # context builder still included
 
@@ -148,12 +148,12 @@ class TestModeInjection:
         assert "FOCUSED:BETA-LAUNCH" in ctx
 
     async def test_mode_before_focus(self, engine, db, mock_context_builder):
-        """Mode section appears before Previous Focus."""
+        """Mode section appears before Current System State."""
         from genesis.db.crud import ego as ego_crud
         await ego_crud.set_state(db, key="ego_focus_summary", value="test focus")
         ctx = await engine.assemble_context(context_builder=mock_context_builder)
         mode_pos = ctx.index("Operating Mode")
-        focus_pos = ctx.index("Previous Focus")
+        focus_pos = ctx.index("Current System State")
         assert mode_pos < focus_pos
 
     async def test_genesis_ego_mode_key(self, db, mock_context_builder):
