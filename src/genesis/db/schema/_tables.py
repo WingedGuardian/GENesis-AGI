@@ -808,6 +808,25 @@ TABLES = {
             resolution  TEXT
         )
     """,
+    # ── Ego Intentions Queue ──────────────────────────────────────────────
+    "ego_intentions": """
+        CREATE TABLE IF NOT EXISTS ego_intentions (
+            id                TEXT PRIMARY KEY,
+            content           TEXT NOT NULL,          -- what to propose when triggered
+            trigger_condition TEXT NOT NULL,           -- when to fire (natural language)
+            ego_source        TEXT NOT NULL,           -- 'user_ego_cycle' or 'genesis_ego_cycle'
+            status            TEXT NOT NULL DEFAULT 'active'
+                CHECK (status IN ('active', 'fired', 'expired', 'withdrawn')),
+            created_at        TEXT NOT NULL,
+            fired_at          TEXT,
+            proposal_id       TEXT,                   -- FK to ego_proposals.id (set on fire)
+            cycle_count       INTEGER NOT NULL DEFAULT 0,
+            max_cycles        INTEGER NOT NULL DEFAULT 20,
+            reasoning         TEXT,
+            priority          TEXT NOT NULL DEFAULT 'normal'
+                CHECK (priority IN ('low', 'normal', 'high'))
+        )
+    """,
     # ── Intervention Journal ────────────────────────────────────────────────
     "intervention_journal": """
         CREATE TABLE IF NOT EXISTS intervention_journal (
@@ -1297,6 +1316,10 @@ INDEXES = [
     # ego directives
     "CREATE INDEX IF NOT EXISTS idx_ego_directives_status ON ego_directives(status)",
     "CREATE INDEX IF NOT EXISTS idx_ego_directives_created ON ego_directives(created_at)",
+    # ego intentions
+    "CREATE INDEX IF NOT EXISTS idx_ego_intentions_source_status ON ego_intentions(ego_source, status)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_intentions_status ON ego_intentions(status)",
+    "CREATE INDEX IF NOT EXISTS idx_ego_intentions_created ON ego_intentions(created_at)",
     # intervention journal
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_status ON intervention_journal(outcome_status)",
     "CREATE INDEX IF NOT EXISTS idx_intervention_journal_proposal ON intervention_journal(proposal_id)",

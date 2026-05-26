@@ -123,6 +123,7 @@ class EgoCycle:
         default_factory=lambda: datetime.now(UTC).isoformat()
     )
     compacted_into: str | None = None  # set when folded into compacted summary
+    ego_source: str = ""  # 'user_ego_cycle' or 'genesis_ego_cycle'
 
 
 @dataclass

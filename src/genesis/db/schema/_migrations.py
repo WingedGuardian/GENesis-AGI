@@ -1119,6 +1119,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT",
         "ego_proposals.goal_id")
 
+    # Ego cycles: ego_source so dashboard can show which ego ran each cycle.
+    await _try_alter(db,
+        "ALTER TABLE ego_cycles ADD COLUMN ego_source TEXT",
+        "ego_cycles.ego_source")
+
     # Surplus insights: consumed_at so reflection can mark promoted insights
     # as processed without losing the 'promoted' status.
     await _try_alter(db,
