@@ -92,7 +92,7 @@ class UserEgoContextBuilder:
         )
 
         sections.append(await self._user_model_section())
-        sections.append(self._ego_notepad_section())
+        sections.append(await self._intentions_section())
         sections.append(await self._user_goals_section())
         sections.append(await self._user_directives_section())
         sections.append(await self._world_snapshot_section())
@@ -222,6 +222,11 @@ class UserEgoContextBuilder:
         except Exception:
             logger.warning("Failed to read ego notepad", exc_info=True)
             return ""
+
+    async def _intentions_section(self) -> str:
+        """Deferred intentions for review."""
+        from genesis.ego.intentions_context import build_intentions_section
+        return await build_intentions_section(self._db, "user_ego_cycle")
 
     async def _user_goals_section(self) -> str:
         """Active user goals — the bedrock of the world model."""
