@@ -65,12 +65,12 @@ class FocusResult:
 #   "light"  — 1-2 line summary (implemented in PR 3)
 #   "skip"   — omit entirely
 #
-# "always" sections: user_model, ego_notepad, directives, output_contract
+# "always" sections: user_model, intentions, directives, output_contract
 # These are NEVER overridden regardless of focus type.
 
 _ALL_SECTIONS = (
     "user_model",
-    "ego_notepad",
+    "intentions",
     "goals",
     "directives",
     "world_snapshot",
@@ -92,7 +92,7 @@ _ALL_SECTIONS = (
 
 # Sections that are always included at full depth regardless of weights.
 _ALWAYS_SECTIONS = frozenset({
-    "user_model", "ego_notepad", "directives", "output_contract",
+    "user_model", "intentions", "directives", "output_contract",
 })
 
 

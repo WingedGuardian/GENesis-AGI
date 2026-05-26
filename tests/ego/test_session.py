@@ -498,12 +498,14 @@ class TestOutputParsing:
         assert result["focus_summary"] == "investigating backlog growth"
 
     def test_missing_required_field(self):
-        raw = json.dumps({"focus_summary": "test"})
-        result = EgoSession._parse_output(raw)
-        assert result is None  # missing proposals
-
-    def test_follow_ups_no_longer_required(self):
-        """follow_ups field removed from contract — output without it parses fine."""
+        """proposals and focus_summary are required; follow_ups is optional."""
+        # Missing proposals → None
+        raw = json.dumps({"focus_summary": "test", "follow_ups": []})
+        assert EgoSession._parse_output(raw) is None
+        # Missing focus_summary → None
+        raw = json.dumps({"proposals": [], "follow_ups": []})
+        assert EgoSession._parse_output(raw) is None
+        # follow_ups absent → still valid (no longer required)
         raw = json.dumps({"proposals": [], "focus_summary": "test"})
         result = EgoSession._parse_output(raw)
         assert result is not None

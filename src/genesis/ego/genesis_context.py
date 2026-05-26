@@ -52,6 +52,7 @@ class GenesisEgoContextBuilder:
         )
 
         sections.append(await self._system_health_section())
+        sections.append(await self._intentions_section())
         sections.append(await self._signals_section())
         sections.append(await self._observations_section())
         sections.append(await self._follow_ups_section())
@@ -66,6 +67,11 @@ class GenesisEgoContextBuilder:
         return "\n".join(sections)
 
     # -- Section builders --
+
+    async def _intentions_section(self) -> str:
+        """Deferred intentions for review."""
+        from genesis.ego.intentions_context import build_intentions_section
+        return await build_intentions_section(self._db, "genesis_ego_cycle")
 
     async def _system_health_section(self) -> str:
         """Live system health from health_data snapshot."""
@@ -643,8 +649,9 @@ class GenesisEgoContextBuilder:
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what Genesis is focused on",\n'
-            '  "follow_ups": [],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
+            '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
+            '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
             '  "communication_decision": "send_digest|urgent_notify|stay_quiet"\n'
             "}\n"
             "```\n\n"

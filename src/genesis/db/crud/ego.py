@@ -30,6 +30,7 @@ async def create_cycle(
     created_at: str | None = None,
     output_hash: str | None = None,
     output_size: int | None = None,
+    ego_source: str = "",
 ) -> str:
     """Insert a new ego cycle record. Returns the id."""
     if created_at is None:
@@ -38,8 +39,9 @@ async def create_cycle(
         """INSERT INTO ego_cycles
            (id, output_text, proposals_json, focus_summary,
             model_used, cost_usd, input_tokens, output_tokens,
-            duration_ms, created_at, output_hash, output_size)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            duration_ms, created_at, output_hash, output_size,
+            ego_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             output_text,
@@ -53,6 +55,7 @@ async def create_cycle(
             created_at,
             output_hash,
             output_size,
+            ego_source,
         ),
     )
     await db.commit()

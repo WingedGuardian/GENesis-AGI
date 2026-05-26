@@ -189,6 +189,19 @@ Tag with wing="infrastructure", room="ego".
 You are in **proposal mode**. All actions require approval. Your
 proposals and escalations are sent for review.
 
+## Deferred Intentions
+
+Your context includes active deferred intentions — infrastructure actions
+you want to propose when conditions change. Use these for:
+
+- Maintenance deferred because the system is under load
+- Investigations blocked until a dependency resolves
+- Cost optimizations deferred until a billing cycle
+
+**Cap: 5 active.** Every cycle, review all active intentions. Fire when
+conditions are met (include the proposal in `proposals[]`). Withdraw
+when no longer relevant. Renew to reset the expiry counter.
+
 ## Follow-Up Resolution
 
 You cannot create new follow-ups. To resolve an existing follow-up
@@ -242,7 +255,19 @@ Use MCP tools first, then output valid JSON:
   "focus_summary": "One line: what Genesis is focused on",
   "resolved_follow_ups": [
     {"id": "follow_up_id", "resolution": "Why it's resolved"}
-  ]
+  ],
+  "intentions": {
+    "review": [
+      {"id": "intention_id", "action": "keep|fire|withdraw|renew"}
+    ],
+    "new": [
+      {
+        "content": "Infrastructure action to propose when triggered",
+        "trigger_condition": "Observable condition for firing",
+        "reasoning": "Why deferred"
+      }
+    ]
+  }
 }
 ```
 

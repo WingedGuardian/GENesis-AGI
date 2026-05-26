@@ -4136,7 +4136,7 @@
                 <!-- User Ego (CEO) row -->
                 <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }" style="margin-bottom: 0.4rem;">
                   <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
-                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc; min-width: 2.8rem;">CEO</span>
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #c084fc; min-width: 2.8rem;">CEO <span style="font-weight: 400; opacity: 0.7;">(User)</span></span>
                     <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ue?.model || '?'"></span>
                     <template x-if="ue?.pending_proposals > 0">
                       <span style="font-size: 0.62rem; background: rgba(192,132,252,0.2); color: #c084fc; padding: 0 0.3rem; border-radius: 3px;"
@@ -4148,8 +4148,8 @@
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
                          :title="'Interval: ' + (ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || '?') + 'min / ' + (ue?.max_interval_minutes || 240) + 'min max'">
                       <div :style="(() => {
-                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 60;
-                        const base = ue?.cadence_minutes || 60;
+                        const cur = ue?.cadence?.current_interval_minutes || ue?.cadence_minutes || 90;
+                        const base = ue?.cadence_minutes || 90;
                         const max = ue?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
                         const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
@@ -4163,7 +4163,7 @@
                 <!-- Genesis Ego (COO) row -->
                 <div x-data="{ ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }">
                   <div style="display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.15rem;">
-                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa; min-width: 2.8rem;">COO</span>
+                    <span style="font-size: 0.72rem; font-weight: 600; color: #60a5fa; min-width: 2.8rem;">COO <span style="font-weight: 400; opacity: 0.7;">(Genesis)</span></span>
                     <span style="font-size: 0.68rem; opacity: 0.6;" x-text="ge?.model || '?'"></span>
                     <template x-if="ge?.pending_proposals > 0">
                       <span style="font-size: 0.62rem; background: rgba(96,165,250,0.2); color: #60a5fa; padding: 0 0.3rem; border-radius: 3px;"
@@ -4175,8 +4175,8 @@
                     <div style="flex: 1; height: 4px; background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;"
                          :title="'Interval: ' + (ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || '?') + 'min / ' + (ge?.max_interval_minutes || 240) + 'min max'">
                       <div :style="(() => {
-                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 60;
-                        const base = ge?.cadence_minutes || 60;
+                        const cur = ge?.cadence?.current_interval_minutes || ge?.cadence_minutes || 90;
+                        const base = ge?.cadence_minutes || 90;
                         const max = ge?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
                         const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
@@ -6625,33 +6625,92 @@
                   </select>
                 </div>
               </div>
-              <!-- Model / Cadence controls -->
-              <div style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px; display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem;">
-                <!-- Model -->
-                <div>
-                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Model</div>
-                  <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
-                          @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: $event.target.value}) })">
-                    <template x-for="m in ['opus', 'sonnet', 'haiku']" :key="m">
-                      <option :value="m" x-text="m.charAt(0).toUpperCase() + m.slice(1)"
-                              :selected="m === ($store.genesisDashboard.egoStatus?.model || 'opus')"></option>
-                    </template>
-                  </select>
+              <!-- Model -->
+              <div style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">
+                <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Model</div>
+                <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
+                        @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({model: $event.target.value}) })">
+                  <template x-for="m in ['opus', 'sonnet', 'haiku']" :key="m">
+                    <option :value="m" x-text="m.charAt(0).toUpperCase() + m.slice(1)"
+                            :selected="m === ($store.genesisDashboard.egoStatus?.model || 'opus')"></option>
+                  </template>
+                </select>
+              </div>
+              <!-- User Ego (CEO) Cadence -->
+              <div x-data="{ ue: $store.genesisDashboard.egoStatus?.egos?.user_ego }"
+                   style="margin-top: 0.6rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">
+                <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.4rem;">User Ego (CEO) Cadence</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                  <div>
+                    <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When active</div>
+                    <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                            @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cadence_minutes: parseInt($event.target.value)}) })">
+                      <template x-for="c in [30, 60, 90, 120, 180, 240]" :key="c">
+                        <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                :selected="c === ($store.genesisDashboard.egoStatus?.cadence_minutes || 90)"></option>
+                      </template>
+                    </select>
+                  </div>
+                  <div>
+                    <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When idle</div>
+                    <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                            @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({max_interval_minutes: parseInt($event.target.value)}) })">
+                      <template x-for="c in [120, 240, 480, 720, 1440]" :key="c">
+                        <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                :selected="c === (ue?.max_interval_minutes || 240)"></option>
+                      </template>
+                    </select>
+                  </div>
                 </div>
-                <!-- Cadence -->
-                <div>
-                  <div style="font-size: 0.72rem; color: #c084fc; font-weight: 600; margin-bottom: 0.2rem;">Base Cadence</div>
-                  <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.3rem 0.5rem; font-size: 0.82rem;"
-                          @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({cadence_minutes: parseInt($event.target.value)}) })">
-                    <template x-for="c in [30, 60, 120, 240]" :key="c">
-                      <option :value="c" x-text="c + 'min'"
-                              :selected="c === ($store.genesisDashboard.egoStatus?.cadence_minutes || 60)"></option>
-                    </template>
-                  </select>
+                <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.25rem;">
+                  Currently every <span x-text="ue?.cadence?.current_interval_minutes || '?'"></span>min.
+                  How often when you're engaged. Slows toward idle limit when you're away.
                 </div>
               </div>
-              <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-top: 0.3rem; padding: 0 0.8rem;">
-                Adaptive cadence: runs at base interval when active, backs off up to 4h when idle. Currently every <span x-text="$store.genesisDashboard.egoCadence?.current_interval_minutes || '?'"></span>min. Changes saved to local overlay. Restart server to apply.
+              <!-- Genesis Ego (COO) Cadence — collapsed by default -->
+              <div x-data="{ expanded: false, ge: $store.genesisDashboard.egoStatus?.egos?.genesis_ego }"
+                   style="margin-top: 0.4rem; padding: 0.4rem 0.8rem; background: rgba(96,165,250,0.04); border: 1px solid rgba(96,165,250,0.12); border-radius: 6px;">
+                <div style="display: flex; align-items: center; justify-content: space-between; cursor: pointer;" @click="expanded = !expanded">
+                  <span style="font-size: 0.72rem; color: #60a5fa; font-weight: 600;">Genesis Ego (COO) Cadence</span>
+                  <span style="font-size: 0.65rem; color: var(--color-text-secondary);">
+                    <template x-if="!expanded">
+                      <span x-text="'Active: ' + (ge?.cadence_minutes || '?') + 'min / Idle: ' + ((ge?.max_interval_minutes || 240)/60) + 'h  ▸'"></span>
+                    </template>
+                    <template x-if="expanded"><span>▾</span></template>
+                  </span>
+                </div>
+                <template x-if="expanded">
+                  <div style="margin-top: 0.4rem;">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem;">
+                      <div>
+                        <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When active</div>
+                        <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                                @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({genesis_cadence_minutes: parseInt($event.target.value)}) })">
+                          <template x-for="c in [30, 60, 90, 120, 180, 240]" :key="c">
+                            <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                    :selected="c === (ge?.cadence_minutes || 90)"></option>
+                          </template>
+                        </select>
+                      </div>
+                      <div>
+                        <div style="font-size: 0.65rem; color: var(--color-text-secondary); margin-bottom: 0.15rem;">When idle</div>
+                        <select style="width: 100%; background: var(--color-bg-secondary); color: var(--color-text-primary); border: 1px solid var(--color-border); border-radius: 4px; padding: 0.25rem 0.4rem; font-size: 0.78rem;"
+                                @change="fetchApi('/api/genesis/settings/ego', { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({genesis_max_interval_minutes: parseInt($event.target.value)}) })">
+                          <template x-for="c in [120, 240, 480, 720, 1440]" :key="c">
+                            <option :value="c" x-text="c >= 60 ? (c/60) + 'h' : c + 'min'"
+                                    :selected="c === (ge?.max_interval_minutes || 240)"></option>
+                          </template>
+                        </select>
+                      </div>
+                    </div>
+                    <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.25rem;">
+                      Currently every <span x-text="ge?.cadence?.current_interval_minutes || '?'"></span>min.
+                    </div>
+                  </div>
+                </template>
+              </div>
+              <div style="font-size: 0.6rem; color: var(--color-text-secondary); margin-top: 0.3rem; padding: 0 0.8rem;">
+                Adaptive cadence: runs at the "active" rate when you're engaged, backs off toward the "idle" limit when you're away, then slows further the longer you've been gone (up to every 3 days after 2 weeks).
               </div>
               <!-- Last cycle -->
               <template x-if="$store.genesisDashboard.egoStatus?.last_cycle">
@@ -6776,6 +6835,9 @@
                          @click="$store.genesisDashboard.egoModal.expandedCycle = $store.genesisDashboard.egoModal.expandedCycle === c.id ? null : c.id">
                       <span style="font-size: 0.72rem; color: var(--color-text-secondary); min-width: 120px;"
                             x-text="$store.genesisDashboard.formatDateTime(c.created_at)"></span>
+                      <span style="font-size: 0.62rem; padding: 1px 5px; border-radius: 3px; font-weight: 600; min-width: 28px; text-align: center;"
+                            :style="(c.ego_source || '').includes('genesis') ? 'background: rgba(59,130,246,0.15); color: #60a5fa;' : (c.ego_source ? 'background: rgba(168,85,247,0.15); color: #c084fc;' : 'background: rgba(136,136,136,0.1); color: #888;')"
+                            x-text="(c.ego_source || '').includes('genesis') ? 'COO' : (c.ego_source ? 'CEO' : '?')"></span>
                       <span style="font-size: 0.82rem; flex: 1;" x-text="c.focus_summary || 'No summary'"></span>
                       <span style="font-size: 0.72rem; color: var(--color-text-secondary);"
                             x-text="'$' + (c.cost_usd || 0).toFixed(4)"></span>

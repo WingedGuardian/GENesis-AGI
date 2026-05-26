@@ -268,7 +268,10 @@ class ProposalWorkflow:
 
     # -- Delivery ----------------------------------------------------------
 
-    # Minimum hours between digest deliveries per ego source.
+    # GROUNDWORK(digest-rate-limit): 6h minimum between Telegram deliveries
+    # per ego source. Proposals are stored regardless; only delivery is
+    # gated. Set to True when ready to enforce.
+    _DIGEST_RATE_LIMIT_ENABLED = False
     _DIGEST_RATE_LIMIT_HOURS = 6
 
     async def send_digest(
@@ -292,30 +295,29 @@ class ProposalWorkflow:
             logger.warning("No topic_manager — cannot send ego digest")
             return None
 
-        # Rate limit: check last delivery timestamp for this ego source
-        try:
+        # GROUNDWORK(digest-rate-limit): enforce minimum interval between
+        # Telegram deliveries per ego source. Proposals are already stored
+        # in the DB regardless; this only gates the notification.
+        if self._DIGEST_RATE_LIMIT_ENABLED and ego_source:
             from datetime import UTC, datetime, timedelta
 
-            from genesis.db.crud import ego as _ego_crud
-
-            rate_key = f"last_digest_delivery:{ego_source or 'default'}"
-            last_ts = await _ego_crud.get_state(self._db, rate_key)
+            state_key = f"last_digest_delivery:{ego_source}"
+            last_ts = await ego_crud.get_state(self._db, state_key)
             if last_ts:
-                last_dt = datetime.fromisoformat(last_ts)
-                cutoff = datetime.now(UTC) - timedelta(
-                    hours=self._DIGEST_RATE_LIMIT_HOURS,
-                )
-                if last_dt > cutoff:
-                    logger.info(
-                        "Digest rate-limited for %s — last delivery %s, "
-                        "minimum interval %dh. Proposals stored, not sent.",
-                        ego_source,
-                        last_ts[:19],
-                        self._DIGEST_RATE_LIMIT_HOURS,
+                try:
+                    last_dt = datetime.fromisoformat(last_ts)
+                    cutoff = datetime.now(UTC) - timedelta(
+                        hours=self._DIGEST_RATE_LIMIT_HOURS,
                     )
-                    return None
-        except Exception:
-            pass  # Fail open — send if rate check errors
+                    if last_dt > cutoff:
+                        logger.info(
+                            "Digest rate-limited for %s (last: %s, next eligible: %s)",
+                            ego_source, last_ts,
+                            (last_dt + timedelta(hours=self._DIGEST_RATE_LIMIT_HOURS)).isoformat(),
+                        )
+                        return None
+                except (ValueError, TypeError):
+                    pass  # Malformed timestamp — proceed with delivery
 
         proposals = await ego_crud.list_proposals_by_batch(self._db, batch_id)
         if not proposals:
@@ -374,18 +376,19 @@ class ProposalWorkflow:
             value=delivery_id,
         )
 
-        # Record delivery timestamp for rate limiting
+        # GROUNDWORK(digest-rate-limit): record delivery timestamp for
+        # rate limiting. Written even when gate is disabled so the
+        # timestamp is ready when the gate is flipped on.
         try:
-            from datetime import UTC, datetime
-
-            rate_key = f"last_digest_delivery:{ego_source or 'default'}"
-            await ego_crud.set_state(
-                self._db,
-                key=rate_key,
-                value=datetime.now(UTC).isoformat(),
-            )
+            if ego_source:
+                from datetime import UTC, datetime
+                await ego_crud.set_state(
+                    self._db,
+                    key=f"last_digest_delivery:{ego_source}",
+                    value=datetime.now(UTC).isoformat(),
+                )
         except Exception:
-            pass  # Non-critical
+            pass  # Non-critical — don't let timestamp failure block delivery
 
         logger.info(
             "Sent ego digest for batch %s (delivery_id=%s, %d proposals)",

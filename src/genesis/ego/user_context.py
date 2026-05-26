@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -92,7 +91,7 @@ class UserEgoContextBuilder:
         )
 
         sections.append(await self._user_model_section())
-        sections.append(self._ego_notepad_section())
+        sections.append(await self._intentions_section())
         sections.append(await self._user_goals_section())
         sections.append(await self._user_directives_section())
         sections.append(await self._world_snapshot_section())
@@ -205,23 +204,10 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    # -- Ego notepad (persistent qualitative observations) --
-
-    _NOTEPAD_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_NOTEPAD.md"
-    _NOTEPAD_MARKER = "# Ego Notepad"
-
-    def _ego_notepad_section(self) -> str:
-        """Inject the ego's persistent notepad into context."""
-        try:
-            if not self._NOTEPAD_PATH.exists():
-                return ""
-            content = self._NOTEPAD_PATH.read_text().strip()
-            if not content or self._NOTEPAD_MARKER not in content:
-                return ""
-            return f"## Your Knowledge Notepad\n\n{content}\n"
-        except Exception:
-            logger.warning("Failed to read ego notepad", exc_info=True)
-            return ""
+    async def _intentions_section(self) -> str:
+        """Deferred intentions for review."""
+        from genesis.ego.intentions_context import build_intentions_section
+        return await build_intentions_section(self._db, "user_ego_cycle")
 
     async def _user_goals_section(self) -> str:
         """Active user goals — the bedrock of the world model."""
@@ -1124,9 +1110,10 @@ class UserEgoContextBuilder:
             "    }\n"
             "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
-            '  "follow_ups": [],\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'
+            '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
+            '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
             '  "morning_report": "only if this is a morning trigger"\n'
             "}\n"
             "```\n\n"

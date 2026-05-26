@@ -151,7 +151,8 @@ async def init(rt: GenesisRuntime) -> None:
             config,
             model="sonnet",
             default_effort="high",
-            cadence_minutes=max(config.cadence_minutes, 60),
+            cadence_minutes=config.genesis_cadence_minutes,
+            max_interval_minutes=config.genesis_max_interval_minutes,
             morning_report_enabled=False,
         )
 

@@ -536,6 +536,7 @@ class EgoSession:
             input_tokens=output.input_tokens,
             output_tokens=output.output_tokens,
             duration_ms=output.duration_ms,
+            ego_source=self._source_tag,
         )
         await self._compaction.store_cycle(cycle)
 
@@ -712,10 +713,10 @@ class EgoSession:
                                 rd.get("id"), exc_info=True,
                             )
 
-            # 10d. Process knowledge notepad updates (user ego only)
-            knowledge_updates = parsed.get("knowledge_updates", [])
-            if knowledge_updates and self._source_tag == "user_ego_cycle":
-                await self._apply_knowledge_updates(knowledge_updates)
+            # 10d. Process deferred intentions (both egos)
+            intentions_data = parsed.get("intentions")
+            if intentions_data and isinstance(intentions_data, dict):
+                await self._process_intentions(intentions_data)
 
             # 11. Compute and store factual focus summary.
             # The ego's authored focus is already logged in ego_cycles
@@ -1296,88 +1297,105 @@ class EgoSession:
                 deduped,
             )
 
-    # -- Knowledge notepad --------------------------------------------------
+    # -- Deferred intentions ------------------------------------------------
 
-    _NOTEPAD_PATH = Path(__file__).resolve().parent.parent / "identity" / "EGO_NOTEPAD.md"
-    _NOTEPAD_MARKER = "# Ego Notepad"
-
-    async def _apply_knowledge_updates(
+    async def _process_intentions(
         self,
-        updates: list[dict],
+        intentions_data: dict,
     ) -> None:
-        """Apply incremental updates to EGO_NOTEPAD.md.
+        """Process the ego's intentions output: review existing + create new.
 
-        Each update: {section, action (add|update|remove), content, replaces?}
+        Actions in review: keep (increment cycle_count), fire (mark fired),
+        withdraw (mark withdrawn), renew (reset cycle_count).
         """
         try:
-            if self._NOTEPAD_PATH.exists():
-                text = self._NOTEPAD_PATH.read_text()
-            else:
-                # Seed from example template
-                example = self._NOTEPAD_PATH.with_suffix(".md.example")
-                text = example.read_text() if example.exists() else ""
+            from genesis.db.crud import ego_intentions
 
-            if not text.strip():
-                logger.warning("Ego notepad is empty — skipping updates")
-                return
-
-            sections = _parse_notepad_sections(text)
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
-
-            applied = 0
-            for u in updates:
-                section_name = u["section"]
-                action = u["action"]
-                # Sanitize: strip newlines (break markdown list), cap length
-                content = u["content"].replace("\n", " ").strip()[:500]
-
-                if section_name not in sections:
-                    logger.warning(
-                        "Ego notepad: unknown section %r — skipping",
-                        section_name,
-                    )
-                    continue
-
-                entries = sections[section_name]["entries"]
-                cap = sections[section_name]["cap"]
-
-                if action == "add":
-                    entries.append(f"- [{today}] {content}")
-                    # Enforce cap — trim oldest
-                    if cap and len(entries) > cap:
-                        entries[:] = entries[-cap:]
-                    applied += 1
-
-                elif action == "update":
-                    replaces = u.get("replaces", "")
-                    if not replaces:
-                        continue
-                    for i, entry in enumerate(entries):
-                        if replaces in entry:
-                            entries[i] = f"- [{today}] {content}"
-                            applied += 1
-                            break
-
-                elif action == "remove":
-                    for i, entry in enumerate(entries):
-                        if content in entry:
-                            entries.pop(i)
-                            applied += 1
-                            break
-
-            if applied == 0:
-                return
-
-            # Rebuild file
-            result = _rebuild_notepad(sections, today)
-            self._NOTEPAD_PATH.write_text(result)
-            logger.info(
-                "Ego notepad: applied %d/%d updates",
-                applied,
-                len(updates),
+            # 1. Auto-expire overdue intentions FIRST — clean the working set
+            # before the ego's review actions take effect. Uses strict > so
+            # an intention at exactly max_cycles survives one final review.
+            expired = await ego_intentions.expire_overdue(
+                self._db, self._source_tag,
             )
+            if expired:
+                logger.info(
+                    "Auto-expired %d intention(s) for %s",
+                    expired, self._source_tag,
+                )
+
+            # 2. Review existing intentions (filtered to this ego's source)
+            reviews = intentions_data.get("review", [])
+            if isinstance(reviews, list):
+                for entry in reviews:
+                    if not isinstance(entry, dict):
+                        continue
+                    iid = entry.get("id")
+                    action = entry.get("action")
+                    if not iid or action not in ("keep", "fire", "withdraw", "renew"):
+                        continue
+
+                    if action == "keep":
+                        new_count = await ego_intentions.increment_cycle_count(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        logger.debug("Intention %s kept (cycle %d)", iid, new_count)
+                    elif action == "fire":
+                        ok = await ego_intentions.fire(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s fired", iid)
+                        else:
+                            logger.warning("Intention %s fire failed (not active?)", iid)
+                    elif action == "withdraw":
+                        ok = await ego_intentions.withdraw(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s withdrawn", iid)
+                    elif action == "renew":
+                        ok = await ego_intentions.renew(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s renewed (counter reset)", iid)
+
+            # 3. Create new intentions
+            new_intentions = intentions_data.get("new", [])
+            if isinstance(new_intentions, list):
+                for item in new_intentions:
+                    if not isinstance(item, dict):
+                        continue
+                    content = (item.get("content") or "").strip()[:500]
+                    trigger = (item.get("trigger_condition") or "").strip()[:500]
+                    if not content or not trigger:
+                        logger.warning("Skipping intention with empty content/trigger")
+                        continue
+
+                    try:
+                        max_cycles = min(int(item.get("max_cycles", 20)), 50)
+                    except (ValueError, TypeError):
+                        max_cycles = 20
+                    priority = item.get("priority", "normal")
+                    if priority not in ("low", "normal", "high"):
+                        priority = "normal"
+
+                    iid = await ego_intentions.create(
+                        self._db,
+                        content=content,
+                        trigger_condition=trigger,
+                        ego_source=self._source_tag,
+                        reasoning=str(item.get("reasoning", ""))[:500],
+                        priority=priority,
+                        max_cycles=max_cycles,
+                    )
+                    if iid:
+                        logger.info("Created intention %s for %s", iid, self._source_tag)
+                    # None return means cap reached — already logged by CRUD
+
+            await self._db.commit()
         except Exception:
-            logger.error("Failed to apply ego notepad updates", exc_info=True)
+            logger.error("Failed to process intentions", exc_info=True)
 
     # -- Approved proposal sweep --------------------------------------------
 
@@ -1752,7 +1770,6 @@ def _parse_realist_response(
 
 
 _VALID_URGENCIES = frozenset({"low", "normal", "high", "critical"})
-_VALID_NOTEPAD_ACTIONS = frozenset({"add", "update", "remove"})
 
 # -- Behavioral focus detection --------------------------------------------
 #
@@ -1793,14 +1810,10 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("focus_summary"), str):
         logger.warning("Ego output missing or invalid 'focus_summary' field")
         return None
-    # follow_ups is no longer required — ego cannot create them.
-    # If present, log a warning (ego still trying to create follow-ups).
-    follow_ups = data.get("follow_ups")
-    if follow_ups and isinstance(follow_ups, list) and len(follow_ups) > 0:
-        logger.info(
-            "Ego output contains %d follow_ups (creation disabled, ignored)",
-            len(follow_ups),
-        )
+    # follow_ups is no longer required in the output contract.
+    # Accept presence or absence gracefully.
+    if "follow_ups" in data and not isinstance(data["follow_ups"], list):
+        data["follow_ups"] = []
 
     # Focus sanitization removed — focus_summary is system-computed
     # (computed_focus.py). The ego's authored focus is logged in
@@ -1817,20 +1830,43 @@ def _validate_output(data: dict) -> dict | None:
         except (ValueError, TypeError):
             p["confidence"] = 0.0
 
-    # Sanitize knowledge_updates — filter malformed entries.
+    # Sanitize knowledge_updates — legacy field, log if ego still outputs it.
     if "knowledge_updates" in data:
         raw = data["knowledge_updates"]
-        if not isinstance(raw, list):
-            data["knowledge_updates"] = []
+        if isinstance(raw, list) and raw:
+            logger.info(
+                "Ego output contains %d knowledge_updates (notepad removed, ignored)",
+                len(raw),
+            )
+        del data["knowledge_updates"]
+
+    # Sanitize intentions — validate structure.
+    if "intentions" in data:
+        raw = data["intentions"]
+        if not isinstance(raw, dict):
+            data["intentions"] = {"review": [], "new": []}
         else:
-            data["knowledge_updates"] = [
-                u
-                for u in raw
-                if isinstance(u, dict)
-                and isinstance(u.get("section"), str)
-                and u.get("action") in _VALID_NOTEPAD_ACTIONS
-                and isinstance(u.get("content"), str)
+            # Sanitize review entries
+            review = raw.get("review", [])
+            if not isinstance(review, list):
+                review = []
+            raw["review"] = [
+                r for r in review
+                if isinstance(r, dict)
+                and isinstance(r.get("id"), str)
+                and r.get("action") in ("keep", "fire", "withdraw", "renew")
             ]
+            # Sanitize new entries
+            new = raw.get("new", [])
+            if not isinstance(new, list):
+                new = []
+            raw["new"] = [
+                n for n in new
+                if isinstance(n, dict)
+                and isinstance(n.get("content"), str)
+                and isinstance(n.get("trigger_condition"), str)
+            ]
+            data["intentions"] = raw
 
     # Sanitize resolved_directives — filter malformed entries.
     if "resolved_directives" in data:
@@ -1847,83 +1883,3 @@ def _validate_output(data: dict) -> dict | None:
             ]
 
     return data
-
-
-# -- Notepad parsing helpers -----------------------------------------------
-
-_CAP_PATTERN = re.compile(r"_\(max (\d+) items?\)_")
-
-# Ordered sections for the ego notepad — defines output order.
-_NOTEPAD_SECTIONS = [
-    "Active Projects & Priorities",
-    "Interests & Expertise",
-    "Proposal Context Journal",
-    "Open Questions",
-]
-
-
-def _parse_notepad_sections(text: str) -> dict[str, dict]:
-    """Parse EGO_NOTEPAD.md into sections.
-
-    Returns {section_name: {"cap": int|None, "entries": [str]}}
-    preserving the header block (everything before the first ## section).
-    """
-    sections: dict[str, dict] = {}
-    current_section: str | None = None
-    header_lines: list[str] = []
-
-    for line in text.splitlines():
-        if line.startswith("## "):
-            current_section = line[3:].strip()
-            sections[current_section] = {"cap": None, "entries": []}
-        elif current_section is None:
-            header_lines.append(line)
-        elif current_section in sections:
-            cap_match = _CAP_PATTERN.search(line)
-            if cap_match:
-                sections[current_section]["cap"] = int(cap_match.group(1))
-            elif line.startswith("- "):
-                sections[current_section]["entries"].append(line)
-            # Skip empty lines and other non-entry content
-
-    # Store header for rebuild
-    sections["__header__"] = {"cap": None, "entries": header_lines}
-    return sections
-
-
-def _rebuild_notepad(sections: dict[str, dict], today: str) -> str:
-    """Rebuild EGO_NOTEPAD.md from parsed sections."""
-    lines: list[str] = []
-
-    # Header — update timestamp
-    for line in sections.get("__header__", {}).get("entries", []):
-        if "Last updated:" in line:
-            lines.append(f"> Last updated: {today}")
-        else:
-            lines.append(line)
-    lines.append("")
-
-    # Sections in defined order, then any extras
-    seen = {"__header__"}
-    for name in _NOTEPAD_SECTIONS:
-        if name in sections:
-            _emit_section(lines, name, sections[name])
-            seen.add(name)
-    for name, data in sections.items():
-        if name not in seen:
-            _emit_section(lines, name, data)
-
-    return "\n".join(lines) + "\n"
-
-
-def _emit_section(lines: list[str], name: str, data: dict) -> None:
-    """Emit a single section into the output lines."""
-    lines.append(f"## {name}")
-    cap = data.get("cap")
-    if cap:
-        lines.append(f"_(max {cap} items)_")
-    entries = data.get("entries", [])
-    if entries:
-        lines.append("")
-        lines.extend(entries)
-    lines.append("")

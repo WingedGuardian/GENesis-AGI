@@ -123,6 +123,7 @@ class EgoCycle:
         default_factory=lambda: datetime.now(UTC).isoformat()
     )
     compacted_into: str | None = None  # set when folded into compacted summary
+    ego_source: str = ""  # 'user_ego_cycle' or 'genesis_ego_cycle'
 
 
 @dataclass
@@ -151,5 +152,8 @@ class EgoConfig:
     shadow_morning_report: bool = True  # shadow mode for morning reports
     # Unified cognitive loop — goal review staleness threshold
     goal_review_staleness_days: int = 10  # trigger goal_review after N days without progress
+    # Genesis ego (COO) independent scheduling — defaults match user ego
+    genesis_cadence_minutes: int = 90  # base interval for genesis ego
+    genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
 
 

@@ -85,6 +85,7 @@ class CompactionEngine:
             created_at=cycle.created_at,
             output_hash=content_hash(cycle.output_text),
             output_size=content_size(cycle.output_text),
+            ego_source=cycle.ego_source,
         )
 
     async def assemble_context(
