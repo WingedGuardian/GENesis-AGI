@@ -606,6 +606,19 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
                             current_ids.add(alert_id)
                     except (ValueError, TypeError):
                         pass
+                # Check Tier 2 target configured
+                t2_status = backup_data.get("tier2_status", "unknown")
+                if t2_status in ("not_configured", "no_smbclient"):
+                    alert_id = "backup:tier2_unconfigured"
+                    alerts.append({
+                        "id": alert_id,
+                        "severity": "WARNING",
+                        "message": (
+                            "Large backup targets not configured — "
+                            "Qdrant/SQL snapshots are local-only"
+                        ),
+                    })
+                    current_ids.add(alert_id)
         except (json.JSONDecodeError, OSError):
             pass
     else:
