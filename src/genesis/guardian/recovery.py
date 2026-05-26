@@ -200,6 +200,8 @@ class RecoveryEngine:
         stands down and lets the system recover naturally.
         Never touches io.max (host safety boundary).
         """
+        import asyncio
+
         from genesis.guardian.cgroup_ops import (
             find_top_io_pids,
             find_top_io_pids_rate,
@@ -210,7 +212,7 @@ class RecoveryEngine:
         # 1. Collect diagnostics — rate-based ranking (500ms delta sample)
         #    identifies the actual current I/O offender, not just the
         #    process with the highest cumulative lifetime total.
-        top_pids = find_top_io_pids_rate(container, top_n=5)
+        top_pids = await asyncio.to_thread(find_top_io_pids_rate, container, 5)
         if not top_pids:
             # Fallback to cumulative if rate sampling fails (all PIDs gone)
             top_pids = find_top_io_pids(container, top_n=5)
