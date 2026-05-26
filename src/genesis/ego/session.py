@@ -1308,82 +1308,94 @@ class EgoSession:
         Actions in review: keep (increment cycle_count), fire (mark fired),
         withdraw (mark withdrawn), renew (reset cycle_count).
         """
-        from genesis.db.crud import ego_intentions
+        try:
+            from genesis.db.crud import ego_intentions
 
-        # 1. Auto-expire overdue intentions FIRST — clean the working set
-        # before the ego's review actions take effect. Uses strict > so
-        # an intention at exactly max_cycles survives one final review.
-        expired = await ego_intentions.expire_overdue(
-            self._db, self._source_tag,
-        )
-        if expired:
-            logger.info(
-                "Auto-expired %d intention(s) for %s",
-                expired, self._source_tag,
+            # 1. Auto-expire overdue intentions FIRST — clean the working set
+            # before the ego's review actions take effect. Uses strict > so
+            # an intention at exactly max_cycles survives one final review.
+            expired = await ego_intentions.expire_overdue(
+                self._db, self._source_tag,
             )
-
-        # 2. Review existing intentions
-        reviews = intentions_data.get("review", [])
-        if isinstance(reviews, list):
-            for entry in reviews:
-                if not isinstance(entry, dict):
-                    continue
-                iid = entry.get("id")
-                action = entry.get("action")
-                if not iid or action not in ("keep", "fire", "withdraw", "renew"):
-                    continue
-
-                if action == "keep":
-                    new_count = await ego_intentions.increment_cycle_count(
-                        self._db, iid,
-                    )
-                    logger.debug("Intention %s kept (cycle %d)", iid, new_count)
-                elif action == "fire":
-                    ok = await ego_intentions.fire(self._db, iid)
-                    if ok:
-                        logger.info("Intention %s fired", iid)
-                    else:
-                        logger.warning("Intention %s fire failed (not active?)", iid)
-                elif action == "withdraw":
-                    ok = await ego_intentions.withdraw(self._db, iid)
-                    if ok:
-                        logger.info("Intention %s withdrawn", iid)
-                elif action == "renew":
-                    ok = await ego_intentions.renew(self._db, iid)
-                    if ok:
-                        logger.info("Intention %s renewed (counter reset)", iid)
-
-        # 3. Create new intentions
-        new_intentions = intentions_data.get("new", [])
-        if isinstance(new_intentions, list):
-            for item in new_intentions:
-                if not isinstance(item, dict):
-                    continue
-                content = (item.get("content") or "").strip()[:500]
-                trigger = (item.get("trigger_condition") or "").strip()[:500]
-                if not content or not trigger:
-                    logger.warning("Skipping intention with empty content/trigger")
-                    continue
-
-                max_cycles = min(int(item.get("max_cycles", 20)), 50)
-                priority = item.get("priority", "normal")
-                if priority not in ("low", "normal", "high"):
-                    priority = "normal"
-
-                iid = await ego_intentions.create(
-                    self._db,
-                    content=content,
-                    trigger_condition=trigger,
-                    ego_source=self._source_tag,
-                    reasoning=str(item.get("reasoning", ""))[:500],
-                    priority=priority,
-                    max_cycles=max_cycles,
+            if expired:
+                logger.info(
+                    "Auto-expired %d intention(s) for %s",
+                    expired, self._source_tag,
                 )
-                if iid:
-                    logger.info("Created intention %s for %s", iid, self._source_tag)
-                # None return means cap reached — already logged by CRUD
 
-        await self._db.commit()
+            # 2. Review existing intentions (filtered to this ego's source)
+            reviews = intentions_data.get("review", [])
+            if isinstance(reviews, list):
+                for entry in reviews:
+                    if not isinstance(entry, dict):
+                        continue
+                    iid = entry.get("id")
+                    action = entry.get("action")
+                    if not iid or action not in ("keep", "fire", "withdraw", "renew"):
+                        continue
+
+                    if action == "keep":
+                        new_count = await ego_intentions.increment_cycle_count(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        logger.debug("Intention %s kept (cycle %d)", iid, new_count)
+                    elif action == "fire":
+                        ok = await ego_intentions.fire(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s fired", iid)
+                        else:
+                            logger.warning("Intention %s fire failed (not active?)", iid)
+                    elif action == "withdraw":
+                        ok = await ego_intentions.withdraw(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s withdrawn", iid)
+                    elif action == "renew":
+                        ok = await ego_intentions.renew(
+                            self._db, iid, ego_source=self._source_tag,
+                        )
+                        if ok:
+                            logger.info("Intention %s renewed (counter reset)", iid)
+
+            # 3. Create new intentions
+            new_intentions = intentions_data.get("new", [])
+            if isinstance(new_intentions, list):
+                for item in new_intentions:
+                    if not isinstance(item, dict):
+                        continue
+                    content = (item.get("content") or "").strip()[:500]
+                    trigger = (item.get("trigger_condition") or "").strip()[:500]
+                    if not content or not trigger:
+                        logger.warning("Skipping intention with empty content/trigger")
+                        continue
+
+                    try:
+                        max_cycles = min(int(item.get("max_cycles", 20)), 50)
+                    except (ValueError, TypeError):
+                        max_cycles = 20
+                    priority = item.get("priority", "normal")
+                    if priority not in ("low", "normal", "high"):
+                        priority = "normal"
+
+                    iid = await ego_intentions.create(
+                        self._db,
+                        content=content,
+                        trigger_condition=trigger,
+                        ego_source=self._source_tag,
+                        reasoning=str(item.get("reasoning", ""))[:500],
+                        priority=priority,
+                        max_cycles=max_cycles,
+                    )
+                    if iid:
+                        logger.info("Created intention %s for %s", iid, self._source_tag)
+                    # None return means cap reached — already logged by CRUD
+
+            await self._db.commit()
+        except Exception:
+            logger.error("Failed to process intentions", exc_info=True)
 
     # -- Approved proposal sweep --------------------------------------------
 
@@ -1773,14 +1785,10 @@ def _validate_output(data: dict) -> dict | None:
     if not isinstance(data.get("focus_summary"), str):
         logger.warning("Ego output missing or invalid 'focus_summary' field")
         return None
-    # follow_ups is no longer required — ego cannot create them.
-    # If present, log a warning (ego still trying to create follow-ups).
-    follow_ups = data.get("follow_ups")
-    if follow_ups and isinstance(follow_ups, list) and len(follow_ups) > 0:
-        logger.info(
-            "Ego output contains %d follow_ups (creation disabled, ignored)",
-            len(follow_ups),
-        )
+    # follow_ups is no longer required in the output contract.
+    # Accept presence or absence gracefully.
+    if "follow_ups" in data and not isinstance(data["follow_ups"], list):
+        data["follow_ups"] = []
 
     # Focus sanitization removed — focus_summary is system-computed
     # (computed_focus.py). The ego's authored focus is logged in

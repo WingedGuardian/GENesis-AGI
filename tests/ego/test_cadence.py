@@ -253,13 +253,21 @@ class TestCircuitBreaker:
 
 
 class TestAdaptiveInterval:
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, config):
+        """Prevent hot-reload from overriding the test config with disk values."""
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: config,
+        )
+
     async def test_backoff_increases_interval(self, cadence, mock_session, config):
         # Cycle with no proposals → backoff
         mock_session.run_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
         )
         await cadence._on_tick()
-        assert cadence.current_interval_minutes == config.cadence_minutes * int(config.backoff_multiplier)
+        assert cadence.current_interval_minutes == int(config.cadence_minutes * config.backoff_multiplier)
 
     async def test_proposals_reset_interval(self, cadence, mock_session, config):
         # First: backoff
