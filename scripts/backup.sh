@@ -311,16 +311,45 @@ git add -A
 if git diff --cached --quiet; then
     log "No changes since last backup"
 else
-    git commit -m "backup: $(date -Iseconds)" --quiet
-    git push --quiet || {
-        log "WARNING: git push failed — backup committed locally only"
-    }
-    log "Backup committed and pushed"
+    # Explicit error handling — set -e is suppressed by ||.
+    # Without this, a corrupt git repo silently kills the script
+    # (as happened 2026-05-08 through 2026-05-25: 17 days unnoticed).
+    if git commit -m "backup: $(date -Iseconds)" --quiet 2>&1; then
+        if ! git push --quiet 2>&1; then
+            _FAILURE_REASON="git push failed — backup exists locally only (not replicated to remote)"
+            log "ERROR: $_FAILURE_REASON"
+        else
+            log "Backup committed and pushed"
+        fi
+    else
+        _FAILURE_REASON="git commit failed (corrupt repo or index error)"
+        log "ERROR: git commit failed — repository may need re-clone from remote"
+    fi
 fi
 
-if [ "$_SQLITE_LINES" -gt 0 ]; then
+if [ "$_SQLITE_LINES" -gt 0 ] && [ -z "$_FAILURE_REASON" ]; then
     _SUCCESS=true
 else
-    log "WARNING: No SQLite data backed up — marking as failure"
+    if [ -z "$_FAILURE_REASON" ]; then
+        _FAILURE_REASON="No SQLite data backed up"
+    fi
+    log "WARNING: Backup incomplete — marking as failure (reason: $_FAILURE_REASON)"
+fi
+
+# --- Alert on failure via Telegram ---
+if [ "$_SUCCESS" != "true" ]; then
+    if [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_FORUM_CHAT_ID:-}" ]; then
+        _TG_MSG="🚨 *Backup failed*
+
+Reason: ${_FAILURE_REASON:-unknown}
+Time: $(date -Is)
+SQLite lines: $_SQLITE_LINES
+Duration: $(( $(date +%s) - _STARTED_AT ))s"
+        curl -sf -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{\"chat_id\":\"${TELEGRAM_FORUM_CHAT_ID}\",\"text\":$(printf '%s' "$_TG_MSG" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))'),\"parse_mode\":\"Markdown\"}" \
+            > /dev/null 2>&1 || log "WARNING: Telegram alert failed to send"
+    fi
 fi
 log "Backup complete (success=$_SUCCESS)"

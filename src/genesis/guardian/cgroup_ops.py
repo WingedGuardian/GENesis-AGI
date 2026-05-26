@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import signal
+import time
 from pathlib import Path
 
 from genesis.guardian._subprocess import run_subprocess as _run_subprocess
@@ -101,11 +102,50 @@ def list_container_pids(container: str) -> list[int]:
         return []
 
 
+def _read_proc_io(pid: int) -> dict | None:
+    """Read /proc/PID/io and /proc/PID/comm for a single PID.
+
+    Returns a dict with read_bytes, write_bytes, total_bytes, comm,
+    or None if the PID is gone or unreadable.
+    """
+    try:
+        io_path = Path(f"/proc/{pid}/io")
+        if not io_path.exists():
+            return None
+
+        io_content = io_path.read_text()
+        read_bytes = 0
+        write_bytes = 0
+        for line in io_content.splitlines():
+            if line.startswith("read_bytes:"):
+                read_bytes = int(line.split(":")[1].strip())
+            elif line.startswith("write_bytes:"):
+                write_bytes = int(line.split(":")[1].strip())
+
+        comm = "unknown"
+        with contextlib.suppress(OSError):
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+
+        return {
+            "pid": pid,
+            "read_bytes": read_bytes,
+            "write_bytes": write_bytes,
+            "total_bytes": read_bytes + write_bytes,
+            "comm": comm,
+        }
+    except (OSError, ValueError):
+        return None
+
+
 def find_top_io_pids(container: str, top_n: int = 5) -> list[dict]:
-    """Find top I/O consumers among container PIDs.
+    """Find top I/O consumers among container PIDs (cumulative).
 
     Reads /proc/PID/io for each container PID and returns the top N by
-    total bytes (read + write). Each entry is a dict with keys:
+    total bytes (read + write). These are CUMULATIVE lifetime counts —
+    long-running processes dominate. For current-rate ranking, use
+    find_top_io_pids_rate().
+
+    Each entry is a dict with keys:
     pid, read_bytes, write_bytes, total_bytes, comm.
 
     Returns an empty list on any error. Individual PID read failures are
@@ -115,42 +155,64 @@ def find_top_io_pids(container: str, top_n: int = 5) -> list[dict]:
     if not pids:
         return []
 
-    io_data: list[dict] = []
-    for pid in pids:
-        try:
-            io_path = Path(f"/proc/{pid}/io")
-            comm_path = Path(f"/proc/{pid}/comm")
-
-            if not io_path.exists():
-                continue
-
-            io_content = io_path.read_text()
-            read_bytes = 0
-            write_bytes = 0
-            for line in io_content.splitlines():
-                if line.startswith("read_bytes:"):
-                    read_bytes = int(line.split(":")[1].strip())
-                elif line.startswith("write_bytes:"):
-                    write_bytes = int(line.split(":")[1].strip())
-
-            comm = "unknown"
-            with contextlib.suppress(OSError):
-                comm = comm_path.read_text().strip()
-
-            io_data.append({
-                "pid": pid,
-                "read_bytes": read_bytes,
-                "write_bytes": write_bytes,
-                "total_bytes": read_bytes + write_bytes,
-                "comm": comm,
-            })
-        except (OSError, ValueError):
-            # Process may have exited between listing and reading
-            continue
-
-    # Sort by total I/O, descending
+    io_data = [d for pid in pids if (d := _read_proc_io(pid)) is not None]
     io_data.sort(key=lambda x: x["total_bytes"], reverse=True)
     return io_data[:top_n]
+
+
+def find_top_io_pids_rate(
+    container: str, top_n: int = 5, sample_interval_s: float = 0.5,
+) -> list[dict]:
+    """Find top I/O consumers by current rate (delta sampling).
+
+    Takes two /proc/PID/io snapshots separated by sample_interval_s and
+    computes the byte delta. Identifies the process actively writing NOW,
+    not just the one with the highest cumulative total.
+
+    Each entry is a dict with keys:
+      pid, comm, read_rate, write_rate, total_rate (bytes/sec),
+      read_bytes_cumulative, write_bytes_cumulative.
+
+    PIDs that disappear between samples are silently skipped.
+    Returns an empty list on any error.
+    """
+    pids = list_container_pids(container)
+    if not pids:
+        return []
+
+    # First sample
+    t0: dict[int, dict] = {}
+    for pid in pids:
+        data = _read_proc_io(pid)
+        if data:
+            t0[pid] = data
+
+    if not t0:
+        return []
+
+    time.sleep(sample_interval_s)
+
+    # Second sample + delta
+    rates: list[dict] = []
+    for pid, before in t0.items():
+        after = _read_proc_io(pid)
+        if after is None:
+            continue  # PID disappeared between samples
+        delta_read = max(0, after["read_bytes"] - before["read_bytes"])
+        delta_write = max(0, after["write_bytes"] - before["write_bytes"])
+        delta_total = delta_read + delta_write
+        rates.append({
+            "pid": pid,
+            "comm": after["comm"],
+            "read_rate": delta_read / sample_interval_s,
+            "write_rate": delta_write / sample_interval_s,
+            "total_rate": delta_total / sample_interval_s,
+            "read_bytes_cumulative": after["read_bytes"],
+            "write_bytes_cumulative": after["write_bytes"],
+        })
+
+    rates.sort(key=lambda x: x["total_rate"], reverse=True)
+    return rates[:top_n]
 
 
 async def kill_pid(

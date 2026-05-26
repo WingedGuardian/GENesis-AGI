@@ -202,24 +202,39 @@ class RecoveryEngine:
         """
         from genesis.guardian.cgroup_ops import (
             find_top_io_pids,
+            find_top_io_pids_rate,
             kill_pid,
             read_io_pressure,
         )
 
-        # 1. Collect diagnostics — find top 5 I/O consumers
-        top_pids = find_top_io_pids(container, top_n=5)
+        # 1. Collect diagnostics — rate-based ranking (500ms delta sample)
+        #    identifies the actual current I/O offender, not just the
+        #    process with the highest cumulative lifetime total.
+        top_pids = find_top_io_pids_rate(container, top_n=5)
         if not top_pids:
-            return False, "No I/O consuming processes found in container cgroup"
+            # Fallback to cumulative if rate sampling fails (all PIDs gone)
+            top_pids = find_top_io_pids(container, top_n=5)
+            if not top_pids:
+                return False, "No I/O consuming processes found in container cgroup"
 
         # Log all candidates for observability
         for entry in top_pids:
-            logger.info(
-                "IO_TRIAGE candidate: PID %d (%s) "
-                "read=%d write=%d total=%d bytes",
-                entry["pid"], entry["comm"],
-                entry["read_bytes"], entry["write_bytes"],
-                entry["total_bytes"],
-            )
+            if "total_rate" in entry:
+                logger.info(
+                    "IO_TRIAGE candidate: PID %d (%s) "
+                    "rate=%.0f bytes/s (cumulative: read=%d write=%d)",
+                    entry["pid"], entry["comm"], entry["total_rate"],
+                    entry.get("read_bytes_cumulative", 0),
+                    entry.get("write_bytes_cumulative", 0),
+                )
+            else:
+                logger.info(
+                    "IO_TRIAGE candidate (cumulative fallback): PID %d (%s) "
+                    "read=%d write=%d total=%d bytes",
+                    entry["pid"], entry["comm"],
+                    entry["read_bytes"], entry["write_bytes"],
+                    entry["total_bytes"],
+                )
 
         # 2. Assess PSI trend — is pressure accelerating or recovering?
         pressure = read_io_pressure(container)
@@ -241,9 +256,15 @@ class RecoveryEngine:
                 f"Failed to kill PID {target['pid']} ({target['comm']})"
             )
 
+        # Report rate if available, else cumulative
+        if "total_rate" in target:
+            io_detail = f"rate={target['total_rate']:.0f} bytes/s"
+        else:
+            io_detail = f"total_bytes={target['total_bytes']}"
+
         return True, (
             f"Killed top I/O consumer: PID {target['pid']} "
-            f"({target['comm']}) total_bytes={target['total_bytes']}"
+            f"({target['comm']}) {io_detail}"
         )
 
     async def _resource_clear(self, container: str) -> tuple[bool, str]:

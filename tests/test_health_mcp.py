@@ -210,7 +210,20 @@ class TestHealthAlerts:
         assert any("throttled" in w["message"] for w in warnings)
 
     @pytest.mark.asyncio
-    async def test_no_alerts_when_all_healthy(self):
+    async def test_no_alerts_when_all_healthy(self, tmp_path, monkeypatch):
+        # Create a fake successful backup status so the backup alert doesn't fire
+        import json
+        from datetime import UTC, datetime
+        from pathlib import Path
+
+        fake_home = tmp_path / "fakehome"
+        (fake_home / ".genesis").mkdir(parents=True)
+        (fake_home / ".genesis" / "backup_status.json").write_text(json.dumps({
+            "timestamp": datetime.now(UTC).isoformat(),
+            "success": True, "sqlite_lines": 100,
+        }))
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
         svc = _mock_service({
             "call_sites": {"a": {"status": "healthy"}},
             "queues": {"deferred_work": 5},

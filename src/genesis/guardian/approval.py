@@ -65,19 +65,23 @@ class _ApprovalState:
             return True
 
 
-# Module-level state shared between handler and caller
-_state = _ApprovalState()
-
-
 class _ApprovalHandler(BaseHTTPRequestHandler):
-    """HTTP handler for approval URLs."""
+    """HTTP handler for approval URLs.
+
+    Each ApprovalServer instance creates a bound subclass with its own
+    _approval_state class attribute.  This prevents the module-level
+    singleton bug where a second ApprovalServer would overwrite the
+    first server's token.
+    """
+
+    _approval_state: _ApprovalState  # Set by ApprovalServer.start()
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.rstrip("/")
 
         if path.startswith("/approve/"):
             token = path[len("/approve/"):]
-            if _state.try_approve(token):
+            if self._approval_state.try_approve(token):
                 self._respond(200, {
                     "status": "approved",
                     "message": "Recovery approved. Guardian will proceed.",
@@ -107,6 +111,11 @@ class _ApprovalHandler(BaseHTTPRequestHandler):
 class ApprovalServer:
     """Manages the approval HTTP server lifecycle.
 
+    Each instance owns its own _ApprovalState — no module-level
+    singleton. A bound handler subclass carries the state via a class
+    attribute, avoiding the bug where concurrent ApprovalServer instances
+    would share (and overwrite) each other's tokens.
+
     Starts in a background thread, generates single-use tokens,
     and auto-shuts down after approval or timeout.
     """
@@ -115,22 +124,31 @@ class ApprovalServer:
         self._config = config
         self._server: HTTPServer | None = None
         self._thread: threading.Thread | None = None
+        self._state = _ApprovalState()
 
     @property
     def is_approved(self) -> bool:
-        return _state.approved
+        return self._state.approved
 
     def start(self) -> str:
         """Start the approval server and return a new approval URL.
 
         Returns the full approval URL including token.
         """
-        token = _state.create_token(expiry_s=self._config.token_expiry_s)
+        token = self._state.create_token(expiry_s=self._config.token_expiry_s)
 
         host = self._config.bind_host or "0.0.0.0"  # noqa: S104
         port = self._config.port
 
-        self._server = HTTPServer((host, port), _ApprovalHandler)
+        # Create a handler subclass bound to THIS instance's state.
+        # HTTPServer takes a class (not instance), so we use a class
+        # attribute to carry the state into the handler.
+        state = self._state
+
+        class _BoundHandler(_ApprovalHandler):
+            _approval_state = state
+
+        self._server = HTTPServer((host, port), _BoundHandler)
         self._server.timeout = 1  # Allow periodic shutdown checks
 
         self._thread = threading.Thread(
@@ -165,7 +183,7 @@ class ApprovalServer:
 
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            if _state.approved:
+            if self._state.approved:
                 return True
             time.sleep(1)
         return False

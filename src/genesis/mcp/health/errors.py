@@ -567,6 +567,57 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         except Exception:
             logger.error("Genesis update alert check failed", exc_info=True)
 
+    # ── Backup health ───────────────────────────────────────────────
+    from pathlib import Path
+
+    backup_status_file = Path.home() / ".genesis" / "backup_status.json"
+    if backup_status_file.is_file():
+        try:
+            backup_data = json.loads(backup_status_file.read_text())
+            if not backup_data.get("success", False):
+                alert_id = "backup:last_failed"
+                reason = backup_data.get("failure_reason") or "check backup log"
+                ts = backup_data.get("timestamp", "unknown")
+                alerts.append({
+                    "id": alert_id,
+                    "severity": "CRITICAL",
+                    "message": f"Last backup failed at {ts}: {reason}",
+                })
+                current_ids.add(alert_id)
+            else:
+                # Check staleness — backup succeeded but too long ago
+                ts = backup_data.get("timestamp")
+                if ts:
+                    try:
+                        last = datetime.fromisoformat(ts)
+                        age_h = (
+                            datetime.now(UTC) - last
+                        ).total_seconds() / 3600
+                        if age_h > 8:  # 6h schedule + 2h grace
+                            alert_id = "backup:overdue"
+                            alerts.append({
+                                "id": alert_id,
+                                "severity": "CRITICAL",
+                                "message": (
+                                    f"Backup overdue — last success "
+                                    f"was {age_h:.0f}h ago"
+                                ),
+                            })
+                            current_ids.add(alert_id)
+                    except (ValueError, TypeError):
+                        pass
+        except (json.JSONDecodeError, OSError):
+            pass
+    else:
+        # No status file = backups never configured or never ran
+        alert_id = "backup:not_configured"
+        alerts.append({
+            "id": alert_id,
+            "severity": "CRITICAL",
+            "message": "Backups not configured — no backup status file found",
+        })
+        current_ids.add(alert_id)
+
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):
         if old_id in current_ids:
