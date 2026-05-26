@@ -236,6 +236,7 @@ class TestLifecycle:
 
     @pytest.mark.asyncio
     async def test_expire_overdue(self, db):
+        """Expiry uses strict > so the ego gets one final review at max_cycles."""
         from genesis.db.crud import ego_intentions
 
         iid = await ego_intentions.create(
@@ -245,12 +246,17 @@ class TestLifecycle:
             ego_source="user_ego_cycle",
             max_cycles=2,
         )
+        # At exactly max_cycles — should NOT expire yet (ego gets final review)
         await ego_intentions.increment_cycle_count(db, iid)
         await ego_intentions.increment_cycle_count(db, iid)
+        expired = await ego_intentions.expire_overdue(db, "user_ego_cycle")
+        assert expired == 0
+        assert await ego_intentions.count_active(db, "user_ego_cycle") == 1
 
+        # One more increment past max_cycles — NOW it expires
+        await ego_intentions.increment_cycle_count(db, iid)
         expired = await ego_intentions.expire_overdue(db, "user_ego_cycle")
         assert expired == 1
-
         items = await ego_intentions.list_active(db, "user_ego_cycle")
         assert len(items) == 0
 

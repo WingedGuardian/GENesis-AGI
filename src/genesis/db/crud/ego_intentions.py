@@ -101,13 +101,16 @@ async def fire(
     *,
     proposal_id: str | None = None,
 ) -> bool:
-    """Mark an intention as fired. Returns True if updated."""
+    """Mark an intention as fired. Returns True if updated.
+
+    Caller should commit — this function does not commit individually
+    to allow batching with other intention operations in a single cycle.
+    """
     cursor = await db.execute(
         "UPDATE ego_intentions SET status = 'fired', fired_at = ?, "
         "proposal_id = ? WHERE id = ? AND status = 'active'",
         (_now_iso(), proposal_id, intention_id),
     )
-    await db.commit()
     return cursor.rowcount > 0
 
 
@@ -115,13 +118,15 @@ async def withdraw(
     db: aiosqlite.Connection,
     intention_id: str,
 ) -> bool:
-    """Mark an intention as withdrawn. Returns True if updated."""
+    """Mark an intention as withdrawn. Returns True if updated.
+
+    Caller should commit.
+    """
     cursor = await db.execute(
         "UPDATE ego_intentions SET status = 'withdrawn' "
         "WHERE id = ? AND status = 'active'",
         (intention_id,),
     )
-    await db.commit()
     return cursor.rowcount > 0
 
 
@@ -131,14 +136,13 @@ async def renew(
 ) -> bool:
     """Reset cycle_count to 0 (intention still relevant, trigger not yet met).
 
-    Returns True if updated.
+    Returns True if updated. Caller should commit.
     """
     cursor = await db.execute(
         "UPDATE ego_intentions SET cycle_count = 0 "
         "WHERE id = ? AND status = 'active'",
         (intention_id,),
     )
-    await db.commit()
     return cursor.rowcount > 0
 
 
@@ -146,12 +150,14 @@ async def expire_overdue(
     db: aiosqlite.Connection,
     ego_source: str,
 ) -> int:
-    """Auto-expire intentions past their max_cycles. Returns count expired."""
+    """Auto-expire intentions past their max_cycles. Returns count expired.
+
+    Caller should commit.
+    """
     cursor = await db.execute(
         "UPDATE ego_intentions SET status = 'expired' "
         "WHERE ego_source = ? AND status = 'active' "
-        "AND cycle_count >= max_cycles",
+        "AND cycle_count > max_cycles",
         (ego_source,),
     )
-    await db.commit()
     return cursor.rowcount

@@ -1310,7 +1310,19 @@ class EgoSession:
         """
         from genesis.db.crud import ego_intentions
 
-        # 1. Review existing intentions
+        # 1. Auto-expire overdue intentions FIRST — clean the working set
+        # before the ego's review actions take effect. Uses strict > so
+        # an intention at exactly max_cycles survives one final review.
+        expired = await ego_intentions.expire_overdue(
+            self._db, self._source_tag,
+        )
+        if expired:
+            logger.info(
+                "Auto-expired %d intention(s) for %s",
+                expired, self._source_tag,
+            )
+
+        # 2. Review existing intentions
         reviews = intentions_data.get("review", [])
         if isinstance(reviews, list):
             for entry in reviews:
@@ -1340,16 +1352,6 @@ class EgoSession:
                     ok = await ego_intentions.renew(self._db, iid)
                     if ok:
                         logger.info("Intention %s renewed (counter reset)", iid)
-
-        # 2. Auto-expire overdue intentions
-        expired = await ego_intentions.expire_overdue(
-            self._db, self._source_tag,
-        )
-        if expired:
-            logger.info(
-                "Auto-expired %d intention(s) for %s",
-                expired, self._source_tag,
-            )
 
         # 3. Create new intentions
         new_intentions = intentions_data.get("new", [])
