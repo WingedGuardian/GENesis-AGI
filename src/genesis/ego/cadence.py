@@ -144,12 +144,19 @@ class EgoCadenceManager:
             misfire_grace_time=300,
         )
         self._scheduler.start()
-        self._reactive_task = asyncio.create_task(
-            self._reactive_loop(), name=f"ego_reactive_{id(self)}",
+        from genesis.util.tasks import tracked_task
+
+        self._reactive_task = tracked_task(
+            self._reactive_loop(),
+            name=f"ego_reactive_{id(self)}",
+            event_bus=self._event_bus,
+            logger=logger,
         )
-        self._signal_consumer_task = asyncio.create_task(
+        self._signal_consumer_task = tracked_task(
             self._signal_consumer_loop(),
             name=f"ego_signal_consumer_{id(self)}",
+            event_bus=self._event_bus,
+            logger=logger,
         )
         self._running = True
         morning_str = (
@@ -417,6 +424,9 @@ class EgoCadenceManager:
         )
         if self._signal_queue.push(signal):
             logger.debug("Proactive signal pushed: %s", signal.summary)
+        else:
+            # Roll back count so deep-think alignment is preserved
+            self._proactive_cycle_count -= 1
 
     async def _process_signals(self) -> None:
         """Drain signal queue and run unified cycle.
@@ -437,7 +447,9 @@ class EgoCadenceManager:
                 break
 
         async with self._lock:
-            # Re-check gates under lock (state may have changed since emission)
+            # Re-check gates under lock (state may have changed since emission).
+            # If rejected, drained signals are lost — acceptable for timer ticks
+            # since the next scheduled tick will push a new signal.
             if not self._should_run(skip_idle_check=True):
                 return
 
