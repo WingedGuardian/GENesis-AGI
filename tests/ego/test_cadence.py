@@ -217,8 +217,9 @@ class TestCadenceTick:
         self, cadence, mock_session,
     ):
         """CycleBlockedError in morning report also doesn't trip breaker."""
-        mock_session.run_cycle.side_effect = CycleBlockedError("approval pending")
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
         await cadence._on_morning_report()
+        await cadence._process_signals()
         assert cadence.consecutive_failures == 0
 
 
@@ -298,7 +299,7 @@ class TestProcessSignals:
 
 
 # ---------------------------------------------------------------------------
-# Morning report (unchanged — still uses run_cycle)
+# Morning report — now pushes signal instead of calling run_cycle
 # ---------------------------------------------------------------------------
 
 
@@ -309,7 +310,11 @@ class TestMorningReport:
         """Morning report runs even when user is active."""
         mock_idle_detector.is_idle.return_value = False
         await cadence._on_morning_report()
-        mock_session.run_cycle.assert_called_once_with(is_morning_report=True)
+        # Morning report now pushes a signal, not calls run_cycle
+        assert not cadence._signal_queue.empty()
+        signals = cadence._signal_queue.drain()
+        assert len(signals) == 1
+        assert signals[0].focus_category == "daily_briefing"
 
     async def test_morning_report_still_checks_pause(
         self, cadence, mock_session,
@@ -317,6 +322,33 @@ class TestMorningReport:
         cadence.pause()
         await cadence._on_morning_report()
         mock_session.run_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
+
+    async def test_morning_report_pushes_daily_briefing_signal(
+        self, cadence,
+    ):
+        """Morning report signal has correct metadata."""
+        await cadence._on_morning_report()
+        signals = cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.signal_type == "timer"
+        assert sig.focus_category == "daily_briefing"
+        assert sig.priority == "high"
+        assert "Morning report" in sig.summary
+        assert sig.metadata.get("model_override") == "sonnet"
+        assert sig.metadata.get("effort_override") == "low"
+
+    async def test_morning_report_effort_via_metadata(
+        self, cadence, mock_session,
+    ):
+        """Morning report effort override flows through to unified cycle."""
+        await cadence._on_morning_report()
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_called_once()
+        call_kwargs = mock_session.run_unified_cycle.call_args[1]
+        assert call_kwargs["model_override"] == "sonnet"
+        assert call_kwargs["effort_override"] == "low"
 
 
 # ---------------------------------------------------------------------------
