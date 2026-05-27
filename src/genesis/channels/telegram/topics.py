@@ -36,6 +36,8 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     "surplus": "Surplus",
     "recon": "Recon",
     "ego_proposals": "Ego Proposals",
+    # Dispatch lifecycle: "Dispatching..." on spawn, after-action debrief on completion.
+    "ego_dispatches": "Ego Dispatches",
     # Autonomous CLI approval prompts — inline ✅ buttons + optional
     # "approve all N pending" batch button.  Bare "approve"/"reject"
     # text messages in this topic resolve the most recent pending request.

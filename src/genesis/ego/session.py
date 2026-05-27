@@ -1613,7 +1613,7 @@ class EgoSession:
         return "\n".join(parts)
 
     async def _notify_execution(self, prop: dict, session_id: str) -> None:
-        """Send structured notification to ego_proposals topic."""
+        """Send structured notification to ego_dispatches topic."""
         try:
             import html as html_mod
 
@@ -1623,7 +1623,7 @@ class EgoSession:
             content = html_mod.escape(prop.get("content", "")[:200])
             action = html_mod.escape(prop.get("action_type", "unknown"))
             msg = f"<b>Dispatched</b> [{action}]: {content}\n<i>Session:</i> {session_id}"
-            await tm.send_to_category("ego_proposals", msg)
+            await tm.send_to_category("ego_dispatches", msg)
         except Exception:
             logger.debug("Failed to send execution notification", exc_info=True)
 
