@@ -273,6 +273,7 @@ class EgoSession:
         signals: list[EgoSignal],
         *,
         model_override: str | None = None,
+        effort_override: str | None = None,
     ) -> EgoCycle | None:
         """Execute one ego cycle via the unified perceive→think→act→learn pipeline.
 
@@ -287,6 +288,8 @@ class EgoSession:
             List of ``EgoSignal`` objects drained from the SignalQueue.
         model_override:
             Override model selection (takes precedence over config).
+        effort_override:
+            Override effort level (e.g. morning report uses "low").
 
         Returns the stored EgoCycle, or None if perception found nothing
         actionable or the CC invocation failed.
@@ -304,12 +307,14 @@ class EgoSession:
 
         # 2. THINK — context, prompt, invoke
 
-        # Context assembly — uses assemble_context() as-is.
-        # Context weights are DEFINED in focus.py lookup table but NOT
-        # wired to build() until PR 3 adds the context_weights param.
-        # PR 1: focus affects the PROMPT, not context assembly.
+        # Context assembly with focus-based section weights.
+        # Weights come from the focus selector's lookup table (focus.py).
+        # Sections marked "skip" are omitted, "light" get 1-2 line summaries,
+        # "always" sections (user_model, intentions, directives, output_contract)
+        # are never skipped.
         dynamic_context = await self._compaction.assemble_context(
             context_builder=self._context_builder,
+            context_weights=focus.context_weights if focus else None,
         )
 
         # Focus-specific prompt
@@ -318,9 +323,9 @@ class EgoSession:
             focus=focus,
         )
 
-        # Model + effort from config (no cycle-type overrides in unified loop)
+        # Model + effort from config, with signal-based overrides
         model = CCModel(model_override or self._config.model)
-        effort = EffortLevel(self._config.default_effort)
+        effort = EffortLevel(effort_override or self._config.default_effort)
 
         # System prompt is identity ONLY (cacheable)
         system_prompt = self._static_prompt

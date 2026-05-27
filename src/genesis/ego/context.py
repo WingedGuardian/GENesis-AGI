@@ -40,8 +40,21 @@ class EgoContextBuilder:
         self._health_data = health_data
         self._capabilities = capabilities or {}
 
-    async def build(self) -> str:
-        """Assemble the full EGO_CONTEXT.md content."""
+    async def build(
+        self,
+        *,
+        context_weights: dict[str, str] | None = None,
+    ) -> str:
+        """Assemble the full EGO_CONTEXT.md content.
+
+        Parameters
+        ----------
+        context_weights:
+            Per-section weight dict from the focus selector.
+            Accepted for API compatibility with the unified loop, but this
+            base class does not implement section filtering. Subclasses
+            (UserEgoContextBuilder, GenesisEgoContextBuilder) implement it.
+        """
         sections: list[str] = []
         sections.append("# EGO_CONTEXT — Operational Briefing\n")
         sections.append(

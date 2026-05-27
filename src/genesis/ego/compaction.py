@@ -92,12 +92,20 @@ class CompactionEngine:
         self,
         *,
         context_builder: EgoContextBuilder,
+        context_weights: dict[str, str] | None = None,
     ) -> str:
         """Assemble operational context for a new ego cycle.
 
         Returns a markdown string combining:
         1. Previous cycle's focus summary (continuity thread)
         2. Fresh situational context from EgoContextBuilder
+
+        Parameters
+        ----------
+        context_weights:
+            Optional per-section weight dict from the focus selector.
+            Keys are section names, values are "always"/"deep"/"light"/"skip".
+            When None, all sections are built at full depth (backward compat).
         """
         sections: list[str] = []
 
@@ -135,7 +143,9 @@ class CompactionEngine:
 
         # Fresh situational context from the context builder.
         sections.append("## Operational Context\n")
-        fresh_context = await context_builder.build()
+        fresh_context = await context_builder.build(
+            context_weights=context_weights,
+        )
         sections.append(fresh_context)
 
         return "\n".join(sections)

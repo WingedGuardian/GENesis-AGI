@@ -80,8 +80,29 @@ class UserEgoContextBuilder:
         self._db = db
         self._capabilities = capabilities or {}
 
-    async def build(self) -> str:
-        """Assemble the full user ego context."""
+    async def build(
+        self,
+        *,
+        context_weights: dict[str, str] | None = None,
+    ) -> str:
+        """Assemble the full user ego context.
+
+        Parameters
+        ----------
+        context_weights:
+            Per-section weight dict from the focus selector.
+            Values: "always", "deep", "light", "skip".
+            When None, all sections render at full depth (backward compat).
+        """
+        from genesis.ego.focus import _ALWAYS_SECTIONS
+
+        weights = dict(context_weights) if context_weights else {}
+        # Defensive: always-sections cannot be skipped or lightened,
+        # even if a caller passes bad weights directly.
+        for section in _ALWAYS_SECTIONS:
+            if weights.get(section) in ("skip", "light"):
+                weights[section] = "deep"
+
         sections: list[str] = []
         sections.append("# USER_EGO_CONTEXT — What Does the User Need?\n")
         sections.append(
@@ -90,33 +111,54 @@ class UserEgoContextBuilder:
             "to do if they were here right now?*\n"
         )
 
-        sections.append(await self._user_model_section())
-        sections.append(await self._intentions_section())
-        sections.append(await self._user_goals_section())
-        sections.append(await self._user_directives_section())
-        sections.append(await self._world_snapshot_section())
-        sections.append(await self._user_activity_pulse_section())
-        sections.append(await self._recent_conversations_section())
-        sections.append(await self._backlog_summary_section())
-        sections.append(await self._genesis_escalations_section())
-        sections.append(await self._capabilities_section())
-        # System status removed — user ego has no jurisdiction over Genesis
-        # health.  System issues reach it ONLY via genesis ego escalations.
-        sections.append(await self._follow_ups_section())
-        sections.append(await self._proposal_history_section())
-        sections.append(await self._proposal_board_section())
-        sections.append(await self._execution_outcomes_section())
-        sections.append(await self._goal_progress_section())
-        sections.append(await self._capability_performance_section())
-        sections.append(await self._autonomy_readiness_section())
-        sections.append(await self._recurring_patterns_section())
-        sections.append(self._output_contract_section())
+        # Map weight keys → section methods. Order matches the original
+        # build() order for deterministic output.
+        section_map: list[tuple[str, Any]] = [
+            ("user_model", self._user_model_section),
+            ("intentions", self._intentions_section),
+            ("goals", self._user_goals_section),
+            ("directives", self._user_directives_section),
+            ("world_snapshot", self._world_snapshot_section),
+            ("activity_pulse", self._user_activity_pulse_section),
+            ("recent_conversations", self._recent_conversations_section),
+            ("backlog_summary", self._backlog_summary_section),
+            ("escalations", self._genesis_escalations_section),
+            ("capabilities", self._capabilities_section),
+            # System status removed — user ego has no jurisdiction over
+            # Genesis health. Issues reach it ONLY via escalations.
+            ("follow_ups", self._follow_ups_section),
+            ("proposal_history", self._proposal_history_section),
+            ("proposal_board", self._proposal_board_section),
+            ("execution_outcomes", self._execution_outcomes_section),
+            ("goal_progress", self._goal_progress_section),
+            ("capability_performance", self._capability_performance_section),
+            ("autonomy_readiness", self._autonomy_readiness_section),
+            ("recurring_patterns", self._recurring_patterns_section),
+            ("output_contract", self._output_contract_section),
+        ]
+
+        import asyncio
+
+        for key, method in section_map:
+            depth = weights.get(key, "deep")
+            if depth == "skip":
+                continue
+            is_async = asyncio.iscoroutinefunction(method)
+            if depth == "light":
+                result = (
+                    await method(depth="light") if is_async
+                    else method(depth="light")
+                )
+            else:
+                # "deep" or "always" — full depth (default behavior)
+                result = await method() if is_async else method()
+            sections.append(result)
 
         return "\n".join(sections)
 
     # -- Section builders --
 
-    async def _user_model_section(self) -> str:
+    async def _user_model_section(self, *, depth: str = "deep") -> str:
         """Who the user is — from user_model_cache."""
         lines = ["## User Profile\n"]
 
@@ -136,6 +178,14 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         model_json, version, synthesized_at, evidence_count = row
+
+        if depth == "light":
+            return (
+                f"## User Profile\n"
+                f"*v{version}, {evidence_count} evidence points, "
+                f"synthesized {synthesized_at[:10]}*\n"
+            )
+
         lines.append(
             f"*v{version}, {evidence_count} evidence points, "
             f"last synthesized {synthesized_at[:10]}*\n"
@@ -204,12 +254,12 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _intentions_section(self) -> str:
+    async def _intentions_section(self, *, depth: str = "deep") -> str:
         """Deferred intentions for review."""
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "user_ego_cycle")
 
-    async def _user_goals_section(self) -> str:
+    async def _user_goals_section(self, *, depth: str = "deep") -> str:
         """Active user goals — the bedrock of the world model."""
         lines = ["## User Goals\n"]
 
@@ -227,6 +277,29 @@ class UserEgoContextBuilder:
                 "conversations and stored automatically.*\n"
             )
             return "\n".join(lines)
+
+        if depth == "light":
+            from datetime import UTC, datetime
+            now = datetime.now(UTC)
+            stale = 0
+            for g in goals:
+                updated_at = g.get("updated_at") or g.get("created_at") or ""
+                if updated_at:
+                    try:
+                        days = (now - datetime.fromisoformat(updated_at)).days
+                        if days >= 7:
+                            stale += 1
+                    except (ValueError, TypeError):
+                        pass
+            summary = f"{len(goals)} active goals"
+            if stale:
+                summary += f" ({stale} stale)"
+            titles = ", ".join(
+                g.get("title", "?")[:40] for g in goals[:3]
+            )
+            if len(goals) > 3:
+                titles += f", +{len(goals) - 3} more"
+            return f"## User Goals\n{summary}: {titles}\n"
 
         from datetime import UTC, datetime
 
@@ -290,7 +363,7 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _user_directives_section(self) -> str:
+    async def _user_directives_section(self, *, depth: str = "deep") -> str:
         """User directives — explicit user instructions for the ego.
 
         Only rendered if there are active directives. Returns empty string
@@ -345,12 +418,23 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _world_snapshot_section(self) -> str:
+    async def _world_snapshot_section(self, *, depth: str = "deep") -> str:
         """Synthesized view of the user's world — events, contacts, signals.
 
         Replaces the raw user-world observations section with a structured
         world snapshot that connects goals to events, contacts, and signals.
         """
+        if depth == "light":
+            try:
+                from genesis.ego.world_snapshot import build as build_snapshot
+                snapshot = await build_snapshot(self._db)
+                rendered = snapshot.render()
+                # Count non-empty lines as content proxy
+                items = len([ln for ln in rendered.split("\n") if ln.strip()])
+                return f"## User's World\n{items} items in world snapshot.\n"
+            except Exception:
+                return "## User's World\n*Snapshot not available.*\n"
+
         lines = ["## User's World\n"]
 
         try:
@@ -408,7 +492,7 @@ class UserEgoContextBuilder:
             return f"{value:.2f}"
         return str(value)
 
-    async def _user_activity_pulse_section(self) -> str:
+    async def _user_activity_pulse_section(self, *, depth: str = "deep") -> str:
         """User activity signals — interpreted for ego decision-making.
 
         Queries the latest awareness tick and surfaces user-facing signal
@@ -433,6 +517,9 @@ class UserEgoContextBuilder:
             return "\n".join(lines)
 
         signals_json, created_at = row
+
+        if depth == "light":
+            return f"## User Activity Pulse\nLatest tick: {created_at[:16]}\n"
 
         try:
             signals = json.loads(signals_json) if signals_json else {}
@@ -473,8 +560,22 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _recent_conversations_section(self) -> str:
+    async def _recent_conversations_section(self, *, depth: str = "deep") -> str:
         """What the user has been working on — from cc_sessions."""
+        if depth == "light":
+            try:
+                cursor = await self._db.execute(
+                    "SELECT COUNT(*) FROM cc_sessions "
+                    "WHERE source_tag = 'foreground' "
+                    "AND started_at >= datetime('now', '-48 hours') "
+                    "AND topic != ''"
+                )
+                row = await cursor.fetchone()
+                count = row[0] if row else 0
+                return f"## Recent Conversations (48h)\n{count} sessions.\n"
+            except Exception:
+                return "## Recent Conversations (48h)\n*Not available.*\n"
+
         lines = ["## Recent Conversations (48h)\n"]
 
         try:
@@ -511,10 +612,8 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _backlog_summary_section(self) -> str:
+    async def _backlog_summary_section(self, *, depth: str = "deep") -> str:
         """Inbox, recon, and pending item backlogs."""
-        lines = ["## Backlogs\n"]
-
         counts: list[tuple[str, int, str | None]] = []  # (label, count, oldest)
 
         # Inbox: pending/processing items
@@ -557,6 +656,13 @@ class UserEgoContextBuilder:
         except Exception:
             pass
 
+        if depth == "light":
+            if not counts:
+                return "## Backlogs\n*All clear.*\n"
+            parts = [f"{label}: {count}" for label, count, _ in counts]
+            return f"## Backlogs\n{' | '.join(parts)}\n"
+
+        lines = ["## Backlogs\n"]
         if not counts:
             lines.append("*All backlogs clear.*\n")
         else:
@@ -585,7 +691,7 @@ class UserEgoContextBuilder:
         except (ValueError, TypeError):
             return None
 
-    async def _genesis_escalations_section(self) -> str:
+    async def _genesis_escalations_section(self, *, depth: str = "deep") -> str:
         """Escalations from the Genesis ego that need user ego attention."""
         lines = ["## Genesis Ego Escalations\n"]
 
@@ -616,6 +722,16 @@ class UserEgoContextBuilder:
             lines.append("*No escalations from Genesis ego.*\n")
             return "\n".join(lines)
 
+        if depth == "light":
+            crit = sum(1 for r in rows if r[2] == "critical")
+            high = sum(1 for r in rows if r[2] == "high")
+            parts = [f"{len(rows)} escalations"]
+            if crit:
+                parts.append(f"{crit} critical")
+            if high:
+                parts.append(f"{high} high")
+            return f"## Genesis Ego Escalations\n{', '.join(parts)}.\n"
+
         lines.append(f"**{len(rows)} escalations** needing your attention:\n")
         for _source, content, priority, created_at in rows:
             age = self._days_ago(created_at) or "?"
@@ -629,13 +745,18 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _capabilities_section(self) -> str:
+    async def _capabilities_section(self, *, depth: str = "deep") -> str:
         """What Genesis CAN do — prompts stretch thinking."""
-        lines = ["## Genesis Capabilities\n"]
-
         if not self._capabilities:
-            lines.append("*No capabilities registered.*\n")
-            return "\n".join(lines)
+            return "## Genesis Capabilities\n*No capabilities registered.*\n"
+
+        if depth == "light":
+            return (
+                f"## Genesis Capabilities\n"
+                f"{len(self._capabilities)} capabilities available.\n"
+            )
+
+        lines = ["## Genesis Capabilities\n"]
 
         # Just list capabilities briefly — the ego can explore via MCP
         for name, description in sorted(self._capabilities.items()):
@@ -647,7 +768,7 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _follow_ups_section(self) -> str:
+    async def _follow_ups_section(self, *, depth: str = "deep") -> str:
         """Pending follow-ups the user ego should track."""
         lines = ["## Open Threads\n"]
 
@@ -663,6 +784,9 @@ class UserEgoContextBuilder:
         if not actionable:
             lines.append("*No follow-ups requiring attention.*\n")
             return "\n".join(lines)
+
+        if depth == "light":
+            return f"## Open Threads\n{len(actionable)} follow-ups pending.\n"
 
         # Filter to user-relevant follow-ups (pinned items always shown)
         user_relevant = [
@@ -700,7 +824,7 @@ class UserEgoContextBuilder:
 
     _NEUTRAL_STATUS = NEUTRAL_STATUS  # single source of truth in ego.types
 
-    async def _proposal_history_section(self) -> str:
+    async def _proposal_history_section(self, *, depth: str = "deep") -> str:
         """Recent proposal topics with neutral status for context.
 
         Split into Active and Recently Tried so active proposals are always
@@ -709,6 +833,28 @@ class UserEgoContextBuilder:
         when available. No aggregate scores, no user_response text —
         those trigger deference bias.
         """
+        if depth == "light":
+            try:
+                cursor = await self._db.execute(
+                    "SELECT COUNT(*) FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('pending', 'approved', 'executed')"
+                )
+                active = (await cursor.fetchone())[0]
+                cursor2 = await self._db.execute(
+                    "SELECT COUNT(*) FROM ego_proposals "
+                    "WHERE created_at >= datetime('now', '-7 days') "
+                    "AND status IN ('withdrawn', 'tabled', 'rejected', "
+                    "'failed', 'expired')"
+                )
+                tried = (await cursor2.fetchone())[0]
+                return (
+                    f"## Proposals\n"
+                    f"Active: {active} | Recently tried: {tried}\n"
+                )
+            except Exception:
+                return "## Proposals\n*Not available.*\n"
+
         lines = ["## Active Proposals\n"]
         table_header = (
             "| Action | Topic | Outcome | Realist |\n"
@@ -796,7 +942,7 @@ class UserEgoContextBuilder:
         except (ValueError, TypeError):
             return "?"
 
-    async def _proposal_board_section(self) -> str:
+    async def _proposal_board_section(self, *, depth: str = "deep") -> str:
         """Board (focus) + queue (pending) + approved + deferred."""
         from genesis.db.crud import ego as ego_crud
 
@@ -810,6 +956,15 @@ class UserEgoContextBuilder:
             lines.append("## Proposal Board\n")
             lines.append("*Could not query pending proposals.*\n")
             return "\n".join(lines)
+
+        if depth == "light":
+            board = sum(1 for p in all_pending if p.get("rank") is not None)
+            queue = len(all_pending) - board
+            return (
+                f"## Proposal Board\n"
+                f"{board} on board, {queue} queued, "
+                f"{len(all_pending)} total pending.\n"
+            )
 
         board = [p for p in all_pending if p.get("rank") is not None]
         queue = [p for p in all_pending if p.get("rank") is None]
@@ -899,7 +1054,7 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _execution_outcomes_section(self) -> str:
+    async def _execution_outcomes_section(self, *, depth: str = "deep") -> str:
         """Recent outcomes from ego-dispatched background sessions."""
         lines = ["## Recent Execution Outcomes (48h)\n"]
 
@@ -920,6 +1075,9 @@ class UserEgoContextBuilder:
             lines.append("*No ego dispatch outcomes in last 48h.*\n")
             return "\n".join(lines)
 
+        if depth == "light":
+            return f"## Recent Execution Outcomes (48h)\n{len(rows)} outcomes.\n"
+
         lines.append(f"**{len(rows)} outcomes**:\n")
         for content, priority, created_at in rows:
             short = (content or "")[:200].replace("\n", " ")
@@ -929,7 +1087,7 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _goal_progress_section(self) -> str:
+    async def _goal_progress_section(self, *, depth: str = "deep") -> str:
         """Goal pursuit progress — executed proposals grouped by goal."""
         lines = ["## Goal Progress (7d)\n"]
 
@@ -955,6 +1113,13 @@ class UserEgoContextBuilder:
             lines.append("*No goal-linked proposals executed recently.*\n")
             return "\n".join(lines)
 
+        if depth == "light":
+            goal_ids = {r[0] for r in rows}
+            return (
+                f"## Goal Progress (7d)\n"
+                f"{len(rows)} executed proposals across {len(goal_ids)} goals.\n"
+            )
+
         # Group by goal
         by_goal: dict[str, dict] = {}
         for goal_id, title, content, status, response, created in rows:
@@ -973,7 +1138,7 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _capability_performance_section(self) -> str:
+    async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """Your track record — domain confidence from multiple data sources.
 
         Framed as context for better proposals, NOT as a limiter.
@@ -991,6 +1156,13 @@ class UserEgoContextBuilder:
         if not entries:
             lines.append("*No performance data yet.*\n")
             return "\n".join(lines)
+
+        if depth == "light":
+            avg_conf = sum(e.get("confidence", 0) for e in entries) / len(entries)
+            return (
+                f"## Your Track Record\n"
+                f"{len(entries)} domains tracked (avg confidence: {avg_conf:.0%}).\n"
+            )
 
         _TREND_ICONS = {"improving": "+", "declining": "-", "stable": "="}
 
@@ -1011,7 +1183,7 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _autonomy_readiness_section(self) -> str:
+    async def _autonomy_readiness_section(self, *, depth: str = "deep") -> str:
         """Show autonomy posteriors — informs promotion proposals."""
         from genesis.db.crud import autonomy as autonomy_crud
         from genesis.db.crud.autonomy import bayesian_level, bayesian_posterior
@@ -1022,6 +1194,18 @@ class UserEgoContextBuilder:
             return ""
         if not states:
             return ""
+
+        if depth == "light":
+            ready = sum(
+                1 for s in states
+                if bayesian_level(s["total_successes"], s["total_corrections"])
+                > s["current_level"]
+            )
+            return (
+                f"## Autonomy Readiness\n"
+                f"{len(states)} categories tracked"
+                f"{f', {ready} ready for promotion' if ready else ''}.\n"
+            )
 
         lines = ["## Autonomy Readiness\n"]
         for row in states:
@@ -1045,7 +1229,7 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _recurring_patterns_section(self) -> str:
+    async def _recurring_patterns_section(self, *, depth: str = "deep") -> str:
         """Detect recurring observation patterns (3+ occurrences in 72h).
 
         Groups unresolved observations by (type, category) and surfaces
@@ -1075,6 +1259,9 @@ class UserEgoContextBuilder:
             lines.append("*No recurring patterns detected.*\n")
             return "\n".join(lines)
 
+        if depth == "light":
+            return f"## Recurring Patterns (72h)\n{len(rows)} patterns detected.\n"
+
         lines.append(
             f"**{len(rows)} pattern(s)** appearing 3+ times "
             f"(may warrant automation):\n"
@@ -1090,7 +1277,7 @@ class UserEgoContextBuilder:
         return "\n".join(lines)
 
     @staticmethod
-    def _output_contract_section() -> str:
+    def _output_contract_section(*, depth: str = "deep") -> str:
         """Remind the ego of its required output format."""
         return (
             "## Output Contract\n\n"
