@@ -101,6 +101,8 @@ class SignalQueue:
         self._dedup_hours = dedup_hours
         # summary → last_seen timestamp (same pattern as cadence.py:104)
         self._seen: dict[str, datetime] = {}
+        # Blocking notification for consumer loop (set on push, cleared on drain)
+        self._notify = asyncio.Event()
 
     def push(self, signal: EgoSignal) -> bool:
         """Add a signal to the queue.
@@ -136,6 +138,7 @@ class SignalQueue:
         # Try to enqueue
         try:
             self._queue.put_nowait(signal)
+            self._notify.set()
             logger.debug(
                 "Signal queued [%s]: %s",
                 signal.priority,
@@ -151,7 +154,11 @@ class SignalQueue:
 
         Returns signals sorted by priority (highest first — they
         come out in priority order from the PriorityQueue).
+
+        Clears the notify event BEFORE draining so that a push()
+        during drain re-sets it — the next wait() returns immediately.
         """
+        self._notify.clear()
         signals: list[EgoSignal] = []
         while not self._queue.empty():
             try:
@@ -175,8 +182,13 @@ class SignalQueue:
         """Whether the queue is empty."""
         return self._queue.empty()
 
+    async def wait(self) -> None:
+        """Block until at least one signal is pushed."""
+        await self._notify.wait()
+
     def clear(self) -> None:
         """Drop all signals and reset dedup state."""
+        self._notify.clear()
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()

@@ -5,7 +5,10 @@ Covers: priority ordering, dedup, expiry, queue overflow, drain, clear.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from genesis.ego.signals import EgoSignal, SignalQueue
 
@@ -177,3 +180,53 @@ def test_queue_dedup_truncates_long_summary():
 
     assert q.push(sig1) is True
     assert q.push(sig2) is False  # deduped by first 100 chars
+
+
+# ── SignalQueue.wait() ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_wait_returns_on_push():
+    """wait() should return once a signal is pushed."""
+    q = SignalQueue(maxsize=10)
+
+    async def push_after_delay():
+        await asyncio.sleep(0.05)
+        q.push(EgoSignal(summary="wake up"))
+
+    asyncio.create_task(push_after_delay())
+    await asyncio.wait_for(q.wait(), timeout=2.0)
+    assert not q.empty()
+
+
+@pytest.mark.asyncio
+async def test_wait_blocks_when_empty():
+    """wait() should not return if nothing is pushed (within timeout)."""
+    q = SignalQueue(maxsize=10)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(q.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_drain_clears_notify():
+    """After drain(), wait() should block again until next push."""
+    q = SignalQueue(maxsize=10)
+    q.push(EgoSignal(summary="first"))
+    q.drain()
+
+    # Event was cleared by drain — wait should block
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(q.wait(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_push_during_drain_resets_notify():
+    """If push() happens after drain clears the event, wait() returns immediately."""
+    q = SignalQueue(maxsize=10)
+    q.push(EgoSignal(summary="original"))
+    q.drain()  # clears notify
+
+    # Push a new signal — should re-set the event
+    q.push(EgoSignal(summary="new signal"))
+    await asyncio.wait_for(q.wait(), timeout=1.0)
+    assert not q.empty()

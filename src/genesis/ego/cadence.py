@@ -8,6 +8,7 @@ Owns an APScheduler with two jobs:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -19,6 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.ego.session import CycleBlockedError
+from genesis.ego.signals import EgoSignal, SignalQueue
 from genesis.ego.types import EgoConfig
 from genesis.env import user_timezone
 
@@ -91,6 +93,10 @@ class EgoCadenceManager:
         self._deep_think_interval = 5
         self._proactive_cycle_count = 0
 
+        # Unified signal queue: _on_tick() pushes here, consumer loop drains
+        self._signal_queue = SignalQueue()
+        self._signal_consumer_task: asyncio.Task | None = None
+
         # Reactive event queue: events push here, debounce loop drains
         self._reactive_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
         self._reactive_task: asyncio.Task | None = None
@@ -138,8 +144,19 @@ class EgoCadenceManager:
             misfire_grace_time=300,
         )
         self._scheduler.start()
-        self._reactive_task = asyncio.create_task(
-            self._reactive_loop(), name=f"ego_reactive_{id(self)}",
+        from genesis.util.tasks import tracked_task
+
+        self._reactive_task = tracked_task(
+            self._reactive_loop(),
+            name=f"ego_reactive_{id(self)}",
+            event_bus=self._event_bus,
+            logger=logger,
+        )
+        self._signal_consumer_task = tracked_task(
+            self._signal_consumer_loop(),
+            name=f"ego_signal_consumer_{id(self)}",
+            event_bus=self._event_bus,
+            logger=logger,
         )
         self._running = True
         morning_str = (
@@ -156,10 +173,18 @@ class EgoCadenceManager:
         )
 
     async def stop(self) -> None:
-        """Shut down APScheduler and reactive loop."""
-        if self._reactive_task is not None:
-            self._reactive_task.cancel()
-            self._reactive_task = None
+        """Shut down APScheduler, reactive loop, and signal consumer.
+
+        Awaits task cancellation so any held lock is released before
+        stop() returns — prevents deadlock if caller re-acquires the lock.
+        """
+        for attr in ("_reactive_task", "_signal_consumer_task"):
+            task = getattr(self, attr, None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, attr, None)
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
         self._running = False
@@ -359,67 +384,133 @@ class EgoCadenceManager:
     # -- Tick handlers -----------------------------------------------------
 
     async def _on_tick(self) -> None:
-        """Interval trigger handler. Checks all gates then runs cycle."""
+        """Interval trigger handler. Pushes idle signal for consumer loop.
+
+        Gate checks run here (emission-time). The consumer loop re-checks
+        under lock before running the cycle. Lock is NOT held here —
+        _on_tick only pushes signals, no shared mutable state besides
+        _proactive_cycle_count (serialized by APScheduler max_instances=1).
+        """
         self._emit_heartbeat("tick")
         logger.debug(
             "Ego tick fired (current_interval=%dm, config_cadence=%dm)",
             self._current_interval,
             self._config.cadence_minutes,
         )
-        async with self._lock:
-            if not self._should_run(skip_idle_check=False):
-                return
+        if not self._should_run(skip_idle_check=False):
+            return
 
-            # Deep-think: every Nth proactive cycle upgrades to Opus.
-            # Only effective for egos that normally run Sonnet (Genesis ego).
-            self._proactive_cycle_count += 1
-            model_override = None
-            if (
-                self._deep_think_interval > 0
-                and self._proactive_cycle_count % self._deep_think_interval == 0
-                and self._config.model != "opus"
-            ):
-                model_override = "opus"
-                logger.info(
-                    "Deep-think cycle %d — upgrading to Opus",
-                    self._proactive_cycle_count,
-                )
+        # Deep-think: every Nth proactive cycle upgrades to Opus.
+        # Only effective for egos that normally run Sonnet (Genesis ego).
+        self._proactive_cycle_count += 1
+        model_override = None
+        if (
+            self._deep_think_interval > 0
+            and self._proactive_cycle_count % self._deep_think_interval == 0
+            and self._config.model != "opus"
+        ):
+            model_override = "opus"
+            logger.info(
+                "Deep-think cycle %d — upgrading to Opus",
+                self._proactive_cycle_count,
+            )
+
+        signal = EgoSignal(
+            signal_type="timer",
+            focus_category="proactive",
+            summary=f"Idle tick #{self._proactive_cycle_count}",
+            priority="medium",
+            metadata={"model_override": model_override} if model_override else {},
+        )
+        if self._signal_queue.push(signal):
+            logger.debug("Proactive signal pushed: %s", signal.summary)
+        else:
+            # Roll back count so deep-think alignment is preserved
+            self._proactive_cycle_count -= 1
+
+    async def _process_signals(self) -> None:
+        """Drain signal queue and run unified cycle.
+
+        Separated from the consumer loop for testability — tests call
+        this directly after pushing signals.
+        """
+        signals = self._signal_queue.drain()
+        if not signals:
+            return
+
+        # Extract model override from signal metadata (deep-think)
+        model_override = None
+        for sig in signals:
+            mo = sig.metadata.get("model_override")
+            if mo:
+                model_override = mo
+                break
+
+        async with self._lock:
+            # Re-check gates under lock (state may have changed since emission).
+            # If rejected, drained signals are lost — acceptable for timer ticks
+            # since the next scheduled tick will push a new signal.
+            if not self._should_run(skip_idle_check=True):
+                return
 
             try:
-                cycle = await self._session.run_cycle(
-                    model_override=model_override,
+                cycle = await self._session.run_unified_cycle(
+                    signals, model_override=model_override,
                 )
             except CycleBlockedError as exc:
-                # Approval gate is a gate, not a failure.
-                # Don't trip the circuit breaker.
-                logger.info("Ego cycle gated: %s", exc)
+                logger.info("Unified cycle gated: %s", exc)
                 return
             except Exception as exc:
-                logger.error("Ego cycle failed with exception", exc_info=True)
+                logger.error("Unified cycle failed", exc_info=True)
                 self._record_failure(str(exc))
                 return
 
             if cycle is None:
-                # CC error or session creation failure
-                self._record_failure("cycle returned None")
+                # None here means CC-level failure (session creation,
+                # invocation error). The "no actionable signals" path
+                # from _perceive cannot reach here because we guard
+                # `if not signals: return` above.
+                self._record_failure("unified cycle returned None")
                 return
 
-            # Check if the cycle produced meaningful output.
-            # A parse-failure cycle has empty focus_summary — treat as soft failure
-            # so the circuit breaker can detect persistent LLM issues.
+            # Validate output (same logic as the old _on_tick)
             proposals = []
             try:
                 proposals = json.loads(cycle.proposals_json)
             except (json.JSONDecodeError, TypeError):
-                logger.debug("Could not parse proposals_json for cycle %s", cycle.id)
+                logger.debug(
+                    "Could not parse proposals_json for cycle %s", cycle.id,
+                )
 
             if not cycle.focus_summary and not proposals:
-                logger.warning("Ego cycle %s produced no usable output", cycle.id)
+                logger.warning(
+                    "Unified cycle %s produced no usable output", cycle.id,
+                )
                 self._record_failure("cycle produced no usable output")
                 return
 
             self._record_success()
             await self._update_interval(had_proposals=bool(proposals))
+
+    async def _signal_consumer_loop(self) -> None:
+        """Background consumer for the unified signal queue.
+
+        Blocks until signals arrive, brief batch window, then processes.
+        Same outer structure as _reactive_loop() for reliability.
+        """
+        while True:
+            try:
+                await self._signal_queue.wait()
+                await asyncio.sleep(2)  # Brief batch window
+                await self._process_signals()
+            except asyncio.CancelledError:
+                logger.debug("Signal consumer loop cancelled")
+                break
+            except Exception:
+                logger.warning(
+                    "Signal consumer error — backing off 60s", exc_info=True,
+                )
+                await asyncio.sleep(60)
 
     async def _on_morning_report(self) -> None:
         """Cron trigger handler. Morning report cycle (skips idle check)."""
