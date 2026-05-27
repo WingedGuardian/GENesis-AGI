@@ -467,8 +467,6 @@ class DirectSessionRunner:
             await update_proposal_outcome(
                 db, proposal_id, success=result.success, summary=summary,
             )
-            # Send after-action debrief to Telegram
-            await self._notify_dispatch_debrief(proposal_id, request, result)
             # On failure: create observation so ego sees it next cycle
             if not result.success:
                 try:
@@ -492,6 +490,8 @@ class DirectSessionRunner:
                 proposal_id,
                 exc_info=True,
             )
+        # Debrief is best-effort, fully self-contained (own try/except)
+        await self._notify_dispatch_debrief(proposal_id, request, result)
 
     async def _notify_dispatch_debrief(
         self,

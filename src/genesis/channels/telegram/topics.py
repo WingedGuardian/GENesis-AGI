@@ -285,6 +285,7 @@ class TopicManager:
             "surplus": "surplus",
             "recon": "recon",
             "ego_proposals": "ego_proposals",
+            "ego_dispatches": "ego_dispatches",
             # Autonomous CLI approvals get their own topic so the inline
             # button UX and "approve all N pending" semantics are clearly
             # scoped — they don't mix with general alerts.
