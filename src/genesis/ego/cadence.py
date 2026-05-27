@@ -448,9 +448,9 @@ class EgoCadenceManager:
             except CycleBlockedError as exc:
                 logger.info("Unified cycle gated: %s", exc)
                 return
-            except Exception:
+            except Exception as exc:
                 logger.error("Unified cycle failed", exc_info=True)
-                self._record_failure("unified cycle failed")
+                self._record_failure(str(exc))
                 return
 
             if cycle is None:
@@ -463,8 +463,12 @@ class EgoCadenceManager:
 
             # Validate output (same logic as the old _on_tick)
             proposals = []
-            with contextlib.suppress(json.JSONDecodeError, TypeError):
+            try:
                 proposals = json.loads(cycle.proposals_json)
+            except (json.JSONDecodeError, TypeError):
+                logger.debug(
+                    "Could not parse proposals_json for cycle %s", cycle.id,
+                )
 
             if not cycle.focus_summary and not proposals:
                 logger.warning(
