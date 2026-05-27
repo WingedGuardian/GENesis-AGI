@@ -119,6 +119,7 @@ async def init(rt: GenesisRuntime) -> None:
             session_id_key="user_ego_cc_session_id",
             focus_summary_key="ego_focus_summary",  # User ego owns the canonical focus
             source_tag="user_ego_cycle",
+            router=rt._router,
         )
 
         if rt._autonomous_dispatcher is not None:
@@ -191,6 +192,7 @@ async def init(rt: GenesisRuntime) -> None:
             session_id_key="genesis_ego_cc_session_id",
             focus_summary_key="genesis_ego_focus_summary",  # Separate from user ego
             source_tag="genesis_ego_cycle",
+            router=rt._router,
         )
 
         if rt._autonomous_dispatcher is not None:

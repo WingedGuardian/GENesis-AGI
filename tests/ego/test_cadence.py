@@ -1,4 +1,10 @@
-"""Tests for the ego cadence manager."""
+"""Tests for the ego cadence manager.
+
+After PR 2 (unified cognitive loop), _on_tick() pushes signals to the
+SignalQueue and _process_signals() drains the queue and calls
+run_unified_cycle(). Tests that verify end-to-end proactive behavior
+call _on_tick() then _process_signals().
+"""
 
 from __future__ import annotations
 
@@ -43,8 +49,9 @@ def config():
 
 @pytest.fixture
 def mock_session():
-    """Mock EgoSession with controllable run_cycle."""
+    """Mock EgoSession with controllable run_cycle and run_unified_cycle."""
     session = AsyncMock()
+    # Legacy path (morning report, reactive loop)
     session.run_cycle.return_value = EgoCycle(
         id="c1",
         output_text="test",
@@ -52,6 +59,17 @@ def mock_session():
         focus_summary="testing",
         model_used="opus",
         cost_usd=0.15,
+        ego_source="user_ego_cycle",
+    )
+    # Unified path (proactive via signal consumer)
+    session.run_unified_cycle.return_value = EgoCycle(
+        id="u1",
+        output_text="unified test",
+        proposals_json=json.dumps([{"action_type": "test"}]),
+        focus_summary="unified testing",
+        model_used="opus",
+        cost_usd=0.15,
+        ego_source="user_ego_cycle",
     )
     return session
 
@@ -99,6 +117,9 @@ class TestCadenceLifecycle:
         job_ids = {j.id for j in jobs}
         assert "ego_cycle" in job_ids
         assert "ego_morning_report" in job_ids
+        # Consumer task should be running
+        assert cadence._signal_consumer_task is not None
+        assert not cadence._signal_consumer_task.done()
         await cadence.stop()
 
     async def test_stop_shuts_down(self, cadence):
@@ -106,6 +127,7 @@ class TestCadenceLifecycle:
         assert cadence.is_running
         await cadence.stop()
         assert not cadence.is_running
+        assert cadence._signal_consumer_task is None
 
     async def test_pause_resume(self, cadence):
         assert not cadence.is_paused
@@ -116,26 +138,37 @@ class TestCadenceLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Tick behavior
+# Tick behavior — _on_tick() now pushes signals, _process_signals() runs cycle
 # ---------------------------------------------------------------------------
 
 
 class TestCadenceTick:
-    async def test_tick_runs_cycle_when_idle(
-        self, cadence, mock_session, mock_idle_detector,
+    async def test_tick_pushes_signal_to_queue(
+        self, cadence, mock_idle_detector,
     ):
+        """_on_tick() pushes a signal to the queue (doesn't call run_cycle)."""
         mock_idle_detector.is_idle.return_value = True
         await cadence._on_tick()
-        mock_session.run_cycle.assert_called_once()
+        assert not cadence._signal_queue.empty()
+
+    async def test_tick_runs_unified_cycle_when_idle(
+        self, cadence, mock_session, mock_idle_detector,
+    ):
+        """_on_tick() + _process_signals() calls run_unified_cycle."""
+        mock_idle_detector.is_idle.return_value = True
+        await cadence._on_tick()
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_called_once()
         # model_override is None for normal proactive cycles
-        assert mock_session.run_cycle.call_args.kwargs.get("model_override") is None
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") is None
 
     async def test_tick_skips_when_active(
         self, cadence, mock_session, mock_idle_detector,
     ):
         mock_idle_detector.is_idle.return_value = False
         await cadence._on_tick()
-        mock_session.run_cycle.assert_not_called()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_onboarding_incomplete(
         self, cadence, mock_session, tmp_path,
@@ -143,35 +176,41 @@ class TestCadenceTick:
         # Remove the marker created by autouse fixture
         (tmp_path / ".genesis" / "setup-complete").unlink()
         await cadence._on_tick()
-        mock_session.run_cycle.assert_not_called()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_paused(
         self, cadence, mock_session,
     ):
         cadence.pause()
         await cadence._on_tick()
-        mock_session.run_cycle.assert_not_called()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
 
     async def test_tick_skips_when_circuit_open(
         self, cadence, mock_session,
     ):
         cadence._circuit_open_until = datetime.now(UTC) + timedelta(hours=1)
         await cadence._on_tick()
-        mock_session.run_cycle.assert_not_called()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
 
     async def test_tick_handles_exception(
         self, cadence, mock_session,
     ):
-        mock_session.run_cycle.side_effect = RuntimeError("boom")
+        """Exception in run_unified_cycle records a failure."""
+        mock_session.run_unified_cycle.side_effect = RuntimeError("boom")
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.consecutive_failures == 1
 
     async def test_tick_cycle_blocked_does_not_trip_breaker(
         self, cadence, mock_session,
     ):
         """CycleBlockedError is a gate, not a failure — no circuit breaker impact."""
-        mock_session.run_cycle.side_effect = CycleBlockedError("approval pending")
+        mock_session.run_unified_cycle.side_effect = CycleBlockedError("approval pending")
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.consecutive_failures == 0
 
     async def test_morning_report_cycle_blocked_does_not_trip_breaker(
@@ -184,7 +223,82 @@ class TestCadenceTick:
 
 
 # ---------------------------------------------------------------------------
-# Morning report
+# Signal consumer — _process_signals() tests
+# ---------------------------------------------------------------------------
+
+
+class TestProcessSignals:
+    async def test_process_signals_calls_unified_cycle(
+        self, cadence, mock_session,
+    ):
+        """_process_signals() drains queue and calls run_unified_cycle."""
+        from genesis.ego.signals import EgoSignal
+
+        cadence._signal_queue.push(EgoSignal(
+            signal_type="timer",
+            focus_category="proactive",
+            summary="Idle tick #1",
+        ))
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_called_once()
+        # Signals are passed as first positional arg
+        call_args = mock_session.run_unified_cycle.call_args
+        signals = call_args[0][0]
+        assert len(signals) == 1
+        assert signals[0].summary == "Idle tick #1"
+
+    async def test_process_signals_empty_queue_noop(
+        self, cadence, mock_session,
+    ):
+        """Empty queue → no cycle call."""
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_deep_think_passes_model_override_via_metadata(
+        self, cadence, mock_session, mock_idle_detector, monkeypatch,
+    ):
+        """Every Nth proactive cycle passes model_override='opus' via signal metadata."""
+        mock_idle_detector.is_idle.return_value = True
+        sonnet_config = EgoConfig(
+            cadence_minutes=60, model="sonnet",  # Non-opus so deep-think triggers
+        )
+        cadence._config = sonnet_config
+        # Prevent hot-reload from overwriting test config back to disk values
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: sonnet_config,
+        )
+        cadence._deep_think_interval = 2  # Every 2nd cycle
+
+        # Cycle 1: no override
+        await cadence._on_tick()
+        await cadence._process_signals()
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") is None
+
+        # Cycle 2: deep-think → opus override
+        mock_session.run_unified_cycle.reset_mock()
+        await cadence._on_tick()
+        await cadence._process_signals()
+        assert mock_session.run_unified_cycle.call_args.kwargs.get("model_override") == "opus"
+
+    async def test_signal_queue_created_on_init(self, cadence):
+        """EgoCadenceManager creates a SignalQueue on init."""
+        assert cadence._signal_queue is not None
+        assert cadence._signal_queue.empty()
+
+    async def test_consumer_loop_lifecycle(self, cadence):
+        """start() creates consumer task, stop() cancels it."""
+        assert cadence._signal_consumer_task is None
+        await cadence.start()
+        assert cadence._signal_consumer_task is not None
+        task = cadence._signal_consumer_task
+        assert not task.done()
+        await cadence.stop()
+        assert cadence._signal_consumer_task is None
+
+
+# ---------------------------------------------------------------------------
+# Morning report (unchanged — still uses run_cycle)
 # ---------------------------------------------------------------------------
 
 
@@ -206,36 +320,42 @@ class TestMorningReport:
 
 
 # ---------------------------------------------------------------------------
-# Circuit breaker
+# Circuit breaker — driven via _on_tick() + _process_signals()
 # ---------------------------------------------------------------------------
 
 
 class TestCircuitBreaker:
     async def test_opens_after_n_failures(self, cadence, mock_session, config):
-        mock_session.run_cycle.return_value = None  # failure signal
+        mock_session.run_unified_cycle.return_value = None  # failure signal
         for _ in range(config.consecutive_failure_limit):
             await cadence._on_tick()
+            await cadence._process_signals()
 
         assert cadence.consecutive_failures == config.consecutive_failure_limit
         assert cadence._circuit_open_until is not None
 
         # Next tick should be skipped due to circuit breaker
-        mock_session.run_cycle.reset_mock()
+        mock_session.run_unified_cycle.reset_mock()
         await cadence._on_tick()
-        mock_session.run_cycle.assert_not_called()
+        mock_session.run_unified_cycle.assert_not_called()
+        assert cadence._signal_queue.empty()
 
     async def test_resets_on_success(self, cadence, mock_session):
         # Simulate 2 failures
-        mock_session.run_cycle.return_value = None
+        mock_session.run_unified_cycle.return_value = None
         await cadence._on_tick()
+        await cadence._process_signals()
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.consecutive_failures == 2
 
         # Success resets
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="ok", proposals_json="[]", focus_summary="ok",
+            ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.consecutive_failures == 0
 
     async def test_expires_after_backoff(self, cadence, config):
@@ -248,7 +368,7 @@ class TestCircuitBreaker:
 
 
 # ---------------------------------------------------------------------------
-# Adaptive interval
+# Adaptive interval — driven via _on_tick() + _process_signals()
 # ---------------------------------------------------------------------------
 
 
@@ -263,37 +383,45 @@ class TestAdaptiveInterval:
 
     async def test_backoff_increases_interval(self, cadence, mock_session, config):
         # Cycle with no proposals → backoff
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.current_interval_minutes == int(config.cadence_minutes * config.backoff_multiplier)
 
     async def test_proposals_reset_interval(self, cadence, mock_session, config):
         # First: backoff
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.current_interval_minutes > config.cadence_minutes
 
         # Then: proposals reset
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="active",
             proposals_json=json.dumps([{"action_type": "test"}]),
             focus_summary="active",
+            ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.current_interval_minutes == config.cadence_minutes
 
     async def test_backoff_capped_at_max(self, cadence, mock_session, config):
         """Multiple idle cycles don't exceed max_interval_minutes."""
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
         )
         # Run enough times to exceed max
         for _ in range(10):
             await cadence._on_tick()
+            await cadence._process_signals()
         assert cadence.current_interval_minutes <= config.max_interval_minutes
 
 
@@ -384,17 +512,26 @@ class TestRecencyMaxInterval:
 class TestRecencyAwareBackoff:
     """_update_interval respects recency-adjusted max."""
 
+    @pytest.fixture(autouse=True)
+    def _isolate_config(self, monkeypatch, config):
+        monkeypatch.setattr(
+            "genesis.ego.config.load_ego_config",
+            lambda: config,
+        )
+
     async def test_backoff_respects_recency_tier(self, cadence, mock_session, db):
         """When user was active 2 days ago, backoff caps at 480 (not 240)."""
         ts = (datetime.now(UTC) - timedelta(days=2)).isoformat()
         await _insert_foreground_session(db, last_activity_at=ts)
 
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
         )
         # Run enough idle cycles to hit the cap
         for _ in range(10):
             await cadence._on_tick()
+            await cadence._process_signals()
 
         assert cadence.current_interval_minutes <= 480
         # Should have backed off beyond the old 240 cap
@@ -406,20 +543,24 @@ class TestRecencyAwareBackoff:
         old_ts = (datetime.now(UTC) - timedelta(days=10)).isoformat()
         await _insert_foreground_session(db, last_activity_at=old_ts)
 
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="quiet", proposals_json="[]", focus_summary="idle",
+            ego_source="user_ego_cycle",
         )
         for _ in range(5):
             await cadence._on_tick()
+            await cadence._process_signals()
         assert cadence.current_interval_minutes > cadence._config.cadence_minutes
 
         # Productive cycle → reset to base
-        mock_session.run_cycle.return_value = EgoCycle(
+        mock_session.run_unified_cycle.return_value = EgoCycle(
             output_text="active",
             proposals_json=json.dumps([{"action_type": "test"}]),
             focus_summary="active",
+            ego_source="user_ego_cycle",
         )
         await cadence._on_tick()
+        await cadence._process_signals()
         assert cadence.current_interval_minutes == cadence._config.cadence_minutes
 
 
