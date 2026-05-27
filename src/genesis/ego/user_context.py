@@ -97,8 +97,8 @@ class UserEgoContextBuilder:
         from genesis.ego.focus import _ALWAYS_SECTIONS
 
         weights = dict(context_weights) if context_weights else {}
-        # Defensive: always-sections cannot be skipped or lightened,
-        # even if a caller passes bad weights directly.
+        # Primary enforcement is in compaction.assemble_context(). This
+        # is a defense-in-depth guard for direct build() callers.
         for section in _ALWAYS_SECTIONS:
             if weights.get(section) in ("skip", "light"):
                 weights[section] = "deep"

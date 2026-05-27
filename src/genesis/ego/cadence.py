@@ -497,7 +497,14 @@ class EgoCadenceManager:
                 return
 
             self._record_success()
-            await self._update_interval(had_proposals=bool(proposals))
+            # Morning report always resets interval to base (it's a
+            # reporting event, not a proposal-productivity measurement).
+            is_morning_report = any(
+                s.focus_category == "daily_briefing" for s in signals
+            )
+            await self._update_interval(
+                had_proposals=bool(proposals) or is_morning_report,
+            )
 
     async def _signal_consumer_loop(self) -> None:
         """Background consumer for the unified signal queue.
@@ -536,7 +543,8 @@ class EgoCadenceManager:
             summary=f"Morning report {date.today().isoformat()}",
             priority="high",
             metadata={
-                "model_override": "sonnet",
+                # No model_override — uses config model (user-configurable).
+                # Effort override comes from the dedicated config field.
                 "effort_override": self._config.morning_report_effort,
             },
         )

@@ -261,6 +261,35 @@ class TestCompactionWeightThreading:
             context_weights={"goals": "light", "capabilities": "skip"},
         )
 
+    async def test_always_sections_enforced_in_compaction(self, db):
+        """Compaction upgrades always-section weights before passing to build()."""
+        from genesis.ego.compaction import CompactionEngine
+
+        await db.execute(
+            "INSERT OR IGNORE INTO ego_state (key, value) VALUES (?, ?)",
+            ("user_ego_mode", "active"),
+        )
+        await db.commit()
+
+        engine = CompactionEngine(db=db)
+        mock_builder = AsyncMock()
+        mock_builder.build.return_value = "mock context"
+
+        # Try to skip always-sections — compaction should upgrade them
+        await engine.assemble_context(
+            context_builder=mock_builder,
+            context_weights={
+                "user_model": "skip",
+                "output_contract": "light",
+                "goals": "light",
+            },
+        )
+
+        passed_weights = mock_builder.build.call_args[1]["context_weights"]
+        assert passed_weights["user_model"] == "deep"
+        assert passed_weights["output_contract"] == "deep"
+        assert passed_weights["goals"] == "light"  # non-always stays light
+
     async def test_none_weights_backward_compat(self, db):
         """assemble_context with no weights passes None to build()."""
         from genesis.ego.compaction import CompactionEngine

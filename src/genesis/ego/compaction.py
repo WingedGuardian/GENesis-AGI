@@ -142,6 +142,14 @@ class CompactionEngine:
             pass  # Non-critical — skip if unavailable
 
         # Fresh situational context from the context builder.
+        # Enforce _ALWAYS_SECTIONS before passing to builder — single guard
+        # so every builder (user, genesis, future) gets the protection.
+        if context_weights:
+            from genesis.ego.focus import _ALWAYS_SECTIONS
+            context_weights = {
+                k: ("deep" if k in _ALWAYS_SECTIONS and v in ("skip", "light") else v)
+                for k, v in context_weights.items()
+            }
         sections.append("## Operational Context\n")
         fresh_context = await context_builder.build(
             context_weights=context_weights,

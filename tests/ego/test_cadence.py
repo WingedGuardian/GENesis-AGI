@@ -336,7 +336,8 @@ class TestMorningReport:
         assert sig.focus_category == "daily_briefing"
         assert sig.priority == "high"
         assert "Morning report" in sig.summary
-        assert sig.metadata.get("model_override") == "sonnet"
+        # No model_override — uses config model (user-configurable)
+        assert "model_override" not in sig.metadata
         assert sig.metadata.get("effort_override") == "low"
 
     async def test_morning_report_effort_via_metadata(
@@ -347,8 +348,20 @@ class TestMorningReport:
         await cadence._process_signals()
         mock_session.run_unified_cycle.assert_called_once()
         call_kwargs = mock_session.run_unified_cycle.call_args[1]
-        assert call_kwargs["model_override"] == "sonnet"
+        # model_override is None — uses config model, not hardcoded
+        assert call_kwargs["model_override"] is None
         assert call_kwargs["effort_override"] == "low"
+
+    async def test_morning_report_resets_interval(
+        self, cadence, mock_session,
+    ):
+        """Morning report always resets interval to base (reporting event)."""
+        # Back off the interval first
+        cadence._current_interval = 120
+        await cadence._on_morning_report()
+        await cadence._process_signals()
+        # Morning report should reset interval regardless of proposals
+        assert cadence._current_interval == cadence._config.cadence_minutes
 
 
 # ---------------------------------------------------------------------------

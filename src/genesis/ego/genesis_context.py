@@ -58,7 +58,13 @@ class GenesisEgoContextBuilder:
         """
         import asyncio
 
+        from genesis.ego.focus import _ALWAYS_SECTIONS
+
         weights = dict(context_weights) if context_weights else {}
+        # Defense-in-depth: primary enforcement in compaction.assemble_context()
+        for section in _ALWAYS_SECTIONS:
+            if weights.get(section) in ("skip", "light"):
+                weights[section] = "deep"
 
         sections: list[str] = []
         sections.append("# GENESIS_EGO_CONTEXT — Operations Briefing\n")
