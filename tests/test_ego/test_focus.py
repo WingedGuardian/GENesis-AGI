@@ -224,8 +224,8 @@ def test_reactive_weights_have_deep_escalations():
     """Reactive focus should have deep escalations."""
     weights = FOCUS_CONTEXT_WEIGHTS["reactive"]
     assert weights["escalations"] == "deep"
-    # And light/skip for non-essential
-    assert weights["capabilities"] == "skip"
+    # Capabilities gets light awareness for reactive proposals
+    assert weights["capabilities"] == "light"
 
 
 def test_goal_review_weights_have_deep_goals():
