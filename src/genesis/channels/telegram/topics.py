@@ -36,6 +36,8 @@ DEFAULT_CATEGORIES: dict[str, str] = {
     "surplus": "Surplus",
     "recon": "Recon",
     "ego_proposals": "Ego Proposals",
+    # Dispatch lifecycle: "Dispatching..." on spawn, after-action debrief on completion.
+    "ego_dispatches": "Ego Dispatches",
     # Autonomous CLI approval prompts — inline ✅ buttons + optional
     # "approve all N pending" batch button.  Bare "approve"/"reject"
     # text messages in this topic resolve the most recent pending request.
@@ -283,6 +285,7 @@ class TopicManager:
             "surplus": "surplus",
             "recon": "recon",
             "ego_proposals": "ego_proposals",
+            "ego_dispatches": "ego_dispatches",
             # Autonomous CLI approvals get their own topic so the inline
             # button UX and "approve all N pending" semantics are clearly
             # scoped — they don't mix with general alerts.

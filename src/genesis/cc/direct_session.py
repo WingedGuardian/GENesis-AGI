@@ -490,6 +490,40 @@ class DirectSessionRunner:
                 proposal_id,
                 exc_info=True,
             )
+        # Debrief is best-effort, fully self-contained (own try/except)
+        await self._notify_dispatch_debrief(proposal_id, request, result)
+
+    async def _notify_dispatch_debrief(
+        self,
+        proposal_id: str,
+        request: DirectSessionRequest,
+        result: DirectSessionResult,
+    ) -> None:
+        """Send after-action report to ego_dispatches Telegram topic."""
+        try:
+            import html as html_mod
+
+            pw = getattr(self._rt, "_ego_proposal_workflow", None)
+            tm = getattr(pw, "_topic_manager", None) if pw else None
+            if tm is None:
+                return
+
+            status = "✓ Completed" if result.success else "✗ Failed"
+            outcome = (result.output_text or result.error or "no output")[:400]
+            outcome_escaped = html_mod.escape(outcome)
+
+            cost_str = f"${result.cost_usd:.4f}" if result.cost_usd else "—"
+            dur_str = f"{result.duration_s:.0f}s" if result.duration_s else "—"
+
+            msg = (
+                f"<b>Dispatch Debrief</b> [{status}]\n"
+                f"<i>Proposal:</i> {proposal_id[:12]}\n"
+                f"<i>Duration:</i> {dur_str} | <i>Cost:</i> {cost_str}\n\n"
+                f"<b>Outcome:</b>\n{outcome_escaped}"
+            )
+            await tm.send_to_category("ego_dispatches", msg)
+        except Exception:
+            logger.debug("Failed to send dispatch debrief", exc_info=True)
 
     def _build_invocation(self, request: DirectSessionRequest) -> CCInvocation:
         system_prompt = request.system_prompt
