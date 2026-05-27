@@ -13,7 +13,6 @@ import pytest
 
 from genesis.ego.user_context import UserEgoContextBuilder
 
-
 # ---------------------------------------------------------------------------
 # Shared DB fixture (minimal schema for context builders)
 # ---------------------------------------------------------------------------
