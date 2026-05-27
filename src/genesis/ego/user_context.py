@@ -255,7 +255,11 @@ class UserEgoContextBuilder:
         return "\n".join(lines)
 
     async def _intentions_section(self, *, depth: str = "deep") -> str:
-        """Deferred intentions for review."""
+        """Deferred intentions for review.
+
+        depth is accepted for interface consistency but ignored — intentions
+        are in _ALWAYS_SECTIONS and always render at full depth.
+        """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "user_ego_cycle")
 

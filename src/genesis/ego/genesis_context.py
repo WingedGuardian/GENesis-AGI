@@ -104,7 +104,11 @@ class GenesisEgoContextBuilder:
     # -- Section builders --
 
     async def _intentions_section(self, *, depth: str = "deep") -> str:
-        """Deferred intentions for review."""
+        """Deferred intentions for review.
+
+        depth is accepted for interface consistency but ignored — intentions
+        are always rendered at full depth.
+        """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "genesis_ego_cycle")
 
@@ -192,8 +196,8 @@ class GenesisEgoContextBuilder:
         # Parse signals from the most recent tick (display) and previous
         # tick (trend comparison).
         current_row = rows[0]
-        signals_json, depth, created_at = current_row
-        lines.append(f"**Last tick**: {created_at} (depth: {depth})\n")
+        signals_json, classified_depth, created_at = current_row
+        lines.append(f"**Last tick**: {created_at} (depth: {classified_depth})\n")
 
         signals = self._parse_signals_json(signals_json)
 

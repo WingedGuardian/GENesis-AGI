@@ -325,7 +325,11 @@ class EgoSession:
 
         # Model + effort from config, with signal-based overrides
         model = CCModel(model_override or self._config.model)
-        effort = EffortLevel(effort_override or self._config.default_effort)
+        try:
+            effort = EffortLevel(effort_override or self._config.default_effort)
+        except ValueError:
+            logger.warning("Invalid effort_override %r — using default", effort_override)
+            effort = EffortLevel(self._config.default_effort)
 
         # System prompt is identity ONLY (cacheable)
         system_prompt = self._static_prompt
