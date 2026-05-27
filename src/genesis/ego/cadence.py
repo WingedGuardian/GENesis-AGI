@@ -166,13 +166,18 @@ class EgoCadenceManager:
         )
 
     async def stop(self) -> None:
-        """Shut down APScheduler, reactive loop, and signal consumer."""
-        if self._reactive_task is not None:
-            self._reactive_task.cancel()
-            self._reactive_task = None
-        if self._signal_consumer_task is not None:
-            self._signal_consumer_task.cancel()
-            self._signal_consumer_task = None
+        """Shut down APScheduler, reactive loop, and signal consumer.
+
+        Awaits task cancellation so any held lock is released before
+        stop() returns — prevents deadlock if caller re-acquires the lock.
+        """
+        for attr in ("_reactive_task", "_signal_consumer_task"):
+            task = getattr(self, attr, None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                setattr(self, attr, None)
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
         self._running = False
@@ -449,6 +454,10 @@ class EgoCadenceManager:
                 return
 
             if cycle is None:
+                # None here means CC-level failure (session creation,
+                # invocation error). The "no actionable signals" path
+                # from _perceive cannot reach here because we guard
+                # `if not signals: return` above.
                 self._record_failure("unified cycle returned None")
                 return
 
