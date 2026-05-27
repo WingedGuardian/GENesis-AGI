@@ -5,7 +5,10 @@ Covers: priority ordering, dedup, expiry, queue overflow, drain, clear.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+
+import pytest
 
 from genesis.ego.signals import EgoSignal, SignalQueue
 
@@ -180,10 +183,6 @@ def test_queue_dedup_truncates_long_summary():
 
 
 # ── SignalQueue.wait() ───────────────────────────────────────────────────
-
-import asyncio
-
-import pytest
 
 
 @pytest.mark.asyncio
