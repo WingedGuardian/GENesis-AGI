@@ -438,17 +438,18 @@ class EgoCadenceManager:
         if not signals:
             return
 
-        # Extract overrides from signal metadata (deep-think model, morning effort)
+        # Extract overrides from signal metadata (deep-think model, morning effort).
+        # Use `is None` checks (not falsy) so empty strings don't slip through.
         model_override = None
         effort_override = None
         for sig in signals:
-            if not model_override:
+            if model_override is None:
                 mo = sig.metadata.get("model_override")
-                if mo:
+                if mo is not None:
                     model_override = mo
-            if not effort_override:
+            if effort_override is None:
                 eo = sig.metadata.get("effort_override")
-                if eo:
+                if eo is not None:
                     effort_override = eo
 
         async with self._lock:
