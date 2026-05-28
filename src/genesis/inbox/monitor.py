@@ -504,12 +504,16 @@ class InboxMonitor:
                     processed_at=now_iso,
                 )
                 continue
+            # source_content = re-read at resume time, not original
+            # detection.  Safe: hash guard above ensures file is unchanged
+            # since it was parked for approval.
             resume_items.append(InboxItem(
                 id=row_id,
                 file_path=file_path,
                 content=content,
                 content_hash=stored_hash,
                 detected_at=str(row["created_at"]),
+                source_content=content,
             ))
 
         resumed_ids: set[str] = {item.id for item in resume_items}
@@ -746,6 +750,7 @@ class InboxMonitor:
                 pending_items.append(InboxItem(
                     id=existing_failed["id"], file_path=str(f),
                     content=content, content_hash=h, detected_at=now_iso,
+                    source_content=content,
                 ))
                 continue
 
@@ -760,6 +765,7 @@ class InboxMonitor:
             pending_items.append(InboxItem(
                 id=item_id, file_path=str(f), content=content,
                 content_hash=h, detected_at=now_iso,
+                source_content=content,
             ))
 
         cooldown = timedelta(seconds=self._config.evaluation_cooldown_seconds)
@@ -844,6 +850,7 @@ class InboxMonitor:
             pending_items.append(InboxItem(
                 id=item_id, file_path=str(f), content=eval_content,
                 content_hash=h, detected_at=now_iso,
+                source_content=content,
             ))
 
         return pending_items
@@ -1058,12 +1065,44 @@ class InboxMonitor:
                 )
                 completed_at = self._clock().isoformat()
                 for item in batch:
+                    source = item.source_content or item.content
+                    prev = await inbox_items.get_evaluated_content(
+                        self._db, item.file_path,
+                    )
+                    full_content = _merge_evaluated_content(prev, source)
+                    # Diagnostic: detect file changes during evaluation
                     try:
-                        full_content = read_content(Path(item.file_path))
+                        current_content = read_content(Path(item.file_path))
                     except (FileNotFoundError, PermissionError):
-                        full_content = item.content
-                    if not full_content.strip():
-                        full_content = item.content
+                        current_content = None
+                    if current_content is not None and current_content != source:
+                        logger.warning(
+                            "BASELINE_GUARD: file changed during eval "
+                            "for %s (detection=%d chars, completion=%d "
+                            "chars, merge_baseline=%d chars)",
+                            item.file_path,
+                            len(source), len(current_content),
+                            len(full_content),
+                        )
+                        if self._event_bus:
+                            try:
+                                from genesis.observability.types import (
+                                    Severity,
+                                    Subsystem,
+                                )
+                                await self._event_bus.emit(
+                                    Subsystem.INBOX, Severity.WARNING,
+                                    "baseline_guard.file_changed",
+                                    f"File changed during evaluation: "
+                                    f"detection={len(source)}, "
+                                    f"completion={len(current_content)}",
+                                    file_path=item.file_path,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "BASELINE_GUARD event emit failed",
+                                    exc_info=True,
+                                )
                     await inbox_items.update_status(
                         self._db, item.id, status="completed",
                         processed_at=completed_at,
@@ -1151,12 +1190,47 @@ class InboxMonitor:
                         processed_at=completed_at,
                     )
                 else:
+                    source = item.source_content or item.content
+                    prev = await inbox_items.get_evaluated_content(
+                        self._db, item.file_path,
+                    )
+                    full_content = _merge_evaluated_content(prev, source)
+                    # Diagnostic: detect file changes during evaluation
                     try:
-                        full_content = read_content(Path(item.file_path))
+                        current_content = read_content(
+                            Path(item.file_path),
+                        )
                     except (FileNotFoundError, PermissionError):
-                        full_content = item.content
-                    if not full_content.strip():
-                        full_content = item.content
+                        current_content = None
+                    if (current_content is not None
+                            and current_content != source):
+                        logger.warning(
+                            "BASELINE_GUARD: file changed during eval "
+                            "for %s (detection=%d chars, completion=%d "
+                            "chars, merge_baseline=%d chars)",
+                            item.file_path,
+                            len(source), len(current_content),
+                            len(full_content),
+                        )
+                        if self._event_bus:
+                            try:
+                                from genesis.observability.types import (
+                                    Severity,
+                                    Subsystem,
+                                )
+                                await self._event_bus.emit(
+                                    Subsystem.INBOX, Severity.WARNING,
+                                    "baseline_guard.file_changed",
+                                    f"File changed during evaluation: "
+                                    f"detection={len(source)}, "
+                                    f"completion={len(current_content)}",
+                                    file_path=item.file_path,
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "BASELINE_GUARD event emit failed",
+                                    exc_info=True,
+                                )
                     if response_path:
                         await inbox_items.set_response_path(
                             self._db, item.id,
@@ -1334,3 +1408,25 @@ def _compute_new_content(old_content: str, new_content: str) -> str:
     while result and not result[-1].strip():
         result.pop()
     return "\n".join(result)
+
+
+def _merge_evaluated_content(
+    prev_content: str | None, source_content: str,
+) -> str:
+    """Merge previous baseline with detection-time content.
+
+    Returns the union of all non-empty stripped lines from both inputs,
+    sorted for deterministic output.  This makes ``evaluated_content``
+    monotonically grow — once a line has been evaluated it stays in the
+    baseline forever, preventing re-evaluation even if the source file
+    is cleared and refilled by sync (e.g. rclone from Dropbox).
+    """
+    lines: set[str] = set()
+    if prev_content:
+        lines.update(
+            line.strip() for line in prev_content.splitlines() if line.strip()
+        )
+    lines.update(
+        line.strip() for line in source_content.splitlines() if line.strip()
+    )
+    return "\n".join(sorted(lines))

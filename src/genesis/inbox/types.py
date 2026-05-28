@@ -54,6 +54,16 @@ class InboxItem:
     content: str
     content_hash: str
     detected_at: str
+    source_content: str = ""
+    """Full file content at detection time.
+
+    For new files this equals ``content``.  For modified files
+    ``content`` holds only the delta while ``source_content``
+    preserves the complete file snapshot captured during Phase 3.
+    Used at completion to build a cumulative evaluated-content
+    baseline that survives mid-evaluation file changes (e.g. rclone
+    sync clearing the source while a CC session is running).
+    """
 
 
 @dataclass(frozen=True)

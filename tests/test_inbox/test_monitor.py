@@ -1451,3 +1451,166 @@ def test_coherence_check_passes_with_domain_stem_fallback():
     evaluation = "# Inbox Evaluation\n\n**Classification:** Technology\n\nLangChain's new feature " + "x" * 300
     source = "https://www.langchain.com/blog/something"
     assert _passes_coherence_check(evaluation, source) is True
+
+
+# ── Baseline guard tests ──────────────────────────────────────────────
+
+
+class TestMergeEvaluatedContent:
+    """Unit tests for _merge_evaluated_content."""
+
+    def test_empty_prev_returns_source_lines(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content(None, "alpha\nbeta\n")
+        lines = result.splitlines()
+        assert "alpha" in lines
+        assert "beta" in lines
+
+    def test_empty_source_returns_prev_lines(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content("alpha\nbeta\n", "")
+        lines = result.splitlines()
+        assert "alpha" in lines
+        assert "beta" in lines
+
+    def test_union_of_both(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content("alpha\nbeta", "beta\ngamma")
+        lines = set(result.splitlines())
+        assert lines == {"alpha", "beta", "gamma"}
+
+    def test_deduplicates_stripped(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content("  alpha  \nbeta", "alpha\n  beta  ")
+        lines = result.splitlines()
+        assert lines.count("alpha") == 1
+        assert lines.count("beta") == 1
+
+    def test_blank_lines_excluded(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content("\n\nalpha\n\n", "\n\nbeta\n\n")
+        assert "" not in result.splitlines()
+
+    def test_sorted_output(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content("gamma\nalpha", "beta")
+        assert result.splitlines() == ["alpha", "beta", "gamma"]
+
+    def test_both_none_and_empty(self):
+        from genesis.inbox.monitor import _merge_evaluated_content
+        result = _merge_evaluated_content(None, "")
+        assert result == ""
+
+
+@pytest.mark.asyncio
+async def test_baseline_guard_survives_file_clear(
+    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+):
+    """evaluated_content preserves detection-time content even if the file
+    is cleared during evaluation (the race condition that caused Genesis-19
+    through Genesis-26 to re-evaluate the same items)."""
+    from genesis.db.crud import inbox_items
+
+    clock = _FakeClock()
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+    )
+
+    original_content = (
+        "Numenta\n\n"
+        "https://example.com/article-1\n\n"
+        "https://example.com/article-2\n"
+    )
+
+    mock_invoker.run.return_value = _success_output(
+        "# Inbox Evaluation\n\n## 1. Numenta\nGood stuff.\n\n"
+        "## 2. example.com/article-1\nInteresting.\n\n"
+        "## 3. example.com/article-2\nNoted.\n" + "x" * 300
+    )
+
+    # Write file and do first evaluation
+    (inbox_dir / "Genesis.md").write_text(original_content)
+    result = await mon.check_once()
+    assert result.batches_dispatched == 1
+
+    # Verify evaluated_content was stored
+    row = await inbox_items.get_by_file_path(
+        db, str(inbox_dir / "Genesis.md"),
+    )
+    assert row is not None
+    stored = row["evaluated_content"]
+    assert stored is not None
+    # All original lines should be in the merged baseline
+    assert "Numenta" in stored
+    assert "https://example.com/article-1" in stored
+    assert "https://example.com/article-2" in stored
+
+    # Simulate: file is cleared by sync during NEXT evaluation
+    # First, advance clock past cooldown
+    clock.now += timedelta(hours=2)
+
+    # Write file with only new content (simulates user clearing old items)
+    (inbox_dir / "Genesis.md").write_text("https://example.com/article-3\n")
+
+    result2 = await mon.check_once()
+    assert result2.batches_dispatched == 1
+
+    # Verify: evaluated_content now has BOTH old and new lines
+    row2 = await inbox_items.get_by_file_path(
+        db, str(inbox_dir / "Genesis.md"),
+    )
+    stored2 = row2["evaluated_content"]
+    assert "Numenta" in stored2, "Old content lost from baseline"
+    assert "https://example.com/article-1" in stored2, "Old URL lost"
+    assert "https://example.com/article-2" in stored2, "Old URL lost"
+    assert "https://example.com/article-3" in stored2, "New URL missing"
+
+
+@pytest.mark.asyncio
+async def test_baseline_guard_delta_only_new_items(
+    db, mock_invoker, mock_session_manager, inbox_dir, tmp_path,
+):
+    """After a successful evaluation, adding new items to the file should
+    produce a delta containing ONLY the new items, not previously evaluated ones."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.monitor import _compute_new_content
+
+    clock = _FakeClock()
+    config = InboxConfig(watch_path=inbox_dir, batch_size=1)
+    writer = ResponseWriter(watch_path=inbox_dir, timezone="UTC")
+    mon = InboxMonitor(
+        db=db, invoker=mock_invoker, session_manager=mock_session_manager,
+        config=config, writer=writer, clock=clock, prompt_dir=tmp_path,
+    )
+
+    mock_invoker.run.return_value = _success_output(
+        "# Eval\n\n## 1. Article 1\nGood.\n\n"
+        "## 2. Article 2\nNoted.\n" + "x" * 300
+    )
+
+    # Initial evaluation
+    (inbox_dir / "test.md").write_text(
+        "https://example.com/article-1\nhttps://example.com/article-2\n"
+    )
+    await mon.check_once()
+
+    # Get the stored baseline
+    prev = await inbox_items.get_evaluated_content(
+        db, str(inbox_dir / "test.md"),
+    )
+    assert prev is not None
+
+    # Add a new URL
+    new_content = (
+        "https://example.com/article-1\n"
+        "https://example.com/article-2\n"
+        "https://example.com/article-3\n"
+    )
+
+    delta = _compute_new_content(prev, new_content)
+    assert "article-3" in delta
+    assert "article-1" not in delta
+    assert "article-2" not in delta
