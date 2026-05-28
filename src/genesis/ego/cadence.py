@@ -438,13 +438,19 @@ class EgoCadenceManager:
         if not signals:
             return
 
-        # Extract model override from signal metadata (deep-think)
+        # Extract overrides from signal metadata (deep-think model, morning effort).
+        # Use `is None` checks (not falsy) so empty strings don't slip through.
         model_override = None
+        effort_override = None
         for sig in signals:
-            mo = sig.metadata.get("model_override")
-            if mo:
-                model_override = mo
-                break
+            if model_override is None:
+                mo = sig.metadata.get("model_override")
+                if mo is not None:
+                    model_override = mo
+            if effort_override is None:
+                eo = sig.metadata.get("effort_override")
+                if eo is not None:
+                    effort_override = eo
 
         async with self._lock:
             # Re-check gates under lock (state may have changed since emission).
@@ -455,7 +461,9 @@ class EgoCadenceManager:
 
             try:
                 cycle = await self._session.run_unified_cycle(
-                    signals, model_override=model_override,
+                    signals,
+                    model_override=model_override,
+                    effort_override=effort_override,
                 )
             except CycleBlockedError as exc:
                 logger.info("Unified cycle gated: %s", exc)
@@ -490,7 +498,14 @@ class EgoCadenceManager:
                 return
 
             self._record_success()
-            await self._update_interval(had_proposals=bool(proposals))
+            # Morning report always resets interval to base (it's a
+            # reporting event, not a proposal-productivity measurement).
+            is_morning_report = any(
+                s.focus_category == "daily_briefing" for s in signals
+            )
+            await self._update_interval(
+                had_proposals=bool(proposals) or is_morning_report,
+            )
 
     async def _signal_consumer_loop(self) -> None:
         """Background consumer for the unified signal queue.
@@ -513,28 +528,29 @@ class EgoCadenceManager:
                 await asyncio.sleep(60)
 
     async def _on_morning_report(self) -> None:
-        """Cron trigger handler. Morning report cycle (skips idle check)."""
-        async with self._lock:
-            if not self._should_run(skip_idle_check=True):
-                return
+        """Cron trigger handler. Pushes daily briefing signal.
 
-            try:
-                cycle = await self._session.run_cycle(is_morning_report=True)
-            except CycleBlockedError as exc:
-                logger.info("Ego morning report gated: %s", exc)
-                return
-            except Exception as exc:
-                logger.error("Ego morning report failed", exc_info=True)
-                self._record_failure(str(exc))
-                return
+        Lock is NOT held — same reasoning as _on_tick(). The consumer
+        loop acquires the lock before running the unified cycle.
+        """
+        if not self._should_run(skip_idle_check=True):
+            return
 
-            if cycle is None:
-                self._record_failure("morning report returned None")
-                return
+        from datetime import date
 
-            self._record_success()
-            # Morning report always resets interval to base
-            await self._update_interval(had_proposals=True)
+        signal = EgoSignal(
+            signal_type="timer",
+            focus_category="daily_briefing",
+            summary=f"Morning report {date.today().isoformat()}",
+            priority="high",
+            metadata={
+                # No model_override — uses config model (user-configurable).
+                # Effort override comes from the dedicated config field.
+                "effort_override": self._config.morning_report_effort,
+            },
+        )
+        if self._signal_queue.push(signal):
+            logger.info("Morning report signal pushed")
 
     # -- Gate logic --------------------------------------------------------
 

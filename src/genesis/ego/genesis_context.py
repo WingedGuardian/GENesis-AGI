@@ -42,8 +42,30 @@ class GenesisEgoContextBuilder:
         self._health_data = health_data
         self._capabilities = capabilities or {}
 
-    async def build(self) -> str:
-        """Assemble the full Genesis ego context."""
+    async def build(
+        self,
+        *,
+        context_weights: dict[str, str] | None = None,
+    ) -> str:
+        """Assemble the full Genesis ego context.
+
+        Parameters
+        ----------
+        context_weights:
+            Per-section weight dict from the focus selector.
+            Keys that match genesis section names are applied; unknown
+            keys are ignored (default to "deep").
+        """
+        import asyncio
+
+        from genesis.ego.focus import _ALWAYS_SECTIONS
+
+        weights = dict(context_weights) if context_weights else {}
+        # Defense-in-depth: primary enforcement in compaction.assemble_context()
+        for section in _ALWAYS_SECTIONS:
+            if weights.get(section) in ("skip", "light"):
+                weights[section] = "deep"
+
         sections: list[str] = []
         sections.append("# GENESIS_EGO_CONTEXT — Operations Briefing\n")
         sections.append(
@@ -51,29 +73,52 @@ class GenesisEgoContextBuilder:
             "Keep the system healthy so the user doesn't have to.*\n"
         )
 
-        sections.append(await self._system_health_section())
-        sections.append(await self._intentions_section())
-        sections.append(await self._signals_section())
-        sections.append(await self._observations_section())
-        sections.append(await self._follow_ups_section())
-        sections.append(await self._cost_section())
-        sections.append(await self._proposal_history_section())
-        sections.append(await self._proposal_board_section())
-        sections.append(await self._execution_outcomes_section())
-        sections.append(await self._capability_performance_section())
-        sections.append(await self._autonomy_readiness_section())
-        sections.append(self._output_contract_section())
+        # Map weight keys → section methods. Genesis ego sections differ
+        # from user ego sections. Keys not in focus.py weight table
+        # default to "deep" via weights.get(key, "deep").
+        section_map: list[tuple[str, Any]] = [
+            ("system_health", self._system_health_section),
+            ("intentions", self._intentions_section),
+            ("signals", self._signals_section),
+            ("observations", self._observations_section),
+            ("follow_ups", self._follow_ups_section),
+            ("cost", self._cost_section),
+            ("proposal_history", self._proposal_history_section),
+            ("proposal_board", self._proposal_board_section),
+            ("execution_outcomes", self._execution_outcomes_section),
+            ("capability_performance", self._capability_performance_section),
+            ("autonomy_readiness", self._autonomy_readiness_section),
+            ("output_contract", self._output_contract_section),
+        ]
+
+        for key, method in section_map:
+            depth = weights.get(key, "deep")
+            if depth == "skip":
+                continue
+            is_async = asyncio.iscoroutinefunction(method)
+            if depth == "light":
+                result = (
+                    await method(depth="light") if is_async
+                    else method(depth="light")
+                )
+            else:
+                result = await method() if is_async else method()
+            sections.append(result)
 
         return "\n".join(sections)
 
     # -- Section builders --
 
-    async def _intentions_section(self) -> str:
-        """Deferred intentions for review."""
+    async def _intentions_section(self, *, depth: str = "deep") -> str:
+        """Deferred intentions for review.
+
+        depth is accepted for interface consistency but ignored — intentions
+        are always rendered at full depth.
+        """
         from genesis.ego.intentions_context import build_intentions_section
         return await build_intentions_section(self._db, "genesis_ego_cycle")
 
-    async def _system_health_section(self) -> str:
+    async def _system_health_section(self, *, depth: str = "deep") -> str:
         """Live system health from health_data snapshot."""
         lines = ["## System Health\n"]
 
@@ -134,7 +179,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _signals_section(self) -> str:
+    async def _signals_section(self, *, depth: str = "deep") -> str:
         """Recent awareness loop signal values with trend indicators."""
         lines = ["## Awareness Signals (latest tick)\n"]
 
@@ -157,8 +202,8 @@ class GenesisEgoContextBuilder:
         # Parse signals from the most recent tick (display) and previous
         # tick (trend comparison).
         current_row = rows[0]
-        signals_json, depth, created_at = current_row
-        lines.append(f"**Last tick**: {created_at} (depth: {depth})\n")
+        signals_json, classified_depth, created_at = current_row
+        lines.append(f"**Last tick**: {created_at} (depth: {classified_depth})\n")
 
         signals = self._parse_signals_json(signals_json)
 
@@ -224,7 +269,7 @@ class GenesisEgoContextBuilder:
             return "\u2192"
         return "\u2191" if delta > 0 else "\u2193"
 
-    async def _observations_section(self) -> str:
+    async def _observations_section(self, *, depth: str = "deep") -> str:
         """Genesis-internal observations — system issues needing attention."""
         lines = ["## Unresolved Observations (last 48h, max 20)\n"]
 
@@ -275,7 +320,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _follow_ups_section(self) -> str:
+    async def _follow_ups_section(self, *, depth: str = "deep") -> str:
         """Maintenance follow-ups for the Genesis ego."""
         lines = ["## Maintenance Follow-ups\n"]
 
@@ -321,7 +366,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _cost_section(self) -> str:
+    async def _cost_section(self, *, depth: str = "deep") -> str:
         """Daily spend and budget status."""
         lines = ["## Cost Status\n"]
 
@@ -356,7 +401,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _proposal_history_section(self) -> str:
+    async def _proposal_history_section(self, *, depth: str = "deep") -> str:
         """Recent proposal outcomes for self-calibration.
 
         Split into Active (pending/approved/executed) and Recently Tried
@@ -446,7 +491,7 @@ class GenesisEgoContextBuilder:
         except (ValueError, TypeError):
             return "?"
 
-    async def _proposal_board_section(self) -> str:
+    async def _proposal_board_section(self, *, depth: str = "deep") -> str:
         """Operational focus + pending ops proposals + approved."""
         from genesis.db.crud import ego as ego_crud
 
@@ -519,7 +564,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _execution_outcomes_section(self) -> str:
+    async def _execution_outcomes_section(self, *, depth: str = "deep") -> str:
         """Recent outcomes from ego-dispatched background sessions."""
         lines = ["## Recent Execution Outcomes (48h)\n"]
 
@@ -549,7 +594,7 @@ class GenesisEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
-    async def _capability_performance_section(self) -> str:
+    async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """System capability performance — domain confidence from multiple sources."""
         lines = ["## Capability Performance\n"]
 
@@ -585,7 +630,7 @@ class GenesisEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _autonomy_readiness_section(self) -> str:
+    async def _autonomy_readiness_section(self, *, depth: str = "deep") -> str:
         """Show autonomy posteriors so ego can propose promotion when ready."""
         from genesis.db.crud import autonomy as autonomy_crud
         from genesis.db.crud.autonomy import bayesian_level, bayesian_posterior
@@ -620,7 +665,7 @@ class GenesisEgoContextBuilder:
         return "\n".join(lines)
 
     @staticmethod
-    def _output_contract_section() -> str:
+    def _output_contract_section(*, depth: str = "deep") -> str:
         """Remind the Genesis ego of its output format.
 
         Includes the escalation field for issues beyond its scope.

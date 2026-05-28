@@ -92,12 +92,20 @@ class CompactionEngine:
         self,
         *,
         context_builder: EgoContextBuilder,
+        context_weights: dict[str, str] | None = None,
     ) -> str:
         """Assemble operational context for a new ego cycle.
 
         Returns a markdown string combining:
         1. Previous cycle's focus summary (continuity thread)
         2. Fresh situational context from EgoContextBuilder
+
+        Parameters
+        ----------
+        context_weights:
+            Optional per-section weight dict from the focus selector.
+            Keys are section names, values are "always"/"deep"/"light"/"skip".
+            When None, all sections are built at full depth (backward compat).
         """
         sections: list[str] = []
 
@@ -134,8 +142,18 @@ class CompactionEngine:
             pass  # Non-critical — skip if unavailable
 
         # Fresh situational context from the context builder.
+        # Enforce _ALWAYS_SECTIONS before passing to builder — single guard
+        # so every builder (user, genesis, future) gets the protection.
+        if context_weights:
+            from genesis.ego.focus import _ALWAYS_SECTIONS
+            context_weights = {
+                k: ("deep" if k in _ALWAYS_SECTIONS and v in ("skip", "light") else v)
+                for k, v in context_weights.items()
+            }
         sections.append("## Operational Context\n")
-        fresh_context = await context_builder.build()
+        fresh_context = await context_builder.build(
+            context_weights=context_weights,
+        )
         sections.append(fresh_context)
 
         return "\n".join(sections)
