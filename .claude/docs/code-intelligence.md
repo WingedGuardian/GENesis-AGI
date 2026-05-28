@@ -67,9 +67,8 @@ Genesis). Supports 66 languages. 3D visualization at `localhost:9749`.
 Index rebuilds automatically on each commit (post-commit hook). If stale,
 run `index_repository` manually.
 
-**GitNexus** — LadybugDB graph. `query` tool (FTS) is broken on Linux
-(known issue). Other tools (`impact`, `route_map`, `api_impact`, `rename`,
-`context`) work fine. Auto-reindexes on commit.
+**GitNexus** — LadybugDB graph. All tools work including `query` (FTS
+fixed in 1.6.5). Auto-reindexes on commit + scheduled Mon/Thu 5am UTC.
 
 **Grep/Glob/Read** — Always available, zero overhead. Preferred for config
 files, markdown, YAML, JSON, shell scripts, SQL, and any non-code content.

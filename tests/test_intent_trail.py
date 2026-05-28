@@ -194,7 +194,8 @@ class TestObservationStorage:
                 type TEXT NOT NULL,
                 content TEXT NOT NULL,
                 priority TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                expires_at TEXT
             )"""
         )
         conn.commit()
@@ -210,3 +211,4 @@ class TestObservationStorage:
         assert "session:test-session" in row[1]  # source
         assert row[2] == "conversation_pivot"  # type
         assert "memory search" in row[3]  # content
+        assert row[6] is not None  # expires_at should be set

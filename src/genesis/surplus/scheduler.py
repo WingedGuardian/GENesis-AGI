@@ -264,6 +264,16 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
+        # GitNexus reindex: Mon & Thu 5am UTC (~72h apart).
+        # Uses CronTrigger (not IntervalTrigger) — IntervalTrigger resets
+        # on restart and would never fire if server restarts more often.
+        self._scheduler.add_job(
+            self.run_gitnexus_reindex,
+            CronTrigger(day_of_week="mon,thu", hour=5),
+            id="gitnexus_reindex",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
         # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am UTC)
         self._scheduler.add_job(
             self.schedule_wing_audit,
@@ -933,6 +943,57 @@ class SurplusScheduler:
                 rt._heavy_workload_since = None
             except Exception:
                 pass
+
+    async def run_gitnexus_reindex(self) -> None:
+        """Reindex the GitNexus code graph (Mon & Thu 5am UTC).
+
+        Runs ``gitnexus analyze --index-only`` as a subprocess.
+        CPU-only AST parsing, no ONNX/GPU (embeddings off by default).
+        Incremental since GitNexus 1.6.5 — fast on unchanged repos.
+        """
+        import asyncio
+        import shutil
+
+        try:
+            from genesis.runtime import GenesisRuntime
+            if GenesisRuntime.instance().paused:
+                logger.debug("GitNexus reindex skipped (Genesis paused)")
+                return
+        except Exception:
+            logger.warning("Pause check failed — skipping GitNexus reindex", exc_info=True)
+            return
+
+        gitnexus = shutil.which("gitnexus")
+        if not gitnexus:
+            logger.warning("GitNexus reindex skipped — gitnexus not found on PATH")
+            return
+
+        try:
+            repo_root = str(Path.home() / "genesis")
+            proc = await asyncio.create_subprocess_exec(
+                gitnexus, "analyze", "--index-only",
+                cwd=repo_root,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                logger.info("GitNexus reindex complete")
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_success("gitnexus_reindex")
+            else:
+                err_msg = (stderr or stdout or b"unknown error").decode()[:200]
+                logger.error("GitNexus reindex failed (rc=%d): %s", proc.returncode, err_msg)
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_failure(
+                        "gitnexus_reindex", err_msg,
+                    )
+        except Exception as exc:
+            logger.exception("GitNexus reindex failed")
+            with contextlib.suppress(Exception):
+                GenesisRuntime.instance().record_job_failure(
+                    "gitnexus_reindex", str(exc),
+                )
 
     async def run_memory_extraction(self) -> None:
         """Run periodic memory extraction from session transcripts."""
