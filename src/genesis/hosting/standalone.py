@@ -493,6 +493,7 @@ class StandaloneAdapter:
                 reply_waiter=reply_waiter,
                 engagement_tracker=rt.engagement_tracker,
                 autonomous_cli_gate=autonomous_cli_gate,
+                proposal_workflow=rt._ego_proposal_workflow,
             )
             self._telegram_adapter = adapter
 
