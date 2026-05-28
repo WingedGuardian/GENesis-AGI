@@ -49,19 +49,9 @@ def config():
 
 @pytest.fixture
 def mock_session():
-    """Mock EgoSession with controllable run_cycle and run_unified_cycle."""
+    """Mock EgoSession with controllable run_unified_cycle."""
     session = AsyncMock()
-    # Legacy path (morning report, reactive loop)
-    session.run_cycle.return_value = EgoCycle(
-        id="c1",
-        output_text="test",
-        proposals_json=json.dumps([{"action_type": "test"}]),
-        focus_summary="testing",
-        model_used="opus",
-        cost_usd=0.15,
-        ego_source="user_ego_cycle",
-    )
-    # Unified path (proactive via signal consumer)
+    # All cycle types flow through run_unified_cycle via the signal consumer
     session.run_unified_cycle.return_value = EgoCycle(
         id="u1",
         output_text="unified test",
@@ -321,7 +311,6 @@ class TestMorningReport:
     ):
         cadence.pause()
         await cadence._on_morning_report()
-        mock_session.run_cycle.assert_not_called()
         assert cadence._signal_queue.empty()
 
     async def test_morning_report_pushes_daily_briefing_signal(
@@ -850,6 +839,28 @@ class TestEscalationSignals:
         cadence.pause()
         cadence.push_escalation_event({"type": "test", "summary": "x"})
         assert cadence._signal_queue.empty()
+
+    async def test_escalation_survives_reactive_rate_limit_in_mixed_batch(
+        self, cadence, mock_session,
+    ):
+        """Escalation survives reactive rate limit when batched with reactive signal."""
+        cadence._running = True
+        now = datetime.now(UTC)
+        cadence._reactive_timestamps = [
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=30),
+        ]
+        # Push both reactive and escalation in the same batch
+        cadence.push_reactive_event({"type": "test", "summary": "rate limited reactive"})
+        cadence.push_escalation_event({"type": "health.critical", "summary": "critical failure"})
+        await cadence._process_signals()
+        # Escalation must survive; reactive must be dropped
+        mock_session.run_unified_cycle.assert_called_once()
+        call_args = mock_session.run_unified_cycle.call_args
+        signals = call_args[0][0]
+        assert len(signals) == 1
+        assert signals[0].focus_category == "escalation"
 
     async def test_escalation_flows_through_unified_cycle(
         self, cadence, mock_session,
