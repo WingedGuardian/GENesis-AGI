@@ -233,13 +233,23 @@ class ConversationLoop:
                 self._fire_failure_detection("generic_error")
                 return f"[Genesis error: {e}]"
 
-            # Store cc_session_id from first response
+            # Store cc_session_id from first response (non-critical — next
+            # turn re-checks the guard so a transient DB lock just delays
+            # session resume by one turn).
             if not session.get("cc_session_id") and output.session_id:
-                await cc_sessions.update_cc_session_id(
-                    self._db, session["id"], cc_session_id=output.session_id,
-                )
+                try:
+                    await cc_sessions.update_cc_session_id(
+                        self._db, session["id"], cc_session_id=output.session_id,
+                    )
+                except Exception:
+                    logger.warning("Failed to store cc_session_id", exc_info=True)
 
-            await self._session_mgr.update_activity(session["id"])
+            # Activity timestamp — non-critical, but reap_stale() uses it so
+            # persistent failures deserve monitoring (WARNING, not debug).
+            try:
+                await self._session_mgr.update_activity(session["id"])
+            except Exception:
+                logger.warning("Failed to update session activity", exc_info=True)
 
             # Record cost incrementally (session stays active)
             if output.cost_usd or output.input_tokens or output.output_tokens:
@@ -474,12 +484,23 @@ class ConversationLoop:
                 self._fire_failure_detection("generic_error")
                 return f"[Genesis error: {e}]"
 
+            # Store cc_session_id from first response (non-critical — next
+            # turn re-checks the guard so a transient DB lock just delays
+            # session resume by one turn).
             if not session.get("cc_session_id") and output.session_id:
-                await cc_sessions.update_cc_session_id(
-                    self._db, session["id"], cc_session_id=output.session_id,
-                )
+                try:
+                    await cc_sessions.update_cc_session_id(
+                        self._db, session["id"], cc_session_id=output.session_id,
+                    )
+                except Exception:
+                    logger.warning("Failed to store cc_session_id", exc_info=True)
 
-            await self._session_mgr.update_activity(session["id"])
+            # Activity timestamp — non-critical, but reap_stale() uses it so
+            # persistent failures deserve monitoring (WARNING, not debug).
+            try:
+                await self._session_mgr.update_activity(session["id"])
+            except Exception:
+                logger.warning("Failed to update session activity", exc_info=True)
 
             # Record cost incrementally (session stays active)
             if output.cost_usd or output.input_tokens or output.output_tokens:
