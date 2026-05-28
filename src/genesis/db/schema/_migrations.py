@@ -1237,15 +1237,24 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     # Bulk-resolve stale conversation_pivot observations (>7 days).
     # These are transient topic-shift signals with no downstream consumer.
     # Marks resolved, never deletes — audit trail preserved.
+    # Uses Python-computed ISO timestamps to match the T-separator format
+    # stored by _record_pivot_observation (datetime('now') uses spaces).
     try:
+        from datetime import UTC, datetime
+        from datetime import timedelta as _td
+        _now = datetime.now(UTC)
+        _cutoff = (_now - _td(days=7)).isoformat()
+        _now_iso = _now.isoformat()
         cursor = await db.execute(
             "UPDATE observations SET resolved = 1,"
-            " resolved_at = datetime('now'),"
+            " resolved_at = ?,"
             " resolution_notes = 'auto-resolved: conversation_pivot TTL (7d) bulk migration'"
             " WHERE type = 'conversation_pivot' AND resolved = 0"
-            " AND created_at < datetime('now', '-7 days')"
+            " AND created_at < ?",
+            (_now_iso, _cutoff),
         )
-        if cursor.rowcount and cursor.rowcount > 0:
+        if cursor.rowcount:
+            await db.commit()
             logger.info(
                 "Bulk-resolved %d stale conversation_pivot observations",
                 cursor.rowcount,
