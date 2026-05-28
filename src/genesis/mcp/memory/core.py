@@ -59,7 +59,8 @@ async def memory_recall(
 
     Args:
         source: 'episodic' | 'knowledge' | 'both' | None. Defaults to
-            ``'episodic'`` — searches only conversational/personal memories.
+            ``'both'`` — searches episodic and knowledge_base collections.
+            Knowledge results below a score floor are filtered to reduce noise.
             Use ``knowledge_recall`` MCP tool for knowledge-base lookups,
             or pass ``'both'`` / ``'knowledge'`` explicitly if needed.
         compact: If True, return lightweight previews only (memory_id, preview,
@@ -96,12 +97,13 @@ async def memory_recall(
     memory_mod._require_init()
     assert memory_mod._retriever is not None and memory_mod._db is not None
 
-    # Default to episodic-only. Knowledge base is opt-in via explicit
-    # source="knowledge"/"both" or the separate knowledge_recall tool.
-    # Intent classification is preserved in HybridRetriever.recall() for
-    # direct callers (proactive hook, dashboard, ego) — not removed.
+    # Default to searching both episodic and knowledge collections.
+    # This ensures curated KB content surfaces alongside conversational
+    # memory without requiring explicit source='both' on every call.
+    # Internal callers (ego, reflection, extraction) use _retriever.recall()
+    # directly and are unaffected by this MCP-layer default.
     if source is None:
-        source = "episodic"
+        source = "both"
 
     pipeline_used = mode  # track which pipeline actually ran
 
@@ -208,6 +210,17 @@ async def memory_recall(
                     "Failed to fetch event-calendar memory %s", mid,
                     exc_info=True,
                 )
+
+    # KB noise control: when searching both collections, apply a score floor
+    # to knowledge_base results to suppress low-relevance bulk intelligence.
+    # Episodic results are unfiltered. Score floor matches knowledge_recall's
+    # min_score=0.15 (post-authority-boost) as a conservative baseline.
+    _KB_MIN_SCORE = 0.15
+    if source == "both":
+        results = [
+            r for r in results
+            if r.memory_type != "knowledge_base" or r.score >= _KB_MIN_SCORE
+        ]
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
     try:

@@ -595,6 +595,7 @@ async def _search_qdrant(
                         "memory_id": str(hit.get("id", "")),
                         "content": payload.get("content", ""),
                         "score": hit.get("score", 0.0),
+                        "confidence": payload.get("confidence", 0.5),
                         "source_session_id": payload.get("source_session_id"),
                         "memory_class": payload.get("memory_class", "fact"),
                         "_retrieved_count": payload.get("retrieved_count", 0),
@@ -619,8 +620,9 @@ def _rrf_fusion(
 
     Wing-filtered results get a 1.5x bonus to prioritize domain-relevant
     content without exclusively filtering (cross-domain results still surface).
-    Knowledge base results get 1.0x weight (same as primary — payload filter
-    already ensures only intentionally ingested content is included).
+    Knowledge base results get 0.6x base weight scaled by ingestion confidence
+    (curated ~0.95 competes at rank 2+; recon ~0.65 rarely surfaces). Max 1 KB
+    slot prevents KB from flooding out episodic context.
     Code index results get a 0.5x weight (supplementary, not primary).
     """
     scores: dict[str, float] = {}
@@ -663,13 +665,17 @@ def _rrf_fusion(
             if mid not in content_map:
                 content_map[mid] = r
 
-    # Knowledge base results — intentionally ingested content (1.0x weight)
+    # Knowledge base results — confidence-weighted (0.6x base, scaled by
+    # ingestion confidence). Curated content (~0.95 conf) competes at rank 2+;
+    # recon/bulk intelligence (~0.65 conf) rarely surfaces over episodic.
     if knowledge_results:
+        _KB_BASE_WEIGHT = 0.6
         for rank, r in enumerate(knowledge_results):
             mid = r.get("memory_id", "")
             if not mid:
                 continue
-            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+            confidence = r.get("confidence", 0.5)
+            scores[mid] = scores.get(mid, 0.0) + (_KB_BASE_WEIGHT * confidence) / (k + rank + 1)
             if mid not in content_map:
                 content_map[mid] = r
 
@@ -681,13 +687,22 @@ def _rrf_fusion(
     # and very weak multi-source hits.  Tune upward to ~0.025 if rank 2-3
     # results are still noisy in practice.
     _MIN_RRF_SCORE_RANK2 = 0.015
+    _MAX_KB_SLOTS = 1  # Prevent KB from flooding out episodic context
+    kb_count = 0
     results = []
-    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS]):
+    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS + 2]):  # scan a few extra in case KB slots are skipped
         if mid not in content_map:
             continue
         if i > 0 and score < _MIN_RRF_SCORE_RANK2:
-            break  # Remaining results are even lower — stop
-        results.append(content_map[mid])
+            break
+        entry = content_map[mid]
+        if entry.get("collection") == "knowledge_base":
+            kb_count += 1
+            if kb_count > _MAX_KB_SLOTS:
+                continue  # Skip this KB result, keep scanning
+        results.append(entry)
+        if len(results) >= _MAX_RESULTS:
+            break
     return results
 
 
@@ -793,6 +808,10 @@ def _format_results(results: list[dict]) -> str:
             parts.append(f"id:{mid[:8]}")
 
         tag = " | ".join(parts)
+        # Graph breadcrumbs: append related memory hints if available
+        related = r.get("related_ids")
+        if related:
+            tag += " | → " + ", ".join(f"id:{rid}" for rid in related)
         lines.append(f"[{tag}] {content}")
 
     # Remind the session about deeper search options beyond this hook
@@ -1156,6 +1175,32 @@ async def _run(prompt: str, session_id: str = "") -> None:
         )
         fused = [r for r in fused if not _is_garbage(r.get("content", ""))]
         fused_count = len(fused)
+
+        # Graph breadcrumbs: 1-hop sync SQL for top results (~5ms total).
+        # Appends related memory IDs so CC can expand via memory_expand.
+        if fused and _DB_PATH.exists():
+            try:
+                _gc = sqlite3.connect(str(_DB_PATH), timeout=2)
+                try:
+                    seen = {r.get("memory_id") for r in fused}
+                    for r in fused[:3]:
+                        mid = r.get("memory_id")
+                        if not mid:
+                            continue
+                        rows = _gc.execute(
+                            "SELECT target_id FROM memory_links"
+                            " WHERE source_id = ? AND strength >= 0.5"
+                            " ORDER BY strength DESC LIMIT 2",
+                            (mid,),
+                        ).fetchall()
+                        related = [row[0][:8] for row in rows if row[0] not in seen]
+                        if related:
+                            r["related_ids"] = related
+                finally:
+                    _gc.close()
+            except Exception:
+                pass  # Graph breadcrumbs are best-effort
+
         output = _format_results(fused)
         if output:
             print(output)
