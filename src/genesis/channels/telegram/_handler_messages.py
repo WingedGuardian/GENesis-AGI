@@ -791,7 +791,11 @@ async def _try_bare_approval_resolution(
         )
     except Exception:
         log.error("Failed to resolve bare approval", exc_info=True)
-        return False
+        try:
+            await msg.reply_text("Failed to process approval — please try again.")
+        except Exception:
+            log.debug("Failed to send approval error reply", exc_info=True)
+        return True  # Consume — user intended approval, not conversation
     if resolved_id is None:
         log.debug(
             "Bare %s in Approvals topic ignored — no pending requests",
@@ -1324,10 +1328,15 @@ async def handle_callback_query(
 
     user = update.effective_user
     if not user or not ctx.authorized(user.id):
-        await query.answer("Not authorized", show_alert=True)
+        with contextlib.suppress(Exception):
+            await query.answer("Not authorized", show_alert=True)
         return
 
-    await query.answer()  # Dismiss spinner immediately
+    # Dismiss spinner — purely cosmetic.  Stale callbacks (>30s old, common
+    # after polling restarts) raise BadRequest here; the approval resolution
+    # below must still proceed.
+    with contextlib.suppress(Exception):
+        await query.answer()
 
     data = query.data or ""
     parts = data.split(":", 1)
@@ -1370,7 +1379,7 @@ async def handle_callback_query(
                 parse_mode="HTML",
             )
         except Exception:
-            log.debug("Failed to edit message after cli_approve", exc_info=True)
+            log.warning("Failed to edit message after cli_approve", exc_info=True)
         _wake_inbox_monitor()
         return
 
@@ -1423,7 +1432,7 @@ async def handle_callback_query(
                 parse_mode="HTML",
             )
         except Exception:
-            log.debug("Failed to edit message after cli_approve_all", exc_info=True)
+            log.warning("Failed to edit message after cli_approve_all", exc_info=True)
         _wake_inbox_monitor()
         return
 
@@ -1444,7 +1453,7 @@ async def handle_callback_query(
                     parse_mode="HTML",
                 )
             except Exception:
-                log.debug("Failed to edit message after callback resolution", exc_info=True)
+                log.warning("Failed to edit message after callback resolution", exc_info=True)
         else:
             # Waiter expired or already processed — still show user feedback
             # so button presses aren't silently swallowed.
@@ -1462,7 +1471,7 @@ async def handle_callback_query(
                     parse_mode="HTML",
                 )
             except Exception:
-                log.debug("Failed to edit expired waiter message", exc_info=True)
+                log.warning("Failed to edit expired waiter message", exc_info=True)
 
 
 async def handle_voice(ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE):

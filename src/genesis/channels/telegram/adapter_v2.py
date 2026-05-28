@@ -189,6 +189,17 @@ class TelegramAdapterV2(ChannelAdapter):
 
         self._app.add_handler(TypeHandler(Update, _record_any_update), group=-1)
 
+        # Global error handler — catches unhandled exceptions in any handler
+        # so they are logged with full traceback rather than silently dropped.
+        async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+            log.error(
+                "Unhandled exception in Telegram handler: %s",
+                context.error,
+                exc_info=context.error,
+            )
+
+        self._app.add_error_handler(_on_error)
+
         log.info("Starting Telegram bot V2 (polling)...")
         await self._app.initialize()
         await self._app.start()
