@@ -18,7 +18,6 @@ import os
 import re
 import sys
 
-
 # Matches 'git worktree remove' with optional flags
 _WORKTREE_REMOVE = re.compile(
     r"\bgit\s+worktree\s+remove\b"
