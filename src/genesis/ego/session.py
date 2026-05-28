@@ -571,8 +571,27 @@ class EgoSession:
             # persisted to ego_state. It controls THIS cycle's delivery only.
             comm_decision = parsed.get("communication_decision", "send_digest")
             if proposals:
-                # Realist gate — LLM evaluates proposals against history
-                proposals = await self._filter_proposals(proposals)
+                # Bypass realist gate when critical directives are active —
+                # the user explicitly told the ego to propose something.
+                # The realist's zombie detection would incorrectly block
+                # re-proposals that were rejected for fixable reasons.
+                has_critical_directive = False
+                try:
+                    active_dirs = await ego_crud.list_active_directives(
+                        self._db, self._source_tag.replace("_cycle", ""),
+                    )
+                    has_critical_directive = any(
+                        d.get("priority") in ("critical", "high")
+                        for d in active_dirs
+                    )
+                except Exception:
+                    pass
+                if has_critical_directive:
+                    logger.info(
+                        "Realist bypassed — active critical/high directive(s)",
+                    )
+                else:
+                    proposals = await self._filter_proposals(proposals)
                 # Log realist cost for observability (cycle dataclass is frozen,
                 # so cost is tracked via logging; negligible vs ego cycle cost)
                 if self._last_realist_cost_usd > 0:
