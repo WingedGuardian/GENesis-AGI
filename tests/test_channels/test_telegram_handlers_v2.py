@@ -1147,9 +1147,10 @@ async def test_callback_unauthorized_rejected():
 
     await handlers["callback_query"](update, ctx)
 
-    # answer() might fail for stale queries but should still be attempted
-    # The key assertion: no approval resolution happened
-    # (no gate wired, so nothing to check — but handler should return early)
+    # Handler should reject unauthorized user and attempt to notify them
+    update.callback_query.answer.assert_called_once_with(
+        "Not authorized", show_alert=True,
+    )
 
 
 @pytest.mark.asyncio

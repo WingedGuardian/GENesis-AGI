@@ -353,7 +353,7 @@ class OutreachScheduler:
         try:
             # Only surface critical observations that haven't been seen yet.
             # Cache results so we can still alert during DB lock contention.
-            import time as _time
+            import time
             from datetime import UTC, datetime
             from zoneinfo import ZoneInfo
 
@@ -361,7 +361,9 @@ class OutreachScheduler:
             from genesis.db.crud.observations import INTERNAL_OBS_TYPES
             from genesis.env import user_timezone
 
-            _MAX_CACHE_AGE_S = 30 * 60  # Don't alert from cache older than 30 min
+            # Cache window must be shorter than dedup_window (30min) to avoid
+            # re-alerting items that aged out of the in-memory dedup dict.
+            _MAX_CACHE_AGE_S = 20 * 60  # 20 min (< 30 min dedup window)
 
             db_ok = True
             try:
@@ -371,12 +373,13 @@ class OutreachScheduler:
                     exclude_types=tuple(INTERNAL_OBS_TYPES),
                     limit=10,
                 )
-                if observations:
-                    self._cached_critical_obs = observations
-                    self._cached_critical_obs_at = _time.monotonic()
+                # Always update cache on successful query — even if empty
+                # (clears stale items that have since been surfaced).
+                self._cached_critical_obs = observations
+                self._cached_critical_obs_at = time.monotonic()
             except Exception:
                 db_ok = False
-                cache_age = _time.monotonic() - self._cached_critical_obs_at
+                cache_age = time.monotonic() - self._cached_critical_obs_at
                 if self._cached_critical_obs and cache_age < _MAX_CACHE_AGE_S:
                     logger.warning(
                         "Critical obs DB query failed — using cache (%d items, %.0fs old)",
