@@ -113,9 +113,16 @@ async def query_stale(
     *,
     older_than: str,
 ) -> list[dict]:
+    """Return active non-foreground sessions older than *older_than*.
+
+    Foreground sessions are excluded at the SQL level — they should never
+    be auto-expired (the user might resume).
+    """
     cursor = await db.execute(
         """SELECT * FROM cc_sessions
-           WHERE status = 'active' AND last_activity_at < ?
+           WHERE status = 'active'
+             AND session_type != 'foreground'
+             AND last_activity_at < ?
            ORDER BY last_activity_at ASC""",
         (older_than,),
     )

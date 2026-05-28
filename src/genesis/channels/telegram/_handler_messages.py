@@ -794,7 +794,7 @@ async def _try_bare_approval_resolution(
         try:
             await msg.reply_text("Failed to process approval — please try again.")
         except Exception:
-            log.debug("Failed to send approval error reply", exc_info=True)
+            log.warning("Failed to send approval error reply", exc_info=True)
         return True  # Consume — user intended approval, not conversation
     if resolved_id is None:
         log.debug(
@@ -1328,15 +1328,19 @@ async def handle_callback_query(
 
     user = update.effective_user
     if not user or not ctx.authorized(user.id):
-        with contextlib.suppress(Exception):
+        try:
             await query.answer("Not authorized", show_alert=True)
+        except Exception:
+            log.debug("Failed to answer unauthorized callback query", exc_info=True)
         return
 
     # Dismiss spinner — purely cosmetic.  Stale callbacks (>30s old, common
     # after polling restarts) raise BadRequest here; the approval resolution
     # below must still proceed.
-    with contextlib.suppress(Exception):
+    try:
         await query.answer()
+    except Exception:
+        log.debug("Failed to answer callback query (stale?)", exc_info=True)
 
     data = query.data or ""
     parts = data.split(":", 1)
