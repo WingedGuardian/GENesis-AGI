@@ -690,7 +690,7 @@ def _rrf_fusion(
     _MAX_KB_SLOTS = 1  # Prevent KB from flooding out episodic context
     kb_count = 0
     results = []
-    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS + 2]):  # scan a few extra in case KB slots are skipped
+    for i, (mid, score) in enumerate(ranked[:_MAX_RESULTS * 2]):  # scan extra to handle KB slot skips
         if mid not in content_map:
             continue
         if i > 0 and score < _MIN_RRF_SCORE_RANK2:

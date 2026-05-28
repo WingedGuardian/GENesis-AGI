@@ -219,7 +219,7 @@ async def memory_recall(
     if source == "both":
         results = [
             r for r in results
-            if r.memory_type != "knowledge_base" or r.score >= _KB_MIN_SCORE
+            if r.payload.get("scope") != "external" or r.score >= _KB_MIN_SCORE
         ]
 
     # MCP-layer instrumentation: emit with mode and pipeline attribution
