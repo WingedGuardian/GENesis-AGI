@@ -67,11 +67,51 @@ async def test_query_active(db, sess_fields):
 
 
 async def test_query_stale(db, sess_fields):
+    # Background sessions should appear in stale results
     await cc_sessions.create(
-        db, **{**sess_fields, "last_activity_at": "2026-03-07T06:00:00"},
+        db,
+        **{**sess_fields, "session_type": "background_task",
+           "last_activity_at": "2026-03-07T06:00:00"},
     )
     rows = await cc_sessions.query_stale(db, older_than="2026-03-07T07:00:00")
     assert len(rows) == 1
+
+
+async def test_query_stale_excludes_foreground(db, sess_fields):
+    """Foreground sessions must never appear in stale query results."""
+    await cc_sessions.create(
+        db,
+        **{**sess_fields, "session_type": "foreground",
+           "last_activity_at": "2026-03-07T06:00:00"},
+    )
+    rows = await cc_sessions.query_stale(db, older_than="2026-03-07T07:00:00")
+    assert len(rows) == 0
+
+
+async def test_reap_stale_excludes_foreground(db, sess_fields):
+    """reap_stale must never mark foreground sessions as completed."""
+    await cc_sessions.create(
+        db,
+        **{**sess_fields, "session_type": "foreground",
+           "last_activity_at": "2026-03-07T06:00:00"},
+    )
+    reaped = await cc_sessions.reap_stale(db, older_than="2026-03-07T07:00:00")
+    assert reaped == 0
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["status"] == "active"  # Still active, not reaped
+
+
+async def test_reap_stale_expires_background(db, sess_fields):
+    """reap_stale should expire stale background sessions."""
+    await cc_sessions.create(
+        db,
+        **{**sess_fields, "session_type": "background_task",
+           "last_activity_at": "2026-03-07T06:00:00"},
+    )
+    reaped = await cc_sessions.reap_stale(db, older_than="2026-03-07T07:00:00")
+    assert reaped == 1
+    row = await cc_sessions.get_by_id(db, "sess-1")
+    assert row["status"] == "completed"
 
 
 async def test_delete(db, sess_fields):
