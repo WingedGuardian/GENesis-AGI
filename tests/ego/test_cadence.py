@@ -632,3 +632,236 @@ class TestRecencyTiersConstant:
             _, max_a = _RECENCY_TIERS[i]
             _, max_b = _RECENCY_TIERS[i + 1]
             assert max_b > max_a
+
+
+# ---------------------------------------------------------------------------
+# Reactive signals — push_reactive_event → signal queue → unified cycle
+# ---------------------------------------------------------------------------
+
+
+class TestReactiveSignals:
+    def test_push_reactive_creates_signal(self, cadence):
+        """push_reactive_event creates an EgoSignal in the signal queue."""
+        cadence._running = True
+        cadence.push_reactive_event({
+            "type": "breaker.tripped",
+            "summary": "Provider X circuit breaker tripped",
+            "priority": "high",
+            "source": "routing",
+        })
+        assert not cadence._signal_queue.empty()
+        signals = cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.signal_type == "event"
+        assert sig.focus_category == "reactive"
+        assert "Provider X" in sig.summary
+        assert sig.metadata["model_override"] == "opus"
+        assert sig.metadata["effort_override"] == "high"
+        assert sig.metadata["event_type"] == "breaker.tripped"
+        assert sig.metadata["source"] == "routing"
+
+    def test_push_reactive_dedup_via_signal_queue(self, cadence):
+        """Same summary rejected by SignalQueue's 6h dedup."""
+        cadence._running = True
+        event = {
+            "type": "test",
+            "summary": "Same event summary",
+            "priority": "high",
+        }
+        cadence.push_reactive_event(event)
+        cadence.push_reactive_event(event)  # Should be deduped
+        signals = cadence._signal_queue.drain()
+        assert len(signals) == 1
+
+    def test_push_reactive_skips_when_paused(self, cadence):
+        """No signal pushed when paused."""
+        cadence._running = True
+        cadence.pause()
+        cadence.push_reactive_event({"type": "test", "summary": "x"})
+        assert cadence._signal_queue.empty()
+
+    def test_push_reactive_skips_when_not_running(self, cadence):
+        """No signal pushed when not running."""
+        cadence._running = False
+        cadence.push_reactive_event({"type": "test", "summary": "x"})
+        assert cadence._signal_queue.empty()
+
+    def test_push_reactive_model_override_is_opus(self, cadence):
+        """Reactive signals carry opus/high to match CYCLE_TYPE_DEFAULTS[REACTIVE]."""
+        cadence._running = True
+        cadence.push_reactive_event({"type": "test", "summary": "alert"})
+        signals = cadence._signal_queue.drain()
+        assert signals[0].metadata["model_override"] == "opus"
+        assert signals[0].metadata["effort_override"] == "high"
+
+    async def test_reactive_flows_through_unified_cycle(
+        self, cadence, mock_session,
+    ):
+        """push_reactive_event + _process_signals → run_unified_cycle."""
+        cadence._running = True
+        cadence.push_reactive_event({
+            "type": "health.degraded",
+            "summary": "System health degraded",
+            "priority": "high",
+        })
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_called_once()
+        call_args = mock_session.run_unified_cycle.call_args
+        signals = call_args[0][0]
+        assert len(signals) == 1
+        assert signals[0].focus_category == "reactive"
+        assert call_args[1]["model_override"] == "opus"
+        assert call_args[1]["effort_override"] == "high"
+
+    async def test_reactive_rate_limit_at_consumer(
+        self, cadence, mock_session,
+    ):
+        """Consumer drops reactive signals when rate limit (3/hour) is hit."""
+        cadence._running = True
+        # Simulate 3 prior reactive cycles this hour
+        now = datetime.now(UTC)
+        cadence._reactive_timestamps = [
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=30),
+        ]
+        cadence.push_reactive_event({
+            "type": "test",
+            "summary": "4th event this hour",
+            "priority": "high",
+        })
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_not_called()
+
+    async def test_reactive_rate_limit_preserves_non_reactive(
+        self, cadence, mock_session,
+    ):
+        """Non-reactive signals survive when reactive rate limit is hit."""
+        cadence._running = True
+        # Saturate reactive rate limit
+        now = datetime.now(UTC)
+        cadence._reactive_timestamps = [
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=30),
+        ]
+        # Push a reactive signal AND a proactive signal
+        from genesis.ego.signals import EgoSignal
+
+        cadence._signal_queue.push(EgoSignal(
+            signal_type="event",
+            focus_category="reactive",
+            summary="reactive event",
+            priority="high",
+        ))
+        cadence._signal_queue.push(EgoSignal(
+            signal_type="timer",
+            focus_category="proactive",
+            summary="proactive tick",
+            priority="medium",
+        ))
+        await cadence._process_signals()
+        # Should still run with the proactive signal
+        mock_session.run_unified_cycle.assert_called_once()
+        call_args = mock_session.run_unified_cycle.call_args
+        signals = call_args[0][0]
+        assert len(signals) == 1
+        assert signals[0].focus_category == "proactive"
+
+    async def test_reactive_records_timestamp_on_success(
+        self, cadence, mock_session,
+    ):
+        """Successful reactive cycle records a timestamp for rate limiting."""
+        cadence._running = True
+        assert len(cadence._reactive_timestamps) == 0
+        cadence.push_reactive_event({
+            "type": "test",
+            "summary": "alert event",
+            "priority": "high",
+        })
+        await cadence._process_signals()
+        assert len(cadence._reactive_timestamps) == 1
+
+    def test_push_reactive_priority_mapping(self, cadence):
+        """Event priority strings map to signal priority levels."""
+        from genesis.ego.cadence import _map_priority
+
+        assert _map_priority("CRITICAL") == "critical"
+        assert _map_priority("ERROR") == "high"
+        assert _map_priority("WARNING") == "medium"
+        assert _map_priority("high") == "high"
+        assert _map_priority("medium") == "medium"
+        assert _map_priority("low") == "low"
+        assert _map_priority("unknown") == "low"
+
+
+# ---------------------------------------------------------------------------
+# Escalation signals — push_escalation_event → signal queue → unified cycle
+# ---------------------------------------------------------------------------
+
+
+class TestEscalationSignals:
+    def test_push_escalation_creates_signal(self, cadence):
+        """push_escalation_event creates a critical escalation signal."""
+        cadence._running = True
+        cadence.push_escalation_event({
+            "type": "health.critical",
+            "summary": "Database unreachable",
+            "priority": "CRITICAL",
+            "source": "health",
+        })
+        assert not cadence._signal_queue.empty()
+        signals = cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.signal_type == "event"
+        assert sig.focus_category == "escalation"
+        assert sig.priority == "critical"
+        assert sig.metadata["model_override"] == "sonnet"
+        assert sig.metadata["effort_override"] == "medium"
+
+    async def test_escalation_not_rate_limited(
+        self, cadence, mock_session,
+    ):
+        """Escalation signals are NOT subject to reactive rate limiting."""
+        cadence._running = True
+        # Saturate reactive rate limit
+        now = datetime.now(UTC)
+        cadence._reactive_timestamps = [
+            now - timedelta(minutes=10),
+            now - timedelta(minutes=20),
+            now - timedelta(minutes=30),
+        ]
+        cadence.push_escalation_event({
+            "type": "health.critical",
+            "summary": "Critical system failure",
+        })
+        await cadence._process_signals()
+        # Should still run — escalation is not reactive
+        mock_session.run_unified_cycle.assert_called_once()
+        call_args = mock_session.run_unified_cycle.call_args
+        signals = call_args[0][0]
+        assert signals[0].focus_category == "escalation"
+
+    def test_push_escalation_skips_when_paused(self, cadence):
+        """No signal pushed when paused."""
+        cadence._running = True
+        cadence.pause()
+        cadence.push_escalation_event({"type": "test", "summary": "x"})
+        assert cadence._signal_queue.empty()
+
+    async def test_escalation_flows_through_unified_cycle(
+        self, cadence, mock_session,
+    ):
+        """push_escalation_event + _process_signals → run_unified_cycle."""
+        cadence._running = True
+        cadence.push_escalation_event({
+            "type": "guardian.alert",
+            "summary": "Container OOM detected",
+        })
+        await cadence._process_signals()
+        mock_session.run_unified_cycle.assert_called_once()
+        call_args = mock_session.run_unified_cycle.call_args
+        assert call_args[1]["model_override"] == "sonnet"
+        assert call_args[1]["effort_override"] == "medium"
