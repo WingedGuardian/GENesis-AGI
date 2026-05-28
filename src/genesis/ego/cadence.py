@@ -3,6 +3,11 @@
 Owns an APScheduler with two jobs:
 1. IntervalTrigger for regular cycles (adaptive backoff)
 2. CronTrigger for the mandatory morning report
+
+All cycle types (proactive, morning report, reactive, escalation) flow
+through the unified signal consumer loop: signal sources push EgoSignal
+objects to the SignalQueue, and _signal_consumer_loop() drains + runs
+run_unified_cycle().
 """
 
 from __future__ import annotations
@@ -45,6 +50,18 @@ _RECENCY_TIERS: list[tuple[timedelta | None, int]] = [
 ]
 
 
+def _map_priority(severity_or_priority: str) -> str:
+    """Map event severity/priority strings to signal priority levels."""
+    s = severity_or_priority.lower()
+    if s in ("critical",):
+        return "critical"
+    if s in ("error", "high"):
+        return "high"
+    if s in ("warning", "medium"):
+        return "medium"
+    return "low"
+
+
 class EgoCadenceManager:
     """Manages when the ego runs.
 
@@ -55,7 +72,8 @@ class EgoCadenceManager:
     - Circuit breaker (N consecutive failures -> pause)
     - Pause/resume controls
 
-    Does NOT own the EgoSession — just calls ``session.run_cycle()``.
+    All cycle dispatch goes through ``session.run_unified_cycle()`` via
+    the signal consumer loop.
     """
 
     def __init__(
@@ -93,22 +111,18 @@ class EgoCadenceManager:
         self._deep_think_interval = 5
         self._proactive_cycle_count = 0
 
-        # Unified signal queue: _on_tick() pushes here, consumer loop drains
+        # Unified signal queue: all signal sources push here, consumer loop drains.
+        # Proactive (_on_tick), morning report (_on_morning_report), reactive
+        # (push_reactive_event), and escalation (push_escalation_event) all
+        # converge on this queue.
         self._signal_queue = SignalQueue()
         self._signal_consumer_task: asyncio.Task | None = None
 
-        # Reactive event queue: events push here, debounce loop drains
-        self._reactive_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=100)
-        self._reactive_task: asyncio.Task | None = None
-        self._reactive_debounce_s = 300  # 5 minutes
+        # Reactive rate limiting: max N reactive-focused cycles per hour.
+        # Checked at the consumer (not at push time) to preserve batch semantics —
+        # a burst of events batches into one cycle consuming one rate-limit slot.
         self._reactive_max_per_hour = 3
         self._reactive_timestamps: list[datetime] = []
-
-        # Reactive dedup: skip events with same summary within window.
-        # Prevents the same deadline or observation from re-triggering
-        # a reactive cycle every 30 min (sweep interval).
-        self._reactive_seen: dict[str, datetime] = {}
-        self._reactive_dedup_hours = 6
 
     # -- Lifecycle ---------------------------------------------------------
 
@@ -146,12 +160,6 @@ class EgoCadenceManager:
         self._scheduler.start()
         from genesis.util.tasks import tracked_task
 
-        self._reactive_task = tracked_task(
-            self._reactive_loop(),
-            name=f"ego_reactive_{id(self)}",
-            event_bus=self._event_bus,
-            logger=logger,
-        )
         self._signal_consumer_task = tracked_task(
             self._signal_consumer_loop(),
             name=f"ego_signal_consumer_{id(self)}",
@@ -173,18 +181,17 @@ class EgoCadenceManager:
         )
 
     async def stop(self) -> None:
-        """Shut down APScheduler, reactive loop, and signal consumer.
+        """Shut down APScheduler and signal consumer.
 
         Awaits task cancellation so any held lock is released before
         stop() returns — prevents deadlock if caller re-acquires the lock.
         """
-        for attr in ("_reactive_task", "_signal_consumer_task"):
-            task = getattr(self, attr, None)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-                setattr(self, attr, None)
+        task = self._signal_consumer_task
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._signal_consumer_task = None
         if self._scheduler.running:
             self._scheduler.shutdown(wait=False)
         self._running = False
@@ -216,117 +223,62 @@ class EgoCadenceManager:
     def consecutive_failures(self) -> int:
         return self._consecutive_failures
 
-    # -- Reactive event queue -----------------------------------------------
+    # -- Reactive / escalation signal emitters --------------------------------
 
     def push_reactive_event(self, event: dict) -> None:
         """Push an event that may trigger a reactive ego cycle.
 
-        Events are debounced: the reactive loop waits 5 minutes after the
-        first event before running a cycle (batching concurrent events).
-        Rate-limited to 3 reactive cycles per hour.
-        Content-deduped: same summary within 6h window is skipped.
+        Creates an EgoSignal and pushes to the unified signal queue.
+        Content dedup is handled by SignalQueue (6h window on
+        ``reactive:{summary}``). Rate limiting happens at the consumer
+        (``_process_signals``) to preserve batch semantics.
 
         event keys: {"type": str, "summary": str, "priority": str?, "source": str?}
         """
         if not self._running or self._paused:
             return
 
-        # Content dedup: skip if same summary seen recently
-        summary = event.get("summary", "")[:100]
-        now = datetime.now(UTC)
-        if summary in self._reactive_seen:
-            age = (now - self._reactive_seen[summary]).total_seconds()
-            if age < self._reactive_dedup_hours * 3600:
-                logger.debug("Reactive event deduped (%.0fm old): %s", age / 60, summary[:50])
-                return
+        signal = EgoSignal(
+            signal_type="event",
+            focus_category="reactive",
+            summary=event.get("summary", "")[:200],
+            priority=_map_priority(event.get("priority", "high")),
+            metadata={
+                "model_override": "opus",
+                "effort_override": "high",
+                "event_type": event.get("type"),
+                "source": event.get("source"),
+            },
+        )
+        if self._signal_queue.push(signal):
+            logger.debug("Reactive signal pushed: %s", event.get("type", "?"))
 
-        # Prune old entries (keep dict bounded)
-        cutoff = now - timedelta(hours=self._reactive_dedup_hours)
-        self._reactive_seen = {
-            k: v for k, v in self._reactive_seen.items() if v > cutoff
-        }
-        self._reactive_seen[summary] = now
+    def push_escalation_event(self, event: dict) -> None:
+        """Push a critical event as an escalation signal.
 
-        try:
-            self._reactive_queue.put_nowait(event)
-            logger.debug("Reactive event queued: %s", event.get("type", "?"))
-        except asyncio.QueueFull:
-            logger.warning("Reactive queue full — dropping event")
+        Escalation signals get ``focus_category="escalation"`` which
+        selects escalation-specific context weights and prompt directive.
+        No rate limit — escalation signals are critical and rare.
 
-    async def _reactive_loop(self) -> None:
-        """Background task: drain reactive queue with debounce, run cycle."""
-        while True:
-            try:
-                # Block until first event arrives
-                first_event = await self._reactive_queue.get()
-                events = [first_event]
+        event keys: {"type": str, "summary": str, "priority": str?, "source": str?}
+        """
+        if not self._running or self._paused:
+            return
 
-                # Debounce: wait, then drain anything that arrived meanwhile
-                await asyncio.sleep(self._reactive_debounce_s)
-                while not self._reactive_queue.empty():
-                    try:
-                        events.append(self._reactive_queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-
-                # Rate limit: max N reactive cycles per hour
-                now = datetime.now(UTC)
-                cutoff = now - timedelta(hours=1)
-                self._reactive_timestamps = [
-                    ts for ts in self._reactive_timestamps if ts > cutoff
-                ]
-                if len(self._reactive_timestamps) >= self._reactive_max_per_hour:
-                    logger.info(
-                        "Reactive rate limit: %d/%d in last hour, skipping %d event(s)",
-                        len(self._reactive_timestamps),
-                        self._reactive_max_per_hour,
-                        len(events),
-                    )
-                    continue
-
-                # Run reactive cycle
-                event_summary = "; ".join(
-                    e.get("summary", e.get("type", "?"))[:80] for e in events[:5]
-                )
-                logger.info(
-                    "Reactive cycle triggered by %d event(s): %s",
-                    len(events),
-                    event_summary,
-                )
-
-                async with self._lock:
-                    if not self._should_run(skip_idle_check=True):
-                        continue
-
-                    try:
-                        from genesis.ego.types import CycleType
-
-                        cycle = await self._session.run_cycle(
-                            cycle_type=CycleType.REACTIVE,
-                        )
-                    except CycleBlockedError as exc:
-                        logger.info("Reactive cycle gated: %s", exc)
-                        continue
-                    except Exception:
-                        logger.error("Reactive cycle failed", exc_info=True)
-                        self._record_failure("reactive cycle failed")
-                        continue
-
-                    if cycle is not None:
-                        self._record_success()
-                        self._reactive_timestamps.append(datetime.now(UTC))
-                        logger.info(
-                            "Reactive cycle %s completed (cost=$%.4f)",
-                            cycle.id,
-                            cycle.cost_usd,
-                        )
-
-            except asyncio.CancelledError:
-                logger.debug("Reactive loop cancelled")
-                return
-            except Exception:
-                logger.error("Reactive loop error", exc_info=True)
-                await asyncio.sleep(60)  # Back off on unexpected errors
+        signal = EgoSignal(
+            signal_type="event",
+            focus_category="escalation",
+            summary=event.get("summary", "")[:200],
+            priority="critical",
+            metadata={
+                "model_override": "sonnet",
+                "effort_override": "medium",
+                "event_type": event.get("type"),
+                "source": event.get("source"),
+            },
+        )
+        if self._signal_queue.push(signal):
+            logger.info("Escalation signal pushed: %s", event.get("type", "?"))
 
     # -- Sweep helpers -----------------------------------------------------
 
@@ -433,13 +385,45 @@ class EgoCadenceManager:
 
         Separated from the consumer loop for testability — tests call
         this directly after pushing signals.
+
+        Reactive rate limiting happens here (not at push time) to preserve
+        batch semantics: a burst of events batches into one cycle consuming
+        one rate-limit slot.
         """
         signals = self._signal_queue.drain()
         if not signals:
             return
 
-        # Extract overrides from signal metadata (deep-think model, morning effort).
-        # Use `is None` checks (not falsy) so empty strings don't slip through.
+        # Reactive rate limit: max N reactive-focused cycles per hour.
+        # If the batch contains reactive signals and the limit is hit,
+        # drop reactive signals but keep non-reactive ones (e.g., a
+        # proactive tick that landed in the same batch window).
+        has_reactive = any(s.focus_category == "reactive" for s in signals)
+        if has_reactive:
+            now = datetime.now(UTC)
+            cutoff = now - timedelta(hours=1)
+            self._reactive_timestamps = [
+                ts for ts in self._reactive_timestamps if ts > cutoff
+            ]
+            if len(self._reactive_timestamps) >= self._reactive_max_per_hour:
+                non_reactive = [
+                    s for s in signals if s.focus_category != "reactive"
+                ]
+                if not non_reactive:
+                    logger.info(
+                        "Reactive rate limit: %d/%d in last hour, "
+                        "dropping %d signal(s)",
+                        len(self._reactive_timestamps),
+                        self._reactive_max_per_hour,
+                        len(signals),
+                    )
+                    return
+                signals = non_reactive
+                has_reactive = False
+
+        # Extract overrides from signal metadata (deep-think model, morning effort,
+        # reactive model/effort). Use `is None` checks (not falsy) so empty
+        # strings don't slip through.
         model_override = None
         effort_override = None
         for sig in signals:
@@ -498,6 +482,11 @@ class EgoCadenceManager:
                 return
 
             self._record_success()
+
+            # Record reactive timestamp for rate limiting
+            if has_reactive:
+                self._reactive_timestamps.append(datetime.now(UTC))
+
             # Morning report always resets interval to base (it's a
             # reporting event, not a proposal-productivity measurement).
             is_morning_report = any(
@@ -511,7 +500,8 @@ class EgoCadenceManager:
         """Background consumer for the unified signal queue.
 
         Blocks until signals arrive, brief batch window, then processes.
-        Same outer structure as _reactive_loop() for reliability.
+        All cycle types (proactive, morning, reactive, escalation) flow
+        through this single loop.
         """
         while True:
             try:
