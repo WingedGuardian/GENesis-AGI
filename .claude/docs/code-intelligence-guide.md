@@ -45,11 +45,11 @@ Config: `.serena/project.yml`
 
 ## GitNexus (Knowledge Graph)
 
-Graph of ~34K nodes and ~51K edges. CLI: `gitnexus <command>`.
+Graph of ~41K nodes and ~66K edges. CLI: `gitnexus <command>`.
 Index: `.gitnexus/lbug` (LadybugDB). Refresh: `gitnexus analyze`.
 
-**Best for:** impact analysis, execution flows, coupling, routes, tools.
-**Not for:** text search (FTS broken on Linux — LadybugDB/ladybug#430).
+**Best for:** impact analysis, execution flows, coupling, routes, tools,
+text search (`gitnexus query` — FTS fixed in 1.6.5 / @ladybugdb/core 0.16.1).
 
 ### Graph Structure
 
@@ -151,16 +151,11 @@ gitnexus impact "Method:src/genesis/autonomy/dispatcher.py:TaskDispatcher.submit
 
 ### Known Limitations
 
-- **FTS/text search broken on Linux.** LadybugDB v0.15.x segfaults on
-  `CREATE_FTS_INDEX` with 1000+ rows. Inherited from archived KuzuDB.
-  Tracked: LadybugDB/ladybug#430, GitNexus#1160.
+- **FTS/text search fixed.** LadybugDB/ladybug#430 resolved in
+  @ladybugdb/core 0.16.1 (shipped with GitNexus 1.6.5). `gitnexus query`
+  now works on Linux.
 - **Vector/embedding search not configured.** Requires `--embeddings`
   flag at analyze time + embedding provider.
-- **`query` tool returns empty results** without FTS. Use `context`,
-  `impact`, and Cypher queries instead.
-- **Env var required:** `GITNEXUS_LBUG_EXTENSION_INSTALL=never` must be
-  set to prevent segfault during `gitnexus analyze`. Set in
-  `~/.local/bin/env`.
 
 ### Skill Files (Detailed Workflows)
 

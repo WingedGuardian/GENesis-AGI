@@ -96,8 +96,8 @@ Four tool layers for code search and analysis, lightest to richest:
   to read 3+ files to answer a dependency question, stop and use
   Serena/GitNexus/CBM instead.
 
-**Known limitation:** FTS text search is broken on Linux
-(LadybugDB/ladybug#430). Use Grep/Serena for text search.
+**FTS text search:** Fixed in GitNexus 1.6.5 (@ladybugdb/core 0.16.1).
+`gitnexus query` now works for text search on Linux.
 
 Full decision matrix: `.claude/docs/code-intelligence.md`
 
@@ -251,6 +251,24 @@ Memories are tagged with a `wing` (top-level domain) and optional `room`
 (specific topic). When searching, you can filter by wing for domain-specific
 recall. Current wings: memory, learning, routing, infrastructure, channels,
 autonomy.
+
+## Memory Recall Behavior
+
+- **Search the whole system.** Use `memory_recall` with `source='both'`
+  to search episodic AND knowledge_base. Don't assume episodic alone is
+  sufficient. For domain-specific topics (external tools, products, APIs),
+  also try `knowledge_recall` with the product/tool name.
+- **Follow surfaced procedures.** When a `[Procedure]` tag appears in
+  proactive results, read the full procedure via `procedure_recall`,
+  evaluate applicability (>80% match = follow it), and note deviations.
+  Update via `procedure_store` if the procedure is outdated.
+- **Expand related memory hints.** When proactive results show
+  `[→ related: id:xxx]`, use `memory_expand` to get full context when the
+  topic is actively relevant.
+- **Don't wait to be asked.** When a topic comes up that likely has prior
+  context (recurring themes, named entities, project references),
+  proactively recall before responding. The user should not have to say
+  "check memory."
 
 ## MCP Tool Selection
 

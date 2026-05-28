@@ -91,6 +91,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "task_detected": timedelta(days=1),
     "model_downgrade": timedelta(days=1),
     # ── 7-day (version tracking, operational) ──────────────────────────
+    "conversation_pivot": timedelta(days=7),
     "genesis_version_change": timedelta(days=7),
     "memory_index": timedelta(days=7),
     "db_maintenance": timedelta(days=7),

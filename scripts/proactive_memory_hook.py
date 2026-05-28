@@ -27,7 +27,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parent.parent
@@ -173,18 +173,22 @@ def _record_pivot_observation(
     """Write a conversation_pivot observation to the DB."""
     try:
         import uuid as _uuid
+        now = datetime.now(UTC)
+        expires_at = (now + timedelta(days=7)).isoformat()
         conn = sqlite3.connect(str(db_path), timeout=2)
         try:
             conn.execute(
-                "INSERT INTO observations (id, source, type, content, priority, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO observations"
+                " (id, source, type, content, priority, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     _uuid.uuid4().hex,
                     f"session:{session_id}",
                     "conversation_pivot",
                     f"Conversation pivot: {label}. Trigger: {trigger[:80]}",
                     "low",
-                    datetime.now(UTC).isoformat(),
+                    now.isoformat(),
+                    expires_at,
                 ),
             )
             conn.commit()
