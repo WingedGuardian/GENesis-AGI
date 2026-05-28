@@ -92,6 +92,45 @@ def _load_bridge_config() -> dict | None:
 # and re-exported for backwards compatibility with standalone.py.
 
 
+def create_telegram_adapter(
+    *,
+    config: dict,
+    conversation_loop: "ConversationLoop",
+    runtime: "GenesisRuntime",
+    tts_provider: object | None = None,
+    config_loader: object | None = None,
+    reply_waiter: object | None = None,
+):
+    """Single factory for the Telegram adapter.
+
+    Shared by both ``bridge.py`` (standalone bridge process) and
+    ``standalone.py`` (integrated server).  Having one construction site
+    prevents parameter divergence — a missing ``proposal_workflow`` was
+    silently breaking proposal resolution (PR #471).
+    """
+    from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2
+
+    autonomous_cli_gate = runtime.autonomous_cli_approval_gate
+    if autonomous_cli_gate is None:
+        log.warning(
+            "Telegram adapter: autonomous_cli_approval_gate is None — "
+            "inline approval buttons will not resolve.",
+        )
+
+    return TelegramAdapterV2(
+        token=config["token"],
+        conversation_loop=conversation_loop,
+        allowed_users=config["allowed_users"],
+        whisper_model=config["whisper_model"],
+        tts_provider=tts_provider,
+        config_loader=config_loader,
+        reply_waiter=reply_waiter,
+        engagement_tracker=runtime.engagement_tracker,
+        autonomous_cli_gate=autonomous_cli_gate,
+        proposal_workflow=runtime._ego_proposal_workflow,
+    )
+
+
 async def _run_headless(runtime: GenesisRuntime) -> None:
     """Keep the bridge process alive without Telegram.
 
@@ -185,33 +224,13 @@ async def main():
     if runtime.outreach_pipeline:
         runtime.outreach_pipeline.set_reply_waiter(reply_waiter)
 
-    from genesis.channels.telegram.adapter_v2 import TelegramAdapterV2 as AdapterCls
-    log.info("Starting Telegram adapter V2")
-
-    # Inject the autonomous CLI approval gate so handle_callback_query
-    # can resolve cli_approve/cli_approve_all inline buttons and the text
-    # handler can resolve bare approve/reject typed in the Approvals topic.
-    # If the gate is None (unusual — autonomy init failed), approvals
-    # still deliver but must be resolved via the dashboard approvals API.
-    autonomous_cli_gate = runtime.autonomous_cli_approval_gate
-    if autonomous_cli_gate is None:
-        log.warning(
-            "Telegram bridge: autonomous_cli_approval_gate is None — "
-            "inline approval buttons will not resolve. Dashboard-only "
-            "approval fallback is still available.",
-        )
-
-    adapter = AdapterCls(
-        token=config["token"],
+    adapter = create_telegram_adapter(
+        config=config,
         conversation_loop=conversation_loop,
-        allowed_users=config["allowed_users"],
-        whisper_model=config["whisper_model"],
+        runtime=runtime,
         tts_provider=tts_provider,
         config_loader=tts_config_loader,
         reply_waiter=reply_waiter,
-        engagement_tracker=runtime.engagement_tracker,
-        autonomous_cli_gate=autonomous_cli_gate,
-        proposal_workflow=runtime._ego_proposal_workflow,
     )
 
     # Register adapter so outreach pipeline can deliver via Telegram

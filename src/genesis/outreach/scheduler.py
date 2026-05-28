@@ -49,6 +49,10 @@ class OutreachScheduler:
         # Critical observation dedup — prevents re-alerting if mark_surfaced
         # fails after successful delivery. Entries expire after 30 minutes.
         self._critical_obs_sent: dict[str, float] = {}  # obs_id → monotonic time
+        # Cache of last successful critical observation fetch — used as
+        # fallback when the DB query fails (e.g., lock contention).
+        self._cached_critical_obs: list[dict] = []
+        self._cached_critical_obs_at: float = 0.0  # monotonic time of cache
 
     @property
     def is_running(self) -> bool:
@@ -347,6 +351,9 @@ class OutreachScheduler:
         even when paused (like health checks — observability, not dispatches).
         """
         try:
+            # Only surface critical observations that haven't been seen yet.
+            # Cache results so we can still alert during DB lock contention.
+            import time
             from datetime import UTC, datetime
             from zoneinfo import ZoneInfo
 
@@ -354,13 +361,34 @@ class OutreachScheduler:
             from genesis.db.crud.observations import INTERNAL_OBS_TYPES
             from genesis.env import user_timezone
 
-            # Only surface critical observations that haven't been seen yet
-            observations = await obs_crud.get_unsurfaced(
-                self._db,
-                priority_filter=("critical",),
-                exclude_types=tuple(INTERNAL_OBS_TYPES),
-                limit=10,
-            )
+            # Cache window must be shorter than dedup_window (30min) to avoid
+            # re-alerting items that aged out of the in-memory dedup dict.
+            _MAX_CACHE_AGE_S = 20 * 60  # 20 min (< 30 min dedup window)
+
+            db_ok = True
+            try:
+                observations = await obs_crud.get_unsurfaced(
+                    self._db,
+                    priority_filter=("critical",),
+                    exclude_types=tuple(INTERNAL_OBS_TYPES),
+                    limit=10,
+                )
+                # Always update cache on successful query — even if empty
+                # (clears stale items that have since been surfaced).
+                self._cached_critical_obs = observations
+                self._cached_critical_obs_at = time.monotonic()
+            except Exception:
+                db_ok = False
+                cache_age = time.monotonic() - self._cached_critical_obs_at
+                if self._cached_critical_obs and cache_age < _MAX_CACHE_AGE_S:
+                    logger.warning(
+                        "Critical obs DB query failed — using cache (%d items, %.0fs old)",
+                        len(self._cached_critical_obs), cache_age,
+                    )
+                    observations = self._cached_critical_obs
+                else:
+                    logger.warning("Critical obs DB query failed — no usable cache")
+                    observations = []
 
             if not observations:
                 await self._record_job_result("critical_observations")
@@ -390,7 +418,10 @@ class OutreachScheduler:
             except Exception:
                 alert_tz = UTC
 
-            lines = ["\U0001f6a8 CRITICAL OBSERVATION" + ("S" if len(observations) > 1 else ""), ""]
+            header = "\U0001f6a8 CRITICAL OBSERVATION" + ("S" if len(observations) > 1 else "")
+            if not db_ok:
+                header += " \u26a0\ufe0f [DB unavailable — cached]"
+            lines = [header, ""]
             for obs in observations:
                 content = (obs.get("content") or "")[:200]
                 obs_type = obs.get("type", "unknown")
@@ -417,12 +448,15 @@ class OutreachScheduler:
                 len(observations), result.status.value,
             )
 
-            # Only mark surfaced if delivery actually succeeded
+            # Only mark surfaced if delivery succeeded AND DB is available
             from genesis.outreach.types import OutreachStatus
             ids = [obs["id"] for obs in observations]
-            if result.status == OutreachStatus.DELIVERED:
-                now = datetime.now(UTC).isoformat()
-                await obs_crud.mark_surfaced(self._db, ids, now)
+            if result.status == OutreachStatus.DELIVERED and db_ok:
+                try:
+                    now = datetime.now(UTC).isoformat()
+                    await obs_crud.mark_surfaced(self._db, ids, now)
+                except Exception:
+                    logger.warning("Failed to mark critical obs as surfaced", exc_info=True)
 
             # In-memory dedup — prevent re-alerting if mark_surfaced fails
             # after delivery, or if delivery was rejected by dedup layer.
