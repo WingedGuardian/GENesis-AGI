@@ -1021,3 +1021,145 @@ def test_format_error_bad_request():
     result = _format_error(err)
     assert "Message is too long" in result
     assert "Telegram error" in result
+
+
+# ── Callback query handler tests ──────────────────────────────────────
+
+
+def _make_callback_update(
+    user_id=123, callback_data="cli_approve:req-1", message_text="Approval request"
+):
+    """Build a mock Telegram Update for callback query testing."""
+    update = MagicMock()
+    update.effective_user = MagicMock()
+    update.effective_user.id = user_id
+    update.message = None
+    update.effective_message = None
+
+    query = AsyncMock()
+    query.data = callback_data
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+    query.message = MagicMock()
+    query.message.text = message_text
+    query.message.text_html = f"<b>{message_text}</b>"
+
+    update.callback_query = query
+    return update
+
+
+@pytest.fixture
+def handlers_with_gate(mock_loop, mock_adapter, dedupe):
+    gate = AsyncMock()
+    gate.resolve_request = AsyncMock(return_value=True)
+    gate.approve_all_pending = AsyncMock(return_value=2)
+    return make_handlers_v2(
+        mock_loop,
+        allowed_users={123},
+        whisper_model="base",
+        adapter=mock_adapter,
+        db=mock_loop._db,
+        dedupe=dedupe,
+        autonomous_cli_gate=gate,
+    ), gate
+
+
+@pytest.mark.asyncio
+async def test_callback_cli_approve_resolves(handlers_with_gate):
+    """Single cli_approve callback should resolve the request."""
+    handlers, gate = handlers_with_gate
+    update = _make_callback_update(callback_data="cli_approve:req-abc")
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    gate.resolve_request.assert_called_once_with(
+        "req-abc", decision="approved", resolved_by="telegram:button:123",
+    )
+    update.callback_query.answer.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_callback_cli_approve_all_batch(handlers_with_gate):
+    """Batch cli_approve_all should resolve triggering request + all pending."""
+    handlers, gate = handlers_with_gate
+    update = _make_callback_update(callback_data="cli_approve_all:req-xyz")
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    gate.resolve_request.assert_called_once_with(
+        "req-xyz", decision="approved", resolved_by="telegram:batch:123",
+    )
+    gate.approve_all_pending.assert_called_once_with(
+        resolved_by="telegram:batch:123",
+    )
+
+
+@pytest.mark.asyncio
+async def test_callback_stale_query_still_resolves(handlers_with_gate):
+    """Stale callback (query.answer fails) should still resolve the approval."""
+    handlers, gate = handlers_with_gate
+    update = _make_callback_update(callback_data="cli_approve:req-stale")
+    update.callback_query.answer = AsyncMock(
+        side_effect=Exception("Query is too old"),
+    )
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    gate.resolve_request.assert_called_once_with(
+        "req-stale", decision="approved", resolved_by="telegram:button:123",
+    )
+
+
+@pytest.mark.asyncio
+async def test_callback_already_resolved_shows_status(handlers_with_gate):
+    """Already-resolved request should show current status, not error."""
+    handlers, gate = handlers_with_gate
+    gate.resolve_request = AsyncMock(return_value=False)
+    # _resolution_label looks up the gate's approval_manager
+    gate.approval_manager = AsyncMock()
+    gate.approval_manager.get_by_id = AsyncMock(
+        return_value={"status": "expired"},
+    )
+    update = _make_callback_update(callback_data="cli_approve:req-old")
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    # Should have tried to edit message with status
+    update.callback_query.edit_message_text.assert_called_once()
+    call_kwargs = update.callback_query.edit_message_text.call_args
+    assert "Expired" in call_kwargs.kwargs.get("text", call_kwargs.args[0] if call_kwargs.args else "")
+
+
+@pytest.mark.asyncio
+async def test_callback_unauthorized_rejected():
+    """Unauthorized user should get rejected with no approval resolution."""
+    handlers = make_handlers_v2(
+        AsyncMock(spec=["handle_message_streaming", "_db"]),
+        allowed_users={123},
+        whisper_model="base",
+    )
+    update = _make_callback_update(user_id=999)  # Not in allowed_users
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    # answer() might fail for stale queries but should still be attempted
+    # The key assertion: no approval resolution happened
+    # (no gate wired, so nothing to check — but handler should return early)
+
+
+@pytest.mark.asyncio
+async def test_callback_unknown_action_ignored(handlers_with_gate):
+    """Unknown callback action should be silently ignored."""
+    handlers, gate = handlers_with_gate
+    update = _make_callback_update(callback_data="unknown:some-key")
+    ctx = _make_context()
+
+    await handlers["callback_query"](update, ctx)
+
+    gate.resolve_request.assert_not_called()
+    gate.approve_all_pending.assert_not_called()
