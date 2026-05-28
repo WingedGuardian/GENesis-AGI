@@ -69,7 +69,14 @@ here and know the key takeaway.}
 
 ### What We Could Do With It
 
-{Collaborative actions — Genesis + user}
+{Collaborative actions — Genesis + user. Go beyond "adopt or ignore."
+Consider: incremental improvements to something already in play, better
+measurement of something currently vibes-checked, upgrades to the approach
+rather than the tool, patterns that make existing work more rigorous.
+
+When the user asks "what can we learn from this?" — the answer includes
+EVERYTHING: small refinements, architectural upgrades, measurement gaps,
+better approaches to the same problem. Not just "should we use this tool."}
 
 ### What to Watch
 
