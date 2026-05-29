@@ -69,6 +69,11 @@ class MemoryStore:
         return self._qdrant
 
     @property
+    def embedding_provider(self) -> EmbeddingProvider:
+        """Public accessor for the EmbeddingProvider instance."""
+        return self._embeddings
+
+    @property
     def linker(self) -> MemoryLinker | None:
         """Public access to the memory linker for extraction typed links."""
         return self._linker

@@ -91,8 +91,11 @@ async def run_extraction_cycle(
         "events_failed": 0,
         "goals_detected": 0,
         "contacts_detected": 0,
+        "connections_created": 0,
         "errors": 0,
     }
+    # Collect newly stored memories for cross-session connection discovery
+    _newly_stored: list[tuple[str, str, str]] = []
 
     # Find sessions with unextracted content (includes filesystem discovery)
     sessions = await _find_extractable_sessions(db, transcript_dir=transcript_dir)
@@ -208,6 +211,9 @@ async def run_extraction_cycle(
                     )
                     summary["entities_extracted"] += 1
                     session_extraction_count += 1
+                    _newly_stored.append(
+                        (memory_id, extraction.content, cc_session_id)
+                    )
 
                     # Store SVO event if temporal + verb present
                     if extraction.event_verb and extraction.temporal:
@@ -294,6 +300,21 @@ async def run_extraction_cycle(
                     keywords=all_keywords, topic=latest_topic,
                 )
         summary["sessions_processed"] += 1
+
+    # Cross-session connection discovery (vector-based, no LLM)
+    if _newly_stored and not reference_only_mode:
+        try:
+            from genesis.memory.connection_pass import run_connection_pass
+
+            conn_result = await run_connection_pass(
+                db=db,
+                qdrant_client=store.qdrant_client,
+                embedding_provider=store.embedding_provider,
+                newly_stored=_newly_stored,
+            )
+            summary["connections_created"] = conn_result["connections_created"]
+        except Exception:
+            logger.warning("Connection pass failed", exc_info=True)
 
     return summary
 

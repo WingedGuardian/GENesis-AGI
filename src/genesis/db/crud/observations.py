@@ -148,6 +148,7 @@ _TTL_BY_TYPE: dict[str, timedelta] = {
     "memory_operation": timedelta(days=3),
     "quarantined_reflection": timedelta(days=14),
     "code_audit": timedelta(days=14),
+    "cc_memory_staleness": timedelta(days=14),
 }
 _TTL_PREFIX: list[tuple[str, timedelta]] = [
     ("triage_depth_", timedelta(days=30)),
