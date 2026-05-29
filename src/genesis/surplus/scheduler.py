@@ -311,12 +311,17 @@ class SurplusScheduler:
                 misfire_grace_time=300,
             )
         if self._j9_eval_batch_hours > 0:
+            # CronTrigger instead of IntervalTrigger: IntervalTrigger resets
+            # on server restart, so a 24h job never fires if the server
+            # restarts more frequently.  Fixed hour ensures the batch runs
+            # daily regardless of restart cadence.
+            from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
-                IntervalTrigger(hours=self._j9_eval_batch_hours),
+                CronTrigger(hour=3),  # 3 AM UTC daily
                 id="schedule_j9_eval_batch",
                 max_instances=1,
-                misfire_grace_time=300,
+                misfire_grace_time=3600,
             )
         if self._model_eval_hours > 0:
             self._scheduler.add_job(
