@@ -1262,6 +1262,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     except Exception:
         logger.debug("conversation_pivot bulk-resolve skipped", exc_info=True)
 
+    # Measurement batch: prompt_hash on eval_events for prompt versioning
+    await _try_alter(db,
+        "ALTER TABLE eval_events ADD COLUMN prompt_hash TEXT",
+        "eval_events.prompt_hash")
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

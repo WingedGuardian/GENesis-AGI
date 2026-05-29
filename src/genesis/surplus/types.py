@@ -39,6 +39,8 @@ class TaskType(StrEnum):
     WING_AUDIT = "wing_audit"
     # CC memory file staleness detection
     CC_MEMORY_STALENESS = "cc_memory_staleness"
+    # Measurement batch: fresh session diagnostic
+    FRESH_SESSION_TEST = "fresh_session_test"
 
 
 class ComputeTier(StrEnum):

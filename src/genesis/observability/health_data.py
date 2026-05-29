@@ -127,7 +127,19 @@ class HealthDataService:
             "memory_health": await memory_health(self._db),
             "provider_health": self._serialize_provider_health(),
             "eval_staleness": await eval_staleness(self._db),
+            "vcr": await self._vcr_snapshot(),
         }
+
+    async def _vcr_snapshot(self) -> dict:
+        """Verified Completion Rate for ego proposals."""
+        if self._db is None:
+            return {}
+        try:
+            from genesis.db.crud.ego import compute_vcr
+            return await compute_vcr(self._db, days=30)
+        except Exception:
+            logger.debug("VCR snapshot failed", exc_info=True)
+            return {}
 
     def _serialize_provider_health(self) -> dict:
         """Serialize provider probe results for the snapshot."""

@@ -1158,6 +1158,16 @@ TABLES = {
             updated_at           TEXT NOT NULL
         )
     """,
+    "prompt_versions": """
+        CREATE TABLE IF NOT EXISTS prompt_versions (
+            hash         TEXT NOT NULL,
+            call_site    TEXT NOT NULL,
+            first_seen   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+            content_preview TEXT,
+            PRIMARY KEY (hash, call_site)
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)

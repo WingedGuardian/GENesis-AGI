@@ -583,13 +583,14 @@ call_sites:
   judge:
     chain:
     - openrouter-deepseek-v4
+    - openrouter-deepseek-v4-flash
     default_paid: true
     retry_profile: background
     dispatch: api
     description: "LLM-as-judge primitive \u2014 grades outputs against versioned\
       \ rubrics for the eval harness (and, in later phases, CRAG retrieval).\
-      \ Single-model chain by design: if the judge model is unavailable,\
-      \ fail loudly rather than silently swap models and corrupt calibration."
+      \ Same-family fallback (v4 then v4-flash) for resilience; model_used\
+      \ is logged per judgment for calibration traceability."
   voice_conversation:
     chain:
     - groq-free

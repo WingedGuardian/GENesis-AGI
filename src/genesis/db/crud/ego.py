@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -853,3 +853,71 @@ async def get_goal_proposal_summary(
         return dict(await cursor.fetchall())
     except Exception:
         return {}
+
+
+async def compute_vcr(
+    db: aiosqlite.Connection,
+    *,
+    days: int = 30,
+) -> dict:
+    """Compute Verified Completion Rate for ego proposals.
+
+    VCR measures whether autonomously dispatched proposals actually
+    succeeded, not just whether they were dispatched.
+
+    Returns dict with:
+      - total_resolved: all proposals that left 'pending' state
+      - total_executed: proposals that were dispatched as sessions
+      - outcomes_completed: executed proposals whose session succeeded
+      - outcomes_failed: executed proposals whose session failed
+      - outcomes_unknown: executed proposals with no outcome data
+      - vcr: outcomes_completed / total_executed (0.0 if none)
+      - dispatch_rate: total_executed / total_resolved (0.0 if none)
+    """
+    since = (datetime.now(UTC) - timedelta(days=days)).isoformat()
+    try:
+        cursor = await db.execute(
+            "SELECT status, user_response FROM ego_proposals "
+            "WHERE resolved_at >= ? OR (status = 'executed' AND created_at >= ?)",
+            (since, since),
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        return {
+            "total_resolved": 0, "total_executed": 0,
+            "outcomes_completed": 0, "outcomes_failed": 0,
+            "outcomes_unknown": 0, "vcr": 0.0, "dispatch_rate": 0.0,
+        }
+
+    total_resolved = 0
+    total_executed = 0
+    completed = 0
+    failed = 0
+    unknown = 0
+
+    for status, user_response in rows:
+        if status in ("pending",):
+            continue  # not yet resolved
+        total_resolved += 1
+        if status == "executed":
+            total_executed += 1
+            resp = user_response or ""
+            if "|completed:" in resp:
+                completed += 1
+            elif "|failed:" in resp:
+                failed += 1
+            else:
+                unknown += 1
+
+    vcr = completed / total_executed if total_executed > 0 else 0.0
+    dispatch_rate = total_executed / total_resolved if total_resolved > 0 else 0.0
+
+    return {
+        "total_resolved": total_resolved,
+        "total_executed": total_executed,
+        "outcomes_completed": completed,
+        "outcomes_failed": failed,
+        "outcomes_unknown": unknown,
+        "vcr": round(vcr, 4),
+        "dispatch_rate": round(dispatch_rate, 4),
+    }

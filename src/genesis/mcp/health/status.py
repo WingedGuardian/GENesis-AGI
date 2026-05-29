@@ -37,6 +37,7 @@ async def _impl_health_status() -> dict:
         "outreach_stats": snap.get("outreach_stats", {}),
         "services": snap.get("services", {}),
         "provider_activity": provider_activity,
+        "vcr": snap.get("vcr", {}),
     }
 
 

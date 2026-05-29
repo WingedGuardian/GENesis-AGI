@@ -91,6 +91,7 @@ class SurplusScheduler:
         self._bookmark_enrichment_executor: SurplusExecutor | None = None
         self._model_eval_executor: SurplusExecutor | None = None
         self._j9_eval_batch_executor: SurplusExecutor | None = None
+        self._fresh_session_test_executor: SurplusExecutor | None = None
         self._disk_cleanup_executor: SurplusExecutor | None = None
         self._backup_verification_executor: SurplusExecutor | None = None
         self._dead_letter_replay_executor: SurplusExecutor | None = None
@@ -138,6 +139,20 @@ class SurplusScheduler:
     def set_j9_eval_batch_executor(self, executor: SurplusExecutor) -> None:
         """Set executor for J9_EVAL_BATCH tasks (daily memory relevance scoring)."""
         self._j9_eval_batch_executor = executor
+
+    def set_fresh_session_test_executor(self, executor: SurplusExecutor) -> None:
+        """Set executor for FRESH_SESSION_TEST tasks (weekly documentation quality diagnostic)."""
+        self._fresh_session_test_executor = executor
+        # Late-registration: if scheduler already started, add the job now
+        if self._scheduler.running and not self._scheduler.get_job("schedule_fresh_session_test"):
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self._schedule_fresh_session_test,
+                CronTrigger(day_of_week="sun", hour=5),
+                id="schedule_fresh_session_test",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
 
     def set_maintenance_executors(
         self,
@@ -311,12 +326,27 @@ class SurplusScheduler:
                 misfire_grace_time=300,
             )
         if self._j9_eval_batch_hours > 0:
+            # CronTrigger instead of IntervalTrigger: IntervalTrigger resets
+            # on server restart, so a 24h job never fires if the server
+            # restarts more frequently.  Fixed hour ensures the batch runs
+            # daily regardless of restart cadence.
+            from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
-                IntervalTrigger(hours=self._j9_eval_batch_hours),
+                CronTrigger(hour=3),  # 3 AM UTC daily
                 id="schedule_j9_eval_batch",
                 max_instances=1,
-                misfire_grace_time=300,
+                misfire_grace_time=3600,
+            )
+        # Fresh session test: weekly Sunday 5 AM UTC
+        if self._fresh_session_test_executor is not None:
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self._schedule_fresh_session_test,
+                CronTrigger(day_of_week="sun", hour=5),
+                id="schedule_fresh_session_test",
+                max_instances=1,
+                misfire_grace_time=3600,
             )
         if self._model_eval_hours > 0:
             self._scheduler.add_job(
@@ -480,6 +510,29 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_j9_eval_batch", str(exc))
+            except Exception:
+                pass
+
+    async def _schedule_fresh_session_test(self) -> None:
+        """Enqueue a FRESH_SESSION_TEST task if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            active = await self._queue.active_by_type(TaskType.FRESH_SESSION_TEST)
+            if active == 0:
+                await self._queue.enqueue(
+                    TaskType.FRESH_SESSION_TEST, ComputeTier.FREE_API, 0.2, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_fresh_session_test")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("Fresh session test scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_fresh_session_test", str(exc))
             except Exception:
                 pass
 
@@ -1138,6 +1191,8 @@ class SurplusScheduler:
             executor = self._j9_eval_batch_executor
         elif task.task_type == _TT.CC_MEMORY_STALENESS and self._cc_memory_staleness_executor is not None:
             executor = self._cc_memory_staleness_executor
+        elif task.task_type == _TT.FRESH_SESSION_TEST and self._fresh_session_test_executor is not None:
+            executor = self._fresh_session_test_executor
 
         try:
             result = await executor.execute(task)

@@ -212,6 +212,17 @@ async def init(rt: GenesisRuntime) -> None:
             logger.error("Unexpected error wiring J9EvalBatchExecutor", exc_info=True)
             await _degraded(rt, "J9EvalBatchExecutor")
 
+        # Fresh session test executor (weekly documentation quality diagnostic)
+        try:
+            from genesis.surplus.fresh_session_test import FreshSessionTestExecutor
+            fst_executor = FreshSessionTestExecutor(router=rt._router)
+            rt._surplus_scheduler.set_fresh_session_test_executor(fst_executor)
+            logger.info("FreshSessionTestExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire FreshSessionTestExecutor", exc_info=True)
+        except Exception:
+            logger.error("Unexpected error wiring FreshSessionTestExecutor", exc_info=True)
+
         try:
             from genesis.surplus.maintenance import (
                 BackupVerificationExecutor,
