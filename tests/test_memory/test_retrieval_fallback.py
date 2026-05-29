@@ -51,6 +51,8 @@ async def test_recall_fts_only_on_embedding_failure(mock_qdrant, mock_crud, mock
         _make_fts_row("mem-2", -3.0),
     ])
     mock_links.count_links = AsyncMock(return_value=0)
+    mock_links.batch_link_counts = AsyncMock(return_value={})
+    mock_links.inter_candidate_links = AsyncMock(return_value=[])
 
     results = await retriever.recall("test query", limit=10)
 
@@ -75,6 +77,8 @@ async def test_recall_fts_only_vector_rank_is_none(mock_qdrant, mock_crud, mock_
         _make_fts_row("mem-1", -5.0),
     ])
     mock_links.count_links = AsyncMock(return_value=0)
+    mock_links.batch_link_counts = AsyncMock(return_value={})
+    mock_links.inter_candidate_links = AsyncMock(return_value=[])
 
     results = await retriever.recall("test query", limit=10)
     assert len(results) == 1
@@ -109,6 +113,8 @@ async def test_recall_normal_unchanged(mock_qdrant, mock_crud, mock_links, _):
     }]
     mock_crud.search_ranked = AsyncMock(return_value=[])
     mock_links.count_links = AsyncMock(return_value=0)
+    mock_links.batch_link_counts = AsyncMock(return_value={})
+    mock_links.inter_candidate_links = AsyncMock(return_value=[])
 
     results = await retriever.recall("test query", source="episodic", limit=10)
     assert len(results) == 1

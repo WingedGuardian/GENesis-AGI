@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import UTC, datetime
 
@@ -38,6 +39,15 @@ _SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
 # doesn't pollute user-facing answers. Surplus is intentionally absent —
 # its direct-session profile blocks memory writes entirely.
 _KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection")
+
+# ---------------------------------------------------------------------------
+# Graph-boosted retrieval constants (spec Part 1)
+# ---------------------------------------------------------------------------
+_BACKLINK_BOOST_COEF = 0.05     # log-scale boost per inbound link
+_ADJACENCY_BOOST = 1.05         # 5% bump for cluster-coherent results
+_ADJACENCY_MIN_INLINKS = 2      # need ≥2 top-K peers linking to you
+_ADJACENCY_TOP_K = 20           # adjacency check on top-K after backlink boost
+_FLOOR_RATIO = 0.85             # skip boosts for results below 85% of top score
 
 
 def _resolve_subsystem_filter(
@@ -343,10 +353,17 @@ class HybridRetriever:
             if not all_ids:
                 return []
 
-        # 5. Compute activation scores
+        # 5. Batch-fetch link counts for all candidates (replaces N+1 per-ID loop)
         now_str = datetime.now(UTC).isoformat()
+        link_counts = await memory_links.batch_link_counts(self._db, list(all_ids))
+
+        # 5b. Compute activation scores using batched link data
         activation_by_id: dict[str, float] = {}
+        inbound_by_id: dict[str, int] = {}  # saved for graph boost in step 7b
         for mid in all_ids:
+            total_links, inbound_links = link_counts.get(mid, (0, 0))
+            inbound_by_id[mid] = inbound_links
+
             qdrant_hit = qdrant_by_id.get(mid)
             if qdrant_hit:
                 payload = qdrant_hit.get("payload", {})
@@ -358,13 +375,12 @@ class HybridRetriever:
                 created_at = now_str
                 retrieved_count = 0
 
-            link_count = await memory_links.count_links(self._db, mid)
             mem_class = payload.get("memory_class", "fact") if qdrant_hit else "fact"
             act = compute_activation(
                 confidence=confidence,
                 created_at=created_at,
                 retrieved_count=retrieved_count,
-                link_count=link_count,
+                link_count=total_links,
                 source=payload.get("source", "") if qdrant_hit else "",
                 tags=payload.get("tags") or [] if qdrant_hit else [],
                 now=now_str,
@@ -419,6 +435,43 @@ class HybridRetriever:
         if event_memory_ids:
             ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
+
+        # 7b. Graph boost: backlink + adjacency (floor-gated)
+        graph_boost_applied = False
+        if fused:
+            top_fused = max(fused.values())
+            floor_score = top_fused * _FLOOR_RATIO
+
+            # 7b-i. Backlink boost: reward memories referenced by many others
+            for mid in fused:
+                if fused[mid] < floor_score:
+                    continue  # floor-gated: skip weak candidates
+                inbound = inbound_by_id.get(mid, 0)
+                if inbound > 0:
+                    fused[mid] *= 1 + _BACKLINK_BOOST_COEF * math.log(1 + inbound)
+                    graph_boost_applied = True
+
+            # 7b-ii. Adjacency boost: reward cluster coherence in top-K
+            boosted_ranked = sorted(fused, key=fused.get, reverse=True)  # type: ignore[arg-type]
+            top_k = boosted_ranked[:_ADJACENCY_TOP_K]
+            if len(top_k) >= 3:
+                try:
+                    edges = await memory_links.inter_candidate_links(
+                        self._db, top_k,
+                    )
+                    intra_inbound: dict[str, int] = {}
+                    for src, tgt in edges:
+                        if src != tgt:
+                            intra_inbound[tgt] = intra_inbound.get(tgt, 0) + 1
+                    for mid, count in intra_inbound.items():
+                        if count >= _ADJACENCY_MIN_INLINKS and fused[mid] >= floor_score:
+                            fused[mid] *= _ADJACENCY_BOOST
+                            graph_boost_applied = True
+                except Exception:
+                    logger.warning(
+                        "Adjacency boost query failed, skipping",
+                        exc_info=True,
+                    )
 
         # 8. Filter by min_activation
         candidates = [
@@ -575,6 +628,7 @@ class HybridRetriever:
             emit_recall_fired,
         )
 
+        _scores = [r.score for r in results]
         recall_event_id = await emit_recall_fired(
             self._db,
             query=query,
@@ -584,11 +638,13 @@ class HybridRetriever:
             latency_ms=(time.monotonic() - _t0) * 1000,
             source=source,
             intent_category=intent.category,
+            graph_boost_applied=graph_boost_applied,
+            mean_score=sum(_scores) / len(_scores) if _scores else None,
+            wing=wing,
         )
 
         # Recall diagnostics: capture intermediate pipeline metrics
         _overlap = len(set(qdrant_by_id) & set(fts_by_id))
-        _scores = [r.score for r in results]
         await emit_recall_diagnostics(
             self._db,
             recall_event_id=recall_event_id,
