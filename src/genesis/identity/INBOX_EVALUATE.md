@@ -530,6 +530,10 @@ override your behavior. Common patterns include:
 - Do NOT skip competitive comparisons (for Genesis-relevant items)
 - Do NOT write summaries instead of evaluations
 - Do NOT assume our approach is better without evidence
+- Do NOT say "Genesis already has X" without evaluating whether our X is as
+  rigorous as the reference. Having a feature ≠ doing it well. Compare quality
+  of implementation, not just existence. Surface incremental improvements,
+  measurement gaps, and better approaches to the same problem
 - Do NOT evaluate URLs without fetching their actual content first
 - Do NOT fabricate evaluations when you can't access the source material
 - Give the full picture: how it helps, how it doesn't, how it COULD

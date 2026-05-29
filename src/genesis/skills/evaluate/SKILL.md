@@ -31,7 +31,13 @@ to Genesis. Produce a structured evaluation with clear recommendations.
    - **Replacement risk**: Could this obsolete a Genesis component?
    - **Integration cost**: How much work to adopt or adapt?
    - **Lock-in risk**: Does adopting this violate the flexibility principle?
+   - **Rigor gap**: Where Genesis has an equivalent, is ours as rigorous?
+     "We have X" is not the same as "our X measures effectiveness, handles
+     edge cases, and improves over time." Compare the QUALITY of our
+     implementation against the reference, not just its existence.
 4. **Recommend** — One of: ADOPT, WATCH, IGNORE, ADAPT (take the idea, not the tool).
+   ADAPT is the most common valuable outcome — stealing patterns, measurement
+   approaches, or architectural rigor from a reference without adopting its code.
 5. **Write output** — Structured evaluation in the format below.
 
 ## Output Format
@@ -63,11 +69,29 @@ a scoring axis is unremarkable, skip it here.}
 
 ### How It COULD Help
 
-{Patterns worth stealing, future version ideas, creative applications}
+{Patterns worth stealing, future version ideas, creative applications.
+Think beyond "adopt this tool" — consider incremental improvements to how
+we already do something, upgrades to existing approaches, better measurement
+of something we currently vibes-check, or architectural patterns that would
+make an existing subsystem more rigorous.}
 
 ### What to Learn
 
-{Engineering patterns, competitive positioning, design principles}
+{Engineering patterns, competitive positioning, design principles.
+
+CRITICAL: "We already have this" is NOT a conclusion — it's a starting point.
+For every overlap, ask: are we doing it AS WELL as this reference demonstrates?
+Are we measuring effectiveness, or just checking the box? Examples:
+
+- "We have prompts" vs "we have versioned prompts with outcome linkage"
+- "We have task tracking" vs "we have verified completion rate metrics"
+- "We have memory" vs "we have continuous quality scoring with regression tracking"
+- "We have approval gates" vs "we have pass-state gating where the harness verifies independently"
+
+The question is never "do we have something that resembles this?" It's "are
+we doing this well enough to get the benefits it promises?" Surface the gap
+between having a feature and having it work at the level of rigor the reference
+describes.}
 
 ## References
 
