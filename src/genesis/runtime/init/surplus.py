@@ -239,6 +239,18 @@ async def init(rt: GenesisRuntime) -> None:
             await _degraded(rt, "MaintenanceExecutors")
 
         try:
+            from genesis.surplus.cc_memory_staleness import CCMemoryStalenessExecutor
+            cc_staleness_executor = CCMemoryStalenessExecutor(db=rt._db)
+            rt._surplus_scheduler.set_cc_memory_staleness_executor(cc_staleness_executor)
+            logger.info("CCMemoryStalenessExecutor wired to surplus scheduler")
+        except (ImportError, AttributeError):
+            logger.error("Failed to wire CCMemoryStalenessExecutor", exc_info=True)
+            await _degraded(rt, "CCMemoryStalenessExecutor")
+        except Exception:
+            logger.error("Unexpected error wiring CCMemoryStalenessExecutor", exc_info=True)
+            await _degraded(rt, "CCMemoryStalenessExecutor")
+
+        try:
             from genesis.follow_ups.dispatcher import FollowUpDispatcher
             follow_up_dispatcher = FollowUpDispatcher(db=rt._db, queue=queue)
             rt._surplus_scheduler.set_follow_up_dispatcher(follow_up_dispatcher)

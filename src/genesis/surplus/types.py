@@ -37,6 +37,8 @@ class TaskType(StrEnum):
     J9_EVAL_BATCH = "j9_eval_batch"
     # Memory taxonomy hygiene
     WING_AUDIT = "wing_audit"
+    # CC memory file staleness detection
+    CC_MEMORY_STALENESS = "cc_memory_staleness"
 
 
 class ComputeTier(StrEnum):

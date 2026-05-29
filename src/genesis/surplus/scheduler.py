@@ -95,6 +95,7 @@ class SurplusScheduler:
         self._backup_verification_executor: SurplusExecutor | None = None
         self._dead_letter_replay_executor: SurplusExecutor | None = None
         self._db_maintenance_executor: SurplusExecutor | None = None
+        self._cc_memory_staleness_executor: SurplusExecutor | None = None
         self._recon_gatherer: ReconGatherer | None = None
         self._model_intelligence_job = None  # Set via set_model_intelligence_job()
         self._models_md_synthesis_job = None  # Set via set_models_md_synthesis_job()
@@ -155,6 +156,10 @@ class SurplusScheduler:
             self._dead_letter_replay_executor = dead_letter_replay
         if db_maintenance:
             self._db_maintenance_executor = db_maintenance
+
+    def set_cc_memory_staleness_executor(self, executor: SurplusExecutor) -> None:
+        """Set a dedicated executor for CC_MEMORY_STALENESS tasks."""
+        self._cc_memory_staleness_executor = executor
 
     def set_recon_gatherer(self, gatherer: ReconGatherer) -> None:
         """Set the recon gatherer for scheduled release checking."""
@@ -279,6 +284,14 @@ class SurplusScheduler:
             self.schedule_wing_audit,
             CronTrigger(day_of_week="sun,wed", hour=2),
             id="wing_audit",
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        # CC memory staleness scan: weekly Sunday 3am UTC
+        self._scheduler.add_job(
+            self.schedule_cc_memory_staleness,
+            CronTrigger(day_of_week="sun", hour=3),
+            id="cc_memory_staleness",
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -641,6 +654,29 @@ class SurplusScheduler:
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_failure("schedule_wing_audit", str(exc))
+            except Exception:
+                pass
+
+    async def schedule_cc_memory_staleness(self) -> None:
+        """Enqueue a CC memory staleness scan if none pending/running."""
+        try:
+            from genesis.surplus.types import ComputeTier, TaskType
+
+            active = await self._queue.active_by_type(TaskType.CC_MEMORY_STALENESS)
+            if active == 0:
+                await self._queue.enqueue(
+                    TaskType.CC_MEMORY_STALENESS, ComputeTier.FREE_API, 0.3, "competence"
+                )
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_success("schedule_cc_memory_staleness")
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.exception("CC memory staleness scheduling failed")
+            try:
+                from genesis.runtime import GenesisRuntime
+                GenesisRuntime.instance().record_job_failure("schedule_cc_memory_staleness", str(exc))
             except Exception:
                 pass
 
@@ -1100,6 +1136,8 @@ class SurplusScheduler:
             executor = self._db_maintenance_executor
         elif task.task_type == _TT.J9_EVAL_BATCH and self._j9_eval_batch_executor is not None:
             executor = self._j9_eval_batch_executor
+        elif task.task_type == _TT.CC_MEMORY_STALENESS and self._cc_memory_staleness_executor is not None:
+            executor = self._cc_memory_staleness_executor
 
         try:
             result = await executor.execute(task)
