@@ -207,13 +207,26 @@ async def insert_subsystem_grade(
     factors: dict,
     sample_count: int,
 ) -> str:
-    """Insert a per-subsystem quality grade. Returns the grade id."""
-    gid = _new_id()
+    """Insert or update a per-subsystem quality grade. Returns the grade id.
+
+    Uses deterministic ID from (subsystem, period_end, period_type) to
+    prevent duplicate rows from repeated aggregation runs.
+    """
+    import hashlib
+    gid = hashlib.sha256(
+        f"{subsystem}:{period_end}:{period_type}".encode(),
+    ).hexdigest()[:16]
     await db.execute(
         """INSERT INTO eval_subsystem_grades
            (id, period_start, period_end, period_type, subsystem,
             grade, score, factors_json, sample_count, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET
+            grade = excluded.grade,
+            score = excluded.score,
+            factors_json = excluded.factors_json,
+            sample_count = excluded.sample_count,
+            created_at = excluded.created_at""",
         (gid, period_start, period_end, period_type, subsystem,
          grade, score, json.dumps(factors), sample_count, _now_iso()),
     )
@@ -252,6 +265,7 @@ async def get_subsystem_grades(
 
 async def get_latest_subsystem_grades(
     db: aiosqlite.Connection,
+    period_type: str = "weekly",
 ) -> list[dict]:
     """Get the most recent grade for each subsystem."""
     cursor = await db.execute(
@@ -259,9 +273,12 @@ async def get_latest_subsystem_grades(
            INNER JOIN (
                SELECT subsystem, MAX(period_end) as max_end
                FROM eval_subsystem_grades
+               WHERE period_type = ?
                GROUP BY subsystem
            ) latest ON g.subsystem = latest.subsystem
-                    AND g.period_end = latest.max_end""",
+                    AND g.period_end = latest.max_end
+           WHERE g.period_type = ?""",
+        (period_type, period_type),
     )
     rows = await cursor.fetchall()
     result = []

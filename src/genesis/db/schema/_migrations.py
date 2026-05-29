@@ -1267,33 +1267,30 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE eval_events ADD COLUMN prompt_hash TEXT",
         "eval_events.prompt_hash")
 
-    # B2: per-subsystem quality grades
-    try:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS eval_subsystem_grades (
-                id           TEXT PRIMARY KEY,
-                period_start TEXT NOT NULL,
-                period_end   TEXT NOT NULL,
-                period_type  TEXT NOT NULL
-                             CHECK (period_type IN ('daily', 'weekly')),
-                subsystem    TEXT NOT NULL
-                             CHECK (subsystem IN (
-                                 'memory', 'ego', 'procedural', 'awareness', 'reflection'
-                             )),
-                grade        TEXT,
-                score        REAL,
-                factors_json TEXT NOT NULL,
-                sample_count INTEGER NOT NULL,
-                created_at   TEXT NOT NULL
-                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-            )
-        """)
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_eval_subsystem_grades_period "
-            "ON eval_subsystem_grades(subsystem, period_end)"
+    # B2: per-subsystem quality grades (IF NOT EXISTS handles idempotency)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS eval_subsystem_grades (
+            id           TEXT PRIMARY KEY,
+            period_start TEXT NOT NULL,
+            period_end   TEXT NOT NULL,
+            period_type  TEXT NOT NULL
+                         CHECK (period_type IN ('daily', 'weekly')),
+            subsystem    TEXT NOT NULL
+                         CHECK (subsystem IN (
+                             'memory', 'ego', 'procedural', 'awareness', 'reflection'
+                         )),
+            grade        TEXT,
+            score        REAL,
+            factors_json TEXT NOT NULL,
+            sample_count INTEGER NOT NULL,
+            created_at   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
-    except Exception:
-        logger.debug("eval_subsystem_grades migration skipped", exc_info=True)
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_subsystem_grades_period "
+        "ON eval_subsystem_grades(subsystem, period_end)"
+    )
 
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:

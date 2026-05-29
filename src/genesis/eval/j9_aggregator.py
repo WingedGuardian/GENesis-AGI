@@ -596,7 +596,10 @@ async def _grade_ego(
         # Expected success = midpoint of bucket range
         parts = bucket_label.split("-")
         if len(parts) == 2:
-            expected = (float(parts[0]) + float(parts[1])) / 2
+            try:
+                expected = (float(parts[0]) + float(parts[1])) / 2
+            except (ValueError, TypeError):
+                continue
             actual = bucket_data.get("success_rate", 0)
             cal_errors.append(abs(expected - actual))
     cal_accuracy = 1.0 - (sum(cal_errors) / len(cal_errors)) if cal_errors else None
