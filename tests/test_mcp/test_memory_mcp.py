@@ -1391,8 +1391,8 @@ async def test_memory_recall_no_drift_when_wing_specified():
         mod._store, mod._db, mod._retriever, mod._qdrant = old
 
 
-async def test_memory_recall_defaults_to_episodic():
-    """memory_recall with no explicit source should pass source='episodic' to retriever."""
+async def test_memory_recall_defaults_to_both():
+    """memory_recall with no explicit source should pass source='both' to retriever."""
     import genesis.mcp.memory_mcp as mod
 
     old = mod._store, mod._db, mod._retriever, mod._qdrant
@@ -1406,11 +1406,11 @@ async def test_memory_recall_defaults_to_episodic():
         tools = await _get_tools()
         await tools["memory_recall"].fn(query="what is my Salesforce experience")
 
-        # Verify retriever.recall was called with source="episodic" (not "both")
+        # Verify retriever.recall was called with source="both" (searches both collections)
         mod._retriever.recall.assert_called_once()
         call_kwargs = mod._retriever.recall.call_args.kwargs
-        assert call_kwargs.get("source") == "episodic", (
-            f"Expected source='episodic', got source={call_kwargs.get('source')!r}"
+        assert call_kwargs.get("source") == "both", (
+            f"Expected source='both', got source={call_kwargs.get('source')!r}"
         )
     finally:
         mod._store, mod._db, mod._retriever, mod._qdrant = old
