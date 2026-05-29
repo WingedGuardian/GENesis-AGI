@@ -210,35 +210,39 @@ GBrain runs 17 phases. Genesis needs to add at minimum:
 
 ### 3.2 New Phases
 
-**Phase 0: Link Repair (before consolidation)**
-- Check all `memory_links` for orphaned references (target_id points to
-  deleted or nonexistent memory)
-- Remove stale links
-- Check bidirectionality where appropriate (if A `supports` B, should B
-  `supported_by` A?)
+**Implementation note (Sprint 2):** All four phases below are implemented.
+Phases run after existing consolidation, each with individual try/except
+error isolation. Minimal refactor approach — existing `run()` structure
+preserved, new phases appended at the end. Each phase handles `dry_run`
+internally.
 
-**Phase 1: Existing Consolidation (unchanged)**
-- Semantic clustering + LLM synthesis
-- Already works. No changes needed.
+**Phase 5: Link Repair (after consolidation)**
+- Pure SQL: finds memory_ids in `memory_links` that don't exist in `memory_metadata`
+- Removes all links involving orphaned IDs
+- File: `src/genesis/memory/dream_link_repair.py`
 
-**Phase 2: Entity Resolution Scan**
-- Run Layer 2 dedup (2.2 above) on memories modified since last dream
-- Run contradiction detection (2.3 above)
-- Discover new aliases for Layer 1 dictionary
+**Phase 6: Entity Resolution Scan**
+- Finds near-duplicate memories via Qdrant similarity search (threshold 0.92)
+- Auto-merge at ≥0.95 cosine (newer survives, older deprecated)
+- LLM check at 0.85-0.95 via `dream_cycle_entity_check` call site (free-tier SLM, 50/run cap)
+- Contradiction detection: creates `contradicts` or `succeeded_by` links
+- Full audit trail: `entity_resolution_audit` table preserves both memory
+  contents, cosine score, LLM verdict, and survivor ID for post-hoc review
+- File: `src/genesis/memory/dream_entity_scan.py`
 
-**Phase 3: Orphan Detection**
-- Find memories with zero inbound AND zero outbound links
-- These are "islands" — potentially valuable but disconnected from the graph
-- For each orphan, attempt to discover connections via embedding similarity
-  to linked memories
-- If connections found, create links. If not, flag for review.
+**Phase 7: Orphan Detection**
+- Finds memories with zero links in the graph (52% of corpus)
+- Searches for similar linked memories (threshold 0.80, max 200/run)
+- Creates `related_to` links for discoverable connections
+- File: `src/genesis/memory/dream_orphan_detection.py`
 
-**Phase 4: Centrality Recomputation**
-- Run `centrality_scores()` (already built)
-- Store results in `memory_metadata` or a dedicated table
-- These pre-computed scores feed into Part 1's retrieval boost
+**Phase 8: Centrality Recomputation**
+- Calls existing `centrality_scores(db, top_n=500)` (k=200 approximation)
+- Persists to `centrality_cache` table (atomic DELETE + INSERT replacement)
+- Runs even in dry_run (observational data, no destructive effect)
+- File: `src/genesis/memory/dream_centrality.py`
 
-**Phase 5: Theme Discovery (Future)**
+**Phase 9: Theme Discovery (Future)**
 - Cross-session pattern identification
 - Find concepts that appear across many sessions but aren't explicitly linked
 - Create `categorized_as` links to discovered themes
@@ -246,11 +250,10 @@ GBrain runs 17 phases. Genesis needs to add at minimum:
 
 ### 3.3 Phase Coordination
 
-- Add phase tracking to dream cycle: `dream_phase` column or metadata
-- Each phase runs sequentially with error isolation (one phase failing
-  doesn't block others)
-- Log phase timing for observability
-- Advisory-style lock to prevent concurrent dream cycles
+- Each phase in its own try/except — one failing doesn't block the next
+- Report dict includes per-phase sub-reports with timing and stats
+- Existing advisory lock prevents concurrent dream cycles
+- Dry_run: consolidation skips writes; new phases handle dry_run internally
 
 ### 3.4 Tiered Enrichment by Reference Count
 
