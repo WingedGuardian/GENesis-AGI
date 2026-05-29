@@ -116,6 +116,7 @@
           proposals: [],
           cadence: null,
           followUps: [],
+          vcr: null,
           expandedCycle: null,
           rejectingId: null,
           rejectReason: "",
@@ -3018,18 +3019,20 @@
         async fetchEgoDetail() {
           this.startModalFetch("egoModal");
           try {
-            const [statusR, cadenceR, cyclesR, proposalsR, followUpsR] = await Promise.all([
+            const [statusR, cadenceR, cyclesR, proposalsR, followUpsR, vcrR] = await Promise.all([
               fetchApi("/api/genesis/ego/status"),
               fetchApi("/api/genesis/ego/cadence"),
               fetchApi("/api/genesis/ego/cycles"),
               fetchApi("/api/genesis/ego/proposals/all"),
               fetchApi("/api/genesis/ego/follow-ups"),
+              fetchApi("/api/genesis/ego/vcr"),
             ]);
             if (statusR?.ok) this.egoStatus = await statusR.json();
             if (cadenceR?.ok) this.egoModal.cadence = await cadenceR.json();
             if (cyclesR?.ok) this.egoModal.cycles = await cyclesR.json();
             if (proposalsR?.ok) this.egoModal.proposals = await proposalsR.json();
             if (followUpsR?.ok) this.egoModal.followUps = await followUpsR.json();
+            if (vcrR?.ok) this.egoModal.vcr = await vcrR.json();
             this.finishModalFetch("egoModal");
           } catch {
             this.failModalFetch("egoModal", "Ego detail unavailable");
@@ -6605,6 +6608,30 @@
                     <span x-text="($store.genesisDashboard.egoStatus?.uncompacted_cycles || 0) + ' uncompacted'"></span>
                   </div>
                 </div>
+                <!-- VCR (Verified Completion Rate) -->
+                <template x-if="$store.genesisDashboard.egoModal.vcr">
+                  <div style="background: rgba(76,175,80,0.06); border: 1px solid rgba(76,175,80,0.15); border-radius: 6px; padding: 0.8rem; grid-column: 1 / -1;">
+                    <div style="font-size: 0.72rem; color: #4caf50; font-weight: 600; margin-bottom: 0.3rem;">Verified Completion Rate (30d)</div>
+                    <div style="display: flex; align-items: baseline; gap: 1.5rem; flex-wrap: wrap;">
+                      <div>
+                        <span style="font-size: 1.3rem; font-weight: 700;"
+                              x-text="(($store.genesisDashboard.egoModal.vcr.vcr || 0) * 100).toFixed(0) + '%'"></span>
+                        <span style="font-size: 0.72rem; color: var(--color-text-secondary);"> VCR</span>
+                      </div>
+                      <div>
+                        <span style="font-size: 1.1rem; font-weight: 600;"
+                              x-text="(($store.genesisDashboard.egoModal.vcr.dispatch_rate || 0) * 100).toFixed(0) + '%'"></span>
+                        <span style="font-size: 0.72rem; color: var(--color-text-secondary);"> dispatch rate</span>
+                      </div>
+                      <div style="font-size: 0.78rem; color: var(--color-text-secondary);">
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_completed || 0"></span> completed,
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_failed || 0"></span> failed,
+                        <span x-text="$store.genesisDashboard.egoModal.vcr.outcomes_unknown || 0"></span> unknown
+                        <span> / <span x-text="$store.genesisDashboard.egoModal.vcr.total_executed || 0"></span> executed</span>
+                      </div>
+                    </div>
+                  </div>
+                </template>
               </div>
               <!-- Effort selector -->
               <div style="margin-top: 1rem; padding: 0.6rem 0.8rem; background: rgba(192,132,252,0.04); border: 1px solid rgba(192,132,252,0.12); border-radius: 6px;">

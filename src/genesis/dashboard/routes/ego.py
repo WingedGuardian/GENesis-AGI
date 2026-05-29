@@ -356,3 +356,23 @@ async def ego_follow_ups():
         }
         for f in items
     ])
+
+
+@blueprint.route("/api/genesis/ego/vcr")
+@_async_route
+async def ego_vcr():
+    """Return Verified Completion Rate for ego proposals."""
+    from genesis.db.crud.ego import compute_vcr
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({
+            "vcr": 0.0, "dispatch_rate": 0.0,
+            "total_resolved": 0, "total_executed": 0,
+            "outcomes_completed": 0, "outcomes_failed": 0,
+            "outcomes_unknown": 0,
+        })
+
+    data = await compute_vcr(rt._db, days=30)
+    return jsonify(data)
