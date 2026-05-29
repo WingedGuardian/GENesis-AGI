@@ -452,6 +452,9 @@ class HybridRetriever:
                     graph_boost_applied = True
 
             # 7b-ii. Adjacency boost: reward cluster coherence in top-K
+            # Recompute floor after backlink boost — the top score may
+            # have changed, and the adjacency gate should use the new top.
+            floor_score = max(fused.values()) * _FLOOR_RATIO
             boosted_ranked = sorted(fused, key=fused.get, reverse=True)  # type: ignore[arg-type]
             top_k = boosted_ranked[:_ADJACENCY_TOP_K]
             if len(top_k) >= 3:

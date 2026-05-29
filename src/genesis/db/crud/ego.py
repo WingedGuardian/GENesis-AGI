@@ -926,15 +926,21 @@ async def compute_vcr(
         if status in ("pending",):
             continue  # not yet resolved
         total_resolved += 1
+        resp = user_response or ""
         if status == "executed":
             total_executed += 1
-            resp = user_response or ""
             if "|completed:" in resp:
                 completed += 1
             elif "|failed:" in resp:
                 failed += 1
             else:
                 unknown += 1
+        elif status == "failed" and "|verification_failed:" in resp:
+            # Verification-failed proposals were dispatched (reached
+            # 'executed' before verification flipped them to 'failed').
+            # Count them as dispatch failures for VCR accuracy.
+            total_executed += 1
+            failed += 1
 
     vcr = completed / total_executed if total_executed > 0 else 0.0
     dispatch_rate = total_executed / total_resolved if total_resolved > 0 else 0.0

@@ -78,7 +78,6 @@ def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
             failures.append(
                 f"File too small: {filepath} ({size}B < {expected.min_size_bytes}B)"
             )
-            continue
         if expected.required_strings:
             try:
                 content = path.read_text(errors="replace")

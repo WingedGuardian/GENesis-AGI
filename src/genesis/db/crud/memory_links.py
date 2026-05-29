@@ -107,10 +107,13 @@ async def inter_candidate_links(
     """Return all directed edges ``(source, target)`` between *memory_ids*.
 
     Used for adjacency boost: finding which candidates in a top-K set
-    link to each other.
+    link to each other. The query uses ``2 * len(memory_ids)``
+    placeholders, so callers must keep the list under ~499 IDs.
     """
     if not memory_ids:
         return []
+    if len(memory_ids) > 499:
+        memory_ids = memory_ids[:499]
     ph = ",".join("?" * len(memory_ids))
     cursor = await db.execute(
         f"SELECT source_id, target_id FROM memory_links"
