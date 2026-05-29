@@ -190,3 +190,84 @@ async def get_latest_snapshot(
     if d.get("metrics_json"):
         d["metrics"] = json.loads(d["metrics_json"])
     return d
+
+
+# ── eval_subsystem_grades ───────────────────────────────────────────────────
+
+
+async def insert_subsystem_grade(
+    db: aiosqlite.Connection,
+    *,
+    period_start: str,
+    period_end: str,
+    period_type: str,
+    subsystem: str,
+    grade: str | None,
+    score: float | None,
+    factors: dict,
+    sample_count: int,
+) -> str:
+    """Insert a per-subsystem quality grade. Returns the grade id."""
+    gid = _new_id()
+    await db.execute(
+        """INSERT INTO eval_subsystem_grades
+           (id, period_start, period_end, period_type, subsystem,
+            grade, score, factors_json, sample_count, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (gid, period_start, period_end, period_type, subsystem,
+         grade, score, json.dumps(factors), sample_count, _now_iso()),
+    )
+    await db.commit()
+    return gid
+
+
+async def get_subsystem_grades(
+    db: aiosqlite.Connection,
+    *,
+    subsystem: str | None = None,
+    period_type: str | None = None,
+    limit: int = 52,
+) -> list[dict]:
+    """Query subsystem grades, most recent first."""
+    sql = "SELECT * FROM eval_subsystem_grades WHERE 1=1"
+    params: list = []
+    if subsystem:
+        sql += " AND subsystem = ?"
+        params.append(subsystem)
+    if period_type:
+        sql += " AND period_type = ?"
+        params.append(period_type)
+    sql += " ORDER BY period_end DESC LIMIT ?"
+    params.append(limit)
+    cursor = await db.execute(sql, params)
+    rows = await cursor.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("factors_json"):
+            d["factors"] = json.loads(d["factors_json"])
+        result.append(d)
+    return result
+
+
+async def get_latest_subsystem_grades(
+    db: aiosqlite.Connection,
+) -> list[dict]:
+    """Get the most recent grade for each subsystem."""
+    cursor = await db.execute(
+        """SELECT g.* FROM eval_subsystem_grades g
+           INNER JOIN (
+               SELECT subsystem, MAX(period_end) as max_end
+               FROM eval_subsystem_grades
+               GROUP BY subsystem
+           ) latest ON g.subsystem = latest.subsystem
+                    AND g.period_end = latest.max_end""",
+    )
+    rows = await cursor.fetchall()
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("factors_json"):
+            d["factors"] = json.loads(d["factors_json"])
+        result.append(d)
+    return result

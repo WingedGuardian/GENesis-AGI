@@ -1049,6 +1049,25 @@ TABLES = {
                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """,
+    "eval_subsystem_grades": """
+        CREATE TABLE IF NOT EXISTS eval_subsystem_grades (
+            id           TEXT PRIMARY KEY,
+            period_start TEXT NOT NULL,
+            period_end   TEXT NOT NULL,
+            period_type  TEXT NOT NULL
+                         CHECK (period_type IN ('daily', 'weekly')),
+            subsystem    TEXT NOT NULL
+                         CHECK (subsystem IN (
+                             'memory', 'ego', 'procedural', 'awareness', 'reflection'
+                         )),
+            grade        TEXT,
+            score        REAL,
+            factors_json TEXT NOT NULL,
+            sample_count INTEGER NOT NULL,
+            created_at   TEXT NOT NULL
+                         DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
     "user_goals": """
         CREATE TABLE IF NOT EXISTS user_goals (
             id              TEXT PRIMARY KEY,
@@ -1380,6 +1399,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_eval_events_type ON eval_events(event_type, timestamp)",
     "CREATE INDEX IF NOT EXISTS idx_eval_events_session ON eval_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period ON eval_snapshots(dimension, period_end)",
+    "CREATE INDEX IF NOT EXISTS idx_eval_subsystem_grades_period ON eval_subsystem_grades(subsystem, period_end)",
     # SVO event calendar
     "CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id)",
     "CREATE INDEX IF NOT EXISTS idx_memory_events_date ON memory_events(event_date)",
