@@ -29,6 +29,9 @@ async def emit_recall_fired(
     mode: str | None = None,
     pipeline_used: str | None = None,
     intent_category: str | None = None,
+    graph_boost_applied: bool = False,
+    mean_score: float | None = None,
+    wing: str | None = None,
 ) -> str | None:
     """Log a memory recall() invocation as an eval event.
 
@@ -42,6 +45,7 @@ async def emit_recall_fired(
             "memory_ids": memory_ids[:10],
             "latency_ms": round(latency_ms, 1),
             "source": source,
+            "graph_boost_applied": graph_boost_applied,
         }
         if mode:
             metrics["mode"] = mode
@@ -49,6 +53,10 @@ async def emit_recall_fired(
             metrics["pipeline_used"] = pipeline_used
         if intent_category:
             metrics["intent_category"] = intent_category
+        if mean_score is not None:
+            metrics["mean_score"] = round(mean_score, 4)
+        if wing:
+            metrics["wing"] = wing
         return await j9_eval.insert_event(
             db,
             dimension="memory",
