@@ -278,6 +278,10 @@ class InboxMonitor:
         else:
             logger.warning("INBOX_EVALUATE.md not found at %s, using fallback", path)
             self._system_prompt = _FALLBACK_SYSTEM_PROMPT
+        # Prompt versioning: record hash for outcome linkage
+        from genesis.db.crud.prompt_versions import compute_prompt_hash
+        self._prompt_hash = compute_prompt_hash(self._system_prompt)
+        self._prompt_version_recorded = False
         return self._system_prompt
 
     async def check_once(self) -> CheckResult:
@@ -904,6 +908,23 @@ class InboxMonitor:
 
             prompt = self._build_prompt(batch)
             system_prompt = self._load_system_prompt()
+
+            # Record prompt version on first dispatch
+            if not self._prompt_version_recorded and self._db is not None:
+                try:
+                    from genesis.db.crud.prompt_versions import record_version
+                    await record_version(
+                        self._db,
+                        prompt_hash=self._prompt_hash,
+                        call_site="inbox_evaluate",
+                        content_preview=system_prompt[:200],
+                    )
+                    self._prompt_version_recorded = True
+                except Exception:
+                    logger.debug(
+                        "Failed to record inbox prompt version",
+                        exc_info=True,
+                    )
 
             try:
                 model = CCModel(self._config.model)

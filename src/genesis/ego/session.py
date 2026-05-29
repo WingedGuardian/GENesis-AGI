@@ -134,6 +134,10 @@ class EgoSession:
                 "You are Genesis's executive function. "
                 "Output valid JSON matching the ego output schema."
             )
+        # Prompt versioning: hash the static prompt for outcome linkage
+        from genesis.db.crud.prompt_versions import compute_prompt_hash
+        self._prompt_hash = compute_prompt_hash(self._static_prompt)
+        self._prompt_version_recorded = False
 
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         self._autonomous_dispatcher = dispatcher
@@ -188,6 +192,19 @@ class EgoSession:
 
         # 3. Build prompts — system prompt is identity ONLY (cacheable),
         #    operational context goes in the user message.
+        #    Record prompt version on first use for versioning/outcome linkage.
+        if not self._prompt_version_recorded and self._db is not None:
+            try:
+                from genesis.db.crud.prompt_versions import record_version
+                await record_version(
+                    self._db,
+                    prompt_hash=self._prompt_hash,
+                    call_site="ego_cycle",
+                    content_preview=self._static_prompt[:200],
+                )
+                self._prompt_version_recorded = True
+            except Exception:
+                logger.debug("Failed to record ego prompt version", exc_info=True)
         system_prompt = self._static_prompt
         user_prompt = self._build_user_prompt(
             dynamic_context=dynamic_context,
