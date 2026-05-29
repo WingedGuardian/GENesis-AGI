@@ -1050,6 +1050,34 @@ TABLES = {
                          DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
         )
     """,
+    "entity_resolution_audit": """
+        CREATE TABLE IF NOT EXISTS entity_resolution_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          TEXT NOT NULL,
+            action          TEXT NOT NULL
+                            CHECK (action IN (
+                                'auto_merge', 'llm_merge', 'contradiction',
+                                'succeeded_by', 'flagged', 'skipped'
+                            )),
+            memory_id_a     TEXT NOT NULL,
+            memory_id_b     TEXT NOT NULL,
+            content_a       TEXT,
+            content_b       TEXT,
+            cosine_score    REAL,
+            llm_verdict     TEXT,
+            llm_reasoning   TEXT,
+            survivor_id     TEXT,
+            created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """,
+    "centrality_cache": """
+        CREATE TABLE IF NOT EXISTS centrality_cache (
+            memory_id        TEXT PRIMARY KEY,
+            centrality_score REAL NOT NULL,
+            computed_at      TEXT NOT NULL
+        )
+    """,
     "eval_subsystem_grades": """
         CREATE TABLE IF NOT EXISTS eval_subsystem_grades (
             id           TEXT PRIMARY KEY,
@@ -1401,6 +1429,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_eval_events_session ON eval_events(session_id)",
     "CREATE INDEX IF NOT EXISTS idx_eval_snapshots_period ON eval_snapshots(dimension, period_end)",
     "CREATE INDEX IF NOT EXISTS idx_eval_subsystem_grades_period ON eval_subsystem_grades(subsystem, period_end)",
+    # Entity resolution audit
+    "CREATE INDEX IF NOT EXISTS idx_er_audit_run ON entity_resolution_audit(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_er_audit_action ON entity_resolution_audit(action, created_at)",
+    # Centrality cache
+    "CREATE INDEX IF NOT EXISTS idx_centrality_score ON centrality_cache(centrality_score DESC)",
     # SVO event calendar
     "CREATE INDEX IF NOT EXISTS idx_memory_events_memory ON memory_events(memory_id)",
     "CREATE INDEX IF NOT EXISTS idx_memory_events_date ON memory_events(event_date)",

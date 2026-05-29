@@ -10,8 +10,12 @@ Distance metric: Cosine
 
 from __future__ import annotations
 
+import logging
+
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PointStruct, VectorParams
+
+logger = logging.getLogger(__name__)
 
 VECTOR_DIM = 1024
 COLLECTIONS = ["episodic_memory", "knowledge_base"]
@@ -172,6 +176,39 @@ def get_point(
         return None
     except Exception:
         return None
+
+
+def batch_retrieve_vectors(
+    client: QdrantClient,
+    point_ids: list[str],
+    *,
+    collection: str = "episodic_memory",
+    batch_size: int = 100,
+) -> dict[str, list[float]]:
+    """Batch-retrieve vectors for multiple points.
+
+    Returns ``{point_id: vector}``. Missing points are silently omitted.
+    Batches in chunks of *batch_size* to avoid oversized requests.
+    """
+    vector_map: dict[str, list[float]] = {}
+    for i in range(0, len(point_ids), batch_size):
+        batch = point_ids[i : i + batch_size]
+        try:
+            results = client.retrieve(
+                collection_name=collection,
+                ids=batch,
+                with_vectors=True,
+            )
+            for r in results:
+                vector_map[str(r.id)] = r.vector
+        except Exception:
+            logger.warning(
+                "Failed to retrieve vectors for batch %d-%d",
+                i,
+                i + len(batch),
+                exc_info=True,
+            )
+    return vector_map
 
 
 def scroll_points(

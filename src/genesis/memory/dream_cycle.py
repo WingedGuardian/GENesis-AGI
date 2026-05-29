@@ -186,56 +186,99 @@ async def run(
     report["clusters_found"] = len(all_clusters)
     logger.info("Dream cycle %s: found %d clusters", run_id[:8], len(all_clusters))
 
+    # Always populate cluster report data (useful in both dry_run and live)
+    report["cluster_sizes"] = _size_distribution(all_clusters)
     if dry_run:
-        report["cluster_sizes"] = _size_distribution(all_clusters)
         report["sample_clusters"] = _sample_clusters(all_clusters, n=5)
-        logger.info("Dream cycle %s: DRY RUN — no changes written", run_id[:8])
-        return report
 
-    # Phase 3+4 — Synthesize and deprecate (live mode)
-    # Sort by descending size so highest-redundancy clusters merge first
-    all_clusters.sort(key=len, reverse=True)
-    merged = 0
+    # Phase 3+4 — Synthesize and deprecate (live mode only)
+    if not dry_run:
+        all_clusters.sort(key=len, reverse=True)
+        merged = 0
 
-    for cluster in all_clusters:
-        if merged >= max_merges:
-            break
+        for cluster in all_clusters:
+            if merged >= max_merges:
+                break
 
-        if len(cluster) > max_cluster_size:
-            report["clusters_skipped_large"] += 1
-            logger.info(
-                "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
-                run_id[:8], len(cluster),
-                cluster[0].get("wing", "?"), cluster[0].get("room", "?"),
-            )
-            continue
+            if len(cluster) > max_cluster_size:
+                report["clusters_skipped_large"] += 1
+                logger.info(
+                    "Dream cycle %s: skipping cluster of %d in %s/%s (too large)",
+                    run_id[:8], len(cluster),
+                    cluster[0].get("wing", "?"), cluster[0].get("room", "?"),
+                )
+                continue
 
-        try:
-            result = await _synthesize_and_deprecate(
-                cluster=cluster,
-                run_id=run_id,
-                qdrant=qdrant,
-                db=db,
-                router=router,
-                store=store,
-            )
-            merged += 1
-            report["memories_deprecated"] += result["deprecated_count"]
-        except Exception as exc:
-            report["errors"].append({
-                "cluster_size": len(cluster),
-                "error": str(exc),
-            })
-            logger.warning(
-                "Dream cycle %s: synthesis failed for cluster of %d: %s",
-                run_id[:8], len(cluster), exc, exc_info=True,
-            )
+            try:
+                result = await _synthesize_and_deprecate(
+                    cluster=cluster,
+                    run_id=run_id,
+                    qdrant=qdrant,
+                    db=db,
+                    router=router,
+                    store=store,
+                )
+                merged += 1
+                report["memories_deprecated"] += result["deprecated_count"]
+            except Exception as exc:
+                report["errors"].append({
+                    "cluster_size": len(cluster),
+                    "error": str(exc),
+                })
+                logger.warning(
+                    "Dream cycle %s: synthesis failed for cluster of %d: %s",
+                    run_id[:8], len(cluster), exc, exc_info=True,
+                )
 
-    report["clusters_merged"] = merged
-    logger.info(
-        "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
-        run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
+        report["clusters_merged"] = merged
+        logger.info(
+            "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
+            run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
+        )
+
+    # ── Sprint 2 phases (each handles dry_run internally) ──────────────
+
+    phase_kwargs = dict(
+        qdrant=qdrant, db=db, router=router, store=store,
+        run_id=run_id, dry_run=dry_run,
     )
+
+    # Phase 5 — Link repair
+    try:
+        from genesis.memory.dream_link_repair import run_link_repair
+
+        report["link_repair"] = await run_link_repair(**phase_kwargs)
+    except Exception as exc:
+        report["errors"].append({"phase": "link_repair", "error": str(exc)})
+        logger.warning("Dream phase link_repair failed: %s", exc, exc_info=True)
+
+    # Phase 6 — Entity resolution (dedup + contradiction detection)
+    try:
+        from genesis.memory.dream_entity_scan import run_entity_resolution
+
+        report["entity_resolution"] = await run_entity_resolution(**phase_kwargs)
+    except Exception as exc:
+        report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
+        logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
+
+    # Phase 7 — Orphan detection
+    try:
+        from genesis.memory.dream_orphan_detection import run_orphan_detection
+
+        report["orphan_detection"] = await run_orphan_detection(**phase_kwargs)
+    except Exception as exc:
+        report["errors"].append({"phase": "orphan_detection", "error": str(exc)})
+        logger.warning("Dream phase orphan_detection failed: %s", exc, exc_info=True)
+
+    # Phase 8 — Centrality recomputation (runs even in dry_run)
+    try:
+        from genesis.memory.dream_centrality import run_centrality_recompute
+
+        report["centrality"] = await run_centrality_recompute(**phase_kwargs)
+    except Exception as exc:
+        report["errors"].append({"phase": "centrality", "error": str(exc)})
+        logger.warning("Dream phase centrality failed: %s", exc, exc_info=True)
+
     return report
 
 
@@ -383,29 +426,10 @@ async def _cluster_bucket(
 def _batch_get_vectors(
     qdrant: QdrantClient, point_ids: list[str],
 ) -> dict[str, list[float]]:
-    """Batch-retrieve vectors for all points in one Qdrant call.
+    """Batch-retrieve vectors — delegates to shared Qdrant utility."""
+    from genesis.qdrant.collections import batch_retrieve_vectors
 
-    Returns {point_id: vector}. Missing points are silently omitted.
-    Batches in chunks of 100 to avoid oversized requests.
-    """
-    vector_map: dict[str, list[float]] = {}
-    batch_size = 100
-    for i in range(0, len(point_ids), batch_size):
-        batch_ids = point_ids[i:i + batch_size]
-        try:
-            results = qdrant.retrieve(
-                collection_name=COLLECTION,
-                ids=batch_ids,
-                with_vectors=True,
-            )
-            for r in results:
-                vector_map[str(r.id)] = r.vector
-        except Exception:
-            logger.warning(
-                "Failed to retrieve vectors for batch %d-%d",
-                i, i + len(batch_ids), exc_info=True,
-            )
-    return vector_map
+    return batch_retrieve_vectors(qdrant, point_ids, collection=COLLECTION)
 
 
 def _get_vector(qdrant: QdrantClient, point_id: str) -> list[float]:
