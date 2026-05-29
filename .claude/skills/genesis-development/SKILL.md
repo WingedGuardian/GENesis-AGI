@@ -192,6 +192,15 @@ Verify before any commit:
 - Staged files do not include secrets (`secrets.env`, `.env`, credentials)
 - GROUNDWORK-tagged code not accidentally deleted
 - New capabilities registered in `_capabilities.py` + bootstrap manifest
+- **Conventional commit prefixes**: `feat:`, `fix:`, `refactor:`, `docs:`,
+  `test:`, `chore:`. Scope optional: `feat(ego): add cadence manager`.
+  Subject line under 72 characters. Dominant category wins if mixed.
+- **NEVER push to main or merge into main without a PR and user approval.**
+  Enforced by PreToolUse hook.
+- **Targeted tests during development.** Run ONLY the relevant test file(s)
+  for your changes. NEVER run the full test suite locally — CI handles that.
+  Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
+- **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 
 ## Reference Router
 
