@@ -135,6 +135,7 @@
         schedulerData: { subsystems: [], total_jobs: 0 },
         userJobs: { jobs: [] },
         evalMetrics: null,
+        subsystemGrades: null,
         autonomyConfig: null,
         approvalActions: {},
         _restartingBridge: false,
@@ -1774,6 +1775,14 @@
             }
           } catch (e) {
             console.warn("Eval metrics fetch failed:", e);
+          }
+          try {
+            const resp = await fetchApi("/api/genesis/eval/subsystem-grades");
+            if (resp && resp.ok) {
+              this.subsystemGrades = await resp.json();
+            }
+          } catch (e) {
+            console.warn("Subsystem grades fetch failed:", e);
           }
         },
 
@@ -5151,6 +5160,36 @@
                 <div style="font-size: 0.62rem; opacity: 0.5; margin-top: 0.2rem;" x-text="data.weeks_of_data + ' weeks'"></div>
               </div>
             </template>
+          </div>
+        </template>
+        <!-- Subsystem Grades -->
+        <template x-if="$store.genesisDashboard.subsystemGrades?.grades">
+          <div style="margin-top: 0.8rem;">
+            <div style="font-size: 0.72rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.4rem; opacity: 0.7;">Subsystem Quality Grades</div>
+            <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.5rem;">
+              <template x-for="sub in ['memory', 'ego', 'procedural', 'awareness', 'reflection']" :key="sub">
+                <div style="border: 1px solid var(--color-border); border-radius: 6px; padding: 0.5rem 0.6rem;">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.2rem;">
+                    <span style="font-size: 0.72rem; font-weight: 600; text-transform: capitalize;" x-text="sub"></span>
+                    <span style="font-size: 1.1rem; font-weight: 700; min-width: 1.5rem; text-align: center;"
+                          :style="(() => {
+                            const g = $store.genesisDashboard.subsystemGrades?.grades?.[sub];
+                            if (!g || !g.grade) return 'opacity: 0.4';
+                            const colors = { A: '#4caf50', B: '#8bc34a', C: '#ff9800', D: '#ff5722', F: '#d9534f' };
+                            return 'color:' + (colors[g.grade] || '#888');
+                          })()"
+                          x-text="$store.genesisDashboard.subsystemGrades?.grades?.[sub]?.grade || '—'"></span>
+                  </div>
+                  <div style="font-size: 0.65rem; opacity: 0.6;"
+                       x-text="(() => {
+                         const g = $store.genesisDashboard.subsystemGrades?.grades?.[sub];
+                         if (!g) return 'no data';
+                         if (!g.grade) return g.reason || 'insufficient data';
+                         return 'score: ' + g.score + ' · ' + g.sample_count + ' samples';
+                       })()"></div>
+                </div>
+              </template>
+            </div>
           </div>
         </template>
       </div>

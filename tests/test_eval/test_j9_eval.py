@@ -7,7 +7,15 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.db.crud import j9_eval
-from genesis.eval.j9_aggregator import _simple_slope
+from genesis.eval.j9_aggregator import (
+    _grade_awareness,
+    _grade_ego,
+    _grade_memory,
+    _grade_procedural,
+    _grade_reflection,
+    _score_to_grade,
+    _simple_slope,
+)
 from genesis.eval.j9_hooks import (
     emit_procedure_invoked,
     emit_procedure_outcome,
@@ -261,3 +269,173 @@ def test_simple_slope_noisy():
     assert slope is not None
     assert slope > 0  # positive trend
     assert 0.08 < slope < 0.12  # roughly 0.1 per step
+
+
+# ── Subsystem grading ──────────────────────────────────────────────────────
+
+
+def test_score_to_grade_boundaries():
+    assert _score_to_grade(95) == "A"
+    assert _score_to_grade(90) == "A"
+    assert _score_to_grade(89.9) == "B"
+    assert _score_to_grade(80) == "B"
+    assert _score_to_grade(70) == "C"
+    assert _score_to_grade(60) == "D"
+    assert _score_to_grade(59.9) == "F"
+    assert _score_to_grade(0) == "F"
+    assert _score_to_grade(None) is None
+
+
+async def test_grade_memory_with_full_data(db):
+    """Memory grade computes from precision@5, MRR, and usage_rate."""
+    dimension_results = {
+        "memory": {
+            "precision_at_5": 0.85,
+            "mrr": 0.90,
+            "usage_rate": 0.70,
+            "total_recalls": 50,
+        },
+    }
+    result = await _grade_memory(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is not None
+    assert result["score"] is not None
+    assert result["sample_count"] == 50
+    # Score should be weighted average: 0.85*0.4 + 0.90*0.3 + 0.70*0.3 = 0.82 → 82
+    assert 80 <= result["score"] <= 85
+
+
+async def test_grade_memory_insufficient_data(db):
+    """Memory grade returns null when sample count too low."""
+    dimension_results = {
+        "memory": {
+            "precision_at_5": None,
+            "mrr": None,
+            "usage_rate": None,
+            "total_recalls": 0,
+        },
+    }
+    result = await _grade_memory(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is None
+    assert result["score"] is None
+    assert "insufficient" in result.get("reason", "")
+
+
+async def test_grade_ego_with_data(db):
+    """Ego grade computes from approval rate and execution success."""
+    dimension_results = {
+        "ego": {
+            "approval_rate": 0.24,
+            "execution_success_rate": 1.0,
+            "confidence_calibration": {
+                "0.6-0.8": {"count": 9, "success_rate": 0.44},
+                "0.8-1.0": {"count": 16, "success_rate": 0.13},
+            },
+            "total_proposals": 29,
+        },
+    }
+    result = await _grade_ego(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is not None
+    assert result["score"] is not None
+    assert result["sample_count"] == 29
+    # 24% approval → score should be low
+    assert result["score"] < 60  # D or F territory
+
+
+async def test_grade_procedural_insufficient_invocations(db):
+    """Procedural grade requires minimum invocations."""
+    dimension_results = {
+        "procedure": {
+            "success_rate": None,
+            "mean_confidence": 0.65,
+            "invocation_count": 2,
+            "total_procedures": 30,
+        },
+    }
+    result = await _grade_procedural(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is None
+    assert "insufficient" in result.get("reason", "")
+
+
+async def test_grade_awareness_from_ticks(db):
+    """Awareness grade computes from awareness_ticks data."""
+    # Insert some awareness ticks
+    for i in range(25):
+        depth = ["Micro", "Light", "Deep", "Strategic"][i % 4] if i < 20 else None
+        await db.execute(
+            "INSERT INTO awareness_ticks (id, created_at, source, classified_depth, "
+            "signals_json, scores_json) VALUES (?, ?, 'scheduled', ?, '[]', '[]')",
+            (f"tick-{i}", "2026-05-05T12:00:00Z", depth),
+        )
+    await db.commit()
+
+    result = await _grade_awareness(db, "2026-05-01", "2026-05-08", {})
+    assert result["grade"] is not None
+    assert result["score"] is not None
+    assert result["sample_count"] == 25
+    assert result["factors"]["classified_count"] == 20
+    assert result["factors"]["depth_balance"] > 0  # Some balance among 4 depths
+
+
+async def test_grade_reflection_from_observations(db):
+    """Reflection grade computes from observations data."""
+    # Insert some observations
+    for i in range(15):
+        await db.execute(
+            "INSERT INTO observations (id, type, source, content, priority, "
+            "created_at, influenced_action) VALUES (?, ?, 'ego_cycle', 'test', "
+            "'medium', ?, ?)",
+            (f"obs-{i}", ["task_detected", "pattern", "insight"][i % 3],
+             "2026-05-05T12:00:00Z", 1 if i < 10 else 0),
+        )
+    await db.commit()
+
+    result = await _grade_reflection(db, "2026-05-01", "2026-05-08", {})
+    assert result["grade"] is not None
+    assert result["score"] is not None
+    assert result["sample_count"] == 15
+    assert result["factors"]["influence_rate"] == pytest.approx(10 / 15, abs=0.01)
+    assert result["factors"]["type_count"] == 3
+
+
+# ── CRUD: eval_subsystem_grades ────────────────────────────────────────────
+
+
+async def test_insert_and_get_subsystem_grade(db):
+    gid = await j9_eval.insert_subsystem_grade(
+        db,
+        period_start="2026-05-01",
+        period_end="2026-05-08",
+        period_type="weekly",
+        subsystem="memory",
+        grade="B",
+        score=83.5,
+        factors={"precision_at_5": 0.85, "mrr": 0.90},
+        sample_count=50,
+    )
+    assert gid
+
+    grades = await j9_eval.get_subsystem_grades(db, subsystem="memory")
+    assert len(grades) == 1
+    assert grades[0]["grade"] == "B"
+    assert grades[0]["score"] == 83.5
+    assert grades[0]["factors"]["precision_at_5"] == 0.85
+
+
+async def test_get_latest_subsystem_grades(db):
+    for sub in ["memory", "ego"]:
+        await j9_eval.insert_subsystem_grade(
+            db,
+            period_start="2026-05-01",
+            period_end="2026-05-08",
+            period_type="weekly",
+            subsystem=sub,
+            grade="C",
+            score=72.0,
+            factors={},
+            sample_count=10,
+        )
+
+    latest = await j9_eval.get_latest_subsystem_grades(db)
+    assert len(latest) == 2
+    subsystems = {g["subsystem"] for g in latest}
+    assert subsystems == {"memory", "ego"}

@@ -25,37 +25,7 @@
                 ]
             },
             {
-                "matcher": "startup",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-                        "timeout": 2000
-                    }
-                ]
-            },
-            {
-                "matcher": "resume",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-                        "timeout": 2000
-                    }
-                ]
-            },
-            {
-                "matcher": "clear",
-                "hooks": [
-                    {
-                        "type": "command",
-                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cbm-session-reminder.sh",
-                        "timeout": 2000
-                    }
-                ]
-            },
-            {
-                "matcher": "compact",
+                "matcher": "startup|resume|clear|compact",
                 "hooks": [
                     {
                         "type": "command",

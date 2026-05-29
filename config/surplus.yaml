@@ -17,7 +17,7 @@ jobs:
   analytical_hours: 12
   follow_up_dispatch_minutes: 5
   memory_extraction_hours: 2
-  j9_eval_batch_hours: 0          # Disabled: 100% error rate, no value
+  j9_eval_batch_hours: 24          # Daily memory relevance scoring (CronTrigger 3am UTC)
   model_eval_hours: 24            # Run model quality assessments daily
 
 task_defaults:

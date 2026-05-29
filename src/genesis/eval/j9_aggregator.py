@@ -76,6 +76,39 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
     except Exception:
         logger.warning("J9 weekly composite failed", exc_info=True)
 
+    # ── Per-subsystem grades ──────────────────────────────────────────────
+    subsystem_results: dict[str, dict] = {}
+    for sub_name, grade_fn in [
+        ("memory", _grade_memory),
+        ("ego", _grade_ego),
+        ("procedural", _grade_procedural),
+        ("awareness", _grade_awareness),
+        ("reflection", _grade_reflection),
+    ]:
+        try:
+            grade_info = await grade_fn(db, period_start, period_end, results)
+            await j9_eval.insert_subsystem_grade(
+                db,
+                period_start=period_start,
+                period_end=period_end,
+                period_type="weekly",
+                subsystem=sub_name,
+                grade=grade_info["grade"],
+                score=grade_info["score"],
+                factors=grade_info["factors"],
+                sample_count=grade_info["sample_count"],
+            )
+            subsystem_results[sub_name] = grade_info
+            logger.info(
+                "J9 subsystem %s: grade=%s score=%s (%d samples)",
+                sub_name, grade_info["grade"], grade_info["score"],
+                grade_info["sample_count"],
+            )
+        except Exception:
+            logger.warning("J9 subsystem %s grading failed", sub_name, exc_info=True)
+
+    results["subsystem_grades"] = subsystem_results
+
     return results
 
 
@@ -479,3 +512,279 @@ def _simple_slope(values: list[float]) -> float | None:
     numerator = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values))
     denominator = sum((i - x_mean) ** 2 for i in range(n))
     return round(numerator / denominator, 6) if denominator else None
+
+
+# ── Per-Subsystem Grading ───────────────────────────────────────────────────
+
+# Minimum samples required per subsystem before issuing a letter grade.
+_MIN_SAMPLES = {"memory": 10, "ego": 5, "procedural": 5,
+                "awareness": 20, "reflection": 10}
+
+
+def _score_to_grade(score: float | None) -> str | None:
+    """Convert a 0-100 score to a letter grade. None if insufficient data."""
+    if score is None:
+        return None
+    if score >= 90:
+        return "A"
+    if score >= 80:
+        return "B"
+    if score >= 70:
+        return "C"
+    if score >= 60:
+        return "D"
+    return "F"
+
+
+async def _grade_memory(
+    db: aiosqlite.Connection,
+    since: str,
+    until: str,
+    dimension_results: dict[str, dict],
+) -> dict:
+    """Grade memory subsystem from dimension 1 metrics.
+
+    Factors: precision@5 (40%), MRR (30%), usage_rate (30%).
+    All factors are 0.0-1.0 natively, scaled to 0-100.
+    """
+    metrics = dimension_results.get("memory", {})
+    p5 = metrics.get("precision_at_5")
+    mrr = metrics.get("mrr")
+    usage = metrics.get("usage_rate")
+    total = metrics.get("total_recalls", 0)
+
+    factors = {"precision_at_5": p5, "mrr": mrr, "usage_rate": usage,
+               "total_recalls": total}
+
+    available = [(p5, 0.4), (mrr, 0.3), (usage, 0.3)]
+    valid = [(v, w) for v, w in available if v is not None]
+
+    if not valid or total < _MIN_SAMPLES["memory"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": f"insufficient data ({total} recalls, need {_MIN_SAMPLES['memory']})"}
+
+    # Re-normalize weights if some factors are missing
+    total_weight = sum(w for _, w in valid)
+    score = sum(v * w / total_weight for v, w in valid) * 100
+
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total}
+
+
+async def _grade_ego(
+    db: aiosqlite.Connection,
+    since: str,
+    until: str,
+    dimension_results: dict[str, dict],
+) -> dict:
+    """Grade ego subsystem from dimension 3 metrics.
+
+    Factors: approval_rate (40%), execution_success (30%),
+    confidence_calibration_accuracy (30%).
+    """
+    metrics = dimension_results.get("ego", {})
+    approval = metrics.get("approval_rate")
+    exec_success = metrics.get("execution_success_rate")
+    total = metrics.get("total_proposals", 0)
+
+    # Confidence calibration accuracy: how well does stated confidence
+    # predict actual approval? Perfect calibration = 1.0.
+    cal = metrics.get("confidence_calibration", {})
+    cal_errors = []
+    for bucket_label, bucket_data in cal.items():
+        # Expected success = midpoint of bucket range
+        parts = bucket_label.split("-")
+        if len(parts) == 2:
+            try:
+                expected = (float(parts[0]) + float(parts[1])) / 2
+            except (ValueError, TypeError):
+                continue
+            actual = bucket_data.get("success_rate", 0)
+            cal_errors.append(abs(expected - actual))
+    cal_accuracy = 1.0 - (sum(cal_errors) / len(cal_errors)) if cal_errors else None
+
+    factors = {"approval_rate": approval, "execution_success_rate": exec_success,
+               "calibration_accuracy": cal_accuracy,
+               "total_proposals": total}
+
+    available = [(approval, 0.4), (exec_success, 0.3), (cal_accuracy, 0.3)]
+    valid = [(v, w) for v, w in available if v is not None]
+
+    if not valid or total < _MIN_SAMPLES["ego"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": f"insufficient data ({total} proposals, need {_MIN_SAMPLES['ego']})"}
+
+    total_weight = sum(w for _, w in valid)
+    score = sum(v * w / total_weight for v, w in valid) * 100
+
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total}
+
+
+async def _grade_procedural(
+    db: aiosqlite.Connection,
+    since: str,
+    until: str,
+    dimension_results: dict[str, dict],
+) -> dict:
+    """Grade procedural subsystem from dimension 5 metrics.
+
+    Factors: success_rate (50%), mean_confidence (25%),
+    invocation_activity (25% — normalized by total procedures).
+    """
+    metrics = dimension_results.get("procedure", {})
+    success = metrics.get("success_rate")
+    confidence = metrics.get("mean_confidence")
+    invocations = metrics.get("invocation_count", 0)
+    total_procs = metrics.get("total_procedures", 1)
+
+    # Invocation activity: ratio of invocations to total procedures.
+    # >1.0 per procedure per week = healthy, cap at 1.0 for scoring.
+    activity = min(invocations / max(total_procs, 1), 1.0) if invocations else 0.0
+
+    factors = {"success_rate": success, "mean_confidence": confidence,
+               "invocation_count": invocations, "activity_ratio": round(activity, 4),
+               "total_procedures": total_procs}
+
+    available = [(success, 0.5), (confidence, 0.25), (activity, 0.25)]
+    valid = [(v, w) for v, w in available if v is not None]
+
+    if not valid or invocations < _MIN_SAMPLES["procedural"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})"}
+
+    total_weight = sum(w for _, w in valid)
+    score = sum(v * w / total_weight for v, w in valid) * 100
+
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": invocations}
+
+
+async def _grade_awareness(
+    db: aiosqlite.Connection,
+    since: str,
+    until: str,
+    _dimension_results: dict[str, dict],
+) -> dict:
+    """Grade awareness subsystem from awareness_ticks data.
+
+    Factors: tick_regularity (30%), classification_rate (40%),
+    depth_balance (30%).
+    """
+    # Total ticks in period
+    cursor = await db.execute(
+        "SELECT COUNT(*) as cnt FROM awareness_ticks "
+        "WHERE created_at >= ? AND created_at < ?",
+        (since, until),
+    )
+    row = await cursor.fetchone()
+    total_ticks = row["cnt"] if row else 0
+
+    # Classified ticks (non-null classified_depth)
+    cursor = await db.execute(
+        "SELECT classified_depth, COUNT(*) as cnt FROM awareness_ticks "
+        "WHERE created_at >= ? AND created_at < ? "
+        "AND classified_depth IS NOT NULL "
+        "GROUP BY classified_depth",
+        (since, until),
+    )
+    depth_rows = await cursor.fetchall()
+    depth_dist = {r["classified_depth"]: r["cnt"] for r in depth_rows}
+    classified_count = sum(depth_dist.values())
+
+    # Tick regularity: expect ~2000+/week (5-min ticks, 2016 per week).
+    # Score as ratio to expected, capped at 1.0.
+    expected_ticks = 2016  # 7 * 24 * 60 / 5
+    tick_regularity = min(total_ticks / expected_ticks, 1.0) if total_ticks else 0.0
+
+    # Classification rate: what fraction of ticks got classified
+    classification_rate = classified_count / total_ticks if total_ticks else 0.0
+
+    # Depth balance: entropy-like measure of depth distribution.
+    # Perfect balance (all 4 depths equal) = 1.0. All one depth = 0.0.
+    depth_balance = 0.0
+    if classified_count > 0 and len(depth_dist) > 1:
+        import math
+        probs = [c / classified_count for c in depth_dist.values()]
+        max_entropy = math.log(4)  # 4 depth levels
+        entropy = -sum(p * math.log(p) for p in probs if p > 0)
+        depth_balance = entropy / max_entropy if max_entropy else 0.0
+
+    factors = {"tick_regularity": round(tick_regularity, 4),
+               "classification_rate": round(classification_rate, 4),
+               "depth_balance": round(depth_balance, 4),
+               "total_ticks": total_ticks,
+               "classified_count": classified_count,
+               "depth_distribution": depth_dist}
+
+    if total_ticks < _MIN_SAMPLES["awareness"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_ticks,
+                "reason": f"insufficient data ({total_ticks} ticks, need {_MIN_SAMPLES['awareness']})"}
+
+    score = (tick_regularity * 0.3 + classification_rate * 0.4
+             + depth_balance * 0.3) * 100
+
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total_ticks}
+
+
+async def _grade_reflection(
+    db: aiosqlite.Connection,
+    since: str,
+    until: str,
+    _dimension_results: dict[str, dict],
+) -> dict:
+    """Grade reflection subsystem from observations data.
+
+    Factors: observation_volume (25%), influence_rate (50%),
+    type_diversity (25%).
+    """
+    # Total observations in period
+    cursor = await db.execute(
+        """SELECT COUNT(*) as total,
+                  SUM(CASE WHEN influenced_action = 1 THEN 1 ELSE 0 END) as influenced
+           FROM observations
+           WHERE created_at >= ? AND created_at < ?""",
+        (since, until),
+    )
+    row = await cursor.fetchone()
+    total_obs = row["total"] if row else 0
+    influenced = row["influenced"] if row else 0
+
+    # Influence rate: fraction of observations that led to action
+    influence_rate = influenced / total_obs if total_obs else 0.0
+
+    # Observation volume: expect 50+/week for a healthy system.
+    # Score as ratio to expected, capped at 1.0.
+    volume_score = min(total_obs / 50, 1.0) if total_obs else 0.0
+
+    # Type diversity: how many distinct observation types
+    cursor = await db.execute(
+        "SELECT COUNT(DISTINCT type) as type_count FROM observations "
+        "WHERE created_at >= ? AND created_at < ?",
+        (since, until),
+    )
+    row = await cursor.fetchone()
+    type_count = row["type_count"] if row else 0
+    # Expect 3+ types for healthy diversity, cap at 1.0
+    type_diversity = min(type_count / 3, 1.0) if type_count else 0.0
+
+    factors = {"observation_volume": total_obs, "volume_score": round(volume_score, 4),
+               "influence_rate": round(influence_rate, 4),
+               "type_diversity": round(type_diversity, 4),
+               "type_count": type_count, "influenced_count": influenced}
+
+    if total_obs < _MIN_SAMPLES["reflection"]:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_obs,
+                "reason": f"insufficient data ({total_obs} observations, need {_MIN_SAMPLES['reflection']})"}
+
+    score = (volume_score * 0.25 + influence_rate * 0.5
+             + type_diversity * 0.25) * 100
+
+    return {"grade": _score_to_grade(score), "score": round(score, 1),
+            "factors": factors, "sample_count": total_obs}

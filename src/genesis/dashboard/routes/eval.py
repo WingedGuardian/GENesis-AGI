@@ -125,3 +125,60 @@ async def eval_health():
             if age_days is not None else "Could not parse timestamp"
         ),
     })
+
+
+@blueprint.route("/api/genesis/eval/subsystem-grades")
+@_async_route
+async def eval_subsystem_grades():
+    """Return latest per-subsystem quality grades."""
+    from genesis.db.crud import j9_eval
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"grades": {}}), 503
+
+    grades = await j9_eval.get_latest_subsystem_grades(rt._db)
+    result = {}
+    for g in grades:
+        result[g["subsystem"]] = {
+            "grade": g.get("grade"),
+            "score": g.get("score"),
+            "factors": g.get("factors", {}),
+            "sample_count": g.get("sample_count", 0),
+            "period_end": g.get("period_end"),
+            "reason": g.get("factors", {}).get("reason"),
+        }
+
+    return jsonify({"grades": result})
+
+
+@blueprint.route("/api/genesis/eval/subsystem-grades/trend")
+@_async_route
+async def eval_subsystem_grades_trend():
+    """Return 12-week trend for each subsystem grade."""
+    from genesis.db.crud import j9_eval
+    from genesis.runtime import GenesisRuntime
+
+    rt = GenesisRuntime.instance()
+    if not rt.is_bootstrapped or rt._db is None:
+        return jsonify({"trends": {}}), 503
+
+    subsystems = ["memory", "ego", "procedural", "awareness", "reflection"]
+    trends = {}
+    for sub in subsystems:
+        history = await j9_eval.get_subsystem_grades(
+            rt._db, subsystem=sub, period_type="weekly", limit=12,
+        )
+        history.reverse()  # oldest first for sparkline
+        trends[sub] = [
+            {
+                "period_end": h.get("period_end"),
+                "grade": h.get("grade"),
+                "score": h.get("score"),
+                "sample_count": h.get("sample_count", 0),
+            }
+            for h in history
+        ]
+
+    return jsonify({"trends": trends})
