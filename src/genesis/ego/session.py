@@ -349,6 +349,19 @@ class EgoSession:
             effort = EffortLevel(self._config.default_effort)
 
         # System prompt is identity ONLY (cacheable)
+        # Record prompt version on first use (same guard as run_cycle)
+        if not self._prompt_version_recorded and self._db is not None:
+            try:
+                from genesis.db.crud.prompt_versions import record_version
+                await record_version(
+                    self._db,
+                    prompt_hash=self._prompt_hash,
+                    call_site="ego_cycle",
+                    content_preview=self._static_prompt[:200],
+                )
+                self._prompt_version_recorded = True
+            except Exception:
+                logger.debug("Failed to record ego prompt version", exc_info=True)
         system_prompt = self._static_prompt
 
         # Build invocation — same pattern as run_cycle

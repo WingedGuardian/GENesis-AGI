@@ -204,6 +204,8 @@ class InboxMonitor:
         self._prompt_dir = prompt_dir or _PROMPT_DIR
         self._scheduler = AsyncIOScheduler()
         self._system_prompt: str | None = None
+        self._prompt_hash: str = ""
+        self._prompt_version_recorded: bool = False
         self._check_lock = asyncio.Lock()
         self._triage_pipeline = triage_pipeline
         self._autonomous_dispatcher = None

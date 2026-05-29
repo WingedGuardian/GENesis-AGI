@@ -143,6 +143,16 @@ class SurplusScheduler:
     def set_fresh_session_test_executor(self, executor: SurplusExecutor) -> None:
         """Set executor for FRESH_SESSION_TEST tasks (weekly documentation quality diagnostic)."""
         self._fresh_session_test_executor = executor
+        # Late-registration: if scheduler already started, add the job now
+        if self._scheduler.running and not self._scheduler.get_job("schedule_fresh_session_test"):
+            from apscheduler.triggers.cron import CronTrigger
+            self._scheduler.add_job(
+                self._schedule_fresh_session_test,
+                CronTrigger(day_of_week="sun", hour=5),
+                id="schedule_fresh_session_test",
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
 
     def set_maintenance_executors(
         self,

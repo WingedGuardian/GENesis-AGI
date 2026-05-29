@@ -144,9 +144,9 @@ class FreshSessionTestExecutor:
 def _extract_score(text: str) -> int:
     """Extract score from the JSON summary block in the response."""
     import re
-    match = re.search(r'"score"\s*:\s*(\d)', text)
+    match = re.search(r'"score"\s*:\s*(\d+)', text)
     if match:
-        return int(match.group(1))
+        return min(5, max(0, int(match.group(1))))
     # Fallback: count non-UNANSWERABLE answers
     unanswerable_count = text.upper().count("UNANSWERABLE")
-    return max(0, 5 - unanswerable_count)
+    return min(5, max(0, 5 - unanswerable_count))
