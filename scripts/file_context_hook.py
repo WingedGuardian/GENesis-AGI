@@ -17,6 +17,8 @@ from pathlib import Path
 
 # Max files to track per session (most recent first)
 _MAX_FILES = 20
+# Project root prefix for filtering — only track project files
+_PROJECT_PREFIX = str(Path.home() / "genesis")
 
 
 def main() -> None:
@@ -50,7 +52,7 @@ def _process(data: dict) -> None:
         return
 
     # Filter to project files only (skip system/temp paths)
-    if not file_path.startswith("${HOME}/genesis"):
+    if not file_path.startswith(_PROJECT_PREFIX):
         return
 
     # Validate session_id is a safe path component (CC uses UUIDs)

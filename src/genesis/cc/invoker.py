@@ -185,6 +185,9 @@ class CCInvoker:
         # Without this, the sandbox lives on /tmp where intermittent ENOENT
         # failures break the Bash tool for entire sessions.
         env["CLAUDE_CODE_TMPDIR"] = str(self._CC_SANDBOX_TMPDIR)
+        # Prevent CC's alt-screen renderer from corrupting terminal scrollback
+        # in Linux/tmux.  No-op on CC <2.1.132; required post-migration.
+        env["CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN"] = "1"
         return env
 
     async def interrupt(self) -> None:
@@ -241,6 +244,12 @@ class CCInvoker:
                         server_name = source[start:end]
                     break
             return CCMCPError(source, server_name=server_name)
+        # Thinking block corruption (stale resume with extended thinking).
+        # Semantically a session error — the session's thinking state is
+        # incompatible with modification.  conversation.py already catches
+        # CCError on resumes, so this only improves classification fidelity.
+        if "thinking" in lower and "cannot be modified" in lower:
+            return CCSessionError(source)
         # Generic process error
         return CCProcessError(source)
 

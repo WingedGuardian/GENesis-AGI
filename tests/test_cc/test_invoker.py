@@ -582,6 +582,27 @@ def test_classify_error_generic(invoker):
     assert isinstance(err, CCProcessError)
 
 
+def test_classify_error_thinking_block(invoker):
+    """Thinking-block corruption on resume classified as session error."""
+    from genesis.cc.exceptions import CCSessionError
+
+    err = invoker._classify_error(
+        "thinking blocks cannot be modified after initial creation"
+    )
+    assert isinstance(err, CCSessionError)
+
+
+def test_classify_error_thinking_block_from_stdout(invoker):
+    """Thinking-block signal can appear in stdout (streaming mode)."""
+    from genesis.cc.exceptions import CCSessionError
+
+    err = invoker._classify_error(
+        "",
+        stdout_text="Error: thinking blocks cannot be modified after initial creation",
+    )
+    assert isinstance(err, CCSessionError)
+
+
 # --- interrupt() tests ---
 
 

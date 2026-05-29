@@ -105,6 +105,7 @@ _TRAIL_DIR = Path.home() / ".genesis" / "sessions"
 _PIVOT_SIMILARITY_THRESHOLD = 0.3
 _PIVOT_DEBOUNCE_MSGS = 3
 _MAX_TRAIL_DISPLAY = 8  # Show at most this many pivots in injected line
+_GENESIS_PREFIX = str(Path.home() / "genesis") + "/"
 
 
 def _trail_path(session_id: str) -> Path:
@@ -270,8 +271,8 @@ def _keywords_from_files(file_paths: list[str]) -> list[str]:
     """
     keywords: list[str] = []
     for fp in file_paths[:5]:  # Top 5 most recent
-        # Strip common prefixes and extensions
-        path = fp.replace("${HOME}/genesis/", "")
+        # Strip project root prefix to extract meaningful path components
+        path = fp.replace(_GENESIS_PREFIX, "")
         parts = path.replace("/", " ").replace("_", " ").replace(".", " ").split()
         for part in parts:
             part = part.lower()
