@@ -244,6 +244,12 @@ class CCInvoker:
                         server_name = source[start:end]
                     break
             return CCMCPError(source, server_name=server_name)
+        # Thinking block corruption (stale resume with extended thinking).
+        # Semantically a session error — the session's thinking state is
+        # incompatible with modification.  conversation.py already catches
+        # CCError on resumes, so this only improves classification fidelity.
+        if "thinking" in lower and "cannot be modified" in lower:
+            return CCSessionError(source)
         # Generic process error
         return CCProcessError(source)
 
