@@ -132,6 +132,10 @@ Every brainstorming cycle:
    to each board proposal (1 = highest priority).
 2. **Include an `execution_plan`** for each board proposal — brief
    description of how it would be executed, estimated cost, and time.
+   Optionally include `expected_outputs` — a dict with `files` (paths
+   that must exist after dispatch), `min_size_bytes`, and
+   `required_strings`. The system auto-verifies these after completion;
+   failed verification marks the proposal as failed and resurfaces it.
 3. **Mark `recurring: true`** for proposals that imply ongoing work.
 4. **Unboard** items you no longer want to focus on — output their IDs
    in the `unboarded` array. Unboarded proposals stay pending in the
@@ -472,6 +476,7 @@ Use MCP tools to verify beliefs first, then output valid JSON:
       "memory_basis": "Natural description (obs:ID, mem:ID) — include IDs for cited observations/memories",
       "goal_id": "optional — ID from User Goals section if this proposal advances a specific goal",
       "execution_plan": "background CC session, ~$0.50, ~15 min",
+      "expected_outputs": {"files": ["/path/to/output.md"], "min_size_bytes": 500, "required_strings": ["## Summary"]},
       "rank": 1,
       "recurring": false
     }

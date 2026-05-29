@@ -1228,6 +1228,11 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE ego_proposals ADD COLUMN content_size INTEGER",
         "ego_proposals.content_size")
 
+    # Post-dispatch verification: structured expected-outputs metadata
+    await _try_alter(db,
+        "ALTER TABLE ego_proposals ADD COLUMN expected_outputs TEXT",
+        "ego_proposals.expected_outputs")
+
     # surplus_tasks.not_before — existed in CREATE TABLE DDL but lacked
     # ALTER TABLE migration for installs created before the column was added.
     await _try_alter(db,

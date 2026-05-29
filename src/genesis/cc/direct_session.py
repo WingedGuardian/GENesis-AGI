@@ -458,11 +458,51 @@ class DirectSessionRunner:
             return
         proposal_id = request.caller_context.split(":", 1)[1]
         try:
-            from genesis.db.crud.ego import update_proposal_outcome
+            from genesis.db.crud.ego import (
+                mark_proposal_verification_failed,
+                update_proposal_outcome,
+            )
 
             db = getattr(self._rt, "_db", None)
             if db is None:
                 return
+
+            # Post-dispatch verification: if the session succeeded and the
+            # proposal defines expected_outputs, verify deliverables before
+            # recording the outcome.
+            if result.success:
+                verification_failed = await self._verify_proposal_outputs(
+                    db, proposal_id,
+                )
+                if verification_failed:
+                    # Mark as failed + store observation; skip normal outcome
+                    await mark_proposal_verification_failed(
+                        db, proposal_id, summary=verification_failed,
+                    )
+                    try:
+                        store = getattr(self._rt, "_memory_store", None)
+                        if store is not None:
+                            await store.store(
+                                content=(
+                                    f"Ego dispatch VERIFICATION FAILED for "
+                                    f"proposal {proposal_id}: {verification_failed}"
+                                ),
+                                source="ego_dispatch_verification",
+                                tags=["ego", "verification_failure"],
+                                memory_type="episodic",
+                                wing="autonomy",
+                                room="ego",
+                            )
+                    except Exception:
+                        logger.debug(
+                            "Failed to store verification observation",
+                            exc_info=True,
+                        )
+                    await self._notify_dispatch_debrief(
+                        proposal_id, request, result,
+                    )
+                    return
+
             summary = (result.output_text or result.error or "")[:1000]
             await update_proposal_outcome(
                 db, proposal_id, success=result.success, summary=summary,
@@ -492,6 +532,37 @@ class DirectSessionRunner:
             )
         # Debrief is best-effort, fully self-contained (own try/except)
         await self._notify_dispatch_debrief(proposal_id, request, result)
+
+    async def _verify_proposal_outputs(
+        self,
+        db: object,
+        proposal_id: str,
+    ) -> str | None:
+        """Check expected outputs for a completed proposal.
+
+        Returns a failure summary string if verification fails,
+        or ``None`` if verification passes or is not configured.
+        """
+        try:
+            from genesis.db.crud.ego import get_proposal
+            from genesis.ego.verification import parse_expected_outputs, verify_outputs
+
+            proposal = await get_proposal(db, proposal_id)
+            if not proposal:
+                return None
+            expected = parse_expected_outputs(proposal.get("expected_outputs"))
+            if expected is None:
+                return None  # no verification configured
+            result = verify_outputs(expected)
+            if not result.passed:
+                return "; ".join(result.failures)
+        except Exception:
+            logger.warning(
+                "Post-dispatch verification error for %s (skipping)",
+                proposal_id,
+                exc_info=True,
+            )
+        return None
 
     async def _notify_dispatch_debrief(
         self,

@@ -7,6 +7,7 @@ via TopicManager, and status resolution.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 import uuid
@@ -25,6 +26,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 TOPIC_CATEGORY = "ego_proposals"
+
+
+def _serialize_expected_outputs(raw: dict | str | None) -> str | None:
+    """Serialize expected_outputs from ego LLM output for DB storage.
+
+    Accepts a dict (from parsed LLM JSON) or a pre-serialized string.
+    Returns a JSON string or None.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return json.dumps(raw)
+    if isinstance(raw, str):
+        return raw  # already serialized
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Digest formatting
@@ -221,6 +238,9 @@ class ProposalWorkflow:
                 content_hash=_content_hash(proposal_content),
                 content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
+                expected_outputs=_serialize_expected_outputs(
+                    p.get("expected_outputs"),
+                ),
             )
             ids.append(pid)
 

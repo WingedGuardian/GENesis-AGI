@@ -73,7 +73,10 @@ Every cycle:
 1. **Review your board.** Re-rank based on current system state. Assign
    `rank` to each board proposal (1 = highest priority).
 2. **Include an `execution_plan`** for each board proposal — how it would
-   be executed, estimated cost, and time.
+   be executed, estimated cost, and time. Optionally include
+   `expected_outputs` — a dict with `files` (paths that must exist after
+   dispatch), `min_size_bytes`, and `required_strings`. Auto-verified
+   after completion; failed verification marks the proposal as failed.
 3. **Mark `recurring: true`** for ongoing operational tasks.
 4. **Unboard** items you no longer need to focus on — output their IDs
    in the `unboarded` array. They stay pending for user decision.
@@ -229,6 +232,7 @@ Use MCP tools first, then output valid JSON:
       "urgency": "low|normal|high|critical",
       "alternatives": "What else you considered",
       "execution_plan": "health check via MCP tools, ~$0.10, ~2 min",
+      "expected_outputs": {"files": ["/path/to/output.md"], "min_size_bytes": 200},
       "rank": 1,
       "recurring": false
     }

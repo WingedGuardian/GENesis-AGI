@@ -301,6 +301,7 @@ async def create_proposal(
     content_hash: str | None = None,
     content_size: int | None = None,
     original_content: str | None = None,
+    expected_outputs: str | None = None,
 ) -> str:
     """Insert a new ego proposal. Returns the id."""
     if created_at is None:
@@ -311,8 +312,10 @@ async def create_proposal(
             confidence, urgency, alternatives, status, cycle_id,
             batch_id, created_at, expires_at, rank, execution_plan,
             recurring, memory_basis, realist_verdict, realist_reasoning,
-            ego_source, goal_id, content_hash, content_size, original_content)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ego_source, goal_id, content_hash, content_size,
+            original_content, expected_outputs)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   ?, ?)""",
         (
             id,
             action_type,
@@ -338,6 +341,7 @@ async def create_proposal(
             content_hash,
             content_size,
             original_content,
+            expected_outputs,
         ),
     )
     await db.commit()
@@ -468,6 +472,29 @@ async def update_proposal_outcome(
     suffix = f"|{'completed' if success else 'failed'}:{summary[:1000]}"
     cursor = await db.execute(
         "UPDATE ego_proposals SET user_response = COALESCE(user_response, '') || ? "
+        "WHERE id = ? AND status = 'executed'",
+        (suffix, proposal_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def mark_proposal_verification_failed(
+    db: aiosqlite.Connection,
+    proposal_id: str,
+    *,
+    summary: str,
+) -> bool:
+    """Transition an executed proposal to 'failed' after verification failure.
+
+    Called when post-dispatch output verification detects missing or
+    insufficient deliverables. Distinct from :func:`update_proposal_outcome`
+    which appends outcome text but keeps status as 'executed'.
+    """
+    suffix = f"|verification_failed:{summary[:1000]}"
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'failed', "
+        "user_response = COALESCE(user_response, '') || ? "
         "WHERE id = ? AND status = 'executed'",
         (suffix, proposal_id),
     )

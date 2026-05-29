@@ -784,7 +784,8 @@ TABLES = {
             goal_id          TEXT,                    -- FK to user_goals.id (nullable — not all proposals serve a goal)
             content_hash     TEXT,                    -- SHA-256 of content at creation time
             content_size     INTEGER,                 -- byte count of content at creation time
-            original_content TEXT                     -- pre-realist-amendment content (NULL if not amended)
+            original_content TEXT,                    -- pre-realist-amendment content (NULL if not amended)
+            expected_outputs TEXT                     -- JSON: post-dispatch verification criteria (files, min_size, required_strings)
         )
     """,
     "ego_state": """

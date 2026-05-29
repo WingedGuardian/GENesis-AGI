@@ -1631,6 +1631,28 @@ class EgoSession:
             f"\nRationale: {prop.get('rationale') or ''}",
         ]
 
+        # Post-dispatch verification context
+        eo_raw = prop.get("expected_outputs")
+        if eo_raw:
+            try:
+                import json as _json
+
+                parsed_eo = _json.loads(eo_raw) if isinstance(eo_raw, str) else eo_raw
+                if isinstance(parsed_eo, dict) and parsed_eo.get("files"):
+                    eo_lines = [
+                        "\nExpected outputs (auto-verified after completion):",
+                        f"  Files: {', '.join(parsed_eo['files'])}",
+                    ]
+                    if parsed_eo.get("min_size_bytes"):
+                        eo_lines.append(f"  Min size: {parsed_eo['min_size_bytes']} bytes")
+                    if parsed_eo.get("required_strings"):
+                        eo_lines.append(
+                            f"  Required content: {', '.join(parsed_eo['required_strings'])}"
+                        )
+                    parts.append("\n".join(eo_lines))
+            except (ValueError, TypeError):
+                pass
+
         # World model context — each section degrades independently
         try:
             from genesis.db.crud import user_goals
