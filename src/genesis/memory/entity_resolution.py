@@ -140,12 +140,30 @@ async def find_dedup_candidates(
     Returns list of ``(point_a, point_b, cosine_score)`` tuples.
     Deduplicates pairs so ``(A, B)`` and ``(B, A)`` only appear once.
 
-    Args:
-        points: List of point dicts with ``id`` and ``payload`` keys
-            (from ``_scroll_and_group``).
-        vectors: Pre-fetched vectors keyed by point ID.
-        threshold: Minimum cosine similarity to consider as candidate.
+    The inner loop is synchronous Qdrant I/O and runs via
+    ``asyncio.to_thread`` to avoid blocking the event loop.
     """
+    import asyncio
+
+    return await asyncio.to_thread(
+        _find_dedup_candidates_sync,
+        qdrant, points, vectors,
+        threshold=threshold,
+        max_candidates_per_point=max_candidates_per_point,
+        collection=collection,
+    )
+
+
+def _find_dedup_candidates_sync(
+    qdrant: QdrantClient,
+    points: list[dict],
+    vectors: dict[str, list[float]],
+    *,
+    threshold: float,
+    max_candidates_per_point: int,
+    collection: str,
+) -> list[tuple[dict, dict, float]]:
+    """Synchronous inner loop for dedup candidate discovery."""
     from genesis.qdrant import collections as qdrant_ops
 
     seen_pairs: set[tuple[str, str]] = set()

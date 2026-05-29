@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 COLLECTION: str = "episodic_memory"
 
 
+def _parse_ts(ts: str) -> datetime:
+    """Parse ISO timestamp, returning datetime.min on failure."""
+    try:
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
+    except (ValueError, TypeError):
+        return datetime.min.replace(tzinfo=UTC)
+
+
 async def run_entity_resolution(
     *,
     qdrant: QdrantClient,
@@ -37,8 +48,14 @@ async def run_entity_resolution(
     store: MemoryStore,
     run_id: str,
     dry_run: bool,
+    buckets: dict | None = None,
 ) -> dict[str, Any]:
-    """Dedup + contradiction detection across episodic memories."""
+    """Dedup + contradiction detection across episodic memories.
+
+    Args:
+        buckets: Pre-scrolled (wing, room) → points dict from consolidation.
+            If None, scrolls Qdrant independently (slower, used in standalone).
+    """
     from genesis.memory.entity_resolution import (
         AUTO_MERGE_THRESHOLD,
         LLM_CHECK_FLOOR,
@@ -59,10 +76,11 @@ async def run_entity_resolution(
         "errors": [],
     }
 
-    # 1. Scroll non-deprecated episodic memories, grouped by (wing, room)
-    from genesis.memory.dream_cycle import _scroll_and_group
+    # 1. Use pre-scrolled buckets if available, otherwise scroll independently
+    if buckets is None:
+        from genesis.memory.dream_cycle import _scroll_and_group
 
-    buckets = await _scroll_and_group(qdrant)
+        buckets = await _scroll_and_group(qdrant)
     total_points = sum(len(pts) for pts in buckets.values())
     report["total_points"] = total_points
 
@@ -108,7 +126,9 @@ async def run_entity_resolution(
             # Determine which memory is newer (survivor)
             ts_a = payload_a.get("created_at", "")
             ts_b = payload_b.get("created_at", "")
-            if ts_a >= ts_b:
+            dt_a = _parse_ts(ts_a)
+            dt_b = _parse_ts(ts_b)
+            if dt_a >= dt_b:
                 survivor_id, deprecated_id = point_a["id"], point_b["id"]
             else:
                 survivor_id, deprecated_id = point_b["id"], point_a["id"]
@@ -205,8 +225,13 @@ async def run_entity_resolution(
                             strength=round(score, 4),
                             created_at=datetime.now(UTC).isoformat(),
                         )
-                    except Exception:
-                        pass  # PK collision = link already exists
+                    except Exception as link_exc:
+                        # Only PK collision is expected; log unexpected errors
+                        if "UNIQUE constraint" not in str(link_exc):
+                            logger.warning(
+                                "Contradiction link %s→%s failed: %s",
+                                src[:8], tgt[:8], link_exc,
+                            )
 
                     await log_resolution(
                         db,

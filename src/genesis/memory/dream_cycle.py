@@ -256,7 +256,9 @@ async def run(
     try:
         from genesis.memory.dream_entity_scan import run_entity_resolution
 
-        report["entity_resolution"] = await run_entity_resolution(**phase_kwargs)
+        report["entity_resolution"] = await run_entity_resolution(
+            **phase_kwargs, buckets=buckets,
+        )
     except Exception as exc:
         report["errors"].append({"phase": "entity_resolution", "error": str(exc)})
         logger.warning("Dream phase entity_resolution failed: %s", exc, exc_info=True)
@@ -619,7 +621,7 @@ async def rollback(
                 qdrant,
                 collection=COLLECTION,
                 point_id=mid,
-                payload={"deprecated": False, "synthesized_into": None},
+                payload={"deprecated": False, "synthesized_into": None, "merged_into": None},
             )
             report["restored"] += 1
         except Exception as exc:
