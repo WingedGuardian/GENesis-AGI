@@ -438,6 +438,14 @@ _CALL_SITE_META: dict[str, dict] = {
         "model_tier": "slm",
         "wired": True,
     },
+    "dream_cycle_entity_check": {
+        "description": "Dream cycle entity resolution — quick semantic overlap/contradiction check between candidate memory pairs. Weekly Sunday 4am within dream cycle, capped at 50 calls/run.",
+        "category": "consolidation",
+        "frequency": "Weekly batch (Sunday 4am, within dream cycle, max 50 checks/run)",
+        "model_tier": "slm",
+        "wired": True,
+        "see_also": ["dream_cycle_synthesis"],
+    },
     "28_observation_sweep": {
         "description": "Functionally replaced by awareness loop's signal collection (awareness/loop.py:perform_tick). Kept as historical reference; no live consumers route through this call site.",
         "category": "processing",

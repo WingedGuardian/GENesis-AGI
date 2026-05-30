@@ -365,6 +365,13 @@ call_sites:
     - mistral-small-free
     - openrouter-free
     retry_profile: background
+  dream_cycle_entity_check:
+    chain:
+    - nvidia-nim-kimi
+    - groq-free
+    - mistral-small-free
+    - openrouter-free
+    retry_profile: background
   27_pre_execution_assessment:
     chain:
     - glm51

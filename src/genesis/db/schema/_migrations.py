@@ -1297,6 +1297,50 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ON eval_subsystem_grades(subsystem, period_end)"
     )
 
+    # Dream cycle entity resolution audit trail (Sprint 2)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS entity_resolution_audit (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          TEXT NOT NULL,
+            action          TEXT NOT NULL
+                            CHECK (action IN (
+                                'auto_merge', 'llm_merge', 'contradiction',
+                                'succeeded_by', 'flagged', 'skipped'
+                            )),
+            memory_id_a     TEXT NOT NULL,
+            memory_id_b     TEXT NOT NULL,
+            content_a       TEXT,
+            content_b       TEXT,
+            cosine_score    REAL,
+            llm_verdict     TEXT,
+            llm_reasoning   TEXT,
+            survivor_id     TEXT,
+            created_at      TEXT NOT NULL
+                            DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_er_audit_run "
+        "ON entity_resolution_audit(run_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_er_audit_action "
+        "ON entity_resolution_audit(action, created_at)"
+    )
+
+    # Pre-computed betweenness centrality cache (Sprint 2)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS centrality_cache (
+            memory_id        TEXT PRIMARY KEY,
+            centrality_score REAL NOT NULL,
+            computed_at      TEXT NOT NULL
+        )
+    """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_centrality_score "
+        "ON centrality_cache(centrality_score DESC)"
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

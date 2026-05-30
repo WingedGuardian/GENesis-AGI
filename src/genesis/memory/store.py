@@ -120,6 +120,14 @@ class MemoryStore:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
 
+        # Surface form normalization: expand known aliases before embedding
+        try:
+            from genesis.memory.entity_resolution import normalize_content
+
+            content = normalize_content(content)
+        except Exception:
+            pass  # best-effort — never block a store on normalization failure
+
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
         from genesis.perception.confidence import load_config as load_confidence_config
