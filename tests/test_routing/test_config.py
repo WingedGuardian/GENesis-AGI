@@ -140,7 +140,8 @@ def test_load_full_yaml(monkeypatch):
     # 2026-05-23: 47 → 48 after 40_ego_focus_selection added by #420.
     # 2026-05-23: 48 → 49 after voice_conversation added by #422.
     # 2026-05-24: 49 → 48 after models_md_synthesis removed (converted to CC session dispatch).
-    assert len(cfg.call_sites) == 48
+    # 2026-05-29: 48 → 49 after dream_cycle_entity_check added (Sprint 2).
+    assert len(cfg.call_sites) == 49
     assert "models_md_synthesis" not in cfg.call_sites  # removed 2026-05-24
     assert "2_triage" not in cfg.call_sites  # removed 2026-05-10
     assert "7_task_retrospective" not in cfg.call_sites  # removed 2026-05-10 (duplicate; live one is 43_task_retrospective)

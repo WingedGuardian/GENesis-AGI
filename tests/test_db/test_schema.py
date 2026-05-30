@@ -51,6 +51,8 @@ EXPECTED_TABLES = [
     "credential_access_log",
     "session_heartbeats",
     "ego_intentions",
+    "entity_resolution_audit",
+    "centrality_cache",
 ]
 
 
