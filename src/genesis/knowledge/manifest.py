@@ -139,6 +139,21 @@ class ManifestManager:
         entry = manifest.get(h)
         return entry.get("unit_ids", []) if entry else []
 
+    def add_tree_index(self, source: str, *, doc_id: str) -> None:
+        """Associate a PageIndex doc_id with an existing source entry."""
+        manifest = self._load()
+        h = self.source_hash(source)
+        if h in manifest:
+            manifest[h]["pageindex_doc_id"] = doc_id
+            self._save()
+
+    def get_tree_index_doc_id(self, source: str) -> str | None:
+        """Look up the PageIndex doc_id for a source, if any."""
+        manifest = self._load()
+        h = self.source_hash(source)
+        entry = manifest.get(h)
+        return entry.get("pageindex_doc_id") if entry else None
+
     def list_sources(self) -> list[dict]:
         """List all ingested sources with metadata."""
         manifest = self._load()

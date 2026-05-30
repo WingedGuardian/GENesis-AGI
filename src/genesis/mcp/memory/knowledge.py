@@ -668,10 +668,13 @@ def _get_orchestrator():
             "Router not available — standalone bootstrap also failed"
         )
 
+    from genesis.knowledge.tree_index import get_client as get_tree_index_client
+
     return KnowledgeOrchestrator(
         registry=build_default_registry(),
         distillation=DistillationPipeline(router=rt._router),
         manifest=ManifestManager(),
+        tree_index_client=get_tree_index_client(),
     )
 
 
@@ -697,7 +700,7 @@ async def knowledge_ingest_source(
     result = await orchestrator.ingest_source(
         source, project_type=project_type, domain=domain, purpose=purpose,
     )
-    return {
+    response = {
         "source": result.source,
         "source_type": result.source_type,
         "units_created": result.units_created,
@@ -705,6 +708,9 @@ async def knowledge_ingest_source(
         "quality_flags": result.quality_flags,
         "error": result.error,
     }
+    if result.tree_index_doc_id:
+        response["tree_index_doc_id"] = result.tree_index_doc_id
+    return response
 
 
 @mcp.tool()

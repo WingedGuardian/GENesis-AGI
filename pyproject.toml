@@ -41,6 +41,9 @@ browser = [
 distribution = [
     "composio-client>=1.33.0",
 ]
+documents = [
+    "pageindex>=0.2.8",
+]
 release = []  # detect-secrets is now a core dep (see dependencies above)
 
 [build-system]
