@@ -27,8 +27,7 @@ DEFAULT_CONFIG = {
     "provider": "aws",
     "region": "us-east-1",
     "instance_type": "t3.medium",
-    "image_id": "",  # Ubuntu 24.04 AMI — set when account is ready
-    "ssh_key_name": "",
+    "image_id": "",  # Empty = auto-resolve latest Ubuntu 24.04 via SSM
     "repo_url": "https://github.com/WingedGuardian/GENesis-AGI.git",
     "install_command": "scripts/install.sh --non-interactive",
     "smoke_timeout_s": 120,

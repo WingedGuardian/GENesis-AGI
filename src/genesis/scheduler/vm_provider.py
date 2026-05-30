@@ -2,17 +2,23 @@
 
 Defines the VMProvider protocol and VMInstance dataclass used by
 the install test runner to provision, manage, and tear down cloud
-VMs. Provider implementations (AWS, Azure, GCP) are stubs until
-their respective accounts are configured.
+VMs. AWS is fully implemented; Azure and GCP are stubs.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Where ephemeral SSH keys live during a test run
+_KEY_DIR = Path(os.environ.get("GENESIS_TMP", str(Path.home() / "tmp")))
 
 
 @dataclass
@@ -71,8 +77,6 @@ class VMProvider(ABC):
         self, instance: VMInstance, *, max_wait_s: int = 300, poll_s: int = 10,
     ) -> bool:
         """Poll until SSH is available. Returns True if reachable."""
-        import asyncio
-
         elapsed = 0
         while elapsed < max_wait_s:
             try:
@@ -90,28 +94,295 @@ class VMProvider(ABC):
         return False
 
 
-# ─── Provider Implementations (Stubs) ────────────────────────────────────────
+# ─── SSH Helper ──────────────────────────────────────────────────────────────
+
+
+async def _run_ssh(
+    ip: str, user: str, key_path: str, cmd: str, *, timeout_s: int = 600,
+) -> str:
+    """Run a command on a remote host via the system ssh client."""
+    ssh_args = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-o", "ServerAliveInterval=30",
+        "-i", key_path,
+        f"{user}@{ip}",
+        cmd,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *ssh_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except TimeoutError:
+        proc.kill()
+        raise RuntimeError(f"SSH command timed out after {timeout_s}s: {cmd[:80]}") from None
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"SSH command failed (rc={proc.returncode}): "
+            f"{stderr.decode(errors='replace')[:500]}"
+        )
+    return stdout.decode(errors="replace")
+
+
+# ─── AWS Provider ────────────────────────────────────────────────────────────
+
+
+# Ubuntu 24.04 LTS AMI SSM parameter (canonical's official)
+_UBUNTU_SSM_PARAM = (
+    "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
+)
+
+# Tag used to find/reuse the Genesis security group
+_SG_TAG = "genesis-install-test"
 
 
 class AWSProvider(VMProvider):
-    """AWS EC2 provider — stub until credentials are configured."""
+    """AWS EC2 provider — provisions ephemeral VMs for install testing.
+
+    Credentials come from the environment (AWS_ACCESS_KEY_ID /
+    AWS_SECRET_ACCESS_KEY) or secrets.env. No pre-existing key pair
+    or security group required — both are managed automatically.
+    """
 
     @property
     def name(self) -> str:
         return "aws"
 
+    def _get_ec2(self, region: str):
+        """Get a boto3 EC2 resource for the given region."""
+        import boto3
+        return boto3.resource("ec2", region_name=region)
+
+    def _get_ec2_client(self, region: str):
+        """Get a boto3 EC2 client for the given region."""
+        import boto3
+        return boto3.client("ec2", region_name=region)
+
+    def _get_ssm_client(self, region: str):
+        """Get a boto3 SSM client for AMI lookup."""
+        import boto3
+        return boto3.client("ssm", region_name=region)
+
+    async def _resolve_ami(self, region: str) -> str:
+        """Resolve the latest Ubuntu 24.04 AMI ID via SSM."""
+        loop = asyncio.get_event_loop()
+        ssm = self._get_ssm_client(region)
+        resp = await loop.run_in_executor(
+            None,
+            lambda: ssm.get_parameter(Name=_UBUNTU_SSM_PARAM),
+        )
+        ami_id = resp["Parameter"]["Value"]
+        logger.info("Resolved Ubuntu 24.04 AMI: %s in %s", ami_id, region)
+        return ami_id
+
+    async def _ensure_security_group(self, region: str) -> str:
+        """Find or create the genesis-install-test security group."""
+        loop = asyncio.get_event_loop()
+        client = self._get_ec2_client(region)
+
+        # Check if it already exists
+        try:
+            resp = await loop.run_in_executor(
+                None,
+                lambda: client.describe_security_groups(
+                    Filters=[{"Name": "group-name", "Values": [_SG_TAG]}],
+                ),
+            )
+            if resp["SecurityGroups"]:
+                sg_id = resp["SecurityGroups"][0]["GroupId"]
+                logger.info("Reusing security group %s", sg_id)
+                return sg_id
+        except Exception:
+            pass
+
+        # Create it
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.create_security_group(
+                GroupName=_SG_TAG,
+                Description="Ephemeral SG for Genesis install testing — SSH only",
+            ),
+        )
+        sg_id = resp["GroupId"]
+
+        # Allow SSH from anywhere (the VM is ephemeral and short-lived)
+        await loop.run_in_executor(
+            None,
+            lambda: client.authorize_security_group_ingress(
+                GroupId=sg_id,
+                IpPermissions=[{
+                    "IpProtocol": "tcp",
+                    "FromPort": 22,
+                    "ToPort": 22,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH for install test"}],
+                }],
+            ),
+        )
+        # Tag it
+        await loop.run_in_executor(
+            None,
+            lambda: client.create_tags(
+                Resources=[sg_id],
+                Tags=[{"Key": "Name", "Value": _SG_TAG}],
+            ),
+        )
+        logger.info("Created security group %s", sg_id)
+        return sg_id
+
+    async def _create_key_pair(self, region: str, run_id: str) -> tuple[str, str]:
+        """Create an ephemeral EC2 key pair. Returns (key_name, key_file_path)."""
+        loop = asyncio.get_event_loop()
+        client = self._get_ec2_client(region)
+        key_name = f"genesis-install-test-{run_id}"
+
+        resp = await loop.run_in_executor(
+            None,
+            lambda: client.create_key_pair(
+                KeyName=key_name, KeyType="ed25519",
+            ),
+        )
+        key_material = resp["KeyMaterial"]
+
+        # Write to a temp file
+        _KEY_DIR.mkdir(parents=True, exist_ok=True)
+        key_path = _KEY_DIR / f"{key_name}.pem"
+        key_path.write_text(key_material)
+        key_path.chmod(0o600)
+        logger.info("Created ephemeral key pair %s → %s", key_name, key_path)
+        return key_name, str(key_path)
+
+    async def _delete_key_pair(self, region: str, key_name: str, key_path: str) -> None:
+        """Delete the ephemeral key pair from AWS and local disk."""
+        loop = asyncio.get_event_loop()
+        client = self._get_ec2_client(region)
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: client.delete_key_pair(KeyName=key_name),
+            )
+            logger.info("Deleted EC2 key pair %s", key_name)
+        except Exception:
+            logger.warning("Failed to delete EC2 key pair %s", key_name, exc_info=True)
+
+        with contextlib.suppress(Exception):
+            Path(key_path).unlink(missing_ok=True)
+
     async def provision(self, config: dict) -> VMInstance:
-        raise NotImplementedError(
-            "AWS provider not yet implemented. "
-            "Requires: boto3, IAM credentials, VPC/subnet/SG setup. "
-            "Config expects: region, instance_type, image_id, ssh_key_name."
+        """Provision an EC2 instance for install testing."""
+        import uuid
+
+        region = config.get("region", "us-east-1")
+        instance_type = config.get("instance_type", "t3.medium")
+        run_id = uuid.uuid4().hex[:8]
+
+        # Resolve AMI
+        ami_id = config.get("image_id") or await self._resolve_ami(region)
+
+        # Ensure security group
+        sg_id = await self._ensure_security_group(region)
+
+        # Create ephemeral key pair
+        key_name, key_path = await self._create_key_pair(region, run_id)
+
+        # Launch instance
+        loop = asyncio.get_event_loop()
+        ec2 = self._get_ec2(region)
+        try:
+            instances = await loop.run_in_executor(
+                None,
+                lambda: ec2.create_instances(
+                    ImageId=ami_id,
+                    InstanceType=instance_type,
+                    KeyName=key_name,
+                    SecurityGroupIds=[sg_id],
+                    MinCount=1,
+                    MaxCount=1,
+                    TagSpecifications=[{
+                        "ResourceType": "instance",
+                        "Tags": [
+                            {"Key": "Name", "Value": f"genesis-install-test-{run_id}"},
+                            {"Key": "genesis-role", "Value": "install-test"},
+                        ],
+                    }],
+                    # 30GB root volume (install needs space for venv + qdrant)
+                    BlockDeviceMappings=[{
+                        "DeviceName": "/dev/sda1",
+                        "Ebs": {
+                            "VolumeSize": 30,
+                            "VolumeType": "gp3",
+                            "DeleteOnTermination": True,
+                        },
+                    }],
+                ),
+            )
+        except Exception as exc:
+            # Clean up key pair on launch failure
+            await self._delete_key_pair(region, key_name, key_path)
+            raise RuntimeError(f"EC2 launch failed: {exc}") from exc
+
+        instance = instances[0]
+        logger.info("Launched EC2 instance %s, waiting for running state", instance.id)
+
+        # Wait for running
+        await loop.run_in_executor(None, instance.wait_until_running)
+        await loop.run_in_executor(None, instance.reload)
+
+        public_ip = instance.public_ip_address
+        if not public_ip:
+            raise RuntimeError(
+                f"Instance {instance.id} has no public IP. "
+                "Check that the default VPC subnet assigns public IPs."
+            )
+
+        logger.info("EC2 instance %s running at %s", instance.id, public_ip)
+        return VMInstance(
+            instance_id=instance.id,
+            provider="aws",
+            ip=public_ip,
+            ssh_user="ubuntu",
+            ssh_key_path=key_path,
+            region=region,
+            metadata={
+                "key_name": key_name,
+                "sg_id": sg_id,
+                "run_id": run_id,
+            },
         )
 
     async def teardown(self, instance: VMInstance) -> None:
-        raise NotImplementedError("AWS teardown not yet implemented.")
+        """Terminate the EC2 instance and clean up the key pair."""
+        loop = asyncio.get_event_loop()
+        region = instance.region or "us-east-1"
+        client = self._get_ec2_client(region)
+
+        # Terminate
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: client.terminate_instances(InstanceIds=[instance.instance_id]),
+            )
+            logger.info("Terminated EC2 instance %s", instance.instance_id)
+        except Exception:
+            logger.warning(
+                "Failed to terminate %s", instance.instance_id, exc_info=True,
+            )
+
+        # Clean up key pair
+        key_name = instance.metadata.get("key_name", "")
+        if key_name:
+            await self._delete_key_pair(region, key_name, instance.ssh_key_path)
 
     async def ssh_command(self, instance: VMInstance, cmd: str) -> str:
-        raise NotImplementedError("AWS SSH not yet implemented.")
+        """Execute a command on the EC2 instance via SSH."""
+        return await _run_ssh(
+            instance.ip, instance.ssh_user, instance.ssh_key_path, cmd,
+        )
 
 
 class AzureProvider(VMProvider):
