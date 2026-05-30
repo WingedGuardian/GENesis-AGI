@@ -206,7 +206,7 @@ class AWSProvider(VMProvider):
             None,
             lambda: client.create_security_group(
                 GroupName=_SG_TAG,
-                Description="Ephemeral SG for Genesis install testing — SSH only",
+                Description="Ephemeral SG for Genesis install testing - SSH only",
             ),
         )
         sg_id = resp["GroupId"]
