@@ -126,7 +126,7 @@ async def run(golden_path: Path) -> None:
     if result.disagreed_cases > 0:
         print("\nDisagreements:")
         for outcome in result.outcomes:
-            if not outcome.agreed:
+            if not outcome.agreed and not outcome.error:
                 label = "pass" if outcome.user_passed else "fail"
                 judge = "pass" if outcome.judge_passed else "fail"
                 print(f"  {outcome.case_id[:12]}... golden={label} judge={judge} "

@@ -145,13 +145,13 @@ async def _get_session_context(db: aiosqlite.Connection, obs_created_at: str) ->
 async def _grade_observation(
     observation_content: str,
     session_context: str,
-) -> tuple[float, str]:
+) -> tuple[float, str, str]:
     """Grade a reflection observation using litellm directly.
 
     Uses the judge call site's model chain (DeepSeek V4) for cost
     efficiency. Falls back gracefully on error.
 
-    Returns (score, rationale).
+    Returns (score, rationale, model_used).
     """
     import litellm
 
@@ -175,6 +175,7 @@ async def _grade_observation(
     ]
     last_exc = None
     response = None
+    used_model = None
     for model in models:
         try:
             response = await litellm.acompletion(
@@ -182,6 +183,7 @@ async def _grade_observation(
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
             )
+            used_model = model
             break
         except Exception as exc:
             last_exc = exc
@@ -207,10 +209,11 @@ async def _grade_observation(
         score = float(parsed.get("score", 0.0))
         score = max(0.0, min(1.0, score))
         rationale = str(parsed.get("rationale", ""))
-        return score, rationale
+        return score, rationale, used_model or "unknown"
     except (json.JSONDecodeError, ValueError, TypeError) as exc:
         logger.warning("Parse failure: %s; raw=%r", exc, raw[:200])
-        return 0.0, f"parse error: {exc}"
+        # Raise so the caller counts this as an error, not a "fail" label.
+        raise ValueError(f"Judge response parse failure: {exc}") from exc
 
 
 async def generate_golden_set(count: int, output_path: Path) -> dict:
@@ -242,7 +245,7 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
             session_context = await _get_session_context(db, created_at)
 
             try:
-                score, rationale = await _grade_observation(
+                score, rationale, model_used = await _grade_observation(
                     content, session_context,
                 )
             except Exception as exc:
@@ -267,6 +270,7 @@ async def generate_golden_set(count: int, output_path: Path) -> dict:
                 },
                 "_judge_score": score,
                 "_judge_rationale": rationale,
+                "_judge_model": model_used,
                 "_created_at": created_at,
                 "_priority": obs["priority"],
                 "_retrieved_count": obs["retrieved_count"],
