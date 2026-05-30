@@ -116,15 +116,31 @@ class TestAWSProvider:
         return AWSProvider()
 
     @pytest.mark.asyncio
-    async def test_resolve_ami(self) -> None:
+    async def test_resolve_ami_x86(self) -> None:
         provider = self._make_provider()
         mock_ssm = MagicMock()
         mock_ssm.get_parameter.return_value = {
             "Parameter": {"Value": "ami-0abcdef1234567890"},
         }
         with patch.object(provider, "_get_ssm_client", return_value=mock_ssm):
-            ami = await provider._resolve_ami("us-east-1")
+            ami = await provider._resolve_ami("us-east-1", "t3.micro")
         assert ami == "ami-0abcdef1234567890"
+        # Should use amd64 SSM param
+        call_arg = mock_ssm.get_parameter.call_args[1]["Name"]
+        assert "amd64" in call_arg
+
+    @pytest.mark.asyncio
+    async def test_resolve_ami_arm64(self) -> None:
+        provider = self._make_provider()
+        mock_ssm = MagicMock()
+        mock_ssm.get_parameter.return_value = {
+            "Parameter": {"Value": "ami-arm64test"},
+        }
+        with patch.object(provider, "_get_ssm_client", return_value=mock_ssm):
+            ami = await provider._resolve_ami("us-east-1", "t4g.small")
+        assert ami == "ami-arm64test"
+        call_arg = mock_ssm.get_parameter.call_args[1]["Name"]
+        assert "arm64" in call_arg
 
     @pytest.mark.asyncio
     async def test_ensure_security_group_existing(self) -> None:

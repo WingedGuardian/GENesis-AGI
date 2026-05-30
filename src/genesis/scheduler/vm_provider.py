@@ -122,21 +122,29 @@ async def _run_ssh(
         proc.kill()
         raise RuntimeError(f"SSH command timed out after {timeout_s}s: {cmd[:80]}") from None
 
+    out = stdout.decode(errors="replace")
+    err = stderr.decode(errors="replace")
     if proc.returncode != 0:
+        # Include both stdout and stderr in error for diagnosis
+        combined = (out + "\n" + err).strip()
         raise RuntimeError(
             f"SSH command failed (rc={proc.returncode}): "
-            f"{stderr.decode(errors='replace')[:500]}"
+            f"{combined[-1000:]}"
         )
-    return stdout.decode(errors="replace")
+    return out
 
 
 # ─── AWS Provider ────────────────────────────────────────────────────────────
 
 
-# Ubuntu 24.04 LTS AMI SSM parameter (canonical's official)
-_UBUNTU_SSM_PARAM = (
-    "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id"
-)
+# Ubuntu 24.04 LTS AMI SSM parameters (canonical's official)
+_UBUNTU_SSM_PARAMS = {
+    "x86_64": "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
+    "arm64": "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id",
+}
+
+# Instance types known to be ARM64 (Graviton)
+_ARM64_PREFIXES = ("t4g", "m6g", "m7g", "c6g", "c7g", "r6g", "r7g", "a1")
 
 # Tag used to find/reuse the Genesis security group
 _SG_TAG = "genesis-install-test"
@@ -169,16 +177,19 @@ class AWSProvider(VMProvider):
         import boto3
         return boto3.client("ssm", region_name=region)
 
-    async def _resolve_ami(self, region: str) -> str:
-        """Resolve the latest Ubuntu 24.04 AMI ID via SSM."""
+    async def _resolve_ami(self, region: str, instance_type: str) -> str:
+        """Resolve the latest Ubuntu 24.04 AMI ID via SSM, matching architecture."""
+        arch = "arm64" if instance_type.split(".")[0] in _ARM64_PREFIXES else "x86_64"
+        ssm_param = _UBUNTU_SSM_PARAMS[arch]
+
         loop = asyncio.get_event_loop()
         ssm = self._get_ssm_client(region)
         resp = await loop.run_in_executor(
             None,
-            lambda: ssm.get_parameter(Name=_UBUNTU_SSM_PARAM),
+            lambda: ssm.get_parameter(Name=ssm_param),
         )
         ami_id = resp["Parameter"]["Value"]
-        logger.info("Resolved Ubuntu 24.04 AMI: %s in %s", ami_id, region)
+        logger.info("Resolved Ubuntu 24.04 AMI (%s): %s in %s", arch, ami_id, region)
         return ami_id
 
     async def _ensure_security_group(self, region: str) -> str:
@@ -281,8 +292,8 @@ class AWSProvider(VMProvider):
         instance_type = config.get("instance_type", "t3.medium")
         run_id = uuid.uuid4().hex[:8]
 
-        # Resolve AMI
-        ami_id = config.get("image_id") or await self._resolve_ami(region)
+        # Resolve AMI (architecture-aware)
+        ami_id = config.get("image_id") or await self._resolve_ami(region, instance_type)
 
         # Ensure security group
         sg_id = await self._ensure_security_group(region)
