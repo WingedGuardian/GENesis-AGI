@@ -30,9 +30,7 @@ from genesis.cc.types import (
 )
 from genesis.db.crud import ego as ego_crud
 from genesis.ego.types import (
-    CYCLE_TYPE_DEFAULTS,
     NEUTRAL_STATUS,
-    CycleType,
     EgoConfig,
     EgoCycle,
 )
@@ -144,147 +142,6 @@ class EgoSession:
 
     # -- Public API --------------------------------------------------------
 
-    async def run_cycle(
-        self,
-        *,
-        is_morning_report: bool = False,
-        cycle_type: CycleType | None = None,
-        model_override: str | None = None,
-    ) -> EgoCycle | None:
-        """Execute one ego thinking cycle.
-
-        Parameters
-        ----------
-        is_morning_report:
-            Legacy flag, still supported. Equivalent to
-            ``cycle_type=CycleType.MORNING_REPORT``.
-        cycle_type:
-            Determines model and effort for this cycle. If None,
-            inferred from ``is_morning_report``.
-        model_override:
-            Override model selection (e.g., "opus" for deep-think cycles).
-            Takes precedence over both config and cycle_type defaults.
-
-        Returns the stored EgoCycle, or None if the cycle failed (CC error).
-
-        Raises:
-            CycleBlockedError: Approval gate blocked the cycle (not a failure).
-        """
-        # Resolve cycle type
-        if cycle_type is None:
-            cycle_type = CycleType.MORNING_REPORT if is_morning_report else CycleType.PROACTIVE
-        is_morning_report = cycle_type == CycleType.MORNING_REPORT
-
-        # Select model + effort: config is the base, cycle type overrides
-        # only for specific types (morning report → sonnet/low, etc.)
-        cycle_model, cycle_effort = CYCLE_TYPE_DEFAULTS.get(cycle_type, (None, None))
-        model = CCModel(cycle_model or self._config.model)
-        effort = EffortLevel(cycle_effort or self._config.default_effort)
-
-        # model_override takes precedence (e.g., deep-think Opus cycle)
-        if model_override:
-            model = CCModel(model_override)
-
-        # 1. Assemble operational context (previous focus + fresh context)
-        dynamic_context = await self._compaction.assemble_context(
-            context_builder=self._context_builder,
-        )
-
-        # 3. Build prompts — system prompt is identity ONLY (cacheable),
-        #    operational context goes in the user message.
-        #    Record prompt version on first use for versioning/outcome linkage.
-        if not self._prompt_version_recorded and self._db is not None:
-            try:
-                from genesis.db.crud.prompt_versions import record_version
-                await record_version(
-                    self._db,
-                    prompt_hash=self._prompt_hash,
-                    call_site="ego_cycle",
-                    content_preview=self._static_prompt[:200],
-                )
-                self._prompt_version_recorded = True
-            except Exception:
-                logger.debug("Failed to record ego prompt version", exc_info=True)
-        system_prompt = self._static_prompt
-        user_prompt = self._build_user_prompt(
-            dynamic_context=dynamic_context,
-            is_morning_report=is_morning_report,
-        )
-
-        # 4. Build invocation — ephemeral (no resume).
-        # append_system_prompt=True: preserve CC's tool framework
-        # underneath the ego identity prompt (see feedback_append_system_prompt.md).
-        invocation = CCInvocation(
-            prompt=user_prompt,
-            model=model,
-            effort=effort,
-            resume_session_id=None,
-            append_system_prompt=True,
-            system_prompt=system_prompt,
-            timeout_s=2400,
-            skip_permissions=True,
-            working_dir=background_session_dir(),
-            mcp_config=self._mcp_config_path,
-        )
-
-        output = None
-        session_id: str | None = None
-        if self._autonomous_dispatcher is not None:
-            decision = await self._autonomous_dispatcher.route(
-                AutonomousDispatchRequest(
-                    subsystem="ego",
-                    policy_id=self._source_tag,
-                    action_label=self._source_tag.replace("_", " "),
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    cli_invocation=invocation,
-                    dispatch_mode="cli",
-                    cli_fallback_allowed=True,
-                    approval_required_for_cli=True,
-                    approval_key_stable=True,
-                ),
-            )
-            if decision.mode == "blocked":
-                logger.warning("Ego cycle blocked: %s", decision.reason)
-                raise CycleBlockedError(decision.reason or "approval pending")
-
-        if output is None:
-            try:
-                sess = await self._session_manager.create_background(
-                    session_type=SessionType.BACKGROUND_TASK,
-                    model=model,
-                    effort=effort,
-                    source_tag=self._source_tag,
-                )
-                session_id = sess["id"]
-                _set_obs_session(session_id)
-            except Exception:
-                logger.error("Failed to create ego background session", exc_info=True)
-                return None
-
-            try:
-                output = await self._invoker.run(invocation)
-            except Exception:
-                logger.error("Ego CC invocation failed", exc_info=True)
-                try:
-                    await self._session_manager.fail(session_id, reason="CC invocation error")
-                except Exception:
-                    logger.error("Session fail() also errored", exc_info=True)
-                return None
-
-        if output.is_error:
-            logger.error("Ego CC session returned error: %s", output.error_message)
-            if session_id is not None:
-                try:
-                    await self._session_manager.fail(session_id, reason=output.error_message)
-                except Exception:
-                    logger.error("Session fail() also errored", exc_info=True)
-            return None
-
-        return await self._process_cycle_output(output, model, session_id)
-
     async def run_unified_cycle(
         self,
         signals: list[EgoSignal],
@@ -292,12 +149,9 @@ class EgoSession:
         model_override: str | None = None,
         effort_override: str | None = None,
     ) -> EgoCycle | None:
-        """Execute one ego cycle via the unified perceive→think→act→learn pipeline.
+        """Execute one ego cycle via the perceive→think→act→learn pipeline.
 
-        This is the new entry point for the unified cognitive loop.
-        It coexists with ``run_cycle()`` during migration (PRs 1-4).
-        After PR 5, ``run_cycle()`` is removed and this becomes the
-        sole cycle method.
+        Entry point for all ego cycles via the unified cognitive loop.
 
         Parameters
         ----------
@@ -349,7 +203,7 @@ class EgoSession:
             effort = EffortLevel(self._config.default_effort)
 
         # System prompt is identity ONLY (cacheable)
-        # Record prompt version on first use (same guard as run_cycle)
+        # Record prompt version on first use
         if not self._prompt_version_recorded and self._db is not None:
             try:
                 from genesis.db.crud.prompt_versions import record_version
@@ -364,7 +218,7 @@ class EgoSession:
                 logger.debug("Failed to record ego prompt version", exc_info=True)
         system_prompt = self._static_prompt
 
-        # Build invocation — same pattern as run_cycle
+        # Build invocation — ephemeral (no resume)
         invocation = CCInvocation(
             prompt=user_prompt,
             model=model,
@@ -531,7 +385,7 @@ class EgoSession:
                 exc_info=True,
             )
 
-    # -- Output processing (shared by run_cycle and run_unified_cycle) -----
+    # -- Output processing --------------------------------------------------
 
     async def _process_cycle_output(
         self,
@@ -539,7 +393,7 @@ class EgoSession:
         model: CCModel,
         session_id: str | None,
     ) -> EgoCycle:
-        """Post-invocation processing shared by run_cycle and run_unified_cycle.
+        """Post-invocation processing for ego cycles.
 
         Handles: parse → focus sanitize → store cycle → complete session →
         record last_run → realist gate → proposals → table/withdraw/unboard →
@@ -818,41 +672,17 @@ class EgoSession:
 
     # -- Prompt building ---------------------------------------------------
 
-    def _build_user_prompt(
-        self,
-        *,
-        dynamic_context: str,
-        is_morning_report: bool,
-    ) -> str:
-        """Build the user message: operational context + directive.
-
-        The system prompt is the static identity only (cacheable).
-        All dynamic content goes here in the user message.
-        """
-        directive = (
-            "Run your ego cycle. Review the operational context below, "
-            "check your open threads, and use your MCP tools to verify "
-            "any beliefs before proposing actions. End with valid JSON "
-            "matching the ego output schema."
-        )
-        if is_morning_report:
-            directive += (
-                "\n\nThis is a MORNING REPORT cycle. Include the morning_report "
-                "field with your daily briefing for the user."
-            )
-        return f"{directive}\n\n---\n\n{dynamic_context}"
-
     def _build_focused_prompt(
         self,
         *,
         dynamic_context: str,
         focus: FocusResult,
     ) -> str:
-        """Build a focus-specific user message for the unified cognitive loop.
+        """Build a focus-specific user message for ego cycles.
 
-        Similar to ``_build_user_prompt`` but with a focus directive instead
-        of the generic "run your ego cycle" directive. The focus comes from
-        the perceive phase (FocusSelector output).
+        The system prompt is the static identity only (cacheable).
+        All dynamic content goes here in the user message.  The focus
+        directive comes from the perceive phase (FocusSelector output).
 
         Parameters
         ----------

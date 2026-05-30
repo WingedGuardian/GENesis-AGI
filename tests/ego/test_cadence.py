@@ -677,7 +677,7 @@ class TestReactiveSignals:
         assert cadence._signal_queue.empty()
 
     def test_push_reactive_model_override_is_opus(self, cadence):
-        """Reactive signals carry opus/high to match CYCLE_TYPE_DEFAULTS[REACTIVE]."""
+        """Reactive signals carry opus/high model/effort overrides."""
         cadence._running = True
         cadence.push_reactive_event({"type": "test", "summary": "alert"})
         signals = cadence._signal_queue.drain()

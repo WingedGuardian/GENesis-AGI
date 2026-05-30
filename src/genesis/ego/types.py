@@ -8,24 +8,11 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 
-class CycleType(StrEnum):
-    """Types of ego thinking cycles.
-
-    DEPRECATED: will be removed in PR 5 when all cycle types are
-    migrated to the unified cognitive loop (FocusCategory).
-    """
-
-    PROACTIVE = "proactive"        # Regular brainstorming (uses config model/effort)
-    MORNING_REPORT = "morning_report"  # Daily briefing (always Sonnet, Low)
-    REACTIVE = "reactive"          # User message response (uses config model/effort)
-    ESCALATION = "escalation"      # Health/escalation eval (always Sonnet, Medium)
-
-
 class FocusCategory(StrEnum):
     """Focus categories for the unified cognitive loop.
 
-    Replaces CycleType — signals carry a focus_category that determines
-    context weighting and prompt specialization.
+    Signals carry a focus_category that determines context weighting
+    and prompt specialization.
     """
 
     PROACTIVE = "proactive"
@@ -34,17 +21,6 @@ class FocusCategory(StrEnum):
     GOAL_REVIEW = "goal_review"
     DISPATCH_OUTCOME = "dispatch_outcome"
     ESCALATION = "escalation"
-
-
-# Per-cycle-type model/effort OVERRIDES.  Only cycle types listed here
-# bypass the ego's config.model / config.default_effort.  PROACTIVE is
-# intentionally absent — it respects the per-ego config so genesis ego
-# can run Sonnet while user ego runs Opus.
-CYCLE_TYPE_DEFAULTS: dict[CycleType, tuple[str, str]] = {
-    CycleType.MORNING_REPORT: ("sonnet", "low"),
-    CycleType.ESCALATION: ("sonnet", "medium"),
-    CycleType.REACTIVE: ("opus", "high"),  # fires need the best model
-}
 
 
 class ProposalStatus(StrEnum):
