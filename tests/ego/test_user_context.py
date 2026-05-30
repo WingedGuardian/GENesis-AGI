@@ -844,3 +844,102 @@ class TestUserEgoContextBuilder:
         )
         result = await builder._recurring_patterns_section()
         assert "No recurring patterns detected" in result
+
+    # ── Goal Deep Dive ──────────────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_empty_without_focus_id(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Deep dive returns empty string when no focus_id is set."""
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        await builder.build()
+        result = await builder._goal_deep_dive_section()
+        assert result == ""
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_renders_with_focus_id(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Deep dive renders full goal info when focus_id is set."""
+        await db.execute(TABLES["user_goals"])
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, description, "
+            " timeline, confidence, created_at, updated_at, progress_notes) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("goal-dd1", "Master Kubernetes", "learning", "high", "active",
+             "Learn K8s for deployment", "2026-06-30", 0.6,
+             "2026-05-01", "2026-05-10",
+             json.dumps([
+                 {"date": "2026-05-05", "note": "Completed pods tutorial"},
+                 {"date": "2026-05-10", "note": "Started services chapter"},
+             ])),
+        )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "goal-dd1"
+        result = await builder._goal_deep_dive_section()
+
+        assert "Goal Deep Dive: Master Kubernetes" in result
+        assert "goal-dd1" in result
+        assert "learning" in result
+        assert "high" in result
+        assert "2026-06-30" in result
+        assert "Completed pods tutorial" in result
+        assert "Started services chapter" in result
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_shows_proposals(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Deep dive shows linked proposals."""
+        await db.execute(TABLES["user_goals"])
+        # Fixture creates ego_proposals inline without goal_id — add column
+        import contextlib
+        with contextlib.suppress(Exception):
+            await db.execute(
+                "ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT",
+            )
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-dd2", "Fix Auth", "project", "critical", "active",
+             "2026-05-01", "2026-05-10"),
+        )
+        await db.execute(
+            "INSERT INTO ego_proposals "
+            "(id, action_type, content, status, goal_id, confidence, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("prop-1", "investigate", "Audit auth middleware",
+             "executed", "goal-dd2", 0.9, "2026-05-12"),
+        )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "goal-dd2"
+        result = await builder._goal_deep_dive_section()
+
+        assert "Goal-Linked Proposals" in result
+        assert "Audit auth middleware" in result
+        assert "completed" in result  # NEUTRAL_STATUS maps executed → completed
+
+    @pytest.mark.asyncio
+    async def test_goal_deep_dive_skip_depth(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Deep dive returns empty when depth is 'skip'."""
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "goal-123"
+        result = await builder._goal_deep_dive_section(depth="skip")
+        assert result == ""
