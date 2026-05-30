@@ -7,7 +7,27 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
-## [Unreleased]
+## [v3.0b12.1] - 2026-05-30
+
+### Added
+
+- **Reflection quality rubric** (#493) --- LLM-as-judge rubric scoring
+  deep reflection observations on specificity, actionability, novelty,
+  and grounding. Foundation for DSPy prompt optimization. Calibrated at
+  98% agreement on 50 hand-graded cases.
+- **Golden set generator** --- one-shot script to bootstrap rubric
+  calibration data from existing deep reflection observations.
+- **Standalone calibration runner** --- validates the rubric outside the
+  full Genesis runtime using a lightweight litellm router wrapper.
+- **Voyage AI reranking** (#489) --- post-retrieval reranking via
+  Voyage rerank-2.5 for memory recall precision.
+- **Memory recall defaults** (#492) --- rerank enabled by default with
+  opt-out for latency-sensitive callers.
+- **Ego realist upgrade** (#491) --- realist gate now uses Opus with
+  domain boundary enforcement.
+- **User job timezone fix** (#490) --- scheduler respects user timezone
+  for job scheduling.
+- **Ego CycleType removal** (#486) --- legacy run_cycle() enum removed.
 
 ---
 
