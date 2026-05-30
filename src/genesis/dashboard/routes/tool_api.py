@@ -153,9 +153,9 @@ async def tool_invoke(tool_name: str):
         try:
             result = await fn()
             return jsonify(_normalize_result(result))
-        except Exception as exc:
+        except Exception:
             logger.exception("Tool %s failed", tool_name)
-            return jsonify({"error": f"Tool {tool_name} execution failed", "detail": str(exc)}), 500
+            return jsonify({"error": f"Tool {tool_name} execution failed"}), 500
 
     # POST tools — extract params from JSON body
     if request.method == "GET":
@@ -197,6 +197,6 @@ async def tool_invoke(tool_name: str):
     try:
         result = await fn(**kwargs)
         return jsonify(_normalize_result(result))
-    except Exception as exc:
+    except Exception:
         logger.exception("Tool %s failed", tool_name)
-        return jsonify({"error": f"Tool {tool_name} execution failed", "detail": str(exc)}), 500
+        return jsonify({"error": f"Tool {tool_name} execution failed"}), 500

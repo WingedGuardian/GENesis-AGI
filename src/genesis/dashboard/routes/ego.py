@@ -163,9 +163,9 @@ async def ego_trigger():
     try:
         await mgr._on_tick()
         return jsonify({"status": "ok", "message": f"{target} ego cycle triggered"})
-    except Exception as e:
+    except Exception:
         logger.error("Manual ego trigger failed", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Ego trigger failed — check server logs"}), 500
 
 
 @blueprint.route("/api/genesis/ego/cycles")
