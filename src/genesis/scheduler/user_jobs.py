@@ -67,12 +67,17 @@ class UserJobScheduler:
         if not self._scheduler:
             return False
 
+        from zoneinfo import ZoneInfo
+
         from apscheduler.triggers.cron import CronTrigger
+
+        from genesis.env import user_timezone
 
         cron_expr = job.get("cron_expression", "")
         job_id = job.get("id", "")
         try:
-            trigger = CronTrigger.from_crontab(cron_expr)
+            tz = ZoneInfo(user_timezone())
+            trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
             self._scheduler.add_job(
                 self._dispatch_job,
                 trigger,
