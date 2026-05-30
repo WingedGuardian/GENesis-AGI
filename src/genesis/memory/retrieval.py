@@ -187,7 +187,7 @@ class HybridRetriever:
         room: str | None = None,
         include_subsystem: bool | list[str] = False,
         only_subsystem: str | list[str] | None = None,
-        rerank: bool = False,
+        rerank: bool = True,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 

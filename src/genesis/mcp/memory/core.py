@@ -54,7 +54,7 @@ async def memory_recall(
     time_range: str | None = None,
     include_subsystem: bool | list[str] = False,
     only_subsystem: str | list[str] | None = None,
-    rerank: bool = False,
+    rerank: bool = True,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -445,7 +445,7 @@ async def memory_proactive(
     # min_activation=0.0: use activation as a ranking signal, not a filter gate.
     # With confidence=0.5 (96% of memories) and retrieved_count=0 (80%),
     # even day-old memories fail a 0.3 threshold. Let RRF fusion rank instead.
-    results = await memory_mod._retriever.recall(current_message, limit=limit * 2, min_activation=0.0)
+    results = await memory_mod._retriever.recall(current_message, limit=limit * 2, min_activation=0.0, rerank=False)
     filtered = [
         r for r in results
         if "memory_operation" not in (r.payload.get("tags") or [])

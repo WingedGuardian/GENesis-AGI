@@ -100,7 +100,7 @@ async def test_memory_recall_delegates(mock_deps, tools):
         "query", source="both", limit=5, min_activation=0.0,
         wing=None, room=None, expand_query_terms=True,
         include_subsystem=False, only_subsystem=None,
-        rerank=False,
+        rerank=True,
     )
 
 
@@ -139,7 +139,7 @@ async def test_memory_proactive_delegates(mock_deps, tools):
     results = await tools["memory_proactive"].fn(current_message="hello world", limit=3)
     assert len(results) == 1
     memory_mcp._retriever.recall.assert_awaited_once_with(
-        "hello world", limit=6, min_activation=0.0
+        "hello world", limit=6, min_activation=0.0, rerank=False,
     )
 
 
