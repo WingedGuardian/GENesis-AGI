@@ -90,5 +90,4 @@ def list_rubrics() -> list[Rubric]:
 
 # Auto-import first-party rubrics so they self-register.
 # New rubrics are added here.
-from genesis.eval.rubrics import memory_recall_grounding  # noqa: E402,F401
-from genesis.eval.rubrics import reflection_quality  # noqa: E402,F401
+from genesis.eval.rubrics import memory_recall_grounding, reflection_quality  # noqa: E402,F401
