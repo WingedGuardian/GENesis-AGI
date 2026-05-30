@@ -80,6 +80,22 @@ def _is_allowed(path: Path) -> bool:
     return any(resolved.is_relative_to(root.resolve()) for root in _ALLOWED_ROOTS)
 
 
+def _sanitize_path(raw: str | None) -> tuple[Path | None, tuple | None]:
+    """Resolve and validate a user-supplied path.
+
+    Returns ``(resolved_path, None)`` on success, or
+    ``(None, (error_dict, status_code))`` on failure. Centralizes path
+    canonicalization + allowlist validation so user input never reaches
+    filesystem operations without sanitization.
+    """
+    if not raw:
+        return None, ({"error": "path required"}, 400)
+    resolved = Path(raw).resolve()
+    if not _is_allowed(resolved):
+        return None, ({"error": "Path not allowed"}, 403)
+    return resolved, None
+
+
 def _file_info(p: Path) -> dict:
     """Return metadata dict for a single path."""
     try:
@@ -146,13 +162,9 @@ def file_read():
     Query params:
         path – absolute file path
     """
-    raw_path = request.args.get("path")
-    if not raw_path:
-        return jsonify({"error": "path required"}), 400
-
-    target = Path(raw_path).resolve()
-    if not _is_allowed(target):
-        return jsonify({"error": "Path not allowed"}), 403
+    target, err = _sanitize_path(request.args.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
     if not target.is_file():
         return jsonify({"error": "Not a file"}), 404
     if target.stat().st_size > _MAX_FILE_SIZE:
@@ -190,15 +202,13 @@ def file_write():
     JSON body: {path: str, content: str}
     """
     data = request.get_json(silent=True) or {}
-    raw_path = data.get("path")
     content = data.get("content")
 
-    if not raw_path or content is None:
-        return jsonify({"error": "path and content required"}), 400
-
-    target = Path(raw_path).resolve()
-    if not _is_allowed(target):
-        return jsonify({"error": "Path not allowed"}), 403
+    target, err = _sanitize_path(data.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
+    if content is None:
+        return jsonify({"error": "content required"}), 400
     if not target.exists():
         return jsonify({"error": "File not found — use create endpoint"}), 404
     if len(content.encode("utf-8")) > _MAX_FILE_SIZE:
@@ -219,15 +229,11 @@ def file_create():
     JSON body: {path: str, is_dir: bool (default false), content: str (optional)}
     """
     data = request.get_json(silent=True) or {}
-    raw_path = data.get("path")
     is_dir = data.get("is_dir", False)
 
-    if not raw_path:
-        return jsonify({"error": "path required"}), 400
-
-    target = Path(raw_path).resolve()
-    if not _is_allowed(target):
-        return jsonify({"error": "Path not allowed"}), 403
+    target, err = _sanitize_path(data.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
     if target.exists():
         return jsonify({"error": "Already exists"}), 409
 
@@ -254,18 +260,16 @@ def file_rename():
     JSON body: {path: str, new_name: str}
     """
     data = request.get_json(silent=True) or {}
-    raw_path = data.get("path")
     new_name = data.get("new_name")
 
-    if not raw_path or not new_name:
-        return jsonify({"error": "path and new_name required"}), 400
+    source, err = _sanitize_path(data.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
+    if not new_name:
+        return jsonify({"error": "new_name required"}), 400
 
     if "/" in new_name or "\\" in new_name:
         return jsonify({"error": "new_name must be a filename, not a path"}), 400
-
-    source = Path(raw_path).resolve()
-    if not _is_allowed(source):
-        return jsonify({"error": "Source path not allowed"}), 403
     if not source.exists():
         return jsonify({"error": "Source not found"}), 404
 
@@ -290,13 +294,9 @@ def file_delete():
 
     Query params: path – absolute file path
     """
-    raw_path = request.args.get("path")
-    if not raw_path:
-        return jsonify({"error": "path required"}), 400
-
-    target = Path(raw_path).resolve()
-    if not _is_allowed(target):
-        return jsonify({"error": "Path not allowed"}), 403
+    target, err = _sanitize_path(request.args.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
     if not target.exists():
         return jsonify({"error": "Not found"}), 404
     if target.is_dir():
@@ -308,7 +308,7 @@ def file_delete():
         logger.exception("Failed to delete %s", target)
         return jsonify({"error": "Delete failed"}), 500
 
-    return jsonify({"status": "ok", "path": str(raw_path)})
+    return jsonify({"status": "ok", "path": str(target)})
 
 
 @blueprint.route("/api/genesis/files/download")
@@ -318,13 +318,9 @@ def file_download():
     Query params:
         path – absolute file path
     """
-    raw_path = request.args.get("path")
-    if not raw_path:
-        return jsonify({"error": "path required"}), 400
-
-    target = Path(raw_path).resolve()
-    if not _is_allowed(target):
-        return jsonify({"error": "Path not allowed"}), 403
+    target, err = _sanitize_path(request.args.get("path"))
+    if err:
+        return jsonify(err[0]), err[1]
     if not target.is_file():
         return jsonify({"error": "Not a file"}), 404
     if target.stat().st_size > _MAX_UPLOAD_SIZE:
