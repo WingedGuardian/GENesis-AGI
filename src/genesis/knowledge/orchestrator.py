@@ -31,6 +31,7 @@ class IngestResult:
     unit_ids: list[str] = field(default_factory=list)
     quality_flags: list[str] = field(default_factory=list)
     error: str | None = None
+    tree_index_doc_id: str | None = None
 
 
 class KnowledgeOrchestrator:
@@ -42,11 +43,15 @@ class KnowledgeOrchestrator:
         registry: ContentProcessorRegistry,
         distillation: DistillationPipeline,
         manifest: ManifestManager,
+        tree_index_client: object | None = None,
+        tree_index_threshold: int = 25,
     ) -> None:
         self._registry = registry
         self._distillation = distillation
         self._manifest = manifest
         self._store_lock = asyncio.Lock()
+        self._tree_index = tree_index_client
+        self._tree_index_threshold = tree_index_threshold
 
     async def ingest_source(
         self,
@@ -99,6 +104,20 @@ class KnowledgeOrchestrator:
                 quality_flags=["empty_content"],
             )
 
+        # 3b. Kick off tree indexing in parallel (if applicable)
+        tree_task: asyncio.Task | None = None
+        should_tree_index = (
+            self._tree_index is not None
+            and content.source_type == "pdf"
+            and content.metadata.get("page_count", 0) >= self._tree_index_threshold
+            and Path(source).exists()
+        )
+        if should_tree_index:
+            tree_task = asyncio.create_task(
+                self._tree_index_source(source),
+                name=f"tree-index-{Path(source).name}",
+            )
+
         # 4. Save extracted text to disk
         extracted_path = self._manifest.save_extracted_text(
             source, content.text, content.source_type
@@ -124,11 +143,17 @@ class KnowledgeOrchestrator:
                 extracted_path=extracted_path,
                 original_path=original_path,
             )
+            # Still collect tree result if started
+            tree_doc_id = await self._collect_tree_result(tree_task, source)
+            flags = ["no_units_extracted"]
+            if tree_task is not None and tree_doc_id is None:
+                flags.append("tree_index_failed")
             return IngestResult(
                 source=source,
                 source_type=content.source_type,
                 units_created=0,
-                quality_flags=["no_units_extracted"],
+                quality_flags=flags,
+                tree_index_doc_id=tree_doc_id,
             )
 
         # 7. Store each unit
@@ -166,12 +191,18 @@ class KnowledgeOrchestrator:
         if ratio < MIN_EXTRACTION_RATIO and units:
             quality_flags.append("thin_extraction")
 
+        # 9. Collect tree indexing result (if started)
+        tree_doc_id = await self._collect_tree_result(tree_task, source)
+        if tree_task is not None and tree_doc_id is None:
+            quality_flags.append("tree_index_failed")
+
         return IngestResult(
             source=source,
             source_type=content.source_type,
             units_created=len(unit_ids),
             unit_ids=unit_ids,
             quality_flags=quality_flags,
+            tree_index_doc_id=tree_doc_id,
         )
 
     async def ingest_batch(
@@ -212,6 +243,42 @@ class KnowledgeOrchestrator:
             results.append(result)
 
         return results
+
+    async def _collect_tree_result(
+        self,
+        tree_task: asyncio.Task | None,
+        source: str,
+    ) -> str | None:
+        """Await a tree indexing task and update manifest on success.
+
+        Returns the doc_id on success, None on failure or if no task.
+        """
+        if tree_task is None:
+            return None
+        try:
+            doc_id = await tree_task
+            if doc_id:
+                self._manifest.add_tree_index(source, doc_id=doc_id)
+            return doc_id
+        except Exception as exc:
+            logger.warning(
+                "Tree indexing failed for %s (non-blocking): %s",
+                source, exc,
+            )
+            return None
+
+    async def _tree_index_source(self, source: str) -> str | None:
+        """Upload a document to PageIndex and save the tree index.
+
+        Returns the doc_id on success, None on failure.
+        """
+        from genesis.knowledge.tree_index import save_tree_index
+
+        doc_id = await self._tree_index.upload_document(source)
+        tree = await self._tree_index.get_tree(doc_id)
+        save_tree_index(source, doc_id, tree)
+        logger.info("Tree index built for %s (doc_id=%s)", source, doc_id)
+        return doc_id
 
     async def _store_units(
         self,

@@ -159,6 +159,7 @@ def _resolve_session_id(session_id: str) -> str:
 _bookmarks_tools = importlib.import_module(".bookmarks", __name__)  # noqa: F401
 _conversation_tools = importlib.import_module(".conversation", __name__)  # noqa: F401
 _core_tools = importlib.import_module(".core", __name__)  # noqa: F401
+_documents_tools = importlib.import_module(".documents", __name__)  # noqa: F401
 _identity_tools = importlib.import_module(".identity", __name__)  # noqa: F401
 _knowledge_tools = importlib.import_module(".knowledge", __name__)  # noqa: F401
 _observations_tools = importlib.import_module(".observations", __name__)  # noqa: F401
