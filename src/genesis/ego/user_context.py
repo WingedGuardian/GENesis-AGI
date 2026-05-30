@@ -1159,7 +1159,7 @@ class UserEgoContextBuilder:
         - All proposals linked to this goal (last 20, all statuses)
         """
         focus_id = getattr(self, "_current_focus_id", None)
-        if not focus_id or depth == "skip":
+        if depth in ("skip", "light") or not focus_id:
             return ""
 
         try:

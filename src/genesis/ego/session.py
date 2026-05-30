@@ -321,7 +321,7 @@ class EgoSession:
                             ),
                         )
             except Exception:
-                logger.debug(
+                logger.warning(
                     "Goal recommendation post-processing failed",
                     exc_info=True,
                 )
@@ -450,7 +450,7 @@ class EgoSession:
                 recommendation,
             )
         except Exception:
-            logger.debug(
+            logger.warning(
                 "Failed to surface goal recommendation", exc_info=True,
             )
 

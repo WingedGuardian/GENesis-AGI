@@ -364,7 +364,7 @@ class EgoCadenceManager:
         try:
             from genesis.db.crud import user_goals
 
-            goals = await user_goals.list_active(self._db)
+            goals = await user_goals.list_active(self._session._db)
             if not goals:
                 return
 
