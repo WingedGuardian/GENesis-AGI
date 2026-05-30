@@ -31,7 +31,7 @@ class GenesisMemoryRecall(Extension):
                 return
 
             results = await asyncio.wait_for(
-                rt.hybrid_retriever.recall(query, source="both", limit=5),
+                rt.hybrid_retriever.recall(query, source="both", limit=5, rerank=False),
                 timeout=_TIMEOUT,
             )
 

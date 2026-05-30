@@ -75,7 +75,7 @@ class VoiceConversationHandler:
         # 2. Memory recall (best-effort — don't fail the whole request)
         memories_text = ""
         try:
-            results = await self._retriever.recall(transcript, limit=5)
+            results = await self._retriever.recall(transcript, limit=5, rerank=False)
             if results:
                 snippets = []
                 for r in results[:5]:
