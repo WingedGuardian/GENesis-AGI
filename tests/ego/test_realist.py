@@ -463,3 +463,70 @@ class TestEgoSourceIsolation:
         sent_html = mock_tm.send_to_category.call_args[0][1]
         # Should show 1 pending from old user batch, not 2 (which would include genesis)
         assert "1 older proposal(s) still awaiting response" in sent_html
+
+
+# -- Domain boundary enforcement tests --
+
+
+class TestDomainBoundary:
+    """Tests for domain boundary enforcement in the realist prompt."""
+
+    def test_genesis_ego_gets_domain_context(self):
+        """Genesis ego source adds domain boundary section to prompt."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "investigate", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "Genesis ego (COO/operations)" in prompt
+        assert "infrastructure ONLY" in prompt
+
+    def test_genesis_ego_gets_domain_rule(self):
+        """Genesis ego source adds rule 7 for domain boundary."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "Domain boundary" in prompt
+        assert "REJECT any proposal outside Genesis infrastructure" in prompt
+
+    def test_user_ego_no_domain_context(self):
+        """User ego source does NOT add domain boundary section."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
+            [],
+            ego_source="user_ego_cycle",
+        )
+        assert "Genesis ego (COO/operations)" not in prompt
+        assert "Domain boundary" not in prompt
+
+    def test_empty_ego_source_no_domain_context(self):
+        """Empty/missing ego source does NOT add domain boundary section."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
+            [],
+        )
+        assert "Genesis ego (COO/operations)" not in prompt
+        assert "Domain boundary" not in prompt
+
+    def test_domain_rule_mentions_key_user_domains(self):
+        """Rule 7 explicitly lists the user-domain categories to reject."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        for domain in ("career", "content publishing", "social media",
+                        "marketing", "job applications", "networking"):
+            assert domain.lower() in prompt.lower(), f"Missing domain: {domain}"
+
+    def test_domain_rule_allows_amend_for_mixed(self):
+        """Rule 7 instructs AMEND (not reject) for infra fixes with user context."""
+        prompt = _build_realist_prompt(
+            [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "AMEND" in prompt
+        assert "infrastructure component" in prompt

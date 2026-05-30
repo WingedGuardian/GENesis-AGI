@@ -819,12 +819,12 @@ class EgoSession:
             logger.warning("Realist: failed to fetch history, passing through")
             return proposals
 
-        prompt = _build_realist_prompt(proposals, recent)
+        prompt = _build_realist_prompt(proposals, recent, ego_source=self._source_tag)
 
         try:
             invocation = CCInvocation(
                 prompt=prompt,
-                model=CCModel.SONNET,
+                model=CCModel.OPUS,
                 effort=EffortLevel.MEDIUM,
                 skip_permissions=True,
                 working_dir=background_session_dir(),
@@ -1546,6 +1546,8 @@ _NEUTRAL_STATUS = NEUTRAL_STATUS  # re-export for backwards compat
 def _build_realist_prompt(
     proposals: list[dict],
     recent_history: list[dict],
+    *,
+    ego_source: str = "",
 ) -> str:
     """Build the realist evaluation prompt.
 
@@ -1572,9 +1574,36 @@ def _build_realist_prompt(
         conf = p.get("confidence", 0.0)
         proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
 
+    # Domain boundary context — only for the Genesis/operations ego.
+    ego_section = ""
+    if ego_source == "genesis_ego_cycle":
+        ego_section = """
+## Ego Source
+These proposals are from the **Genesis ego (COO/operations)**.
+Its jurisdiction is Genesis infrastructure ONLY: system health,
+performance, maintenance, and operational reliability. It has NO
+jurisdiction over the user's career, content publishing, social media,
+marketing, outreach strategy, job applications, networking, conferences,
+personal scheduling, or external platforms Genesis doesn't operate.
+
+"""
+
+    domain_rule = ""
+    if ego_source == "genesis_ego_cycle":
+        domain_rule = """
+7. **Domain boundary (operations ego only).** These proposals come from
+   the operations ego. REJECT any proposal outside Genesis infrastructure.
+   Career, job applications, content publishing, social media, marketing,
+   outreach strategy, networking, conferences, personal scheduling, and
+   external platforms are user ego domain. If a proposal mentions a
+   user-domain topic as context for an infrastructure fix (e.g., "CDP
+   dropped during a job application session"), AMEND to focus on the
+   infrastructure component only and remove the user-domain framing.
+"""
+
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
-
+{ego_section}
 ## Rules
 
 1. **Read operations are NOT proposals.** Investigating, researching, reading,
@@ -1604,7 +1633,7 @@ proposal and return a JSON array of verdicts.
    patterns in the history. A proposal that failed before may succeed
    now — circumstances change. Judge the proposal on its own merits,
    not on inferred system state.
-
+{domain_rule}
 ## Recent Proposal History (48h)
 {chr(10).join(history_lines)}
 
