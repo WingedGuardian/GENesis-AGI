@@ -7,6 +7,7 @@ distillation -> knowledge units -> storage (SQLite + Qdrant).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import typing
@@ -165,6 +166,11 @@ class KnowledgeOrchestrator:
                 )
         except Exception as exc:
             logger.error("Storage failed for %s: %s", source, exc)
+            # Cancel tree task to avoid orphaned upload
+            if tree_task is not None:
+                tree_task.cancel()
+                with contextlib.suppress(Exception):
+                    await tree_task
             return IngestResult(
                 source=source,
                 source_type=content.source_type,

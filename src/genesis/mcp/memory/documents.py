@@ -14,11 +14,19 @@ from ..memory import mcp
 logger = logging.getLogger(__name__)
 
 
-def _get_tree_client():
-    """Lazy-create a TreeIndexClient. Returns None if not configured."""
-    from genesis.knowledge.tree_index import get_client
+_tree_client_cache: object | None = None
+_tree_client_checked = False
 
-    return get_client()
+
+def _get_tree_client():
+    """Lazy-create and cache a TreeIndexClient. Returns None if not configured."""
+    global _tree_client_cache, _tree_client_checked
+    if not _tree_client_checked:
+        from genesis.knowledge.tree_index import get_client
+
+        _tree_client_cache = get_client()
+        _tree_client_checked = True
+    return _tree_client_cache
 
 
 @mcp.tool()
@@ -105,6 +113,8 @@ async def document_query(
         if cached:
             doc_id = cached["doc_id"]
         elif resolved.exists():
+            if resolved.suffix.lower() != ".pdf":
+                return {"error": "Only PDF files are supported for tree indexing"}
             # Auto-index
             try:
                 doc_id = await client.upload_document(str(resolved))
