@@ -179,8 +179,8 @@ async def user_job_control_endpoint(job_id: str):
         elif action == "delete":
             ok = await scheduler.remove_job(job_id)
             return jsonify({"success": ok, "action": "deleted"})
-    except Exception as exc:
-        logger.error("User job control failed: %s", exc, exc_info=True)
-        return jsonify({"error": str(exc)}), 500
+    except Exception:
+        logger.error("User job control failed", exc_info=True)
+        return jsonify({"error": "Job control failed — check server logs"}), 500
 
     return jsonify({"error": "Unknown action"}), 400
