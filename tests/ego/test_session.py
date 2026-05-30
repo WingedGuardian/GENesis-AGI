@@ -615,3 +615,76 @@ class TestOutputContractCommDecision:
 # Focus sanitization tests removed — focus_summary is now system-computed
 # (computed_focus.py). Tests for compute_focus_summary are in
 # tests/ego/test_computed_focus.py.
+
+
+# ---------------------------------------------------------------------------
+# Goal assessment output
+# ---------------------------------------------------------------------------
+
+
+class TestGoalAssessmentOutput:
+    """Tests for goal_assessment + goal_status_recommendation processing."""
+
+    def test_validate_output_accepts_goal_assessment(self):
+        """goal_assessment string passes validation."""
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "Goal review",
+            "goal_assessment": "This goal is on track but needs more focus.",
+            "goal_status_recommendation": "continue",
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert result["goal_assessment"] == "This goal is on track but needs more focus."
+        assert result["goal_status_recommendation"] == "continue"
+
+    def test_validate_output_sanitizes_invalid_goal_assessment(self):
+        """Non-string goal_assessment gets sanitized to empty string."""
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "Goal review",
+            "goal_assessment": 42,
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert result["goal_assessment"] == ""
+
+    def test_validate_output_rejects_invalid_recommendation(self):
+        """Invalid goal_status_recommendation gets removed."""
+        from genesis.ego.session import _validate_output
+
+        data = {
+            "proposals": [],
+            "focus_summary": "Goal review",
+            "goal_status_recommendation": "invalid_value",
+        }
+        result = _validate_output(data)
+        assert result is not None
+        assert "goal_status_recommendation" not in result
+
+    def test_validate_output_accepts_all_valid_recommendations(self):
+        """All valid recommendation values pass validation."""
+        from genesis.ego.session import _validate_output
+
+        for rec in ("continue", "pause", "deprioritize", "close"):
+            data = {
+                "proposals": [],
+                "focus_summary": "Goal review",
+                "goal_status_recommendation": rec,
+            }
+            result = _validate_output(data)
+            assert result is not None
+            assert result["goal_status_recommendation"] == rec
+
+    def test_output_contract_includes_goal_fields(self):
+        """Output contract mentions goal_assessment and goal_status_recommendation."""
+        from genesis.ego.user_context import UserEgoContextBuilder
+
+        contract = UserEgoContextBuilder._output_contract_section()
+        assert "goal_assessment" in contract
+        assert "goal_status_recommendation" in contract
+        assert "continue|pause|deprioritize|close" in contract

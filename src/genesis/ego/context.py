@@ -44,6 +44,7 @@ class EgoContextBuilder:
         self,
         *,
         context_weights: dict[str, str] | None = None,
+        focus_id: str | None = None,
     ) -> str:
         """Assemble the full EGO_CONTEXT.md content.
 
@@ -54,6 +55,9 @@ class EgoContextBuilder:
             Accepted for API compatibility with the unified loop, but this
             base class does not implement section filtering. Subclasses
             (UserEgoContextBuilder, GenesisEgoContextBuilder) implement it.
+        focus_id:
+            Optional target ID (e.g., goal_id) from the focus selector.
+            Used by UserEgoContextBuilder for goal-specific deep dives.
         """
         sections: list[str] = []
         sections.append("# EGO_CONTEXT — Operational Briefing\n")

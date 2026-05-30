@@ -46,6 +46,7 @@ class GenesisEgoContextBuilder:
         self,
         *,
         context_weights: dict[str, str] | None = None,
+        focus_id: str | None = None,
     ) -> str:
         """Assemble the full Genesis ego context.
 
@@ -55,6 +56,8 @@ class GenesisEgoContextBuilder:
             Per-section weight dict from the focus selector.
             Keys that match genesis section names are applied; unknown
             keys are ignored (default to "deep").
+        focus_id:
+            Accepted for API compatibility. Not used by Genesis ego.
         """
         import asyncio
 

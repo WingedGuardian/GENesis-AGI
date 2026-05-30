@@ -259,6 +259,7 @@ class TestCompactionWeightThreading:
 
         mock_builder.build.assert_called_once_with(
             context_weights={"goals": "light", "capabilities": "skip"},
+            focus_id=None,
         )
 
     async def test_always_sections_enforced_in_compaction(self, db):
@@ -305,7 +306,9 @@ class TestCompactionWeightThreading:
         mock_builder.build.return_value = "mock context"
 
         await engine.assemble_context(context_builder=mock_builder)
-        mock_builder.build.assert_called_once_with(context_weights=None)
+        mock_builder.build.assert_called_once_with(
+            context_weights=None, focus_id=None,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +371,24 @@ class TestFocusWeightTable:
         assert FOCUS_CONTEXT_WEIGHTS["dispatch_outcome"]["proposal_history"] == "light"
 
     def test_section_count(self):
-        """_ALL_SECTIONS should have exactly 19 entries."""
+        """_ALL_SECTIONS should have exactly 20 entries."""
         from genesis.ego.focus import _ALL_SECTIONS
-        assert len(_ALL_SECTIONS) == 19
+        assert len(_ALL_SECTIONS) == 20
+
+    def test_goal_deep_dive_deep_for_goal_review(self):
+        """goal_deep_dive is 'deep' only during goal_review cycles."""
+        from genesis.ego.focus import FOCUS_CONTEXT_WEIGHTS
+
+        assert FOCUS_CONTEXT_WEIGHTS["goal_review"]["goal_deep_dive"] == "deep"
+
+    def test_goal_deep_dive_skip_for_non_goal_review(self):
+        """goal_deep_dive is 'skip' for all non-goal_review focus types."""
+        from genesis.ego.focus import FOCUS_CONTEXT_WEIGHTS
+
+        for focus_type in (
+            "proactive", "daily_briefing", "reactive",
+            "dispatch_outcome", "escalation",
+        ):
+            assert (
+                FOCUS_CONTEXT_WEIGHTS[focus_type]["goal_deep_dive"] == "skip"
+            ), f"goal_deep_dive should be 'skip' for {focus_type}"

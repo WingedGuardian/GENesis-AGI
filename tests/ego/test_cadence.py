@@ -876,3 +876,107 @@ class TestEscalationSignals:
         call_args = mock_session.run_unified_cycle.call_args
         assert call_args[1]["model_override"] == "sonnet"
         assert call_args[1]["effort_override"] == "medium"
+
+
+# ---------------------------------------------------------------------------
+# Goal staleness scanner
+# ---------------------------------------------------------------------------
+
+
+class TestGoalStaleness:
+    """Tests for _check_stale_goals() — goal_review signal collector."""
+
+    @pytest.fixture
+    async def goal_db(self):
+        """DB with user_goals table."""
+        async with aiosqlite.connect(":memory:") as conn:
+            conn.row_factory = aiosqlite.Row
+            for table in ("ego_cycles", "ego_state", "cc_sessions", "user_goals"):
+                await conn.execute(TABLES[table])
+            await conn.commit()
+            yield conn
+
+    @pytest.fixture
+    def goal_cadence(self, mock_session, config, mock_idle_detector, goal_db):
+        mock_session._source_tag = "user_ego_cycle"
+        mock_session._db = goal_db
+        return EgoCadenceManager(
+            session=mock_session,
+            config=config,
+            idle_detector=mock_idle_detector,
+            db=goal_db,
+        )
+
+    async def test_stale_goal_pushes_signal(self, goal_cadence, goal_db):
+        """Goal stale beyond threshold pushes a goal_review signal."""
+        twenty_days_ago = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-1", "Test Goal", "project", "high", "active",
+             twenty_days_ago, twenty_days_ago),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+
+        assert not goal_cadence._signal_queue.empty()
+        signals = goal_cadence._signal_queue.drain()
+        assert len(signals) == 1
+        sig = signals[0]
+        assert sig.focus_category == "goal_review"
+        assert sig.focus_id == "goal-1"
+        assert "20d" in sig.summary
+
+    async def test_fresh_goal_no_signal(self, goal_cadence, goal_db):
+        """Goal updated recently should NOT trigger a signal."""
+        now = datetime.now(UTC).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-2", "Fresh Goal", "project", "medium", "active", now, now),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        assert goal_cadence._signal_queue.empty()
+
+    async def test_genesis_ego_skipped(self, goal_cadence, goal_db):
+        """Genesis ego should NOT run goal staleness checks."""
+        goal_cadence._session._source_tag = "genesis_ego_cycle"
+        twenty_days_ago = (datetime.now(UTC) - timedelta(days=20)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-3", "Stale Goal", "career", "high", "active",
+             twenty_days_ago, twenty_days_ago),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        assert goal_cadence._signal_queue.empty()
+
+    async def test_respects_config_threshold(self, goal_cadence, goal_db):
+        """Uses goal_review_staleness_days from config."""
+        # Set threshold to 30 days, goal is only 15 days old
+        goal_cadence._config.goal_review_staleness_days = 30
+        fifteen_days_ago = (datetime.now(UTC) - timedelta(days=15)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-4", "Not Stale Yet", "learning", "medium", "active",
+             fifteen_days_ago, fifteen_days_ago),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        assert goal_cadence._signal_queue.empty()
+
+        # Now set threshold to 10 — same goal should trigger
+        goal_cadence._config.goal_review_staleness_days = 10
+        await goal_cadence._check_stale_goals()
+        assert not goal_cadence._signal_queue.empty()
