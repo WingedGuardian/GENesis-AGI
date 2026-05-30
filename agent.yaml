@@ -1,0 +1,36 @@
+spec_version: "0.1.0"
+name: genesis-agi
+version: 3.0.0-beta
+description: >
+  Genesis is an open-source autonomous AI agent system built on Claude Code as its
+  reasoning engine. It provides persistent 4-layer hybrid memory (essential knowledge,
+  proactive recall, deep search, and a knowledge pipeline), closed-loop self-learning
+  with outcome classification and causal attribution, background cognition (researching
+  and thinking between sessions), and an earned-autonomy framework where trust is
+  granted per action category through demonstrated competence. Genesis is not a
+  chatbot or API wrapper — it is a cognitive architecture designed to get measurably
+  better the longer it runs alongside a user.
+license: MIT
+model:
+  preferred: anthropic:claude-sonnet-4-6
+runtime:
+  max_turns: 200
+skills:
+  - name: persistent-memory
+    description: 4-layer hybrid memory system — essential knowledge, proactive recall, semantic search via Qdrant, and a knowledge pipeline that compounds across months
+  - name: closed-loop-learning
+    description: Outcome classification, causal attribution, and procedure extraction with Laplace-smoothed confidence scores
+  - name: background-cognition
+    description: Autonomous research, reflection, and communication between interactive sessions using background Claude Code processes
+  - name: earned-autonomy
+    description: Per-action-category trust model — autonomy is granted through demonstrated competence and revoked on failure
+  - name: web-research
+    description: Web fetch, search, and crawl via MCP tools with anti-bot handling
+  - name: telegram-integration
+    description: Bidirectional Telegram channel for async communication with the agent
+  - name: code-intelligence
+    description: GitNexus blast-radius analysis, Serena LSP, and codebase-memory-mcp for safe, impact-aware code changes
+compliance:
+  risk_tier: elevated
+  supervision:
+    human_in_the_loop: destructive
