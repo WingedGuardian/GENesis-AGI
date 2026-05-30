@@ -93,6 +93,7 @@ class CompactionEngine:
         *,
         context_builder: EgoContextBuilder,
         context_weights: dict[str, str] | None = None,
+        focus_id: str | None = None,
     ) -> str:
         """Assemble operational context for a new ego cycle.
 
@@ -106,6 +107,9 @@ class CompactionEngine:
             Optional per-section weight dict from the focus selector.
             Keys are section names, values are "always"/"deep"/"light"/"skip".
             When None, all sections are built at full depth (backward compat).
+        focus_id:
+            Optional target ID from the focus selector (e.g., goal_id).
+            Forwarded to the context builder for focused sections.
         """
         sections: list[str] = []
 
@@ -153,6 +157,7 @@ class CompactionEngine:
         sections.append("## Operational Context\n")
         fresh_context = await context_builder.build(
             context_weights=context_weights,
+            focus_id=focus_id,
         )
         sections.append(fresh_context)
 

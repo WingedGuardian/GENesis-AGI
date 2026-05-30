@@ -84,6 +84,7 @@ class UserEgoContextBuilder:
         self,
         *,
         context_weights: dict[str, str] | None = None,
+        focus_id: str | None = None,
     ) -> str:
         """Assemble the full user ego context.
 
@@ -93,9 +94,14 @@ class UserEgoContextBuilder:
             Per-section weight dict from the focus selector.
             Values: "always", "deep", "light", "skip".
             When None, all sections render at full depth (backward compat).
+        focus_id:
+            Target ID from the focus selector (e.g., a goal_id for
+            goal_review cycles). Used by _goal_deep_dive_section to
+            render focused context on a specific goal.
         """
         from genesis.ego.focus import _ALWAYS_SECTIONS
 
+        self._current_focus_id = focus_id
         weights = dict(context_weights) if context_weights else {}
         # Primary enforcement is in compaction.assemble_context(). This
         # is a defense-in-depth guard for direct build() callers.
@@ -131,6 +137,7 @@ class UserEgoContextBuilder:
             ("proposal_board", self._proposal_board_section),
             ("execution_outcomes", self._execution_outcomes_section),
             ("goal_progress", self._goal_progress_section),
+            ("goal_deep_dive", self._goal_deep_dive_section),
             ("capability_performance", self._capability_performance_section),
             ("autonomy_readiness", self._autonomy_readiness_section),
             ("recurring_patterns", self._recurring_patterns_section),
@@ -1142,6 +1149,112 @@ class UserEgoContextBuilder:
         lines.append("")
         return "\n".join(lines)
 
+    async def _goal_deep_dive_section(self, *, depth: str = "deep") -> str:
+        """Deep dive on the focused goal — only rendered during goal_review.
+
+        When the focus selector targets a specific goal (via focus_id),
+        this section provides the ego with comprehensive context:
+        - Full goal metadata
+        - Complete progress note history (last 15)
+        - All proposals linked to this goal (last 20, all statuses)
+        """
+        focus_id = getattr(self, "_current_focus_id", None)
+        if not focus_id or depth == "skip":
+            return ""
+
+        try:
+            from genesis.db.crud import user_goals
+        except ImportError:
+            return ""
+
+        try:
+            goal = await user_goals.get_by_id(self._db, focus_id)
+        except Exception:
+            logger.debug("Failed to fetch goal %s for deep dive", focus_id)
+            return ""
+
+        if not goal:
+            return f"## Goal Deep Dive\n*Goal {focus_id} not found.*\n"
+
+        lines = [f"## Goal Deep Dive: {goal.get('title', '?')}\n"]
+
+        # Full goal metadata
+        lines.append(f"- **ID**: {focus_id}")
+        lines.append(f"- **Category**: {goal.get('category', '?')}")
+        lines.append(f"- **Priority**: {goal.get('priority', '?')}")
+        lines.append(f"- **Status**: {goal.get('status', '?')}")
+        lines.append(f"- **Timeline**: {goal.get('timeline') or 'None set'}")
+        lines.append(f"- **Created**: {(goal.get('created_at') or '?')[:10]}")
+        lines.append(f"- **Last Updated**: {(goal.get('updated_at') or '?')[:10]}")
+        lines.append(f"- **Confidence**: {goal.get('confidence', '?')}")
+        if goal.get("description"):
+            lines.append(f"- **Description**: {goal['description'][:300]}")
+        lines.append("")
+
+        # Full progress note history (last 15)
+        import json as _json
+
+        progress_raw = goal.get("progress_notes", "[]")
+        try:
+            notes = (
+                _json.loads(progress_raw)
+                if isinstance(progress_raw, str)
+                else progress_raw
+            )
+        except (_json.JSONDecodeError, TypeError):
+            notes = []
+
+        if notes and isinstance(notes, list):
+            lines.append("### Progress History\n")
+            for note in notes[-15:]:
+                if isinstance(note, dict):
+                    date = note.get("date", "?")
+                    text = note.get("note", str(note))[:200]
+                else:
+                    date = "?"
+                    text = str(note)[:200]
+                lines.append(f"- [{date}] {text}")
+            if len(notes) > 15:
+                lines.append(f"- ... and {len(notes) - 15} earlier entries")
+            lines.append("")
+        else:
+            lines.append("### Progress History\n*No progress notes recorded.*\n")
+
+        # All proposals linked to this goal (last 20, all statuses)
+        try:
+            cursor = await self._db.execute(
+                "SELECT action_type, content, status, rationale, "
+                "  created_at, user_response "
+                "FROM ego_proposals "
+                "WHERE goal_id = ? "
+                "ORDER BY created_at DESC "
+                "LIMIT 20",
+                (focus_id,),
+            )
+            proposal_rows = await cursor.fetchall()
+        except Exception:
+            logger.debug("Failed to query proposals for goal %s", focus_id)
+            proposal_rows = []
+
+        if proposal_rows:
+            from genesis.ego.types import NEUTRAL_STATUS
+
+            lines.append("### Goal-Linked Proposals\n")
+            for row in proposal_rows:
+                action = row[0] or "?"
+                content = (row[1] or "")[:150].replace("\n", " ")
+                status = NEUTRAL_STATUS.get(row[2], row[2]) if row[2] else "?"
+                created = (row[4] or "")[:10]
+                lines.append(f"- [{created}] [{status}] **{action}**: {content}")
+            lines.append("")
+        else:
+            lines.append(
+                "### Goal-Linked Proposals\n*No proposals for this goal.*\n"
+            )
+
+        lines.append("")
+        return "\n".join(lines)
+
     async def _capability_performance_section(self, *, depth: str = "deep") -> str:
         """Your track record — domain confidence from multiple data sources.
 
@@ -1305,7 +1418,9 @@ class UserEgoContextBuilder:
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'
             '  "intentions": {"review": [{"id": "...", "action": "keep|fire|withdraw|renew"}], '
             '"new": [{"content": "...", "trigger_condition": "...", "reasoning": "..."}]},\n'
-            '  "morning_report": "only if this is a morning trigger"\n'
+            '  "morning_report": "only if this is a morning trigger",\n'
+            '  "goal_assessment": "free-text analysis of the focused goal (goal_review cycles only)",\n'
+            '  "goal_status_recommendation": "continue|pause|deprioritize|close (goal_review cycles only)"\n'
             "}\n"
             "```\n\n"
             "If you have nothing to propose, return an empty proposals "

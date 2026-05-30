@@ -84,6 +84,7 @@ _ALL_SECTIONS = (
     "proposal_board",
     "execution_outcomes",
     "goal_progress",
+    "goal_deep_dive",
     "capability_performance",
     "autonomy_readiness",
     "recurring_patterns",
@@ -111,11 +112,12 @@ def _make_weights(overrides: dict[str, str]) -> dict[str, str]:
 _DEFAULT_WEIGHTS = _make_weights({})
 
 FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
-    # Proactive: breadth scan, everything deep (same as current)
-    "proactive": _DEFAULT_WEIGHTS,
+    # Proactive: breadth scan, everything deep — except goal_deep_dive
+    # (deep dive only fires during dedicated goal_review cycles)
+    "proactive": _make_weights({"goal_deep_dive": "skip"}),
 
-    # Daily briefing: needs full breadth for the morning report
-    "daily_briefing": _DEFAULT_WEIGHTS,
+    # Daily briefing: full breadth for the morning report — no deep dive
+    "daily_briefing": _make_weights({"goal_deep_dive": "skip"}),
 
     # Reactive: health/escalations deep, others light
     "reactive": _make_weights({
@@ -125,6 +127,7 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "follow_ups": "deep",
         "goals": "light",
         "goal_progress": "light",
+        "goal_deep_dive": "skip",
         "world_snapshot": "light",
         "activity_pulse": "light",
         "recent_conversations": "light",
@@ -140,6 +143,7 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
     "goal_review": _make_weights({
         "goals": "deep",
         "goal_progress": "deep",
+        "goal_deep_dive": "deep",
         "execution_outcomes": "deep",
         "follow_ups": "deep",
         "proposal_board": "deep",
@@ -160,6 +164,7 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "execution_outcomes": "deep",
         "goals": "deep",
         "goal_progress": "deep",
+        "goal_deep_dive": "skip",
         "proposal_board": "deep",
         "follow_ups": "light",
         "world_snapshot": "skip",
@@ -181,6 +186,7 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "proposal_board": "deep",
         "goals": "light",
         "goal_progress": "light",
+        "goal_deep_dive": "skip",
         "world_snapshot": "light",
         "activity_pulse": "light",
         "recent_conversations": "light",

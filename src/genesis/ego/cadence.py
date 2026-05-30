@@ -1,8 +1,10 @@
 """Ego cadence manager — controls when the ego runs.
 
-Owns an APScheduler with two jobs:
-1. IntervalTrigger for regular cycles (adaptive backoff)
+Owns an APScheduler with jobs:
+1. IntervalTrigger for regular proactive cycles (adaptive backoff)
 2. CronTrigger for the mandatory morning report
+3. IntervalTrigger for the 30-min mechanical sweep (proposal expiry/dispatch)
+4. CronTrigger for goal staleness scanning (user ego only, twice daily)
 
 All cycle types (proactive, morning report, reactive, escalation) flow
 through the unified signal consumer loop: signal sources push EgoSignal
@@ -157,6 +159,17 @@ class EgoCadenceManager:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Goal staleness scanner: push goal_review signals for stale goals.
+        # User ego only — genesis ego has no goal jurisdiction. Skipped at
+        # runtime via source_tag check but also gate registration for clarity.
+        if self._session._source_tag == "user_ego_cycle":
+            self._scheduler.add_job(
+                self._check_stale_goals,
+                CronTrigger(hour="10,16", timezone=user_timezone()),
+                id="ego_goal_staleness",
+                max_instances=1,
+                misfire_grace_time=600,
+            )
         self._scheduler.start()
         from genesis.util.tasks import tracked_task
 
@@ -332,6 +345,66 @@ class EgoCadenceManager:
             logger.debug("Deadline scanner found %d approaching event(s)", len(events))
         except Exception:
             logger.debug("Deadline scanner failed", exc_info=True)
+
+    # -- Goal staleness scanner ------------------------------------------------
+
+    async def _check_stale_goals(self) -> None:
+        """Push goal_review signals for goals stale beyond threshold.
+
+        Queries user_goals.updated_at and pushes one signal per stale goal.
+        Only meaningful for the user ego — the genesis ego has no goal
+        jurisdiction.  Registration is gated in start() but we double-check
+        source_tag here as defense-in-depth.
+        """
+        if self._session._source_tag != "user_ego_cycle":
+            return
+        if not self._should_run(skip_idle_check=True):
+            return
+
+        try:
+            from genesis.db.crud import user_goals
+
+            goals = await user_goals.list_active(self._db)
+            if not goals:
+                return
+
+            threshold_days = self._config.goal_review_staleness_days
+            now = datetime.now(UTC)
+            pushed = 0
+
+            for g in goals:
+                updated_at = g.get("updated_at") or g.get("created_at") or ""
+                if not updated_at:
+                    continue
+                try:
+                    updated = datetime.fromisoformat(updated_at)
+                    if updated.tzinfo is None:
+                        updated = updated.replace(tzinfo=UTC)
+                    days_stale = (now - updated).days
+                except (ValueError, TypeError):
+                    continue
+
+                if days_stale < threshold_days:
+                    continue
+
+                title = (g.get("title") or "?")[:80]
+                signal = EgoSignal(
+                    signal_type="timer",
+                    focus_category="goal_review",
+                    summary=f"Goal stale ({days_stale}d): {title}",
+                    priority="medium",
+                    focus_id=g["id"],
+                    metadata={},
+                )
+                if self._signal_queue.push(signal):
+                    pushed += 1
+
+            if pushed:
+                logger.info(
+                    "Goal staleness scanner: %d signal(s) pushed", pushed,
+                )
+        except Exception:
+            logger.debug("Goal staleness scanner failed", exc_info=True)
 
     # -- Tick handlers -----------------------------------------------------
 

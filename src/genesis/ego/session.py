@@ -186,6 +186,7 @@ class EgoSession:
         dynamic_context = await self._compaction.assemble_context(
             context_builder=self._context_builder,
             context_weights=focus.context_weights if focus else None,
+            focus_id=focus.focus_id if focus else None,
         )
 
         # Focus-specific prompt
@@ -305,6 +306,26 @@ class EgoSession:
         # 4. LEARN — record cycle outcome
         await self._record_cycle_outcome(cycle, focus)
 
+        # 5. Goal review post-processing: surface status recommendation
+        if focus.focus_type == "goal_review" and focus.focus_id:
+            try:
+                parsed_output = self._parse_output(cycle.output_text)
+                if parsed_output:
+                    goal_rec = parsed_output.get("goal_status_recommendation")
+                    if goal_rec and goal_rec != "continue":
+                        await self._surface_goal_recommendation(
+                            goal_id=focus.focus_id,
+                            recommendation=goal_rec,
+                            assessment=parsed_output.get(
+                                "goal_assessment", ""
+                            ),
+                        )
+            except Exception:
+                logger.debug(
+                    "Goal recommendation post-processing failed",
+                    exc_info=True,
+                )
+
         return cycle
 
     async def _perceive(self, signals: list[EgoSignal]) -> FocusResult | None:
@@ -377,12 +398,60 @@ class EgoSession:
                 signals_consumed=json.dumps(focus.signals_consumed),
                 perception_rationale=focus.rationale,
                 perceive_cost_usd=focus.perceive_cost_usd,
+                assessment=getattr(self, "_last_goal_assessment", None),
             )
         except Exception:
             logger.warning(
                 "Failed to record cycle outcome for %s",
                 cycle.id,
                 exc_info=True,
+            )
+
+    async def _surface_goal_recommendation(
+        self,
+        *,
+        goal_id: str,
+        recommendation: str,
+        assessment: str,
+    ) -> None:
+        """Surface a goal status recommendation as an observation.
+
+        The ego assesses; the user decides. Recommendations appear in the
+        user's morning report and may trigger Telegram notifications via
+        the outreach pipeline.
+        """
+        import uuid
+
+        from genesis.db.crud import observations as obs_crud
+
+        try:
+            from genesis.db.crud import user_goals
+
+            goal = await user_goals.get_by_id(self._db, goal_id)
+            title = (goal.get("title") or "?") if goal else "?"
+            content = (
+                f"Goal review recommendation for '{title}': "
+                f"**{recommendation}**\n\n"
+                f"Assessment: {assessment[:500]}"
+            )
+            await obs_crud.create(
+                self._db,
+                id=str(uuid.uuid4()),
+                source="user_ego",
+                type="goal_recommendation",
+                content=content,
+                priority="medium",
+                category="goal_review",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            logger.info(
+                "Goal recommendation surfaced: %s → %s",
+                goal_id[:12],
+                recommendation,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to surface goal recommendation", exc_info=True,
             )
 
     # -- Output processing --------------------------------------------------
@@ -456,6 +525,12 @@ class EgoSession:
                 )
             except Exception:
                 logger.warning("Failed to record ego last_run", exc_info=True)
+
+        # 8b. Extract goal_assessment for Learn phase (goal_review cycles).
+        # Stored in ego_cycle_outcomes.assessment by _record_cycle_outcome().
+        self._last_goal_assessment = (
+            parsed.get("goal_assessment") if parsed else None
+        )
 
         # 9. Process proposals
         if parsed:
@@ -709,7 +784,10 @@ class EgoSession:
             directive += (
                 "\n\nThis is a GOAL REVIEW cycle. Assess progress on the "
                 "focused goal, identify blockers, and propose goal-advancing "
-                "actions. Include the goal_assessment field."
+                "actions. Include the goal_assessment field with your analysis "
+                "of the goal's current state. Include "
+                "goal_status_recommendation: one of "
+                '"continue", "pause", "deprioritize", or "close".'
             )
         elif focus.focus_type == "reactive":
             directive += (
@@ -1820,5 +1898,19 @@ def _validate_output(data: dict) -> dict | None:
                 and isinstance(r.get("id"), str)
                 and r["id"]
             ]
+
+    # Sanitize goal_assessment — optional free text, string only.
+    if "goal_assessment" in data and not isinstance(
+        data["goal_assessment"], str
+    ):
+        data["goal_assessment"] = ""
+
+    # Sanitize goal_status_recommendation — optional enum.
+    _VALID_GOAL_RECS = ("continue", "pause", "deprioritize", "close")
+    if (
+        "goal_status_recommendation" in data
+        and data["goal_status_recommendation"] not in _VALID_GOAL_RECS
+    ):
+        del data["goal_status_recommendation"]
 
     return data
