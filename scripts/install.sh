@@ -116,7 +116,7 @@ PREFLIGHT_OK=1
 _KB_PER_GB=1048576
 _MIN_DISK_KB=$(( 5 * _KB_PER_GB ))   # 5GB
 _WARN_DISK_KB=$(( 10 * _KB_PER_GB )) # 10GB
-_MIN_RAM_KB=$(( 2 * _KB_PER_GB ))    # 2GB
+_MIN_RAM_KB=$(( _KB_PER_GB + _KB_PER_GB / 2 ))  # 1.5GB (2GB VMs report ~1.8GB after kernel)
 _WARN_RAM_KB=$(( 4 * _KB_PER_GB ))   # 4GB
 
 # Disk: >= 5GB free on $HOME (Genesis ~2GB + Qdrant ~1GB + headroom)
@@ -153,8 +153,9 @@ fi
 mem_total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
 if [ -n "${mem_total_kb:-}" ]; then
     mem_total_gb=$((mem_total_kb / _KB_PER_GB))
+    mem_total_mb=$((mem_total_kb / 1024))
     if [ "$mem_total_kb" -lt "$_MIN_RAM_KB" ]; then
-        echo "    FAIL  RAM: ${mem_total_gb}GB (need >= 2GB)"
+        echo "    FAIL  RAM: ${mem_total_mb}MB (need >= 1536MB / a 2GB instance)"
         PREFLIGHT_OK=0
     elif [ "$mem_total_kb" -lt "$_WARN_RAM_KB" ]; then
         echo "    WARN  RAM: ${mem_total_gb}GB (Genesis will work but may be slow)"
