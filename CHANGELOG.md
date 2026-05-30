@@ -28,6 +28,14 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 - **User job timezone fix** (#490) --- scheduler respects user timezone
   for job scheduling.
 - **Ego CycleType removal** (#486) --- legacy run_cycle() enum removed.
+- **PageIndex document indexing** (#487) --- tree-based vectorless RAG
+  for structured PDFs via PageIndex cloud API.
+- **Dream cycle entity resolution** (#483) --- graph enrichment during
+  dream cycles with entity resolution and relationship extraction.
+
+### Fixed
+
+- **CodeQL security alerts** (#485) --- resolved all 8 open alerts.
 
 ---
 
