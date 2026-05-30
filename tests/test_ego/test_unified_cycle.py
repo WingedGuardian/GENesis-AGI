@@ -190,17 +190,6 @@ def test_focus_category_values():
     assert FocusCategory.ESCALATION == "escalation"
 
 
-def test_focus_category_coexists_with_cycle_type():
-    """FocusCategory and CycleType should coexist without conflict."""
-    from genesis.ego.types import CycleType, FocusCategory
-
-    # Both should import cleanly
-    assert CycleType.PROACTIVE == "proactive"
-    assert FocusCategory.PROACTIVE == "proactive"
-    # But they are different types
-    assert type(CycleType.PROACTIVE) is not type(FocusCategory.PROACTIVE)
-
-
 # ── EgoConfig goal_review_staleness_days ──────────────────────────────────
 
 

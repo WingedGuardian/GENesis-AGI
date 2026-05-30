@@ -13,7 +13,8 @@ from genesis.db.crud import ego as ego_crud
 from genesis.db.schema import TABLES
 from genesis.ego.dispatch import EgoDispatcher
 from genesis.ego.session import EgoSession
-from genesis.ego.types import CycleType, EgoConfig
+from genesis.ego.signals import EgoSignal
+from genesis.ego.types import EgoConfig
 
 # ---------------------------------------------------------------------------
 # Sample ego output
@@ -148,81 +149,82 @@ def ego_session(
 
 
 # ---------------------------------------------------------------------------
-# Session cycle tests
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-class TestEgoSession:
-    async def test_run_cycle_success(self, ego_session, mock_invoker, db):
-        """Full successful cycle: proposals created, focus stored."""
-        cycle = await ego_session.run_cycle()
+def _make_signal(**overrides) -> EgoSignal:
+    """Build a minimal EgoSignal for testing."""
+    defaults = {
+        "signal_type": "timer",
+        "focus_category": "proactive",
+        "summary": "Idle tick",
+        "priority": "medium",
+    }
+    defaults.update(overrides)
+    return EgoSignal(**defaults)
+
+
+# ---------------------------------------------------------------------------
+# Session cycle tests (unified cognitive loop)
+# ---------------------------------------------------------------------------
+
+
+class TestUnifiedCycle:
+    """Tests for run_unified_cycle — the sole cycle entry point."""
+
+    async def test_success(self, ego_session, mock_invoker, db):
+        """Full successful cycle: signal → perceive → invoke → proposals."""
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
 
         assert cycle is not None
         assert cycle.cost_usd == 0.15
         assert cycle.model_used == "opus"
         assert cycle.focus_summary == "investigating backlog growth"
-        # Invoker called for ego cycle + realist filter (2 calls when proposals exist)
         assert mock_invoker.run.call_count >= 1
 
-        # Focus summary stored in ego_state is system-computed (not ego-authored).
-        # The test DB lacks ego_directives etc., so computed_focus falls back.
+        # Focus summary stored in ego_state is system-computed.
         focus = await ego_crud.get_state(db, "ego_focus_summary")
         assert focus == "general system awareness"
 
-    async def test_run_cycle_no_proposals(
+    async def test_no_proposals(
         self, ego_session, mock_invoker, mock_proposal_workflow,
     ):
         """Cycle with empty proposals array still stores the cycle."""
         mock_invoker.run.return_value = _cc_output(
             _valid_output(proposals=[], follow_ups=[]),
         )
-        cycle = await ego_session.run_cycle()
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
 
         assert cycle is not None
         mock_proposal_workflow.create_batch.assert_not_called()
 
-    async def test_run_cycle_with_follow_ups(self, ego_session, dispatcher):
-        """Follow-up recording is disabled — output is parsed but not stored."""
-        cycle = await ego_session.run_cycle()
-        assert cycle is not None
-
-        # record_follow_ups is a no-op (PR #375), so nothing lands in DB
-        pending = await dispatcher.get_pending_follow_ups()
-        assert len(pending) == 0
-
-    async def test_run_cycle_morning_report(self, ego_session, mock_invoker):
-        """Morning report flag appears in the user prompt."""
-        await ego_session.run_cycle(is_morning_report=True)
-
-        call_args = mock_invoker.run.call_args_list[0][0][0]
-        assert "MORNING REPORT" in call_args.prompt
-
-    async def test_run_cycle_cc_error(
+    async def test_cc_error(
         self, ego_session, mock_invoker, mock_session_manager,
     ):
-        """CC error causes graceful failure."""
+        """CC error causes graceful failure — returns None."""
         mock_invoker.run.return_value = _cc_output(is_error=True)
-        cycle = await ego_session.run_cycle()
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
 
         assert cycle is None
         mock_session_manager.fail.assert_called_once()
 
-    async def test_run_cycle_cc_exception(
+    async def test_cc_exception(
         self, ego_session, mock_invoker, mock_session_manager,
     ):
         """CC invocation exception causes graceful failure."""
         mock_invoker.run.side_effect = TimeoutError("CC timed out")
-        cycle = await ego_session.run_cycle()
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
 
         assert cycle is None
         mock_session_manager.fail.assert_called_once()
 
-    async def test_run_cycle_parse_failure(
+    async def test_parse_failure(
         self, ego_session, mock_invoker, mock_proposal_workflow,
     ):
         """Invalid output stores cycle but creates no proposals."""
         mock_invoker.run.return_value = _cc_output("not json at all")
-        cycle = await ego_session.run_cycle()
+        cycle = await ego_session.run_unified_cycle([_make_signal()])
 
         assert cycle is not None
         assert cycle.proposals_json == "[]"
@@ -230,27 +232,70 @@ class TestEgoSession:
 
     async def test_invocation_args(self, ego_session, mock_invoker):
         """Verify CCInvocation has correct model, effort, append mode."""
-        await ego_session.run_cycle()
+        await ego_session.run_unified_cycle([_make_signal()])
 
-        # First call is the ego cycle; subsequent calls are realist filter
         invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.model.value == "opus"
-        assert invocation.effort.value == "high"  # default from EgoConfig
+        assert invocation.model.value == "opus"  # from EgoConfig default
+        assert invocation.effort.value == "high"  # from EgoConfig default
         assert invocation.append_system_prompt is True
         assert invocation.skip_permissions is True
 
-    async def test_context_assembled_before_cycle(
-        self, ego_session, mock_compaction, mock_invoker,
-    ):
-        """assemble_context is called to build operational context."""
-        await ego_session.run_cycle()
-        mock_compaction.assemble_context.assert_called_once()
+    async def test_model_override(self, ego_session, mock_invoker):
+        """model_override takes precedence over config default."""
+        await ego_session.run_unified_cycle(
+            [_make_signal()], model_override="sonnet",
+        )
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.model.value == "sonnet"
+
+    async def test_effort_override(self, ego_session, mock_invoker):
+        """effort_override takes precedence over config default."""
+        await ego_session.run_unified_cycle(
+            [_make_signal()], effort_override="low",
+        )
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.effort.value == "low"
+
+    async def test_daily_briefing_prompt(self, ego_session, mock_invoker):
+        """Daily briefing signal → DAILY BRIEFING directive in prompt."""
+        signal = _make_signal(focus_category="daily_briefing")
+        await ego_session.run_unified_cycle([signal])
+
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert "DAILY BRIEFING" in invocation.prompt
+        assert "morning_report" in invocation.prompt
+
+    async def test_reactive_prompt(self, ego_session, mock_invoker):
+        """Reactive signal → REACTIVE directive in prompt."""
+        signal = _make_signal(focus_category="reactive", summary="health alert")
+        await ego_session.run_unified_cycle([signal])
+
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert "REACTIVE" in invocation.prompt
+
+    async def test_ephemeral_no_resume(self, ego_session, mock_invoker):
+        """Every cycle is ephemeral — resume_session_id is always None."""
+        await ego_session.run_unified_cycle([_make_signal()])
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.resume_session_id is None
+
+    async def test_system_prompt_is_static(self, ego_session, mock_invoker):
+        """System prompt is the static identity — no dynamic content."""
+        await ego_session.run_unified_cycle([_make_signal()])
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert invocation.system_prompt == ego_session._static_prompt
+
+    async def test_dynamic_context_in_user_message(self, ego_session, mock_invoker):
+        """Operational context appears in the user message, not system prompt."""
+        await ego_session.run_unified_cycle([_make_signal()])
+        invocation = mock_invoker.run.call_args_list[0][0][0]
+        assert "Test operational context" in invocation.prompt
 
     async def test_session_manager_lifecycle(
         self, ego_session, mock_session_manager,
     ):
         """Session is created and completed on success."""
-        await ego_session.run_cycle()
+        await ego_session.run_unified_cycle([_make_signal()])
         mock_session_manager.create_background.assert_called_once()
         mock_session_manager.complete.assert_called_once()
 
@@ -258,60 +303,25 @@ class TestEgoSession:
         self, ego_session, mock_proposal_workflow,
     ):
         """Proposals from ego output are sent as a batch."""
-        await ego_session.run_cycle()
+        await ego_session.run_unified_cycle([_make_signal()])
         mock_proposal_workflow.create_batch.assert_called_once()
         mock_proposal_workflow.send_digest.assert_called_once()
 
-    async def test_ephemeral_no_resume(self, ego_session, mock_invoker):
-        """Every cycle is ephemeral — resume_session_id is always None."""
-        await ego_session.run_cycle()
-        # First call is the ego cycle
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.resume_session_id is None
+    async def test_empty_signals_returns_none(self, ego_session, mock_invoker):
+        """Empty signal list → no cycle, returns None."""
+        cycle = await ego_session.run_unified_cycle([])
+        assert cycle is None
+        mock_invoker.run.assert_not_called()
 
-    async def test_ephemeral_consecutive_cycles(self, ego_session, mock_invoker):
-        """Consecutive cycles are independent — no resume between them."""
-        await ego_session.run_cycle()
-        mock_invoker.run.reset_mock()
+    async def test_focus_in_prompt(self, ego_session, mock_invoker):
+        """Focus type and rationale appear in the user prompt."""
+        signal = _make_signal(summary="Goal stale for 12 days",
+                              focus_category="goal_review")
+        await ego_session.run_unified_cycle([signal])
 
-        await ego_session.run_cycle()
-        # First call after reset is the ego cycle
         invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.resume_session_id is None
-
-    async def test_morning_report_uses_sonnet_low(self, ego_session, mock_invoker):
-        """Morning report cycle uses Sonnet/Low per cycle type defaults."""
-        await ego_session.run_cycle(is_morning_report=True)
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.model.value == "sonnet"
-        assert invocation.effort.value == "low"
-
-    async def test_cycle_type_proactive(self, ego_session, mock_invoker):
-        """Proactive cycle type uses Opus/High."""
-        await ego_session.run_cycle(cycle_type=CycleType.PROACTIVE)
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.model.value == "opus"
-        assert invocation.effort.value == "high"
-
-    async def test_cycle_type_escalation(self, ego_session, mock_invoker):
-        """Escalation cycle type uses Sonnet/Medium."""
-        await ego_session.run_cycle(cycle_type=CycleType.ESCALATION)
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert invocation.model.value == "sonnet"
-        assert invocation.effort.value == "medium"
-
-    async def test_system_prompt_is_static(self, ego_session, mock_invoker):
-        """System prompt is the static identity — no dynamic content."""
-        await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        # System prompt should be the cached static prompt
-        assert invocation.system_prompt == ego_session._static_prompt
-
-    async def test_dynamic_context_in_user_message(self, ego_session, mock_invoker):
-        """Operational context appears in the user message, not system prompt."""
-        await ego_session.run_cycle()
-        invocation = mock_invoker.run.call_args_list[0][0][0]
-        assert "Test operational context" in invocation.prompt
+        assert "goal_review" in invocation.prompt
+        assert "GOAL REVIEW" in invocation.prompt
 
 
 # ---------------------------------------------------------------------------
