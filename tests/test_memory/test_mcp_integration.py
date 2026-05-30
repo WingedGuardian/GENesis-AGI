@@ -100,6 +100,7 @@ async def test_memory_recall_delegates(mock_deps, tools):
         "query", source="both", limit=5, min_activation=0.0,
         wing=None, room=None, expand_query_terms=True,
         include_subsystem=False, only_subsystem=None,
+        rerank=False,
     )
 
 

@@ -54,6 +54,7 @@ async def memory_recall(
     time_range: str | None = None,
     include_subsystem: bool | list[str] = False,
     only_subsystem: str | list[str] | None = None,
+    rerank: bool = False,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -89,6 +90,9 @@ async def memory_recall(
         only_subsystem: Subsystem-filter replace mode. Return ONLY rows
             tagged with the named subsystem(s); user content excluded.
             Used by ego's own self-recall path.
+        rerank: If True, apply Voyage AI cross-encoder reranking after RRF
+            fusion. Improves precision by rescoring candidates on semantic
+            relevance. Adds ~300ms latency. Default False — opt-in per call.
     """
     import time as _time
 
@@ -144,6 +148,7 @@ async def memory_recall(
             wing=wing, room=room, expand_query_terms=expand_query_terms,
             include_subsystem=include_subsystem,
             only_subsystem=only_subsystem,
+            rerank=rerank,
         )
         pipeline_used = "standard"
 

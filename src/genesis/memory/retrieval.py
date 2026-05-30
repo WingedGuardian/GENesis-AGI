@@ -13,6 +13,7 @@ from genesis.db.crud import memory_links, observations
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import classify_intent, expand_query, rank_by_intent
+from genesis.memory.reranker import VoyageReranker
 from genesis.memory.types import RetrievalResult
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.provider_activity import track_operation
@@ -167,10 +168,12 @@ class HybridRetriever:
         embedding_provider: EmbeddingProvider,
         qdrant_client: QdrantClient,
         db: aiosqlite.Connection,
+        reranker: VoyageReranker | None = None,
     ) -> None:
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
         self._db = db
+        self._reranker = reranker
 
     async def recall(
         self,
@@ -184,6 +187,7 @@ class HybridRetriever:
         room: str | None = None,
         include_subsystem: bool | list[str] = False,
         only_subsystem: str | list[str] | None = None,
+        rerank: bool = False,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -435,6 +439,40 @@ class HybridRetriever:
         if event_memory_ids:
             ranked_lists.append(event_memory_ids)
         fused = _rrf_fuse(ranked_lists)
+
+        # 7.5 Cross-encoder reranking (optional, off by default)
+        #
+        # Voyage scores live in a different range (0.0–1.0) than RRF scores
+        # (~0.01–0.05). To keep the score space uniform for graph boost and
+        # final sort, we replace the entire fused dict with positional scores
+        # derived from the reranker's ordering. Candidates the reranker
+        # didn't score are dropped — if they lacked content or fell below
+        # top_k, they weren't strong enough to keep.
+        if rerank and self._reranker and self._reranker.enabled and fused:
+            rerank_candidates = sorted(
+                fused, key=fused.get, reverse=True,  # type: ignore[arg-type]
+            )[:limit * 3]
+            rerank_docs: list[dict[str, str]] = []
+            for mid in rerank_candidates:
+                content = ""
+                qhit = qdrant_by_id.get(mid)
+                if qhit:
+                    content = qhit.get("payload", {}).get("content", "")
+                elif mid in fts_by_id:
+                    content = fts_by_id[mid].get("content", "")
+                if content:
+                    rerank_docs.append({"id": mid, "text": content})
+            if rerank_docs:
+                reranked = await self._reranker.rerank(
+                    query, rerank_docs, top_k=limit * 2,
+                )
+                if reranked:
+                    # Rebuild fused with only reranked candidates, using
+                    # positional scores so graph boost floor-gating works.
+                    fused = {
+                        item["id"]: 1.0 / (1 + rank)
+                        for rank, item in enumerate(reranked)
+                    }
 
         # 7b. Graph boost: backlink + adjacency (floor-gated)
         graph_boost_applied = False

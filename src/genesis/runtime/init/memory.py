@@ -101,12 +101,15 @@ async def init(rt: GenesisRuntime) -> None:
         logger.info("Genesis MemoryStore created (storage embedder)")
 
         from genesis.cc.context_injector import ContextInjector
+        from genesis.memory.reranker import VoyageReranker
         from genesis.memory.retrieval import HybridRetriever
 
+        reranker = VoyageReranker()
         rt._hybrid_retriever = HybridRetriever(
             embedding_provider=recall_embedder,
             qdrant_client=qdrant,
             db=rt._db,
+            reranker=reranker,
         )
         rt._context_injector = ContextInjector(
             retriever=rt._hybrid_retriever,

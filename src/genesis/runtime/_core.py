@@ -518,6 +518,15 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             except Exception:
                 logger.exception("Failed to unload modules")
 
+        if self._hybrid_retriever is not None:
+            reranker = getattr(self._hybrid_retriever, "_reranker", None)
+            if reranker is not None:
+                try:
+                    await reranker.close()
+                    logger.info("Closed Voyage reranker HTTP client")
+                except Exception:
+                    logger.debug("Reranker close failed", exc_info=True)
+
         if self._event_bus is not None:
             try:
                 await self._event_bus.stop()
