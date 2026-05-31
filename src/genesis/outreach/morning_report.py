@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -261,26 +260,21 @@ class MorningReportGenerator:
         else:
             lines.append("- CC sessions: none in last 24h")
 
-        # Inbox items — pending count from filesystem, plus DB status breakdown
-        inbox_dir = os.path.expanduser("~/inbox")
-        pending_fs = len(os.listdir(inbox_dir)) if os.path.isdir(inbox_dir) else 0
+        # Inbox items — only report genuinely pending DB items (not filesystem output files)
         cursor = await self._db.execute(
-            "SELECT status, COUNT(*) FROM inbox_items "
-            "WHERE created_at >= datetime('now', '-24 hours') "
-            "GROUP BY status"
+            "SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'"
         )
-        rows = await cursor.fetchall()
-        if rows:
-            parts = [f"{r[0]}={r[1]}" for r in rows]
-            lines.append(f"- Inbox items: {pending_fs} pending (filesystem), recent: {', '.join(parts)}")
-        else:
-            lines.append(f"- Inbox items: {pending_fs} pending (filesystem), none processed in last 24h")
+        pending_inbox = (await cursor.fetchone())[0]
+        if pending_inbox > 0:
+            lines.append(f"- Inbox: {pending_inbox} items awaiting evaluation")
 
         # User-relevant observations with content preview (top 5)
+        # Filter: unresolved + not yet surfaced + not internal type
         placeholders = ",".join("?" for _ in _INTERNAL_OBS_TYPES)
         cursor = await self._db.execute(
             f"SELECT id, priority, type, content FROM observations "
-            f"WHERE resolved = 0 AND type NOT IN ({placeholders}) "
+            f"WHERE resolved = 0 AND surfaced_at IS NULL "
+            f"AND type NOT IN ({placeholders}) "
             "ORDER BY CASE priority "
             "  WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
             "created_at DESC LIMIT 5",
@@ -554,6 +548,7 @@ class MorningReportGenerator:
         """Return observations surfaced 3+ times but still unresolved.
 
         These are known conditions — demoted to end of report.
+        Includes last_surfaced_at so the LLM can judge staleness.
         """
         from genesis.db.crud.observations import get_standing
 
@@ -567,10 +562,43 @@ class MorningReportGenerator:
         if not items:
             return None
 
+        # Provide last report timestamp so LLM can compress unchanged items
+        cursor = await self._db.execute(
+            "SELECT created_at FROM outreach_history "
+            "WHERE signal_type = 'morning_report' "
+            "ORDER BY created_at DESC LIMIT 1 OFFSET 1"  # Previous report, not this one
+        )
+        row = await cursor.fetchone()
+        last_report_at = row[0] if row else None
+
+        # Parse last_report_at to datetime for correct comparison
+        # (outreach_history uses space-separated format, surfaced_at uses ISO T-format)
+        last_report_dt = None
+        if last_report_at:
+            try:
+                last_report_dt = datetime.fromisoformat(last_report_at)
+                if last_report_dt.tzinfo is None:
+                    last_report_dt = last_report_dt.replace(tzinfo=UTC)
+            except (ValueError, TypeError):
+                pass
+
         lines = []
+        if last_report_at:
+            lines.append(f"(Last report: {last_report_at[:16]})")
         for obs in items:
             content = obs["content"][:150].replace("\n", " ")
             count = obs.get("surfaced_count", 0)
             age = _relative_age(obs.get("created_at", ""))
-            lines.append(f"- {content} (surfaced {count}x, {age})")
+            last_surfaced = obs.get("surfaced_at", "")
+            changed_since_last = True
+            if last_report_dt and last_surfaced:
+                try:
+                    surfaced_dt = datetime.fromisoformat(last_surfaced)
+                    if surfaced_dt.tzinfo is None:
+                        surfaced_dt = surfaced_dt.replace(tzinfo=UTC)
+                    changed_since_last = surfaced_dt > last_report_dt
+                except (ValueError, TypeError):
+                    pass
+            status = "" if changed_since_last else " [unchanged]"
+            lines.append(f"- {content} (surfaced {count}x, {age}){status}")
         return "\n".join(lines)
