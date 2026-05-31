@@ -368,7 +368,7 @@ class EgoCadenceManager:
             if not goals:
                 return
 
-            threshold_days = self._config.goal_review_staleness_days
+            global_threshold = self._config.goal_review_staleness_days
             now = datetime.now(UTC)
             pushed = 0
 
@@ -384,6 +384,13 @@ class EgoCadenceManager:
                 except (ValueError, TypeError):
                     continue
 
+                # Per-goal cadence override (cadence_days > 0), else global
+                per_goal = g.get("cadence_days")
+                threshold_days = (
+                    per_goal
+                    if isinstance(per_goal, int) and per_goal > 0
+                    else global_threshold
+                )
                 if days_stale < threshold_days:
                     continue
 

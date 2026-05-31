@@ -318,13 +318,29 @@ class UserEgoContextBuilder:
 
         now = datetime.now(UTC)
 
+        # Group goals into hierarchy: top-level, children, orphans
+        active_ids = {g["id"] for g in goals}
+        top_level = []
+        children_by_parent: dict[str, list[dict]] = {}
         for g in goals:
+            pid = g.get("parent_goal_id")
+            if not pid:
+                top_level.append(g)
+            elif pid in active_ids:
+                children_by_parent.setdefault(pid, []).append(g)
+            else:
+                # Orphan: parent not in active list — render at top level
+                top_level.append(g)
+
+        async def _render_goal(g: dict, prefix: str = "- ") -> None:
             goal_id = g.get("id", "?")
             priority = g.get("priority", "medium")
             title = g.get("title", "?")[:120]
             category = g.get("category", "")
+            goal_type = g.get("goal_type", "milestone")
+            type_tag = " [continuous]" if goal_type == "continuous" else ""
 
-            # Staleness: days since updated_at
+            # Staleness
             updated_at = g.get("updated_at") or g.get("created_at") or ""
             stale_str = ""
             if updated_at:
@@ -341,10 +357,18 @@ class UserEgoContextBuilder:
             progress_notes_raw = g.get("progress_notes", "[]")
             try:
                 import json
-                notes = json.loads(progress_notes_raw) if isinstance(progress_notes_raw, str) else progress_notes_raw
+                notes = (
+                    json.loads(progress_notes_raw)
+                    if isinstance(progress_notes_raw, str)
+                    else progress_notes_raw
+                )
                 if notes and isinstance(notes, list):
                     latest = notes[-1]
-                    note_text = latest.get("note", str(latest)) if isinstance(latest, dict) else str(latest)
+                    note_text = (
+                        latest.get("note", str(latest))
+                        if isinstance(latest, dict)
+                        else str(latest)
+                    )
                     progress_str = f' | Last: "{note_text[:60]}"'
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -352,24 +376,37 @@ class UserEgoContextBuilder:
             # Proposal outcome summary
             proposal_str = ""
             try:
-                summary = await ego_crud.get_goal_proposal_summary(self._db, goal_id)
+                summary = await ego_crud.get_goal_proposal_summary(
+                    self._db, goal_id,
+                )
                 if summary:
-                    parts = [f"{count} {status}" for status, count in summary.items()]
+                    parts = [
+                        f"{count} {status}"
+                        for status, count in summary.items()
+                    ]
                     proposal_str = f" | Proposals: {', '.join(parts)}"
             except Exception:
                 pass
 
-            # Render
             header = (
-                f"- [{priority.upper()}] **{title}** "
-                f"(id={goal_id}, {category})"
+                f"{prefix}[{priority.upper()}] **{title}** "
+                f"(id={goal_id}, {category}){type_tag}"
             )
-            detail_parts = [p for p in [stale_str, progress_str, proposal_str] if p]
+            detail_parts = [
+                p for p in [stale_str, progress_str, proposal_str] if p
+            ]
             if detail_parts:
                 detail = "".join(detail_parts).lstrip(" |")
-                lines.append(f"{header}\n  {detail}")
+                indent = "  " if prefix == "- " else "    "
+                lines.append(f"{header}\n{indent}{detail}")
             else:
                 lines.append(header)
+
+        # Render: top-level goals with children indented beneath
+        for g in top_level:
+            await _render_goal(g, prefix="- ")
+            for child in children_by_parent.get(g["id"], []):
+                await _render_goal(child, prefix="  ↳ ")
 
         lines.append("")
         return "\n".join(lines)
@@ -1251,6 +1288,42 @@ class UserEgoContextBuilder:
             lines.append(
                 "### Goal-Linked Proposals\n*No proposals for this goal.*\n"
             )
+
+        # Subgoals: show children if this is a parent goal
+        try:
+            from genesis.db.crud import user_goals as ug_crud
+
+            children = await ug_crud.list_children(
+                self._db, focus_id, include_achieved=True,
+            )
+            if children:
+                lines.append("### Subgoals\n")
+                for ch in children:
+                    ch_status = ch.get("status", "?")
+                    ch_title = (ch.get("title") or "?")[:100]
+                    ch_id = ch.get("id", "?")
+                    lines.append(
+                        f"- [{ch_status}] **{ch_title}** (id={ch_id})"
+                    )
+                lines.append("")
+        except Exception:
+            logger.debug("Failed to query subgoals for %s", focus_id)
+
+        # Parent context: if this is a child goal, show parent
+        if goal.get("parent_goal_id"):
+            try:
+                parent = await user_goals.get_by_id(
+                    self._db, goal["parent_goal_id"],
+                )
+                if parent:
+                    lines.append(
+                        f"### Parent Goal\n"
+                        f"**{parent.get('title', '?')}** "
+                        f"(id={parent.get('id', '?')}, "
+                        f"{parent.get('status', '?')})\n"
+                    )
+            except Exception:
+                pass
 
         lines.append("")
         return "\n".join(lines)

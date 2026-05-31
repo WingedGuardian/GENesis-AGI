@@ -1118,6 +1118,9 @@ TABLES = {
             parent_goal_id  TEXT,
             evidence_source TEXT,
             confidence      REAL NOT NULL DEFAULT 0.5,
+            goal_type       TEXT NOT NULL DEFAULT 'milestone'
+                            CHECK (goal_type IN ('milestone', 'continuous')),
+            cadence_days    INTEGER,              -- per-goal review cadence override (NULL = global default)
             created_at      TEXT NOT NULL
                             DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
             updated_at      TEXT NOT NULL

@@ -1341,6 +1341,21 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ON centrality_cache(centrality_score DESC)"
     )
 
+    # Goal decomposition (PR 7): goal_type + cadence_days on user_goals.
+    # goal_type distinguishes milestone (achievable) vs continuous (ongoing).
+    # cadence_days overrides the global staleness threshold per-goal.
+    await _try_alter(
+        db,
+        "ALTER TABLE user_goals ADD COLUMN goal_type TEXT NOT NULL "
+        "DEFAULT 'milestone' CHECK (goal_type IN ('milestone', 'continuous'))",
+        "user_goals.goal_type",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE user_goals ADD COLUMN cadence_days INTEGER",
+        "user_goals.cadence_days",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
