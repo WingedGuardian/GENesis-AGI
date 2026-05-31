@@ -549,14 +549,14 @@ class EgoSession:
                         self._db, self._source_tag.replace("_cycle", ""),
                     )
                     has_critical_directive = any(
-                        d.get("priority") in ("critical", "high")
+                        d.get("priority") == "critical"
                         for d in active_dirs
                     )
                 except Exception:
                     pass
                 if has_critical_directive:
                     logger.info(
-                        "Realist bypassed — active critical/high directive(s)",
+                        "Realist bypassed — active critical directive(s)",
                     )
                 else:
                     proposals = await self._filter_proposals(proposals)

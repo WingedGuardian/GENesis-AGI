@@ -211,6 +211,22 @@ async def count_active_by_type(db: aiosqlite.Connection, task_type: str) -> int:
     return row[0]
 
 
+async def last_completed_at(db: aiosqlite.Connection, task_type: str) -> str | None:
+    """Return the most recent ``completed_at`` timestamp for *task_type*.
+
+    Used by the scheduler's cooldown check to avoid re-enqueuing tasks
+    that completed recently (e.g. after a server restart).
+    """
+    cursor = await db.execute(
+        "SELECT completed_at FROM surplus_tasks "
+        "WHERE task_type = ? AND status = 'completed' AND completed_at IS NOT NULL "
+        "ORDER BY completed_at DESC LIMIT 1",
+        (task_type,),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
 async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM surplus_tasks WHERE id = ?", (id,))
     await db.commit()
