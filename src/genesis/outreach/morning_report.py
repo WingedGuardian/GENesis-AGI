@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -261,26 +260,21 @@ class MorningReportGenerator:
         else:
             lines.append("- CC sessions: none in last 24h")
 
-        # Inbox items — pending count from filesystem, plus DB status breakdown
-        inbox_dir = os.path.expanduser("~/inbox")
-        pending_fs = len(os.listdir(inbox_dir)) if os.path.isdir(inbox_dir) else 0
+        # Inbox items — only report genuinely pending DB items (not filesystem output files)
         cursor = await self._db.execute(
-            "SELECT status, COUNT(*) FROM inbox_items "
-            "WHERE created_at >= datetime('now', '-24 hours') "
-            "GROUP BY status"
+            "SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'"
         )
-        rows = await cursor.fetchall()
-        if rows:
-            parts = [f"{r[0]}={r[1]}" for r in rows]
-            lines.append(f"- Inbox items: {pending_fs} pending (filesystem), recent: {', '.join(parts)}")
-        else:
-            lines.append(f"- Inbox items: {pending_fs} pending (filesystem), none processed in last 24h")
+        pending_inbox = (await cursor.fetchone())[0]
+        if pending_inbox > 0:
+            lines.append(f"- Inbox: {pending_inbox} items awaiting evaluation")
 
         # User-relevant observations with content preview (top 5)
+        # Filter: unresolved + not yet surfaced + not internal type
         placeholders = ",".join("?" for _ in _INTERNAL_OBS_TYPES)
         cursor = await self._db.execute(
             f"SELECT id, priority, type, content FROM observations "
-            f"WHERE resolved = 0 AND type NOT IN ({placeholders}) "
+            f"WHERE resolved = 0 AND surfaced_at IS NULL "
+            f"AND type NOT IN ({placeholders}) "
             "ORDER BY CASE priority "
             "  WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
             "created_at DESC LIMIT 5",

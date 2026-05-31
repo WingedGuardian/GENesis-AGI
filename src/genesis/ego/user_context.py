@@ -1428,12 +1428,26 @@ class UserEgoContextBuilder:
         lines = ["## Recurring Patterns (72h)\n"]
 
         try:
+            # Exclude Genesis-internal observations — infrastructure, system_health,
+            # performance, maintenance, security are genesis_ego's jurisdiction.
+            # NULL categories pass through (ambiguous, not definitively Genesis-internal).
             cursor = await self._db.execute(
                 "SELECT type, category, COUNT(*) AS cnt, "
                 "  MAX(content) AS sample, MAX(created_at) AS latest "
                 "FROM observations "
                 "WHERE created_at >= datetime('now', '-3 days') "
                 "  AND resolved = 0 "
+                "  AND (category IS NULL "
+                "       OR category NOT IN "
+                "       ('system_health', 'infrastructure', 'performance', "
+                "        'maintenance', 'security')) "
+                "  AND type NOT IN "
+                "  ('awareness_tick', 'micro_reflection', 'light_reflection', "
+                "   'deep_reflection', 'reflection_observation', "
+                "   'reflection_summary', 'reflection_output', "
+                "   'memory_operation', 'memory_index', "
+                "   'version_change', 'genesis_version_change', "
+                "   'genesis_version_baseline', 'build_state') "
                 "GROUP BY type, category "
                 "HAVING cnt >= 3 "
                 "ORDER BY cnt DESC "

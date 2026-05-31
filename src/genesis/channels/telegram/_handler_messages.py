@@ -1083,11 +1083,21 @@ async def _try_bare_proposal_resolution(ctx: HandlerContext, msg) -> bool:
                             return True
                     except Exception:
                         log.warning("Withdrawn re-validate failed", exc_info=True)
-                return False
+                with contextlib.suppress(Exception):
+                    await msg.reply_text(
+                        "No pending proposals to resolve. "
+                        "Proposals may have expired or been resolved elsewhere."
+                    )
+                return True  # Consumed — gave feedback
             # Use the MOST RECENT batch (user sees latest digest at top)
             batch_id = pending[-1].get("batch_id")
             if not batch_id:
-                return False
+                with contextlib.suppress(Exception):
+                    await msg.reply_text(
+                        "Could not determine proposal batch. "
+                        "Try 'approve all pending' or reply to a specific proposal."
+                    )
+                return True  # Consumed — gave feedback
 
             # Handle "approve all" / "reject all" (sentinel key 0)
             if 0 in decisions:
