@@ -1,0 +1,50 @@
+# Genesis PII/infrastructure leak prevention rules.
+#
+# Extends gitleaks default rules (API keys, tokens, etc.) with
+# install-specific patterns that shouldn't reach the public repo.
+#
+# Allowlisted paths: sanitizer code, release scripts, CI workflows,
+# and test fixtures that legitimately contain these patterns.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "genesis-private-ip-10-176"
+description = "Install-specific private IP (Tailscale 10.176.x.x)"
+regex = '''10\.176\.\d{1,3}\.\d{1,3}'''
+tags = ["infrastructure", "genesis"]
+
+[[rules]]
+id = "genesis-private-ip-192-168-50"
+description = "Install-specific private IP (LAN 192.168.50.x)"
+regex = '''192\.168\.50\.\d{1,3}'''
+tags = ["infrastructure", "genesis"]
+
+[[rules]]
+id = "genesis-tailscale-cgnat"
+description = "Tailscale CGNAT address (100.64-127.x.x)"
+regex = '''100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}'''
+tags = ["infrastructure", "genesis"]
+
+[[rules]]
+id = "genesis-aws-account-id"
+description = "AWS account ID near identifying keyword"
+regex = '''(?i)(account.?id|aws.?account)[\s=:"']+\d{12}'''
+tags = ["cloud", "genesis"]
+
+[[rules]]
+id = "genesis-private-hostname"
+description = "Known private hostnames"
+regex = '''\b(zorror|assistant1)\b'''
+tags = ["infrastructure", "genesis"]
+
+# Global allowlist — paths that legitimately contain these patterns
+[allowlist]
+paths = [
+    '''tests/''',
+    '''scripts/prepare-public-release\.sh''',
+    '''\.github/workflows/''',
+    '''src/genesis/contribution/sanitize\.py''',
+    '''\.gitleaks\.toml''',
+]
