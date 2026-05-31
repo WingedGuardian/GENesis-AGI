@@ -431,13 +431,13 @@ async def test_reference_store_upsert_preserves_id():
             uid_b = await tools["reference_store"].fn(
                 kind="network",
                 identifier="Container IP",
-                value="10.176.34.207",
+                value="10.0.0.101",
                 description="Incus container running Genesis runtime (rotated)",
             )
             assert uid_b == uid_a  # stable on conflict
 
             row = await mod.knowledge.get(real_db, uid_a)
-            assert "10.176.34.207" in row["body"]
+            assert "10.0.0.101" in row["body"]
             assert "rotated" in row["body"]
             assert row["qdrant_id"] == "qdrant-b"
 
