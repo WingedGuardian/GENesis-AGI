@@ -77,10 +77,20 @@ data/genesis.sql
 src/genesis/modules/automaton_supervisor/
 config/modules/automaton-supervisor.yaml
 
-# Personal/internal content (private by default)
-docs/reflections/
-docs/plans/
-docs/content/
+# Docs are private by default — opt-in for public.
+# Only directories listed with ! are tracked.
+docs/
+!docs/architecture/
+!docs/decisions/
+!docs/case-studies/
+!docs/eval/
+!docs/images/
+!docs/journey/
+!docs/reference/
+!docs/actions/
+# Private files within allowed dirs
+docs/reference/2026-*.md
+docs/reference/backup-history-migration.md
 
 # Career-ops interop (private — lives at ~/.genesis/interop/)
 config/interop_system_prompt.md

@@ -283,7 +283,7 @@ async def test_ingest_upsert_on_duplicate(db_with_schema, mock_store):
     # Re-ingest with the same identifier
     mock_store.store = AsyncMock(return_value="qdrant-test-id-2")
     ext2 = Extraction(
-        content="Container IP is 10.176.34.207 for the Genesis runtime container (rotated)",
+        content="Container IP is 10.0.0.101 for the Genesis runtime container (rotated)",
         extraction_type="entity",
         confidence=0.92,
         entities=["Genesis runtime"],
@@ -303,7 +303,7 @@ async def test_ingest_upsert_on_duplicate(db_with_schema, mock_store):
         "SELECT body FROM knowledge_units WHERE id = ?", (uid1,),
     )
     body = (await cursor.fetchone())[0]
-    assert "10.176.34.207" in body
+    assert "10.0.0.101" in body
     assert "rotated" in body
 
 

@@ -70,16 +70,16 @@ placeholders throughout `src/`, `config/`, `scripts/`, `docs/`, root files:
 
 | Pattern | Replaced with |
 |---|---|
-| `10.176.34.199` | `${OLLAMA_URL:-http://localhost:11434}` or `${OLLAMA_HOST:-localhost}` |
-| `192.168.50.100` | `${LM_STUDIO_HOST:-localhost:1234}` or `${LM_STUDIO_HOST:-localhost}` |
-| `192.168.50.77` | `${VM_HOST:-localhost}` |
-| `192.168.50.x` (any other) | `${LOCAL_HOST:-localhost}` |
-| `10.176.34.206` | `${CONTAINER_IP:-localhost}` |
-| `fd42:e3ba:1142:18bb:216:3eff:fe93:5e04` | `${CONTAINER_IPV6:-not configured}` |
-| `fd4d:77b8:b157:7fdf:be24:11ff:feab:89f5` | `${HOST_IPV6:-not configured}` |
+| `<OLLAMA_IP>` | `${OLLAMA_URL:-http://localhost:11434}` or `${OLLAMA_HOST:-localhost}` |
+| `<LM_STUDIO_IP>` | `${LM_STUDIO_HOST:-localhost:1234}` or `${LM_STUDIO_HOST:-localhost}` |
+| `<HOST_VM_IP>` | `${VM_HOST:-localhost}` |
+| `<LOCAL_NET_IP>` (any other) | `${LOCAL_HOST:-localhost}` |
+| `<CONTAINER_IP>` | `${CONTAINER_IP:-localhost}` |
+| `<CONTAINER_IPV6>` | `${CONTAINER_IPV6:-not configured}` |
+| `<HOST_IPV6>` | `${HOST_IPV6:-not configured}` |
 | `/home/ubuntu/` (except in install scripts) | `${HOME}/` |
 | `America/New_York` | `UTC` |
-| `5070ti` | `local GPU host` |
+| `<GPU_HOST>` | `local GPU host` |
 | `WingedGuardian/Genesis` / `WingedGuardian/genesis-backups` | `YOUR_GITHUB_USER/...` |
 
 **Enforced by**: the global replacement loops in `[5b/9]` and `[5c/9]`,
