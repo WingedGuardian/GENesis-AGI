@@ -44,12 +44,18 @@ ruff check . && pytest -v
 
 ### Standard flow (features, larger changes)
 
-1. **Fork the repo** and clone your fork
-2. **Create a branch**: `git checkout -b <scope>/<description>` (e.g., `feat/memory-recall-timeout`)
-3. **Make your changes** — target ~600 LOC per file, hard cap 1000
-4. **Run lint + tests**: `ruff check . && pytest -v`
-5. **Commit** with a conventional prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
-6. **Open a PR** against `main`
+1. **Open an issue or Discussion first** — describe what you want to change and why.
+   This lets us confirm it fits the project direction before you write code.
+   Skip this for typo fixes or small doc corrections.
+2. **Fork the repo** and clone your fork
+3. **Create a branch**: `git checkout -b <scope>/<description>` (e.g., `feat/memory-recall-timeout`)
+4. **Make your changes** — target ~600 LOC per file, hard cap 1000
+5. **Run lint + tests**: `ruff check . && pytest -v`
+6. **Commit** with a conventional prefix: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`, `chore:`
+7. **Open a PR** against `main` — reference the issue/discussion in the description
+
+PRs without a prior issue or discussion may be closed if the change wasn't
+discussed first. All PRs require a maintainer review before merging.
 
 ## Commit conventions
 
