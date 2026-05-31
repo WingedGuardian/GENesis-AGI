@@ -188,6 +188,53 @@ async def test_reflect_output_preserved_when_writer_gates(db):
     assert result.stored is False     # But flagged as not stored
 
 
+async def test_reflect_records_corpus_entry(db):
+    """Successful reflection records an I/O pair in reflection_corpus."""
+    from genesis.perception.engine import ReflectionEngine
+
+    assembler = AsyncMock()
+    assembler.assemble = AsyncMock(return_value=PromptContext(
+        depth="Light", identity="Genesis", signals_text="cpu: 0.3",
+        tick_number=1, suggested_focus="situation",
+    ))
+    builder = MagicMock()
+    builder.build = MagicMock(return_value="Test prompt for corpus")
+    caller = AsyncMock()
+    caller.call = AsyncMock(return_value=LLMResponse(
+        text='{"tags":["idle"],"salience":0.1,"anomaly":false,"summary":"Normal.","signals_examined":1}',
+        model="gemini-flash", input_tokens=100, output_tokens=50,
+        cost_usd=0.0, latency_ms=200,
+    ))
+    parser = MagicMock()
+    parser.parse = MagicMock(return_value=ParseResult(
+        success=True, output=_micro_output(),
+    ))
+    writer = AsyncMock()
+    writer.write = AsyncMock(return_value=True)
+
+    engine = ReflectionEngine(
+        context_assembler=assembler,
+        prompt_builder=builder,
+        llm_caller=caller,
+        output_parser=parser,
+        result_writer=writer,
+    )
+
+    result = await engine.reflect(Depth.LIGHT, _make_tick(Depth.LIGHT), db=db)
+    assert result.success is True
+
+    # Verify corpus entry was recorded
+    cursor = await db.execute("SELECT * FROM reflection_corpus")
+    rows = await cursor.fetchall()
+    assert len(rows) == 1
+    row = dict(rows[0])
+    assert row["depth"] == "Light"
+    assert row["focus_area"] == "situation"
+    assert row["prompt_text"] == "Test prompt for corpus"
+    assert row["model_used"] == "gemini-flash"
+    assert row["parsed_ok"] == 1
+
+
 async def test_reflect_max_retries_exceeded(db):
     from genesis.perception.engine import ReflectionEngine
 

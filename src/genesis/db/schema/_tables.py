@@ -1219,6 +1219,24 @@ TABLES = {
             PRIMARY KEY (hash, call_site)
         )
     """,
+    # ── Reflection Corpus ────────────────────────────────────────────────
+    "reflection_corpus": """
+        CREATE TABLE IF NOT EXISTS reflection_corpus (
+            id                    TEXT PRIMARY KEY,
+            depth                 TEXT NOT NULL,
+            focus_area            TEXT,
+            prompt_text           TEXT NOT NULL,
+            response_text         TEXT NOT NULL,
+            parsed_ok             INTEGER,
+            model_used            TEXT,
+            quality_score         REAL,
+            quality_label         TEXT,
+            graded_at             TEXT,
+            tick_id               TEXT,
+            created_at            TEXT NOT NULL,
+            used_in_optimization  INTEGER DEFAULT 0
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1446,6 +1464,9 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_user_jobs_status ON user_jobs(status)",
     "CREATE INDEX IF NOT EXISTS idx_user_jobs_next_run ON user_jobs(next_run_at)",
     "CREATE INDEX IF NOT EXISTS idx_user_job_runs_job ON user_job_runs(job_id, started_at DESC)",
+    # reflection corpus
+    "CREATE INDEX IF NOT EXISTS idx_corpus_depth ON reflection_corpus(depth)",
+    "CREATE INDEX IF NOT EXISTS idx_corpus_quality ON reflection_corpus(quality_label)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
