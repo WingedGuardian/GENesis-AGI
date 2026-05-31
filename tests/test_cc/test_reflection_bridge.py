@@ -590,3 +590,179 @@ async def test_bridge_cc_session_id_after_retry(db):
     assert row["pid"] == 50002
     # cc_session_id should be from the retry, not the first run
     assert row["cc_session_id"] == RETRY_CC_SID
+
+
+# ── store_reflection_output: Light skips primary observation ────────
+
+
+@pytest.mark.asyncio
+async def test_store_reflection_output_light_skips_primary(db):
+    """Light depth should NOT create a reflection_output observation."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-light-1",
+        timestamp="2026-05-30T12:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+    output = CCOutput(
+        session_id="refl-light-1",
+        text=json.dumps({
+            "assessment": "All systems normal.",
+            "patterns": [],
+            "recommendations": [],
+            "confidence": 0.7,
+            "focus_area": "situation",
+            "escalate_to_deep": False,
+            "escalation_reason": "",
+            "user_model_updates": [],
+            "surplus_candidates": [],
+        }),
+        model_used="haiku",
+        cost_usd=0.001,
+        input_tokens=100,
+        output_tokens=50,
+        duration_ms=1000,
+        exit_code=0,
+    )
+
+    await store_reflection_output(Depth.LIGHT, tick, output, db=db)
+
+    # reflection_output should NOT exist
+    rows = await db.execute_fetchall(
+        "SELECT type FROM observations WHERE source = 'cc_reflection_light' "
+        "AND type = 'reflection_output'"
+    )
+    assert len(rows) == 0, "Light should not create reflection_output observations"
+
+    # reflection_summary SHOULD exist
+    rows = await db.execute_fetchall(
+        "SELECT type, content FROM observations WHERE source = 'cc_reflection_light' "
+        "AND type = 'reflection_summary'"
+    )
+    assert len(rows) == 1, "Light should still create reflection_summary"
+    assert "All systems normal" in rows[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_store_reflection_output_strategic_keeps_primary(db):
+    """Strategic depth should still create reflection_output observation."""
+    from genesis.cc.reflection_bridge._output import store_reflection_output
+
+    tick = TickResult(
+        tick_id="tick-strat-1",
+        timestamp="2026-05-30T12:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.STRATEGIC,
+        trigger_reason="test",
+    )
+    output = CCOutput(
+        session_id="refl-strat-1",
+        text=json.dumps({
+            "assessment": "Strategic weekly review.",
+            "observations": ["obs1"],
+        }),
+        model_used="opus",
+        cost_usd=0.10,
+        input_tokens=2000,
+        output_tokens=1000,
+        duration_ms=30000,
+        exit_code=0,
+    )
+
+    await store_reflection_output(Depth.STRATEGIC, tick, output, db=db)
+
+    # Strategic SHOULD create reflection_output
+    rows = await db.execute_fetchall(
+        "SELECT type FROM observations WHERE source = 'cc_reflection_strategic' "
+        "AND type = 'reflection_output'"
+    )
+    assert len(rows) == 1, "Strategic should still create reflection_output"
+
+
+# ── build_light_prompt_enriched: prior context injection ────────────
+
+
+@pytest.mark.asyncio
+async def test_light_prompt_includes_prior_context(db):
+    """Light prompt should include prior summary when one exists."""
+    from genesis.cc.reflection_bridge._prompts import build_light_prompt_enriched
+    from genesis.db.crud import observations
+
+    # Create a prior reflection_summary observation
+    await observations.create(
+        db,
+        id=str(uuid.uuid4()),
+        source="cc_reflection_light",
+        type="reflection_summary",
+        content="CPU spike resolved. Memory stable at 60%.",
+        priority="medium",
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+    tick = TickResult(
+        tick_id="tick-ctx-1",
+        timestamp="2026-05-30T13:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+
+    assembler = AsyncMock()
+    ctx = AsyncMock()
+    ctx.signals_text = "error_count=0 [normal]"
+    ctx.cognitive_state = "Idle"
+    ctx.user_profile = None
+    ctx.user_model = None
+    ctx.memory_hits = None
+    assembler.assemble = AsyncMock(return_value=ctx)
+
+    prompt = await build_light_prompt_enriched(
+        tick, "situation", "## Focus: Situation Assessment",
+        db=db, context_assembler=assembler,
+    )
+
+    assert "Previous Light Cycle Finding" in prompt
+    assert "CPU spike resolved" in prompt
+    assert "Do NOT repeat" in prompt
+
+
+@pytest.mark.asyncio
+async def test_light_prompt_no_prior_context(db):
+    """Light prompt should work without prior summary."""
+    from genesis.cc.reflection_bridge._prompts import build_light_prompt_enriched
+
+    tick = TickResult(
+        tick_id="tick-ctx-2",
+        timestamp="2026-05-30T13:00:00",
+        source="scheduled",
+        signals=[],
+        scores=[],
+        classified_depth=Depth.LIGHT,
+        trigger_reason="test",
+    )
+
+    assembler = AsyncMock()
+    ctx = AsyncMock()
+    ctx.signals_text = "error_count=0 [normal]"
+    ctx.cognitive_state = "Idle"
+    ctx.user_profile = None
+    ctx.user_model = None
+    ctx.memory_hits = None
+    assembler.assemble = AsyncMock(return_value=ctx)
+
+    prompt = await build_light_prompt_enriched(
+        tick, "situation", "## Focus: Situation Assessment",
+        db=db, context_assembler=assembler,
+    )
+
+    assert "Previous Light Cycle Finding" not in prompt
+    assert "Perform a Light reflection" in prompt

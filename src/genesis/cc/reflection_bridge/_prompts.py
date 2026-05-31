@@ -488,6 +488,30 @@ async def build_enriched_prompt(
     return "\n".join(parts), bundle.gathered_observation_ids, bundle.gathered_surplus_ids
 
 
+async def _fetch_prior_light_summary(db) -> str | None:
+    """Fetch the most recent light reflection summary for prior context.
+
+    Returns the plain-text assessment from the last ``reflection_summary``
+    observation (source ``cc_reflection_light``), truncated to 400 chars.
+    Returns ``None`` when no prior summary exists.
+    """
+    from genesis.db.crud import observations
+
+    # resolved=None: include all summaries regardless of resolution state.
+    # We want the most recent finding even if it was manually resolved;
+    # the 3-day TTL handles true staleness.
+    results = await observations.query(
+        db,
+        source="cc_reflection_light",
+        type="reflection_summary",
+        limit=1,
+    )
+    if not results:
+        return None
+    content = results[0].get("content", "")
+    return content[:400] if content.strip() else None
+
+
 async def build_light_prompt_enriched(
     tick: TickResult,
     focus: str,
@@ -507,6 +531,15 @@ async def build_light_prompt_enriched(
         f"## Signals\n{ctx.signals_text}",
         f"\n## Current Cognitive State\n{ctx.cognitive_state or '(none)'}",
     ]
+
+    # Prior context: what the previous Light cycle found.
+    # Prevents the LLM from re-discovering unchanged conditions.
+    prior_summary = await _fetch_prior_light_summary(db)
+    if prior_summary:
+        parts.append(
+            f"\n## Previous Light Cycle Finding\n{prior_summary}\n"
+            "Do NOT repeat or rephrase this. Only report what is NEW or CHANGED."
+        )
 
     if focus == "user_impact":
         if ctx.user_profile:
