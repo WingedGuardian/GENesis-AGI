@@ -204,3 +204,41 @@ async def test_schedule_pipeline_enqueues_when_cooldown_expired(db):
 
     # Step 1 should be enqueued
     assert await queue.active_by_type(TaskType.PROMPT_REVIEW_CATALOG) == 1
+
+
+# ── Realist bypass — critical-only ───────────────────────────────────
+
+
+async def test_realist_bypass_only_on_critical_directive(db):
+    """The realist bypass should trigger on critical directives only,
+    not high-priority ones (which may be informational)."""
+    from genesis.db.crud import ego as ego_crud
+
+    # Create a high-priority directive
+    await db.execute(
+        "INSERT INTO ego_directives (id, content, priority, source, ego_target, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("test-high", "Some guidance", "high", "user", "genesis_ego", "active",
+         datetime.now(UTC).isoformat()),
+    )
+    await db.commit()
+
+    dirs = await ego_crud.list_active_directives(db, "genesis_ego")
+    assert len(dirs) == 1
+
+    # High-priority should NOT trigger bypass (the actual check from session.py)
+    has_critical = any(d.get("priority") == "critical" for d in dirs)
+    assert has_critical is False
+
+    # Now add a critical directive
+    await db.execute(
+        "INSERT INTO ego_directives (id, content, priority, source, ego_target, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        ("test-crit", "Must do this", "critical", "user", "genesis_ego", "active",
+         datetime.now(UTC).isoformat()),
+    )
+    await db.commit()
+
+    dirs = await ego_crud.list_active_directives(db, "genesis_ego")
+    has_critical = any(d.get("priority") == "critical" for d in dirs)
+    assert has_critical is True

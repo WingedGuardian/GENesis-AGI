@@ -470,7 +470,9 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             active = await self._queue.active_by_type(TaskType.CODE_AUDIT)
-            if active == 0:
+            if active == 0 and not await self._recently_completed(
+                TaskType.CODE_AUDIT, self._code_audit_hours,
+            ):
                 await self._queue.enqueue(
                     TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
                 )
@@ -1489,12 +1491,12 @@ class SurplusScheduler:
                 pass
 
             for _ in range(3):
-                if not await self.dispatch_once():
-                    break
-                # Refresh heartbeat after each task so long-running
-                # sequences don't trip the 900s watchdog threshold.
+                # Refresh heartbeat before each dispatch so slow or
+                # failing tasks don't trip the 900s watchdog threshold.
                 with contextlib.suppress(Exception):
                     GenesisRuntime.instance().record_job_success("surplus_dispatch")
+                if not await self.dispatch_once():
+                    break
 
             if self._event_bus:
                 await self._event_bus.emit(
