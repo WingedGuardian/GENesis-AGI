@@ -1,0 +1,22 @@
+#!/bin/bash
+# Genesis commit-msg hook — block private infrastructure details in commit messages.
+#
+# Patterns match install-specific IPs, personal email, AWS account IDs,
+# and private hostnames. Covers the gap that gitleaks (file-content only)
+# does not scan commit messages.
+
+PATTERNS='10\.176\.[0-9]|192\.168\.50\.[0-9]|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|046056[0-9]{6}|moonandstar|zorror|assistant1'
+
+if grep -qE "$PATTERNS" "$1"; then
+    echo ""
+    echo "BLOCKED: Commit message contains private infrastructure details."
+    echo ""
+    grep -nE "$PATTERNS" "$1"
+    echo ""
+    echo "Remove private IPs, hostnames, or account IDs from the commit message."
+    echo "If this is a false positive, commit with --no-verify (but think twice)."
+    echo ""
+    exit 1
+fi
+
+exit 0

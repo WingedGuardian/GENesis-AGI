@@ -63,6 +63,7 @@ fi
 # Hooks to sync. Executable hook scripts AND their colocated helpers.
 # Extend this list as Phase 6 adds more hooks.
 HOOKS_TO_SYNC=(
+    "commit-msg"
     "post-commit"
     "pre-commit"
     "pre-push"
