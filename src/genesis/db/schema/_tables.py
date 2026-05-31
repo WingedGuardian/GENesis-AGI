@@ -1312,6 +1312,7 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_surplus_tasks_status ON surplus_tasks(status)",
     "CREATE INDEX IF NOT EXISTS idx_surplus_tasks_priority ON surplus_tasks(priority DESC)",
     "CREATE INDEX IF NOT EXISTS idx_surplus_tasks_tier ON surplus_tasks(compute_tier)",
+    "CREATE INDEX IF NOT EXISTS idx_surplus_tasks_type_completed ON surplus_tasks(task_type, status, completed_at DESC)",
     # awareness loop
     "CREATE INDEX IF NOT EXISTS idx_ticks_depth ON awareness_ticks(classified_depth)",
     "CREATE INDEX IF NOT EXISTS idx_ticks_created ON awareness_ticks(created_at)",

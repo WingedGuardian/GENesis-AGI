@@ -104,6 +104,10 @@ class SurplusQueue:
         """Count tasks that are pending OR running for a given type."""
         return await surplus_tasks.count_active_by_type(self._db, str(task_type))
 
+    async def last_completed_at(self, task_type: TaskType | str) -> str | None:
+        """Most recent ``completed_at`` for *task_type*, or ``None``."""
+        return await surplus_tasks.last_completed_at(self._db, str(task_type))
+
     async def _apply_drive_weight(self, base_priority: float, drive: str) -> float:
         """Multiply base priority by the drive's current weight."""
         cursor = await self._db.execute(

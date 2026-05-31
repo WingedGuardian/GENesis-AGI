@@ -442,6 +442,26 @@ class SurplusScheduler:
                     "Brainstorm check failed with exception",
                 )
 
+    async def _recently_completed(
+        self, task_type, cooldown_hours: int | float,
+    ) -> bool:
+        """Return ``True`` if *task_type* completed within *cooldown_hours*.
+
+        Used on startup to avoid re-enqueuing tasks that already ran
+        recently — prevents Telegram flooding after server restarts.
+        """
+        last = await self._queue.last_completed_at(task_type)
+        if last is None:
+            return False
+        try:
+            completed = datetime.fromisoformat(last)
+            if completed.tzinfo is None:
+                completed = completed.replace(tzinfo=UTC)
+            age_s = (self._clock() - completed).total_seconds()
+            return age_s < cooldown_hours * 3600
+        except (ValueError, TypeError):
+            return False
+
     async def schedule_code_audit(self) -> None:
         """Enqueue a code audit task if none pending/running."""
         if not self._enable_code_audits:
@@ -450,7 +470,9 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             active = await self._queue.active_by_type(TaskType.CODE_AUDIT)
-            if active == 0:
+            if active == 0 and not await self._recently_completed(
+                TaskType.CODE_AUDIT, self._code_audit_hours,
+            ):
                 await self._queue.enqueue(
                     TaskType.CODE_AUDIT, ComputeTier.FREE_API, 0.5, "competence"
                 )
@@ -473,7 +495,9 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             active = await self._queue.active_by_type(TaskType.CODE_INDEX)
-            if active == 0:
+            if active == 0 and not await self._recently_completed(
+                TaskType.CODE_INDEX, self._code_index_hours,
+            ):
                 await self._queue.enqueue(
                     TaskType.CODE_INDEX, ComputeTier.FREE_API, 0.6, "competence"
                 )
@@ -496,7 +520,9 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             active = await self._queue.active_by_type(TaskType.J9_EVAL_BATCH)
-            if active == 0:
+            if active == 0 and not await self._recently_completed(
+                TaskType.J9_EVAL_BATCH, self._j9_eval_batch_hours,
+            ):
                 await self._queue.enqueue(
                     TaskType.J9_EVAL_BATCH, ComputeTier.FREE_API, 0.3, "competence"
                 )
@@ -544,7 +570,9 @@ class SurplusScheduler:
             from genesis.surplus.types import ComputeTier, TaskType
 
             active = await self._queue.active_by_type(TaskType.MODEL_EVAL)
-            if active == 0:
+            if active == 0 and not await self._recently_completed(
+                TaskType.MODEL_EVAL, self._model_eval_hours,
+            ):
                 payload = json.dumps({"model_id": "groq-free"})
                 await self._queue.enqueue(
                     TaskType.MODEL_EVAL, ComputeTier.FREE_API, 0.4, "competence",
@@ -577,7 +605,9 @@ class SurplusScheduler:
             ]
             for task_type, priority, drive in maintenance_tasks:
                 active = await self._queue.active_by_type(task_type)
-                if active == 0:
+                if active == 0 and not await self._recently_completed(
+                    task_type, self._maintenance_hours,
+                ):
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
@@ -667,7 +697,9 @@ class SurplusScheduler:
             ]
             for task_type, priority, drive in analytical_tasks:
                 active = await self._queue.active_by_type(task_type)
-                if active == 0:
+                if active == 0 and not await self._recently_completed(
+                    task_type, self._analytical_hours,
+                ):
                     await self._queue.enqueue(
                         task_type, ComputeTier.FREE_API, priority, drive,
                     )
@@ -751,6 +783,14 @@ class SurplusScheduler:
         # running.  Checks RUNNING too — otherwise a slow pipeline step
         # could allow a duplicate enqueue on the next scheduled cycle.
         if await self._queue.active_by_type(step1.task_type) > 0:
+            return None
+
+        # Cooldown: skip if the pipeline's final step completed recently.
+        # Uses the last step because that's when the full pipeline finished.
+        last_step = defn.steps[-1]
+        if await self._recently_completed(
+            last_step.task_type, self._analytical_hours,
+        ):
             return None
 
         payload = build_initial_payload(pipeline_name, len(defn.steps))
@@ -1441,19 +1481,28 @@ class SurplusScheduler:
         except Exception:
             pass
         try:
-            for _ in range(3):
-                if not await self.dispatch_once():
-                    break
-            if self._event_bus:
-                await self._event_bus.emit(
-                    Subsystem.SURPLUS, Severity.DEBUG,
-                    "heartbeat", "surplus_scheduler dispatch completed",
-                )
+            # Record heartbeat at loop entry so the watchdog sees liveness
+            # even when a single dispatch_once() blocks for 15-30 minutes
+            # (sequential task execution + intake pipeline overhead).
             try:
                 from genesis.runtime import GenesisRuntime
                 GenesisRuntime.instance().record_job_success("surplus_dispatch")
             except Exception:
                 pass
+
+            for _ in range(3):
+                # Refresh heartbeat before each dispatch so slow or
+                # failing tasks don't trip the 900s watchdog threshold.
+                with contextlib.suppress(Exception):
+                    GenesisRuntime.instance().record_job_success("surplus_dispatch")
+                if not await self.dispatch_once():
+                    break
+
+            if self._event_bus:
+                await self._event_bus.emit(
+                    Subsystem.SURPLUS, Severity.DEBUG,
+                    "heartbeat", "surplus_scheduler dispatch completed",
+                )
         except Exception as exc:
             logger.exception("Surplus dispatch loop failed")
             if self._event_bus:
