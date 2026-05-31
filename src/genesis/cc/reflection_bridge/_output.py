@@ -70,12 +70,19 @@ async def store_reflection_output(depth, tick, output, *, db) -> None:
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
 
-    # Cooldown gate: skip primary observation if one of the same type+source
-    # was created within the last 30 minutes.  Still process sub-outputs
-    # (light escalations, deltas, surplus) and strategic focus.
-    skip_primary = await observations.exists_recent_by_type(
-        db, source=source, type="reflection_output", window_minutes=30,
-    )
+    # Light: skip primary observation — reflection_summary (stored below)
+    # is the canonical record.  The primary is a raw CC dump that duplicates
+    # summary content and has no downstream consumers.
+    # Deep uses OutputRouter; Strategic keeps primary (runs rarely).
+    if depth == Depth.LIGHT:
+        skip_primary = True
+    else:
+        # Cooldown gate: skip primary observation if one of the same
+        # type+source was created within the last 30 minutes.  Still process
+        # sub-outputs (light escalations, deltas, surplus) and strategic focus.
+        skip_primary = await observations.exists_recent_by_type(
+            db, source=source, type="reflection_output", window_minutes=30,
+        )
     if skip_primary:
         logger.debug("Reflection output cooldown: skipping (recent %s exists within 30m)", source)
     else:
