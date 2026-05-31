@@ -97,6 +97,7 @@ async def test_no_unexpected_tables(db):
         "task_type_watermarks",
         "prompt_versions",
         "eval_subsystem_grades",
+        "reflection_corpus",
     }
     for table in tables:
         assert table in known, f"Unexpected table: {table}"

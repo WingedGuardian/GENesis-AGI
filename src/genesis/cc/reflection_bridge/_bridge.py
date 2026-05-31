@@ -446,6 +446,23 @@ class CCReflectionBridge:
                 output_tokens=output.output_tokens,
             )
 
+        # 4b. Record corpus entry (prompt + raw output, before gating)
+        try:
+            from genesis.cc.reflection_bridge._prompts import _light_focus_area
+            from genesis.db.crud import reflection_corpus
+            _focus = _light_focus_area(tick) if depth == Depth.LIGHT else None
+            await reflection_corpus.record(
+                db,
+                depth=depth.value,
+                prompt_text=prompt,
+                response_text=output.text or "",
+                tick_id=getattr(tick, "tick_id", None),
+                focus_area=_focus,
+                model_used=output.model_used or str(model),
+            )
+        except Exception:
+            logger.debug("Corpus recording failed (table may not exist yet)", exc_info=True)
+
         # 5. Route output
         routing_failed = False
         if self._output_router and depth == Depth.DEEP:

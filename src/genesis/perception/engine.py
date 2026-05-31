@@ -91,6 +91,13 @@ class ReflectionEngine:
                 reason="all_providers_exhausted",
             )
 
+        # 3b. Record corpus entry (prompt + raw response, before gating)
+        corpus_id = await self._record_corpus(
+            depth_str, prompt, response, tick,
+            focus_area=getattr(context, "suggested_focus", None),
+            db=db,
+        )
+
         # 4. Parse output (with retries)
         parsed = self._parser.parse(response, depth_str)
         retries = 0
@@ -112,10 +119,19 @@ class ReflectionEngine:
             parsed = self._parser.parse(response, depth_str)
 
         if not parsed.success:
+            # Backfill corpus parse status
+            if corpus_id:
+                from genesis.db.crud import reflection_corpus
+                await reflection_corpus.mark_parsed(db, corpus_id, parsed_ok=False)
             return ReflectionResult(
                 success=False,
                 reason="max_retries_exceeded",
             )
+
+        # Backfill corpus parse status
+        if corpus_id:
+            from genesis.db.crud import reflection_corpus
+            await reflection_corpus.mark_parsed(db, corpus_id, parsed_ok=True)
 
         # 5. Write results (returns False if gated by salience/dedup)
         stored = await self._writer.write(parsed.output, depth, tick, db=db)
@@ -123,3 +139,29 @@ class ReflectionEngine:
         # Always return the parsed output — Telegram delivery should not
         # be coupled to observation storage gates (PR #101 rule).
         return ReflectionResult(success=True, output=parsed.output, stored=stored)
+
+    @staticmethod
+    async def _record_corpus(
+        depth: str,
+        prompt: str,
+        response,
+        tick,
+        *,
+        focus_area: str | None,
+        db,
+    ) -> str | None:
+        """Record prompt/response pair in reflection_corpus for quality tracking."""
+        try:
+            from genesis.db.crud import reflection_corpus
+            return await reflection_corpus.record(
+                db,
+                depth=depth,
+                prompt_text=prompt,
+                response_text=response.text,
+                tick_id=tick.tick_id,
+                focus_area=focus_area,
+                model_used=response.model,
+            )
+        except Exception:
+            logger.debug("Corpus recording failed (table may not exist yet)", exc_info=True)
+            return None
