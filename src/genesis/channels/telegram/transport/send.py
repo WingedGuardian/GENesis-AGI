@@ -27,6 +27,7 @@ from genesis.channels.telegram.transport.send_safety import (
 logger = logging.getLogger(__name__)
 
 _MAX_RETRIES = 3
+_TG_MAX_LEN = 4096
 
 
 async def safe_send_message(
@@ -41,8 +42,27 @@ async def safe_send_message(
 ) -> Any:
     """Send a message with safe retry logic.
 
-    Returns the sent Message object, or None if all attempts failed.
+    Automatically splits messages that exceed Telegram's 4096-character
+    limit.  Returns the last sent Message object, or None if all attempts
+    failed.  reply_markup is attached to the LAST chunk only.
     """
+    if len(text) > _TG_MAX_LEN:
+        # Split into chunks — use the existing code-block-aware splitter
+        from genesis.channels.telegram._handler_helpers import _split_for_telegram
+
+        chunks = _split_for_telegram(text, _TG_MAX_LEN)
+        last_msg = None
+        for i, chunk in enumerate(chunks):
+            is_last = i == len(chunks) - 1
+            last_msg = await safe_send_message(
+                bot, chat_id, chunk,
+                parse_mode=parse_mode,
+                message_thread_id=message_thread_id,
+                reply_markup=reply_markup if is_last else None,
+                max_retries=max_retries,
+            )
+        return last_msg
+
     for attempt in range(max_retries):
         try:
             kwargs: dict[str, Any] = {

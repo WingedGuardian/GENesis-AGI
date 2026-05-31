@@ -146,6 +146,7 @@ class TelegramAdapterV2(ChannelAdapter):
             .read_timeout(30.0)
             .write_timeout(30.0)
             .connect_timeout(10.0)
+            .concurrent_updates(True)
             .build()
         )
 

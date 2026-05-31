@@ -575,7 +575,7 @@ async def get_standing(
     prio_placeholders = ",".join("?" for _ in priority_filter)
     sql = (
         "SELECT id, source, type, category, content, priority, "
-        "created_at, surfaced_count "
+        "created_at, surfaced_at, surfaced_count "
         f"FROM observations WHERE surfaced_count >= ? AND resolved = 0 "
         f"AND priority IN ({prio_placeholders})"
     )
@@ -598,7 +598,7 @@ async def get_standing(
         {
             "id": r[0], "source": r[1], "type": r[2], "category": r[3],
             "content": r[4], "priority": r[5], "created_at": r[6],
-            "surfaced_count": r[7],
+            "surfaced_at": r[7], "surfaced_count": r[8],
         }
         for r in rows
     ]

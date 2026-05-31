@@ -548,6 +548,7 @@ class MorningReportGenerator:
         """Return observations surfaced 3+ times but still unresolved.
 
         These are known conditions — demoted to end of report.
+        Includes last_surfaced_at so the LLM can judge staleness.
         """
         from genesis.db.crud.observations import get_standing
 
@@ -561,10 +562,26 @@ class MorningReportGenerator:
         if not items:
             return None
 
+        # Provide last report timestamp so LLM can compress unchanged items
+        cursor = await self._db.execute(
+            "SELECT created_at FROM outreach_history "
+            "WHERE signal_type = 'morning_report' "
+            "ORDER BY created_at DESC LIMIT 1 OFFSET 1"  # Previous report, not this one
+        )
+        row = await cursor.fetchone()
+        last_report_at = row[0] if row else None
+
         lines = []
+        if last_report_at:
+            lines.append(f"(Last report: {last_report_at[:16]})")
         for obs in items:
             content = obs["content"][:150].replace("\n", " ")
             count = obs.get("surfaced_count", 0)
             age = _relative_age(obs.get("created_at", ""))
-            lines.append(f"- {content} (surfaced {count}x, {age})")
+            last_surfaced = obs.get("surfaced_at", "")
+            changed_since_last = (
+                last_surfaced > last_report_at if last_report_at and last_surfaced else True
+            )
+            status = "" if changed_since_last else " [unchanged]"
+            lines.append(f"- {content} (surfaced {count}x, {age}){status}")
         return "\n".join(lines)
