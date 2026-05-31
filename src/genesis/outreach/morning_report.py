@@ -571,6 +571,17 @@ class MorningReportGenerator:
         row = await cursor.fetchone()
         last_report_at = row[0] if row else None
 
+        # Parse last_report_at to datetime for correct comparison
+        # (outreach_history uses space-separated format, surfaced_at uses ISO T-format)
+        last_report_dt = None
+        if last_report_at:
+            try:
+                last_report_dt = datetime.fromisoformat(last_report_at)
+                if last_report_dt.tzinfo is None:
+                    last_report_dt = last_report_dt.replace(tzinfo=UTC)
+            except (ValueError, TypeError):
+                pass
+
         lines = []
         if last_report_at:
             lines.append(f"(Last report: {last_report_at[:16]})")
@@ -579,9 +590,15 @@ class MorningReportGenerator:
             count = obs.get("surfaced_count", 0)
             age = _relative_age(obs.get("created_at", ""))
             last_surfaced = obs.get("surfaced_at", "")
-            changed_since_last = (
-                last_surfaced > last_report_at if last_report_at and last_surfaced else True
-            )
+            changed_since_last = True
+            if last_report_dt and last_surfaced:
+                try:
+                    surfaced_dt = datetime.fromisoformat(last_surfaced)
+                    if surfaced_dt.tzinfo is None:
+                        surfaced_dt = surfaced_dt.replace(tzinfo=UTC)
+                    changed_since_last = surfaced_dt > last_report_dt
+                except (ValueError, TypeError):
+                    pass
             status = "" if changed_since_last else " [unchanged]"
             lines.append(f"- {content} (surfaced {count}x, {age}){status}")
         return "\n".join(lines)

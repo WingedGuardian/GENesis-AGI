@@ -51,6 +51,12 @@ async def safe_send_message(
         from genesis.channels.telegram._handler_helpers import _split_for_telegram
 
         chunks = _split_for_telegram(text, _TG_MAX_LEN)
+        if not chunks:
+            logger.error(
+                "Message splitter returned empty list for %d-char message — "
+                "sending truncated fallback", len(text),
+            )
+            chunks = [text[:_TG_MAX_LEN]]
         last_msg = None
         for i, chunk in enumerate(chunks):
             is_last = i == len(chunks) - 1

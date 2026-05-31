@@ -1431,6 +1431,15 @@ class UserEgoContextBuilder:
             # Exclude Genesis-internal observations — infrastructure, system_health,
             # performance, maintenance, security are genesis_ego's jurisdiction.
             # NULL categories pass through (ambiguous, not definitively Genesis-internal).
+            # Uses canonical INTERNAL_OBS_TYPES from observations.py for type exclusion.
+            from genesis.db.crud.observations import INTERNAL_OBS_TYPES
+
+            _GENESIS_CATEGORIES = (
+                "system_health", "infrastructure", "performance",
+                "maintenance", "security",
+            )
+            cat_placeholders = ",".join("?" for _ in _GENESIS_CATEGORIES)
+            type_placeholders = ",".join("?" for _ in INTERNAL_OBS_TYPES)
             cursor = await self._db.execute(
                 "SELECT type, category, COUNT(*) AS cnt, "
                 "  MAX(content) AS sample, MAX(created_at) AS latest "
@@ -1438,20 +1447,13 @@ class UserEgoContextBuilder:
                 "WHERE created_at >= datetime('now', '-3 days') "
                 "  AND resolved = 0 "
                 "  AND (category IS NULL "
-                "       OR category NOT IN "
-                "       ('system_health', 'infrastructure', 'performance', "
-                "        'maintenance', 'security')) "
-                "  AND type NOT IN "
-                "  ('awareness_tick', 'micro_reflection', 'light_reflection', "
-                "   'deep_reflection', 'reflection_observation', "
-                "   'reflection_summary', 'reflection_output', "
-                "   'memory_operation', 'memory_index', "
-                "   'version_change', 'genesis_version_change', "
-                "   'genesis_version_baseline', 'build_state') "
+                f"       OR category NOT IN ({cat_placeholders})) "
+                f"  AND type NOT IN ({type_placeholders}) "
                 "GROUP BY type, category "
                 "HAVING cnt >= 3 "
                 "ORDER BY cnt DESC "
-                "LIMIT 5"
+                "LIMIT 5",
+                (*_GENESIS_CATEGORIES, *INTERNAL_OBS_TYPES),
             )
             rows = await cursor.fetchall()
         except Exception:
