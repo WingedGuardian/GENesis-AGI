@@ -272,7 +272,7 @@ async def ego_goal_update(
         timeline: New timeline (optional)
         status: Set to 'achieved' or 'abandoned' to close the goal (optional)
         goal_type: milestone or continuous (optional)
-        cadence_days: Review cadence in days, 0 to clear / use global default (optional)
+        cadence_days: Review cadence in days (>0 to set, <0 to clear to global default, 0 = no change)
     """
     if category and category not in _VALID_GOAL_CATEGORIES:
         return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
@@ -359,6 +359,9 @@ async def ego_goal_update(
             fields["goal_type"] = goal_type
         if cadence_days > 0:
             fields["cadence_days"] = cadence_days
+        elif cadence_days < 0:
+            # Negative = explicit clear, revert to global default
+            fields["cadence_days"] = None
         if not fields:
             return {"status": "error", "reason": "no fields to update"}
 

@@ -251,12 +251,19 @@ async def check_completion_cascade(
     if parent.get("status") == "achieved":
         return None
 
-    # Check all children of this parent
+    # Check all children of this parent (exclude abandoned — they don't
+    # block cascade since they're intentionally dropped from scope)
     children = await list_children(db, parent_id, include_achieved=True)
     if not children:
         return None
 
-    all_achieved = all(c.get("status") == "achieved" for c in children)
+    live_children = [
+        c for c in children if c.get("status") != "abandoned"
+    ]
+    if not live_children:
+        return None
+
+    all_achieved = all(c.get("status") == "achieved" for c in live_children)
     if not all_achieved:
         return None
 
