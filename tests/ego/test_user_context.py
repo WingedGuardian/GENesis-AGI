@@ -943,3 +943,71 @@ class TestUserEgoContextBuilder:
         builder._current_focus_id = "goal-123"
         result = await builder._goal_deep_dive_section(depth="skip")
         assert result == ""
+
+    # ── Goal Hierarchy Rendering ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_hierarchy_rendering(self, db, mock_health_data, capabilities):
+        """Goals with parent_goal_id render as indented children."""
+        await db.execute(TABLES["user_goals"])
+        now = "2026-05-30T12:00:00Z"
+        # Parent goal
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("parent-1", "Build Platform", "project", "high", "active",
+             now, now),
+        )
+        # Child goal
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, parent_goal_id, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("child-1", "Ship API", "project", "medium", "active",
+             "parent-1", now, now),
+        )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder._user_goals_section()
+
+        assert "Build Platform" in result
+        assert "Ship API" in result
+        assert "↳" in result  # Child rendered with indent marker
+
+    @pytest.mark.asyncio
+    async def test_deep_dive_shows_subgoals(
+        self, db, mock_health_data, capabilities,
+    ):
+        """Deep dive on a parent shows its subgoals."""
+        await db.execute(TABLES["user_goals"])
+        now = "2026-05-30T12:00:00Z"
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("parent-dd", "Master Plan", "project", "high", "active",
+             now, now),
+        )
+        await db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, parent_goal_id, "
+            " created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ("child-dd", "Phase 1", "project", "medium", "active",
+             "parent-dd", now, now),
+        )
+        await db.commit()
+
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        builder._current_focus_id = "parent-dd"
+        result = await builder._goal_deep_dive_section()
+
+        assert "Subgoals" in result
+        assert "Phase 1" in result

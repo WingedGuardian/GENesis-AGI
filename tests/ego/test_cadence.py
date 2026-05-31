@@ -980,3 +980,38 @@ class TestGoalStaleness:
         goal_cadence._config.goal_review_staleness_days = 10
         await goal_cadence._check_stale_goals()
         assert not goal_cadence._signal_queue.empty()
+
+    async def test_per_goal_cadence_days(self, goal_cadence, goal_db):
+        """Goal with cadence_days=7 triggers at 8 days stale."""
+        goal_cadence._config.goal_review_staleness_days = 30  # global: 30d
+        eight_days_ago = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at, "
+            " goal_type, cadence_days) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("goal-cad1", "Weekly Review Goal", "project", "high", "active",
+             eight_days_ago, eight_days_ago, "milestone", 7),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        # Should trigger: 8 days > cadence_days=7, despite global=30
+        assert not goal_cadence._signal_queue.empty()
+
+    async def test_per_goal_cadence_falls_back(self, goal_cadence, goal_db):
+        """Goal without cadence_days uses global threshold."""
+        goal_cadence._config.goal_review_staleness_days = 30
+        eight_days_ago = (datetime.now(UTC) - timedelta(days=8)).isoformat()
+        await goal_db.execute(
+            "INSERT INTO user_goals "
+            "(id, title, category, priority, status, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("goal-cad2", "No Cadence Goal", "project", "medium", "active",
+             eight_days_ago, eight_days_ago),
+        )
+        await goal_db.commit()
+
+        await goal_cadence._check_stale_goals()
+        # Should NOT trigger: 8 days < global 30
+        assert goal_cadence._signal_queue.empty()
