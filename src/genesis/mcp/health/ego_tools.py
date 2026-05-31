@@ -20,6 +20,7 @@ _VALID_DIRECTIVE_PRIORITIES = frozenset({"low", "normal", "high", "critical"})
 _VALID_EGO_TARGETS = frozenset({"user_ego", "genesis_ego"})
 _VALID_GOAL_CATEGORIES = frozenset({"career", "project", "learning", "relationship", "financial", "other"})
 _VALID_GOAL_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
+_VALID_GOAL_TYPES = frozenset({"milestone", "continuous"})
 
 
 def _get_db_path():
@@ -153,11 +154,15 @@ async def ego_goal_create(
     priority: str = "medium",
     description: str = "",
     timeline: str = "",
+    parent_goal_id: str = "",
+    goal_type: str = "milestone",
+    cadence_days: int = 0,
 ) -> dict:
     """Create a new user goal for the ego system.
 
     Goals are visible to the ego in its thinking cycles. The ego considers
-    goals when deciding what to propose.
+    goals when deciding what to propose. Use parent_goal_id to create
+    subgoals under an existing goal.
 
     Args:
         title: Goal title (concise, actionable)
@@ -165,11 +170,16 @@ async def ego_goal_create(
         priority: low, medium, high, or critical
         description: Detailed description of the goal
         timeline: Expected timeline (e.g., "Q2 2026")
+        parent_goal_id: ID of the parent goal (for subgoals)
+        goal_type: milestone (achievable) or continuous (ongoing)
+        cadence_days: Review frequency in days (0 = use global default)
     """
     if category not in _VALID_GOAL_CATEGORIES:
         return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
     if priority not in _VALID_GOAL_PRIORITIES:
         return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_GOAL_PRIORITIES)}"}
+    if goal_type not in _VALID_GOAL_TYPES:
+        return {"status": "error", "reason": f"Invalid goal_type: {goal_type!r}. Must be 'milestone' or 'continuous'"}
 
     import aiosqlite
 
@@ -178,6 +188,13 @@ async def ego_goal_create(
     db_path = _get_db_path()
     async with aiosqlite.connect(str(db_path)) as db:
         db.row_factory = aiosqlite.Row
+
+        # Validate parent exists if specified
+        if parent_goal_id:
+            parent = await user_goals.get_by_id(db, parent_goal_id)
+            if not parent:
+                return {"status": "error", "reason": f"Parent goal {parent_goal_id!r} not found"}
+
         goal_id = await user_goals.create(
             db,
             title=title,
@@ -185,6 +202,9 @@ async def ego_goal_create(
             priority=priority,
             description=description,
             timeline=timeline or None,
+            parent_goal_id=parent_goal_id or None,
+            goal_type=goal_type,
+            cadence_days=cadence_days if cadence_days > 0 else None,
             confidence=0.9,
         )
 
@@ -194,6 +214,8 @@ async def ego_goal_create(
         "title": title,
         "category": category,
         "priority": priority,
+        "parent_goal_id": parent_goal_id or None,
+        "goal_type": goal_type,
     }
 
 
@@ -234,10 +256,12 @@ async def ego_goal_update(
     description: str = "",
     timeline: str = "",
     status: str = "",
+    goal_type: str = "",
+    cadence_days: int = 0,
 ) -> dict:
     """Update an existing user goal, or mark it as achieved/abandoned.
 
-    Pass only the fields you want to change. Empty strings are ignored.
+    Pass only the fields you want to change. Empty strings / zero are ignored.
 
     Args:
         goal_id: The goal ID to update
@@ -247,6 +271,8 @@ async def ego_goal_update(
         description: New description (optional)
         timeline: New timeline (optional)
         status: Set to 'achieved' or 'abandoned' to close the goal (optional)
+        goal_type: milestone or continuous (optional)
+        cadence_days: Review cadence in days (>0 to set, <0 to clear to global default, 0 = no change)
     """
     if category and category not in _VALID_GOAL_CATEGORIES:
         return {"status": "error", "reason": f"Invalid category: {category!r}. Must be one of: {sorted(_VALID_GOAL_CATEGORIES)}"}
@@ -254,6 +280,8 @@ async def ego_goal_update(
         return {"status": "error", "reason": f"Invalid priority: {priority!r}. Must be one of: {sorted(_VALID_GOAL_PRIORITIES)}"}
     if status and status not in ("achieved", "abandoned"):
         return {"status": "error", "reason": f"Invalid status: {status!r}. Must be 'achieved' or 'abandoned'"}
+    if goal_type and goal_type not in _VALID_GOAL_TYPES:
+        return {"status": "error", "reason": f"Invalid goal_type: {goal_type!r}. Must be 'milestone' or 'continuous'"}
 
     import aiosqlite
 
@@ -265,7 +293,53 @@ async def ego_goal_update(
 
         if status == "achieved":
             await user_goals.mark_achieved(db, goal_id)
-            return {"status": "achieved", "goal_id": goal_id}
+
+            # Completion cascade: check if all siblings are achieved
+            cascade_info = None
+            try:
+                cascade = await user_goals.check_completion_cascade(
+                    db, goal_id,
+                )
+                if cascade:
+                    import uuid
+
+                    from genesis.db.crud import observations as obs_crud
+
+                    await obs_crud.create(
+                        db,
+                        id=str(uuid.uuid4()),
+                        source="goal_cascade",
+                        type="goal_recommendation",
+                        content=(
+                            f"All subgoals of '{cascade['parent_title']}' "
+                            f"are now achieved. Consider marking the parent "
+                            f"goal complete (id={cascade['parent_id']})."
+                        ),
+                        priority="medium",
+                        category="goal_review",
+                        created_at=datetime.now(UTC).isoformat(),
+                    )
+                    await user_goals.add_progress_note(
+                        db,
+                        cascade["parent_id"],
+                        "All subgoals achieved — cascade recommendation created",
+                    )
+                    cascade_info = cascade
+                    logger.info(
+                        "Goal cascade: all children of %s achieved",
+                        cascade["parent_id"][:12],
+                    )
+            except Exception:
+                logger.warning(
+                    "Goal cascade check failed for %s", goal_id,
+                    exc_info=True,
+                )
+
+            result: dict = {"status": "achieved", "goal_id": goal_id}
+            if cascade_info:
+                result["cascade"] = cascade_info
+            return result
+
         if status == "abandoned":
             await user_goals.mark_abandoned(db, goal_id)
             return {"status": "abandoned", "goal_id": goal_id}
@@ -281,6 +355,13 @@ async def ego_goal_update(
             fields["priority"] = priority
         if timeline:
             fields["timeline"] = timeline
+        if goal_type:
+            fields["goal_type"] = goal_type
+        if cadence_days > 0:
+            fields["cadence_days"] = cadence_days
+        elif cadence_days < 0:
+            # Negative = explicit clear, revert to global default
+            fields["cadence_days"] = None
         if not fields:
             return {"status": "error", "reason": "no fields to update"}
 

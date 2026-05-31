@@ -784,9 +784,10 @@ class EgoSession:
             directive += (
                 "\n\nThis is a GOAL REVIEW cycle. Assess progress on the "
                 "focused goal, identify blockers, and propose goal-advancing "
-                "actions. Include the goal_assessment field with your analysis "
-                "of the goal's current state. Include "
-                "goal_status_recommendation: one of "
+                "actions. If this goal is too broad, suggest specific subgoals "
+                "in your goal_assessment that the user can create. Include "
+                "the goal_assessment field with your analysis of the goal's "
+                "current state. Include goal_status_recommendation: one of "
                 '"continue", "pause", "deprioritize", or "close".'
             )
         elif focus.focus_type == "reactive":

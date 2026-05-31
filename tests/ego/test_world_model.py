@@ -76,6 +76,109 @@ class TestUserGoalsCRUD:
         assert career[0]["category"] == "career"
 
 
+# -- Goal hierarchy / cascade tests --
+
+
+class TestGoalHierarchy:
+    """Tests for goal decomposition: list_children + completion cascade."""
+
+    @pytest.mark.asyncio
+    async def test_list_children_returns_active(self, db):
+        """list_children returns active children of a parent."""
+        parent_id = await user_goals.create(
+            db, title="Parent Goal", category="project",
+        )
+        child1 = await user_goals.create(
+            db, title="Child 1", category="project",
+            parent_goal_id=parent_id,
+        )
+        child2 = await user_goals.create(
+            db, title="Child 2", category="project",
+            parent_goal_id=parent_id,
+        )
+        children = await user_goals.list_children(db, parent_id)
+        assert len(children) == 2
+        child_ids = {c["id"] for c in children}
+        assert child1 in child_ids
+        assert child2 in child_ids
+
+    @pytest.mark.asyncio
+    async def test_list_children_empty(self, db):
+        """list_children returns empty for goal without children."""
+        goal_id = await user_goals.create(
+            db, title="Leaf Goal", category="project",
+        )
+        children = await user_goals.list_children(db, goal_id)
+        assert children == []
+
+    @pytest.mark.asyncio
+    async def test_cascade_all_achieved(self, db):
+        """Cascade returns parent info when all children are achieved."""
+        parent_id = await user_goals.create(
+            db, title="Parent", category="project", goal_type="milestone",
+        )
+        child1 = await user_goals.create(
+            db, title="Child A", category="project",
+            parent_goal_id=parent_id,
+        )
+        child2 = await user_goals.create(
+            db, title="Child B", category="project",
+            parent_goal_id=parent_id,
+        )
+        await user_goals.mark_achieved(db, child1)
+        await user_goals.mark_achieved(db, child2)
+
+        result = await user_goals.check_completion_cascade(db, child2)
+        assert result is not None
+        assert result["parent_id"] == parent_id
+        assert result["parent_title"] == "Parent"
+
+    @pytest.mark.asyncio
+    async def test_cascade_not_all_achieved(self, db):
+        """Cascade returns None when some children are still active."""
+        parent_id = await user_goals.create(
+            db, title="Parent", category="project", goal_type="milestone",
+        )
+        child1 = await user_goals.create(
+            db, title="Done", category="project",
+            parent_goal_id=parent_id,
+        )
+        await user_goals.create(
+            db, title="Still Active", category="project",
+            parent_goal_id=parent_id,
+        )
+        await user_goals.mark_achieved(db, child1)
+
+        result = await user_goals.check_completion_cascade(db, child1)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cascade_continuous_parent_skips(self, db):
+        """Cascade returns None for continuous parent goals."""
+        parent_id = await user_goals.create(
+            db, title="Ongoing", category="project", goal_type="continuous",
+        )
+        child = await user_goals.create(
+            db, title="Subtask", category="project",
+            parent_goal_id=parent_id,
+        )
+        await user_goals.mark_achieved(db, child)
+
+        result = await user_goals.check_completion_cascade(db, child)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cascade_no_parent(self, db):
+        """Cascade returns None for goal without parent."""
+        goal_id = await user_goals.create(
+            db, title="Solo", category="project",
+        )
+        await user_goals.mark_achieved(db, goal_id)
+
+        result = await user_goals.check_completion_cascade(db, goal_id)
+        assert result is None
+
+
 # -- Contact CRUD tests --
 
 
