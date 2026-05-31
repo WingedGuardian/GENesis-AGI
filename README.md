@@ -8,7 +8,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.12-blue" alt="Python 3.12">
-  <img src="https://img.shields.io/badge/LOC-100%2C000%2B-informational" alt="Lines of Code">
+  <img src="https://img.shields.io/badge/LOC-150%2C000%2B-informational" alt="Lines of Code">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <a href="#get-involved"><img src="https://img.shields.io/badge/contributors-welcome-brightgreen" alt="Contributors Welcome"></a>
 </p>
@@ -46,7 +46,7 @@ But now? **Personal AGI is here.**
 
 Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs.
 
-Open source. 100,000 lines. Clone it. Run it. Tell me I'm wrong.
+Open source. 150,000 lines. Clone it. Run it. Tell me I'm wrong.
 
 <details>
 <summary><i>But wait — is this really AGI?</i></summary>
@@ -94,7 +94,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## What this is
 
-Genesis is a cognitive architecture that makes the AGI claim explicitly — and backs it up with 100,000 lines of open-source code you can read, run, and challenge.
+Genesis is a cognitive architecture that makes the AGI claim explicitly — and backs it up with 150,000 lines of open-source code you can read, run, and challenge.
 
 Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
 
@@ -106,7 +106,7 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
   <i>"Claude Code already had the brain. We gave it the heart."</i>
 </p>
 
-60+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
+50+ subsystems. 4 MCP servers. 2 vector databases. Every design decision made by one engineer working full-stack across infrastructure, cognition, and integration layers. That's the point. If one developer with the right cognitive infrastructure can build and run a system this complex, imagine what a team becomes capable of.
 
 <p align="center">
   <img src="docs/images/genesis-architecture.png" alt="Genesis cognitive architecture — three concentric rings" width="820">
@@ -199,7 +199,7 @@ Four cognitive layers, running continuously:
 ```mermaid
 graph TB
     subgraph "Cognitive architecture"
-        EGO["Ego<br/><i>Two autonomous egos: decisions,<br/>proposals, execution</i>"]
+        EGO["Ego<br/><i>Two egos: signal-driven focus,<br/>goal tracking, autonomous action</i>"]
         AL["Awareness loop<br/><i>5-min tick, 18+ signals,<br/>zero LLM cost</i>"]
         RE["Reflection engine<br/><i>Micro / Light / Deep / Strategic<br/>with relevance tagging</i>"]
         SL["Self-learning loop<br/><i>Dopaminergic feedback</i>"]
@@ -212,7 +212,7 @@ graph TB
 
     subgraph "Memory and data"
         QD["Qdrant<br/><i>2 vector collections</i>"]
-        SQ["SQLite + FTS5<br/><i>60+ tables</i>"]
+        SQ["SQLite + FTS5"]
         MCP["4 MCP servers<br/><i>memory / recon / health / outreach</i>"]
     end
 
@@ -236,6 +236,8 @@ graph TB
 Every 5 minutes, the system collects 18+ signals across all its inputs -- entirely programmatic, zero LLM cost. Signals get classified by how much thinking depth they warrant. Routine health checks get a quick pass. Novel patterns in user behavior get a deep analysis. Accumulated smaller reflections trigger strategic synthesis. The depth decision is automatic, and each cognitive layer feeds the next.
 
 On top of this sits the ego layer: two autonomous decision-makers that read the system's observations and act on them. The User Ego (running Opus) focuses on user goals, activity patterns, and pending work. The Genesis Ego (running Sonnet) handles system health, infrastructure, and operational decisions. Each one assembles its own context from filtered observations, proposes actions via Telegram, and dispatches Claude Code sessions to execute approved work. They run on adaptive cadence -- more frequently when things are active, backing off when they're not.
+
+The ego doesn't just observe -- it runs a unified cognitive loop. Signals (a stale goal, a conversation, a system event) enter a queue. A focus selector picks what matters most. Context gets assembled for that focus. The ego thinks, proposes, acts -- cycle repeats. What you experience: Genesis notices when your goals go stale, reviews them with full context, tells you when subgoals complete a milestone, and adjusts its own review frequency per goal. It doesn't wait for you to ask "how's that project going?" -- it already checked.
 
 When Genesis isn't handling a user request, it doesn't sit idle. It researches topics you'll ask about tomorrow. It audits its own memory for contradictions and staleness. It tests whether its learned procedures still hold up. It works through problems it got stuck on earlier. The system you come back to on Monday is measurably sharper than the one you left on Friday.
 
@@ -301,7 +303,7 @@ Activation scoring ensures relevance isn't just cosine similarity — it's time-
 
 **Session extraction:** After conversations end, a pipeline extracts what mattered — entities, decisions, evaluations, action items, relationships — each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
 
-**Wing taxonomy:** Memory is classified into 7 structural domains (memory, learning, routing, infrastructure, channels, autonomy, general) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
+**Wing taxonomy:** Memory is classified into 10 structural domains (memory, learning, routing, infrastructure, channels, autonomy, dev_workflow, research, integrations, career) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
 
 After six months of operation, Genesis doesn't just have more memories — it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. That's what separates this from a chatbot with a vector database.
 
@@ -376,6 +378,8 @@ Trust is granular, not binary. First failure in a category triggers demotion —
 
 The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate -- one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
 
+**Goal-driven behavior:** Genesis tracks your goals -- milestones and ongoing objectives alike -- and proactively reviews them when they go stale. Goals decompose into subgoals with tracked completion. When all subgoals of a milestone are achieved, Genesis surfaces it. Each goal can have its own review cadence, or fall back to a global default. You don't manage a task tracker -- Genesis manages the goals and tells you when something needs your attention or when something is done.
+
 Four drives shape behavior beneath the autonomy system -- Preservation, Curiosity, Cooperation, Competence -- each a sensitivity multiplier, each in tension with the others. The drives adapt based on evidence from the learning loop. The tension is the point.
 
 The user has override authority. Always.
@@ -437,7 +441,7 @@ The `/integrate-module` skill handles onboarding automatically — discovery, co
 
 ## What's inside
 
-60+ subsystems organized into seven layers:
+50+ subsystems organized into seven layers:
 
 ```mermaid
 graph LR
@@ -512,7 +516,7 @@ V3 was built in 10 phases over seven months: from data schemas to full autonomou
 
 ## Where it's headed
 
-V3 is the foundation -- cognitive architecture complete, ego module live, running in production. What comes next is where it gets ambitious enough to need a community behind it.
+V3 is the foundation -- cognitive architecture complete, unified ego loop live, goal-driven behavior active, running in production. What comes next is where it gets ambitious enough to need a community behind it.
 
 ### V3.x -- Voice interface & ambient awareness
 
@@ -525,17 +529,17 @@ Genesis has memory, learning, and autonomy -- but only through text. The next st
 
 The voice interface is built on Home Assistant as the frontend (wake word, mic, speaker) with Genesis as the cognitive backend. Ambient awareness adds a passive listening mode with a dedicated memory tier, privacy filtering, and a lightweight attention system that decides what deserves Genesis's attention in real time.
 
-### V4 -- Coordinated cognition
+### V4 -- Global workspace & multi-agent coordination
 
-V3 has perception, cognition, learning, and autonomous decision-making. What it lacks is coordination -- subsystems act independently, with no shared awareness of what the system is focused on. V4 fixes that.
+V3.x delivered the unified cognitive loop: signal-driven focus, goal-aware behavior, and coordinated ego action. V4 takes this further -- from a single system thinking coherently to multiple agents coordinating across a shared workspace.
 
 The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **LIDA cognitive cycle** (Franklin et al.) -- frameworks used to model consciousness in cognitive science:
 
 **Sense → Perceive → Attend → Broadcast → Propose → Select → Act → Learn**
 
-- **Shared intent state** -- every session reads what the system is focused on, what decisions have been made, and why. Continuity of purpose across sessions.
-- **Coordinated action selection** -- modules propose, a workspace controller decides. No more conflicting actions from subsystems that don't know what each other are doing.
-- **Signal and drive weight adaptation** -- evidence-driven calibration of attention and the four drives.
+- **Multi-agent workspace** -- Genesis instances sharing intent state, memory, and observations. What one agent learns, all agents benefit from. A personal Genesis that can coordinate with team members' Genesis instances without leaking private context.
+- **Signal and drive weight adaptation** -- evidence-driven calibration of attention and the four drives. The system learns which signals actually predict important outcomes, and adjusts its attention accordingly.
+- **Coordinated action selection across agents** -- when multiple agents observe the same situation, they negotiate who acts rather than duplicating work or conflicting.
 - **Six measurable GWT markers** -- if we can't measure whether the architecture is working, we're building in the dark.
 
 ### V5 -- Self-evolution
