@@ -212,3 +212,104 @@ async def test_get_recent_with_source_filter(db):
 
     all_bookmarks = await crud.get_recent(db, limit=10)
     assert len(all_bookmarks) == 3
+
+
+@pytest.mark.asyncio
+async def test_search_by_topic(db):
+    """Search finds bookmarks by topic keyword."""
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-search-1",
+        bookmark_type="micro", topic="Voice Interface PRD",
+        created_at="2026-03-22T10:00:00",
+    )
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-search-2",
+        bookmark_type="micro", topic="Portfolio deployment plan",
+        created_at="2026-03-22T11:00:00",
+    )
+    results = await crud.search(db, "voice", limit=10)
+    assert len(results) == 1
+    assert results[0]["topic"] == "Voice Interface PRD"
+
+
+@pytest.mark.asyncio
+async def test_search_by_tags(db):
+    """Search finds bookmarks by tag content."""
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-tag-1",
+        bookmark_type="micro", topic="Plan session",
+        tags='["plan", "approved", "voice", "ambient"]',
+        created_at="2026-03-22T10:00:00",
+    )
+    results = await crud.search(db, "ambient", limit=10)
+    assert len(results) == 1
+    assert results[0]["cc_session_id"] == "sess-tag-1"
+
+
+@pytest.mark.asyncio
+async def test_search_multiple_terms_and(db):
+    """Multiple search terms are ANDed — all must match."""
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-and-1",
+        bookmark_type="micro", topic="Voice Interface PRD",
+        tags='["voice", "ambient"]',
+        created_at="2026-03-22T10:00:00",
+    )
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-and-2",
+        bookmark_type="micro", topic="Portfolio plan",
+        tags='["portfolio"]',
+        created_at="2026-03-22T11:00:00",
+    )
+    # Both terms must match
+    results = await crud.search(db, "voice PRD", limit=10)
+    assert len(results) == 1
+    assert results[0]["cc_session_id"] == "sess-and-1"
+
+    # "voice portfolio" matches neither fully
+    results = await crud.search(db, "voice portfolio", limit=10)
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_search_empty_query_returns_recent(db):
+    """Empty query falls back to get_recent."""
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-empty-1",
+        bookmark_type="micro", topic="First",
+        created_at="2026-03-22T10:00:00",
+    )
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-empty-2",
+        bookmark_type="micro", topic="Second",
+        created_at="2026-03-22T11:00:00",
+    )
+    results = await crud.search(db, "", limit=10)
+    assert len(results) == 2
+    assert results[0]["topic"] == "Second"  # Most recent first
+
+
+@pytest.mark.asyncio
+async def test_search_no_matches(db):
+    """Search returns empty list for non-matching query."""
+    await crud.create(
+        db, id=str(uuid.uuid4()), cc_session_id="sess-no-match",
+        bookmark_type="micro", topic="Ego dispatch fix",
+        created_at="2026-03-22T10:00:00",
+    )
+    results = await crud.search(db, "nonexistent_gibberish", limit=10)
+    assert len(results) == 0
+
+
+@pytest.mark.asyncio
+async def test_search_respects_limit(db):
+    """Search respects the limit parameter."""
+    for i in range(5):
+        await crud.create(
+            db, id=str(uuid.uuid4()), cc_session_id=f"sess-limit-{i}",
+            bookmark_type="micro", topic=f"Plan session {i}",
+            tags='["plan"]',
+            created_at=f"2026-03-{20 + i}T10:00:00",
+        )
+    results = await crud.search(db, "plan", limit=3)
+    assert len(results) == 3

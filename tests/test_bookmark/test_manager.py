@@ -223,28 +223,21 @@ async def test_recent(mgr, mock_store):
 
 
 @pytest.mark.asyncio
-async def test_search_filters_by_type(mgr, mock_retriever):
-    """Search should only return session_bookmark type memories."""
-    # Mock retriever returns mixed types
-    mock_result_bookmark = MagicMock()
-    mock_result_bookmark.memory_type = "session_bookmark"
-    mock_result_bookmark.source = "session:sess-123"
-    mock_result_bookmark.memory_id = "mem-1"
-    mock_result_bookmark.score = 0.9
-    mock_result_bookmark.content = "Bookmark content"
-
-    mock_result_episodic = MagicMock()
-    mock_result_episodic.memory_type = "episodic"
-    mock_result_episodic.source = "conversation"
-    mock_result_episodic.memory_id = "mem-2"
-    mock_result_episodic.score = 0.8
-    mock_result_episodic.content = "Regular memory"
-
-    mock_retriever.recall = AsyncMock(
-        return_value=[mock_result_bookmark, mock_result_episodic],
+async def test_search_finds_by_topic(mgr):
+    """Search finds bookmarks by topic keyword via SQL."""
+    await mgr.create_micro(
+        cc_session_id="sess-voice-1",
+        context_messages=[{"text": "Voice Interface PRD", "timestamp": ""}],
+        tags=["voice", "ambient", "PRD"],
+    )
+    await mgr.create_micro(
+        cc_session_id="sess-portfolio-1",
+        context_messages=[{"text": "Portfolio deployment plan", "timestamp": ""}],
+        tags=["portfolio"],
     )
 
-    results = await mgr.search("test query")
-    # Only the bookmark should be returned
-    assert len(results) == 1
-    assert results[0].cc_session_id == "sess-123"
+    results = await mgr.search("voice")
+    assert len(results) >= 1
+    assert any(r.cc_session_id == "sess-voice-1" for r in results)
+    # Portfolio bookmark should not appear
+    assert all(r.cc_session_id != "sess-portfolio-1" for r in results)
