@@ -60,29 +60,28 @@ def _load_db_rules() -> list[dict]:
     if not _GENESIS_DB.exists():
         return []
     try:
-        db = sqlite3.connect(str(_GENESIS_DB))
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            """
-            SELECT m.memory_id, f.content, f.tags
-            FROM memory_metadata m
-            JOIN memory_fts f ON m.memory_id = f.memory_id
-            WHERE m.memory_class = 'rule' AND m.deprecated = 0
-            """
-        ).fetchall()
-        results = []
-        for r in rows:
-            content = r["content"] or ""
-            name_match = re.search(r"^name:\s*(.+)$", content, re.MULTILINE)
-            results.append({
-                "source": "db_rule",
-                "memory_id": r["memory_id"][:12],
-                "name": name_match.group(1).strip() if name_match else "",
-                "tags": r["tags"] or "",
-                "content_preview": content[:300],
-            })
-        db.close()
-        return results
+        with sqlite3.connect(str(_GENESIS_DB)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                """
+                SELECT m.memory_id, f.content, f.tags
+                FROM memory_metadata m
+                JOIN memory_fts f ON m.memory_id = f.memory_id
+                WHERE m.memory_class = 'rule' AND m.deprecated = 0
+                """
+            ).fetchall()
+            results = []
+            for r in rows:
+                content = r["content"] or ""
+                name_match = re.search(r"^name:\s*(.+)$", content, re.MULTILINE)
+                results.append({
+                    "source": "db_rule",
+                    "memory_id": r["memory_id"][:12],
+                    "name": name_match.group(1).strip() if name_match else "",
+                    "tags": r["tags"] or "",
+                    "content_preview": content[:300],
+                })
+            return results
     except Exception:
         return []
 
@@ -92,28 +91,27 @@ def _load_procedures() -> list[dict]:
     if not _GENESIS_DB.exists():
         return []
     try:
-        db = sqlite3.connect(str(_GENESIS_DB))
-        db.row_factory = sqlite3.Row
-        rows = db.execute(
-            """
-            SELECT id, task_type, principle, confidence, tool_trigger
-            FROM procedural_memory
-            WHERE deprecated = 0
-            ORDER BY confidence DESC
-            """
-        ).fetchall()
-        results = []
-        for r in rows:
-            results.append({
-                "source": "procedure",
-                "id": r["id"][:12] if r["id"] else "",
-                "task_type": r["task_type"] or "",
-                "principle": (r["principle"] or "")[:200],
-                "confidence": r["confidence"],
-                "tool_trigger": r["tool_trigger"] or "",
-            })
-        db.close()
-        return results
+        with sqlite3.connect(str(_GENESIS_DB)) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                """
+                SELECT id, task_type, principle, confidence, tool_trigger
+                FROM procedural_memory
+                WHERE deprecated = 0
+                ORDER BY confidence DESC
+                """
+            ).fetchall()
+            results = []
+            for r in rows:
+                results.append({
+                    "source": "procedure",
+                    "id": r["id"][:12] if r["id"] else "",
+                    "task_type": r["task_type"] or "",
+                    "principle": (r["principle"] or "")[:200],
+                    "confidence": r["confidence"],
+                    "tool_trigger": r["tool_trigger"] or "",
+                })
+            return results
     except Exception:
         return []
 
@@ -178,15 +176,32 @@ def _classify_coverage(
 ) -> tuple[list[dict], list[dict]]:
     """Classify feedback items as covered or uncovered by hooks.
 
-    Simple heuristic: check if keywords from the feedback name/description
-    appear in any hook command or script name. Not perfect, but useful for
-    identifying obvious gaps.
+    Heuristic: check if domain-specific keywords from the feedback
+    name/description appear in hook enforcement patterns or script names.
+    Filters out generic path/language words to reduce false positives.
     """
     enforced = _extract_enforced_patterns(hooks)
-    hook_commands = " ".join(
-        h.get("command_preview", "") + " " + h.get("script", "")
-        for h in hooks
-    ).lower()
+
+    # Extract only script names and inline command arguments — not file paths
+    hook_terms = set()
+    for h in hooks:
+        script = h.get("script", "").lower()
+        # Script names are meaningful (e.g., "destructive_command_guard.py")
+        hook_terms.update(re.findall(r"[a-z_]{5,}", script))
+        cmd = h.get("command_preview", "").lower()
+        # Extract quoted strings and flag-like arguments from inline bash
+        hook_terms.update(re.findall(r"'([a-z_]{5,})'", cmd))
+        hook_terms.update(re.findall(r'"([a-z_]{5,})"', cmd))
+
+    # Words too generic to be meaningful matches
+    _NOISE_WORDS = {
+        "hooks", "check", "guard", "genesis", "claude", "python",
+        "script", "shell", "print", "error", "false",
+        "return", "import", "output", "input", "should", "would",
+        "could", "never", "always", "about", "their", "there",
+        "which", "where", "these", "those", "other", "after",
+        "before", "first", "every", "using", "because", "process",
+    }
 
     covered = []
     uncovered = []
@@ -196,13 +211,18 @@ def _classify_coverage(
         desc = item.get("description", "").lower()
         combined = name + " " + desc
 
-        # Check if any significant word from the feedback name appears
-        # in the hook commands
-        words = re.findall(r"[a-z_]{4,}", combined)
-        match_count = sum(1 for w in words if w in hook_commands)
+        # Extract meaningful domain words (5+ chars, not noise)
+        words = [
+            w for w in re.findall(r"[a-z_]{5,}", combined)
+            if w not in _NOISE_WORDS
+        ]
+        match_count = sum(1 for w in words if w in hook_terms)
 
         if match_count >= 2 or any(p in combined for p in enforced):
-            covered.append({**item, "match_strength": "strong" if match_count >= 3 else "weak"})
+            covered.append({
+                **item,
+                "match_strength": "strong" if match_count >= 3 else "weak",
+            })
         else:
             uncovered.append(item)
 

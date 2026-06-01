@@ -139,34 +139,36 @@ _GIVING_UP_PATTERNS = re.compile(
 # offering to merge, create PRs, or declaring implementation complete.
 _FINISHING_PATTERNS = re.compile(
     r"(?:"
-    r"[Mm]erge\s+(?:back\s+)?to\s+main"
-    r"|[Cc]reate\s+a\s+[Pp]ull\s+[Rr]equest"
-    r"|[Pp]ush\s+and\s+create"
-    r"|[Ii]mplementation\s+complete"
-    r"|What\s+would\s+you\s+like\s+to\s+do\?"
-    r"|Keep\s+the\s+branch\s+as-is"
-    r"|Discard\s+this\s+work"
-    r"|[Rr]eady\s+to\s+(?:ship|merge|land|deploy)"
-    r"|[Aa]ll\s+(?:changes|work)\s+(?:are\s+)?(?:done|complete)"
+    r"merge\s+(?:back\s+)?to\s+main"
+    r"|create\s+a\s+pull\s+request"
+    r"|push\s+and\s+create"
+    r"|implementation\s+complete"
+    r"|what\s+would\s+you\s+like\s+to\s+do\?"
+    r"|keep\s+the\s+branch\s+as-is"
+    r"|discard\s+this\s+work"
+    r"|ready\s+to\s+(?:ship|merge|land|deploy)"
+    r"|all\s+(?:changes|work)\s+(?:are\s+)?(?:done|complete)"
     r")",
+    re.IGNORECASE,
 )
 
 # Patterns indicating integration/e2e verification was actually done.
 # If any of these appear alongside finishing language, skip the reminder.
 _VERIFICATION_EVIDENCE = re.compile(
     r"(?:"
-    r"[Ii]ntegration\s+test"
-    r"|[Ee]2[Ee]\s+test"
-    r"|[Ss]moke\s+test"
-    r"|[Aa][Pp][Ii]\s+(?:smoke\s+)?test"
-    r"|[Vv]erif(?:y|ied)\s+(?:the\s+)?(?:actual|end-to-end|e2e)"
-    r"|[Mm]anual(?:ly)?\s+(?:test|verif)"
-    r"|[Ll]ive\s+(?:test|verif)"
-    r"|[Tt]elegram\s+API\s+(?:smoke|confirmed|test)"
-    r"|[Aa]syncio\s+integration"
-    r"|[Pp]roduction\s+(?:test|verif)"
-    r"|[Oo]utcome\s+verif"
+    r"integration\s+test"
+    r"|e2e\s+test"
+    r"|smoke\s+test"
+    r"|api\s+(?:smoke\s+)?test"
+    r"|verif(?:y|ied)\s+(?:the\s+)?(?:actual|end-to-end|e2e)"
+    r"|manual(?:ly)?\s+(?:test|verif)"
+    r"|live\s+(?:test|verif)"
+    r"|telegram\s+api\s+(?:smoke|confirmed|test)"
+    r"|asyncio\s+integration"
+    r"|production\s+(?:test|verif)"
+    r"|outcome\s+verif"
     r")",
+    re.IGNORECASE,
 )
 
 
