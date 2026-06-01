@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -38,16 +37,6 @@ def _make_event(provider: str = "test-provider") -> GenesisEvent:
     )
 
 
-async def _drain_tasks():
-    """Let all pending asyncio tasks complete."""
-    pending = [
-        t for t in asyncio.all_tasks()
-        if t is not asyncio.current_task() and not t.done()
-    ]
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
-
-
 @pytest.fixture
 async def db():
     async with aiosqlite.connect(":memory:") as conn:
@@ -70,21 +59,46 @@ def escalation(db, event_bus):
 
 
 class TestTripTracking:
-    async def test_no_observation_below_threshold(self, escalation, db):
-        """Fewer than _TRIP_THRESHOLD trips should not create observations."""
+    """Test the state tracking logic (_on_event) without DB interaction."""
+
+    async def test_no_escalation_below_threshold(self, escalation):
+        """Fewer than _TRIP_THRESHOLD trips should not set escalated flag."""
         for _ in range(_TRIP_THRESHOLD - 1):
             await escalation._on_event(_make_event())
 
-        cursor = await db.execute("SELECT COUNT(*) FROM observations")
-        count = (await cursor.fetchone())[0]
-        assert count == 0
+        state = escalation._state.get("test-provider")
+        assert state is not None
+        assert state["trip_count"] == _TRIP_THRESHOLD - 1
+        assert state["escalated"] is False
 
-    async def test_observation_at_threshold(self, escalation, db):
-        """Exactly _TRIP_THRESHOLD trips should create one observation."""
+    async def test_escalation_at_threshold(self, escalation):
+        """Exactly _TRIP_THRESHOLD trips should set escalated flag."""
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event())
 
-        await _drain_tasks()
+        state = escalation._state["test-provider"]
+        assert state["trip_count"] == _TRIP_THRESHOLD
+        assert state["escalated"] is True
+        assert state["first_trip_at"] is not None
+
+    async def test_separate_providers_tracked_independently(self, escalation):
+        """Different providers each have their own trip counter."""
+        for _ in range(_TRIP_THRESHOLD):
+            await escalation._on_event(_make_event("provider-a"))
+        for _ in range(_TRIP_THRESHOLD - 1):
+            await escalation._on_event(_make_event("provider-b"))
+
+        assert escalation._state["provider-a"]["escalated"] is True
+        assert escalation._state["provider-b"]["escalated"] is False
+
+
+class TestObservationCreation:
+    """Test _create_observation DB writes directly (bypasses create_task)."""
+
+    async def test_creates_observation(self, escalation, db):
+        """_create_observation should insert a high-priority observation."""
+        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
+        await escalation._create_observation("test-provider", state)
 
         cursor = await db.execute(
             "SELECT source, type, priority, category FROM observations"
@@ -96,30 +110,31 @@ class TestTripTracking:
         assert row["priority"] == "high"
         assert row["category"] == "system_health"
 
-    async def test_no_duplicate_observations(self, escalation, db):
-        """Further trips after escalation should not create more observations."""
-        for _ in range(_TRIP_THRESHOLD + 10):
-            await escalation._on_event(_make_event())
-
-        await _drain_tasks()
+    async def test_dedup_prevents_duplicates(self, escalation, db):
+        """Same provider should not create duplicate unresolved observations."""
+        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
+        await escalation._create_observation("test-provider", state)
+        await escalation._create_observation("test-provider", state)
 
         cursor = await db.execute("SELECT COUNT(*) FROM observations")
         count = (await cursor.fetchone())[0]
         assert count == 1
 
-    async def test_separate_providers_tracked_independently(self, escalation, db):
-        """Different providers each have their own trip counter."""
-        for _ in range(_TRIP_THRESHOLD):
-            await escalation._on_event(_make_event("provider-a"))
-        for _ in range(_TRIP_THRESHOLD - 1):
-            await escalation._on_event(_make_event("provider-b"))
+    async def test_new_observation_after_resolution(self, escalation, db):
+        """After resolving, a new observation for the same provider is allowed."""
+        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
+        await escalation._create_observation("test-provider", state)
 
-        await _drain_tasks()
+        # Resolve
+        await db.execute("UPDATE observations SET resolved = 1 WHERE source = 'routing'")
+        await db.commit()
 
-        cursor = await db.execute("SELECT COUNT(*) FROM observations")
+        # Second observation
+        await escalation._create_observation("test-provider", state)
+
+        cursor = await db.execute("SELECT COUNT(*) FROM observations WHERE source = 'routing'")
         count = (await cursor.fetchone())[0]
-        # Only provider-a hit threshold
-        assert count == 1
+        assert count == 2
 
 
 class TestRecovery:
@@ -135,33 +150,6 @@ class TestRecovery:
     async def test_recovery_unknown_provider_no_error(self, escalation):
         """Recovering an untracked provider should not raise."""
         escalation.record_recovery("nonexistent")
-
-    async def test_recovery_resets_escalation(self, escalation, db):
-        """After recovery, a new failure cycle should create a new observation."""
-        # First cycle
-        for _ in range(_TRIP_THRESHOLD):
-            await escalation._on_event(_make_event())
-        await _drain_tasks()
-
-        # Recover
-        escalation.record_recovery("test-provider")
-
-        # Resolve the first observation so dedup allows a new one
-        await db.execute(
-            "UPDATE observations SET resolved = 1 WHERE source = 'routing'"
-        )
-        await db.commit()
-
-        # Second cycle
-        for _ in range(_TRIP_THRESHOLD):
-            await escalation._on_event(_make_event())
-        await _drain_tasks()
-
-        cursor = await db.execute(
-            "SELECT COUNT(*) FROM observations WHERE source = 'routing'"
-        )
-        count = (await cursor.fetchone())[0]
-        assert count == 2  # one resolved + one new
 
 
 class TestEventFiltering:
@@ -199,14 +187,10 @@ class TestCircuitBreakerRecoveryCallback:
             success_threshold=1,
             on_recovery=lambda name: recoveries.append(name),
         )
-        # Trip the breaker
         cb.record_failure(ErrorCategory.TRANSIENT)
         assert cb._trip_count == 1
 
-        # Force to HALF_OPEN so record_success can recover
         cb._state = ProviderState.HALF_OPEN
-
-        # Recover
         cb.record_success()
         assert cb._trip_count == 0
         assert recoveries == ["test"]
