@@ -30,7 +30,17 @@ def init(rt: GenesisRuntime) -> None:
 
         config = load_config(config_path)
         delegate = LiteLLMDelegate(config)
-        breakers = CircuitBreakerRegistry(config.providers)
+
+        # Provider failure escalation — creates observations when a
+        # provider trips its breaker repeatedly without recovery.
+        from genesis.routing.escalation import ProviderEscalation
+
+        escalation = ProviderEscalation(db=rt._db, event_bus=rt._event_bus)
+        breakers = CircuitBreakerRegistry(
+            config.providers, on_recovery=escalation.record_recovery,
+        )
+        escalation.attach()
+
         cost_tracker = CostTracker(db=rt._db, event_bus=rt._event_bus)
 
         from genesis.resilience.state import ResilienceStateMachine
