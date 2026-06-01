@@ -87,14 +87,17 @@ providers:
     free: true
     rpm_limit: 20  # 40 RPM shared pool — 20 each to stay within aggregate limit
     open_duration_s: 120
-  cerebras-qwen:
-    type: cerebras
-    model: qwen-3-235b-a22b-instruct-2507
-    profile: cerebras-qwen3-235b
-    free: true
-    # 10 RPM, 14,400 RPD. Instruct only (no thinking). Volume play.
-    rpm_limit: 10
-    open_duration_s: 120
+  # cerebras DISABLED — all models removed from Cerebras as of 2026-05.
+  # Only reasoning-only models remain (gpt-oss-120b, zai-glm-4.7) which
+  # return 'reasoning' field instead of 'content', incompatible with LiteLLM.
+  # Re-enable when Cerebras adds standard chat models or LiteLLM adds support.
+  # cerebras-glm:
+  #   type: cerebras
+  #   model: zai-glm-4.7
+  #   profile: cerebras-glm47
+  #   free: true
+  #   rpm_limit: 10
+  #   open_duration_s: 120
   github-o3mini:
     type: github
     model: o3-mini
@@ -276,7 +279,6 @@ call_sites:
     chain:
     - groq-free
     - gemini-free
-    - cerebras-qwen
     - nvidia-nim-deepseek
     - mistral-large-free
     - openrouter-deepseek-v4-flash
@@ -297,7 +299,6 @@ call_sites:
     retry_profile: background
   12_surplus_brainstorm:
     chain:
-    - cerebras-qwen
     - gemini-free
     - mistral-large-free
     - groq-free
@@ -431,7 +432,6 @@ call_sites:
     description: Synthesize research results into concise summaries
   38_procedure_extraction:
     chain:
-    - cerebras-qwen
     - openrouter-deepseek-v4
     - groq-free
     default_paid: true
@@ -458,7 +458,6 @@ call_sites:
     description: Pre-mortem failure analysis before committing to execution
   45_intelligence_intake:
     chain:
-    - cerebras-qwen
     - gemini-free
     - groq-free
     - mistral-large-free
@@ -501,7 +500,6 @@ call_sites:
   40_knowledge_distillation:
     chain:
     - nvidia-nim-deepseek
-    - cerebras-qwen
     - groq-free
     - gemini-free
     - mistral-large-free
@@ -515,13 +513,11 @@ call_sites:
     - mistral-large-free
     - gemini-free
     - groq-free
-    - cerebras-qwen
     - openrouter-free
     retry_profile: background
     description: "Resume review Pass 1 — native LLM structural analysis"
   42_resume_review_pass2:
     chain:
-    - cerebras-qwen
     - mistral-large-free
     - gemini-free
     - groq-free
