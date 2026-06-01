@@ -1056,12 +1056,18 @@ class SurplusScheduler:
             with contextlib.suppress(Exception):
                 GenesisRuntime.instance().record_job_success("dream_cycle")
         except Exception as exc:
-            logger.exception("Dream cycle failed")
+            logger.exception("Dream cycle failed: %s", exc)
             try:
                 from genesis.runtime import GenesisRuntime
-                GenesisRuntime.instance().record_job_failure("dream_cycle", str(exc))
-            except Exception:
-                pass
+                GenesisRuntime.instance().record_job_failure(
+                    "dream_cycle", str(exc)[:500],
+                )
+            except Exception as rec_err:
+                logger.error(
+                    "Failed to record dream_cycle failure: %s "
+                    "(original error: %s)",
+                    rec_err, exc,
+                )
         finally:
             # Always clear heavy workload flag, even on failure.
             # Use the captured `rt` reference (line 859) — re-looking up

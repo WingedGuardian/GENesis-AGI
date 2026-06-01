@@ -4163,7 +4163,8 @@
                         const base = ue?.cadence_minutes || 90;
                         const max = ue?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
-                        const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
+                        const cFail = ue?.cadence?.consecutive_failures || 0;
+                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
                         return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
                       })()"></div>
                     </div>
@@ -4189,7 +4190,8 @@
                         const base = ge?.cadence_minutes || 90;
                         const max = ge?.max_interval_minutes || 240;
                         const pct = Math.min(100, (cur / max) * 100);
-                        const color = cur <= base ? '#4caf50' : cur < max * 0.75 ? '#f0ad4e' : '#d9534f';
+                        const cFail = ge?.cadence?.consecutive_failures || 0;
+                        const color = cFail >= 3 ? '#d9534f' : cur <= base ? '#4caf50' : '#f0ad4e';
                         return `width: ${pct}%; height: 100%; background: ${color}; border-radius: 2px; transition: width 0.5s;`;
                       })()"></div>
                     </div>

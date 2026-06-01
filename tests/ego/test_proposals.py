@@ -246,13 +246,20 @@ class TestProposalWorkflow:
 
     async def test_format_digest_html(self, workflow):
         digest = workflow.format_digest(_sample_proposals(2), "batch123")
-        assert "<b>Ego Proposals</b>" in digest
+        assert "<b>Ego</b>" in digest
         assert "batch123" in digest  # first 8 chars of batch_id
         assert "<b>1.</b>" in digest
         assert "<b>2.</b>" in digest
-        assert "[investigate]" in digest
-        # Footer removed — bidirectional comms replaces reply-to-approve
-        assert "approve all" not in digest
+        assert "<b>WHAT:</b>" in digest
+        assert "confidence]" in digest
+
+    async def test_format_digest_ego_source_labels(self, workflow):
+        """ego_source maps to readable labels in header."""
+        props = [{"action_type": "investigate", "content": "Test", "confidence": 0.5}]
+        user_digest = workflow.format_digest(props, "b1", ego_source="user_ego_cycle")
+        assert "<b>User Ego</b>" in user_digest
+        gen_digest = workflow.format_digest(props, "b1", ego_source="genesis_ego_cycle")
+        assert "<b>Genesis Ego</b>" in gen_digest
 
     async def test_format_digest_escapes_html(self, workflow):
         bad = [{"action_type": "<script>", "content": "a<b>c", "confidence": 0.5}]
@@ -260,23 +267,24 @@ class TestProposalWorkflow:
         assert "<script>" not in digest
         assert "&lt;script&gt;" in digest
 
-    async def test_format_digest_alternatives_shown(self, workflow):
-        props = [_sample_proposals(1)[0]]  # has alternatives
+    async def test_format_digest_alternatives_not_shown(self, workflow):
+        """Alternatives dropped from digest — WHAT/WHY/HOW format only."""
+        props = [_sample_proposals(1)[0]]  # has alternatives field
         digest = workflow.format_digest(props, "b1")
-        assert "Alternatives:" in digest
+        assert "Alternatives:" not in digest
 
     async def test_format_digest_alternatives_hidden(self, workflow):
         props = [_sample_proposals(2)[1]]  # no alternatives key or empty
         digest = workflow.format_digest(props, "b1")
         assert "Alternatives:" not in digest
 
-    async def test_format_digest_memory_basis_shown(self, workflow):
-        """memory_basis renders as italic text when present."""
+    async def test_format_digest_memory_basis_not_shown(self, workflow):
+        """memory_basis dropped from digest — internal attribution only."""
         props = [{"action_type": "investigate", "content": "Test",
                   "memory_basis": "the freelance goal from March",
                   "confidence": 0.8}]
         digest = workflow.format_digest(props, "b1")
-        assert "<i>the freelance goal from March</i>" in digest
+        assert "freelance goal" not in digest
 
     async def test_format_digest_memory_basis_hidden_when_empty(self, workflow):
         """Empty memory_basis does not render."""
@@ -286,14 +294,30 @@ class TestProposalWorkflow:
         # Should not have an empty italic tag
         assert "<i></i>" not in digest
 
-    async def test_format_digest_memory_basis_truncated(self, workflow):
-        """Long memory_basis is truncated to 500 chars."""
-        long_basis = "X" * 600
+    async def test_format_digest_rationale_shown_as_why(self, workflow):
+        """Rationale renders under WHY label."""
         props = [{"action_type": "investigate", "content": "Test",
-                  "memory_basis": long_basis, "confidence": 0.8}]
+                  "rationale": "This matters because deadlines",
+                  "confidence": 0.8}]
         digest = workflow.format_digest(props, "b1")
-        assert "X" * 500 in digest
-        assert "X" * 501 not in digest
+        assert "<b>WHY:</b>" in digest
+        assert "This matters because deadlines" in digest
+
+    async def test_format_digest_execution_plan_shown_as_how(self, workflow):
+        """execution_plan renders under HOW label when present."""
+        props = [{"action_type": "dispatch", "content": "Run analysis",
+                  "execution_plan": "Background CC session, opus model",
+                  "confidence": 0.9}]
+        digest = workflow.format_digest(props, "b1")
+        assert "<b>HOW:</b>" in digest
+        assert "Background CC session" in digest
+
+    async def test_format_digest_no_how_when_plan_empty(self, workflow):
+        """HOW section omitted when execution_plan is empty."""
+        props = [{"action_type": "outreach", "content": "Notify user",
+                  "confidence": 0.9}]
+        digest = workflow.format_digest(props, "b1")
+        assert "<b>HOW:</b>" not in digest
 
     async def test_send_digest_calls_topic_manager(
         self, workflow, db, mock_topic_manager,
