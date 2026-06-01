@@ -326,7 +326,50 @@ class DirectSessionRunner:
     # -- Public API --------------------------------------------------------
 
     async def spawn(self, request: DirectSessionRequest) -> str:
-        """Fire-and-forget. Returns genesis session_id immediately."""
+        """Fire-and-forget. Returns genesis session_id immediately.
+
+        Includes a lightweight autonomy ceiling check: if the background
+        cognitive category has been fully regressed, block ALL background
+        spawns as a circuit breaker. This is defense-in-depth — the
+        proposal gate handles fine-grained domain classification.
+        """
+        # Ceiling check: skip for foreground/user-initiated sessions
+        _SKIP_TAGS = {"foreground", "direct_session", "user_request"}
+        if request.source_tag not in _SKIP_TAGS:
+            mgr = getattr(self._rt, "_autonomy_manager", None)
+            if mgr is not None:
+                try:
+                    from genesis.autonomy.types import AutonomyCategory
+                    state = await mgr.get_state(
+                        AutonomyCategory.BACKGROUND_COGNITIVE.value,
+                    )
+                    # Block if corrections have fully regressed trust
+                    # (posterior < 0.15 means overwhelming corrections)
+                    if state is not None:
+                        from genesis.db.crud.autonomy import bayesian_posterior
+                        posterior = bayesian_posterior(
+                            state.total_successes, state.total_corrections,
+                        )
+                        if posterior < 0.15 and state.total_corrections > 3:
+                            logger.warning(
+                                "Spawn blocked: background_cognitive posterior %.3f "
+                                "(L%d, %dS/%dC) — autonomy circuit breaker",
+                                posterior, state.current_level,
+                                state.total_successes, state.total_corrections,
+                            )
+                            raise RuntimeError(
+                                f"Autonomy circuit breaker: background_cognitive "
+                                f"posterior {posterior:.3f} below threshold"
+                            )
+                except RuntimeError:
+                    raise  # re-raise the circuit breaker
+                except Exception:
+                    # Non-fatal: if check fails, allow spawn
+                    logger.debug(
+                        "Autonomy ceiling check failed (non-fatal)",
+                        exc_info=True,
+                    )
+
         session = await self._session_manager.create_background(
             session_type=SessionType.BACKGROUND_TASK,
             model=request.model,
