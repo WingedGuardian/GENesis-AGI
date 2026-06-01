@@ -54,6 +54,13 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
         parts.append("\n### System State")
         parts.extend(state_lines)
 
+    # Active work: most recent pivot per active session (last 4h)
+    active_work = await _active_session_pivots(db)
+    if active_work:
+        parts.append("\n### Active Work (now)")
+        for line in active_work:
+            parts.append(f"- {line}")
+
     # Active context: recent session topics (last 7 days)
     sessions = await _recent_session_topics(db, days=7)
     if sessions:
@@ -129,6 +136,39 @@ async def _count_observations(db: aiosqlite.Connection) -> int:
         return 0
 
 
+async def _active_session_pivots(db: aiosqlite.Connection) -> list[str]:
+    """Get the most recent conversation pivot per session active in last 4h.
+
+    Provides a real-time "what's happening right now" snapshot without LLM.
+    Groups by session, takes most recent pivot per session, returns top 5.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT source, content, MAX(created_at) as latest "
+            "FROM observations "
+            "WHERE type = 'conversation_pivot' "
+            "AND created_at > datetime('now', '-4 hours') "
+            "GROUP BY source "
+            "ORDER BY latest DESC LIMIT 5"
+        )
+        rows = await cursor.fetchall()
+        results = []
+        for row in rows:
+            content = row[1] or ""
+            # Strip the "Conversation pivot: " prefix if present
+            if content.startswith("Conversation pivot:"):
+                content = content[len("Conversation pivot:"):].strip()
+            # Extract trigger text (more useful than the summary slug)
+            if "Trigger:" in content:
+                trigger = content.split("Trigger:", 1)[1].strip()
+                results.append(trigger[:120])
+            else:
+                results.append(content[:120])
+        return results
+    except Exception:
+        return []
+
+
 async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> list[str]:
     """Get recent foreground session topics."""
     try:
@@ -183,6 +223,7 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         "code_audit",
         "version_change",
         "tech_debt",
+        "conversation_pivot",
         # Autonomy gate data — must never surface to ego context (opacity)
         "autonomy_audit",
         "autonomy_gate_decision",
