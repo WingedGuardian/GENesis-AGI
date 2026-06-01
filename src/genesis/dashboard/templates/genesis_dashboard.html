@@ -5431,9 +5431,15 @@
                     <!-- Per-provider full cards -->
                     <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 0.4rem;">
                       <template x-for="p in (v.llm?.providers || [])" :key="p.name">
-                        <div style="padding: 0.4rem 0.55rem; border-radius: 5px; border: 1px solid var(--color-border);"
-                             :style="p.calls_24h > 0 ? 'background: rgba(255,255,255,0.03)' : 'background: rgba(255,255,255,0.01); opacity: 0.5'">
+                        <div style="padding: 0.4rem 0.55rem; border-radius: 5px;"
+                             :style="p.cb_state === 'open' ? 'border: 1px solid #d9534f; background: rgba(217,83,79,0.08)' : p.cb_state === 'half_open' ? 'border: 1px solid #f0ad4e; background: rgba(240,173,78,0.06)' : p.calls_24h > 0 ? 'border: 1px solid var(--color-border); background: rgba(255,255,255,0.03)' : 'border: 1px solid var(--color-border); background: rgba(255,255,255,0.01); opacity: 0.5'">
                           <div style="display: flex; align-items: center; gap: 0.35rem; margin-bottom: 0.2rem;">
+                            <template x-if="p.cb_state === 'open'">
+                              <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem; background: rgba(217,83,79,0.25); color: #d9534f; font-weight: 700;">OPEN</span>
+                            </template>
+                            <template x-if="p.cb_state === 'half_open'">
+                              <span style="padding: 0.05rem 0.2rem; border-radius: 3px; font-size: 0.56rem; background: rgba(240,173,78,0.25); color: #f0ad4e; font-weight: 700;">HALF-OPEN</span>
+                            </template>
                             <span style="font-weight: 600; font-size: 0.74rem;" x-text="p.display_name"></span>
                             <span style="padding: 0.05rem 0.25rem; border-radius: 3px; font-size: 0.58rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em;"
                                   :style="({'openrouter':'background:rgba(139,92,246,0.15);color:#a78bfa','google':'background:rgba(66,133,244,0.15);color:#8ab4f8','mistral':'background:rgba(255,152,0,0.15);color:#ffb74d','anthropic':'background:rgba(217,119,87,0.15);color:#d9a98a','ollama':'background:rgba(76,175,80,0.15);color:#81c784','groq':'background:rgba(0,188,212,0.15);color:#4dd0e1','deepseek':'background:rgba(33,150,243,0.15);color:#64b5f6','xai':'background:rgba(255,255,255,0.1);color:#aaa','qwen':'background:rgba(255,193,7,0.15);color:#ffd54f','zenmux':'background:rgba(156,39,176,0.15);color:#ce93d8','minimax':'background:rgba(244,67,54,0.15);color:#ef9a9a'})[p.provider_type] || 'background:rgba(255,255,255,0.08);color:#888'"
@@ -5448,6 +5454,11 @@
                             </template>
                           </div>
                           <div style="font-size: 0.64rem; opacity: 0.6; font-family: monospace; margin-bottom: 0.2rem;" x-text="p.model_id"></div>
+                          <template x-if="p.cb_trip_count > 0">
+                            <div style="font-size: 0.62rem; margin-bottom: 0.2rem;"
+                                 :style="p.cb_state === 'open' ? 'color: #d9534f' : 'color: #f0ad4e'"
+                                 x-text="'Breaker tripped ' + p.cb_trip_count + 'x' + (p.cb_last_failure ? ' (' + p.cb_last_failure + ')' : '')"></div>
+                          </template>
                           <template x-if="p.calls_24h > 0">
                             <div style="display: flex; gap: 0.6rem; font-size: 0.66rem; flex-wrap: wrap;">
                               <span><b x-text="p.calls_24h"></b> calls</span>
