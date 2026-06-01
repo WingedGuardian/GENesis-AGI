@@ -92,6 +92,38 @@ async def get_recent(
     return await cursor.fetchall()
 
 
+async def search(
+    db: aiosqlite.Connection,
+    query: str,
+    limit: int = 10,
+) -> list[aiosqlite.Row]:
+    """Search bookmarks by topic and tags using LIKE matching.
+
+    Splits the query into terms and ANDs them — each term must match
+    either the topic or the tags column.
+    """
+    terms = query.strip().split()
+    if not terms:
+        return await get_recent(db, limit)
+
+    conditions = []
+    params: list[str | int] = []
+    for term in terms:
+        like = f"%{term}%"
+        conditions.append("(topic LIKE ? OR tags LIKE ?)")
+        params.extend([like, like])
+
+    where = " AND ".join(conditions)
+    sql = (
+        f"SELECT * FROM session_bookmarks WHERE {where} "  # noqa: S608
+        "ORDER BY created_at DESC LIMIT ?"
+    )
+    params.append(limit)
+
+    cursor = await db.execute(sql, params)
+    return await cursor.fetchall()
+
+
 async def mark_enriched(
     db: aiosqlite.Connection, bookmark_id: str,
 ) -> None:

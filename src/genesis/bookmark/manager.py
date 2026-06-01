@@ -389,45 +389,27 @@ class BookmarkManager:
         return True
 
     async def search(self, query: str, limit: int = 10) -> list[BookmarkResult]:
-        """Search bookmarks using hybrid retrieval (vector + FTS5 + RRF)."""
-        results = await self._retriever.recall(
-            query=query,
-            source="both",
-            limit=limit * 2,  # Over-fetch to filter
-            min_activation=0.0,
-        )
+        """Search bookmarks by keyword against the session_bookmarks table.
 
-        bookmarks: list[BookmarkResult] = []
-        for r in results:
-            if r.memory_type != "session_bookmark":
-                continue
-
-            # Extract session_id from source field
-            cc_session_id = ""
-            if r.source and r.source.startswith("session:"):
-                cc_session_id = r.source[len("session:"):]
-
-            # Look up index table for metadata
-            idx = None
-            if cc_session_id:
-                idx = await bookmark_crud.get_by_session(self._db, cc_session_id)
-
-            bookmarks.append(BookmarkResult(
-                bookmark_id=idx["id"] if idx else r.memory_id,
-                cc_session_id=cc_session_id,
-                topic=idx["topic"] if idx else "",
-                bookmark_type=idx["bookmark_type"] if idx else "micro",
-                created_at=idx["created_at"] if idx else "",
-                has_rich_summary=bool(idx["has_rich_summary"]) if idx else False,
-                source=_safe_get(idx, "source", "auto") if idx else "auto",
-                score=r.score,
-                content=r.content[:200],
-            ))
-
-            if len(bookmarks) >= limit:
-                break
-
-        return bookmarks
+        Searches topic and tags columns directly via SQL LIKE, avoiding
+        the general memory retriever where bookmarks get drowned by 29K+
+        other memories.
+        """
+        rows = await bookmark_crud.search(self._db, query, limit)
+        return [
+            BookmarkResult(
+                bookmark_id=row["id"],
+                cc_session_id=row["cc_session_id"] or "",
+                topic=row["topic"] or "",
+                bookmark_type=row["bookmark_type"] or "micro",
+                created_at=row["created_at"] or "",
+                has_rich_summary=bool(row["has_rich_summary"]),
+                source=_safe_get(row, "source", "auto"),
+                score=1.0,
+                content="",
+            )
+            for row in rows
+        ]
 
     async def recent(self, limit: int = 10) -> list[BookmarkResult]:
         """Get recent bookmarks from the index table."""
