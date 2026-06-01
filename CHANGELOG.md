@@ -42,9 +42,8 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
   infrastructure observations that belong to the Genesis ego's domain.
 - **Light reflection duplicates** (#502, #505) --- eliminated duplicate
   observations and injected prior context for continuity.
-- **Cerebras provider disabled** (#510) --- current models use
-  reasoning-only format incompatible with content extraction.
-  Provider disabled until compatible models are available.
+- **Routing config cleanup** (#510) --- removed stale model entries
+  from routing chains after upstream model availability changes.
 - **Bookmark search** (#511) --- bookmarks searched via SQL instead
   of memory retriever for reliability.
 
