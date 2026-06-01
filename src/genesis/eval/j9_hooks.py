@@ -239,3 +239,27 @@ async def emit_recall_used(
         )
     except Exception:
         logger.debug("eval: failed to emit recall_used", exc_info=True)
+
+
+async def emit_calibration_ece(
+    db: aiosqlite.Connection,
+    *,
+    domain: str,
+    ece: float,
+    sample_count: int,
+) -> str | None:
+    """Emit calibration ECE metric (Verified Autonomy L4)."""
+    try:
+        return await j9_eval.insert_event(
+            db,
+            dimension="system",
+            event_type="calibration_ece",
+            metrics={
+                "domain": domain,
+                "ece": ece,
+                "sample_count": sample_count,
+            },
+        )
+    except Exception:
+        logger.debug("eval: failed to emit calibration_ece", exc_info=True)
+        return None

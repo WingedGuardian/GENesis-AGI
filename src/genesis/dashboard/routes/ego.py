@@ -224,6 +224,7 @@ async def ego_proposals():
             "execution_plan": p.get("execution_plan"),
             "recurring": bool(p.get("recurring", 0)),
             "ego_source": p.get("ego_source"),
+            "realist_verdict": p.get("realist_verdict"),
         }
         for p in pending
     ])
