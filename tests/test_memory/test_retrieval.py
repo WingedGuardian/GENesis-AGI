@@ -482,10 +482,10 @@ async def test_recall_default_excludes_subsystems(
     await retriever.recall("what is x", limit=5)
 
     q_kwargs = mock_qdrant.search.call_args.kwargs
-    assert q_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection"]
+    assert q_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection", "autonomy"]
     assert q_kwargs["include_only_subsystems"] is None
     f_kwargs = mock_crud.search_ranked.call_args.kwargs
-    assert f_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection"]
+    assert f_kwargs["exclude_subsystems"] == ["ego", "triage", "reflection", "autonomy"]
     assert f_kwargs["include_only_subsystems"] is None
 
 
@@ -526,7 +526,7 @@ async def test_recall_include_subsystem_list_keeps_ego(
     await retriever.recall("x", limit=5, include_subsystem=["ego"])
 
     q_kwargs = mock_qdrant.search.call_args.kwargs
-    assert q_kwargs["exclude_subsystems"] == ["triage", "reflection"]
+    assert q_kwargs["exclude_subsystems"] == ["triage", "reflection", "autonomy"]
     assert q_kwargs["include_only_subsystems"] is None
 
 
