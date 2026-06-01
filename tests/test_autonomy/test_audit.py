@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genesis.autonomy.audit import AuditResult, PostExecutionAuditor
+from genesis.autonomy.audit import PostExecutionAuditor
 
 
 def _make_transcript(tool_calls: list[dict]) -> str:
@@ -29,9 +29,8 @@ def _make_transcript(tool_calls: list[dict]) -> str:
             },
         }
         lines.append(json.dumps(entry))
-    tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w")
-    tmp.write("\n".join(lines))
-    tmp.flush()
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w") as tmp:
+        tmp.write("\n".join(lines))
     return tmp.name
 
 

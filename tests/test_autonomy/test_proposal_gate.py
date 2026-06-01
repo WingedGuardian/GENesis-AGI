@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from genesis.autonomy.proposal_gate import DispatchDecision, ProposalDispatchGate
+from genesis.autonomy.proposal_gate import ProposalDispatchGate
 from genesis.autonomy.rules import RuleEngine
 from genesis.autonomy.state_machine import AutonomyManager
 from genesis.autonomy.types import ActionDomain
