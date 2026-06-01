@@ -104,7 +104,7 @@ class ProviderEscalation:
                 content=content,
                 priority="high",
                 category="system_health",
-                created_at=self._clock(),
+                created_at=self._clock().isoformat(),
                 content_hash=content_hash,
                 skip_if_duplicate=True,
             )
