@@ -138,6 +138,25 @@ async def init(rt: GenesisRuntime) -> None:
             rt._cc_invoker.set_protected_paths(rt._protected_paths)
             logger.info("ProtectedPathRegistry wired into CCInvoker")
 
+        # Proposal dispatch gate — evaluates approved ego proposals before dispatch.
+        # Opaque to the ego: blocks proposals that exceed the current autonomy
+        # level for their action domain. Wired into ego sessions in init/ego.py.
+        if rt._db is not None and hasattr(rt, "_autonomy_manager") and rt._autonomy_manager:
+            try:
+                from genesis.autonomy.proposal_gate import ProposalDispatchGate
+                from genesis.autonomy.rules import RuleEngine
+
+                rt._proposal_dispatch_gate = ProposalDispatchGate(
+                    autonomy_manager=rt._autonomy_manager,
+                    rule_engine=rt._action_classifier._rule_engine if hasattr(
+                        rt._action_classifier, "_rule_engine"
+                    ) else RuleEngine(),
+                    protected_paths=rt._protected_paths,
+                )
+                logger.info("Proposal dispatch gate initialized")
+            except Exception:
+                logger.warning("Failed to initialize proposal dispatch gate", exc_info=True)
+
         # Remediation registry — mechanical reflex layer for health probes
         try:
             from genesis.autonomy.remediation import RemediationRegistry, register_defaults

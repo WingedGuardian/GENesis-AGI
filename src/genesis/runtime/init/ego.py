@@ -125,6 +125,9 @@ async def init(rt: GenesisRuntime) -> None:
         if rt._autonomous_dispatcher is not None:
             user_ego_session.set_autonomous_dispatcher(rt._autonomous_dispatcher)
 
+        if getattr(rt, "_proposal_dispatch_gate", None) is not None:
+            user_ego_session.set_proposal_gate(rt._proposal_dispatch_gate)
+
         # Store as the primary ego session (backwards compatible)
         rt._ego_session = user_ego_session
 
@@ -197,6 +200,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         if rt._autonomous_dispatcher is not None:
             genesis_ego_session.set_autonomous_dispatcher(rt._autonomous_dispatcher)
+
+        if getattr(rt, "_proposal_dispatch_gate", None) is not None:
+            genesis_ego_session.set_proposal_gate(rt._proposal_dispatch_gate)
 
         rt._genesis_ego_session = genesis_ego_session
 
