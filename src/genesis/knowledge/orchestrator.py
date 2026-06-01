@@ -107,7 +107,13 @@ class KnowledgeOrchestrator:
 
         # 3b. Kick off tree indexing in parallel (if applicable)
         tree_task: asyncio.Task | None = None
-        source_resolved = Path(source).resolve() if not source.startswith(("http://", "https://")) else None
+        source_resolved = None
+        if not source.startswith(("http://", "https://")):
+            candidate = Path(source).resolve()
+            # Path traversal guard: only allow files under $HOME
+            home = Path.home().resolve()
+            if candidate.is_relative_to(home):
+                source_resolved = candidate
         should_tree_index = (
             self._tree_index is not None
             and content.source_type == "pdf"
