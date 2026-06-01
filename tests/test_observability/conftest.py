@@ -3,10 +3,9 @@
 import functools
 from unittest.mock import MagicMock
 
+import aiohttp
 import pytest
 from aioresponses import aioresponses
-
-import aiohttp
 
 
 def _patch_client_response_init():
