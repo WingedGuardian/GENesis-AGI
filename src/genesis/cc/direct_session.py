@@ -312,6 +312,11 @@ class DirectSessionRunner:
         self._rt = runtime
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
+        self._protected_paths: object | None = None
+
+    def set_protected_paths(self, registry: object) -> None:
+        """Inject ProtectedPathRegistry for background session prompt hardening."""
+        self._protected_paths = registry
 
     # -- Public API --------------------------------------------------------
 
@@ -605,6 +610,17 @@ class DirectSessionRunner:
 
         # Inject profile addendum (tells session its constraints upfront)
         system_prompt += _build_profile_addendum(request.profile)
+
+        # Inject protected paths into background session prompt (Layer 2 defense).
+        # Foreground sessions get this via CCInvoker; background sessions were
+        # missing it. This makes the LLM aware of path restrictions even when
+        # tool_exceptions grant Write access.
+        if self._protected_paths is not None:
+            format_fn = getattr(self._protected_paths, "format_for_prompt", None)
+            if format_fn:
+                protection_context = format_fn()
+                if protection_context:
+                    system_prompt += "\n\n" + protection_context
 
         # Inject skills (explicit from request, auto-detected from prompt keywords)
         skill_names = _resolve_skills(request)

@@ -125,6 +125,11 @@ async def init(rt: GenesisRuntime) -> None:
         )
         rt._direct_session_runner = runner
 
+        # Inject protected paths for background session prompt hardening
+        if getattr(rt, "_protected_paths", None) is not None:
+            runner.set_protected_paths(rt._protected_paths)
+            logger.info("ProtectedPathRegistry wired into DirectSessionRunner")
+
         # Wire MCP tools (pass db so they can enqueue, runner for active_count)
         from genesis.mcp.health.direct_session_tools import init_direct_session_tools
 
