@@ -32,7 +32,7 @@ dependencies = [
 test = [
     "pytest>=8.0",
     "pytest-asyncio",
-    "aioresponses",
+    "aioresponses>=0.7.7",
 ]
 browser = [
     "playwright>=1.40",

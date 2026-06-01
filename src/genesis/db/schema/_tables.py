@@ -564,7 +564,10 @@ TABLES = {
             created_at       TEXT NOT NULL DEFAULT (datetime('now')),
             resolved_at      TEXT,
             resolved_by      TEXT,
-            consumed_at      TEXT
+            consumed_at      TEXT,
+            content_hash     TEXT,                    -- SHA-256 of canonical(action_type,class,desc,ctx)
+            previous_hash    TEXT,                    -- chain link: previous record's chain_hash
+            chain_hash       TEXT                     -- SHA-256(previous_hash:content_hash)
         )
     """,
     "task_states": """
@@ -754,7 +757,9 @@ TABLES = {
             compacted_into  TEXT,                    -- set when folded into compacted summary
             output_hash     TEXT,                    -- SHA-256 of output_text for audit trail
             output_size     INTEGER,                 -- byte count of output_text
-            ego_source      TEXT                     -- 'user_ego_cycle' or 'genesis_ego_cycle'
+            ego_source      TEXT,                    -- 'user_ego_cycle' or 'genesis_ego_cycle'
+            previous_hash   TEXT,                    -- chain link: previous record's chain_hash
+            chain_hash      TEXT                     -- SHA-256(previous_hash:output_hash)
         )
     """,
     "ego_proposals": """

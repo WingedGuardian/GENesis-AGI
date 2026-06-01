@@ -16,14 +16,73 @@ async def create(
     status: str = "pending",
     timeout_at: str | None = None,
     created_at: str | None = None,
+    content_hash: str | None = None,
+    previous_hash: str | None = None,
+    chain_hash: str | None = None,
 ) -> str:
     await db.execute(
         """INSERT INTO approval_requests
            (id, action_type, action_class, description, context,
-            status, timeout_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')))""",
+            status, timeout_at, created_at,
+            content_hash, previous_hash, chain_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
+                   ?, ?, ?)""",
         (id, action_type, action_class, description, context,
-         status, timeout_at, created_at),
+         status, timeout_at, created_at,
+         content_hash, previous_hash, chain_hash),
+    )
+    await db.commit()
+    return id
+
+
+async def create_chained(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    action_type: str,
+    action_class: str,
+    description: str,
+    context: str | None = None,
+    status: str = "pending",
+    timeout_at: str | None = None,
+    created_at: str | None = None,
+) -> str:
+    """Insert approval request with hash chain.
+
+    Note: the read-then-insert has a theoretical TOCTOU race if two
+    requests are created in the same asyncio tick. This is low-probability
+    and detectable: two records sharing the same previous_hash indicates
+    a fork (concurrent write), not tampering. verify_chain() catches it.
+    """
+    from genesis.ego.integrity import canonical_json, chained_hash, content_hash
+
+    c_hash = content_hash(canonical_json({
+        "action_type": action_type,
+        "action_class": action_class,
+        "description": description,
+        "context": context or "",
+    }))
+
+    cursor = await db.execute(
+        "SELECT chain_hash FROM approval_requests "
+        "WHERE chain_hash IS NOT NULL "
+        "ORDER BY created_at DESC, id DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    prev_chain = row[0] if row else None
+
+    chain = chained_hash(c_hash, prev_chain)
+
+    await db.execute(
+        """INSERT INTO approval_requests
+           (id, action_type, action_class, description, context,
+            status, timeout_at, created_at,
+            content_hash, previous_hash, chain_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, COALESCE(?, datetime('now')),
+                   ?, ?, ?)""",
+        (id, action_type, action_class, description, context,
+         status, timeout_at, created_at,
+         c_hash, prev_chain, chain),
     )
     await db.commit()
     return id

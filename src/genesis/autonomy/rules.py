@@ -102,13 +102,38 @@ class RuleEngine:
         """Evaluate *ctx* against rules. First full match wins."""
         for rule in self._rules:
             if self._matches(rule, ctx):
-                return RuleResult(
+                result = RuleResult(
                     decision=rule.decision,
                     rule_id=rule.rule_id,
                     timeout_seconds=rule.timeout_seconds,
                     description=rule.description,
                 )
+                self._log_evaluation(ctx, result)
+                return result
+        self._log_evaluation(ctx, _DEFAULT_RESULT)
         return _DEFAULT_RESULT
+
+    def _log_evaluation(self, ctx: RuleContext, result: RuleResult) -> None:
+        """Structured audit log for rule evaluation (Verified Autonomy L5).
+
+        Key=value format in the message body so GenesisFormatter preserves
+        it in the log file. Tier 1 audit trail (log file, grep-searchable).
+        """
+        level = (
+            logging.DEBUG
+            if result.decision == ApprovalDecision.ACT
+            else logging.INFO
+        )
+        logger.log(
+            level,
+            "autonomy.rule_evaluated rule_id=%s decision=%s "
+            "action_class=%s protection_level=%s context=%s",
+            result.rule_id,
+            result.decision.value,
+            ctx.action_class.value if ctx.action_class else "none",
+            ctx.protection_level.value if ctx.protection_level else "none",
+            ctx.context_category or "none",
+        )
 
     def reload(self) -> None:
         """Re-read rules from YAML. Safe to call at runtime.

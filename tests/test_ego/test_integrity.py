@@ -7,7 +7,13 @@ preservation, and cycle storage with hash/size.
 from __future__ import annotations
 
 from genesis.db.crud import ego as ego_crud
-from genesis.ego.integrity import content_hash, content_size
+from genesis.ego.integrity import (
+    canonical_json,
+    chained_hash,
+    content_hash,
+    content_size,
+    verify_chain,
+)
 
 # ── Utility ─────────────────────────────────────────────────────────────────
 
@@ -156,3 +162,136 @@ def test_realist_pass_no_original_content():
         prop["content"] = verdict["amended_content"]
 
     assert "_original_content" not in prop
+
+
+# ── Hash chain functions (Verified Autonomy L8) ──────────────────────────────
+
+
+def test_canonical_json_key_order_independent():
+    assert canonical_json({"b": 1, "a": 2}) == canonical_json({"a": 2, "b": 1})
+
+
+def test_canonical_json_deterministic():
+    d = {"action_type": "investigate", "description": "test"}
+    assert canonical_json(d) == canonical_json(d)
+
+
+def test_canonical_json_no_whitespace():
+    result = canonical_json({"a": 1, "b": 2})
+    assert " " not in result
+
+
+def test_chained_hash_deterministic():
+    h1 = chained_hash("abc123", "prev456")
+    h2 = chained_hash("abc123", "prev456")
+    assert h1 == h2
+
+
+def test_chained_hash_genesis_sentinel():
+    """First record in chain uses 'genesis' as sentinel."""
+    h = chained_hash("abc123", None)
+    expected_payload = "genesis:abc123"
+    import hashlib
+    assert h == hashlib.sha256(expected_payload.encode()).hexdigest()
+
+
+def test_chained_hash_different_previous():
+    h1 = chained_hash("content", "prev_a")
+    h2 = chained_hash("content", "prev_b")
+    assert h1 != h2
+
+
+def test_chained_hash_different_content():
+    h1 = chained_hash("content_a", "prev")
+    h2 = chained_hash("content_b", "prev")
+    assert h1 != h2
+
+
+def test_verify_chain_empty():
+    valid, idx = verify_chain([])
+    assert valid is True
+    assert idx == -1
+
+
+def test_verify_chain_single_record():
+    ch = content_hash("hello")
+    chain = chained_hash(ch, None)
+    records = [{"content_hash": ch, "previous_hash": None, "chain_hash": chain}]
+    valid, idx = verify_chain(records)
+    assert valid is True
+    assert idx == -1
+
+
+def test_verify_chain_three_records():
+    records = []
+    prev = None
+    for text in ["first", "second", "third"]:
+        ch = content_hash(text)
+        chain = chained_hash(ch, prev)
+        records.append({
+            "content_hash": ch,
+            "previous_hash": prev,
+            "chain_hash": chain,
+        })
+        prev = chain
+
+    valid, idx = verify_chain(records)
+    assert valid is True
+    assert idx == -1
+
+
+def test_verify_chain_tampered_content():
+    """Modifying content of a record breaks the chain."""
+    records = []
+    prev = None
+    for text in ["first", "second", "third"]:
+        ch = content_hash(text)
+        chain = chained_hash(ch, prev)
+        records.append({
+            "content_hash": ch,
+            "previous_hash": prev,
+            "chain_hash": chain,
+        })
+        prev = chain
+
+    # Tamper with second record's content
+    records[1]["content_hash"] = content_hash("TAMPERED")
+
+    valid, idx = verify_chain(records)
+    assert valid is False
+    assert idx == 1  # chain breaks at the tampered record
+
+
+def test_verify_chain_tampered_previous_hash():
+    """Modifying previous_hash link breaks the chain."""
+    records = []
+    prev = None
+    for text in ["first", "second", "third"]:
+        ch = content_hash(text)
+        chain = chained_hash(ch, prev)
+        records.append({
+            "content_hash": ch,
+            "previous_hash": prev,
+            "chain_hash": chain,
+        })
+        prev = chain
+
+    # Break the link between records 1 and 2
+    records[2]["previous_hash"] = "bogus_hash"
+
+    valid, idx = verify_chain(records)
+    assert valid is False
+    assert idx == 2
+
+
+def test_verify_chain_skips_pre_migration():
+    """Records with chain_hash=None (pre-migration) are skipped."""
+    pre_migration = {"content_hash": "old", "previous_hash": None, "chain_hash": None}
+
+    ch = content_hash("new")
+    chain = chained_hash(ch, None)
+    post_migration = {"content_hash": ch, "previous_hash": None, "chain_hash": chain}
+
+    valid, idx = verify_chain([pre_migration, post_migration])
+    assert valid is True
+    assert idx == -1

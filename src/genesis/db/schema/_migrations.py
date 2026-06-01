@@ -1356,6 +1356,35 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "user_goals.cadence_days",
     )
 
+    # Verified Autonomy L8: hash chain columns for tamper-evident audit trails.
+    # ego_cycles: chain links ego cycle decisions
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_cycles ADD COLUMN previous_hash TEXT",
+        "ego_cycles.previous_hash",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE ego_cycles ADD COLUMN chain_hash TEXT",
+        "ego_cycles.chain_hash",
+    )
+    # approval_requests: chain links approval decisions
+    await _try_alter(
+        db,
+        "ALTER TABLE approval_requests ADD COLUMN content_hash TEXT",
+        "approval_requests.content_hash",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE approval_requests ADD COLUMN previous_hash TEXT",
+        "approval_requests.previous_hash",
+    )
+    await _try_alter(
+        db,
+        "ALTER TABLE approval_requests ADD COLUMN chain_hash TEXT",
+        "approval_requests.chain_hash",
+    )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.
