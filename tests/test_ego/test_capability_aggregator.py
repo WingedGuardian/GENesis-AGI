@@ -137,9 +137,10 @@ class TestComputeCapabilityMap:
         results = await compute_capability_map(db)
         investigate = next((r for r in results if r["domain"] == "investigate"), None)
         assert investigate is not None
-        # Weighted by sample size: proposals (n=10) dominate over journal (n=1)
-        # So result should be closer to 50% than 100%
-        assert 0.45 <= investigate["confidence"] <= 0.65
+        # Inverse confidence weighting: journal (100%, weight=1.0) and
+        # proposals (50%, weight=1.5). The weaker signal gets more influence,
+        # pulling toward 50%. Result is ~0.7 (sample size not used in ICW).
+        assert 0.65 <= investigate["confidence"] <= 0.75
 
     @pytest.mark.asyncio
     async def test_autonomy_state_contributes(self, db):

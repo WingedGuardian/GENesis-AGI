@@ -66,12 +66,13 @@ class CompactionEngine:
     async def store_cycle(self, cycle: EgoCycle) -> str:
         """Persist a completed ego cycle to the database.
 
-        Returns the cycle id. Cycles are stored for audit logging,
-        cost tracking, and historical analysis.
+        Returns the cycle id. Uses chained hashing (Verified Autonomy L8)
+        for tamper-evident audit trails. BEGIN IMMEDIATE prevents TOCTOU
+        races between concurrent ego sessions.
         """
         from genesis.ego.integrity import content_hash, content_size
 
-        return await ego_crud.create_cycle(
+        return await ego_crud.create_cycle_chained(
             self._db,
             id=cycle.id,
             output_text=cycle.output_text,

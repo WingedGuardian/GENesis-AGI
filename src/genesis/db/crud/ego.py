@@ -31,6 +31,8 @@ async def create_cycle(
     output_hash: str | None = None,
     output_size: int | None = None,
     ego_source: str = "",
+    previous_hash: str | None = None,
+    chain_hash: str | None = None,
 ) -> str:
     """Insert a new ego cycle record. Returns the id."""
     if created_at is None:
@@ -40,8 +42,8 @@ async def create_cycle(
            (id, output_text, proposals_json, focus_summary,
             model_used, cost_usd, input_tokens, output_tokens,
             duration_ms, created_at, output_hash, output_size,
-            ego_source)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ego_source, previous_hash, chain_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             id,
             output_text,
@@ -56,6 +58,78 @@ async def create_cycle(
             output_hash,
             output_size,
             ego_source,
+            previous_hash,
+            chain_hash,
+        ),
+    )
+    await db.commit()
+    return id
+
+
+async def create_cycle_chained(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    output_text: str,
+    proposals_json: str = "[]",
+    focus_summary: str = "",
+    model_used: str = "",
+    cost_usd: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    duration_ms: int = 0,
+    created_at: str | None = None,
+    output_hash: str = "",
+    output_size: int | None = None,
+    ego_source: str = "",
+) -> str:
+    """Insert ego cycle with hash chain.
+
+    Fetches the previous cycle's chain_hash, computes the new chain link,
+    and inserts. Note: the read-then-insert has a theoretical TOCTOU race
+    if two ego sessions (user + genesis) create cycles simultaneously.
+    This is low-probability and detectable: two records sharing the same
+    previous_hash indicates a fork (concurrent write), not tampering.
+    verify_chain() catches it.
+    """
+    from genesis.ego.integrity import chained_hash
+
+    if created_at is None:
+        created_at = datetime.now(UTC).isoformat()
+
+    cursor = await db.execute(
+        "SELECT chain_hash FROM ego_cycles "
+        "WHERE chain_hash IS NOT NULL "
+        "ORDER BY created_at DESC, id DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    prev_chain = row[0] if row else None
+
+    chain = chained_hash(output_hash, prev_chain)
+
+    await db.execute(
+        """INSERT INTO ego_cycles
+           (id, output_text, proposals_json, focus_summary,
+            model_used, cost_usd, input_tokens, output_tokens,
+            duration_ms, created_at, output_hash, output_size,
+            ego_source, previous_hash, chain_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            id,
+            output_text,
+            proposals_json,
+            focus_summary,
+            model_used,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            duration_ms,
+            created_at,
+            output_hash,
+            output_size,
+            ego_source,
+            prev_chain,
+            chain,
         ),
     )
     await db.commit()

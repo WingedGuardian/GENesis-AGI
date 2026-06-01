@@ -63,7 +63,7 @@ class ApprovalManager:
 
         request_id = str(uuid4())
 
-        await crud.create(
+        await crud.create_chained(
             self._db,
             id=request_id,
             action_type=action_type,

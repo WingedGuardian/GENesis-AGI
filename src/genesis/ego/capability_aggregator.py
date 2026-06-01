@@ -161,19 +161,27 @@ class _DomainAccumulator:
         if not self.signals:
             return None
 
-        # Weighted average: weight by sample size (more data = more influence)
         total_weight = sum(n for _, _, n in self.signals)
         if total_weight == 0:
             return None
 
-        weighted_sum = sum(rate * n for _, rate, n in self.signals)
-        confidence = round(weighted_sum / total_weight, 3)
+        # Inverse confidence weighting (Verified Autonomy L1): surfaces the
+        # weakest signal instead of hiding it behind the average.
+        from genesis.ego.confidence_weighting import inverse_confidence_weight
 
-        # Build evidence summary
+        field_scores = {source: rate for source, rate, _ in self.signals}
+        confidence = round(inverse_confidence_weight(field_scores), 3)
+
+        # Keep arithmetic mean for comparison during rollout
+        arithmetic_mean = round(
+            sum(rate * n for _, rate, n in self.signals) / total_weight, 3
+        )
+
+        # Build evidence summary — includes both scores for calibration
         parts = []
         for source, rate, n in self.signals:
             parts.append(f"{source}:{rate:.0%}({n})")
-        evidence = ", ".join(parts)
+        evidence = ", ".join(parts) + f" | icw={confidence} avg={arithmetic_mean}"
 
         return {
             "domain": self.domain,
