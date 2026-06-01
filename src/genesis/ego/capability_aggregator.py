@@ -170,12 +170,15 @@ class _DomainAccumulator:
         from genesis.ego.confidence_weighting import inverse_confidence_weight
 
         field_scores = {source: rate for source, rate, _ in self.signals}
-        confidence = round(inverse_confidence_weight(field_scores), 3)
-
-        # Keep arithmetic mean for comparison during rollout
+        # Arithmetic mean as fallback if rates are out-of-range (shouldn't
+        # happen, but DB values could be corrupted)
         arithmetic_mean = round(
             sum(rate * n for _, rate, n in self.signals) / total_weight, 3
         )
+        try:
+            confidence = round(inverse_confidence_weight(field_scores), 3)
+        except ValueError:
+            confidence = arithmetic_mean
 
         # Build evidence summary — includes both scores for calibration
         parts = []

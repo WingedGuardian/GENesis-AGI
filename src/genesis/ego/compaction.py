@@ -67,8 +67,8 @@ class CompactionEngine:
         """Persist a completed ego cycle to the database.
 
         Returns the cycle id. Uses chained hashing (Verified Autonomy L8)
-        for tamper-evident audit trails. BEGIN IMMEDIATE prevents TOCTOU
-        races between concurrent ego sessions.
+        for tamper-evident audit trails. Note: the read-then-insert has a
+        theoretical TOCTOU race between concurrent ego sessions (dual ego).
         """
         from genesis.ego.integrity import content_hash, content_size
 

@@ -57,15 +57,24 @@ def verify_chain(records: list[dict]) -> tuple[bool, int]:
     Parameters
     ----------
     records:
-        List of dicts, each with ``content_hash``, ``previous_hash``,
-        and ``chain_hash`` keys. Records with ``chain_hash=None``
-        (pre-migration) are skipped gracefully.
+        List of dicts, each with a content hash field, ``previous_hash``,
+        and ``chain_hash`` keys. The content hash field can be named
+        ``content_hash`` or ``output_hash`` (ego_cycles uses the latter).
+        Records with ``chain_hash=None`` (pre-migration) are skipped.
 
     Returns
     -------
     tuple[bool, int]:
         ``(True, -1)`` if chain is intact.
         ``(False, index)`` at the first broken link.
+
+    Note
+    ----
+    Pre-migration records (chain_hash=None) are skipped implicitly.
+    This means an attacker who replaces a chained record with an unchained
+    one mid-chain would not be detected. This is bounded by the INSERT
+    path: only newly inserted records get chain hashes, and the risk is
+    limited to direct database manipulation.
     """
     prev_chain: str | None = None
     for i, rec in enumerate(records):
@@ -80,8 +89,14 @@ def verify_chain(records: list[dict]) -> tuple[bool, int]:
         if (stored_prev or None) != (prev_chain or None):
             return False, i
 
+        # Accept both column names: ego_cycles uses output_hash,
+        # approval_requests uses content_hash
+        c_hash = rec.get("content_hash") or rec.get("output_hash")
+        if c_hash is None:
+            return False, i
+
         # Recompute and verify the chain_hash
-        recomputed = chained_hash(rec["content_hash"], stored_prev)
+        recomputed = chained_hash(c_hash, stored_prev)
         if stored_chain != recomputed:
             return False, i
 

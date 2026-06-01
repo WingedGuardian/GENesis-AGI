@@ -60,12 +60,13 @@ async def create_chained(
         "action_type": action_type,
         "action_class": action_class,
         "description": description,
+        "context": context or "",
     }))
 
     cursor = await db.execute(
         "SELECT chain_hash FROM approval_requests "
         "WHERE chain_hash IS NOT NULL "
-        "ORDER BY created_at DESC LIMIT 1"
+        "ORDER BY created_at DESC, id DESC LIMIT 1"
     )
     row = await cursor.fetchone()
     prev_chain = row[0] if row else None
