@@ -128,31 +128,33 @@ class PostExecutionAuditor:
 
         files: list[str] = []
         try:
-            for line in transcript.read_text().splitlines():
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if entry.get("type") != "assistant":
-                    continue
-
-                content = entry.get("message", {}).get("content", [])
-                if not isinstance(content, list):
-                    continue
-
-                for block in content:
-                    if not isinstance(block, dict):
+            with transcript.open() as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
                         continue
-                    if block.get("type") != "tool_use":
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
                         continue
-                    if block.get("name") not in ("Write", "Edit"):
+
+                    if entry.get("type") != "assistant":
                         continue
-                    fp = block.get("input", {}).get("file_path", "")
-                    if fp:
-                        files.append(fp)
+
+                    content = entry.get("message", {}).get("content", [])
+                    if not isinstance(content, list):
+                        continue
+
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        if block.get("name") not in ("Write", "Edit"):
+                            continue
+                        fp = block.get("input", {}).get("file_path", "")
+                        if fp:
+                            files.append(fp)
         except Exception:
             logger.error("Failed to parse transcript: %s", path, exc_info=True)
 

@@ -1109,9 +1109,15 @@ class EgoSession:
             if self._proposal_gate is not None:
                 try:
                     prop_row = await ego_crud.get_proposal(self._db, proposal_id)
-                    if prop_row is not None:
-                        decision = await self._proposal_gate.evaluate(prop_row)
-                        if not decision.allowed:
+                    if prop_row is None:
+                        # Proposal disappeared — skip (don't dispatch ungated)
+                        logger.warning(
+                            "Execution brief %s: proposal not found — skipping",
+                            proposal_id,
+                        )
+                        continue
+                    decision = await self._proposal_gate.evaluate(prop_row)
+                    if not decision.allowed:
                             logger.info(
                                 "Execution brief %s blocked by dispatch gate: %s (domain=%s)",
                                 proposal_id,

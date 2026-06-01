@@ -333,8 +333,11 @@ class DirectSessionRunner:
         spawns as a circuit breaker. This is defense-in-depth — the
         proposal gate handles fine-grained domain classification.
         """
-        # Ceiling check: skip for foreground/user-initiated sessions
-        _SKIP_TAGS = {"foreground", "direct_session", "user_request"}
+        # Ceiling check: skip for foreground/user-initiated sessions.
+        # NOTE: DirectSessionRequest.source_tag defaults to "direct_session",
+        # so we intentionally exclude it from the skip set — only explicitly
+        # foreground or user-initiated sessions bypass the check.
+        _SKIP_TAGS = {"foreground", "user_request"}
         if request.source_tag not in _SKIP_TAGS:
             mgr = getattr(self._rt, "_autonomy_manager", None)
             if mgr is not None:

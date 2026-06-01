@@ -313,8 +313,10 @@ def classify_domain(action_type: str, execution_plan: str = "") -> ActionDomain:
             return ActionDomain.EXTERNAL_WRITE
         if any(kw in plan_lower for kw in ("payment", "purchase", "pay", "stripe")):
             return ActionDomain.FINANCIAL
+        # SELF_MODIFY: must reference source code paths specifically.
+        # Exclude ~/.genesis/ (output dir) and github URLs to avoid false positives.
         if (any(kw in plan_lower for kw in ("edit", "write", "modify"))
-                and any(p in plan_lower for p in ("src/genesis", "genesis/"))):
+                and "src/genesis/" in plan_lower):
             return ActionDomain.SELF_MODIFY
 
     return ActionDomain.EXTERNAL_READ
