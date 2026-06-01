@@ -1102,6 +1102,41 @@ class EgoSession:
             else:
                 model = CCModel.SONNET
 
+            # Autonomy dispatch gate — same check as sweep_approved_inner.
+            # Load full proposal to evaluate action domain against current
+            # autonomy level. Gate fires BEFORE the atomic claim so blocked
+            # proposals stay 'approved' (ego-invisible).
+            if self._proposal_gate is not None:
+                try:
+                    prop_row = await ego_crud.get_proposal(self._db, proposal_id)
+                    if prop_row is not None:
+                        decision = await self._proposal_gate.evaluate(prop_row)
+                        if not decision.allowed:
+                            logger.info(
+                                "Execution brief %s blocked by dispatch gate: %s (domain=%s)",
+                                proposal_id,
+                                decision.reason,
+                                decision.action_domain,
+                            )
+                            if self._event_bus:
+                                from genesis.observability.types import Severity, Subsystem
+                                await self._event_bus.emit(
+                                    Subsystem.AUTONOMY,
+                                    Severity.INFO,
+                                    "autonomy.dispatch_gate.block",
+                                    f"Blocked execution brief: {decision.reason}",
+                                    proposal_id=proposal_id,
+                                    action_domain=str(decision.action_domain),
+                                    rule_id=decision.rule_id,
+                                )
+                            continue
+                except Exception:
+                    logger.error(
+                        "Proposal gate failed for execution brief %s — allowing dispatch",
+                        proposal_id,
+                        exc_info=True,
+                    )
+
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
             # Use raw SQL to preserve resolved_at (the approval timestamp
