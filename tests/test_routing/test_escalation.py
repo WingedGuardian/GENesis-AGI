@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiosqlite
 import pytest
@@ -12,8 +11,8 @@ import pytest
 from genesis.db.schema import INDEXES, TABLES
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import GenesisEvent, Severity, Subsystem
-from genesis.routing.circuit_breaker import CircuitBreaker, CircuitBreakerRegistry
-from genesis.routing.escalation import ProviderEscalation, _TRIP_THRESHOLD
+from genesis.routing.circuit_breaker import CircuitBreaker
+from genesis.routing.escalation import _TRIP_THRESHOLD, ProviderEscalation
 from genesis.routing.types import ErrorCategory, ProviderConfig
 
 
@@ -37,6 +36,16 @@ def _make_event(provider: str = "test-provider") -> GenesisEvent:
         timestamp=datetime.now(UTC).isoformat(),
         details={"provider": provider, "call_site": "test"},
     )
+
+
+async def _drain_tasks():
+    """Let all pending asyncio tasks complete."""
+    pending = [
+        t for t in asyncio.all_tasks()
+        if t is not asyncio.current_task() and not t.done()
+    ]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.fixture
@@ -75,8 +84,7 @@ class TestTripTracking:
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event())
 
-        # Allow background task to complete
-        await asyncio.sleep(0.1)
+        await _drain_tasks()
 
         cursor = await db.execute(
             "SELECT source, type, priority, category FROM observations"
@@ -93,7 +101,7 @@ class TestTripTracking:
         for _ in range(_TRIP_THRESHOLD + 10):
             await escalation._on_event(_make_event())
 
-        await asyncio.sleep(0.1)
+        await _drain_tasks()
 
         cursor = await db.execute("SELECT COUNT(*) FROM observations")
         count = (await cursor.fetchone())[0]
@@ -106,7 +114,7 @@ class TestTripTracking:
         for _ in range(_TRIP_THRESHOLD - 1):
             await escalation._on_event(_make_event("provider-b"))
 
-        await asyncio.sleep(0.1)
+        await _drain_tasks()
 
         cursor = await db.execute("SELECT COUNT(*) FROM observations")
         count = (await cursor.fetchone())[0]
@@ -133,7 +141,7 @@ class TestRecovery:
         # First cycle
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event())
-        await asyncio.sleep(0.1)
+        await _drain_tasks()
 
         # Recover
         escalation.record_recovery("test-provider")
@@ -147,7 +155,7 @@ class TestRecovery:
         # Second cycle
         for _ in range(_TRIP_THRESHOLD):
             await escalation._on_event(_make_event())
-        await asyncio.sleep(0.1)
+        await _drain_tasks()
 
         cursor = await db.execute(
             "SELECT COUNT(*) FROM observations WHERE source = 'routing'"
