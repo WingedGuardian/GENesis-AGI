@@ -39,7 +39,8 @@ _SOURCE_TO_COLLECTIONS: dict[str, list[str]] = {
 # content (ego corrections, triage signals, reflection observations)
 # doesn't pollute user-facing answers. Surplus is intentionally absent —
 # its direct-session profile blocks memory writes entirely.
-_KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection")
+# Autonomy: audit/gate data must never surface to ego context (opacity).
+_KNOWN_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
 
 # ---------------------------------------------------------------------------
 # Graph-boosted retrieval constants (spec Part 1)

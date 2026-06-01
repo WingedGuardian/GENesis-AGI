@@ -86,7 +86,6 @@ _ALL_SECTIONS = (
     "goal_progress",
     "goal_deep_dive",
     "capability_performance",
-    "autonomy_readiness",
     "recurring_patterns",
     "output_contract",
 )
@@ -135,7 +134,6 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "proposal_history": "light",
         "capabilities": "light",
         "capability_performance": "skip",
-        "autonomy_readiness": "skip",
         "recurring_patterns": "skip",
     }),
 
@@ -155,7 +153,6 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "proposal_history": "light",
         "capabilities": "light",
         "capability_performance": "skip",
-        "autonomy_readiness": "skip",
         "recurring_patterns": "light",
     }),
 
@@ -175,7 +172,6 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "proposal_history": "light",
         "capabilities": "skip",
         "capability_performance": "skip",
-        "autonomy_readiness": "skip",
         "recurring_patterns": "skip",
     }),
 
@@ -195,7 +191,6 @@ FOCUS_CONTEXT_WEIGHTS: dict[str, dict[str, str]] = {
         "proposal_history": "light",
         "capabilities": "light",
         "capability_performance": "skip",
-        "autonomy_readiness": "skip",
         "recurring_patterns": "skip",
     }),
 }

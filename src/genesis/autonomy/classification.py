@@ -21,7 +21,7 @@ from typing import Any
 import yaml
 
 from genesis.autonomy.rules import RuleContext, RuleEngine
-from genesis.autonomy.types import ActionClass, ApprovalDecision
+from genesis.autonomy.types import ActionClass, ActionDomain, ApprovalDecision
 
 logger = logging.getLogger(__name__)
 
@@ -252,3 +252,71 @@ def classify_action(action_description: str) -> ActionClass:
             return ActionClass.COSTLY_REVERSIBLE
 
     return ActionClass.REVERSIBLE
+
+
+# ---------------------------------------------------------------------------
+# Action domain classification (parallel taxonomy)
+# ---------------------------------------------------------------------------
+
+# Maps ego proposal action_type → ActionDomain.
+# The ego outputs action_type naturally; the domain is derived externally
+# so the ego never sees or reasons about the domain vocabulary.
+ACTION_TYPE_DOMAIN_MAP: dict[str, ActionDomain] = {
+    "investigate": ActionDomain.EXTERNAL_READ,
+    "research": ActionDomain.EXTERNAL_READ,
+    "analyze": ActionDomain.EXTERNAL_READ,
+    "diagnose": ActionDomain.OBSERVE,
+    "monitor": ActionDomain.OBSERVE,
+    "maintenance": ActionDomain.INTERNAL_WRITE,
+    "config": ActionDomain.INTERNAL_WRITE,
+    "optimize": ActionDomain.INTERNAL_WRITE,
+    "outreach": ActionDomain.REPRESENT_USER,
+    "email": ActionDomain.REPRESENT_USER,
+    "apply": ActionDomain.REPRESENT_USER,
+    "notification": ActionDomain.NOTIFY_USER,
+    "alert": ActionDomain.NOTIFY_USER,
+    "publish": ActionDomain.EXTERNAL_WRITE,
+    "content": ActionDomain.EXTERNAL_WRITE,
+    "post": ActionDomain.EXTERNAL_WRITE,
+    "purchase": ActionDomain.FINANCIAL,
+    "payment": ActionDomain.FINANCIAL,
+    "code_change": ActionDomain.SELF_MODIFY,
+    "refactor": ActionDomain.SELF_MODIFY,
+}
+
+
+def classify_domain(action_type: str, execution_plan: str = "") -> ActionDomain:
+    """Derive ActionDomain from an ego proposal's action_type field.
+
+    Primary source: ACTION_TYPE_DOMAIN_MAP lookup.
+    Secondary: keyword heuristic on execution_plan (tools/URLs mentioned).
+    Fallback: EXTERNAL_READ (safe default for most ego proposals).
+
+    The ego never sees or outputs ActionDomain — this is derived externally
+    to maintain opacity of the autonomy mechanism.
+    """
+    # Normalize
+    action_type_lower = action_type.lower().strip()
+
+    # Direct mapping
+    if action_type_lower in ACTION_TYPE_DOMAIN_MAP:
+        return ACTION_TYPE_DOMAIN_MAP[action_type_lower]
+
+    # Check execution_plan for tool hints
+    if execution_plan:
+        plan_lower = execution_plan.lower()
+        if any(kw in plan_lower for kw in ("browser_fill", "form", "apply", "submit")):
+            return ActionDomain.REPRESENT_USER
+        if any(kw in plan_lower for kw in ("outreach_send", "email", "linkedin")):
+            return ActionDomain.REPRESENT_USER
+        if any(kw in plan_lower for kw in ("publish", "medium", "post")):
+            return ActionDomain.EXTERNAL_WRITE
+        if any(kw in plan_lower for kw in ("payment", "purchase", "pay", "stripe")):
+            return ActionDomain.FINANCIAL
+        # SELF_MODIFY: must reference source code paths specifically.
+        # Exclude ~/.genesis/ (output dir) and github URLs to avoid false positives.
+        if (any(kw in plan_lower for kw in ("edit", "write", "modify"))
+                and "src/genesis/" in plan_lower):
+            return ActionDomain.SELF_MODIFY
+
+    return ActionDomain.EXTERNAL_READ

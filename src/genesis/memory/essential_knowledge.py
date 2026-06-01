@@ -183,6 +183,9 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         "code_audit",
         "version_change",
         "tech_debt",
+        # Autonomy gate data — must never surface to ego context (opacity)
+        "autonomy_audit",
+        "autonomy_gate_decision",
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:

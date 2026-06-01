@@ -21,6 +21,7 @@ import yaml
 
 from genesis.autonomy.types import (
     ActionClass,
+    ActionDomain,
     ApprovalDecision,
     ProtectionLevel,
 )
@@ -42,6 +43,7 @@ class RuleContext:
     """Context for rule evaluation — carries all the facts about an action."""
 
     action_class: ActionClass | None = None
+    action_domain: ActionDomain | None = None
     protection_level: ProtectionLevel | None = None
     autonomy_level: int | None = None
     context_category: str | None = None  # relay, background, direct, sub_agent
@@ -139,6 +141,13 @@ class RuleEngine:
             if ctx.action_class.value != cond["action_class"]:
                 return False
 
+        # action_domain
+        if "action_domain" in cond:
+            if ctx.action_domain is None:
+                return False
+            if ctx.action_domain.value != cond["action_domain"]:
+                return False
+
         # protection_level
         if "protection_level" in cond:
             if ctx.protection_level is None:
@@ -156,11 +165,18 @@ class RuleEngine:
             if ctx.context_category not in allowed:
                 return False
 
-        # autonomy_level — exact match or range (for V4)
+        # autonomy_level — exact match (legacy V3 behavior)
         if "autonomy_level" in cond:
             if ctx.autonomy_level is None:
                 return False
             if ctx.autonomy_level != cond["autonomy_level"]:
+                return False
+
+        # minimum_level — gate: blocks if current level is below minimum
+        if "minimum_level" in cond:
+            if ctx.autonomy_level is None:
+                return False
+            if ctx.autonomy_level < cond["minimum_level"]:
                 return False
 
         return True
@@ -169,7 +185,8 @@ class RuleEngine:
 
     # Known condition keys — warn on unknown keys to catch typos
     _KNOWN_CONDITION_KEYS = frozenset({
-        "action_class", "protection_level", "context", "autonomy_level",
+        "action_class", "action_domain", "protection_level", "context",
+        "autonomy_level", "minimum_level",
     })
 
     def _load(self) -> None:

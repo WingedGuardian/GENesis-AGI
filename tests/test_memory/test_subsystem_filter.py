@@ -24,14 +24,14 @@ class TestResolveSubsystemFilter:
     def test_include_list_keeps_named(self) -> None:
         """include_subsystem=['ego'] should preserve user + ego."""
         exclude, include_only = _resolve_subsystem_filter(["ego"], None)
-        assert exclude == ["triage", "reflection"]
+        assert exclude == ["triage", "reflection", "autonomy"]
         assert include_only is None
 
     def test_include_list_multiple(self) -> None:
         exclude, include_only = _resolve_subsystem_filter(
             ["ego", "reflection"], None,
         )
-        assert exclude == ["triage"]
+        assert exclude == ["triage", "autonomy"]
         assert include_only is None
 
     def test_only_subsystem_string(self) -> None:

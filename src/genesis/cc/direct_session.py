@@ -312,11 +312,67 @@ class DirectSessionRunner:
         self._rt = runtime
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
+        self._protected_paths: object | None = None
+        self._auditor: object | None = None
+
+    def set_protected_paths(self, registry: object) -> None:
+        """Inject ProtectedPathRegistry for background session prompt hardening."""
+        self._protected_paths = registry
+
+    def set_auditor(self, auditor: object) -> None:
+        """Inject PostExecutionAuditor for post-session autonomy feedback."""
+        self._auditor = auditor
 
     # -- Public API --------------------------------------------------------
 
     async def spawn(self, request: DirectSessionRequest) -> str:
-        """Fire-and-forget. Returns genesis session_id immediately."""
+        """Fire-and-forget. Returns genesis session_id immediately.
+
+        Includes a lightweight autonomy ceiling check: if the background
+        cognitive category has been fully regressed, block ALL background
+        spawns as a circuit breaker. This is defense-in-depth — the
+        proposal gate handles fine-grained domain classification.
+        """
+        # Ceiling check: skip for foreground/user-initiated sessions.
+        # NOTE: DirectSessionRequest.source_tag defaults to "direct_session",
+        # so we intentionally exclude it from the skip set — only explicitly
+        # foreground or user-initiated sessions bypass the check.
+        _SKIP_TAGS = {"foreground", "user_request"}
+        if request.source_tag not in _SKIP_TAGS:
+            mgr = getattr(self._rt, "_autonomy_manager", None)
+            if mgr is not None:
+                try:
+                    from genesis.autonomy.types import AutonomyCategory
+                    state = await mgr.get_state(
+                        AutonomyCategory.BACKGROUND_COGNITIVE.value,
+                    )
+                    # Block if corrections have fully regressed trust
+                    # (posterior < 0.15 means overwhelming corrections)
+                    if state is not None:
+                        from genesis.db.crud.autonomy import bayesian_posterior
+                        posterior = bayesian_posterior(
+                            state.total_successes, state.total_corrections,
+                        )
+                        if posterior < 0.15 and state.total_corrections > 3:
+                            logger.warning(
+                                "Spawn blocked: background_cognitive posterior %.3f "
+                                "(L%d, %dS/%dC) — autonomy circuit breaker",
+                                posterior, state.current_level,
+                                state.total_successes, state.total_corrections,
+                            )
+                            raise RuntimeError(
+                                f"Autonomy circuit breaker: background_cognitive "
+                                f"posterior {posterior:.3f} below threshold"
+                            )
+                except RuntimeError:
+                    raise  # re-raise the circuit breaker
+                except Exception:
+                    # Non-fatal: if check fails, allow spawn
+                    logger.debug(
+                        "Autonomy ceiling check failed (non-fatal)",
+                        exc_info=True,
+                    )
+
         session = await self._session_manager.create_background(
             session_type=SessionType.BACKGROUND_TASK,
             model=request.model,
@@ -396,6 +452,38 @@ class DirectSessionRunner:
 
             # Feed outcome back to ego proposal if this was a proposal dispatch
             await self._record_proposal_outcome(request, result)
+
+            # Post-execution audit: verify protected paths, feed autonomy signals.
+            # Only for ego dispatches (caller_context starts with "ego_proposal:").
+            # Runs inline (cheap) — transcript parsing is I/O-bound but fast.
+            if (
+                self._auditor is not None
+                and request.caller_context
+                and request.caller_context.startswith("ego_proposal:")
+            ):
+                try:
+                    metadata = {}
+                    db = getattr(self._rt, "_db", None)
+                    if db is not None:
+                        from genesis.db.crud import cc_sessions as cs_crud
+                        row = await cs_crud.get_by_id(db, session_id)
+                        if row and row.get("metadata"):
+                            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                                metadata = json.loads(row["metadata"])
+
+                    await self._auditor.audit_session(
+                        session_id,
+                        transcript_path=metadata.get("transcript_path", ""),
+                        tools_summary=metadata.get("tools_summary"),
+                        session_success=result.success,
+                        caller_context=request.caller_context,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Post-execution audit failed for %s (non-fatal)",
+                        session_id[:8],
+                        exc_info=True,
+                    )
 
             await self._session_manager.complete(
                 session_id,
@@ -605,6 +693,17 @@ class DirectSessionRunner:
 
         # Inject profile addendum (tells session its constraints upfront)
         system_prompt += _build_profile_addendum(request.profile)
+
+        # Inject protected paths into background session prompt (Layer 2 defense).
+        # Foreground sessions get this via CCInvoker; background sessions were
+        # missing it. This makes the LLM aware of path restrictions even when
+        # tool_exceptions grant Write access.
+        if self._protected_paths is not None:
+            format_fn = getattr(self._protected_paths, "format_for_prompt", None)
+            if format_fn:
+                protection_context = format_fn()
+                if protection_context:
+                    system_prompt += "\n\n" + protection_context
 
         # Inject skills (explicit from request, auto-detected from prompt keywords)
         skill_names = _resolve_skills(request)

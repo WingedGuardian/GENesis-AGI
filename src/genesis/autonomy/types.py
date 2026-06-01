@@ -78,6 +78,43 @@ class ActionClass(StrEnum):
 
 
 # ---------------------------------------------------------------------------
+# Action domains — WHO is affected, WHAT kind of external action?
+# ---------------------------------------------------------------------------
+
+class ActionDomain(StrEnum):
+    """Semantic classification of autonomous actions by scope and audience.
+
+    Parallel to ActionClass (which captures irreversibility), ActionDomain
+    captures who is affected and how visible the action is externally.
+    Used by the dispatch gate to determine required autonomy level and
+    derived session profile.
+    """
+
+    OBSERVE = "observe"                    # Read-only, no state change anywhere
+    INTERNAL_WRITE = "internal_write"      # Changes within Genesis (files, memory, config)
+    NOTIFY_USER = "notify_user"            # Sends to user only (Telegram, dashboard)
+    EXTERNAL_READ = "external_read"        # Touches external services, read-only (web search)
+    EXTERNAL_WRITE = "external_write"      # Modifies external state as SYSTEM identity
+    REPRESENT_USER = "represent_user"      # Acts in user's name to external parties
+    FINANCIAL = "financial"                # Involves money
+    SELF_MODIFY = "self_modify"            # Changes Genesis's own code/config/identity
+
+
+# Minimum autonomy level required per domain (background context).
+# Used by the dispatch gate to determine if an action is permitted.
+ACTION_DOMAIN_MIN_LEVEL: dict[ActionDomain, int | None] = {
+    ActionDomain.OBSERVE: 1,
+    ActionDomain.EXTERNAL_READ: 1,
+    ActionDomain.INTERNAL_WRITE: 1,         # L1 if scoped, L2 if broad
+    ActionDomain.NOTIFY_USER: 1,
+    ActionDomain.EXTERNAL_WRITE: 2,
+    ActionDomain.REPRESENT_USER: 3,
+    ActionDomain.FINANCIAL: 4,
+    ActionDomain.SELF_MODIFY: None,         # Blocked from background (V5 deferred)
+}
+
+
+# ---------------------------------------------------------------------------
 # Approval states
 # ---------------------------------------------------------------------------
 

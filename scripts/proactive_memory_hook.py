@@ -537,7 +537,7 @@ async def _embed_text(text: str) -> list[float] | None:
 # — this hook runs in a separate subprocess and can't import the package
 # without slowing the prompt path. Update both lists together if either
 # changes.
-_PROACTIVE_EXCLUDED_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection")
+_PROACTIVE_EXCLUDED_SUBSYSTEMS: tuple[str, ...] = ("ego", "triage", "reflection", "autonomy")
 
 
 async def _search_qdrant(

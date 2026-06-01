@@ -114,6 +114,7 @@ class EgoSession:
         self._event_bus = event_bus
         self._direct_session_runner = direct_session_runner
         self._autonomous_dispatcher = None
+        self._proposal_gate = None
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
@@ -139,6 +140,14 @@ class EgoSession:
 
     def set_autonomous_dispatcher(self, dispatcher: object) -> None:
         self._autonomous_dispatcher = dispatcher
+
+    def set_proposal_gate(self, gate: object) -> None:
+        """Inject the ProposalDispatchGate for evaluating proposals at dispatch.
+
+        The gate is opaque to the ego — it silently blocks proposals that
+        exceed the current autonomy level for their action domain.
+        """
+        self._proposal_gate = gate
 
     # -- Public API --------------------------------------------------------
 
@@ -1093,6 +1102,47 @@ class EgoSession:
             else:
                 model = CCModel.SONNET
 
+            # Autonomy dispatch gate — same check as sweep_approved_inner.
+            # Load full proposal to evaluate action domain against current
+            # autonomy level. Gate fires BEFORE the atomic claim so blocked
+            # proposals stay 'approved' (ego-invisible).
+            if self._proposal_gate is not None:
+                try:
+                    prop_row = await ego_crud.get_proposal(self._db, proposal_id)
+                    if prop_row is None:
+                        # Proposal disappeared — skip (don't dispatch ungated)
+                        logger.warning(
+                            "Execution brief %s: proposal not found — skipping",
+                            proposal_id,
+                        )
+                        continue
+                    decision = await self._proposal_gate.evaluate(prop_row)
+                    if not decision.allowed:
+                            logger.info(
+                                "Execution brief %s blocked by dispatch gate: %s (domain=%s)",
+                                proposal_id,
+                                decision.reason,
+                                decision.action_domain,
+                            )
+                            if self._event_bus:
+                                from genesis.observability.types import Severity, Subsystem
+                                await self._event_bus.emit(
+                                    Subsystem.AUTONOMY,
+                                    Severity.INFO,
+                                    "autonomy.dispatch_gate.block",
+                                    f"Blocked execution brief: {decision.reason}",
+                                    proposal_id=proposal_id,
+                                    action_domain=str(decision.action_domain),
+                                    rule_id=decision.rule_id,
+                                )
+                            continue
+                except Exception:
+                    logger.error(
+                        "Proposal gate failed for execution brief %s — allowing dispatch",
+                        proposal_id,
+                        exc_info=True,
+                    )
+
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
             # Use raw SQL to preserve resolved_at (the approval timestamp
@@ -1405,6 +1455,43 @@ class EgoSession:
                     continue
             except (KeyError, TypeError, ValueError):
                 continue
+
+            # Autonomy dispatch gate — silently skip proposals that exceed
+            # the current autonomy level for their action domain.
+            # The ego never learns about blocks; proposals stay 'approved'
+            # and expire via the 7-day staleness guard naturally.
+            if self._proposal_gate is not None:
+                try:
+                    decision = await self._proposal_gate.evaluate(prop)
+                    if not decision.allowed:
+                        logger.info(
+                            "Proposal %s blocked by dispatch gate: %s (domain=%s)",
+                            prop["id"],
+                            decision.reason,
+                            decision.action_domain,
+                        )
+                        # Emit event for observability (user-visible, ego-invisible)
+                        if self._event_bus:
+                            from genesis.observability.types import Severity, Subsystem
+                            await self._event_bus.emit(
+                                Subsystem.AUTONOMY,
+                                Severity.INFO,
+                                "autonomy.dispatch_gate.block",
+                                f"Blocked proposal: {decision.reason}",
+                                proposal_id=prop["id"],
+                                action_type=prop.get("action_type"),
+                                action_domain=str(decision.action_domain),
+                                rule_id=decision.rule_id,
+                            )
+                        continue
+                except Exception:
+                    # Gate failure is non-fatal — default to allowing dispatch
+                    # (fail-open, log the error for investigation)
+                    logger.error(
+                        "Proposal gate evaluation failed for %s — allowing dispatch",
+                        prop["id"],
+                        exc_info=True,
+                    )
 
             # Self-notification shortcut: outreach proposals whose execution
             # plan indicates a zero-cost Telegram message to the user were

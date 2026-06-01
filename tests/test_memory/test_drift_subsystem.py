@@ -39,12 +39,12 @@ async def test_drift_recall_default_excludes_subsystems() -> None:
         # the filter must be passed through.
         for call in mock_q.search.call_args_list:
             assert call.kwargs.get("exclude_subsystems") == [
-                "ego", "triage", "reflection",
+                "ego", "triage", "reflection", "autonomy",
             ]
             assert call.kwargs.get("include_only_subsystems") is None
         for call in mock_c.search_ranked.call_args_list:
             assert call.kwargs.get("exclude_subsystems") == [
-                "ego", "triage", "reflection",
+                "ego", "triage", "reflection", "autonomy",
             ]
             assert call.kwargs.get("include_only_subsystems") is None
 
