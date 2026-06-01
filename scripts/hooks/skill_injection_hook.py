@@ -24,8 +24,9 @@ _CATALOG_MAX_AGE_S = 3600  # Regenerate catalog if older than 1h
 # the skill. With 10 prompt keywords, a single keyword match = 0.1 (name)
 # or 0.05 (desc). Threshold of 0.1 means 1 name/keyword match suffices.
 _MIN_CONFIDENCE = 0.1
-# Max nudges per prompt
-_MAX_NUDGES = 1
+# Total nudge budget per prompt (process + catalog combined).
+# If process nudges consume slots, catalog gets fewer.
+_MAX_TOTAL_NUDGES = 2
 
 # --- Process Discipline Detection ---
 # Superpowers skills aren't in the Genesis catalog but need nudges
@@ -35,6 +36,7 @@ _MAX_NUDGES = 1
 _PLAN_INTENT_KEYWORDS = {
     "plan", "implement", "build", "feature", "architect", "design",
     "refactor", "redesign", "rewrite", "migrate", "integrate",
+    "overhaul", "consolidate", "extract", "split", "decouple", "scaffold",
 }
 
 # Intent: "about to write code that should be test-driven"
@@ -42,6 +44,7 @@ _CODE_INTENT_KEYWORDS = {
     "implement", "build", "add", "create", "fix", "feature",
     "endpoint", "handler", "function", "class", "module",
     "refactor", "wire", "connect",
+    "api", "route", "service", "hook", "guard", "plugin", "migration", "schema",
 }
 
 # These don't need TDD/brainstorming nudges
@@ -49,6 +52,7 @@ _EXCLUDE_KEYWORDS = {
     "docs", "documentation", "readme", "config", "yaml", "markdown",
     "comment", "typo", "rename", "changelog", "version", "memory",
     "evaluate", "research", "look", "check", "review", "read",
+    "status", "list", "show", "explain", "describe", "summarize", "analyze",
 }
 
 
@@ -142,9 +146,10 @@ def _extract_keywords(prompt: str) -> list[str]:
     stop = {
         "the", "is", "are", "was", "and", "or", "but", "for", "with",
         "this", "that", "can", "you", "how", "what", "when", "where",
-        "why", "not", "let", "use",
+        "why", "not", "let", "use", "need", "want", "please", "just",
+        "some", "make", "get", "also", "then", "into",
     }
-    return [w for w in words if len(w) >= 3 and w not in stop][:10]
+    return [w for w in words if len(w) >= 3 and w not in stop][:12]
 
 
 def _check_process_discipline(
@@ -244,7 +249,9 @@ def main() -> None:
 
         candidates.sort(key=lambda x: x[0], reverse=True)
 
-        for _score, skill in candidates[:_MAX_NUDGES]:
+        # Dynamic budget: total nudges (process + catalog) capped at _MAX_TOTAL_NUDGES
+        catalog_budget = max(0, _MAX_TOTAL_NUDGES - len(process_nudges))
+        for _score, skill in candidates[:catalog_budget]:
             name = skill.get("name", "")
             tier = skill.get("tier", "?")
             desc = skill.get("description", "")

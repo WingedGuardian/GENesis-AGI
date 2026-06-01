@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stop hook: detect resume signals, giving-up patterns, and unreviewed code.
+"""Stop hook: detect resume signals, giving-up, outcome verification, and unreviewed code.
 
 Runs when Claude finishes responding (via .claude/settings.json Stop hook).
 
@@ -11,7 +11,11 @@ Runs when Claude finishes responding (via .claude/settings.json Stop hook).
    delegate work back to the user instead of exhausting available tools.
    If detected, outputs a nudge for the next turn.
 
-3. Checks for unreviewed code changes. If found, outputs a reminder that
+3. Checks the assistant's last message for completion claims without
+   verification evidence. If finishing language is present but no integration
+   or e2e proof, injects a reminder to verify outcomes before claiming done.
+
+4. Checks for unreviewed code changes. If found, outputs a reminder that
    gets injected into context for the next turn.
 
 Reads hook input from stdin as JSON:
@@ -90,6 +94,7 @@ def main() -> None:
     # needs the assistant's last message from hook input.
     assistant_msg = hook_input.get("last_assistant_message", "")
     _check_giving_up(assistant_msg)
+    _check_outcome_verification(assistant_msg)
 
     # Check for unreviewed code changes
     _check_review_state()
@@ -128,6 +133,58 @@ _GIVING_UP_PATTERNS = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+# Patterns indicating the assistant is at the "finishing" stage —
+# offering to merge, create PRs, or declaring implementation complete.
+_FINISHING_PATTERNS = re.compile(
+    r"(?:"
+    r"[Mm]erge\s+(?:back\s+)?to\s+main"
+    r"|[Cc]reate\s+a\s+[Pp]ull\s+[Rr]equest"
+    r"|[Pp]ush\s+and\s+create"
+    r"|[Ii]mplementation\s+complete"
+    r"|What\s+would\s+you\s+like\s+to\s+do\?"
+    r"|Keep\s+the\s+branch\s+as-is"
+    r"|Discard\s+this\s+work"
+    r"|[Rr]eady\s+to\s+(?:ship|merge|land|deploy)"
+    r"|[Aa]ll\s+(?:changes|work)\s+(?:are\s+)?(?:done|complete)"
+    r")",
+)
+
+# Patterns indicating integration/e2e verification was actually done.
+# If any of these appear alongside finishing language, skip the reminder.
+_VERIFICATION_EVIDENCE = re.compile(
+    r"(?:"
+    r"[Ii]ntegration\s+test"
+    r"|[Ee]2[Ee]\s+test"
+    r"|[Ss]moke\s+test"
+    r"|[Aa][Pp][Ii]\s+(?:smoke\s+)?test"
+    r"|[Vv]erif(?:y|ied)\s+(?:the\s+)?(?:actual|end-to-end|e2e)"
+    r"|[Mm]anual(?:ly)?\s+(?:test|verif)"
+    r"|[Ll]ive\s+(?:test|verif)"
+    r"|[Tt]elegram\s+API\s+(?:smoke|confirmed|test)"
+    r"|[Aa]syncio\s+integration"
+    r"|[Pp]roduction\s+(?:test|verif)"
+    r"|[Oo]utcome\s+verif"
+    r")",
+)
+
+
+def _check_outcome_verification(assistant_message: str) -> None:
+    """Remind to verify actual outcomes before presenting completion options."""
+    if not assistant_message:
+        return
+    if not _FINISHING_PATTERNS.search(assistant_message):
+        return
+    if _VERIFICATION_EVIDENCE.search(assistant_message):
+        return
+    print(
+        "OUTCOME VERIFICATION REMINDER: You're presenting completion options "
+        "but haven't mentioned integration or e2e verification beyond unit tests. "
+        "Before the user decides, use superpowers:verification-before-completion — "
+        "run the actual verification command, read the full output, THEN claim status. "
+        "Evidence before assertions."
+    )
 
 
 def _check_giving_up(assistant_message: str) -> None:

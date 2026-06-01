@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
-"""Stop hook: remind to verify actual outcomes before claiming done.
+"""DEPRECATED: Logic merged into genesis_stop_hook.py (2026-06-01).
+
+This file had two issues:
+1. It was never registered in settings.json (built but not wired).
+2. It read the wrong field name ('stop_response' instead of
+   'last_assistant_message'), so it would have silently failed even if wired.
+
+The outcome verification logic now lives in genesis_stop_hook.py alongside
+the giving-up detection and review enforcement checks.
+
+Original description:
+Stop hook: remind to verify actual outcomes before claiming done.
 
 When the assistant's response contains finishing-stage language (merge options,
 PR creation, "implementation complete") but lacks evidence of integration or
