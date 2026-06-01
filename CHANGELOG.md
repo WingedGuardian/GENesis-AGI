@@ -7,6 +7,56 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b13] - 2026-06-01
+
+### Added
+
+- **Provider failure escalation** (#512) --- circuit breaker trips that
+  cycle 5+ times without recovery now auto-create high-priority
+  observations. The ego picks them up naturally instead of relying on
+  manual investigation. Recovery clears the escalation state.
+- **Investigation model override** (#512) --- ego proposal dispatches
+  respect per-action-type model configuration (`dispatch_model_overrides`
+  in ego.yaml). Investigations default to Opus for deeper reasoning.
+- **Dashboard circuit breaker visibility** (#512) --- LLM provider cards
+  in operational vitals show breaker state (OPEN/HALF-OPEN badges),
+  trip count, and last failure category.
+- **Goal decomposition** (#501) --- ego goals support subgoals,
+  cascade tracking, goal_type, and cadence scheduling.
+- **Goal-driven behavior** (#494) --- staleness signals, deep context
+  injection, and assessment for ego goal management.
+- **Reflection corpus recording** (#503) --- captures deep reflection
+  observations for quality measurement and prompt optimization.
+- **Content validation hooks** (#500) --- gitleaks rules and commit-msg
+  hook for automated content validation.
+
+### Fixed
+
+- **Surplus restart flooding** (#504) --- restart-resilient scheduling
+  with completed_at cooldown prevents re-enqueuing on server restart.
+  Watchdog heartbeat refresh prevents false staleness detection.
+- **Morning report staleness** (#506) --- inbox count from DB instead
+  of filesystem, observation surfacing lifecycle respected, standing
+  items use proper datetime comparison.
+- **Ego domain boundaries** (#506) --- user ego no longer sees
+  infrastructure observations that belong to the Genesis ego's domain.
+- **Light reflection duplicates** (#502, #505) --- eliminated duplicate
+  observations and injected prior context for continuity.
+- **Cerebras provider disabled** (#510) --- current models use
+  reasoning-only format incompatible with content extraction.
+  Provider disabled until compatible models are available.
+- **Bookmark search** (#511) --- bookmarks searched via SQL instead
+  of memory retriever for reliability.
+
+### Changed
+
+- **Realist gate tightened** (#504) --- bypass threshold raised from
+  high to critical-only priority.
+- **CODEOWNERS + PR discussion** (#508) --- require discussion
+  before PRs on the public repo.
+
+---
+
 ## [v3.0b12.1] - 2026-05-30
 
 ### Added
