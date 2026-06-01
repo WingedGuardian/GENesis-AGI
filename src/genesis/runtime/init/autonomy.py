@@ -157,6 +157,21 @@ async def init(rt: GenesisRuntime) -> None:
             except Exception:
                 logger.warning("Failed to initialize proposal dispatch gate", exc_info=True)
 
+        # Post-execution auditor — parses transcripts, feeds autonomy signals.
+        # Wired into DirectSessionRunner in init/direct_session.py.
+        if rt._db is not None and hasattr(rt, "_autonomy_manager") and rt._autonomy_manager:
+            try:
+                from genesis.autonomy.audit import PostExecutionAuditor
+
+                rt._post_execution_auditor = PostExecutionAuditor(
+                    protected_paths=rt._protected_paths,
+                    autonomy_manager=rt._autonomy_manager,
+                    event_bus=rt._event_bus,
+                )
+                logger.info("Post-execution auditor initialized")
+            except Exception:
+                logger.warning("Failed to initialize post-execution auditor", exc_info=True)
+
         # Remediation registry — mechanical reflex layer for health probes
         try:
             from genesis.autonomy.remediation import RemediationRegistry, register_defaults

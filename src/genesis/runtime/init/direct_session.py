@@ -130,6 +130,11 @@ async def init(rt: GenesisRuntime) -> None:
             runner.set_protected_paths(rt._protected_paths)
             logger.info("ProtectedPathRegistry wired into DirectSessionRunner")
 
+        # Inject post-execution auditor for autonomy feedback loop
+        if getattr(rt, "_post_execution_auditor", None) is not None:
+            runner.set_auditor(rt._post_execution_auditor)
+            logger.info("PostExecutionAuditor wired into DirectSessionRunner")
+
         # Wire MCP tools (pass db so they can enqueue, runner for active_count)
         from genesis.mcp.health.direct_session_tools import init_direct_session_tools
 

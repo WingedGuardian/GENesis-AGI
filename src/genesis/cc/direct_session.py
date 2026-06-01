@@ -313,10 +313,15 @@ class DirectSessionRunner:
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
         self._protected_paths: object | None = None
+        self._auditor: object | None = None
 
     def set_protected_paths(self, registry: object) -> None:
         """Inject ProtectedPathRegistry for background session prompt hardening."""
         self._protected_paths = registry
+
+    def set_auditor(self, auditor: object) -> None:
+        """Inject PostExecutionAuditor for post-session autonomy feedback."""
+        self._auditor = auditor
 
     # -- Public API --------------------------------------------------------
 
@@ -401,6 +406,38 @@ class DirectSessionRunner:
 
             # Feed outcome back to ego proposal if this was a proposal dispatch
             await self._record_proposal_outcome(request, result)
+
+            # Post-execution audit: verify protected paths, feed autonomy signals.
+            # Only for ego dispatches (caller_context starts with "ego_proposal:").
+            # Runs inline (cheap) — transcript parsing is I/O-bound but fast.
+            if (
+                self._auditor is not None
+                and request.caller_context
+                and request.caller_context.startswith("ego_proposal:")
+            ):
+                try:
+                    metadata = {}
+                    db = getattr(self._rt, "_db", None)
+                    if db is not None:
+                        from genesis.db.crud import cc_sessions as cs_crud
+                        row = await cs_crud.get_by_id(db, session_id)
+                        if row and row.get("metadata"):
+                            with contextlib.suppress(json.JSONDecodeError, TypeError):
+                                metadata = json.loads(row["metadata"])
+
+                    await self._auditor.audit_session(
+                        session_id,
+                        transcript_path=metadata.get("transcript_path", ""),
+                        tools_summary=metadata.get("tools_summary"),
+                        session_success=result.success,
+                        caller_context=request.caller_context,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Post-execution audit failed for %s (non-fatal)",
+                        session_id[:8],
+                        exc_info=True,
+                    )
 
             await self._session_manager.complete(
                 session_id,
