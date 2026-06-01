@@ -139,7 +139,6 @@ class UserEgoContextBuilder:
             ("goal_progress", self._goal_progress_section),
             ("goal_deep_dive", self._goal_deep_dive_section),
             ("capability_performance", self._capability_performance_section),
-            ("autonomy_readiness", self._autonomy_readiness_section),
             ("recurring_patterns", self._recurring_patterns_section),
             ("output_contract", self._output_contract_section),
         ]
@@ -1373,51 +1372,6 @@ class UserEgoContextBuilder:
         )
         return "\n".join(lines)
 
-    async def _autonomy_readiness_section(self, *, depth: str = "deep") -> str:
-        """Show autonomy posteriors — informs promotion proposals."""
-        from genesis.db.crud import autonomy as autonomy_crud
-        from genesis.db.crud.autonomy import bayesian_level, bayesian_posterior
-
-        try:
-            states = await autonomy_crud.list_all(self._db)
-        except Exception:
-            return ""
-        if not states:
-            return ""
-
-        if depth == "light":
-            ready = sum(
-                1 for s in states
-                if bayesian_level(s["total_successes"], s["total_corrections"])
-                > s["current_level"]
-            )
-            return (
-                f"## Autonomy Readiness\n"
-                f"{len(states)} categories tracked"
-                f"{f', {ready} ready for promotion' if ready else ''}.\n"
-            )
-
-        lines = ["## Autonomy Readiness\n"]
-        for row in states:
-            cat = row["category"]
-            level = row["current_level"]
-            earned = row["earned_level"]
-            successes = row["total_successes"]
-            corrections = row["total_corrections"]
-            posterior = bayesian_posterior(successes, corrections)
-            target = bayesian_level(successes, corrections)
-            status = f"L{level}"
-            if earned > level:
-                status += f" (earned L{earned})"
-            readiness = ""
-            if target > level:
-                readiness = f" — **ready for L{min(level + 1, target)}** (posterior={posterior:.3f})"
-            else:
-                readiness = f" (posterior={posterior:.3f})"
-            lines.append(f"- {cat}: {status}{readiness} [{successes}S/{corrections}C]")
-
-        lines.append("")
-        return "\n".join(lines)
 
     async def _recurring_patterns_section(self, *, depth: str = "deep") -> str:
         """Detect recurring observation patterns (3+ occurrences in 72h).
