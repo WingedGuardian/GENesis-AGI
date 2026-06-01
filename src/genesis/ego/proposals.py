@@ -69,52 +69,59 @@ def _sort_proposals(proposals: list[dict]) -> list[dict]:
     )
 
 
+def _truncate(text: str, limit: int) -> str:
+    """Truncate text to limit, adding ellipsis if needed."""
+    return text[:limit] + "\u2026" if len(text) > limit else text
+
+
 def _format_digest(
     proposals: list[dict],
     batch_id: str,
     ego_source: str | None = None,
 ) -> str:
-    """Format proposals as an HTML numbered digest for Telegram.
+    """Format proposals as a structured WHAT/WHY/HOW digest for Telegram.
 
     Proposals are sorted by urgency x confidence before numbering.
+    Fields map to: content → WHAT, rationale → WHY, execution_plan → HOW.
     """
     sorted_proposals = _sort_proposals(proposals)
     label = _EGO_LABELS.get(ego_source or "", "Ego")
-    lines = [f"<b>{_ESC(label)} Proposals</b> \u2014 Batch {_ESC(batch_id[:8])}\n"]
+    lines = [f"<b>{_ESC(label)}</b> \u2014 {_ESC(batch_id[:8])}\n"]
 
     for i, p in enumerate(sorted_proposals, 1):
-        content = p.get("content", "")
-        if len(content) > 800:
-            content = content[:800] + "\u2026"
-        rationale = p.get("rationale", "")
-        if len(rationale) > 500:
-            rationale = rationale[:500] + "\u2026"
-
         urgency = p.get("urgency", "normal")
         urgency_tag = _URGENCY_TAGS.get(urgency, "")
+        action_type = p.get("action_type", "?")
+
+        # Header: number + urgency + action type
         lines.append(
-            f"<b>{i}.</b> {_ESC(urgency_tag)}<b>[{_ESC(p.get('action_type', '?'))}]</b> "
-            f"{_ESC(content)}"
+            f"<b>{i}.</b> {_ESC(urgency_tag)}{_ESC(action_type)}"
         )
+
+        # WHAT (content)
+        content = _truncate(p.get("content", ""), 400)
+        lines.append(f"\n<b>WHAT:</b> {_ESC(content)}")
+
+        # WHY (rationale)
+        rationale = p.get("rationale", "")
         if rationale:
-            lines.append(f"<i>Rationale:</i> {_ESC(rationale)}")
-        memory_basis = p.get("memory_basis", "")
-        if memory_basis:
-            if len(memory_basis) > 500:
-                memory_basis = memory_basis[:500] + "\u2026"
-            lines.append(f"<i>{_ESC(memory_basis)}</i>")
+            rationale = _truncate(rationale, 300)
+            lines.append(f"\n<b>WHY:</b> {_ESC(rationale)}")
+
+        # HOW (execution_plan)
+        plan = p.get("execution_plan", "")
+        if plan:
+            plan = _truncate(plan, 200)
+            lines.append(f"\n<b>HOW:</b> {_ESC(plan)}")
+
+        # Confidence badge
         confidence = p.get("confidence", 0.0)
-        lines.append(f"<i>Confidence:</i> {confidence:.2f} | <i>Urgency:</i> {urgency}")
-        alts = p.get("alternatives", "")
-        if alts:
-            if len(alts) > 300:
-                alts = alts[:300] + "\u2026"
-            lines.append(f"<i>Alternatives:</i> {_ESC(alts)}")
+        lines.append(f"\n[{confidence:.2f} confidence]")
         lines.append("")
 
+    # Separator + compact reply instructions
     lines.append(
-        "<i>Reply: ok/yes/approve \u2022 no/reject \u2022 "
-        "\"approve 1, reject 2\" \u2022 or just talk</i>"
+        "<i>ok \u2022 no \u2022 \"approve 1, reject 2\" \u2022 or talk</i>"
     )
     return "\n".join(lines)
 

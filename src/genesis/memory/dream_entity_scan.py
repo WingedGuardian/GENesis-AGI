@@ -87,10 +87,26 @@ async def run_entity_resolution(
     if total_points < 2:
         return report
 
+    # Large buckets cause O(n) Qdrant searches in find_dedup_candidates,
+    # which exhausts memory.  Skip buckets above this threshold — they
+    # need a chunked/batch algorithm (tracked as follow-up).
+    MAX_BUCKET_FOR_DEDUP = 500
+
     llm_checks_used = 0
 
     for (_wing, _room), points in buckets.items():
         if len(points) < 2:
+            continue
+
+        if len(points) > MAX_BUCKET_FOR_DEDUP:
+            logger.warning(
+                "Entity resolution: bucket (%s, %s) has %d points — "
+                "skipping dedup (limit %d)",
+                _wing, _room, len(points), MAX_BUCKET_FOR_DEDUP,
+            )
+            report.setdefault("skipped_large_buckets", []).append(
+                {"wing": _wing, "room": _room, "count": len(points)},
+            )
             continue
 
         # 2. Fetch vectors for this bucket
