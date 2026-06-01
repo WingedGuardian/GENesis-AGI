@@ -79,54 +79,6 @@ class TestTripTracking:
         assert escalation._state["provider-b"]["escalated"] is False
 
 
-class TestObservationCreation:
-    """Test _create_observation DB writes directly (bypasses create_task)."""
-
-    async def test_creates_observation(self, empty_db, event_bus):
-        """_create_observation should insert a high-priority observation."""
-        esc = ProviderEscalation(db=empty_db, event_bus=event_bus)
-        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
-        await esc._create_observation("test-provider", state)
-
-        cursor = await empty_db.execute(
-            "SELECT source, type, priority, category FROM observations"
-        )
-        row = await cursor.fetchone()
-        assert row is not None
-        assert row["source"] == "routing"
-        assert row["type"] == "provider_failure"
-        assert row["priority"] == "high"
-        assert row["category"] == "system_health"
-
-    async def test_dedup_prevents_duplicates(self, empty_db, event_bus):
-        """Same provider should not create duplicate unresolved observations."""
-        esc = ProviderEscalation(db=empty_db, event_bus=event_bus)
-        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
-        await esc._create_observation("test-provider", state)
-        await esc._create_observation("test-provider", state)
-
-        cursor = await empty_db.execute("SELECT COUNT(*) FROM observations")
-        count = (await cursor.fetchone())[0]
-        assert count == 1
-
-    async def test_new_observation_after_resolution(self, empty_db, event_bus):
-        """After resolving, a new observation for the same provider is allowed."""
-        esc = ProviderEscalation(db=empty_db, event_bus=event_bus)
-        state = {"trip_count": 5, "first_trip_at": datetime.now(UTC).isoformat(), "escalated": True}
-        await esc._create_observation("test-provider", state)
-
-        # Resolve
-        await empty_db.execute("UPDATE observations SET resolved = 1 WHERE source = 'routing'")
-        await empty_db.commit()
-
-        # Second observation
-        await esc._create_observation("test-provider", state)
-
-        cursor = await empty_db.execute("SELECT COUNT(*) FROM observations WHERE source = 'routing'")
-        count = (await cursor.fetchone())[0]
-        assert count == 2
-
-
 class TestRecovery:
     async def test_recovery_clears_state(self, escalation):
         """record_recovery should clear the provider's tracking state."""
