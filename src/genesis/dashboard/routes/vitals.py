@@ -373,22 +373,19 @@ async def _build_llm_section(rt, routing_ctx: dict) -> dict:
     assignments = routing_ctx.get("call_site_assignments", {})
     profiles = routing_ctx.get("profiles", {})
 
-    # Circuit breaker state per provider
+    # Circuit breaker state per provider — read existing breakers only,
+    # don't create new ones (get() lazily creates, which is a side effect).
     cb_states: dict[str, dict] = {}
     if rt.circuit_breakers:
-        for pname in routing_providers:
-            try:
-                cb = rt.circuit_breakers.get(pname)
-                cb_states[pname] = {
-                    "state": str(cb.state),
-                    "trip_count": cb.trip_count,
-                    "last_failure": (
-                        str(cb.last_failure_category)
-                        if cb.last_failure_category else None
-                    ),
-                }
-            except KeyError:
-                pass
+        for pname, cb in rt.circuit_breakers._breakers.items():
+            cb_states[pname] = {
+                "state": str(cb.state),
+                "trip_count": cb.trip_count,
+                "last_failure": (
+                    str(cb.last_failure_category)
+                    if cb.last_failure_category else None
+                ),
+            }
 
     if rt.db:
         try:

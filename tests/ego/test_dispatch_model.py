@@ -43,6 +43,15 @@ class TestDispatchModelOverridesConfig:
         config = load_ego_config(cfg)
         assert config.dispatch_model_overrides == {}
 
+    def test_null_value_defaults_to_empty_dict(self, tmp_path):
+        """YAML null should not crash — falls back to default empty dict."""
+        cfg = tmp_path / "ego.yaml"
+        cfg.write_text("dispatch_model_overrides: null\n")
+        config = load_ego_config(cfg)
+        assert config.dispatch_model_overrides == {}
+        # Must be callable with .get() — the crash site
+        assert config.dispatch_model_overrides.get("investigate") is None
+
 
 class TestDispatchModelOverridesValidation:
     """Validation of dispatch_model_overrides via validate_ego_config."""

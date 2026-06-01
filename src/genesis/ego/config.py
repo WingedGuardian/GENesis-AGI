@@ -6,6 +6,7 @@ dataclass with sensible defaults.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import tempfile
@@ -44,9 +45,14 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
 
     # Build config from YAML, using EgoConfig defaults for missing keys.
     kwargs = {}
-    for field_name in EgoConfig.__dataclass_fields__:
+    for field_name, field_obj in EgoConfig.__dataclass_fields__.items():
         if field_name in raw:
-            kwargs[field_name] = raw[field_name]
+            value = raw[field_name]
+            # Guard: YAML null → None for dict fields would crash .get()
+            # at runtime. Fall back to the field default instead.
+            if value is None and field_obj.default_factory is not dataclasses.MISSING:
+                continue
+            kwargs[field_name] = value
     return EgoConfig(**kwargs)
 
 
