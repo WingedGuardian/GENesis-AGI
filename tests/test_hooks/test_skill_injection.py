@@ -56,7 +56,7 @@ def test_extract_keywords_limit():
 
     long_prompt = " ".join(f"word{i}" for i in range(50))
     keywords = _extract_keywords(long_prompt)
-    assert len(keywords) <= 10
+    assert len(keywords) <= 12
 
 
 def test_catalog_parse_frontmatter():

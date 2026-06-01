@@ -181,7 +181,10 @@ async def test_orchestrator_continues_on_tree_index_failure(tmp_path: Path):
         tree_index_threshold=25,
     )
 
-    result = await orch.ingest_source(str(big_pdf), project_type="test")
+    # Mock Path.home() so the path traversal guard passes on CI
+    # (tmp_path is under /tmp/ on CI, not under /home/runner/)
+    with patch("genesis.knowledge.orchestrator.Path.home", return_value=tmp_path.parent):
+        result = await orch.ingest_source(str(big_pdf), project_type="test")
 
     # Should complete without error, with tree_index_failed flag
     assert result.error is None
