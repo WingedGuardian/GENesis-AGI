@@ -6,6 +6,7 @@ dataclass with sensible defaults.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import tempfile
@@ -44,9 +45,14 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
 
     # Build config from YAML, using EgoConfig defaults for missing keys.
     kwargs = {}
-    for field_name in EgoConfig.__dataclass_fields__:
+    for field_name, field_obj in EgoConfig.__dataclass_fields__.items():
         if field_name in raw:
-            kwargs[field_name] = raw[field_name]
+            value = raw[field_name]
+            # Guard: YAML null → None for dict fields would crash .get()
+            # at runtime. Fall back to the field default instead.
+            if value is None and field_obj.default_factory is not dataclasses.MISSING:
+                continue
+            kwargs[field_name] = value
     return EgoConfig(**kwargs)
 
 
@@ -127,4 +133,13 @@ def validate_ego_config(changes: dict) -> list[str]:
         v = changes["genesis_max_interval_minutes"]
         if not isinstance(v, (int, float)) or v < 60:
             errors.append("genesis_max_interval_minutes must be >= 60")
+    if "dispatch_model_overrides" in changes:
+        v = changes["dispatch_model_overrides"]
+        valid_models = {"opus", "sonnet", "haiku"}
+        if not isinstance(v, dict):
+            errors.append("dispatch_model_overrides must be a dict")
+        else:
+            for action, model in v.items():
+                if model not in valid_models:
+                    errors.append(f"dispatch_model_overrides[{action}]: model must be one of {valid_models}")
     return errors

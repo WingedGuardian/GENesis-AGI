@@ -1458,11 +1458,19 @@ class EgoSession:
                         )
 
             prompt = await self._build_dispatch_prompt(prop)
-            profile = _infer_profile(prop.get("action_type", ""))
+            action_type = prop.get("action_type", "")
+            profile = _infer_profile(action_type)
 
-            # Interact-profile tasks (browser automation, publishing) need Opus
-            # for reliable multi-step workflow execution.
-            model = CCModel.OPUS if profile == "interact" else CCModel.SONNET
+            # Model selection: config override > profile-based default.
+            # Investigations need Opus for deeper reasoning (verify APIs,
+            # query event tables, question suspicious signals).
+            model_override = self._config.dispatch_model_overrides.get(action_type)
+            if model_override:
+                model = CCModel(model_override)
+            elif profile == "interact":
+                model = CCModel.OPUS
+            else:
+                model = CCModel.SONNET
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (_process_execution_briefs is a second path).

@@ -41,6 +41,7 @@ class CircuitBreaker:
         success_threshold: int = 2,
         clock: object = None,
         on_state_change: object = None,
+        on_recovery: object = None,
     ) -> None:
         self._provider = provider
         self._failure_threshold = failure_threshold
@@ -48,6 +49,7 @@ class CircuitBreaker:
         self._success_threshold = success_threshold
         self._clock = clock or time.monotonic
         self._on_state_change = on_state_change
+        self._on_recovery = on_recovery
 
         self._state = ProviderState.CLOSED
         self._consecutive_failures = 0
@@ -103,6 +105,7 @@ class CircuitBreaker:
     def record_success(self) -> None:
         """Record a successful call."""
         old = self._state
+        was_tripped = self._trip_count > 0
         self._consecutive_failures = 0
         self._last_failure_category = None
         if self.state == ProviderState.HALF_OPEN:
@@ -115,6 +118,9 @@ class CircuitBreaker:
             self._state = ProviderState.CLOSED
         if self._state != old:
             self._notify_change()
+        # Notify recovery listeners when provider fully recovers
+        if was_tripped and self._trip_count == 0 and self._on_recovery:
+            self._on_recovery(self._provider.name)
 
     def probe_suspect(self) -> bool:
         """Probe reported this provider may be down. Move to HALF_OPEN for verification.
@@ -159,10 +165,12 @@ class CircuitBreakerRegistry:
         providers: dict[str, ProviderConfig],
         clock: object = None,
         state_file: Path | str | None = None,
+        on_recovery: object = None,
     ) -> None:
         self._providers = providers
         self._clock = clock
         self._state_file = Path(state_file) if state_file else _STATE_FILE
+        self._on_recovery = on_recovery
         self._breakers: dict[str, CircuitBreaker] = {}
         self.load_state()
 
@@ -179,6 +187,7 @@ class CircuitBreakerRegistry:
                 open_duration_s=cfg.open_duration_s,
                 clock=self._clock,
                 on_state_change=self.save_state,
+                on_recovery=self._on_recovery,
             )
         return self._breakers[provider]
 

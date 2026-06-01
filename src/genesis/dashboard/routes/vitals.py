@@ -373,6 +373,20 @@ async def _build_llm_section(rt, routing_ctx: dict) -> dict:
     assignments = routing_ctx.get("call_site_assignments", {})
     profiles = routing_ctx.get("profiles", {})
 
+    # Circuit breaker state per provider — read existing breakers only,
+    # don't create new ones (get() lazily creates, which is a side effect).
+    cb_states: dict[str, dict] = {}
+    if rt.circuit_breakers:
+        for pname, cb in rt.circuit_breakers._breakers.items():
+            cb_states[pname] = {
+                "state": str(cb.state),
+                "trip_count": cb.trip_count,
+                "last_failure": (
+                    str(cb.last_failure_category)
+                    if cb.last_failure_category else None
+                ),
+            }
+
     if rt.db:
         try:
             # Activity data from activity_log
@@ -426,6 +440,7 @@ async def _build_llm_section(rt, routing_ctx: dict) -> dict:
                 profile_key = meta.get("profile", "")
                 prof = profiles.get(profile_key, {}) if profile_key else {}
 
+                cb = cb_states.get(pname, {})
                 providers_list.append({
                     "name": pname,
                     "display_name": _provider_display_name(pname, meta),
@@ -445,6 +460,9 @@ async def _build_llm_section(rt, routing_ctx: dict) -> dict:
                     "reasoning_tier": prof.get("reasoning", ""),
                     "cost_tier": prof.get("cost_tier", ""),
                     "context_window": prof.get("context_window", 0),
+                    "cb_state": cb.get("state", "closed"),
+                    "cb_trip_count": cb.get("trip_count", 0),
+                    "cb_last_failure": cb.get("last_failure"),
                 })
 
             providers_list.sort(key=lambda p: (-p["calls_24h"], p["name"]))
