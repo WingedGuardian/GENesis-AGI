@@ -30,9 +30,12 @@ from pathlib import Path
 
 _GENESIS_DB = Path.home() / "genesis" / "data" / "genesis.db"
 _SETTINGS_JSON = Path.home() / "genesis" / ".claude" / "settings.json"
-_FEEDBACK_DIR = (
-    Path.home() / ".claude" / "projects" / "-home-ubuntu-genesis" / "memory"
-)
+
+# Derive the CC project slug from the genesis repo path — avoids hardcoding
+# the username. CC encodes project dirs as "-"-separated path components.
+_GENESIS_ROOT = Path.home() / "genesis"
+_PROJECT_SLUG = "-" + str(_GENESIS_ROOT).replace("/", "-").lstrip("-")
+_FEEDBACK_DIR = Path.home() / ".claude" / "projects" / _PROJECT_SLUG / "memory"
 
 
 def _load_feedback_files() -> list[dict]:
