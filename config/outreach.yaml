@@ -16,6 +16,8 @@ channel_preferences:
   approval: telegram
   # Content drafts for user review — routed to Content Review topic.
   content: telegram
+  # Ego notifications — informational, no approval needed. Routed to default topic.
+  notification: telegram
 
 thresholds:
   blocker: 0.0
@@ -27,11 +29,14 @@ thresholds:
   approval: 0.0
   # Content review always delivers — manual review is the quality gate.
   content: 0.0
+  # Ego notifications always deliver — the ego already judged relevance.
+  notification: 0.0
 
 rate_limits:
   max_daily: 5
   surplus_daily: 1
   content_daily: 3
+  notification_daily: 10
 
 morning_report:
   trigger_time: "07:00"

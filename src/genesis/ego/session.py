@@ -116,6 +116,7 @@ class EgoSession:
         self._direct_session_runner = direct_session_runner
         self._autonomous_dispatcher = None
         self._proposal_gate = None
+        self._outreach_pipeline = None
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
@@ -149,6 +150,14 @@ class EgoSession:
         exceed the current autonomy level for their action domain.
         """
         self._proposal_gate = gate
+
+    def set_outreach_pipeline(self, pipeline: object) -> None:
+        """Inject the OutreachPipeline for ego notification delivery.
+
+        Late-binding because the outreach pipeline may not be available at
+        EgoSession construction time (same pattern as autonomous_dispatcher).
+        """
+        self._outreach_pipeline = pipeline
 
     # -- Public API --------------------------------------------------------
 
@@ -592,6 +601,11 @@ class EgoSession:
                         cycle.id,
                         communication_decision=comm_decision,
                     )
+
+            # 9a. Process notifications (informational, no approval gate)
+            notifications = parsed.get("notifications", [])
+            if isinstance(notifications, list) and notifications:
+                await self._process_notifications(notifications)
 
             # 9b. Process tabled/withdrawn proposal IDs
             tabled_ids = parsed.get("tabled", [])
@@ -1257,6 +1271,11 @@ class EgoSession:
             if not proposal_id or not prompt:
                 continue
 
+            # Append content firewall rules to ego-authored dispatch prompt.
+            # The ego writes the brief prompt directly — this safety net
+            # catches information that slips through the ego's own judgment.
+            prompt = f"{prompt}\n\n{_CONTENT_FIREWALL_RULES}"
+
             # Map profile and model from brief
             profile = brief.get("profile", "observe")
             if profile not in VALID_PROFILES:
@@ -1481,6 +1500,68 @@ class EgoSession:
                 deduped,
             )
 
+    async def _process_notifications(self, notifications: list[dict]) -> None:
+        """Submit ego notifications to the outreach pipeline.
+
+        Notifications are informational messages that don't need user approval.
+        They route through the outreach pipeline with NOTIFICATION category,
+        subject to governance (dedup, rate limit, quiet hours) but exempt from
+        salience threshold and engagement throttle.
+
+        Fire-and-forget: errors are logged but never block the ego cycle.
+        """
+        if self._outreach_pipeline is None:
+            logger.warning(
+                "OutreachPipeline not available — skipping %d notification(s)",
+                len(notifications),
+            )
+            return
+
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        submitted = 0
+        for notif in notifications:
+            if not isinstance(notif, dict):
+                continue
+            content = notif.get("content", "").strip()
+            if not content:
+                continue
+            # Cap content length to prevent runaway LLM output from
+            # flooding the outreach pipeline with megabyte-sized payloads.
+            if len(content) > 2000:
+                content = content[:2000]
+
+            # Map ego urgency to salience score so governance thresholds
+            # can differentiate. NOTIFICATION threshold is 0.0 by default
+            # so all pass, but this preserves the signal for future tuning.
+            urgency = notif.get("urgency", "normal")
+            salience = {"low": 0.3, "normal": 0.6, "high": 0.9}.get(urgency, 0.6)
+
+            try:
+                request = OutreachRequest(
+                    category=OutreachCategory.NOTIFICATION,
+                    topic=content[:100],
+                    context=content,
+                    salience_score=salience,
+                    signal_type="ego_notification",
+                    channel="telegram",
+                )
+                await self._outreach_pipeline.submit(request)
+                submitted += 1
+            except Exception:
+                logger.warning(
+                    "Failed to submit ego notification: %s",
+                    content[:80],
+                    exc_info=True,
+                )
+
+        if submitted:
+            logger.info(
+                "Submitted %d/%d ego notification(s) to outreach pipeline",
+                submitted,
+                len(notifications),
+            )
+
     # -- Deferred intentions ------------------------------------------------
 
     async def _process_intentions(
@@ -1660,32 +1741,6 @@ class EgoSession:
                         exc_info=True,
                     )
 
-            # Self-notification shortcut: outreach proposals whose execution
-            # plan indicates a zero-cost Telegram message to the user were
-            # already delivered via the proposal digest.  Auto-complete them
-            # instead of spawning an expensive CC session.
-            exec_plan = (prop.get("execution_plan") or "").lower()
-            if (
-                prop.get("action_type") == "outreach"
-                and "telegram" in exec_plan
-                and ("$0" in exec_plan or "~$0" in exec_plan)
-            ):
-                cursor = await self._db.execute(
-                    "UPDATE ego_proposals SET status = 'executed', "
-                    "user_response = 'auto-completed: delivered via proposal digest' "
-                    "WHERE id = ? AND status = 'approved'",
-                    (prop["id"],),
-                )
-                await self._db.commit()
-                if cursor.rowcount > 0:
-                    dispatched.append(prop["id"])
-                    logger.info(
-                        "Proposal %s auto-completed (self-notification — "
-                        "already delivered via digest)",
-                        prop["id"],
-                    )
-                continue
-
             # Content integrity check — detect degradation since creation.
             # Log-only for now; tighten to a gate if we see real degradation.
             stored_hash = prop.get("content_hash")
@@ -1824,42 +1879,49 @@ class EgoSession:
             except (ValueError, TypeError):
                 pass
 
-        # World model context — each section degrades independently
-        try:
-            from genesis.db.crud import user_goals
+        # World model context — ONLY for non-content dispatches.
+        # Content dispatches get minimal context to prevent information
+        # leakage (goals, contacts, events are leak vectors for published
+        # content). The proposal content + exec plan + rationale is sufficient.
+        if not _is_content_dispatch(prop):
+            try:
+                from genesis.db.crud import user_goals
 
-            goals = await user_goals.list_active(self._db)
-            if goals:
-                goal_lines = [
-                    f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]
-                ]
-                parts.append("\n\nUser's active goals:\n" + "\n".join(goal_lines))
-        except Exception:
-            pass
+                goals = await user_goals.list_active(self._db)
+                if goals:
+                    goal_lines = [
+                        f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]
+                    ]
+                    parts.append("\n\nUser's active goals:\n" + "\n".join(goal_lines))
+            except Exception:
+                pass
 
-        try:
-            from genesis.db.crud import user_contacts
+            try:
+                from genesis.db.crud import user_contacts
 
-            contacts = await user_contacts.recently_active(self._db, days=14)
-            if contacts:
-                contact_lines = [
-                    f"- {c['name']} ({c.get('relationship', 'contact')})" for c in contacts[:5]
-                ]
-                parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
-        except Exception:
-            pass
+                contacts = await user_contacts.recently_active(self._db, days=14)
+                if contacts:
+                    contact_lines = [
+                        f"- {c['name']} ({c.get('relationship', 'contact')})" for c in contacts[:5]
+                    ]
+                    parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
+            except Exception:
+                pass
 
-        try:
-            from genesis.db.crud import memory_events
+            try:
+                from genesis.db.crud import memory_events
 
-            events = await memory_events.upcoming_user_events(self._db, days=14)
-            if events:
-                event_lines = [
-                    f"- {e['object']} ({e.get('event_date', 'TBD')})" for e in events[:5]
-                ]
-                parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
-        except Exception:
-            pass
+                events = await memory_events.upcoming_user_events(self._db, days=14)
+                if events:
+                    event_lines = [
+                        f"- {e['object']} ({e.get('event_date', 'TBD')})" for e in events[:5]
+                    ]
+                    parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
+            except Exception:
+                pass
+
+        # Append content firewall rules to all dispatches as safety net
+        parts.append(f"\n\n{_CONTENT_FIREWALL_RULES}")
 
         return "\n".join(parts)
 
@@ -1900,6 +1962,42 @@ def _normalize_to_infra(category: str) -> bool:
         return False
     cat_lower = category.lower()
     return any(cat_lower.startswith(prefix) for prefix in _USER_EGO_INFRA_PREFIXES)
+
+
+# -- Content dispatch detection + firewall rules ----------------------------
+
+_CONTENT_DISPATCH_KEYWORDS = frozenset({
+    "publish", "article", "medium", "post", "draft", "blog",
+})
+# "content" omitted — too broad for substring matching (matches
+# "content_hash", "content error rate"). Caught by action_type check.
+
+
+def _is_content_dispatch(prop: dict) -> bool:
+    """Check if a proposal is a content/publishing dispatch.
+
+    Used to apply information minimization at the dispatch boundary —
+    content dispatches should NOT receive world model context (goals,
+    contacts, events) that could leak into published output.
+    """
+    action_type = (prop.get("action_type") or "").lower()
+    if action_type in ("outreach", "dispatch", "content", "publish"):
+        return True
+    content = (prop.get("content") or "").lower()
+    return any(kw in content for kw in _CONTENT_DISPATCH_KEYWORDS)
+
+
+_CONTENT_FIREWALL_RULES = """
+## Content Firewall (externally-shared content only)
+Principle: release no more information than the task requires.
+- Use generic descriptions for private events ("a recent panel", not
+  the event name)
+- Use roles for people ("an engineer", not personal names)
+- Never reference active job search, applications, or career workflows
+- Never include calendar details, internal codenames, or infrastructure
+- Biographical detail: only if directly relevant to the thesis
+- When in doubt, omit. The user reviews before publish.
+""".strip()
 
 
 # -- Realist prompt & parser -----------------------------------------------

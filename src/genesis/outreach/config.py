@@ -26,6 +26,7 @@ class OutreachConfig:
     max_daily: int
     surplus_daily: int
     content_daily: int
+    notification_daily: int
     morning_report_time: str
     # morning_report_timezone removed — uses genesis.env.user_timezone()
     engagement_timeout_hours: int
@@ -57,6 +58,7 @@ _DEFAULTS = OutreachConfig(
     max_daily=5,
     surplus_daily=1,
     content_daily=3,
+    notification_daily=10,
     morning_report_time="07:00",
     engagement_timeout_hours=24,
     engagement_poll_minutes=60,
@@ -107,7 +109,7 @@ def validate_preferences(preferences: dict) -> list[str]:
 
     if "rate_limits" in preferences:
         rl = preferences["rate_limits"]
-        for field in ("max_daily", "surplus_daily", "content_daily"):
+        for field in ("max_daily", "surplus_daily", "content_daily", "notification_daily"):
             val = rl.get(field)
             if val is not None:
                 try:
@@ -136,6 +138,7 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
             "max_daily": config.max_daily,
             "surplus_daily": config.surplus_daily,
             "content_daily": config.content_daily,
+            "notification_daily": config.notification_daily,
         },
         "morning_report": {
             "trigger_time": config.morning_report_time,
@@ -187,6 +190,7 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
         max_daily=raw.get("rate_limits", {}).get("max_daily", 5),
         surplus_daily=raw.get("rate_limits", {}).get("surplus_daily", 1),
         content_daily=raw.get("rate_limits", {}).get("content_daily", 3),
+        notification_daily=raw.get("rate_limits", {}).get("notification_daily", 10),
         morning_report_time=raw.get("morning_report", {}).get("trigger_time", "07:00"),
         engagement_timeout_hours=raw.get("engagement", {}).get("timeout_hours", 24),
         engagement_poll_minutes=raw.get("engagement", {}).get("poll_interval_minutes", 60),

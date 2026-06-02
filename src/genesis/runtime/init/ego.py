@@ -128,6 +128,9 @@ async def init(rt: GenesisRuntime) -> None:
         if getattr(rt, "_proposal_dispatch_gate", None) is not None:
             user_ego_session.set_proposal_gate(rt._proposal_dispatch_gate)
 
+        if getattr(rt, "_outreach_pipeline", None) is not None:
+            user_ego_session.set_outreach_pipeline(rt._outreach_pipeline)
+
         # Store as the primary ego session (backwards compatible)
         rt._ego_session = user_ego_session
 
@@ -203,6 +206,9 @@ async def init(rt: GenesisRuntime) -> None:
 
         if getattr(rt, "_proposal_dispatch_gate", None) is not None:
             genesis_ego_session.set_proposal_gate(rt._proposal_dispatch_gate)
+
+        if getattr(rt, "_outreach_pipeline", None) is not None:
+            genesis_ego_session.set_outreach_pipeline(rt._outreach_pipeline)
 
         rt._genesis_ego_session = genesis_ego_session
 

@@ -1465,6 +1465,12 @@ class UserEgoContextBuilder:
             '      "memory_basis": "non-obvious memory that informed this (optional)"\n'
             "    }\n"
             "  ],\n"
+            '  "notifications": [\n'
+            "    {\n"
+            '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
             '  "focus_summary": "one-line: what you are focused on for the user",\n'
             '  "resolved_follow_ups": [{"id": "follow_up_id", "resolution": "why resolved"}],\n'
             '  "resolved_directives": [{"id": "directive_id", "resolution": "what you decided"}],\n'

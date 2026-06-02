@@ -19,6 +19,10 @@ class OutreachCategory(StrEnum):
     # Content pipeline drafts for user review. Routed to the "Content Review"
     # supergroup topic. User approves before external publishing.
     CONTENT = "content"
+    # Ego notifications — informational messages that don't need user approval.
+    # Routed through the outreach pipeline with governance (dedup, rate limit,
+    # quiet hours) but no approval gate. Added in PR #530.
+    NOTIFICATION = "notification"
 
 
 class OutreachStatus(StrEnum):
