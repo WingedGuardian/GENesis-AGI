@@ -378,7 +378,9 @@ class TestProcessExecutionBriefs:
 
         mock_direct_runner.spawn.assert_called_once()
         req = mock_direct_runner.spawn.call_args[0][0]
-        assert req.prompt == "Do the thing"
+        assert req.prompt.startswith("Do the thing")
+        # Firewall rules are appended to all execution brief prompts
+        assert "Content Firewall" in req.prompt
         assert req.source_tag == "ego_dispatch"
         assert req.caller_context == "ego_proposal:prop_001"
 
