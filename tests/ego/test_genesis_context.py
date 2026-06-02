@@ -97,7 +97,15 @@ async def db():
                 rank            INTEGER,
                 execution_plan  TEXT,
                 recurring       INTEGER DEFAULT 0,
-                memory_basis    TEXT DEFAULT ''
+                memory_basis    TEXT DEFAULT '',
+                realist_verdict  TEXT,
+                realist_reasoning TEXT,
+                ego_source       TEXT,
+                goal_id          TEXT,
+                content_hash     TEXT,
+                original_content TEXT,
+                content_size     INTEGER,
+                expected_outputs TEXT
             )
         """)
         await conn.execute("""

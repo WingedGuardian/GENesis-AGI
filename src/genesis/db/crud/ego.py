@@ -473,18 +473,27 @@ async def list_proposals(
     *,
     status: str | None = None,
     limit: int = 50,
+    ego_source: str | None = None,
 ) -> list[dict]:
-    """All proposals, optionally filtered by status, newest first."""
+    """All proposals, optionally filtered by status and/or ego_source, newest first.
+
+    If ``ego_source`` is provided, only returns proposals from that ego.
+    NULL ego_source proposals (pre-migration) match any filter.
+    """
+    clauses: list[str] = []
+    params: list[str | int] = []
     if status:
-        cursor = await db.execute(
-            "SELECT * FROM ego_proposals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-            (status, limit),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT * FROM ego_proposals ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        clauses.append("status = ?")
+        params.append(status)
+    if ego_source:
+        clauses.append("(ego_source = ? OR ego_source IS NULL)")
+        params.append(ego_source)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    cursor = await db.execute(
+        f"SELECT * FROM ego_proposals{where} ORDER BY created_at DESC LIMIT ?",
+        tuple(params),
+    )
     return [dict(r) for r in await cursor.fetchall()]
 
 
@@ -715,11 +724,27 @@ async def get_board(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
-    """All tabled proposals, newest first."""
-    cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE status = 'tabled' ORDER BY resolved_at DESC",
-    )
+async def get_tabled(
+    db: aiosqlite.Connection,
+    *,
+    ego_source: str | None = None,
+) -> list[dict]:
+    """All tabled proposals, newest first.
+
+    If ``ego_source`` is provided, only returns proposals from that ego.
+    NULL ego_source proposals (pre-migration) match any filter.
+    """
+    if ego_source:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals "
+            "WHERE status = 'tabled' AND (ego_source = ? OR ego_source IS NULL) "
+            "ORDER BY resolved_at DESC",
+            (ego_source,),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals WHERE status = 'tabled' ORDER BY resolved_at DESC",
+        )
     return [dict(r) for r in await cursor.fetchall()]
 
 

@@ -885,14 +885,16 @@ class UserEgoContextBuilder:
                 cursor = await self._db.execute(
                     "SELECT COUNT(*) FROM ego_proposals "
                     "WHERE created_at >= datetime('now', '-7 days') "
-                    "AND status IN ('pending', 'approved', 'executed')"
+                    "AND status IN ('pending', 'approved', 'executed') "
+                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
                 )
                 active = (await cursor.fetchone())[0]
                 cursor2 = await self._db.execute(
                     "SELECT COUNT(*) FROM ego_proposals "
                     "WHERE created_at >= datetime('now', '-7 days') "
                     "AND status IN ('withdrawn', 'tabled', 'rejected', "
-                    "'failed', 'expired')"
+                    "'failed', 'expired') "
+                    "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL)"
                 )
                 tried = (await cursor2.fetchone())[0]
                 return (
@@ -924,13 +926,14 @@ class UserEgoContextBuilder:
             return f"| {action_type} | {short} | {status} | {realist} |"
 
         try:
-            # Section 1: Active proposals
+            # Section 1: Active proposals (user ego only)
             cursor = await self._db.execute(
                 "SELECT action_type, content, status, realist_verdict, "
                 "realist_reasoning, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "AND status IN ('pending', 'approved', 'executed') "
+                "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
                 "ORDER BY created_at DESC "
                 "LIMIT 15",
             )
@@ -944,7 +947,7 @@ class UserEgoContextBuilder:
                     lines.append(_format_row(row))
                 lines.append("")
 
-            # Section 2: Recently tried
+            # Section 2: Recently tried (user ego only)
             lines.append("## Recently Tried (do not re-propose)\n")
             cursor2 = await self._db.execute(
                 "SELECT action_type, content, status, realist_verdict, "
@@ -952,6 +955,7 @@ class UserEgoContextBuilder:
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
+                "AND (ego_source = 'user_ego_cycle' OR ego_source IS NULL) "
                 "ORDER BY created_at DESC "
                 "LIMIT 10",
             )
@@ -997,7 +1001,7 @@ class UserEgoContextBuilder:
 
         # ---- Fetch all pending proposals ----
         try:
-            all_pending = await ego_crud.get_pending_queue(self._db)
+            all_pending = await ego_crud.get_pending_queue(self._db, ego_source='user_ego_cycle')
         except Exception:
             logger.error("Failed to query pending proposals", exc_info=True)
             lines.append("## Proposal Board\n")
@@ -1059,7 +1063,7 @@ class UserEgoContextBuilder:
 
         # ---- Approved proposals ready for execution ----
         try:
-            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5)
+            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5, ego_source='user_ego_cycle')
         except Exception:
             approved = []
 
@@ -1079,7 +1083,7 @@ class UserEgoContextBuilder:
 
         # ---- Deferred (tabled) proposals ----
         try:
-            tabled = await ego_crud.get_tabled(self._db)
+            tabled = await ego_crud.get_tabled(self._db, ego_source='user_ego_cycle')
         except Exception:
             tabled = []
 

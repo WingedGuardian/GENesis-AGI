@@ -417,13 +417,14 @@ class GenesisEgoContextBuilder:
         )
 
         try:
-            # Section 1: Active proposals
+            # Section 1: Active proposals (genesis ego only)
             cursor = await self._db.execute(
                 "SELECT action_type, content, status, "
                 "user_response, created_at "
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "AND status IN ('pending', 'approved', 'executed') "
+                "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
                 "ORDER BY created_at DESC "
                 "LIMIT 15"
             )
@@ -442,7 +443,7 @@ class GenesisEgoContextBuilder:
                     )
                 lines.append("")
 
-            # Section 2: Recently tried
+            # Section 2: Recently tried (genesis ego only)
             lines.append("## Recently Tried (do not re-propose)\n")
             cursor2 = await self._db.execute(
                 "SELECT action_type, content, status, "
@@ -450,6 +451,7 @@ class GenesisEgoContextBuilder:
                 "FROM ego_proposals "
                 "WHERE created_at >= datetime('now', '-7 days') "
                 "AND status IN ('withdrawn', 'tabled', 'rejected', 'failed', 'expired') "
+                "AND (ego_source = 'genesis_ego_cycle' OR ego_source IS NULL) "
                 "ORDER BY created_at DESC "
                 "LIMIT 10"
             )
@@ -501,7 +503,7 @@ class GenesisEgoContextBuilder:
 
         # ---- Fetch all pending proposals ----
         try:
-            all_pending = await ego_crud.get_pending_queue(self._db)
+            all_pending = await ego_crud.get_pending_queue(self._db, ego_source='genesis_ego_cycle')
         except Exception:
             logger.error("Failed to query pending proposals", exc_info=True)
             lines.append("## Operational Focus\n")
@@ -545,7 +547,7 @@ class GenesisEgoContextBuilder:
 
         # ---- Approved proposals ready for execution ----
         try:
-            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5)
+            approved = await ego_crud.list_proposals(self._db, status="approved", limit=5, ego_source='genesis_ego_cycle')
         except Exception:
             approved = []
 
