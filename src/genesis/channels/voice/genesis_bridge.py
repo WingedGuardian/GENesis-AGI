@@ -32,17 +32,18 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "name": "ask_genesis",
         "description": (
-            "Ask the Genesis backend for memory recall, knowledge lookup, "
-            "task dispatch, or any reasoning that requires the user's personal "
-            "context. Genesis will figure out what tools and capabilities to "
-            "use internally."
+            "REQUIRED for any question about: conversations, past events, "
+            "what we discussed, what we worked on, memories, personal context, "
+            "projects, tasks, or anything the user has told you before. "
+            "You do NOT have this information yourself — you MUST call this "
+            "tool to access the user's history. Genesis has full memory."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What to ask Genesis",
+                    "description": "The user's question, rephrased as a query",
                 },
             },
             "required": ["query"],
@@ -52,9 +53,10 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "name": "web_search",
         "description": (
-            "Quick web search for current facts like weather, news, scores, "
-            "stock prices. Use for simple factual lookups that don't need "
-            "Genesis's memory or knowledge base."
+            "REQUIRED for any question about: current events, weather, news, "
+            "scores, stock prices, real-time facts, or anything that changes "
+            "over time. Also use when the user explicitly asks you to search. "
+            "You do NOT have current information yourself — call this tool."
         ),
         "parameters": {
             "type": "object",
@@ -72,19 +74,24 @@ TOOL_DECLARATIONS = [
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You remember the user's history, projects, and preferences through your tools.
+You have two tools. Use them.
 
-Rules:
-- Be concise. Spoken responses should be 1-3 sentences unless asked for detail.
-- Never use markdown. Speak naturally, like a knowledgeable colleague.
-- When the user asks about their past work, memories, or personal context: \
-call ask_genesis.
-- When the user asks about current events, weather, or real-time facts: \
-call web_search.
-- For general knowledge: answer directly, no tool call needed.
-- If a request would take time, say you'll look into it.
+TOOL RULES (important — follow these strictly):
+- "what did we do / work on / discuss" → ALWAYS call ask_genesis. Never guess.
+- "search / look up / what's the weather / news" → ALWAYS call web_search.
+- "can you search the web" or similar capability questions → call web_search \
+with a relevant query to demonstrate the capability.
+- Questions about the user's personal context, projects, history → call ask_genesis.
+- General knowledge you're confident about → answer directly, no tool call.
+- When in doubt between answering directly and calling a tool → call the tool. \
+Better to be thorough than to guess wrong.
 
-{essential_knowledge}
+VOICE RULES:
+- Respond naturally.
+- Never use markdown, bullet points, or formatting. Speak naturally.
+- Don't narrate what you're doing. Just do it and report the result.
+
+{voice_context}
 """
 
 
@@ -104,7 +111,7 @@ class GenesisBridge:
         self._voice_handler = voice_handler
 
     async def handle_tool_call(
-        self, name: str, arguments: str,
+        self, name: str, arguments: str, *, satellite_id: str = "s2s-default",
     ) -> str:
         """Dispatch a tool call and return the result as JSON string."""
         try:
@@ -113,33 +120,53 @@ class GenesisBridge:
             return json.dumps({"error": f"Invalid arguments: {arguments}"})
 
         if name == "ask_genesis":
-            return await self._ask_genesis(args.get("query", ""))
+            return await self._ask_genesis(
+                args.get("query", ""), satellite_id=satellite_id,
+            )
         if name == "web_search":
             return await self._web_search(args.get("query", ""))
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 
-    async def _ask_genesis(self, query: str) -> str:
-        """Delegate to VoiceConversationHandler — same cognitive path as Phase 1."""
+    async def _ask_genesis(
+        self, query: str, *, satellite_id: str = "s2s-default",
+    ) -> str:
+        """Recall memories and return raw snippets for S2S synthesis.
+
+        Uses raw_snippets=True to skip the Groq LLM call — GPT-Realtime
+        handles synthesis from the raw memory snippets, saving ~2s latency.
+        Falls back to the full LLM path if raw recall fails.
+        """
         if not self._voice_handler:
             return json.dumps({"answer": "Genesis voice handler not available."})
 
+        session_id = f"s2s-{satellite_id}"
         try:
-            # Use a stable session ID for S2S tool calls so context accumulates
             response = await self._voice_handler.handle(
                 transcript=query,
-                session_id="s2s-tool-bridge",
+                session_id=session_id,
+                raw_snippets=True,
             )
             return json.dumps({"answer": response})
         except Exception:
-            logger.exception("ask_genesis tool call failed")
+            logger.exception("ask_genesis raw recall failed, trying full path")
+
+        # Fallback: full LLM path (Groq synthesis)
+        try:
+            response = await self._voice_handler.handle(
+                transcript=query,
+                session_id=session_id,
+            )
+            return json.dumps({"answer": response})
+        except Exception:
+            logger.exception("ask_genesis full path also failed")
             return json.dumps({"error": "Genesis processing failed"})
 
     async def _web_search(self, query: str) -> str:
         """Handle web_search tool call — quick factual lookup."""
         try:
-            from genesis.mcp.health.web_tools import web_search
-            result = await web_search(query, max_results=3)
+            from genesis.mcp.health.web_tools import _impl_web_search
+            result = await _impl_web_search(query, backend="brave", max_results=3)
             search_results = result.get("results", [])
             if search_results:
                 snippets = [
@@ -156,11 +183,47 @@ class GenesisBridge:
         return json.dumps({"error": "Web search unavailable"})
 
     def get_system_prompt(self) -> str:
-        """Build the system prompt with essential knowledge."""
-        ek = ""
+        """Build the system prompt with curated voice context.
+
+        Extracts only the Active Context section from essential knowledge —
+        the rest (wing counts, conversation pivots, ego proposals) is system
+        telemetry that wastes tokens and confuses the voice model.
+        """
+        voice_ctx = ""
         if _ESSENTIAL_KNOWLEDGE_PATH.exists():
-            ek = _ESSENTIAL_KNOWLEDGE_PATH.read_text()[:2000]
+            voice_ctx = _extract_voice_context(
+                _ESSENTIAL_KNOWLEDGE_PATH.read_text(),
+            )
 
         return SYSTEM_INSTRUCTIONS.format(
-            essential_knowledge=f"\nCurrent context:\n{ek}" if ek else "",
+            voice_context=f"\nWhat the user has been working on recently:\n{voice_ctx}"
+            if voice_ctx else "",
         )
+
+
+def _extract_voice_context(ek_text: str, max_chars: int = 500) -> str:
+    """Extract the Active Context section from essential knowledge.
+
+    Strips system telemetry (wing counts, conversation pivots, ego
+    proposals, observation IDs) — keep only plain-language project context.
+    """
+    lines = ek_text.split("\n")
+    in_active_context = False
+    context_lines = []
+
+    for line in lines:
+        # Start collecting at "Active Context"
+        if "### Active Context" in line:
+            in_active_context = True
+            continue
+        # Stop at the next section header
+        if in_active_context and line.startswith("### "):
+            break
+        if in_active_context and line.strip():
+            # Strip leading "- " for cleaner voice context
+            clean = line.strip().lstrip("- ")
+            if clean:
+                context_lines.append(clean)
+
+    result = ". ".join(context_lines)
+    return result[:max_chars] if result else ""

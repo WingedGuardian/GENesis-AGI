@@ -296,8 +296,11 @@ class StandaloneAdapter:
             voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
             bridge = GenesisBridge(voice_handler=voice_handler)
 
-            # S2S session manager
-            s2s_manager = S2SSessionManager(bridge=bridge)
+            # S2S session manager (memory_store for transcript persistence)
+            s2s_manager = S2SSessionManager(
+                bridge=bridge,
+                memory_store=self._runtime.memory_store if self._runtime else None,
+            )
             await s2s_manager.start_reaper()
             logger.info(
                 "S2S session manager created (provider=%s, model=%s)",
@@ -317,6 +320,15 @@ class StandaloneAdapter:
             await self._wyoming_stt.start()
 
             self._s2s_manager = s2s_manager
+
+            # Pre-warm: open WebSocket to GPT-Realtime so the first wake
+            # word doesn't pay the 1.75s connection + config cost.
+            try:
+                session = await s2s_manager.get_or_create("ha-voice-default")
+                await s2s_manager.connect(session)
+                logger.info("S2S session pre-warmed for ha-voice-default")
+            except Exception:
+                logger.warning("S2S pre-warm failed (will connect on first request)")
 
         except Exception:
             logger.exception("Failed to initialize Wyoming voice servers")

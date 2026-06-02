@@ -24,15 +24,19 @@ _VOICE_CALL_SITE = "voice_conversation"
 _ESSENTIAL_KNOWLEDGE_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 
 _VOICE_SYSTEM_PROMPT = """\
-You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You have access to recalled memories and knowledge provided below as context.
+You are Genesis, a cognitive AI partner. You are responding to a voice query.
+You have full memory across ALL channels — Telegram, dashboard, voice, and
+background sessions. The recalled memories below come from your complete
+history with the user, not just voice conversations.
+
+Answer the user's question using the recalled memories. If memories are
+provided, use them — don't say "this is our first conversation" unless
+the memories section is truly empty.
 
 Voice rules:
-- Be concise. Spoken responses should be 1-3 sentences unless the user asks for detail.
-- Never use markdown formatting — no bullets, headers, code blocks, or URLs.
-- Speak naturally, as a knowledgeable colleague would.
+- Respond naturally.
+- Never use markdown formatting. Speak naturally.
 - If you don't know something, say so briefly.
-- For complex requests that would take time, say you'll look into it.
 
 {context}
 """
@@ -56,23 +60,34 @@ class VoiceConversationHandler:
     def session_manager(self) -> VoiceSessionManager:
         return self._sessions
 
-    async def handle(self, transcript: str, session_id: str) -> str:
+    async def handle(
+        self, transcript: str, session_id: str, *, raw_snippets: bool = False,
+    ) -> str:
         """Process a voice transcript and return a spoken response.
 
+        Args:
+            transcript: The user's spoken text.
+            session_id: Voice session identifier.
+            raw_snippets: If True, return formatted memory snippets directly
+                without calling the LLM router. Used by S2S pipeline where
+                GPT-Realtime handles synthesis, saving ~2s of Groq LLM latency.
+
+        Steps (full path):
         1. Get/create session
         2. Recall relevant memories
         3. Assemble context (essential knowledge + memories + buffer)
         4. Call router with voice-optimized system prompt
         5. Store turn in buffer
         6. Return sanitized response
+
+        Steps (raw_snippets path):
+        1. Recall relevant memories
+        2. Return formatted snippets (skip LLM, session, context assembly)
         """
         if not transcript.strip():
             return "I didn't catch that. Could you say that again?"
 
-        # 1. Session — touch to reset sustain timer
-        await self._sessions.get_or_create(session_id)
-
-        # 2. Memory recall (best-effort — don't fail the whole request)
+        # Memory recall (best-effort — don't fail the whole request)
         memories_text = ""
         try:
             results = await self._retriever.recall(transcript, limit=5, rerank=False)
@@ -90,7 +105,16 @@ class VoiceConversationHandler:
                 session_id[:12], exc_info=True,
             )
 
-        # 3. Assemble context
+        # Raw snippets path — return memories directly for S2S synthesis
+        if raw_snippets:
+            return memories_text or "No relevant memories found for this query."
+
+        # Full path: session + context assembly + LLM call
+
+        # 1. Session — touch to reset sustain timer
+        await self._sessions.get_or_create(session_id)
+
+        # 2. Assemble context
         essential = ""
         try:
             if _ESSENTIAL_KNOWLEDGE_PATH.exists():
@@ -109,7 +133,7 @@ class VoiceConversationHandler:
         context_block = "\n\n".join(context_parts) if context_parts else ""
         system_prompt = _VOICE_SYSTEM_PROMPT.format(context=context_block)
 
-        # 4. Build messages (system + buffer + current transcript)
+        # 3. Build messages (system + buffer + current transcript)
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
         ]
@@ -118,7 +142,7 @@ class VoiceConversationHandler:
             messages.extend(buffer)
         messages.append({"role": "user", "content": transcript})
 
-        # 5. Call router
+        # 4. Call router
         try:
             result = await self._router.route_call(
                 call_site_id=_VOICE_CALL_SITE,
@@ -137,9 +161,9 @@ class VoiceConversationHandler:
             )
             return "Something went wrong on my end. Try again."
 
-        # 6. Store turns in buffer
+        # 5. Store turns in buffer
         await self._sessions.add_turn(session_id, "user", transcript)
         await self._sessions.add_turn(session_id, "assistant", response)
 
-        # 7. Sanitize for speech (strip any markdown the LLM sneaks in)
+        # 6. Sanitize for speech (strip any markdown the LLM sneaks in)
         return sanitize_for_speech(response)

@@ -151,9 +151,8 @@ class STTEventHandler(AsyncEventHandler):
             if session.connection is None:
                 await self._s2s_manager.connect(session)
 
-            # Send audio to model (resampled 16kHz → 24kHz internally)
-            await self._s2s_manager.send_audio(session, audio, input_rate=self._rate)
-            await self._s2s_manager.commit_audio(session)
+            # Send complete utterance as conversation item (no VAD conflicts)
+            await self._s2s_manager.send_turn(session, audio, input_rate=self._rate)
 
             # Collect full response — audio AND transcript — before returning.
             # HA's pipeline is sequential: STT → conversation agent → TTS.
@@ -190,6 +189,7 @@ class STTEventHandler(AsyncEventHandler):
             elif not response_audio:
                 logger.warning("S2S response had no audio data")
 
+            logger.info("S2S transcript: %s", transcript[:200] if transcript else "(empty)")
             return transcript or "(no transcription)"
 
         except Exception:
@@ -248,7 +248,8 @@ class WyomingSTTServer:
             tts_server=self._tts_server,
         )
 
-        self._task = asyncio.create_task(
+        from genesis.util.tasks import tracked_task
+        self._task = tracked_task(
             self._server.run(handler_factory),
             name="wyoming-stt",
         )
