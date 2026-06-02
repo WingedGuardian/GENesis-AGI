@@ -147,7 +147,7 @@ class GenesisBridge:
         """Handle web_search tool call — quick factual lookup."""
         try:
             from genesis.mcp.health.web_tools import _impl_web_search
-            result = await _impl_web_search(query, max_results=3)
+            result = await _impl_web_search(query, backend="brave", max_results=3)
             search_results = result.get("results", [])
             if search_results:
                 snippets = [
