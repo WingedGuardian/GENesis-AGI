@@ -116,6 +116,7 @@ class EgoSession:
         self._direct_session_runner = direct_session_runner
         self._autonomous_dispatcher = None
         self._proposal_gate = None
+        self._outreach_pipeline = None
         self._mcp_config_path = mcp_config_path
         self._call_site = call_site or _DEFAULT_CALL_SITE
         self._focus_summary_key = focus_summary_key or _DEFAULT_FOCUS_SUMMARY_KEY
@@ -149,6 +150,14 @@ class EgoSession:
         exceed the current autonomy level for their action domain.
         """
         self._proposal_gate = gate
+
+    def set_outreach_pipeline(self, pipeline: object) -> None:
+        """Inject the OutreachPipeline for ego notification delivery.
+
+        Late-binding because the outreach pipeline may not be available at
+        EgoSession construction time (same pattern as autonomous_dispatcher).
+        """
+        self._outreach_pipeline = pipeline
 
     # -- Public API --------------------------------------------------------
 
