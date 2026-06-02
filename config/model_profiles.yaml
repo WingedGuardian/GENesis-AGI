@@ -721,6 +721,90 @@ profiles:
     last_reviewed: "2026-03-26"
     review_source: manual
 
+  deepseek-v4-pro:
+    display_name: "DeepSeek V4 Pro"
+    provider: openrouter
+    api_id: "deepseek/deepseek-v4-pro"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: cheap
+    cost_per_mtok_in: 0.435
+    cost_per_mtok_out: 0.87
+    latency: moderate
+    strengths:
+      - state-of-the-art logic and mathematical reasoning
+      - code generation accuracy (~75%+ SWE-Bench)
+      - deep chain-of-thought reasoning
+      - cost efficiency for frontier-tier intelligence
+    weaknesses:
+      - creative writing and conversational tone
+      - English nuance in long-form output
+    best_for: [code_work, triage, outcome_classification, executor_review]
+    avoid_for: [foreground_conversation, outreach_draft, creative_writing]
+    free_tier:
+      available: false
+    last_reviewed: "2026-06-02"
+    review_source: openrouter_pricing
+
+  deepseek-v4-flash:
+    display_name: "DeepSeek V4 Flash"
+    provider: openrouter
+    api_id: "deepseek/deepseek-v4-flash"
+    intelligence_tier: A
+    reasoning: A
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 1048576
+    cost_tier: cheap
+    cost_per_mtok_in: 0.0983
+    cost_per_mtok_out: 0.1966
+    latency: fast
+    strengths:
+      - extremely low cost for high-quality reasoning
+      - 1M token context window
+      - fast inference
+      - strong code and analysis capabilities
+    weaknesses:
+      - creative writing
+      - English fluency in long-form output
+    best_for: [code_work, pre_execution_assessment, observation_sweep, triage]
+    avoid_for: [foreground_conversation, outreach_draft, creative_writing]
+    free_tier:
+      available: false
+    last_reviewed: "2026-06-02"
+    review_source: openrouter_pricing
+
+  nvidia-nim-deepseek-v4-pro:
+    display_name: "DeepSeek V4 Pro (NIM)"
+    provider: nvidia_nim
+    api_id: "deepseek-ai/deepseek-v4-pro"
+    intelligence_tier: S
+    reasoning: S
+    instruction_following: A
+    anti_sycophancy: B
+    context_window: 131072
+    cost_tier: free
+    cost_per_mtok_in: 0.0
+    cost_per_mtok_out: 0.0
+    latency: moderate
+    strengths:
+      - free tier access to frontier DeepSeek V4
+      - same model quality as paid V4 Pro
+    weaknesses:
+      - rate limited (40 RPM, 5000 credits)
+      - creative writing and conversational tone
+    best_for: [code_work, triage, fallback_reasoning]
+    avoid_for: [foreground_conversation, outreach_draft, high_throughput]
+    free_tier:
+      available: true
+      credits: 5000
+      rpm_limit: 40
+    last_reviewed: "2026-06-02"
+    review_source: nvidia_nim_catalog
+
   grok-3-mini:
     display_name: "Grok 3 Mini"
     provider: xai

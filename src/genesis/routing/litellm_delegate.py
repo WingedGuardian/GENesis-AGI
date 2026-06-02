@@ -57,6 +57,46 @@ _TYPE_TO_PREFIX: dict[str, str] = {
 }
 
 
+# ── Custom model costs ──────────────────────────────────────────────────
+# Models not yet in LiteLLM's built-in cost database.  Injected at import
+# time so litellm.completion_cost() returns a real value instead of raising.
+# Prices are per-token (NOT per million tokens).
+# Source: https://openrouter.ai/deepseek (checked 2026-06-02)
+_CUSTOM_MODEL_COSTS: dict[str, dict] = {
+    # DeepSeek V4 Pro via OpenRouter — $0.435/$0.87 per MTok
+    "openrouter/deepseek/deepseek-v4-pro": {
+        "input_cost_per_token": 4.35e-7,
+        "output_cost_per_token": 8.7e-7,
+        "max_input_tokens": 131072,
+        "max_output_tokens": 131072,
+        "mode": "chat",
+        "litellm_provider": "openrouter",
+    },
+    # DeepSeek V4 Flash via OpenRouter — $0.0983/$0.1966 per MTok
+    "openrouter/deepseek/deepseek-v4-flash": {
+        "input_cost_per_token": 9.83e-8,
+        "output_cost_per_token": 1.966e-7,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "mode": "chat",
+        "litellm_provider": "openrouter",
+    },
+    # DeepSeek V4 Pro via NVIDIA NIM — free tier
+    "nvidia_nim/deepseek-ai/deepseek-v4-pro": {
+        "input_cost_per_token": 0.0,
+        "output_cost_per_token": 0.0,
+        "max_input_tokens": 131072,
+        "max_output_tokens": 131072,
+        "mode": "chat",
+        "litellm_provider": "nvidia_nim",
+    },
+}
+
+for _model, _cost in _CUSTOM_MODEL_COSTS.items():
+    if _model not in litellm.model_cost:
+        litellm.model_cost[_model] = _cost
+
+
 class LiteLLMDelegate:
     """CallDelegate implementation using litellm.acompletion().
 
