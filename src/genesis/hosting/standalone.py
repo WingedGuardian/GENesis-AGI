@@ -318,6 +318,15 @@ class StandaloneAdapter:
 
             self._s2s_manager = s2s_manager
 
+            # Pre-warm: open WebSocket to GPT-Realtime so the first wake
+            # word doesn't pay the 1.75s connection + config cost.
+            try:
+                session = await s2s_manager.get_or_create("ha-voice-default")
+                await s2s_manager.connect(session)
+                logger.info("S2S session pre-warmed for ha-voice-default")
+            except Exception:
+                logger.warning("S2S pre-warm failed (will connect on first request)")
+
         except Exception:
             logger.exception("Failed to initialize Wyoming voice servers")
 
