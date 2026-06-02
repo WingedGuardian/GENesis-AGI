@@ -1271,6 +1271,11 @@ class EgoSession:
             if not proposal_id or not prompt:
                 continue
 
+            # Append content firewall rules to ego-authored dispatch prompt.
+            # The ego writes the brief prompt directly — this safety net
+            # catches information that slips through the ego's own judgment.
+            prompt = f"{prompt}\n\n{_CONTENT_FIREWALL_RULES}"
+
             # Map profile and model from brief
             profile = brief.get("profile", "observe")
             if profile not in VALID_PROFILES:
@@ -1890,42 +1895,49 @@ class EgoSession:
             except (ValueError, TypeError):
                 pass
 
-        # World model context — each section degrades independently
-        try:
-            from genesis.db.crud import user_goals
+        # World model context — ONLY for non-content dispatches.
+        # Content dispatches get minimal context to prevent information
+        # leakage (goals, contacts, events are leak vectors for published
+        # content). The proposal content + exec plan + rationale is sufficient.
+        if not _is_content_dispatch(prop):
+            try:
+                from genesis.db.crud import user_goals
 
-            goals = await user_goals.list_active(self._db)
-            if goals:
-                goal_lines = [
-                    f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]
-                ]
-                parts.append("\n\nUser's active goals:\n" + "\n".join(goal_lines))
-        except Exception:
-            pass
+                goals = await user_goals.list_active(self._db)
+                if goals:
+                    goal_lines = [
+                        f"- {g['title']} ({g['category']}, {g['priority']})" for g in goals[:5]
+                    ]
+                    parts.append("\n\nUser's active goals:\n" + "\n".join(goal_lines))
+            except Exception:
+                pass
 
-        try:
-            from genesis.db.crud import user_contacts
+            try:
+                from genesis.db.crud import user_contacts
 
-            contacts = await user_contacts.recently_active(self._db, days=14)
-            if contacts:
-                contact_lines = [
-                    f"- {c['name']} ({c.get('relationship', 'contact')})" for c in contacts[:5]
-                ]
-                parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
-        except Exception:
-            pass
+                contacts = await user_contacts.recently_active(self._db, days=14)
+                if contacts:
+                    contact_lines = [
+                        f"- {c['name']} ({c.get('relationship', 'contact')})" for c in contacts[:5]
+                    ]
+                    parts.append("\nRelevant contacts:\n" + "\n".join(contact_lines))
+            except Exception:
+                pass
 
-        try:
-            from genesis.db.crud import memory_events
+            try:
+                from genesis.db.crud import memory_events
 
-            events = await memory_events.upcoming_user_events(self._db, days=14)
-            if events:
-                event_lines = [
-                    f"- {e['object']} ({e.get('event_date', 'TBD')})" for e in events[:5]
-                ]
-                parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
-        except Exception:
-            pass
+                events = await memory_events.upcoming_user_events(self._db, days=14)
+                if events:
+                    event_lines = [
+                        f"- {e['object']} ({e.get('event_date', 'TBD')})" for e in events[:5]
+                    ]
+                    parts.append("\nUpcoming events:\n" + "\n".join(event_lines))
+            except Exception:
+                pass
+
+        # Append content firewall rules to all dispatches as safety net
+        parts.append(f"\n\n{_CONTENT_FIREWALL_RULES}")
 
         return "\n".join(parts)
 
@@ -1966,6 +1978,40 @@ def _normalize_to_infra(category: str) -> bool:
         return False
     cat_lower = category.lower()
     return any(cat_lower.startswith(prefix) for prefix in _USER_EGO_INFRA_PREFIXES)
+
+
+# -- Content dispatch detection + firewall rules ----------------------------
+
+_CONTENT_DISPATCH_KEYWORDS = frozenset({
+    "publish", "article", "medium", "content", "post", "draft", "blog",
+})
+
+
+def _is_content_dispatch(prop: dict) -> bool:
+    """Check if a proposal is a content/publishing dispatch.
+
+    Used to apply information minimization at the dispatch boundary —
+    content dispatches should NOT receive world model context (goals,
+    contacts, events) that could leak into published output.
+    """
+    action_type = (prop.get("action_type") or "").lower()
+    if action_type in ("outreach", "dispatch", "content", "publish"):
+        return True
+    content = (prop.get("content") or "").lower()
+    return any(kw in content for kw in _CONTENT_DISPATCH_KEYWORDS)
+
+
+_CONTENT_FIREWALL_RULES = """
+## Content Firewall (externally-shared content only)
+Principle: release no more information than the task requires.
+- Use generic descriptions for private events ("a recent panel", not
+  the event name)
+- Use roles for people ("an engineer", not personal names)
+- Never reference active job search, applications, or career workflows
+- Never include calendar details, internal codenames, or infrastructure
+- Biographical detail: only if directly relevant to the thesis
+- When in doubt, omit. The user reviews before publish.
+""".strip()
 
 
 # -- Realist prompt & parser -----------------------------------------------
