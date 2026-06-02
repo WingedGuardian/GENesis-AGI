@@ -190,14 +190,34 @@ class CCVersionCollector:
     # ------------------------------------------------------------------
 
     async def _check_registry_version(self, installed: str) -> None:
-        """No-op — Genesis is pegged to a specific CC version.
+        """Check npm registry for a newer CC version.
 
-        CC version updates are managed manually, not tracked via npm
-        registry checks. The infrastructure (registry query, observation
-        storage) is preserved but unwired. All existing
-        cc_version_available observations have been bulk-resolved.
+        Emits a ``cc_version_available`` observation when the registry
+        reports a version newer than *installed*.  Best-effort — any
+        failure is logged at DEBUG and silently dropped by the caller.
         """
-        return
+        from genesis.db.crud import observations
+
+        registry = await self._get_registry_version()
+        if not registry:
+            return
+        if not self._is_newer(registry, installed):
+            return
+        now = datetime.now(UTC).isoformat()
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="cc_version",
+            type="cc_version_available",
+            content=json.dumps(
+                {"installed": installed, "available": registry, "detected_at": now},
+            ),
+            priority="low",
+            created_at=now,
+        )
+        logger.info(
+            "Newer CC version available: %s (installed: %s)", registry, installed,
+        )
 
     async def _get_registry_version(self) -> str:
         """Query npm registry for latest CC version. 10s timeout."""

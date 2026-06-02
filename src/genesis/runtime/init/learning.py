@@ -94,6 +94,7 @@ async def init(rt: GenesisRuntime) -> None:
             if ollama_enabled():
                 probes.append(probe_ollama)
 
+            from genesis.learning.signals.cc_version import CCVersionCollector
             from genesis.learning.signals.genesis_version import GenesisVersionCollector
 
             collectors = [
@@ -116,6 +117,12 @@ async def init(rt: GenesisRuntime) -> None:
                 GenesisVersionCollector(
                     rt._db,
                     pipeline_getter=lambda: rt._outreach_pipeline,
+                ),
+                CCVersionCollector(
+                    rt._db,
+                    router=rt._router,
+                    pipeline_getter=lambda: rt._outreach_pipeline,
+                    memory_store_getter=lambda: rt._memory_store,
                 ),
                 ProcessHealthCollector(),
                 UserGoalStalenessCollector(rt._db),
