@@ -138,6 +138,7 @@ class S2SSessionManager:
         system_prompt = self._bridge.get_system_prompt()
         voice = voice_config.s2s_voice()
         await conn.session.update(session={
+            "type": "realtime",
             "modalities": ["text", "audio"],
             "instructions": system_prompt,
             "voice": voice,
