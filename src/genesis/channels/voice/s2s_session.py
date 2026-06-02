@@ -80,7 +80,7 @@ class S2SSessionManager:
         self,
         *,
         bridge: GenesisBridge,
-        max_idle_seconds: int = 60,
+        max_idle_seconds: int = 300,
     ) -> None:
         self._bridge = bridge
         self._max_idle_seconds = max_idle_seconds

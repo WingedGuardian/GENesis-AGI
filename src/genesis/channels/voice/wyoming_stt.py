@@ -189,6 +189,7 @@ class STTEventHandler(AsyncEventHandler):
             elif not response_audio:
                 logger.warning("S2S response had no audio data")
 
+            logger.info("S2S transcript: %s", transcript[:200] if transcript else "(empty)")
             return transcript or "(no transcription)"
 
         except Exception:

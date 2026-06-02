@@ -32,17 +32,18 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "name": "ask_genesis",
         "description": (
-            "Ask the Genesis backend for memory recall, knowledge lookup, "
-            "task dispatch, or any reasoning that requires the user's personal "
-            "context. Genesis will figure out what tools and capabilities to "
-            "use internally."
+            "REQUIRED for any question about: conversations, past events, "
+            "what we discussed, what we worked on, memories, personal context, "
+            "projects, tasks, or anything the user has told you before. "
+            "You do NOT have this information yourself — you MUST call this "
+            "tool to access the user's history. Genesis has full memory."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What to ask Genesis",
+                    "description": "The user's question, rephrased as a query",
                 },
             },
             "required": ["query"],
@@ -52,9 +53,10 @@ TOOL_DECLARATIONS = [
         "type": "function",
         "name": "web_search",
         "description": (
-            "Quick web search for current facts like weather, news, scores, "
-            "stock prices. Use for simple factual lookups that don't need "
-            "Genesis's memory or knowledge base."
+            "REQUIRED for any question about: current events, weather, news, "
+            "scores, stock prices, real-time facts, or anything that changes "
+            "over time. Also use when the user explicitly asks you to search. "
+            "You do NOT have current information yourself — call this tool."
         ),
         "parameters": {
             "type": "object",
