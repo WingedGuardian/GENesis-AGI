@@ -111,7 +111,7 @@ class GenesisBridge:
         self._voice_handler = voice_handler
 
     async def handle_tool_call(
-        self, name: str, arguments: str,
+        self, name: str, arguments: str, *, satellite_id: str = "s2s-default",
     ) -> str:
         """Dispatch a tool call and return the result as JSON string."""
         try:
@@ -120,26 +120,46 @@ class GenesisBridge:
             return json.dumps({"error": f"Invalid arguments: {arguments}"})
 
         if name == "ask_genesis":
-            return await self._ask_genesis(args.get("query", ""))
+            return await self._ask_genesis(
+                args.get("query", ""), satellite_id=satellite_id,
+            )
         if name == "web_search":
             return await self._web_search(args.get("query", ""))
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 
-    async def _ask_genesis(self, query: str) -> str:
-        """Delegate to VoiceConversationHandler — same cognitive path as Phase 1."""
+    async def _ask_genesis(
+        self, query: str, *, satellite_id: str = "s2s-default",
+    ) -> str:
+        """Recall memories and return raw snippets for S2S synthesis.
+
+        Uses raw_snippets=True to skip the Groq LLM call — GPT-Realtime
+        handles synthesis from the raw memory snippets, saving ~2s latency.
+        Falls back to the full LLM path if raw recall fails.
+        """
         if not self._voice_handler:
             return json.dumps({"answer": "Genesis voice handler not available."})
 
+        session_id = f"s2s-{satellite_id}"
         try:
-            # Use a stable session ID for S2S tool calls so context accumulates
             response = await self._voice_handler.handle(
                 transcript=query,
-                session_id="s2s-tool-bridge",
+                session_id=session_id,
+                raw_snippets=True,
             )
             return json.dumps({"answer": response})
         except Exception:
-            logger.exception("ask_genesis tool call failed")
+            logger.exception("ask_genesis raw recall failed, trying full path")
+
+        # Fallback: full LLM path (Groq synthesis)
+        try:
+            response = await self._voice_handler.handle(
+                transcript=query,
+                session_id=session_id,
+            )
+            return json.dumps({"answer": response})
+        except Exception:
+            logger.exception("ask_genesis full path also failed")
             return json.dumps({"error": "Genesis processing failed"})
 
     async def _web_search(self, query: str) -> str:

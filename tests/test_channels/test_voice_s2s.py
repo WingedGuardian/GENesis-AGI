@@ -91,9 +91,9 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "answer" in data  # Returns "handler not available"
 
-    async def test_ask_genesis_delegates_to_handler(self):
+    async def test_ask_genesis_uses_raw_snippets(self):
         handler = AsyncMock()
-        handler.handle = AsyncMock(return_value="Yesterday you worked on voice Phase 1.")
+        handler.handle = AsyncMock(return_value="Recalled memories:\n- voice Phase 1")
 
         bridge = GenesisBridge(voice_handler=handler)
         result = await bridge.handle_tool_call(
@@ -102,7 +102,46 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "answer" in data
         assert "voice Phase 1" in data["answer"]
-        handler.handle.assert_awaited_once()
+        # Verify raw_snippets=True is passed
+        handler.handle.assert_awaited_once_with(
+            transcript="what did we do yesterday?",
+            session_id="s2s-s2s-default",
+            raw_snippets=True,
+        )
+
+    async def test_ask_genesis_passes_satellite_id(self):
+        handler = AsyncMock()
+        handler.handle = AsyncMock(return_value="memories here")
+
+        bridge = GenesisBridge(voice_handler=handler)
+        result = await bridge.handle_tool_call(
+            "ask_genesis",
+            json.dumps({"query": "test"}),
+            satellite_id="my-satellite",
+        )
+        data = json.loads(result)
+        assert "answer" in data
+        handler.handle.assert_awaited_once_with(
+            transcript="test",
+            session_id="s2s-my-satellite",
+            raw_snippets=True,
+        )
+
+    async def test_ask_genesis_falls_back_on_raw_failure(self):
+        handler = AsyncMock()
+        # First call (raw_snippets=True) fails, second (full path) succeeds
+        handler.handle = AsyncMock(
+            side_effect=[Exception("recall failed"), "Full LLM answer"],
+        )
+
+        bridge = GenesisBridge(voice_handler=handler)
+        result = await bridge.handle_tool_call(
+            "ask_genesis", json.dumps({"query": "test"}),
+        )
+        data = json.loads(result)
+        assert "answer" in data
+        assert data["answer"] == "Full LLM answer"
+        assert handler.handle.await_count == 2
 
     async def test_web_search_import_failure(self):
         bridge = GenesisBridge()
@@ -117,6 +156,62 @@ class TestGenesisBridge:
         prompt = bridge.get_system_prompt()
         assert "Genesis" in prompt
         assert "ask_genesis" in prompt
+
+
+# ─── VoiceConversationHandler tests ─────────────────────────────────────
+
+
+class TestVoiceConversationHandler:
+    async def test_raw_snippets_returns_memories(self):
+        from genesis.channels.voice.handler import VoiceConversationHandler
+
+        retriever = AsyncMock()
+        result_obj = MagicMock()
+        result_obj.content = "Yesterday we worked on voice pipeline."
+        retriever.recall = AsyncMock(return_value=[result_obj])
+
+        router = AsyncMock()
+        handler = VoiceConversationHandler(retriever=retriever, router=router)
+
+        response = await handler.handle("what did we do?", "test-session", raw_snippets=True)
+        assert "voice pipeline" in response
+        # Router should NOT be called in raw_snippets mode
+        router.route_call.assert_not_awaited()
+
+    async def test_raw_snippets_empty_recall(self):
+        from genesis.channels.voice.handler import VoiceConversationHandler
+
+        retriever = AsyncMock()
+        retriever.recall = AsyncMock(return_value=[])
+
+        router = AsyncMock()
+        handler = VoiceConversationHandler(retriever=retriever, router=router)
+
+        response = await handler.handle("what did we do?", "test-session", raw_snippets=True)
+        assert "No relevant memories" in response
+        router.route_call.assert_not_awaited()
+
+    async def test_raw_snippets_recall_failure(self):
+        from genesis.channels.voice.handler import VoiceConversationHandler
+
+        retriever = AsyncMock()
+        retriever.recall = AsyncMock(side_effect=Exception("Qdrant down"))
+
+        router = AsyncMock()
+        handler = VoiceConversationHandler(retriever=retriever, router=router)
+
+        response = await handler.handle("test", "test-session", raw_snippets=True)
+        assert "No relevant memories" in response
+
+    async def test_empty_transcript(self):
+        from genesis.channels.voice.handler import VoiceConversationHandler
+
+        retriever = AsyncMock()
+        router = AsyncMock()
+        handler = VoiceConversationHandler(retriever=retriever, router=router)
+
+        response = await handler.handle("   ", "test-session", raw_snippets=True)
+        assert "didn't catch that" in response
 
 
 # ─── Wyoming TTS server tests ───────────────────────────────────────────
@@ -183,3 +278,57 @@ class TestS2SSessionManager:
         assert inp == "hello"
         assert out == "hi there"
         assert "sat-1" not in mgr._sessions
+
+    async def test_close_stores_transcript(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        store = AsyncMock()
+        store.store = AsyncMock(return_value="mem-123")
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        session = await mgr.get_or_create("sat-1")
+        session.input_transcript = "What did we work on?"
+        session.output_transcript = "We worked on voice pipeline."
+
+        await mgr.close("sat-1")
+
+        store.store.assert_awaited_once()
+        call_kwargs = store.store.call_args
+        content = call_kwargs[0][0]  # first positional arg
+        assert "What did we work on?" in content
+        assert "We worked on voice pipeline." in content
+        assert call_kwargs[1]["source"] == "voice_s2s"
+        assert call_kwargs[1]["wing"] == "channels"
+        assert call_kwargs[1]["room"] == "voice"
+
+    async def test_close_skips_store_when_empty(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        store = AsyncMock()
+        store.store = AsyncMock()
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        await mgr.get_or_create("sat-1")
+        # No transcripts set
+
+        await mgr.close("sat-1")
+        store.store.assert_not_awaited()
+
+    async def test_close_handles_store_failure(self):
+        from genesis.channels.voice.s2s_session import S2SSessionManager
+
+        store = AsyncMock()
+        store.store = AsyncMock(side_effect=Exception("DB error"))
+
+        bridge = GenesisBridge()
+        mgr = S2SSessionManager(bridge=bridge, memory_store=store)
+        session = await mgr.get_or_create("sat-1")
+        session.input_transcript = "hello"
+        session.output_transcript = "hi"
+
+        # Should not raise — store failure is best-effort
+        inp, out = await mgr.close("sat-1")
+        assert inp == "hello"
+        assert out == "hi"

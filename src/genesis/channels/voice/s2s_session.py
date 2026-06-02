@@ -25,6 +25,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
 try:
     import openai
@@ -36,6 +37,9 @@ from genesis.channels.voice.genesis_bridge import (
     TOOL_DECLARATIONS,
     GenesisBridge,
 )
+
+if TYPE_CHECKING:
+    from genesis.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +84,11 @@ class S2SSessionManager:
         self,
         *,
         bridge: GenesisBridge,
+        memory_store: MemoryStore | None = None,
         max_idle_seconds: int = 300,
     ) -> None:
         self._bridge = bridge
+        self._memory_store = memory_store
         self._max_idle_seconds = max_idle_seconds
         self._sessions: dict[str, S2SSession] = {}
         self._client: openai.AsyncOpenAI | None = None
@@ -90,7 +96,8 @@ class S2SSessionManager:
 
     async def start_reaper(self) -> None:
         """Start the idle session reaper (runs every 15s)."""
-        self._reaper_task = asyncio.create_task(
+        from genesis.util.tasks import tracked_task
+        self._reaper_task = tracked_task(
             self._reap_loop(), name="s2s-session-reaper",
         )
 
@@ -255,8 +262,10 @@ class S2SSessionManager:
                             call_id=call_id,
                         )
 
-                        # Dispatch the tool call
-                        result = await self._bridge.handle_tool_call(name, args)
+                        # Dispatch the tool call (pass satellite for session scoping)
+                        result = await self._bridge.handle_tool_call(
+                            name, args, satellite_id=session.satellite_id,
+                        )
 
                         # Send result back to model
                         await conn.conversation.item.create(item={
@@ -292,7 +301,7 @@ class S2SSessionManager:
                 break
 
     async def close(self, satellite_id: str) -> tuple[str, str]:
-        """Close a session and return (input_transcript, output_transcript)."""
+        """Close a session, store transcripts, return (input, output)."""
         session = self._sessions.pop(satellite_id, None)
         if not session:
             return "", ""
@@ -307,6 +316,32 @@ class S2SSessionManager:
                     await conn_mgr.__aexit__(None, None, None)
             except Exception:
                 logger.exception("Error closing S2S session %s", session.session_id)
+
+        # Store conversation transcripts to episodic memory (best-effort)
+        if self._memory_store and (transcripts[0] or transcripts[1]):
+            try:
+                content = (
+                    f"Voice conversation [{satellite_id}]:\n"
+                    f"User: {transcripts[0]}\n"
+                    f"Genesis: {transcripts[1]}"
+                )
+                await self._memory_store.store(
+                    content,
+                    source="voice_s2s",
+                    memory_type="episodic",
+                    tags=["voice", "s2s", "conversation"],
+                    wing="channels",
+                    room="voice",
+                )
+                logger.info(
+                    "Voice transcript stored for session %s (%d turns)",
+                    session.session_id, session.turn_count,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to store voice transcript for %s",
+                    session.session_id, exc_info=True,
+                )
 
         logger.info(
             "S2S session closed: %s (turns=%d)",

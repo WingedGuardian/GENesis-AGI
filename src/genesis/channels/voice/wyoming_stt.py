@@ -248,7 +248,8 @@ class WyomingSTTServer:
             tts_server=self._tts_server,
         )
 
-        self._task = asyncio.create_task(
+        from genesis.util.tasks import tracked_task
+        self._task = tracked_task(
             self._server.run(handler_factory),
             name="wyoming-stt",
         )

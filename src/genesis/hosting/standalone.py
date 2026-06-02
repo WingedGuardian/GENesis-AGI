@@ -296,8 +296,11 @@ class StandaloneAdapter:
             voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
             bridge = GenesisBridge(voice_handler=voice_handler)
 
-            # S2S session manager
-            s2s_manager = S2SSessionManager(bridge=bridge)
+            # S2S session manager (memory_store for transcript persistence)
+            s2s_manager = S2SSessionManager(
+                bridge=bridge,
+                memory_store=self._runtime.memory_store if self._runtime else None,
+            )
             await s2s_manager.start_reaper()
             logger.info(
                 "S2S session manager created (provider=%s, model=%s)",

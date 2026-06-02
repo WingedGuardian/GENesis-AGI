@@ -205,7 +205,8 @@ class WyomingTTSServer:
             audio_ready=self._audio_ready,
         )
 
-        self._task = asyncio.create_task(
+        from genesis.util.tasks import tracked_task
+        self._task = tracked_task(
             self._server.run(handler_factory),
             name="wyoming-tts",
         )
