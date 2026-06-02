@@ -81,6 +81,35 @@ def voice_chat_completions():
             "error": {"message": "Event loop not available", "type": "server_error"},
         }), 503
 
+    # S2S short-circuit: if the S2S model already handled this request
+    # (audio response queued on Wyoming TTS server), return the transcript
+    # as-is without making another LLM call.  HA's pipeline still requires
+    # a conversation agent response — we give it one, but cheaply.
+    from genesis.channels.voice import config as voice_config
+    if voice_config.s2s_enabled():
+        data = request.get_json(force=True, silent=True) or {}
+        messages = data.get("messages", [])
+        transcript = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                transcript = msg.get("content", "").strip()
+                break
+        # In S2S mode, the STT handler already processed the audio through
+        # GPT-Realtime and queued the response audio.  Return the transcript
+        # text — HA will send it to Wyoming TTS, which will serve the S2S
+        # audio instead of synthesizing from this text.
+        logger.info("S2S mode: passing through transcript (%d chars)", len(transcript))
+        return jsonify({
+            "id": "chatcmpl-s2s-passthrough",
+            "object": "chat.completion",
+            "model": "genesis-voice-s2s",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": transcript or "..."},
+                "finish_reason": "stop",
+            }],
+        })
+
     # Parse request
     data = request.get_json(force=True, silent=True) or {}
     messages = data.get("messages", [])

@@ -94,8 +94,11 @@ class StandaloneAdapter:
         # wiring (TTS, reply waiter, etc.).
         self._init_openclaw_conversation_loop()
 
-        # Voice conversation handler — lightweight path for HA voice
+        # Voice conversation handler — lightweight path for HA voice (Phase 1 fallback)
         self._init_voice_handler()
+
+        # Wyoming STT+TTS servers for S2S voice pipeline (Phase 2)
+        await self._init_wyoming_servers()
 
         # Flask in daemon thread
         flask_thread = threading.Thread(
@@ -150,6 +153,9 @@ class StandaloneAdapter:
 
         if self._runtime and self._runtime.awareness_loop is not None:
             self._runtime.awareness_loop.request_stop()
+
+        # Stop Wyoming servers
+        await self._shutdown_wyoming_servers()
 
         if self._telegram_adapter is not None:
             try:
@@ -259,6 +265,70 @@ class StandaloneAdapter:
                 logger.info("Voice adapter skipped — HA_URL or HA_LONG_LIVED_TOKEN not set")
         except Exception:
             logger.exception("Failed to initialize voice handler")
+
+    async def _init_wyoming_servers(self) -> None:
+        """Start Wyoming STT+TTS servers for the S2S voice pipeline.
+
+        The STT server receives raw audio from HA's Assist pipeline and
+        routes it to the S2S model (GPT-Realtime) or falls back to Groq
+        Whisper.  The TTS server sends response audio back to HA.
+
+        Both run as asyncio tasks on the main event loop.
+        """
+        from genesis.channels.voice import config as voice_config
+
+        if not voice_config.s2s_enabled():
+            logger.info(
+                "S2S voice disabled — no API key for provider '%s'. "
+                "Wyoming servers not started.",
+                voice_config.s2s_provider(),
+            )
+            return
+
+        try:
+            from genesis.channels.voice.genesis_bridge import GenesisBridge
+            from genesis.channels.voice.s2s_session import S2SSessionManager
+            from genesis.channels.voice.wyoming_stt import WyomingSTTServer
+            from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+            # Genesis bridge for tool calls — delegates ask_genesis to
+            # the existing VoiceConversationHandler (no DRY violation)
+            voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
+            bridge = GenesisBridge(voice_handler=voice_handler)
+
+            # S2S session manager
+            s2s_manager = S2SSessionManager(bridge=bridge)
+            await s2s_manager.start_reaper()
+            logger.info(
+                "S2S session manager created (provider=%s, model=%s)",
+                voice_config.s2s_provider(),
+                voice_config.s2s_model(),
+            )
+
+            # Wyoming TTS server (must start before STT since STT references it)
+            self._wyoming_tts = WyomingTTSServer()
+            await self._wyoming_tts.start()
+
+            # Wyoming STT server
+            self._wyoming_stt = WyomingSTTServer(
+                s2s_manager=s2s_manager,
+                tts_server=self._wyoming_tts,
+            )
+            await self._wyoming_stt.start()
+
+            self._s2s_manager = s2s_manager
+
+        except Exception:
+            logger.exception("Failed to initialize Wyoming voice servers")
+
+    async def _shutdown_wyoming_servers(self) -> None:
+        """Stop Wyoming servers and close S2S sessions."""
+        if hasattr(self, "_s2s_manager") and self._s2s_manager:
+            await self._s2s_manager.close_all()
+        if hasattr(self, "_wyoming_stt"):
+            await self._wyoming_stt.stop()
+        if hasattr(self, "_wyoming_tts"):
+            await self._wyoming_tts.stop()
 
     def _create_flask_app(self) -> Flask:
         """Create Flask app with vendored static assets."""
