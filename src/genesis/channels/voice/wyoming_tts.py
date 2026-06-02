@@ -43,13 +43,43 @@ _S2S_RATE = 24000
 _S2S_WIDTH = 2
 _S2S_CHANNELS = 1
 
+# Voice PE expects 16kHz (matches Piper/Whisper default)
+_TARGET_RATE = 16000
+
+
+def _resample_pcm(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
+    """Resample 16-bit mono PCM from src_rate to dst_rate.
+
+    Uses linear interpolation — simple and sufficient for voice audio.
+    """
+    if src_rate == dst_rate:
+        return pcm
+
+    import struct
+
+    samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
+    ratio = dst_rate / src_rate
+    new_len = int(len(samples) * ratio)
+    resampled = []
+    for i in range(new_len):
+        src_pos = i / ratio
+        idx = int(src_pos)
+        frac = src_pos - idx
+        if idx + 1 < len(samples):
+            val = samples[idx] * (1 - frac) + samples[idx + 1] * frac
+        else:
+            val = samples[idx] if idx < len(samples) else 0
+        resampled.append(int(val))
+    return struct.pack(f"<{len(resampled)}h", *resampled)
+
 
 class TTSEventHandler(AsyncEventHandler):
     """Handles a single Wyoming TTS client connection from HA."""
 
-    def __init__(self, *args, audio_queue: collections.deque, **kwargs) -> None:
+    def __init__(self, *args, audio_queue: collections.deque, audio_ready: asyncio.Event, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._audio_queue = audio_queue
+        self._audio_ready = audio_ready
 
     async def handle_event(self, event: Event) -> bool:
         if Describe.is_type(event.type):
@@ -76,20 +106,26 @@ class TTSEventHandler(AsyncEventHandler):
         if Synthesize.is_type(event.type):
             synth = Synthesize.from_event(event)
 
-            # Check for pre-generated S2S audio
+            # Wait up to 5s for S2S audio to arrive (STT handler may still
+            # be processing when HA fires the TTS request)
+            if not self._audio_queue:
+                self._audio_ready.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._audio_ready.wait(), timeout=5.0)
+
             if self._audio_queue:
                 audio = self._audio_queue.popleft()
+                self._audio_ready.clear()
                 logger.info(
                     "Serving pre-generated S2S audio: %d bytes (%.1fs)",
                     len(audio),
                     len(audio) / (_S2S_RATE * _S2S_WIDTH * _S2S_CHANNELS),
                 )
-                await self._send_audio(audio, _S2S_RATE, _S2S_WIDTH, _S2S_CHANNELS)
+                # Resample 24kHz → 16kHz for Voice PE compatibility
+                resampled = _resample_pcm(audio, _S2S_RATE, _TARGET_RATE)
+                await self._send_audio(resampled, _TARGET_RATE, _S2S_WIDTH, _S2S_CHANNELS)
             else:
-                # Fallback: generate silence or use external TTS
-                # For now, generate a short silence to satisfy the protocol
-                # TODO: integrate Cartesia/ElevenLabs for real fallback TTS
-                logger.info("No S2S audio queued, synthesizing text: '%s'", synth.text[:50])
+                logger.info("No S2S audio available, synthesizing text: '%s'", synth.text[:50])
                 await self._synthesize_fallback(synth.text)
 
             return True
@@ -145,6 +181,7 @@ class WyomingTTSServer:
         self._server: AsyncServer | None = None
         self._task: asyncio.Task | None = None
         self._audio_queue: collections.deque[bytes] = collections.deque(maxlen=5)
+        self._audio_ready = asyncio.Event()
 
     def queue_audio(self, audio: bytes) -> None:
         """Queue pre-generated audio from the S2S model.
@@ -154,6 +191,7 @@ class WyomingTTSServer:
         instead of doing text-to-speech.
         """
         self._audio_queue.append(audio)
+        self._audio_ready.set()
 
     async def start(self) -> None:
         """Start the Wyoming TTS server."""
@@ -164,6 +202,7 @@ class WyomingTTSServer:
         handler_factory = partial(
             TTSEventHandler,
             audio_queue=self._audio_queue,
+            audio_ready=self._audio_ready,
         )
 
         self._task = asyncio.create_task(

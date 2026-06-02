@@ -77,6 +77,27 @@ class S2SSessionManager:
         self._max_idle_seconds = max_idle_seconds
         self._sessions: dict[str, S2SSession] = {}
         self._client: openai.AsyncOpenAI | None = None
+        self._reaper_task: asyncio.Task | None = None
+
+    async def start_reaper(self) -> None:
+        """Start the idle session reaper (runs every 15s)."""
+        self._reaper_task = asyncio.create_task(
+            self._reap_loop(), name="s2s-session-reaper",
+        )
+
+    async def _reap_loop(self) -> None:
+        """Periodically close idle S2S sessions to prevent WebSocket/billing leaks."""
+        while True:
+            await asyncio.sleep(15)
+            now = datetime.now(UTC)
+            stale = [
+                sat_id for sat_id, s in self._sessions.items()
+                if (now - s.last_activity).total_seconds() > self._max_idle_seconds
+                and not s._closed
+            ]
+            for sat_id in stale:
+                logger.info("Reaping idle S2S session for satellite %s", sat_id)
+                await self.close(sat_id)
 
     async def get_or_create(self, satellite_id: str) -> S2SSession:
         """Return an active session or create a new one."""
@@ -251,6 +272,8 @@ class S2SSessionManager:
         return transcripts
 
     async def close_all(self) -> None:
-        """Close all active sessions (for graceful shutdown)."""
+        """Close all active sessions and stop the reaper (graceful shutdown)."""
+        if self._reaper_task and not self._reaper_task.done():
+            self._reaper_task.cancel()
         for sat_id in list(self._sessions):
             await self.close(sat_id)

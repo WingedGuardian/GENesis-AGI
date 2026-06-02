@@ -296,15 +296,14 @@ class StandaloneAdapter:
             voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
             bridge = GenesisBridge(voice_handler=voice_handler)
 
-            # S2S session manager (None if S2S provider not configured)
-            s2s_manager = None
-            if voice_config.s2s_enabled():
-                s2s_manager = S2SSessionManager(bridge=bridge)
-                logger.info(
-                    "S2S session manager created (provider=%s, model=%s)",
-                    voice_config.s2s_provider(),
-                    voice_config.s2s_model(),
-                )
+            # S2S session manager
+            s2s_manager = S2SSessionManager(bridge=bridge)
+            await s2s_manager.start_reaper()
+            logger.info(
+                "S2S session manager created (provider=%s, model=%s)",
+                voice_config.s2s_provider(),
+                voice_config.s2s_model(),
+            )
 
             # Wyoming TTS server (must start before STT since STT references it)
             self._wyoming_tts = WyomingTTSServer()

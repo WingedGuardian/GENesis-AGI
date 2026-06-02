@@ -128,7 +128,10 @@ class STTEventHandler(AsyncEventHandler):
         response should never take >60s including tool calls. If it does,
         the connection is dead and we fall back to Groq Whisper.
         """
+        # Derive satellite ID from peer address — supports multiple satellites
         satellite_id = "ha-voice-default"
+        if hasattr(self, "client_id") and self.client_id:
+            satellite_id = f"ha-{self.client_id}"
 
         try:
             session = await self._s2s_manager.get_or_create(satellite_id)
