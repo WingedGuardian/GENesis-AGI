@@ -25,6 +25,7 @@ def config():
         max_daily=5,
         surplus_daily=1,
         content_daily=3,
+        notification_daily=10,
         morning_report_time="07:00",
         # morning_report_timezone removed — uses user_timezone()
         engagement_timeout_hours=24,
@@ -46,6 +47,7 @@ def _cfg_no_quiet(**overrides):
         max_daily=5,
         surplus_daily=1,
         content_daily=3,
+        notification_daily=10,
         morning_report_time="07:00",
         # morning_report_timezone removed — uses user_timezone()
         engagement_timeout_hours=24,
