@@ -1136,6 +1136,38 @@ class EgoSession:
         - ``stay_quiet``: create batch only (proposals stored, not sent)
         """
         try:
+            # Auto-table oldest unranked proposals when queue exceeds cap.
+            # Respects the 24h guard — proposals < 24h old are not tabled.
+            try:
+                pending = await ego_crud.list_pending_proposals(
+                    self._db, ego_source=self._source_tag,
+                )
+                max_pending = getattr(self._config, "max_pending_proposals", 15)
+                if len(pending) + len(proposals) > max_pending:
+                    unranked = [
+                        p for p in pending if p.get("rank") is None
+                    ]
+                    excess = len(pending) + len(proposals) - max_pending
+                    oldest = sorted(
+                        unranked, key=lambda x: x.get("created_at", ""),
+                    )
+                    for p in oldest[:excess]:
+                        created = p.get("created_at", "")
+                        if created:
+                            try:
+                                age = datetime.now(UTC) - datetime.fromisoformat(created)
+                                if age.total_seconds() < 86400:
+                                    continue  # 24h guard
+                            except (ValueError, TypeError):
+                                pass
+                        await ego_crud.table_proposal(self._db, p["id"])
+                        logger.info(
+                            "Auto-tabled proposal %s (queue cap %d)",
+                            p["id"][:12], max_pending,
+                        )
+            except Exception:
+                logger.debug("Pending cap check failed, proceeding", exc_info=True)
+
             batch_id, ids = await self._proposals.create_batch(
                 proposals,
                 cycle_id=cycle_id,

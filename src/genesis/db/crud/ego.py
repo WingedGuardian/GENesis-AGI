@@ -702,7 +702,43 @@ async def auto_table_stale_proposals(
     )
     await db.commit()
     logger.info("Auto-tabled %d stale proposal(s) (>%dd)", len(ids), max_age_days)
-    return len(ids)
+
+    # Shorter threshold for unranked proposals — proposals that were never
+    # put on the board are lower-priority and should be cleaned up faster.
+    unranked_days = min(max_age_days, 5)
+    unranked_threshold = f"-{unranked_days} days"
+    cursor2 = await db.execute(
+        "SELECT id FROM ego_proposals "
+        "WHERE status = 'pending' AND rank IS NULL "
+        "AND created_at < datetime('now', ?)",
+        (unranked_threshold,),
+    )
+    unranked_rows = await cursor2.fetchall()
+    unranked_count = 0
+    if unranked_rows:
+        unranked_ids = [r[0] for r in unranked_rows]
+        await db.execute(
+            "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
+            "resolved_at = ? "
+            "WHERE status = 'pending' AND rank IS NULL "
+            "AND created_at < datetime('now', ?)",
+            (now, unranked_threshold),
+        )
+        placeholders2 = ",".join("?" * len(unranked_ids))
+        await db.execute(
+            f"UPDATE intervention_journal SET outcome_status = 'tabled', "
+            f"resolved_at = ? WHERE proposal_id IN ({placeholders2}) "
+            f"AND outcome_status = 'pending'",
+            (now, *unranked_ids),
+        )
+        await db.commit()
+        unranked_count = len(unranked_ids)
+        logger.info(
+            "Auto-tabled %d unranked proposal(s) (>%dd)",
+            unranked_count, unranked_days,
+        )
+
+    return len(ids) + unranked_count
 
 
 async def get_board(

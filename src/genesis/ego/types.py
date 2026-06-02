@@ -131,6 +131,7 @@ class EgoConfig:
     # Genesis ego (COO) independent scheduling — defaults match user ego
     genesis_cadence_minutes: int = 90  # base interval for genesis ego
     genesis_max_interval_minutes: int = 240  # backoff ceiling for genesis ego
+    max_pending_proposals: int = 15  # auto-table oldest unranked when exceeded
     # Per-action-type model overrides for proposal dispatch.
     # Keys are action_type strings (e.g. "investigate"), values are model
     # names ("opus", "sonnet", "haiku").  Falls back to profile-based
