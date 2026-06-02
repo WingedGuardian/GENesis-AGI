@@ -300,10 +300,15 @@ class CCInvoker:
         env = self._build_env(invocation)
         start = time.monotonic()
 
+        # Extract dispatched effort from args — may differ from invocation.effort
+        # if clamp_effort() clamped it for a non-Opus model.
+        effort_idx = args.index("--effort") + 1
+        dispatched_effort = args[effort_idx]
+
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, invocation.effort, invocation.timeout_s,
+            invocation.model, dispatched_effort, invocation.timeout_s,
             prompt_preview,
         )
 
@@ -421,10 +426,15 @@ class CCInvoker:
         env = self._build_env(invocation)
         start = time.monotonic()
 
+        # Extract dispatched effort from args — may differ from invocation.effort
+        # if clamp_effort() clamped it for a non-Opus model.
+        effort_idx = args.index("--effort") + 1
+        dispatched_effort = args[effort_idx]
+
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC streaming session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, invocation.effort, invocation.timeout_s,
+            invocation.model, dispatched_effort, invocation.timeout_s,
             prompt_preview,
         )
 

@@ -375,6 +375,25 @@ class TestRegistryCheck:
         row = await cursor.fetchone()
         assert row[0] == 0
 
+    @pytest.mark.asyncio
+    async def test_registry_check_deduped_on_repeat_calls(self, collector, db) -> None:
+        """Second call with same newer registry version skips npm and creates no duplicate."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="2.0.0",
+        ) as mock_npm:
+            await collector._check_registry_version("1.0.0")  # Creates observation
+            await collector._check_registry_version("1.0.0")  # Should be a no-op
+
+        # npm called exactly once — gated by unresolved observation on second call
+        mock_npm.assert_awaited_once()
+
+        cursor = await db.execute(
+            "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 1
+
     def test_is_newer_basic(self) -> None:
         """Semver comparison works correctly."""
         assert CCVersionCollector._is_newer("2.0.0", "1.0.0") is True

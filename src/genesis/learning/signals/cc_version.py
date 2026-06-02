@@ -192,10 +192,25 @@ class CCVersionCollector:
     async def _check_registry_version(self, installed: str) -> None:
         """Check npm registry for a newer CC version.
 
-        Emits a ``cc_version_available`` observation when the registry
-        reports a version newer than *installed*.  Best-effort — any
-        failure is logged at DEBUG and silently dropped by the caller.
+        Skips the npm network call if an unresolved cc_version_available
+        observation already exists — avoids repeated registry queries
+        (and DB noise) while the user hasn't updated yet.
+
+        When no existing notification is found, queries npm and emits a
+        ``cc_version_available`` observation if the registry is ahead.
+        Best-effort — any failure is logged at DEBUG and silently
+        dropped by the caller.
         """
+        # Gate: skip npm if we already have an unresolved notification.
+        # This prevents a new outbound call + observation every 5-min tick
+        # while the user stays on an older version.
+        cursor = await self._db.execute(
+            "SELECT 1 FROM observations WHERE source = 'cc_version' "
+            "AND type = 'cc_version_available' AND resolved = 0 LIMIT 1",
+        )
+        if await cursor.fetchone():
+            return
+
         from genesis.db.crud import observations
 
         registry = await self._get_registry_version()
