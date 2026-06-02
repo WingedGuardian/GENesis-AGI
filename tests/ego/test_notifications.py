@@ -47,6 +47,32 @@ class TestProcessNotifications:
         assert request.signal_type == "ego_notification"
         assert request.topic == "Backup complete"
         assert request.context == "Backup complete"
+        assert request.salience_score == 0.3  # urgency=low maps to 0.3
+
+    @pytest.mark.asyncio
+    async def test_urgency_maps_to_salience(self, session):
+        """Urgency levels should map to different salience scores."""
+        for urgency, expected_salience in [
+            ("low", 0.3),
+            ("normal", 0.6),
+            ("high", 0.9),
+        ]:
+            session._outreach_pipeline.submit.reset_mock()
+            notifications = [{"content": f"Test {urgency}", "urgency": urgency}]
+            await session._process_notifications(notifications)
+            request = session._outreach_pipeline.submit.call_args[0][0]
+            assert request.salience_score == expected_salience, (
+                f"urgency={urgency} should map to salience={expected_salience}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_content_capped_at_2000_chars(self, session):
+        """Notification content should be capped at 2000 characters."""
+        long_content = "x" * 5000
+        notifications = [{"content": long_content}]
+        await session._process_notifications(notifications)
+        request = session._outreach_pipeline.submit.call_args[0][0]
+        assert len(request.context) == 2000
 
     @pytest.mark.asyncio
     async def test_empty_notifications_no_calls(self, session):

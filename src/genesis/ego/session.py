@@ -1526,13 +1526,23 @@ class EgoSession:
             content = notif.get("content", "").strip()
             if not content:
                 continue
+            # Cap content length to prevent runaway LLM output from
+            # flooding the outreach pipeline with megabyte-sized payloads.
+            if len(content) > 2000:
+                content = content[:2000]
+
+            # Map ego urgency to salience score so governance thresholds
+            # can differentiate. NOTIFICATION threshold is 0.0 by default
+            # so all pass, but this preserves the signal for future tuning.
+            urgency = notif.get("urgency", "normal")
+            salience = {"low": 0.3, "normal": 0.6, "high": 0.9}.get(urgency, 0.6)
 
             try:
                 request = OutreachRequest(
                     category=OutreachCategory.NOTIFICATION,
                     topic=content[:100],
                     context=content,
-                    salience_score=0.5,
+                    salience_score=salience,
                     signal_type="ego_notification",
                     channel="telegram",
                 )
@@ -1957,8 +1967,10 @@ def _normalize_to_infra(category: str) -> bool:
 # -- Content dispatch detection + firewall rules ----------------------------
 
 _CONTENT_DISPATCH_KEYWORDS = frozenset({
-    "publish", "article", "medium", "content", "post", "draft", "blog",
+    "publish", "article", "medium", "post", "draft", "blog",
 })
+# "content" omitted — too broad for substring matching (matches
+# "content_hash", "content error rate"). Caught by action_type check.
 
 
 def _is_content_dispatch(prop: dict) -> bool:
