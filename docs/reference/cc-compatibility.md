@@ -9,13 +9,14 @@
 > through 8 evaluation lenses (see analyzer prompt for details). This document
 > is updated manually after each evaluation.
 >
-> Created: 2026-03-09 | Last updated: 2026-04-01
+> Created: 2026-03-09 | Last updated: 2026-06-01
 
 ---
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.87 (downgraded 2026-04-01 — v2.1.88-90 scrollback regression on Linux)
+**Installed:** Claude Code 2.1.159 (upgraded 2026-06-01 from 2.1.138 — enables Opus 4.8)
+**Pin in scripts:** `CC_VERSION=2.1.159` in `scripts/install.sh` and `scripts/host-setup.sh`
 **Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+)
 
 ---
@@ -45,8 +46,11 @@
 | `--disallowedTools` | CCInvoker | Tool blacklist for scoped sessions (inbox, mail) |
 | `--mcp-config` | CCInvoker | MCP server configuration per session |
 | `--resume` | CCCheckpoint | Session pause/resume |
-| `--allowedTools` | Planned (Phase 7) | Restrict tool access per session type |
-| `--permission-mode` | Planned (Phase 7) | Session permission governance |
+| `--allowedTools` | CCInvoker | Tool whitelist for scoped sessions |
+| `--bare` | CCInvoker | Minimal UI mode for background sessions |
+| `--max-turns` | Guardian Diagnosis | Turn limit (Guardian uses config-driven value) |
+| `--strict-mcp-config` | Guardian Diagnosis | Prevent global MCP config loading in diagnosis |
+| `--permission-mode` | Planned | Session permission governance |
 
 ---
 
@@ -55,11 +59,13 @@
 ### Actively Used
 - CLI non-interactive mode (`-p`)
 - Background session dispatch with `--dangerously-skip-permissions`
-- System prompt injection (`--system-prompt`, `--append-system-prompt`)
+- System prompt injection (`--system-prompt`, `--append-system-prompt`) — all background session paths use `--append-system-prompt`
 - Effort levels (`--effort`)
-- Tool blacklisting (`--disallowedTools`)
+- Tool blacklisting (`--disallowedTools`) and whitelisting (`--allowedTools`)
 - MCP config per session (`--mcp-config`)
 - Session resume (`--resume`)
+- Bare mode (`--bare`)
+- Turn limits (`--max-turns`) and strict MCP config (`--strict-mcp-config`) for Guardian diagnosis
 - PreToolUse / PostToolUse / SessionStart / Stop / UserPromptSubmit hooks
 
 ### Planned to Use (Phase 6-7)
@@ -131,43 +137,84 @@ When a new CC version is released, run through this:
 | 2.1.88 | 2026-03-30 | `PermissionDenied` hook, named subagents, prompt cache fix, memory leak fixes, OOM fix for large Edit | Documented, no immediate action |
 | 2.1.89 | 2026-04-01 | `defer` permission, `MCP_CONNECTION_NONBLOCKING`, 5s MCP bound, scrollback regression | Analyzer prompt broadened, scrollback workaround applied, `defer` documented for future use |
 | 2.1.90 | 2026-04-01 | `--resume` cache miss fix, hook exit-code-2 fix, Edit/Write format-on-save fix, SSE+transcript O(n^2)→O(n) perf | Upgraded, tested — scrollback still broken on Linux. Downgraded to 2.1.87. |
+| 2.1.91–2.1.118 | — | Not individually tracked; no Genesis-breaking changes | System ran on 2.1.138 without known issues |
+| 2.1.119 | — | PostToolUse/PostToolUseFailure hooks gain `duration_ms` field | Additive — no action needed |
+| 2.1.126 | — | `--dangerously-skip-permissions` extended to bypass `.claude/`, `.git/`, `.vscode/` writes | Additive — background sessions already use this flag |
+| 2.1.128 | — | `MCP: workspace` is a reserved server name | No Genesis conflict |
+| 2.1.132 | — | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1` env var lands — **scrollback fix** | Added to `CCInvoker._build_env()` and `settings.json` in PR #479 |
+| 2.1.133 | — | All hooks gain `effort.level` JSON field + `$CLAUDE_EFFORT` env var | Additive — Genesis hooks only read fields they need |
+| 2.1.138 | — | Running version before 2026-06-01 upgrade | Proven stable in production |
+| 2.1.139 | — | Hooks run WITHOUT terminal access — terminal I/O silently suppressed | Safe — Genesis hooks only use stderr for logging |
+| 2.1.143 | — | Stop hooks that block cap at 8 consecutive blocks | Safe — `genesis_stop_hook.py` never returns exit 2 |
+| 2.1.150 | — | npm `stable` tag | Noted |
+| 2.1.152 | — | `cache_creation_input_tokens` reporting bug fixed (was silently 0) | Dashboard cost numbers will appear higher — this is a correctness fix, not a regression |
+| 2.1.153 | — | `/model` saves selection as default for new sessions | No background session impact (`--model` flag overrides) |
+| 2.1.154 | — | Opus 4.8 support; lean system prompt default for Opus 4.8+ | Verified: `--append-system-prompt` works correctly with Opus 4.8 (tested 2026-06-01) |
+| 2.1.156 | — | Fix thinking-block corruption bug for Opus 4.8 on session resume | Minimum safe version for Opus 4.8 extended thinking |
+| 2.1.157 | — | Fix tmux copy-on-select regression | Relevant for Linux/tmux users |
+| 2.1.159 | 2026-06-01 | Current `latest` tag; Opus 4.8 stable | **Upgraded to this version.** All 8 Genesis integration tests passed. |
 
 ---
 
 ## Known Issues
 
-### v2.1.89+ Scrollback Regression (2026-04-01)
+### v2.1.89+ Scrollback Regression — RESOLVED (2026-06-01)
 
 CC v2.1.89 changed default terminal rendering to an alt-screen mode that destroys
-terminal scrollback. Confirmed cross-platform regression (GitHub issues #41965,
-#41814, #42024, #42002, #42076, #42180). Affects all terminals including tmux.
-v2.1.90 does not explicitly fix this but touches fullscreen scrollback code.
+terminal scrollback on Linux/tmux. Confirmed cross-platform regression (GitHub issues
+#41965, #41814, #42024, #42002, #42076, #42180).
 
-**`CLAUDE_CODE_NO_FLICKER=0`:** Platform-dependent. Works on macOS Terminal.app,
-confirmed NOT working on Linux or Windows (GitHub #41965 comments). Setting `=1`
-enables the alt-screen explicitly and is unlikely to help.
+**Resolution:** CC 2.1.132 added `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`. This env
+var was added to `settings.json` and `CCInvoker._build_env()` in PR #479, which
+unblocked the version upgrade. Now running 2.1.159 with scrollback fully functional.
 
-**Workaround:** Downgraded to v2.1.87
-(`npm install -g @anthropic-ai/claude-code@2.1.87`). This loses 2.1.88-90
-passive bugfixes (prompt cache, memory leak, StructuredOutput, --resume cache,
-SSE perf) but restores scrollback. Tested v2.1.90 — scrollback still broken
-on Linux despite fullscreen scrollback code changes. v2.1.87 is the last
-known-good version for Linux terminal scrollback.
+**History:** Downgraded to v2.1.87 on 2026-04-01; ran on 2.1.138 (auto-updated before
+update controls were in place); upgraded to 2.1.159 on 2026-06-01.
 
 ### Install Method: npm Only (2026-04-01)
 
 Removed the standalone installer (`curl -fsSL https://claude.ai/install.sh`)
 in favor of npm-only (`npm install -g @anthropic-ai/claude-code`). The standalone
-binary auto-updates on every launch, which silently overrode a deliberate
-downgrade to v2.1.87 — the running process was always the standalone at v2.1.90
-while `claude --version` reported 2.1.87 from the npm copy. npm pinning gives
-full version control. Upgrades are deliberate via recon triage.
+binary auto-updates on every launch, which silently overrode version pinning.
+npm pinning gives full version control. Upgrades are deliberate via recon triage.
 
-**Suppressing the native installer nag:** CC shows a status bar warning
-("Claude Code has switched from npm to native installer. Run `claude install`")
-when running from npm. Set `DISABLE_INSTALLATION_CHECKS=1` to suppress this.
-The install script adds this to `~/.bashrc` automatically. Do NOT run
-`claude install` — it reinstalls the standalone binary and undoes version pinning.
+**Suppressing the native installer nag:** CC shows a status bar warning when running
+from npm. Set `DISABLE_INSTALLATION_CHECKS=1` to suppress this. The install script
+adds this to `~/.bashrc` automatically. Do NOT run `claude install`.
+
+**Dual npm prefix gotcha (2026-06-01):** This system has two npm prefix locations
+(`/usr/local` and `/usr`). `which claude` resolves to `/usr/local/bin/claude`, so
+installs must explicitly target that prefix:
+```bash
+sudo npm install -g --prefix /usr/local @anthropic-ai/claude-code@<version>
+```
+Running `sudo npm install -g` without `--prefix /usr/local` lands in `/usr/lib/` and
+does not update the `claude` binary on PATH.
+
+### Cache Inflation (since ~2.1.100, accepted)
+
+CC sends ~20K extra `cache_creation` tokens per payload by design. This is accepted
+overhead — upstream has chosen not to fix it. No action taken.
+
+### Cost Tracking Correction (2.1.152)
+
+`cache_creation_input_tokens` was silently reporting 0 before 2.1.152. After upgrade,
+dashboard cost numbers will appear higher. This is a correctness fix, not a regression —
+actual costs were always being incurred, just not displayed.
+
+### Opus 4.8 Lean System Prompt (2.1.154+)
+
+Opus 4.8 uses a leaner default CC system prompt. Genesis uses `--append-system-prompt`
+for all background sessions (ego, reflection, conversation, direct sessions). Verified
+2026-06-01: `--append-system-prompt` works correctly with Opus 4.8 — injected content
+is respected. No action needed.
+
+### Thinking Block Corruption on Resume (Opus extended thinking)
+
+Resuming an Opus session with extended thinking may get 400 errors: "thinking blocks
+cannot be modified." Classified as `CCSessionError` (PR #479). `conversation.py`
+already catches `CCError` on resumes and recovers via `_recover_stale_resume()`.
+Mitigated, not eliminated.
 
 ---
 
