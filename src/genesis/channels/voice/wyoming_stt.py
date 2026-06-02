@@ -121,6 +121,10 @@ class STTEventHandler(AsyncEventHandler):
 
         return True
 
+    # GPT-Realtime requires >= 100ms of audio. At 16kHz 16-bit mono,
+    # 100ms = 3200 bytes. Use 150ms (4800 bytes) as safety margin.
+    _MIN_AUDIO_BYTES = 4800
+
     async def _handle_s2s(self, audio: bytes) -> str:
         """Forward audio to S2S model, play response via TTS server.
 
@@ -128,6 +132,15 @@ class STTEventHandler(AsyncEventHandler):
         response should never take >60s including tool calls. If it does,
         the connection is dead and we fall back to Groq Whisper.
         """
+        # Reject clips too short for the Realtime API (< 150ms)
+        if len(audio) < self._MIN_AUDIO_BYTES:
+            duration_ms = len(audio) / (self._rate * self._width) * 1000
+            logger.warning(
+                "Audio too short for S2S (%.0fms < 150ms), falling back",
+                duration_ms,
+            )
+            return await self._handle_fallback(audio)
+
         # Derive satellite ID from peer address — supports multiple satellites
         satellite_id = "ha-voice-default"
         if hasattr(self, "client_id") and self.client_id:
@@ -138,11 +151,14 @@ class STTEventHandler(AsyncEventHandler):
             if session.connection is None:
                 await self._s2s_manager.connect(session)
 
-            # Send audio to model
-            await self._s2s_manager.send_audio(session, audio)
+            # Send audio to model (resampled 16kHz → 24kHz internally)
+            await self._s2s_manager.send_audio(session, audio, input_rate=self._rate)
             await self._s2s_manager.commit_audio(session)
 
-            # Collect response
+            # Collect full response — audio AND transcript — before returning.
+            # HA's pipeline is sequential: STT → conversation agent → TTS.
+            # The audio MUST be queued on the TTS server BEFORE we return
+            # the transcript, otherwise HA fires TTS with an empty queue.
             response_audio = bytearray()
             transcript = ""
 
@@ -163,9 +179,16 @@ class STTEventHandler(AsyncEventHandler):
                     logger.error("S2S response error: %s", event.text)
                     return await self._handle_fallback(audio)
 
-            # Queue response audio for TTS server to deliver
+            # Queue response audio for TTS server BEFORE returning transcript
             if response_audio and self._tts_server:
                 self._tts_server.queue_audio(bytes(response_audio))
+                logger.info(
+                    "S2S audio queued: %d bytes (%.1fs at 24kHz)",
+                    len(response_audio),
+                    len(response_audio) / (24000 * 2),
+                )
+            elif not response_audio:
+                logger.warning("S2S response had no audio data")
 
             return transcript or "(no transcription)"
 

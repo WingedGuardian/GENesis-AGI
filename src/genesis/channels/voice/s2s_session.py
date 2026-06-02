@@ -134,11 +134,16 @@ class S2SSessionManager:
         session.connection = conn
         session._conn_mgr = conn_mgr
 
-        # Configure session with tools and system prompt
+        # Configure session with tools, system prompt, and audio output
         system_prompt = self._bridge.get_system_prompt()
+        voice = voice_config.s2s_voice()
         await conn.session.update(session={
-            "type": "realtime",
+            "modalities": ["text", "audio"],
             "instructions": system_prompt,
+            "voice": voice,
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm16",
+            "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
             "tools": TOOL_DECLARATIONS,
         })
 
@@ -157,13 +162,20 @@ class S2SSessionManager:
             logger.error("S2S session config timed out (10s)")
             raise RuntimeError("S2S session config timed out") from None
 
-    async def send_audio(self, session: S2SSession, audio: bytes) -> None:
+    async def send_audio(
+        self, session: S2SSession, audio: bytes, *, input_rate: int = 16000,
+    ) -> None:
         """Send a PCM audio chunk to the S2S model.
 
-        Audio format: 16-bit PCM, 16kHz, mono (matches Wyoming input).
+        Resamples from input_rate (default 16kHz, Wyoming) to 24kHz (Realtime API).
         """
         if not session.connection or session._closed:
             return
+
+        # GPT-Realtime expects 24kHz 16-bit mono PCM
+        if input_rate != 24000:
+            from genesis.channels.voice.wyoming_tts import _resample_pcm
+            audio = _resample_pcm(audio, input_rate, 24000)
 
         encoded = base64.b64encode(audio).decode()
         await session.connection.input_audio_buffer.append(audio=encoded)
@@ -182,12 +194,21 @@ class S2SSessionManager:
 
         Handles function calls internally: when the model calls a tool,
         this method dispatches it via GenesisBridge and sends the result
-        back, then continues yielding audio/transcript events.
+        back, then continues yielding audio/transcript events from the
+        follow-up response.
+
+        GPT-Realtime event sequence for tool calls:
+          Response 1: function_call_arguments.done → response.done (no audio)
+          Response 2: audio.delta (N chunks) → audio_transcript.delta → response.done
+        We must NOT break on Response 1's response.done — the audio comes in Response 2.
         """
         if not session.connection or session._closed:
             return
 
         conn = session.connection
+        # Track whether we dispatched a tool call and are awaiting the audio response
+        awaiting_tool_response = False
+
         async for event in conn:
             etype = event.type
 
@@ -205,13 +226,14 @@ class S2SSessionManager:
                     event.name, event.arguments,
                 )
 
-                # Send result back to the model
+                # Send result back to the model and request a new response
                 await conn.conversation.item.create(item={
                     "type": "function_call_output",
                     "call_id": event.call_id,
                     "output": result,
                 })
                 await conn.response.create()
+                awaiting_tool_response = True
 
             # Audio data
             elif etype == "response.audio.delta":
@@ -237,8 +259,14 @@ class S2SSessionManager:
                 if hasattr(event, "transcript"):
                     session.input_transcript += event.transcript
 
-            # Response complete — add turn separator for transcript accumulation
+            # Response complete
             elif etype == "response.done":
+                if awaiting_tool_response:
+                    # This response.done is for the function-call response.
+                    # The audio response hasn't started yet — keep listening.
+                    logger.debug("Tool-call response done, awaiting audio response")
+                    awaiting_tool_response = False
+                    continue
                 session.turn_count += 1
                 session.last_activity = datetime.now(UTC)
                 session.output_transcript += "\n"  # Turn boundary
