@@ -23,6 +23,7 @@ morning_report_effort: low   # effort for morning reports
 
 # Proposals
 board_size: 3                # max active proposals on the bulletin board
+max_pending_proposals: 15    # auto-table oldest unranked when exceeded
 batch_digest: true           # send proposals as batch (vs individual)
 
 # Morning report

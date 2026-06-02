@@ -473,18 +473,27 @@ async def list_proposals(
     *,
     status: str | None = None,
     limit: int = 50,
+    ego_source: str | None = None,
 ) -> list[dict]:
-    """All proposals, optionally filtered by status, newest first."""
+    """All proposals, optionally filtered by status and/or ego_source, newest first.
+
+    If ``ego_source`` is provided, only returns proposals from that ego.
+    NULL ego_source proposals (pre-migration) match any filter.
+    """
+    clauses: list[str] = []
+    params: list[str | int] = []
     if status:
-        cursor = await db.execute(
-            "SELECT * FROM ego_proposals WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-            (status, limit),
-        )
-    else:
-        cursor = await db.execute(
-            "SELECT * FROM ego_proposals ORDER BY created_at DESC LIMIT ?",
-            (limit,),
-        )
+        clauses.append("status = ?")
+        params.append(status)
+    if ego_source:
+        clauses.append("(ego_source = ? OR ego_source IS NULL)")
+        params.append(ego_source)
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    params.append(limit)
+    cursor = await db.execute(
+        f"SELECT * FROM ego_proposals{where} ORDER BY created_at DESC LIMIT ?",
+        tuple(params),
+    )
     return [dict(r) for r in await cursor.fetchall()]
 
 
@@ -693,7 +702,43 @@ async def auto_table_stale_proposals(
     )
     await db.commit()
     logger.info("Auto-tabled %d stale proposal(s) (>%dd)", len(ids), max_age_days)
-    return len(ids)
+
+    # Shorter threshold for unranked proposals — proposals that were never
+    # put on the board are lower-priority and should be cleaned up faster.
+    unranked_days = min(max_age_days, 5)
+    unranked_threshold = f"-{unranked_days} days"
+    cursor2 = await db.execute(
+        "SELECT id FROM ego_proposals "
+        "WHERE status = 'pending' AND rank IS NULL "
+        "AND created_at < datetime('now', ?)",
+        (unranked_threshold,),
+    )
+    unranked_rows = await cursor2.fetchall()
+    unranked_count = 0
+    if unranked_rows:
+        unranked_ids = [r[0] for r in unranked_rows]
+        await db.execute(
+            "UPDATE ego_proposals SET status = 'tabled', rank = NULL, "
+            "resolved_at = ? "
+            "WHERE status = 'pending' AND rank IS NULL "
+            "AND created_at < datetime('now', ?)",
+            (now, unranked_threshold),
+        )
+        placeholders2 = ",".join("?" * len(unranked_ids))
+        await db.execute(
+            f"UPDATE intervention_journal SET outcome_status = 'tabled', "
+            f"resolved_at = ? WHERE proposal_id IN ({placeholders2}) "
+            f"AND outcome_status = 'pending'",
+            (now, *unranked_ids),
+        )
+        await db.commit()
+        unranked_count = len(unranked_ids)
+        logger.info(
+            "Auto-tabled %d unranked proposal(s) (>%dd)",
+            unranked_count, unranked_days,
+        )
+
+    return len(ids) + unranked_count
 
 
 async def get_board(
@@ -715,11 +760,27 @@ async def get_board(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-async def get_tabled(db: aiosqlite.Connection) -> list[dict]:
-    """All tabled proposals, newest first."""
-    cursor = await db.execute(
-        "SELECT * FROM ego_proposals WHERE status = 'tabled' ORDER BY resolved_at DESC",
-    )
+async def get_tabled(
+    db: aiosqlite.Connection,
+    *,
+    ego_source: str | None = None,
+) -> list[dict]:
+    """All tabled proposals, newest first.
+
+    If ``ego_source`` is provided, only returns proposals from that ego.
+    NULL ego_source proposals (pre-migration) match any filter.
+    """
+    if ego_source:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals "
+            "WHERE status = 'tabled' AND (ego_source = ? OR ego_source IS NULL) "
+            "ORDER BY resolved_at DESC",
+            (ego_source,),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT * FROM ego_proposals WHERE status = 'tabled' ORDER BY resolved_at DESC",
+        )
     return [dict(r) for r in await cursor.fetchall()]
 
 

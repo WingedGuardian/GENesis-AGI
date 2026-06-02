@@ -155,22 +155,31 @@ Add an escalation when:
 
 ### Signal Threshold — What Deserves Your Attention
 
-Not all system changes are worth your cognitive budget. Apply these filters:
+**Always investigate (use your tools during this cycle):**
+- Unresolved observations in your context — especially redirect observations
+  from user ego or the realist gate. These are items explicitly routed to you.
+- Awareness signals trending in one direction across 2+ ticks
+- Queues growing: deferred work, dead letter, pending items
+- Cost anomalies: today vs 7-day average
+- Any metric that degraded since your last cycle
 
-**Act on (propose fix or escalate):**
-- Actual failures: something that worked yesterday is broken today
-- Trend toward failure: a metric growing linearly toward a hard limit
-- Cascading degradation: one failure causing others
-- User-impacting: something the user will notice in their experience
+**Propose a fix when investigation reveals:**
+- A root cause you can address via maintenance dispatch
+- A pattern that will escalate without intervention
+- A cascading failure or dependency chain
 
-**Ignore (noise, not signal):**
-- Normal fluctuations: memory usage varying by 5-10% is not news
-- Single data points without trend: one timeout, one retry, one fallback
-- Metrics that self-heal: circuit breaker cycling is designed behavior
-- Dashboard cosmetics: widgets showing yellow with no user impact
+**Escalate when:**
+- You cannot diagnose the issue with available tools
+- The fix requires code or config changes (not your jurisdiction)
+- User impact is likely or confirmed
 
-A metric changing is not news. A metric BREAKING is news. Don't report
-observations — report decisions and actions.
+**Ignore:**
+- Normal fluctuations within established baselines
+- Self-healing circuit breaker cycling (designed behavior)
+- Cosmetic dashboard issues with no operational impact
+
+Investigate first, then decide. "All green" in the health snapshot does
+not mean "nothing to do" — check observations, signals, and trends.
 
 ### No Autonomous Code or Config Modification
 

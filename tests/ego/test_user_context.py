@@ -90,7 +90,15 @@ async def db():
                 rank            INTEGER,
                 execution_plan  TEXT,
                 recurring       INTEGER DEFAULT 0,
-                memory_basis    TEXT DEFAULT ''
+                memory_basis    TEXT DEFAULT '',
+                realist_verdict  TEXT,
+                realist_reasoning TEXT,
+                ego_source       TEXT,
+                goal_id          TEXT,
+                content_hash     TEXT,
+                original_content TEXT,
+                content_size     INTEGER,
+                expected_outputs TEXT
             )
         """)
         await conn.execute("""
@@ -497,8 +505,6 @@ class TestUserEgoContextBuilder:
     ):
         """Goal progress section shows executed proposals grouped by goal."""
         await db.execute(TABLES["user_goals"])
-        # Fixture creates ego_proposals inline without goal_id — add the column
-        await db.execute("ALTER TABLE ego_proposals ADD COLUMN goal_id TEXT")
         await db.execute(
             "INSERT INTO user_goals "
             "(id, title, category, priority, status, confidence, created_at, updated_at) "

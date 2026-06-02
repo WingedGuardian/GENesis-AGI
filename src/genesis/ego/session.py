@@ -16,6 +16,7 @@ import contextlib
 import json
 import logging
 import re
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -582,6 +583,8 @@ class EgoSession:
                 # (content, career, etc.) are rejected and auto-escalated.
                 if proposals and self._source_tag == "genesis_ego_cycle":
                     proposals = self._enforce_domain_boundary(proposals)
+                elif proposals and self._source_tag == "user_ego_cycle":
+                    proposals = await self._enforce_user_domain_boundary(proposals)
 
                 if proposals:
                     await self._process_proposals(
@@ -948,6 +951,16 @@ class EgoSession:
                         prop.get("content", "")[:80],
                         verdict.get("reasoning", "")[:100],
                     )
+                    # Create redirect observation for genesis ego so it
+                    # picks up the topic in its next cycle. Any realist
+                    # rejection of a genesis ego proposal creates a
+                    # redirect — the wording of the rejection may vary.
+                    if self._source_tag == "genesis_ego_cycle":
+                        with contextlib.suppress(Exception):
+                            await self._create_redirect_observation(
+                                prop,
+                                redirect_type="realist_redirect",
+                            )
 
             if rejected_count or amended_count:
                 logger.info(
@@ -1018,7 +1031,8 @@ class EgoSession:
     # Genesis ego allowed action categories (infrastructure/operations only)
     _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
         "system_health", "infrastructure", "performance",
-        "maintenance", "security",
+        "maintenance", "security", "cost_protection",
+        "system_monitoring", "genesis_maintenance",
     })
 
     def _enforce_domain_boundary(
@@ -1046,6 +1060,75 @@ class EgoSession:
                 )
         return allowed
 
+    async def _enforce_user_domain_boundary(
+        self,
+        proposals: list[dict],
+    ) -> list[dict]:
+        """Redirect infrastructure proposals from the user ego.
+
+        The user ego (CEO) should not propose on infrastructure domains.
+        When it does, the proposal is redirected as an observation for the
+        genesis ego to pick up, preserving the signal without polluting
+        the user ego's proposal queue.
+        """
+        allowed = []
+        for p in proposals:
+            category = p.get("action_category", "")
+            if _normalize_to_infra(category):
+                logger.info(
+                    "User ego infra redirect: category=%r → observation (content: %s)",
+                    category,
+                    p.get("content", "")[:80],
+                )
+                with contextlib.suppress(Exception):
+                    await self._create_redirect_observation(
+                        p, redirect_type="cross_domain_redirect",
+                    )
+            else:
+                allowed.append(p)
+        return allowed
+
+    async def _create_redirect_observation(
+        self,
+        proposal: dict,
+        *,
+        redirect_type: str = "cross_domain_redirect",
+    ) -> None:
+        """Create a redirect observation for a cross-domain proposal.
+
+        Uses dedup (skip_if_duplicate) and 3-day TTL so redirects
+        auto-expire if the target ego doesn't act on them.
+        """
+        try:
+            from genesis.db.crud import observations as obs_crud
+
+            content = (
+                f"Redirected from {self._source_tag}: "
+                f"{proposal.get('content', '')[:300]}"
+            )
+            expires = (datetime.now(UTC) + timedelta(days=3)).isoformat()
+            await obs_crud.create(
+                self._db,
+                id=uuid.uuid4().hex,
+                source=f"ego_domain_redirect:{self._source_tag}",
+                type=redirect_type,
+                content=content,
+                # Map proposal urgency to observation priority.
+                # Proposal uses "normal"; observations use "medium".
+                priority={"normal": "medium"}.get(
+                    proposal.get("urgency", "medium"),
+                    proposal.get("urgency", "medium"),
+                ),
+                created_at=datetime.now(UTC).isoformat(),
+                category="infrastructure",
+                expires_at=expires,
+                skip_if_duplicate=True,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to create redirect observation", exc_info=True,
+            )
+
     async def _process_proposals(
         self,
         proposals: list[dict],
@@ -1060,6 +1143,38 @@ class EgoSession:
         - ``stay_quiet``: create batch only (proposals stored, not sent)
         """
         try:
+            # Auto-table oldest unranked proposals when queue exceeds cap.
+            # Respects the 24h guard — proposals < 24h old are not tabled.
+            try:
+                pending = await ego_crud.list_pending_proposals(
+                    self._db, ego_source=self._source_tag,
+                )
+                max_pending = getattr(self._config, "max_pending_proposals", 15)
+                if len(pending) + len(proposals) > max_pending:
+                    unranked = [
+                        p for p in pending if p.get("rank") is None
+                    ]
+                    excess = len(pending) + len(proposals) - max_pending
+                    oldest = sorted(
+                        unranked, key=lambda x: x.get("created_at", ""),
+                    )
+                    for p in oldest[:excess]:
+                        created = p.get("created_at", "")
+                        if created:
+                            try:
+                                age = datetime.now(UTC) - datetime.fromisoformat(created)
+                                if age.total_seconds() < 86400:
+                                    continue  # 24h guard
+                            except (ValueError, TypeError):
+                                pass
+                        await ego_crud.table_proposal(self._db, p["id"])
+                        logger.info(
+                            "Auto-tabled proposal %s (queue cap %d)",
+                            p["id"][:12], max_pending,
+                        )
+            except Exception:
+                logger.debug("Pending cap check failed, proceeding", exc_info=True)
+
             batch_id, ids = await self._proposals.create_batch(
                 proposals,
                 cycle_id=cycle_id,
@@ -1764,6 +1879,29 @@ class EgoSession:
             logger.debug("Failed to send execution notification", exc_info=True)
 
 
+# -- User ego domain boundary -----------------------------------------------
+
+# User ego blocked categories — infrastructure belongs to genesis ego.
+# Uses prefix matching: "infrastructure" matches "infrastructure_bug", etc.
+_USER_EGO_INFRA_PREFIXES = frozenset({
+    "system_health", "infrastructure", "performance",
+    "maintenance", "security", "cost_protection",
+    "system_monitoring", "genesis_maintenance",
+})
+
+
+def _normalize_to_infra(category: str) -> bool:
+    """Check if a category belongs to the infrastructure domain.
+
+    Uses prefix matching to catch LLM-generated variants like
+    'infrastructure_maintenance', 'infrastructure_bug', etc.
+    """
+    if not category:
+        return False
+    cat_lower = category.lower()
+    return any(cat_lower.startswith(prefix) for prefix in _USER_EGO_INFRA_PREFIXES)
+
+
 # -- Realist prompt & parser -----------------------------------------------
 
 _NEUTRAL_STATUS = NEUTRAL_STATUS  # re-export for backwards compat
@@ -1800,7 +1938,7 @@ def _build_realist_prompt(
         conf = p.get("confidence", 0.0)
         proposal_lines.append(f"{i}. [{action}] (confidence: {conf:.2f}) {content}")
 
-    # Domain boundary context — only for the Genesis/operations ego.
+    # Domain boundary context — ego-specific jurisdiction framing.
     ego_section = ""
     if ego_source == "genesis_ego_cycle":
         ego_section = """
@@ -1811,6 +1949,16 @@ performance, maintenance, and operational reliability. It has NO
 jurisdiction over the user's career, content publishing, social media,
 marketing, outreach strategy, job applications, networking, conferences,
 personal scheduling, or external platforms Genesis doesn't operate.
+
+"""
+    elif ego_source == "user_ego_cycle":
+        ego_section = """
+## Ego Source
+These proposals are from the **User ego (CEO)**.
+Its jurisdiction is user value ONLY: career, content, goals,
+networking, and personal advancement. It has NO jurisdiction over
+Genesis infrastructure, system health, cost tracking, performance
+monitoring, or internal maintenance.
 
 """
 
@@ -1826,17 +1974,39 @@ personal scheduling, or external platforms Genesis doesn't operate.
    dropped during a job application session"), AMEND to focus on the
    infrastructure component only and remove the user-domain framing.
 """
+    elif ego_source == "user_ego_cycle":
+        domain_rule = """
+7. **Domain boundary (user ego only).** These proposals come from the
+   user ego. REJECT any proposal about Genesis infrastructure, system
+   health, cost optimization, performance tuning, or internal
+   maintenance. Those belong to the Genesis ego (COO).
+"""
+
+    # Build Rule #1 based on ego source — genesis ego is allowed to
+    # propose investigation dispatches (background sessions for diagnosis),
+    # while user ego should do read-only work in-cycle.
+    if ego_source == "genesis_ego_cycle":
+        rule_1 = """
+1. **Dispatch investigations are valid proposals.** The genesis ego may
+   propose dispatching investigation sessions for issues that require
+   dedicated time beyond the current cycle. Pure in-cycle reads (health
+   checks, observation queries) should still be done in-cycle, but
+   proposing a background session to diagnose a complex issue is a
+   legitimate maintenance action. PASS these unless they are clearly
+   something the ego could resolve with a single MCP tool call."""
+    else:
+        rule_1 = """
+1. **Read operations are NOT proposals.** Investigating, researching, reading,
+   profiling, querying, checking, monitoring — these are things the ego should
+   do during its normal cycle without asking permission. If a proposal is
+   purely investigative with no write/action/outreach component, REJECT it:
+   "Read operation — do this during your cycle, don't propose it.\""""
 
     return f"""You are the Realist — a quality gate for ego proposals. Evaluate each
 proposal and return a JSON array of verdicts.
 {ego_section}
 ## Rules
-
-1. **Read operations are NOT proposals.** Investigating, researching, reading,
-   profiling, querying, checking, monitoring — these are things the ego should
-   do during its normal cycle without asking permission. If a proposal is
-   purely investigative with no write/action/outreach component, REJECT it:
-   "Read operation — do this during your cycle, don't propose it."
+{rule_1}
 
 2. **Check for zombies.** If a proposal covers substantially the same topic
    as a recent proposal that was recycled/withdrawn/deferred/expired, and
