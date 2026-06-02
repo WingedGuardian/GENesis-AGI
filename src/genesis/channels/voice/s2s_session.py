@@ -20,7 +20,10 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-import openai
+try:
+    import openai
+except ImportError:
+    openai = None  # type: ignore[assignment]  # optional dep (pip install genesis[voice])
 
 from genesis.channels.voice import config as voice_config
 from genesis.channels.voice.genesis_bridge import (
@@ -234,10 +237,11 @@ class S2SSessionManager:
                 if hasattr(event, "transcript"):
                     session.input_transcript += event.transcript
 
-            # Response complete
+            # Response complete — add turn separator for transcript accumulation
             elif etype == "response.done":
                 session.turn_count += 1
                 session.last_activity = datetime.now(UTC)
+                session.output_transcript += "\n"  # Turn boundary
                 yield S2SResponseEvent(type="done")
                 break
 

@@ -21,7 +21,6 @@ from genesis.channels.voice.genesis_bridge import (
     GenesisBridge,
 )
 
-
 # ─── Config tests ────────────────────────────────────────────────────────
 
 

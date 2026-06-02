@@ -26,8 +26,6 @@ dependencies = [
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
     "curl_cffi>=0.15.0",  # curl_cffi backend for Scrapling's AsyncFetcher
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
-    "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
-    "openai>=2.20",  # GPT-Realtime API for speech-to-speech voice sessions
 ]
 
 [project.optional-dependencies]
@@ -39,6 +37,10 @@ test = [
 browser = [
     "playwright>=1.40",
     "camoufox>=0.4",
+]
+voice = [
+    "openai[realtime]>=2.20",  # GPT-Realtime API for speech-to-speech voice sessions
+    "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
 ]
 distribution = [
     "composio-client>=1.33.0",
