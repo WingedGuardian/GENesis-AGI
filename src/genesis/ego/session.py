@@ -1731,32 +1731,6 @@ class EgoSession:
                         exc_info=True,
                     )
 
-            # Self-notification shortcut: outreach proposals whose execution
-            # plan indicates a zero-cost Telegram message to the user were
-            # already delivered via the proposal digest.  Auto-complete them
-            # instead of spawning an expensive CC session.
-            exec_plan = (prop.get("execution_plan") or "").lower()
-            if (
-                prop.get("action_type") == "outreach"
-                and "telegram" in exec_plan
-                and ("$0" in exec_plan or "~$0" in exec_plan)
-            ):
-                cursor = await self._db.execute(
-                    "UPDATE ego_proposals SET status = 'executed', "
-                    "user_response = 'auto-completed: delivered via proposal digest' "
-                    "WHERE id = ? AND status = 'approved'",
-                    (prop["id"],),
-                )
-                await self._db.commit()
-                if cursor.rowcount > 0:
-                    dispatched.append(prop["id"])
-                    logger.info(
-                        "Proposal %s auto-completed (self-notification — "
-                        "already delivered via digest)",
-                        prop["id"],
-                    )
-                continue
-
             # Content integrity check — detect degradation since creation.
             # Log-only for now; tighten to a gate if we see real degradation.
             stored_hash = prop.get("content_hash")
