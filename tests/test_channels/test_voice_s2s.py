@@ -84,37 +84,33 @@ class TestGenesisBridge:
         data = json.loads(result)
         assert "error" in data
 
-    async def test_ask_genesis_no_retriever(self):
+    async def test_ask_genesis_no_handler(self):
         bridge = GenesisBridge()
         result = await bridge.handle_tool_call(
             "ask_genesis", json.dumps({"query": "test"}),
         )
         data = json.loads(result)
-        # Without retriever, should still return a structured response
-        assert "answer" in data or "essential_knowledge" in data
+        assert "answer" in data  # Returns "handler not available"
 
-    async def test_ask_genesis_with_retriever(self):
-        retriever = AsyncMock()
-        retriever.recall = AsyncMock(return_value=[
-            {"content": "Yesterday we worked on voice interface Phase 1."},
-        ])
+    async def test_ask_genesis_delegates_to_handler(self):
+        handler = AsyncMock()
+        handler.handle = AsyncMock(return_value="Yesterday you worked on voice Phase 1.")
 
-        bridge = GenesisBridge(retriever=retriever)
+        bridge = GenesisBridge(voice_handler=handler)
         result = await bridge.handle_tool_call(
             "ask_genesis", json.dumps({"query": "what did we do yesterday?"}),
         )
         data = json.loads(result)
-        assert "memories" in data
-        retriever.recall.assert_awaited_once()
+        assert "answer" in data
+        assert "voice Phase 1" in data["answer"]
+        handler.handle.assert_awaited_once()
 
     async def test_web_search_import_failure(self):
         bridge = GenesisBridge()
-        # web_search will fail on import — should return error gracefully
         result = await bridge.handle_tool_call(
             "web_search", json.dumps({"query": "weather"}),
         )
         data = json.loads(result)
-        # Should handle gracefully (either results or error)
         assert isinstance(data, dict)
 
     def test_get_system_prompt(self):

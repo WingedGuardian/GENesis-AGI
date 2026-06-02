@@ -17,11 +17,10 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from genesis.memory.retrieval import HybridRetriever
-    from genesis.routing.router import ModelRouter
+    from genesis.channels.voice.handler import VoiceConversationHandler
 
 logger = logging.getLogger(__name__)
 
@@ -90,16 +89,19 @@ call web_search.
 
 
 class GenesisBridge:
-    """Dispatches S2S model tool calls to Genesis services."""
+    """Dispatches S2S model tool calls to Genesis services.
+
+    Delegates ``ask_genesis`` to the existing ``VoiceConversationHandler``
+    (same cognitive logic as Phase 1 fallback — no DRY violation).
+    Handles ``web_search`` independently since it's a new capability.
+    """
 
     def __init__(
         self,
         *,
-        retriever: HybridRetriever | None = None,
-        router: ModelRouter | None = None,
+        voice_handler: VoiceConversationHandler | None = None,
     ) -> None:
-        self._retriever = retriever
-        self._router = router
+        self._voice_handler = voice_handler
 
     async def handle_tool_call(
         self, name: str, arguments: str,
@@ -118,47 +120,24 @@ class GenesisBridge:
         return json.dumps({"error": f"Unknown tool: {name}"})
 
     async def _ask_genesis(self, query: str) -> str:
-        """Handle ask_genesis tool call — memory + knowledge + routing."""
-        results: dict[str, Any] = {}
+        """Delegate to VoiceConversationHandler — same cognitive path as Phase 1."""
+        if not self._voice_handler:
+            return json.dumps({"answer": "Genesis voice handler not available."})
 
-        # Memory recall
-        if self._retriever:
-            try:
-                memories = await self._retriever.recall(
-                    query=query, limit=5,
-                )
-                if memories:
-                    results["memories"] = [
-                        m.get("content", "")[:500] for m in memories
-                    ]
-            except Exception:
-                logger.exception("Memory recall failed for voice query")
-
-        # Essential knowledge
         try:
-            ek = _ESSENTIAL_KNOWLEDGE_PATH.read_text()
-            if ek.strip():
-                results["essential_knowledge"] = ek[:1000]
-        except FileNotFoundError:
-            pass
-
-        # If we have a router, do a quick LLM synthesis of the results
-        if self._router and results:
-            try:
-                synthesis = await self._synthesize(query, results)
-                return json.dumps({"answer": synthesis})
-            except Exception:
-                logger.exception("LLM synthesis failed for voice query")
-
-        # Fallback: return raw results
-        if results:
-            return json.dumps(results)
-        return json.dumps({"answer": "I don't have information about that in my memory."})
+            # Use a stable session ID for S2S tool calls so context accumulates
+            response = await self._voice_handler.handle(
+                transcript=query,
+                session_id="s2s-tool-bridge",
+            )
+            return json.dumps({"answer": response})
+        except Exception:
+            logger.exception("ask_genesis tool call failed")
+            return json.dumps({"error": "Genesis processing failed"})
 
     async def _web_search(self, query: str) -> str:
         """Handle web_search tool call — quick factual lookup."""
         try:
-            # Use Genesis's web search provider
             from genesis.providers.web_search import web_search
             results = await web_search(query, max_results=3)
             if results:
@@ -173,35 +152,6 @@ class GenesisBridge:
             logger.exception("Web search failed for voice query")
 
         return json.dumps({"error": "Web search unavailable"})
-
-    async def _synthesize(self, query: str, context: dict) -> str:
-        """Use the router to synthesize a concise answer from context."""
-        context_text = ""
-        for key, value in context.items():
-            if isinstance(value, list):
-                context_text += f"\n{key}:\n" + "\n".join(f"- {v}" for v in value)
-            else:
-                context_text += f"\n{key}: {value}"
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are synthesizing information for a voice response. "
-                    "Be concise — 1-3 sentences max. No markdown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Question: {query}\n\nContext:{context_text}",
-            },
-        ]
-
-        response = await self._router.call(
-            messages=messages,
-            call_site="voice_conversation",
-        )
-        return response.get("content", "I found some information but couldn't summarize it.")
 
     def get_system_prompt(self) -> str:
         """Build the system prompt with essential knowledge."""

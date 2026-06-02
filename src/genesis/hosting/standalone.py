@@ -289,13 +289,10 @@ class StandaloneAdapter:
             from genesis.channels.voice.wyoming_stt import WyomingSTTServer
             from genesis.channels.voice.wyoming_tts import WyomingTTSServer
 
-            rt = self._runtime
-
-            # Genesis bridge for tool calls (ask_genesis + web_search)
-            bridge = GenesisBridge(
-                retriever=rt.hybrid_retriever if rt else None,
-                router=rt.router if rt else None,
-            )
+            # Genesis bridge for tool calls — delegates ask_genesis to
+            # the existing VoiceConversationHandler (no DRY violation)
+            voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
+            bridge = GenesisBridge(voice_handler=voice_handler)
 
             # S2S session manager (None if S2S provider not configured)
             s2s_manager = None
