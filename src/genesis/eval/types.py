@@ -13,6 +13,7 @@ class ScorerType(StrEnum):
     JSON_VALIDITY = "json_validity"
     SLOP_DETECTION = "slop_detection"
     LLM_JUDGE = "llm_judge"
+    OUTPUT_QUALITY = "output_quality"
 
 
 class EvalTrigger(StrEnum):

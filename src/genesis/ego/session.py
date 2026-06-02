@@ -958,10 +958,62 @@ class EgoSession:
                     amended_count,
                 )
 
-            return filtered
         except Exception:
             logger.warning("Realist filter failed, passing through", exc_info=True)
+            filtered = proposals  # fail-open: use unfiltered list
+
+        # Quality gate (Verified Autonomy L3) — runs AFTER realist gate.
+        # Placed outside the realist try-except so a quality gate failure
+        # cannot accidentally undo realist rejections. _quality_gate has
+        # its own fail-open error handling.
+        filtered = await self._quality_gate(filtered)
+        return filtered
+
+    async def _quality_gate(self, proposals: list[dict]) -> list[dict]:
+        """Score proposals for coherence/relevance/completeness.
+
+        Proposals below threshold get ``_realist_verdict = "quality_hold"``
+        and stay in the list (stored in DB) but ``send_digest()`` skips them.
+        Fails open: any error passes all proposals through.
+        """
+        if not proposals or not self._router:
             return proposals
+
+        try:
+            from genesis.eval.scorers import get_scorer
+            from genesis.eval.types import ScorerType
+
+            scorer = get_scorer(ScorerType.OUTPUT_QUALITY)
+            scorer.set_router(self._router)
+
+            held_count = 0
+            for p in proposals:
+                try:
+                    passed, score, detail = await scorer.score_async(
+                        actual=(
+                            f"{p.get('content', '')}\n\n"
+                            f"Rationale: {p.get('rationale', '')}"
+                        ),
+                        expected="autonomous proposal",
+                        config={"rubric_name": "output_quality"},
+                    )
+                    if not passed:
+                        p["_realist_verdict"] = "quality_hold"
+                        p["_realist_reasoning"] = (
+                            f"Quality score {score:.2f} below threshold. {detail[:300]}"
+                        )
+                        held_count += 1
+                except Exception:
+                    logger.debug("Quality scoring failed for proposal, passing", exc_info=True)
+
+            if held_count:
+                logger.info(
+                    "Quality gate: held %d/%d proposals", held_count, len(proposals),
+                )
+        except Exception:
+            logger.warning("Quality gate failed, passing all proposals", exc_info=True)
+
+        return proposals
 
     # Genesis ego allowed action categories (infrastructure/operations only)
     _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({

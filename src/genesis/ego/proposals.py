@@ -351,6 +351,12 @@ class ProposalWorkflow:
             logger.warning("No proposals found for batch %s", batch_id)
             return None
 
+        # Skip quality-held proposals — stored in DB but not delivered
+        proposals = [p for p in proposals if p.get("realist_verdict") != "quality_hold"]
+        if not proposals:
+            logger.info("All proposals in batch %s quality-held — no digest", batch_id)
+            return None
+
         digest_html = self.format_digest(proposals, batch_id, ego_source=ego_source)
 
         # Prepend validation warnings if any
@@ -363,7 +369,11 @@ class ProposalWorkflow:
             all_pending = await ego_crud.list_pending_proposals(
                 self._db, ego_source=ego_source,
             )
-            other_pending = [p for p in all_pending if p.get("batch_id") != batch_id]
+            other_pending = [
+                p for p in all_pending
+                if p.get("batch_id") != batch_id
+                and p.get("realist_verdict") != "quality_hold"
+            ]
             if other_pending:
                 summary_lines = []
                 for op in other_pending[:5]:

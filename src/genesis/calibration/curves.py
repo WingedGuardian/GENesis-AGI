@@ -56,4 +56,24 @@ class CalibrationCurveComputer:
             )
         if curves:
             logger.info("Saved %d calibration curves for domain=%s", len(curves), domain)
+
+            # Compute and emit ECE (Verified Autonomy L4)
+            from genesis.calibration.metrics import compute_ece
+
+            ece = compute_ece(curves)
+            total_samples = sum(c["sample_count"] for c in curves)
+            if ece > 0.10:
+                logger.info(
+                    "Calibration: domain=%s ECE=%.4f (above 0.10 threshold, n=%d)",
+                    domain, ece, total_samples,
+                )
+            try:
+                from genesis.eval.j9_hooks import emit_calibration_ece
+
+                await emit_calibration_ece(
+                    self._db, domain=domain, ece=ece, sample_count=total_samples,
+                )
+            except Exception:
+                logger.debug("Failed to emit calibration ECE event", exc_info=True)
+
         return curves

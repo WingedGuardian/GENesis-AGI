@@ -403,6 +403,27 @@ class LLMJudgeScorer(Scorer):
         return passed, score_val, detail
 
 
+class OutputQualityScorer(LLMJudgeScorer):
+    """Quality scorer for autonomous outputs (Verified Autonomy L3).
+
+    Grades coherence, relevance, and completeness via the output_quality
+    rubric. Inherits all async/router/judge infrastructure from
+    LLMJudgeScorer — the only difference is the default rubric name.
+
+    Usage::
+
+        scorer = get_scorer(ScorerType.OUTPUT_QUALITY)
+        scorer.set_router(router)
+        passed, score, detail = await scorer.score_async(
+            actual="proposal content...",
+            expected="autonomous proposal",
+            config={"rubric_name": "output_quality"},
+        )
+    """
+
+    scorer_type = ScorerType.OUTPUT_QUALITY
+
+
 # -- Helpers --
 
 def _extract_json(text: str) -> str:
