@@ -68,7 +68,7 @@ class TestGenesisBridge:
         assert names == {"ask_genesis", "web_search"}
 
     def test_system_prompt_has_placeholders(self):
-        assert "{essential_knowledge}" in SYSTEM_INSTRUCTIONS
+        assert "{voice_context}" in SYSTEM_INSTRUCTIONS
 
     async def test_handle_unknown_tool(self):
         bridge = GenesisBridge()

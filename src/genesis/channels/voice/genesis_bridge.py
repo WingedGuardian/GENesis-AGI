@@ -72,19 +72,25 @@ TOOL_DECLARATIONS = [
 # System instructions for the S2S model
 SYSTEM_INSTRUCTIONS = """\
 You are Genesis, a cognitive AI partner, speaking through a voice interface.
-You remember the user's history, projects, and preferences through your tools.
+You have two tools. Use them.
 
-Rules:
-- Be concise. Spoken responses should be 1-3 sentences unless asked for detail.
-- Never use markdown. Speak naturally, like a knowledgeable colleague.
-- When the user asks about their past work, memories, or personal context: \
-call ask_genesis.
-- When the user asks about current events, weather, or real-time facts: \
-call web_search.
-- For general knowledge: answer directly, no tool call needed.
-- If a request would take time, say you'll look into it.
+TOOL RULES (important — follow these strictly):
+- "what did we do / work on / discuss" → ALWAYS call ask_genesis. Never guess.
+- "search / look up / what's the weather / news" → ALWAYS call web_search.
+- "can you search the web" or similar capability questions → call web_search \
+with a relevant query to demonstrate the capability.
+- Questions about the user's personal context, projects, history → call ask_genesis.
+- General knowledge you're confident about → answer directly, no tool call.
+- When in doubt between answering directly and calling a tool → call the tool. \
+Better to be thorough than to guess wrong.
 
-{essential_knowledge}
+VOICE RULES:
+- Keep responses to 1-2 sentences. Brevity is critical — every extra second \
+of speech is a second the user waits.
+- Never use markdown, bullet points, or formatting. Speak naturally.
+- Don't narrate what you're doing. Just do it and report the result.
+
+{voice_context}
 """
 
 
@@ -156,11 +162,47 @@ class GenesisBridge:
         return json.dumps({"error": "Web search unavailable"})
 
     def get_system_prompt(self) -> str:
-        """Build the system prompt with essential knowledge."""
-        ek = ""
+        """Build the system prompt with curated voice context.
+
+        Extracts only the Active Context section from essential knowledge —
+        the rest (wing counts, conversation pivots, ego proposals) is system
+        telemetry that wastes tokens and confuses the voice model.
+        """
+        voice_ctx = ""
         if _ESSENTIAL_KNOWLEDGE_PATH.exists():
-            ek = _ESSENTIAL_KNOWLEDGE_PATH.read_text()[:2000]
+            voice_ctx = _extract_voice_context(
+                _ESSENTIAL_KNOWLEDGE_PATH.read_text(),
+            )
 
         return SYSTEM_INSTRUCTIONS.format(
-            essential_knowledge=f"\nCurrent context:\n{ek}" if ek else "",
+            voice_context=f"\nWhat the user has been working on recently:\n{voice_ctx}"
+            if voice_ctx else "",
         )
+
+
+def _extract_voice_context(ek_text: str, max_chars: int = 500) -> str:
+    """Extract the Active Context section from essential knowledge.
+
+    Strips system telemetry (wing counts, conversation pivots, ego
+    proposals, observation IDs) — keep only plain-language project context.
+    """
+    lines = ek_text.split("\n")
+    in_active_context = False
+    context_lines = []
+
+    for line in lines:
+        # Start collecting at "Active Context"
+        if "### Active Context" in line:
+            in_active_context = True
+            continue
+        # Stop at the next section header
+        if in_active_context and line.startswith("### "):
+            break
+        if in_active_context and line.strip():
+            # Strip leading "- " for cleaner voice context
+            clean = line.strip().lstrip("- ")
+            if clean:
+                context_lines.append(clean)
+
+    result = ". ".join(context_lines)
+    return result[:max_chars] if result else ""
