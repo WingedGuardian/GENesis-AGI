@@ -491,15 +491,16 @@ class TestDomainBoundary:
         assert "Domain boundary" in prompt
         assert "REJECT any proposal outside Genesis infrastructure" in prompt
 
-    def test_user_ego_no_domain_context(self):
-        """User ego source does NOT add domain boundary section."""
+    def test_user_ego_gets_domain_context(self):
+        """User ego source adds its own domain boundary section."""
         prompt = _build_realist_prompt(
             [{"content": "test", "action_type": "dispatch", "confidence": 0.8}],
             [],
             ego_source="user_ego_cycle",
         )
         assert "Genesis ego (COO/operations)" not in prompt
-        assert "Domain boundary" not in prompt
+        assert "User ego (CEO)" in prompt
+        assert "Domain boundary (user ego only)" in prompt
 
     def test_empty_ego_source_no_domain_context(self):
         """Empty/missing ego source does NOT add domain boundary section."""
@@ -530,3 +531,56 @@ class TestDomainBoundary:
         )
         assert "AMEND" in prompt
         assert "infrastructure component" in prompt
+
+
+# -- Genesis ego realist rule changes tests --
+
+
+class TestGenesisEgoRealist:
+    """Tests for genesis ego realist rule changes."""
+
+    def test_genesis_ego_no_read_operation_rule(self):
+        """Genesis ego realist should NOT have the read-operation rejection rule."""
+        prompt = _build_realist_prompt(
+            [{"action_type": "investigate", "content": "test", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "Read operations are NOT proposals" not in prompt
+        assert "Dispatch investigations are valid" in prompt
+
+    def test_user_ego_has_read_operation_rule(self):
+        """User ego realist SHOULD have the read-operation rejection rule."""
+        prompt = _build_realist_prompt(
+            [{"action_type": "investigate", "content": "test", "confidence": 0.8}],
+            [],
+            ego_source="user_ego_cycle",
+        )
+        assert "Read operations are NOT proposals" in prompt
+        assert "Dispatch investigations are valid" not in prompt
+
+    def test_no_ego_source_has_read_operation_rule(self):
+        """Default (no ego source) should have read-operation rule."""
+        prompt = _build_realist_prompt(
+            [{"action_type": "investigate", "content": "test", "confidence": 0.8}],
+            [],
+        )
+        assert "Read operations are NOT proposals" in prompt
+
+    def test_genesis_ego_still_has_zombie_rule(self):
+        """Genesis ego should still have zombie detection."""
+        prompt = _build_realist_prompt(
+            [{"action_type": "investigate", "content": "test", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "Check for zombies" in prompt
+
+    def test_genesis_ego_still_has_domain_boundary(self):
+        """Genesis ego should still have domain boundary rule."""
+        prompt = _build_realist_prompt(
+            [{"action_type": "investigate", "content": "test", "confidence": 0.8}],
+            [],
+            ego_source="genesis_ego_cycle",
+        )
+        assert "Domain boundary" in prompt

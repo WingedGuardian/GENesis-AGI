@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 _USER_WORLD_CATEGORIES = frozenset({
     "email_recon", "inbox", "finding", "interest", "interests",
     "contribution", "user_model_delta",
+    # User-domain categories — genesis ego should not see these
+    "career", "career_advancement", "career_application",
+    "content", "content_publishing", "content_distribution",
+    "goal_management", "goal_review", "portfolio",
+    "marketing", "outreach", "networking",
 })
 
 # Keywords indicating a session is about Genesis internals (not user-world).

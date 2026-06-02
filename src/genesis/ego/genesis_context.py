@@ -319,6 +319,20 @@ class GenesisEgoContextBuilder:
                 f"- [{priority}] **{source}{cat_str}** ({obs_type}): {short}"
             )
 
+        # Count redirect observations requiring in-cycle investigation
+        redirect_count = sum(
+            1 for row in rows
+            if row[1] in ("cross_domain_redirect", "realist_redirect")
+        )
+        if redirect_count:
+            lines.append(
+                f"\n**{redirect_count} redirect{'s' if redirect_count != 1 else ''} "
+                f"require in-cycle investigation.** Use your MCP tools "
+                f"(health_status, observation_query, memory_recall) to "
+                f"investigate each during THIS cycle. Then propose a "
+                f"concrete fix or escalate findings to user ego.\n"
+            )
+
         lines.append("")
         return "\n".join(lines)
 
