@@ -952,15 +952,15 @@ class EgoSession:
                         verdict.get("reasoning", "")[:100],
                     )
                     # Create redirect observation for genesis ego so it
-                    # investigates in-cycle next time instead of proposing.
+                    # picks up the topic in its next cycle. Any realist
+                    # rejection of a genesis ego proposal creates a
+                    # redirect — the wording of the rejection may vary.
                     if self._source_tag == "genesis_ego_cycle":
-                        reason = verdict.get("reasoning", "").lower()
-                        if "read operation" in reason or "during your cycle" in reason:
-                            with contextlib.suppress(Exception):
-                                await self._create_redirect_observation(
-                                    prop,
-                                    redirect_type="realist_redirect",
-                                )
+                        with contextlib.suppress(Exception):
+                            await self._create_redirect_observation(
+                                prop,
+                                redirect_type="realist_redirect",
+                            )
 
             if rejected_count or amended_count:
                 logger.info(
@@ -1031,7 +1031,8 @@ class EgoSession:
     # Genesis ego allowed action categories (infrastructure/operations only)
     _GENESIS_EGO_ALLOWED_CATEGORIES = frozenset({
         "system_health", "infrastructure", "performance",
-        "maintenance", "security",
+        "maintenance", "security", "cost_protection",
+        "system_monitoring", "genesis_maintenance",
     })
 
     def _enforce_domain_boundary(
@@ -1079,9 +1080,10 @@ class EgoSession:
                     category,
                     p.get("content", "")[:80],
                 )
-                await self._create_redirect_observation(
-                    p, redirect_type="cross_domain_redirect",
-                )
+                with contextlib.suppress(Exception):
+                    await self._create_redirect_observation(
+                        p, redirect_type="cross_domain_redirect",
+                    )
             else:
                 allowed.append(p)
         return allowed
@@ -1111,7 +1113,12 @@ class EgoSession:
                 source=f"ego_domain_redirect:{self._source_tag}",
                 type=redirect_type,
                 content=content,
-                priority=proposal.get("urgency", "medium"),
+                # Map proposal urgency to observation priority.
+                # Proposal uses "normal"; observations use "medium".
+                priority={"normal": "medium"}.get(
+                    proposal.get("urgency", "medium"),
+                    proposal.get("urgency", "medium"),
+                ),
                 created_at=datetime.now(UTC).isoformat(),
                 category="infrastructure",
                 expires_at=expires,
