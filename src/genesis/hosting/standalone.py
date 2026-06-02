@@ -279,9 +279,11 @@ class StandaloneAdapter:
 
         if not voice_config.s2s_enabled():
             logger.info(
-                "S2S voice disabled — no API key for provider '%s'",
+                "S2S voice disabled — no API key for provider '%s'. "
+                "Wyoming servers not started.",
                 voice_config.s2s_provider(),
             )
+            return
 
         try:
             from genesis.channels.voice.genesis_bridge import GenesisBridge

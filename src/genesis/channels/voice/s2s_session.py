@@ -13,6 +13,8 @@ The session lifecycle:
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -49,7 +51,8 @@ class S2SSession:
     satellite_id: str
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     last_activity: datetime = field(default_factory=lambda: datetime.now(UTC))
-    connection: openai.AsyncRealtimeConnection | None = None
+    connection: object | None = None  # openai.AsyncRealtimeConnection (lazy typed)
+    _conn_mgr: object | None = field(default=None, repr=False)
     input_transcript: str = ""
     output_transcript: str = ""
     turn_count: int = 0
@@ -105,7 +108,7 @@ class S2SSessionManager:
         conn_mgr = self._client.realtime.connect(model=model)
         conn = await conn_mgr.__aenter__()
         session.connection = conn
-        session._conn_mgr = conn_mgr  # type: ignore[attr-defined]
+        session._conn_mgr = conn_mgr
 
         # Configure session with tools and system prompt
         system_prompt = self._bridge.get_system_prompt()
@@ -115,15 +118,20 @@ class S2SSessionManager:
             "tools": TOOL_DECLARATIONS,
         })
 
-        # Wait for session.updated confirmation
-        async for event in conn:
-            if event.type == "session.updated":
-                logger.info("S2S session configured: %s", session.session_id)
-                break
-            if event.type == "error":
-                msg = getattr(event, "error", event)
-                logger.error("S2S session config error: %s", msg)
-                raise RuntimeError(f"S2S session config failed: {msg}")
+        # Wait for session.updated confirmation (timeout: 10s)
+        try:
+            async with asyncio.timeout(10):
+                async for event in conn:
+                    if event.type == "session.updated":
+                        logger.info("S2S session configured: %s", session.session_id)
+                        break
+                    if event.type == "error":
+                        msg = getattr(event, "error", event)
+                        logger.error("S2S session config error: %s", msg)
+                        raise RuntimeError(f"S2S session config failed: {msg}")
+        except TimeoutError:
+            logger.error("S2S session config timed out (10s)")
+            raise RuntimeError("S2S session config timed out") from None
 
     async def send_audio(self, session: S2SSession, audio: bytes) -> None:
         """Send a PCM audio chunk to the S2S model.
@@ -133,7 +141,6 @@ class S2SSessionManager:
         if not session.connection or session._closed:
             return
 
-        import base64
         encoded = base64.b64encode(audio).decode()
         await session.connection.input_audio_buffer.append(audio=encoded)
 
@@ -184,7 +191,6 @@ class S2SSessionManager:
 
             # Audio data
             elif etype == "response.audio.delta":
-                import base64
                 audio_bytes = base64.b64decode(event.delta)
                 yield S2SResponseEvent(type="audio", audio=audio_bytes)
 
@@ -232,7 +238,7 @@ class S2SSessionManager:
 
         if session.connection:
             try:
-                conn_mgr = getattr(session, "_conn_mgr", None)
+                conn_mgr = session._conn_mgr
                 if conn_mgr:
                     await conn_mgr.__aexit__(None, None, None)
             except Exception:

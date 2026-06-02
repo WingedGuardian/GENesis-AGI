@@ -138,14 +138,16 @@ class GenesisBridge:
     async def _web_search(self, query: str) -> str:
         """Handle web_search tool call — quick factual lookup."""
         try:
-            from genesis.providers.web_search import web_search
-            results = await web_search(query, max_results=3)
-            if results:
+            from genesis.mcp.health.web_tools import web_search
+            result = await web_search(query, max_results=3)
+            search_results = result.get("results", [])
+            if search_results:
                 snippets = [
                     f"{r.get('title', '')}: {r.get('snippet', '')}"
-                    for r in results[:3]
+                    for r in search_results[:3]
                 ]
                 return json.dumps({"results": snippets})
+            return json.dumps({"results": [], "note": "No results found"})
         except ImportError:
             logger.warning("Web search provider not available")
         except Exception:

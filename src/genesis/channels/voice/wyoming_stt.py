@@ -106,7 +106,13 @@ class STTEventHandler(AsyncEventHandler):
                 self._s2s_manager
                 and voice_config.s2s_enabled()
             ):
-                transcript = await self._handle_s2s(audio)
+                try:
+                    transcript = await asyncio.wait_for(
+                        self._handle_s2s(audio), timeout=60,
+                    )
+                except TimeoutError:
+                    logger.error("S2S round-trip timed out (60s), falling back")
+                    transcript = await self._handle_fallback(audio)
             else:
                 transcript = await self._handle_fallback(audio)
 
@@ -116,7 +122,12 @@ class STTEventHandler(AsyncEventHandler):
         return True
 
     async def _handle_s2s(self, audio: bytes) -> str:
-        """Forward audio to S2S model, play response via TTS server."""
+        """Forward audio to S2S model, play response via TTS server.
+
+        60s timeout on the entire S2S round-trip. Justified: a voice
+        response should never take >60s including tool calls. If it does,
+        the connection is dead and we fall back to Groq Whisper.
+        """
         satellite_id = "ha-voice-default"
 
         try:
