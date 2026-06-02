@@ -42,6 +42,7 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "surplus_opportunity": 24,
     "content_review": 1,  # Short window — distinct content pieces may share topics
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
+    "ego_notification": 12,  # Ego notifications — don't repeat same topic within 12h
 }
 _DEFAULT_DEDUP_HOURS = 24
 
@@ -126,9 +127,20 @@ class GovernanceGate:
             else:
                 failed.append(f"content_quota: daily content limit ({self._config.content_daily}) reached")
 
+        if request.category == OutreachCategory.NOTIFICATION:
+            if await self._notification_available():
+                passed.append("notification_quota")
+            else:
+                failed.append(f"notification_quota: daily notification limit ({self._config.notification_daily}) reached")
+
         # Engagement throttle: reduce outreach if ignore rate is high
-        # BLOCKER/ALERT categories always exempt
-        if request.category not in (OutreachCategory.BLOCKER, OutreachCategory.ALERT):
+        # BLOCKER/ALERT/NOTIFICATION categories always exempt — notifications
+        # are informational and should always deliver regardless of ignore rate.
+        if request.category not in (
+            OutreachCategory.BLOCKER,
+            OutreachCategory.ALERT,
+            OutreachCategory.NOTIFICATION,
+        ):
             throttle = await self._engagement_throttle(request)
             if throttle:
                 failed.append(throttle)
@@ -242,6 +254,15 @@ class GovernanceGate:
         )
         row = await cursor.fetchone()
         return (row[0] if row else 0) < self._config.content_daily
+
+    async def _notification_available(self) -> bool:
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM outreach_history "
+            "WHERE category = 'notification' AND delivered_at IS NOT NULL "
+            "AND delivered_at >= date('now')",
+        )
+        row = await cursor.fetchone()
+        return (row[0] if row else 0) < self._config.notification_daily
 
     async def _engagement_throttle(self, request) -> str | None:
         """Check if low engagement rate should throttle outreach.
