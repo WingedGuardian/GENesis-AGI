@@ -151,9 +151,8 @@ class STTEventHandler(AsyncEventHandler):
             if session.connection is None:
                 await self._s2s_manager.connect(session)
 
-            # Send audio to model (resampled 16kHz → 24kHz internally)
-            await self._s2s_manager.send_audio(session, audio, input_rate=self._rate)
-            await self._s2s_manager.commit_audio(session)
+            # Send complete utterance as conversation item (no VAD conflicts)
+            await self._s2s_manager.send_turn(session, audio, input_rate=self._rate)
 
             # Collect full response — audio AND transcript — before returning.
             # HA's pipeline is sequential: STT → conversation agent → TTS.
