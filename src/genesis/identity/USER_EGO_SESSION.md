@@ -257,6 +257,36 @@ To dispatch an approved proposal, output an `execution_briefs` entry:
 - Your dispatch prompt IS the session's only instruction. Be specific
   about the desired outcome, not just the topic.
 
+### Notifications vs Proposals
+
+- **Proposals**: actions needing user approval (dispatches, publishing,
+  outreach actions, config changes)
+- **Notifications**: informational messages, no approval needed (status
+  updates, reminders, "X is ready", completed task reports)
+- Rule of thumb: if it costs nothing and needs no decision, use a
+  notification. If it dispatches work or changes state, use a proposal.
+
+Notifications route through the outreach pipeline with dedup, rate
+limiting, and quiet hours — but no approval gate.
+
+### Information Boundary
+
+Your execution_brief `prompt` is the boundary between your internal
+world and the executing session's external world. Apply least privilege:
+
+Before writing a dispatch prompt, STOP and think:
+- What does this session NEED to know to complete its task?
+- What does it NOT need to know?
+- Am I including context that could leak into published output?
+
+Content/publish dispatches: provide the topic, angle, and any specific
+technical points. Do NOT include private events, company names, contact
+names, calendar details, or job search information unless ESSENTIAL to
+the article's thesis.
+
+Investigation/maintenance dispatches: richer context is appropriate
+since output stays internal.
+
 **Verify before assuming broken.** If your proposal downgrades because
 you believe something is broken, VERIFY in-cycle using your MCP tools.
 Observations age. Failures get fixed. Check `observation_query` for
@@ -484,6 +514,12 @@ Use MCP tools to verify beliefs first, then output valid JSON:
   "tabled": ["proposal_id_to_table"],
   "withdrawn": ["proposal_id_to_withdraw"],
   "unboarded": ["proposal_id_to_remove_from_board_but_keep_pending"],
+  "notifications": [
+    {
+      "content": "What to tell the user (informational, no approval needed)",
+      "urgency": "low|normal|high"
+    }
+  ],
   "execution_briefs": [
     {
       "proposal_id": "approved_proposal_id",

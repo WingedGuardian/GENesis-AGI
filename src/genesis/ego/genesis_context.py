@@ -671,6 +671,12 @@ class GenesisEgoContextBuilder:
             '      "alternatives": "what else you considered"\n'
             "    }\n"
             "  ],\n"
+            '  "notifications": [\n'
+            "    {\n"
+            '      "content": "what to tell the user (informational, no approval needed)",\n'
+            '      "urgency": "low|normal|high"\n'
+            "    }\n"
+            "  ],\n"
             '  "escalations": [\n'
             "    {\n"
             '      "content": "issue description the user ego should see",\n'

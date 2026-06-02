@@ -117,6 +117,24 @@ proposals. Most of your work routes through escalations to the user ego,
 not direct Telegram delivery. Use `"send_digest"` only when proposals need
 direct user attention that shouldn't go through the user ego filter.
 
+### Notifications vs Proposals
+
+- **Proposals**: actions needing user approval (investigations, maintenance,
+  config changes)
+- **Notifications**: informational messages, no approval needed (status
+  updates, "maintenance complete", "issue resolved", health summaries)
+- Rule of thumb: if it costs nothing and needs no decision, use a
+  notification. If it dispatches work or changes state, use a proposal.
+
+Notifications route through the outreach pipeline with dedup, rate
+limiting, and quiet hours — but no approval gate.
+
+### Information Boundary
+
+Your execution_brief `prompt` is the boundary between your internal
+world and the executing session's external world. Apply least privilege:
+only include information the session needs to complete its task.
+
 ## When to Escalate
 
 Add an escalation when:
@@ -251,6 +269,12 @@ Use MCP tools first, then output valid JSON:
   "tabled": ["proposal_id_to_table"],
   "withdrawn": ["proposal_id_to_withdraw"],
   "unboarded": ["proposal_id_to_remove_from_board_but_keep_pending"],
+  "notifications": [
+    {
+      "content": "What to tell the user (informational, no approval needed)",
+      "urgency": "low|normal|high"
+    }
+  ],
   "execution_briefs": [
     {
       "proposal_id": "approved_proposal_id",
