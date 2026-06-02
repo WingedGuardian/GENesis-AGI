@@ -602,6 +602,11 @@ class EgoSession:
                         communication_decision=comm_decision,
                     )
 
+            # 9a. Process notifications (informational, no approval gate)
+            notifications = parsed.get("notifications", [])
+            if isinstance(notifications, list) and notifications:
+                await self._process_notifications(notifications)
+
             # 9b. Process tabled/withdrawn proposal IDs
             tabled_ids = parsed.get("tabled", [])
             if isinstance(tabled_ids, list):
@@ -1488,6 +1493,58 @@ class EgoSession:
                 len(escalations),
                 created,
                 deduped,
+            )
+
+    async def _process_notifications(self, notifications: list[dict]) -> None:
+        """Submit ego notifications to the outreach pipeline.
+
+        Notifications are informational messages that don't need user approval.
+        They route through the outreach pipeline with NOTIFICATION category,
+        subject to governance (dedup, rate limit, quiet hours) but exempt from
+        salience threshold and engagement throttle.
+
+        Fire-and-forget: errors are logged but never block the ego cycle.
+        """
+        if self._outreach_pipeline is None:
+            logger.warning(
+                "OutreachPipeline not available — skipping %d notification(s)",
+                len(notifications),
+            )
+            return
+
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        submitted = 0
+        for notif in notifications:
+            if not isinstance(notif, dict):
+                continue
+            content = notif.get("content", "").strip()
+            if not content:
+                continue
+
+            try:
+                request = OutreachRequest(
+                    category=OutreachCategory.NOTIFICATION,
+                    topic=content[:100],
+                    context=content,
+                    salience_score=0.5,
+                    signal_type="ego_notification",
+                    channel="telegram",
+                )
+                await self._outreach_pipeline.submit(request)
+                submitted += 1
+            except Exception:
+                logger.warning(
+                    "Failed to submit ego notification: %s",
+                    content[:80],
+                    exc_info=True,
+                )
+
+        if submitted:
+            logger.info(
+                "Submitted %d/%d ego notification(s) to outreach pipeline",
+                submitted,
+                len(notifications),
             )
 
     # -- Deferred intentions ------------------------------------------------
