@@ -40,7 +40,7 @@
 
 We have the most capable AI models ever created, and we're using them like search bars with better grammar.
 
-Every other AI agent puts you in the driver's seat — and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
+Every other AI agent puts you in the driver's seat—and keeps you there. YOU figure out what you need. YOU debug the failures. YOU manage the infrastructure. YOU supervise every step.
 
 But now? **Personal AGI is here.**
 
@@ -65,7 +65,7 @@ But what I can tell you is this: Genesis is far closer to AGI than anything else
 
 Personal AI does what you tell it. Personal AGI does what you *need*.
 
-Your current AI — however capable — is reactive, stateless, and session-scoped. You direct it. You re-explain context every time. It's equally ignorant about you on day 100 as day 1. It's a tool: smart in the moment, dumb about you.
+Your current AI—however capable—is reactive, stateless, and session-scoped. You direct it. You re-explain context every time. It's equally ignorant about you on day 100 as day 1. It's a tool: smart in the moment, dumb about you.
 
 Genesis is different:
 
@@ -74,7 +74,7 @@ Genesis is different:
 - **It has judgment that improves with evidence** — earned autonomy per action category. First failure triggers demotion. Trust is rebuilt through performance, not time.
 - **It's a fundamentally different system at month 6 than month 1** — not because of updates you installed, but because of what it learned living alongside you.
 
-With personal AI, you are the intelligence directing the tool. With personal AGI, it is an intelligence working alongside you — and the amount you need to manage shrinks over time.
+With personal AI, you are the intelligence directing the tool. With personal AGI, it is an intelligence working alongside you—and the amount you need to manage shrinks over time.
 
 **How it does this:**
 
@@ -94,7 +94,7 @@ Day 180 — evolving its own architecture to serve you better.
 
 ## What this is
 
-Genesis is a cognitive architecture that makes the AGI claim explicitly — and backs it up with 150,000 lines of open-source code you can read, run, and challenge.
+Genesis is a cognitive architecture that makes the AGI claim explicitly—and backs it up with 150,000 lines of open-source code you can read, run, and challenge.
 
 Not a chatbot. Not an API wrapper. Not another prompt chain with a for loop.
 
@@ -119,8 +119,6 @@ It uses [Claude Code](https://docs.anthropic.com/en/docs/claude-code) as its rea
 <a id="getting-started"></a>
 
 ## Getting started
-
-*v3 beta — cognitive architecture complete, ego module live, actively hardening. If you find a rough edge, tell Genesis to fix itself.*
 
 ### System requirements
 
@@ -165,11 +163,13 @@ claude    # start your first session
 
 | Component | What it does |
 |---|---|
-| **Genesis container** | All Genesis services with resource limits and isolation |
+| **Full cognitive stack** | Memory (4-layer hybrid retrieval + knowledge graph), self-learning loop, reflection engine, earned autonomy, dual-ego decision layer—all running continuously |
 | **Genesis server** | Dashboard, API, and all subsystems at `http://<container-ip>:5000` |
-| **Qdrant** | Vector database for semantic memory |
-| **Guardian + Sentinel** | Two systems monitoring each other — if one fails, the other recovers it |
-| **Claude Code** | CLI for interacting with Genesis (hooks + MCP servers auto-activate) |
+| **Qdrant** | Vector database powering semantic memory (2 collections: episodic + knowledge) |
+| **Channel integration** | Telegram (proactive outreach, approvals, voice), email triage, browser automation, inbox monitoring |
+| **Background cognition** | Autonomous sessions that think, research, and audit while you're away—surplus compute, reflection cycles, goal tracking |
+| **Self-healing infrastructure** | Guardian (host VM) + Sentinel (container)—two independent systems monitoring each other in a closed loop |
+| **Claude Code** | CLI with Genesis hooks + 4 MCP servers auto-activated per session |
 
 ### Optional: local embedding
 
@@ -186,7 +186,7 @@ Without these, Genesis uses cloud embedding APIs. With them: private, faster, fr
 
 Your Genesis install is one operational system: the public `GENesis-AGI` codebase, your private fork for customizations, and your private encrypted backups repo. See [`.claude/docs/your-genesis.md`](.claude/docs/your-genesis.md) for the full model.
 
-- **Backup** — runs every 6h via cron. SQLite, Qdrant snapshots, memory, transcripts, secrets — GPG-encrypted before push.
+- **Backup** — runs every 6h via cron. SQLite, Qdrant snapshots, memory, transcripts, secrets—GPG-encrypted before push.
 - **Restore** — `git clone <your-fork>` → `scripts/bootstrap.sh` → `scripts/restore.sh`. Back in minutes.
 - **Contribute** — a distributed bug fixing pipeline automatically detects eligible fixes, pushes them to GitHub for inspection, and opens upstream PRs.
 
@@ -233,11 +233,11 @@ graph TB
     style SL fill:#1a1a2e,stroke:#533483,color:#fff
 ```
 
-Every 5 minutes, the system collects 18+ signals across all its inputs -- entirely programmatic, zero LLM cost. Signals get classified by how much thinking depth they warrant. Routine health checks get a quick pass. Novel patterns in user behavior get a deep analysis. Accumulated smaller reflections trigger strategic synthesis. The depth decision is automatic, and each cognitive layer feeds the next.
+Every 5 minutes, the system collects 18+ signals across all its inputs—entirely programmatic, zero LLM cost. Signals get classified by how much thinking depth they warrant. Routine health checks get a quick pass. Novel patterns in user behavior get a deep analysis. Accumulated smaller reflections trigger strategic synthesis. The depth decision is automatic, and each cognitive layer feeds the next.
 
-On top of this sits the ego layer: two autonomous decision-makers that read the system's observations and act on them. The User Ego (running Opus) focuses on user goals, activity patterns, and pending work. The Genesis Ego (running Sonnet) handles system health, infrastructure, and operational decisions. Each one assembles its own context from filtered observations, proposes actions via Telegram, and dispatches Claude Code sessions to execute approved work. They run on adaptive cadence -- more frequently when things are active, backing off when they're not.
+On top of this sits the ego layer: two autonomous decision-makers that read the system's observations and act on them. The User Ego (running Opus) focuses on user goals, activity patterns, and pending work. The Genesis Ego (running Sonnet) handles system health, infrastructure, and operational decisions. Each one assembles its own context from filtered observations, proposes actions via Telegram, and dispatches Claude Code sessions to execute approved work. They run on adaptive cadence—more frequently when things are active, backing off when they're not.
 
-The ego doesn't just observe -- it runs a unified cognitive loop. Signals (a stale goal, a conversation, a system event) enter a queue. A focus selector picks what matters most. Context gets assembled for that focus. The ego thinks, proposes, acts -- cycle repeats. What you experience: Genesis notices when your goals go stale, reviews them with full context, tells you when subgoals complete a milestone, and adjusts its own review frequency per goal. It doesn't wait for you to ask "how's that project going?" -- it already checked.
+The ego doesn't just observe—it runs a unified cognitive loop. Signals (a stale goal, a conversation, a system event) enter a queue. A focus selector picks what matters most. Context gets assembled for that focus. The ego thinks, proposes, acts—cycle repeats. What you experience: Genesis notices when your goals go stale, reviews them with full context, tells you when subgoals complete a milestone, and adjusts its own review frequency per goal. It doesn't wait for you to ask "how's that project going?"—it already checked.
 
 When Genesis isn't handling a user request, it doesn't sit idle. It researches topics you'll ask about tomorrow. It audits its own memory for contradictions and staleness. It tests whether its learned procedures still hold up. It works through problems it got stuck on earlier. The system you come back to on Monday is measurably sharper than the one you left on Friday.
 
@@ -249,7 +249,7 @@ When Genesis isn't handling a user request, it doesn't sit idle. It researches t
 
 ## Memory
 
-Most AI memory is a vector database with a retrieval function. Genesis runs a four-layer architecture — because "what are we working on?", "what's relevant right now?", "find everything about X", and "what does the external documentation say?" are fundamentally different operations that need different retrieval strategies.
+Most AI memory is a vector database with a retrieval function. Genesis runs a four-layer architecture—because "what are we working on?", "what's relevant right now?", "find everything about X", and "what does the external documentation say?" are fundamentally different operations that need different retrieval strategies.
 
 ```
 L1: Essential Knowledge (~300 tokens, injected at every session start)
@@ -258,10 +258,10 @@ L1: Essential Knowledge (~300 tokens, injected at every session start)
     → The forest view. Always available, even if everything else is down.
 
 L2: Proactive Recall (fires on every user message, <1.5s)
-    Surfaces the top 3 relevant memories automatically — before Genesis
+    Surfaces the top 3 relevant memories automatically—before Genesis
     even starts thinking about your question.
     Hybrid: FTS5 keyword + Qdrant vector + activation scoring → RRF fusion.
-    → You never have to ask "do you remember?" — it already checked.
+    → You never have to ask "do you remember?"—it already checked.
 
 L3: Deep Search (on-demand, ~1-2s)
     Full pipeline: 4 ranked signals fused via Reciprocal Rank Fusion.
@@ -274,7 +274,7 @@ L4: Knowledge Pipeline (external, permanent)
     → Domain knowledge that doesn't decay with time.
 ```
 
-LLMs lose the forest for the trees — that's a known weakness of large-context reasoning. The layer model is the architectural compensation: L1 maintains the forest (what are we doing, what have we decided, what matters), while L2-L3 drill into specific trees on demand. L4 provides the reference library.
+LLMs lose the forest for the trees—that's a known weakness of large-context reasoning. The layer model is the architectural compensation: L1 maintains the forest (what are we doing, what have we decided, what matters), while L2-L3 drill into specific trees on demand. L4 provides the reference library.
 
 **What actually happens when you send a message:**
 
@@ -283,16 +283,18 @@ Every prompt triggers L2 before Genesis starts reasoning about your question:
 1. Your message hits a pre-processing hook
 2. In parallel: FTS5 searches for exact keyword matches (~5ms), Qdrant searches for semantic similarity (1024-dim embeddings, ~400ms)
 3. Activation scoring weighs each candidate: `confidence × recency × (access_freq + connectivity) × class_weight`
-4. Reciprocal Rank Fusion combines the ranked lists — memories appearing in multiple signals accumulate score
+4. Reciprocal Rank Fusion combines the ranked lists—memories appearing in multiple signals accumulate score
 5. Top 3 results inject into context with provenance metadata
 
-Total budget: under 1.5 seconds. If the embedding provider is down, vector search is skipped — FTS5 still works because it's compiled into SQLite with zero external dependencies. Memory degrades gracefully, never goes dark.
+Total budget: under 1.5 seconds. If the embedding provider is down, vector search is skipped—FTS5 still works because it's compiled into SQLite with zero external dependencies. Memory degrades gracefully, never goes dark.
 
 **Not just documents in a vector space:**
 
-Memories aren't isolated documents — they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. Within weeks of use, thousands of memories accumulate with tens of thousands of graph links between them.
+Memories aren't isolated documents—they're connected. The knowledge graph creates typed links between memories across 12 edge types: *supports, contradicts, extends, elaborates, succeeded_by, preceded_by*, and more. When a memory is stored, auto-linking finds its nearest neighbors and creates typed edges based on similarity. When you recall a fact, Genesis can walk the graph to find what supports it, what contradicts it, and what replaced it. After three months of operation: 30,000+ memories, 29,000+ vectors across two Qdrant collections, and a knowledge graph with tens of thousands of typed connections between them.
 
-Activation scoring ensures relevance isn't just cosine similarity — it's time-aware decay (configurable half-lives: 30-60 days by source type), access frequency (log scale, capping at 20 retrievals), graph connectivity, and class weighting. A steering rule from month one outranks a casual observation from yesterday.
+An event calendar tracks time-anchored information—deadlines, scheduled tasks, recurring cycles—so Genesis knows not just *what* happened but *when*, and can anticipate what's coming. Procedural memory (48 learned procedures at current count) captures reusable multi-step workflows extracted from experience, each with calibrated confidence scores that promote or demote based on outcomes.
+
+Activation scoring ensures relevance isn't just cosine similarity—it's time-aware decay (configurable half-lives: 30-60 days by source type), access frequency (log scale, capping at 20 retrievals), graph connectivity, and class weighting. A steering rule from month one outranks a casual observation from yesterday.
 
 **Two collections, different lifecycles:**
 
@@ -301,15 +303,27 @@ Activation scoring ensures relevance isn't just cosine similarity — it's time-
 | **Episodic** | Conversations, decisions, reflections, evaluations | Decays over time. Subject to correction. |
 | **Knowledge** | External domain data, ingested reference material | Permanent. Authoritative. Re-ingested, never duplicated. |
 
-**Session extraction:** After conversations end, a pipeline extracts what mattered — entities, decisions, evaluations, action items, relationships — each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
+**Session extraction:** After conversations end, a pipeline extracts what mattered—entities, decisions, evaluations, action items, relationships—each tagged with provenance back to the source conversation and line range. The system doesn't just remember what you said. It identifies what's worth keeping.
 
-**Wing taxonomy:** Memory is classified into 10 structural domains (memory, learning, routing, infrastructure, channels, autonomy, dev_workflow, research, integrations, career) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
+**Wing taxonomy:** Memory is classified into 15 structural domains (infrastructure, learning, channels, memory, dev_workflow, routing, autonomy, career, integrations, research, and more) with subtopics. Querying within a specific domain cuts noise from the full store. Classification uses tiered confidence signals: file path patterns (strongest) → keywords → tags → source pipeline → fallback.
 
-After six months of operation, Genesis doesn't just have more memories — it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. That's what separates this from a chatbot with a vector database.
+After three months of operation, Genesis doesn't just have more memories—it has a structured, interconnected, time-aware knowledge system that surfaces the right context before you ask for it. 30,000+ memories. 9,000+ observations. 2,000+ knowledge base entries. 48 learned procedures. Two vector collections. A knowledge graph connecting it all. That's what separates this from a chatbot with a vector database.
 
 <p align="center">
-  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth" width="760">
+  <img src="docs/images/memory-growth-chart.png" alt="Genesis memory growth — 30,000+ memories across 3 months" width="760">
 </p>
+
+<details>
+<summary><i>Memory growth by the numbers (March–June 2026)</i></summary>
+
+| Month | Memories stored | Observations | Cumulative total |
+|---|---|---|---|
+| March | 1,188 | 2,786 | 1,188 |
+| April | 8,746 | 2,867 | 9,934 |
+| May | 18,972 | 3,119 | 28,906 |
+| June (2 days) | 1,414 | 294 | 30,320 |
+
+</details>
 
 ---
 
@@ -326,7 +340,7 @@ Most AI systems log what happened. Genesis classifies *why* it happened, extract
 6. Extraction    → Extract reusable procedures with calibrated confidence
 ```
 
-**Triage isn't binary.** Not everything deserves the same analysis. A trivial status check gets `SKIP`. A failed approach with a workaround gets `FULL_PLUS_WORKAROUND` — the deepest analysis tier, triggering procedure extraction and drive adaptation. The classifier gates compute spend, not learning opportunity.
+**Triage isn't binary.** Not everything deserves the same analysis. A trivial status check gets `SKIP`. A failed approach with a workaround gets `FULL_PLUS_WORKAROUND`—the deepest analysis tier, triggering procedure extraction and drive adaptation. The classifier gates compute spend, not learning opportunity.
 
 **Outcome classification separates diagnoses that most systems conflate:**
 
@@ -340,7 +354,7 @@ Most AI systems log what happened. Genesis classifies *why* it happened, extract
 
 If you treat "I did it wrong" and "I can't do it yet" the same way, you learn the wrong lessons every time.
 
-**Causal attribution asks *why*:** Was it an external limitation? A gap in the user model? A misinterpretation of scope? Each of the 6 attribution types routes to a different subsystem — a user model gap triggers a high-priority observation; an external limitation routes to infrastructure awareness. The diagnosis determines the treatment.
+**Causal attribution asks *why*:** Was it an external limitation? A gap in the user model? A misinterpretation of scope? Each of the 6 attribution types routes to a different subsystem—a user model gap triggers a high-priority observation; an external limitation routes to infrastructure awareness. The diagnosis determines the treatment.
 
 **Procedure extraction builds reusable knowledge:**
 
@@ -353,9 +367,9 @@ L2 (reliable)→ Higher injection priority. Requires 5+ successes, ≥75% confid
 L1 (core)    → Trigger-cached, instant recall. Requires 8+ successes, ≥85% confidence.
 ```
 
-Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at ~67% confidence — not zero, not certain. Evidence moves it. Three consecutive failures and `failure_count >= success_count + 3` triggers demotion. Confidence below 30% with enough samples quarantines the procedure entirely.
+Confidence uses Laplace smoothing: `(successes + 1) / (total + 2)`. A newly-extracted procedure starts at ~67% confidence—not zero, not certain. Evidence moves it. Three consecutive failures and `failure_count >= success_count + 3` triggers demotion. Confidence below 30% with enough samples quarantines the procedure entirely.
 
-**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight — no single event overcorrects. Protected behaviors (honesty, transparency, pushback) cannot be eroded by weak signals regardless of volume.
+**Drive adaptation:** Outcomes feed back into Genesis's four behavioral drives (cooperation, competence, curiosity, preservation) via EMA updates with a small learning rate (α=0.005). It takes dozens of interactions to meaningfully shift a drive weight—no single event overcorrects. Protected behaviors (honesty, transparency, pushback) cannot be eroded by weak signals regardless of volume.
 
 This isn't "log what happened and hope the next session reads it." It's a closed loop: classify outcome → diagnose cause → extract principle → verify principle → promote or demote. The system gets measurably better at its job over time, and it can show you the receipts.
 
@@ -374,13 +388,13 @@ Genesis earns autonomy per category through demonstrated competence:
 
 V5 extends this to L5-L7: system configuration, learning modification, and identity evolution. These require months of L4 operational data before they're safe to activate.
 
-Trust is granular, not binary. First failure in a category triggers demotion — Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
+Trust is granular, not binary. First failure in a category triggers demotion—Bayesian regression, not a fixed penalty. Earn it back through performance. The regression is always announced. Never silent.
 
-The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate -- one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
+The ego layer is where autonomy meets judgment. Two egos observe the system's state, decide what needs doing, propose actions to the user via Telegram, and execute approved work by dispatching Claude Code sessions. Every dispatch goes through an approval gate—one approval per request, no blanket passes, no stale reuse. The user sees what's proposed and decides what runs.
 
-**Goal-driven behavior:** Genesis tracks your goals -- milestones and ongoing objectives alike -- and proactively reviews them when they go stale. Goals decompose into subgoals with tracked completion. When all subgoals of a milestone are achieved, Genesis surfaces it. Each goal can have its own review cadence, or fall back to a global default. You don't manage a task tracker -- Genesis manages the goals and tells you when something needs your attention or when something is done.
+**Goal-driven behavior:** Genesis tracks your goals—milestones and ongoing objectives alike—and proactively reviews them when they go stale. Goals decompose into subgoals with tracked completion. When all subgoals of a milestone are achieved, Genesis surfaces it. Each goal can have its own review cadence, or fall back to a global default. You don't manage a task tracker—Genesis manages the goals and tells you when something needs your attention or when something is done.
 
-Four drives shape behavior beneath the autonomy system -- Preservation, Curiosity, Cooperation, Competence -- each a sensitivity multiplier, each in tension with the others. The drives adapt based on evidence from the learning loop. The tension is the point.
+Four drives shape behavior beneath the autonomy system—Preservation, Curiosity, Cooperation, Competence—each a sensitivity multiplier, each in tension with the others. The drives adapt based on evidence from the learning loop. The tension is the point.
 
 The user has override authority. Always.
 
@@ -388,11 +402,11 @@ The user has override authority. Always.
 
 ## Infrastructure
 
-Genesis manages its own infrastructure. When something breaks, it diagnoses and fixes it. When it can't, it tells you why via Telegram — not because you noticed something was wrong, but because the system told you.
+Genesis manages its own infrastructure. When something breaks, it diagnoses and fixes it. When it can't, it tells you why via Telegram—not because you noticed something was wrong, but because the system told you.
 
-Two independent systems monitor each other in a closed loop. The external watchdog — running on the host VM outside the container — spawns its own Claude Code session to diagnose and restore Genesis if the container goes unhealthy. The container-side counterpart has its own 6-state machine (healthy → investigating → remediating → escalated → awaiting approval), alarm classifier, and exponential backoff across four tiers before escalation. If the external watchdog goes silent, Genesis detects the stale heartbeat and restarts it over SSH. Neither one runs unprotected. Neither one is a single point of failure.
+Two independent systems monitor each other in a closed loop. The external watchdog—running on the host VM outside the container—spawns its own Claude Code session to diagnose and restore Genesis if the container goes unhealthy. The container-side counterpart has its own 6-state machine (healthy → investigating → remediating → escalated → awaiting approval), alarm classifier, and exponential backoff across four tiers before escalation. If the external watchdog goes silent, Genesis detects the stale heartbeat and restarts it over SSH. Neither one runs unprotected. Neither one is a single point of failure.
 
-The resilience layer tracks four independent failure axes — cloud availability, memory, embeddings, and Claude Code availability — each with its own degradation levels:
+The resilience layer tracks four independent failure axes—cloud availability, memory, embeddings, and Claude Code availability—each with its own degradation levels:
 
 | Axis | Healthy | Degraded | Down |
 |---|---|---|---|
@@ -403,7 +417,7 @@ The resilience layer tracks four independent failure axes — cloud availability
 
 When something breaks: work gets deferred with staleness policies, routing walks the fallback chain, circuit breakers automatically test recovery, and the recovery orchestrator coordinates across all four axes. Most systems have binary health: up or down. Genesis maps the entire space in-between.
 
-Genesis also routes LLM work across model tiers automatically — starting with the cheapest capable model, not the most expensive. Local free models handle extraction. Frontier models handle strategic reasoning. Circuit breakers and fallback chains mean the call site never fails — only individual providers do. Graceful degradation all the way down.
+Genesis also routes LLM work across model tiers automatically—starting with the cheapest capable model, not the most expensive. Local free models handle extraction. Frontier models handle strategic reasoning. Circuit breakers and fallback chains mean the call site never fails—only individual providers do. Graceful degradation all the way down.
 
 ---
 
@@ -413,27 +427,27 @@ Genesis operates in the real world through always-on channels:
 
 **Email** — Two-layer AI triage: a fast model reads and scores every email, a capable model makes final keep/discard decisions on what survives. Relevant findings get stored as searchable intelligence. Your inbox processed by a paralegal and a judge.
 
-**Inbox** — Drop anything — a markdown file, a URL, a PDF, a voice memo — into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and sends you a summary via Telegram within minutes. Drop it in your notes. Walk away.
+**Inbox** — Drop anything—a markdown file, a URL, a PDF, a voice memo—into your notepad or a watched folder. Genesis evaluates the content, determines your intent, processes it through its full knowledge lens, and sends you a summary via Telegram within minutes. Drop it in your notes. Walk away.
 
-**Telegram** — Proactive notifications, morning digests, and conversational interaction. Genesis reaches out when it has something worth saying. Not a notification firehose — calibrated outreach based on measured engagement. Voice input works too: speech gets transcribed and routed through the same pipeline as text.
+**Telegram** — Proactive notifications, morning digests, and conversational interaction. Genesis reaches out when it has something worth saying. Not a notification firehose—calibrated outreach based on measured engagement. Voice input works too: speech gets transcribed and routed through the same pipeline as text.
 
-**Task executor** — Give Genesis a complex multi-step task and walk away. It decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, and delivers. You're notified when it's finished or when it genuinely needs you. Each task it completes, it learns from — which means it needs you less each time.
+**Task executor** — Give Genesis a complex multi-step task and walk away. It decomposes the work, plans execution, runs it in isolated git worktrees, verifies results with adversarial self-review, and delivers. You're notified when it's finished or when it genuinely needs you. Each task it completes, it learns from—which means it needs you less each time.
 
-**Browser** — Genesis maintains persistent browser sessions with saved login state — authenticated scraping, form filling, and web interaction across sessions without re-authenticating every time. A collaborative mode lets you watch what Genesis is doing in the browser in real time via your own window.
+**Browser** — Genesis maintains persistent browser sessions with saved login state—authenticated scraping, form filling, and web interaction across sessions without re-authenticating every time. A collaborative mode lets you watch what Genesis is doing in the browser in real time via your own window.
 
 **Parallel cognition** — While you're working on one thing, Genesis can be doing something else entirely: researching, auditing memory, running recon, processing a document you dropped in the inbox. Multiple threads of work, no context bleed between them, results waiting for you when you're ready.
 
-**The web as a tool** — Genesis treats the web as a searchable, scrapable, structured resource — not just a URL to fetch. Multiple search providers, JS-rendered page extraction, and persistent sessions mean research tasks that would take you hours happen autonomously in the background.
+**The web as a tool** — Genesis treats the web as a searchable, scrapable, structured resource—not just a URL to fetch. Multiple search providers, JS-rendered page extraction, and persistent sessions mean research tasks that would take you hours happen autonomously in the background.
 
 ---
 
 ## Modules
 
-Genesis has a pluggable capability module system. Any program with an interface can plug into Genesis's cognitive stack — memory, learning, reflection, outreach, compute routing — without touching a line of core code or the module's own code.
+Genesis has a pluggable capability module system. Any program with an interface can plug into Genesis's cognitive stack—memory, learning, reflection, outreach, compute routing—without touching a line of core code or the module's own code.
 
 When Genesis runs a module, it doesn't just call it. It remembers the results. It learns from the outcomes. It reflects on the patterns. Domain-specific tracking stays isolated, but generalizable lessons automatically cross into core memory. The module gets smarter because Genesis gets smarter.
 
-The `/integrate-module` skill handles onboarding automatically — discovery, connection mapping, config generation, dashboard setup, verification, and documentation. You don't touch Genesis's code. You just ask.
+The `/integrate-module` skill handles onboarding automatically—discovery, connection mapping, config generation, dashboard setup, verification, and documentation. You don't touch Genesis's code. You just ask.
 
 **Included:** content pipeline (drafting, publishing, analytics), crypto market monitoring, prediction market analysis.
 
@@ -508,7 +522,7 @@ graph LR
 
 V3 was built in 10 phases over seven months: from data schemas to full autonomous cognition, one phase earning the right to build the next. Every architectural choice made under constraint. Every subsystem shaped by what came before it.
 
-[`docs/journey/`](docs/journey/) has the full story — ten phase retrospectives, an origin story going back to V1 (a WhatsApp bot with heuristic routing), and honest documentation of what worked and what didn't. If you want to understand *why* Genesis is built the way it is, not just what it does, start there.
+[`docs/journey/`](docs/journey/) has the full story—ten phase retrospectives, an origin story going back to V1 (a WhatsApp bot with heuristic routing), and honest documentation of what worked and what didn't. If you want to understand *why* Genesis is built the way it is, not just what it does, start there.
 
 ---
 
@@ -516,37 +530,37 @@ V3 was built in 10 phases over seven months: from data schemas to full autonomou
 
 ## Where it's headed
 
-V3 is the foundation -- cognitive architecture complete, unified ego loop live, goal-driven behavior active, running in production. What comes next is where it gets ambitious enough to need a community behind it.
+V3 is the foundation—cognitive architecture complete, unified ego loop live, goal-driven behavior active, running in production. What comes next is where it gets ambitious enough to need a community behind it.
 
-### V3.x -- Voice interface & ambient awareness
+### V3.x — Voice interface & ambient awareness
 
-Genesis has memory, learning, and autonomy -- but only through text. The next step is making it ambient: always listening, always available, always aware of what's happening around you.
+Genesis has memory, learning, and autonomy—but until now, only through text. V3.x makes it ambient: always listening, always available, always aware of what's happening around you.
 
-- **Real-time voice conversation** -- talk to Genesis through a speaker like talking to Alexa, except with full memory, knowledge, and action capabilities behind it. Speech-to-speech model handles the conversation; Genesis handles the thinking.
-- **Ambient transcription** -- continuous listening, transcription, and intelligence extraction. Decisions made, action items, names mentioned, topics discussed -- captured and stored without explicit commands.
-- **Proactive awareness** -- Genesis speaks up when it has something valuable to contribute. Hears you mention a broken deployment? It tells you. Detects emotional escalation in a conversation? It can offer to help.
-- **Genesis HTTP Tool API** -- exposes Genesis's capabilities (memory, health, knowledge, actions) over HTTP, enabling any client -- speech models, Home Assistant, external agents -- to call Genesis tools directly.
+- **Real-time voice conversation** *(live)* — talk to Genesis through a speaker the way you'd talk to Alexa, except with full memory, knowledge, and action capabilities behind it. Speech-to-speech model handles the conversation; Genesis handles the thinking. S2S sessions are live now with session management, audio output, and optimized prompting.
+- **Ambient transcription** — continuous listening, transcription, and intelligence extraction. Decisions made, action items, names mentioned, topics discussed—captured and stored without explicit commands.
+- **Proactive awareness** — Genesis speaks up when it has something valuable to contribute. Hears you mention a broken deployment? It tells you. Detects emotional escalation in a conversation? It can offer to help.
+- **Genesis HTTP Tool API** — exposes Genesis's capabilities (memory, health, knowledge, actions) over HTTP, enabling any client—speech models, Home Assistant, external agents—to call Genesis tools directly.
 
 The voice interface is built on Home Assistant as the frontend (wake word, mic, speaker) with Genesis as the cognitive backend. Ambient awareness adds a passive listening mode with a dedicated memory tier, privacy filtering, and a lightweight attention system that decides what deserves Genesis's attention in real time.
 
-### V4 -- Global workspace & multi-agent coordination
+### V4 — Global workspace & multi-agent coordination
 
-V3.x delivered the unified cognitive loop: signal-driven focus, goal-aware behavior, and coordinated ego action. V4 takes this further -- from a single system thinking coherently to multiple agents coordinating across a shared workspace.
+V3.x delivered the unified cognitive loop: signal-driven focus, goal-aware behavior, and coordinated ego action. V4 takes this further—from a single system thinking coherently to multiple agents coordinating across a shared workspace.
 
-The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **LIDA cognitive cycle** (Franklin et al.) -- frameworks used to model consciousness in cognitive science:
+The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **LIDA cognitive cycle** (Franklin et al.)—frameworks used to model consciousness in cognitive science:
 
 **Sense → Perceive → Attend → Broadcast → Propose → Select → Act → Learn**
 
-- **Multi-agent workspace** -- Genesis instances sharing intent state, memory, and observations. What one agent learns, all agents benefit from. A personal Genesis that can coordinate with team members' Genesis instances without leaking private context.
-- **Signal and drive weight adaptation** -- evidence-driven calibration of attention and the four drives. The system learns which signals actually predict important outcomes, and adjusts its attention accordingly.
-- **Coordinated action selection across agents** -- when multiple agents observe the same situation, they negotiate who acts rather than duplicating work or conflicting.
-- **Six measurable GWT markers** -- if we can't measure whether the architecture is working, we're building in the dark.
+- **Multi-agent workspace** — Genesis instances sharing intent state, memory, and observations. What one agent learns, all agents benefit from. A personal Genesis that can coordinate with team members' Genesis instances without leaking private context.
+- **Signal and drive weight adaptation** — evidence-driven calibration of attention and the four drives. The system learns which signals actually predict important outcomes, and adjusts its attention accordingly.
+- **Coordinated action selection across agents** — when multiple agents observe the same situation, they negotiate who acts rather than duplicating work or conflicting.
+- **Six measurable GWT markers** — if we can't measure whether the architecture is working, we're building in the dark.
 
-### V5 -- Self-evolution
+### V5 — Self-evolution
 
-**Autonomous codebase evolution.** Genesis proposes changes to its own source code. It searches for developments in AI research, evaluates them against its own architecture, and integrates what makes it better. Not a human reviewing papers — the system itself.
+**Autonomous codebase evolution.** Genesis proposes changes to its own source code. It searches for developments in AI research, evaluates them against its own architecture, and integrates what makes it better. Not a human reviewing papers—the system itself.
 
-**User-adaptive architecture.** The underlying codebase shifts to serve each user. Not personalized prompts — structural code changes that reshape how Genesis processes information based on months of learned behavior. The system you're running six months in is architecturally different from the one you started with.
+**User-adaptive architecture.** The underlying codebase shifts to serve each user. Not personalized prompts—structural code changes that reshape how Genesis processes information based on months of learned behavior. The system you're running six months in is architecturally different from the one you started with.
 
 **Full autonomy progression (L5-L7):**
 
@@ -558,7 +572,7 @@ The architecture draws from **Global Workspace Theory** (Baars, 1988) and the **
 
 Every change is proposed to the user first. Genesis backs itself up before self-modification, tests in isolation, and rolls back automatically if something breaks.
 
-Nobody else is attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. Giving a system a framework and the capability to autonomusly upgrade itself may end up being the pinnicale of an "AGI-like" system, or the downfall of the whole thing--we're bold enough to build it and find out which.
+Nobody else is attempting this. Most agent frameworks are still building prompt chains and calling it intelligence. Giving a system a framework and the capability to autonomously upgrade itself may end up being the pinnacle of an "AGI-like" system, or the downfall of the whole thing—we're bold enough to build it and find out which.
 
 <p align="center">
   <img src="docs/images/data-acceptable.jpg" alt="That is acceptable." width="280">
@@ -610,9 +624,9 @@ Standalone libraries extracted from Genesis, stabilized against production use:
 
 ## Get involved
 
-V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates — the memory architecture, the autonomy model, or the audacity of building a self-evolving agent — there's work to do.
+V3 was built solo. V4 and V5 are ambitious enough to need a community. If you've read this far and something here resonates—the memory architecture, the autonomy model, or the audacity of building a self-evolving agent—there's work to do.
 
-**What contributing looks like:** Install it, run it, push it into territory it hasn't been. The cognitive architecture is complete — what it needs now is people who want to help it earn the claim rather than just read about it.
+**What contributing looks like:** Install it, run it, push it into territory it hasn't been. The cognitive architecture is complete—what it needs now is people who want to help it earn the claim rather than just read about it.
 
 **Where to start:**
 - **[Discord](https://discord.gg/Zkc3XMQpJX)** — the hub. Ask questions, share what you're working on
