@@ -59,6 +59,7 @@ from genesis.runtime._job_health import (
     load_persisted_job_health,
     persist_job_health,
     record_job_failure,
+    record_job_start,
     record_job_success,
     register_channel,
 )
@@ -282,6 +283,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 self._heavy_workload = None
                 self._heavy_workload_since = None
         return self._heavy_workload
+
+    def record_job_start(self, job_name: str) -> None:
+        record_job_start(self, job_name)
 
     def record_job_success(self, job_name: str) -> None:
         record_job_success(self, job_name)

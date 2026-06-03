@@ -159,6 +159,62 @@ def persist_job_health(rt: GenesisRuntime, job_name: str, entry: dict, now: str)
         logger.error("Failed to schedule job health persistence for %s", job_name, exc_info=True)
 
 
+def _persist_job_start(rt: GenesisRuntime, job_name: str, now: str) -> None:
+    """Persist only ``last_run`` + ``updated_at`` — no counter increments.
+
+    Unlike ``persist_job_health``, this does NOT increment ``total_runs``,
+    ``total_successes``, or ``total_failures``.  Used exclusively by
+    ``record_job_start`` so that a start + success/failure pair counts as
+    one run, not two.
+    """
+    if rt._db is None:
+        return
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    from genesis.util.tasks import tracked_task
+
+    async def _write() -> None:
+        try:
+            await rt._db.execute(
+                """INSERT INTO job_health
+                   (job_name, last_run, consecutive_failures, total_runs,
+                    total_successes, total_failures, updated_at)
+                   VALUES (?, ?, 0, 0, 0, 0, ?)
+                   ON CONFLICT(job_name) DO UPDATE SET
+                       last_run = excluded.last_run,
+                       updated_at = excluded.updated_at
+                """,
+                (job_name, now, now),
+            )
+            await rt._db.commit()
+        except sqlite3.Error:
+            logger.error("DB error persisting job start for %s", job_name, exc_info=True)
+        except Exception:
+            logger.error("Failed to persist job start for %s", job_name, exc_info=True)
+
+    try:
+        tracked_task(_write(), name=f"persist-job-start-{job_name}")
+    except Exception:
+        logger.error("Failed to schedule job start persistence for %s", job_name, exc_info=True)
+
+
+def record_job_start(rt: GenesisRuntime, job_name: str) -> None:
+    """Record that a scheduled job has started (in-memory + DB).
+
+    Sets ``last_run`` immediately so crashes mid-execution are
+    distinguishable from "never ran".  Does NOT touch
+    ``consecutive_failures``, ``last_success``, or ``last_failure``.
+    Uses a separate DB persist path that does NOT increment run counters.
+    """
+    now = datetime.now(UTC).isoformat()
+    entry = rt._job_health.setdefault(job_name, {"consecutive_failures": 0})
+    entry["last_run"] = now
+    _persist_job_start(rt, job_name, now)
+
+
 def record_job_success(rt: GenesisRuntime, job_name: str) -> None:
     """Record a successful scheduled job execution (in-memory + DB)."""
     now = datetime.now(UTC).isoformat()

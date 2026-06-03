@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import logging
@@ -105,6 +106,7 @@ class SurplusScheduler:
         self._follow_up_dispatcher = None  # Set via set_follow_up_dispatcher()
         self._topic_manager = None
         self._scheduler = AsyncIOScheduler()
+        self._job_event_loop: asyncio.AbstractEventLoop | None = None
 
     def set_topic_manager(self, manager) -> None:
         """Set TopicManager for routing surplus reflections to Telegram topics."""
@@ -148,7 +150,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5),
+                CronTrigger(day_of_week="sun", hour=5, timezone="UTC"),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -260,7 +262,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_model_intelligence,
-                CronTrigger(day_of_week="sun", hour=6),
+                CronTrigger(day_of_week="sun", hour=6, timezone="UTC"),
                 id="model_intelligence",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -270,7 +272,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_models_md_synthesis,
-                CronTrigger(day_of_week="sun", hour=8),
+                CronTrigger(day_of_week="sun", hour=8, timezone="UTC"),
                 id="models_md_synthesis",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -279,7 +281,7 @@ class SurplusScheduler:
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.run_dream_cycle,
-            CronTrigger(day_of_week="sun", hour=4),
+            CronTrigger(day_of_week="sun", hour=4, timezone="UTC"),
             id="dream_cycle",
             max_instances=1,
             misfire_grace_time=3600,
@@ -289,7 +291,7 @@ class SurplusScheduler:
         # on restart and would never fire if server restarts more often.
         self._scheduler.add_job(
             self.run_gitnexus_reindex,
-            CronTrigger(day_of_week="mon,thu", hour=5),
+            CronTrigger(day_of_week="mon,thu", hour=5, timezone="UTC"),
             id="gitnexus_reindex",
             max_instances=1,
             misfire_grace_time=3600,
@@ -297,7 +299,7 @@ class SurplusScheduler:
         # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am UTC)
         self._scheduler.add_job(
             self.schedule_wing_audit,
-            CronTrigger(day_of_week="sun,wed", hour=2),
+            CronTrigger(day_of_week="sun,wed", hour=2, timezone="UTC"),
             id="wing_audit",
             max_instances=1,
             misfire_grace_time=3600,
@@ -305,7 +307,7 @@ class SurplusScheduler:
         # CC memory staleness scan: weekly Sunday 3am UTC
         self._scheduler.add_job(
             self.schedule_cc_memory_staleness,
-            CronTrigger(day_of_week="sun", hour=3),
+            CronTrigger(day_of_week="sun", hour=3, timezone="UTC"),
             id="cc_memory_staleness",
             max_instances=1,
             misfire_grace_time=3600,
@@ -333,7 +335,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
-                CronTrigger(hour=3),  # 3 AM UTC daily
+                CronTrigger(hour=3, timezone="UTC"),  # 3 AM UTC daily
                 id="schedule_j9_eval_batch",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -343,7 +345,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5),
+                CronTrigger(day_of_week="sun", hour=5, timezone="UTC"),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -364,6 +366,20 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=60,
             )
+        # Register error listener so failed/missed jobs are observable.
+        # The handler is sync (runs in the scheduler thread); async work
+        # is bridged via call_soon_threadsafe, matching AwarenessLoop's
+        # pattern (see genesis.awareness.loop._on_scheduler_job_event).
+        try:
+            from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_MISSED
+            self._job_event_loop = asyncio.get_running_loop()
+            self._scheduler.add_listener(
+                self._on_scheduler_job_event,
+                EVENT_JOB_ERROR | EVENT_JOB_MISSED,
+            )
+        except Exception:
+            logger.warning("Failed to register scheduler error listener", exc_info=True)
+
         self._scheduler.start()
 
         # Emit initial heartbeats so the watchdog doesn't see stale
@@ -410,6 +426,67 @@ class SurplusScheduler:
         """Stop the scheduler, waiting for any running job to finish."""
         self._scheduler.shutdown(wait=True)
         logger.info("Surplus scheduler stopped")
+
+    # ── APScheduler error/missed listener ───────────────────────────────
+
+    def _on_scheduler_job_event(self, event) -> None:
+        """APScheduler listener — runs in the scheduler thread (sync).
+
+        Hands the event off to the asyncio loop so async work (DB writes,
+        event bus) can run safely.  Pattern copied from AwarenessLoop.
+        """
+        job_id = getattr(event, "job_id", "unknown")
+        loop = self._job_event_loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(
+                lambda jid=job_id, ev=event: asyncio.ensure_future(
+                    self._emit_job_error_event(jid, ev)
+                ),
+            )
+        except Exception:
+            logger.warning(
+                "Failed to hand off scheduler event for %s", job_id,
+                exc_info=True,
+            )
+
+    async def _emit_job_error_event(self, job_id: str, event) -> None:
+        """Emit observability event for a failed or missed scheduled job."""
+        exception = getattr(event, "exception", None)
+        is_error = exception is not None
+        msg = (
+            f"Scheduled job '{job_id}' failed: {exception}"
+            if is_error
+            else f"Scheduled job '{job_id}' missed (past misfire grace time)"
+        )
+        if is_error:
+            logger.error(msg)
+        else:
+            logger.warning(msg)
+
+        # Record failure in job health tracking
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            rt.record_job_failure(job_id, str(exception or "missed")[:500])
+        except Exception:
+            logger.warning("Failed to record job failure for %s", job_id, exc_info=True)
+
+        # Emit to event bus for dashboard / alerting
+        try:
+            from genesis.runtime import GenesisRuntime
+            rt = GenesisRuntime.instance()
+            if rt.event_bus:
+                await rt.event_bus.emit(
+                    Subsystem.SURPLUS,
+                    Severity.ERROR if is_error else Severity.WARNING,
+                    "scheduler.job_failed" if is_error else "scheduler.job_missed",
+                    msg,
+                    job_id=job_id,
+                )
+        except Exception:
+            logger.warning("Failed to emit scheduler error event", exc_info=True)
 
     async def brainstorm_check(self) -> None:
         """Ensure today's brainstorm sessions are queued."""
@@ -996,6 +1073,15 @@ class SurplusScheduler:
             logger.warning("Pause check failed — skipping dream cycle", exc_info=True)
             return
 
+        # Record start so crashes mid-execution are visible in job_health.
+        # The June 1 crash left last_run at May 17 because neither
+        # record_job_success nor record_job_failure was reached.
+        try:
+            from genesis.runtime import GenesisRuntime
+            GenesisRuntime.instance().record_job_start("dream_cycle")
+        except Exception:
+            pass  # Don't let health tracking prevent the actual job
+
         try:
             from genesis.memory import dream_cycle
             from genesis.runtime import GenesisRuntime
@@ -1070,9 +1156,10 @@ class SurplusScheduler:
                 )
         finally:
             # Always clear heavy workload flag, even on failure.
-            # Use the captured `rt` reference (line 859) — re-looking up
-            # GenesisRuntime.instance() here introduces a second failure
-            # mode during shutdown races.
+            # Use the captured `rt` reference from the try block above —
+            # re-looking up GenesisRuntime.instance() here introduces a
+            # second failure mode during shutdown races.  If `rt` is
+            # unbound (import/lookup failed), NameError is caught below.
             try:
                 rt._heavy_workload = None
                 rt._heavy_workload_since = None
