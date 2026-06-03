@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 COLLECTION: str = "episodic_memory"
+DEDUP_CHUNK_SIZE: int = 200
 
 
 def _parse_ts(ts: str) -> datetime:
@@ -87,110 +88,103 @@ async def run_entity_resolution(
     if total_points < 2:
         return report
 
-    # Large buckets cause O(n) Qdrant searches in find_dedup_candidates,
-    # which exhausts memory.  Skip buckets above this threshold — they
-    # need a chunked/batch algorithm (tracked as follow-up).
-    MAX_BUCKET_FOR_DEDUP = 500
-
+    # Process each bucket in chunks to bound memory.  For buckets within
+    # DEDUP_CHUNK_SIZE, single-pass (no overhead).  For larger buckets,
+    # split into chunks and process each independently; cross-chunk pairs
+    # are handled via a shared processed_pairs set and global Qdrant search.
     llm_checks_used = 0
 
     for (_wing, _room), points in buckets.items():
         if len(points) < 2:
             continue
 
-        if len(points) > MAX_BUCKET_FOR_DEDUP:
-            logger.warning(
+        # Split into chunks (single-element list for small buckets).
+        if len(points) <= DEDUP_CHUNK_SIZE:
+            chunks = [points]
+        else:
+            chunks = [
+                points[i : i + DEDUP_CHUNK_SIZE]
+                for i in range(0, len(points), DEDUP_CHUNK_SIZE)
+            ]
+            logger.info(
                 "Entity resolution: bucket (%s, %s) has %d points — "
-                "skipping dedup (limit %d)",
-                _wing, _room, len(points), MAX_BUCKET_FOR_DEDUP,
+                "processing in %d chunks of ≤%d",
+                _wing, _room, len(points), len(chunks), DEDUP_CHUNK_SIZE,
             )
-            report.setdefault("skipped_large_buckets", []).append(
-                {"wing": _wing, "room": _room, "count": len(points)},
-            )
-            continue
 
-        # 2. Fetch vectors for this bucket
-        point_ids = [p["id"] for p in points]
-        vectors = qdrant_ops.batch_retrieve_vectors(
-            qdrant, point_ids, collection=COLLECTION,
-        )
+        # Track pairs already processed across chunks (Qdrant searches
+        # globally, so chunk N may re-find a pair from chunk M).
+        processed_pairs: set[tuple[str, str]] = set()
+        # Track IDs deprecated by earlier chunks in this bucket so we
+        # don't re-process them as search sources (in-memory payload
+        # is stale; Qdrant is updated but not re-scrolled).
+        deprecated_this_run: set[str] = set()
 
-        # 3. Find dedup candidates (cosine ≥ 0.92)
-        candidates = await find_dedup_candidates(
-            qdrant, points, vectors, collection=COLLECTION,
-        )
-        report["candidates_found"] += len(candidates)
-
-        for point_a, point_b, score in candidates:
-            payload_a = point_a.get("payload", {})
-            payload_b = point_b.get("payload", {})
-            content_a = payload_a.get("content", "")
-            content_b = payload_b.get("content", "")
-
-            if dry_run:
-                report.setdefault("sample_candidates", [])
-                if len(report["sample_candidates"]) < 10:
-                    report["sample_candidates"].append({
-                        "score": round(score, 4),
-                        "id_a": point_a["id"][:12],
-                        "id_b": point_b["id"][:12],
-                        "preview_a": content_a[:80],
-                        "preview_b": content_b[:80],
-                    })
+        for _chunk_idx, chunk in enumerate(chunks):
+            # Filter out points deprecated by earlier chunks.
+            active_chunk = [
+                p for p in chunk if p["id"] not in deprecated_this_run
+            ]
+            if len(active_chunk) < 2:
                 continue
 
-            # Determine which memory is newer (survivor)
-            ts_a = payload_a.get("created_at", "")
-            ts_b = payload_b.get("created_at", "")
-            dt_a = _parse_ts(ts_a)
-            dt_b = _parse_ts(ts_b)
-            if dt_a >= dt_b:
-                survivor_id, deprecated_id = point_a["id"], point_b["id"]
-            else:
-                survivor_id, deprecated_id = point_b["id"], point_a["id"]
+            # 2. Fetch vectors for this chunk
+            point_ids = [p["id"] for p in active_chunk]
+            vectors = qdrant_ops.batch_retrieve_vectors(
+                qdrant, point_ids, collection=COLLECTION,
+            )
 
-            if score >= AUTO_MERGE_THRESHOLD:
-                # Auto-merge: deprecate older, keep newer
-                try:
-                    await _deprecate_memory(
-                        qdrant, db, deprecated_id,
-                        survivor_id=survivor_id,
-                        run_id=run_id,
-                    )
-                    await log_resolution(
-                        db,
-                        run_id=run_id,
-                        action="auto_merge",
-                        memory_id_a=point_a["id"],
-                        memory_id_b=point_b["id"],
-                        content_a=content_a,
-                        content_b=content_b,
-                        cosine_score=score,
-                        survivor_id=survivor_id,
-                    )
-                    report["auto_merged"] += 1
-                except Exception as exc:
-                    report["errors"].append({
-                        "action": "auto_merge",
-                        "ids": [point_a["id"][:12], point_b["id"][:12]],
-                        "error": str(exc),
-                    })
-                    logger.warning(
-                        "Entity auto-merge failed: %s", exc, exc_info=True,
-                    )
+            # 3. Find dedup candidates (cosine ≥ 0.92)
+            candidates = await find_dedup_candidates(
+                qdrant, active_chunk, vectors, collection=COLLECTION,
+            )
 
-            elif score >= LLM_CHECK_FLOOR and llm_checks_used < MAX_ENTITY_CHECKS_PER_RUN:
-                # LLM semantic check
-                llm_checks_used += 1
-                report["llm_checked"] += 1
+            new_candidates = 0
+            for point_a, point_b, score in candidates:
+                # Skip pairs already processed by earlier chunks.
+                pair_key = tuple(sorted((point_a["id"], point_b["id"])))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
 
-                verdict = await check_semantic_overlap(
-                    router, content_a, content_b,
-                )
-                rel = verdict.get("relationship", "distinct")
-                reasoning = verdict.get("reasoning", "")
+                # Skip if either point was deprecated by an earlier chunk.
+                # Qdrant global search still returns deprecated points (no
+                # payload filter); without this guard we'd re-deprecate and
+                # double-count.
+                if point_a["id"] in deprecated_this_run or point_b["id"] in deprecated_this_run:
+                    continue
 
-                if rel == "duplicate":
+                new_candidates += 1
+
+                payload_a = point_a.get("payload", {})
+                payload_b = point_b.get("payload", {})
+                content_a = payload_a.get("content", "")
+                content_b = payload_b.get("content", "")
+
+                if dry_run:
+                    report.setdefault("sample_candidates", [])
+                    if len(report["sample_candidates"]) < 10:
+                        report["sample_candidates"].append({
+                            "score": round(score, 4),
+                            "id_a": point_a["id"][:12],
+                            "id_b": point_b["id"][:12],
+                            "preview_a": content_a[:80],
+                            "preview_b": content_b[:80],
+                        })
+                    continue
+
+                # Determine which memory is newer (survivor)
+                ts_a = payload_a.get("created_at", "")
+                ts_b = payload_b.get("created_at", "")
+                dt_a = _parse_ts(ts_a)
+                dt_b = _parse_ts(ts_b)
+                if dt_a >= dt_b:
+                    survivor_id, deprecated_id = point_a["id"], point_b["id"]
+                else:
+                    survivor_id, deprecated_id = point_b["id"], point_a["id"]
+
+                if score >= AUTO_MERGE_THRESHOLD:
+                    # Auto-merge: deprecate older, keep newer
                     try:
                         await _deprecate_memory(
                             qdrant, db, deprecated_id,
@@ -200,7 +194,101 @@ async def run_entity_resolution(
                         await log_resolution(
                             db,
                             run_id=run_id,
-                            action="llm_merge",
+                            action="auto_merge",
+                            memory_id_a=point_a["id"],
+                            memory_id_b=point_b["id"],
+                            content_a=content_a,
+                            content_b=content_b,
+                            cosine_score=score,
+                            survivor_id=survivor_id,
+                        )
+                        report["auto_merged"] += 1
+                        deprecated_this_run.add(deprecated_id)
+                    except Exception as exc:
+                        report["errors"].append({
+                            "action": "auto_merge",
+                            "ids": [point_a["id"][:12], point_b["id"][:12]],
+                            "error": str(exc),
+                        })
+                        logger.warning(
+                            "Entity auto-merge failed: %s", exc, exc_info=True,
+                        )
+
+                elif score >= LLM_CHECK_FLOOR and llm_checks_used < MAX_ENTITY_CHECKS_PER_RUN:
+                    # LLM semantic check
+                    llm_checks_used += 1
+                    report["llm_checked"] += 1
+
+                    verdict = await check_semantic_overlap(
+                        router, content_a, content_b,
+                    )
+                    rel = verdict.get("relationship", "distinct")
+                    reasoning = verdict.get("reasoning", "")
+
+                    if rel == "duplicate":
+                        try:
+                            await _deprecate_memory(
+                                qdrant, db, deprecated_id,
+                                survivor_id=survivor_id,
+                                run_id=run_id,
+                            )
+                            await log_resolution(
+                                db,
+                                run_id=run_id,
+                                action="llm_merge",
+                                memory_id_a=point_a["id"],
+                                memory_id_b=point_b["id"],
+                                content_a=content_a,
+                                content_b=content_b,
+                                cosine_score=score,
+                                llm_verdict=rel,
+                                llm_reasoning=reasoning,
+                                survivor_id=survivor_id,
+                            )
+                            report["llm_merged"] += 1
+                            deprecated_this_run.add(deprecated_id)
+                        except Exception as exc:
+                            report["errors"].append({
+                                "action": "llm_merge",
+                                "error": str(exc),
+                            })
+
+                    elif rel == "contradicts":
+                        # Create contradiction or succession link
+                        link_type = "contradicts"
+                        # Temporal contradiction: newer supersedes older
+                        if ts_a != ts_b:
+                            link_type = "succeeded_by"
+
+                        try:
+                            from genesis.db.crud import memory_links
+
+                            # Older → newer for succeeded_by; either direction for contradicts
+                            if link_type == "succeeded_by":
+                                src, tgt = deprecated_id, survivor_id
+                            else:
+                                src, tgt = point_a["id"], point_b["id"]
+
+                            await memory_links.create(
+                                db,
+                                source_id=src,
+                                target_id=tgt,
+                                link_type=link_type,
+                                strength=round(score, 4),
+                                created_at=datetime.now(UTC).isoformat(),
+                            )
+                        except Exception as link_exc:
+                            # Only PK collision is expected; log unexpected errors
+                            if "UNIQUE constraint" not in str(link_exc):
+                                logger.warning(
+                                    "Contradiction link %s→%s failed: %s",
+                                    src[:8], tgt[:8], link_exc,
+                                )
+
+                        await log_resolution(
+                            db,
+                            run_id=run_id,
+                            action="contradiction" if link_type == "contradicts" else "succeeded_by",
                             memory_id_a=point_a["id"],
                             memory_id_b=point_b["id"],
                             content_a=content_a,
@@ -208,74 +296,24 @@ async def run_entity_resolution(
                             cosine_score=score,
                             llm_verdict=rel,
                             llm_reasoning=reasoning,
-                            survivor_id=survivor_id,
                         )
-                        report["llm_merged"] += 1
-                    except Exception as exc:
-                        report["errors"].append({
-                            "action": "llm_merge",
-                            "error": str(exc),
-                        })
+                        report["contradictions"] += 1
 
-                elif rel == "contradicts":
-                    # Create contradiction or succession link
-                    link_type = "contradicts"
-                    # Temporal contradiction: newer supersedes older
-                    if ts_a != ts_b:
-                        link_type = "succeeded_by"
-
-                    try:
-                        from genesis.db.crud import memory_links
-
-                        # Older → newer for succeeded_by; either direction for contradicts
-                        if link_type == "succeeded_by":
-                            src, tgt = deprecated_id, survivor_id
-                        else:
-                            src, tgt = point_a["id"], point_b["id"]
-
-                        await memory_links.create(
+                    else:
+                        # distinct — log and skip
+                        await log_resolution(
                             db,
-                            source_id=src,
-                            target_id=tgt,
-                            link_type=link_type,
-                            strength=round(score, 4),
-                            created_at=datetime.now(UTC).isoformat(),
+                            run_id=run_id,
+                            action="skipped",
+                            memory_id_a=point_a["id"],
+                            memory_id_b=point_b["id"],
+                            cosine_score=score,
+                            llm_verdict=rel,
+                            llm_reasoning=reasoning,
                         )
-                    except Exception as link_exc:
-                        # Only PK collision is expected; log unexpected errors
-                        if "UNIQUE constraint" not in str(link_exc):
-                            logger.warning(
-                                "Contradiction link %s→%s failed: %s",
-                                src[:8], tgt[:8], link_exc,
-                            )
+                        report["skipped"] += 1
 
-                    await log_resolution(
-                        db,
-                        run_id=run_id,
-                        action="contradiction" if link_type == "contradicts" else "succeeded_by",
-                        memory_id_a=point_a["id"],
-                        memory_id_b=point_b["id"],
-                        content_a=content_a,
-                        content_b=content_b,
-                        cosine_score=score,
-                        llm_verdict=rel,
-                        llm_reasoning=reasoning,
-                    )
-                    report["contradictions"] += 1
-
-                else:
-                    # distinct — log and skip
-                    await log_resolution(
-                        db,
-                        run_id=run_id,
-                        action="skipped",
-                        memory_id_a=point_a["id"],
-                        memory_id_b=point_b["id"],
-                        cosine_score=score,
-                        llm_verdict=rel,
-                        llm_reasoning=reasoning,
-                    )
-                    report["skipped"] += 1
+            report["candidates_found"] += new_candidates
 
     # Invalidate graph cache if any merges or links created
     if report["auto_merged"] + report["llm_merged"] + report["contradictions"] > 0:
