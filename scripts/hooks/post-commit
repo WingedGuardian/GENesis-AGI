@@ -68,15 +68,25 @@ fi
 # ─── Contribution offer gate (config-driven) ────────────────────────────────
 # Check config/contribution.local.yaml first (user override), then base config.
 # Default: enabled (if neither file exists or key is absent).
-_CONTRIB_CFG_DIR="$_REPO_ROOT/config"
-if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]]; then
-    if grep -qE '^\s*offer_enabled:\s*false' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; then
-        _log "skip: contribution offers disabled via local config"
-        exit 0
+# Mirrors the Python settings layer's deep-merge: local overrides base per-key.
+if [[ -n "$_REPO_ROOT" ]]; then
+    _CONTRIB_CFG_DIR="$_REPO_ROOT/config"
+    _CONTRIB_DISABLED=""
+    # Local override takes precedence (if the key is present in it)
+    if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
+       && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; then
+        _CONTRIB_DISABLED="local"
+    # Fall through to base config (also checked when local exists but lacks the key)
+    elif [[ -f "$_CONTRIB_CFG_DIR/contribution.yaml" ]] \
+         && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.yaml" 2>/dev/null; then
+        # Only use base if local doesn't explicitly set offer_enabled to true
+        if ! { [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
+               && grep -qiE '^\s*offer_enabled:\s*(true|yes|on)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; }; then
+            _CONTRIB_DISABLED="base"
+        fi
     fi
-elif [[ -f "$_CONTRIB_CFG_DIR/contribution.yaml" ]]; then
-    if grep -qE '^\s*offer_enabled:\s*false' "$_CONTRIB_CFG_DIR/contribution.yaml" 2>/dev/null; then
-        _log "skip: contribution offers disabled via base config"
+    if [[ -n "$_CONTRIB_DISABLED" ]]; then
+        _log "skip: contribution offers disabled via $_CONTRIB_DISABLED config"
         exit 0
     fi
 fi
