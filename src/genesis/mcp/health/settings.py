@@ -188,6 +188,13 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         readonly=False,
         needs_restart=True,
     ),
+    "contribution": SettingsDomain(
+        name="contribution",
+        description="Contribution offer pipeline (proactive upstream fix offers)",
+        config_filename="contribution.yaml",
+        readonly=False,
+        needs_restart=False,
+    ),
 }
 
 
@@ -552,6 +559,18 @@ def _validate_channels(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_contribution(changes: dict) -> list[str]:
+    """Validate contribution config changes."""
+    errors: list[str] = []
+    valid_keys = {"offer_enabled"}
+    for key in changes:
+        if key not in valid_keys:
+            errors.append(f"Unknown key '{key}'. Valid: {', '.join(sorted(valid_keys))}")
+    if "offer_enabled" in changes and not isinstance(changes["offer_enabled"], bool):
+        errors.append("offer_enabled must be a boolean")
+    return errors
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
     "tts": _validate_tts,
     "resilience": _validate_resilience,
@@ -561,6 +580,7 @@ _DOMAIN_VALIDATORS: dict[str, Any] = {
     "surplus": _validate_surplus,
     "ego": _validate_ego,
     "channels": _validate_channels,
+    "contribution": _validate_contribution,
 }
 
 

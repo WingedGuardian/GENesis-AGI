@@ -65,6 +65,32 @@ if [[ "$COMMIT_SUBJECT" =~ ^Genesis[[:space:]]+v[0-9]+.*public[[:space:]]release
     fi
 fi
 
+# ─── Contribution offer gate (config-driven) ────────────────────────────────
+# Check config/contribution.local.yaml first (user override), then base config.
+# Default: enabled (if neither file exists or key is absent).
+# Mirrors the Python settings layer's deep-merge: local overrides base per-key.
+if [[ -n "$_REPO_ROOT" ]]; then
+    _CONTRIB_CFG_DIR="$_REPO_ROOT/config"
+    _CONTRIB_DISABLED=""
+    # Local override takes precedence (if the key is present in it)
+    if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
+       && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; then
+        _CONTRIB_DISABLED="local"
+    # Fall through to base config (also checked when local exists but lacks the key)
+    elif [[ -f "$_CONTRIB_CFG_DIR/contribution.yaml" ]] \
+         && grep -qiE '^\s*offer_enabled:\s*(false|no|off)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.yaml" 2>/dev/null; then
+        # Only use base if local doesn't explicitly set offer_enabled to true
+        if ! { [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
+               && grep -qiE '^\s*offer_enabled:\s*(true|yes|on)\s*(#.*)?$' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; }; then
+            _CONTRIB_DISABLED="base"
+        fi
+    fi
+    if [[ -n "$_CONTRIB_DISABLED" ]]; then
+        _log "skip: contribution offers disabled via $_CONTRIB_DISABLED config"
+        exit 0
+    fi
+fi
+
 # Match `fix:` OR `fix(scope):` BUT NOT `fix(local):`.
 # The conventional commits spec allows scopes in parens; we reject scope `local`
 # as the opt-out mechanism.
