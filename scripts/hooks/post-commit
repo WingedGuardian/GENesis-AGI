@@ -65,6 +65,22 @@ if [[ "$COMMIT_SUBJECT" =~ ^Genesis[[:space:]]+v[0-9]+.*public[[:space:]]release
     fi
 fi
 
+# ─── Contribution offer gate (config-driven) ────────────────────────────────
+# Check config/contribution.local.yaml first (user override), then base config.
+# Default: enabled (if neither file exists or key is absent).
+_CONTRIB_CFG_DIR="$_REPO_ROOT/config"
+if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]]; then
+    if grep -qE '^\s*offer_enabled:\s*false' "$_CONTRIB_CFG_DIR/contribution.local.yaml" 2>/dev/null; then
+        _log "skip: contribution offers disabled via local config"
+        exit 0
+    fi
+elif [[ -f "$_CONTRIB_CFG_DIR/contribution.yaml" ]]; then
+    if grep -qE '^\s*offer_enabled:\s*false' "$_CONTRIB_CFG_DIR/contribution.yaml" 2>/dev/null; then
+        _log "skip: contribution offers disabled via base config"
+        exit 0
+    fi
+fi
+
 # Match `fix:` OR `fix(scope):` BUT NOT `fix(local):`.
 # The conventional commits spec allows scopes in parens; we reject scope `local`
 # as the opt-out mechanism.

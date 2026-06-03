@@ -1,0 +1,10 @@
+# Contribution offer pipeline settings.
+#
+# Controls whether Genesis proactively offers to contribute fix commits
+# upstream to the public repo. When enabled, fix: commits trigger a
+# pending-offer marker that surfaces on the next user prompt.
+#
+# Toggle via dashboard Settings tab or:
+#   settings_update("contribution", {"offer_enabled": false})
+
+offer_enabled: true    # Proactively offer to contribute fix: commits upstream
