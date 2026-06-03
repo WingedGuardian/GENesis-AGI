@@ -119,6 +119,38 @@ class TestL2DiskCache:
             assert key in provider_with_l2._cache
             assert provider_with_l2._disk_cache.get(key) == fake_vec
 
+    def test_l2_stores_as_json_not_pickle(self, provider_with_l2: EmbeddingProvider):
+        """CVE-2025-69872: verify embedding cache never uses pickle serialization."""
+        import sqlite3
+
+        vec = [1.0, 2.0, 3.0]
+        provider_with_l2._cache_put("pickle_test", vec)
+        key = provider_with_l2._cache_key("pickle_test")
+        # Inspect the raw mode in diskcache's SQLite DB
+        cache_dir = str(provider_with_l2._disk_cache.directory)
+        conn = sqlite3.connect(cache_dir + "/cache.db")
+        row = conn.execute("SELECT mode FROM Cache WHERE key = ?", (key,)).fetchone()
+        conn.close()
+        assert row is not None, "Entry not found in disk cache"
+        # MODE_PICKLE = 4; should be MODE_RAW (1) instead
+        assert row[0] != 4, "Value stored as MODE_PICKLE (4), expected non-pickle mode"
+
+    def test_l2_rejects_pickle_entries(self, tmp_path):
+        """CVE-2025-69872: pickle-serialized entries must be rejected as cache misses."""
+        import diskcache
+
+        cache_dir = tmp_path / "pickle_reject"
+        key = "test_pickle_key"
+        vec = [1.0, 2.0, 3.0]
+        # Write a pickle entry using vanilla diskcache (no SafeDisk override)
+        plain_cache = diskcache.Cache(str(cache_dir))
+        plain_cache.set(key, vec)  # list[float] → MODE_PICKLE by default
+        plain_cache.close()
+        # Read through a provider whose Cache should reject pickle
+        p = _make_provider(cache_dir=cache_dir)
+        result = p._disk_cache.get(key)
+        assert result is None, "Pickle entry was deserialized — CVE-2025-69872 not mitigated"
+
     @pytest.mark.asyncio
     async def test_cross_process_sharing(self, tmp_path):
         """Two EmbeddingProvider instances sharing the same cache_dir see each other's entries."""
