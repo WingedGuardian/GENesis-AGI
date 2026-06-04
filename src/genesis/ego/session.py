@@ -1866,14 +1866,22 @@ class EgoSession:
                 parsed_eo = _json.loads(eo_raw) if isinstance(eo_raw, str) else eo_raw
                 if isinstance(parsed_eo, dict) and parsed_eo.get("files"):
                     eo_lines = [
-                        "\nExpected outputs (auto-verified after completion):",
-                        f"  Files: {', '.join(parsed_eo['files'])}",
+                        "\n## CRITICAL — Required Output Files",
+                        "You MUST save output to these EXACT file paths.",
+                        "The system auto-verifies these paths after completion.",
+                        "Do NOT rename, add suffixes, version numbers, or use",
+                        "different filenames.",
+                        "",
                     ]
+                    for fpath in parsed_eo["files"]:
+                        eo_lines.append(f"  - {fpath}")
                     if parsed_eo.get("min_size_bytes"):
-                        eo_lines.append(f"  Min size: {parsed_eo['min_size_bytes']} bytes")
+                        eo_lines.append(
+                            f"\nMin size: {parsed_eo['min_size_bytes']} bytes"
+                        )
                     if parsed_eo.get("required_strings"):
                         eo_lines.append(
-                            f"  Required content: {', '.join(parsed_eo['required_strings'])}"
+                            f"Required content: {', '.join(parsed_eo['required_strings'])}"
                         )
                     parts.append("\n".join(eo_lines))
             except (ValueError, TypeError):

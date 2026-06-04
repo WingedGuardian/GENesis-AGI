@@ -359,10 +359,15 @@ async def init(rt: GenesisRuntime) -> None:
             async def _on_high_severity_event(event) -> None:
                 """Route high-severity events to the appropriate ego's signal queue.
 
-                WARNING/ERROR → reactive signal (push_reactive_event)
+                ERROR → reactive signal (push_reactive_event)
                 CRITICAL → escalation signal (push_escalation_event)
+
+                WARNING events are excluded (handled by the subscriber
+                threshold).  The ego picks up WARNING-level issues during
+                regular proactive cycles via health_status context — no
+                need to wake up for them.
                 """
-                # Only react to WARNING+ events with actionable types
+                # Only react to ERROR+ events with actionable types
                 if event.event_type in ("heartbeat", "metric"):
                     return
 
@@ -385,7 +390,7 @@ async def init(rt: GenesisRuntime) -> None:
                     # (system-internal concerns)
                     target = genesis_ego_cadence
 
-                # CRITICAL → escalation signal, WARNING/ERROR → reactive signal
+                # CRITICAL → escalation signal, ERROR → reactive signal
                 is_critical = (
                     hasattr(event, "severity")
                     and event.severity.name == "CRITICAL"
@@ -397,9 +402,9 @@ async def init(rt: GenesisRuntime) -> None:
 
             rt._event_bus.subscribe(
                 _on_high_severity_event,
-                min_severity=Severity.WARNING,
+                min_severity=Severity.ERROR,
             )
-            logger.info("Ego event signal subscriber registered")
+            logger.info("Ego event signal subscriber registered (ERROR+ threshold)")
 
     except ImportError:
         logger.warning("genesis.ego not available")

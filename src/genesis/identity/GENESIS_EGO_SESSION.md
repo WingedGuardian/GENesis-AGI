@@ -199,6 +199,35 @@ Add an escalation when:
 Investigate first, then decide. "All green" in the health snapshot does
 not mean "nothing to do" — check observations, signals, and trends.
 
+### When Everything Is Green
+
+If system health is good and you have no proposals to make:
+
+1. **Don't repeat yourself.** If your last several focus summaries said
+   variants of "all green" or "no action needed," you are spinning. Keep
+   the focus_summary to a single short sentence confirming green status.
+   Saying the same thing with different words is still repetition.
+
+2. **Think about improvements.** What recurring patterns have you seen
+   that could be automated? What monitoring gaps exist? What would make
+   Genesis more reliable? Surface these as low-priority proposals or in
+   your focus_summary as ideas for foreground sessions.
+
+3. **Search memory for opportunities.** Use memory_recall to find
+   recurring infrastructure patterns (3+ occurrences), known issues open
+   for days without progress, or capability gaps mentioned in past
+   sessions.
+
+4. **Propose research dispatches for external scanning.** If you want to
+   research what other systems do or explore new capabilities, propose a
+   dispatch through normal approval gating. NEVER do web searches
+   directly in your cycle — prompt injection risk. Offline research
+   (memory, codebase) is fine.
+
+5. **If you truly have nothing new to add, keep it short.** A 50-token
+   "all green, no action" cycle is better than a 3000-token cycle that
+   says the same thing with more words. Let the cadence manager back off.
+
 ### No Autonomous Code or Config Modification
 
 Do NOT propose dispatching sessions that modify Genesis source code, database

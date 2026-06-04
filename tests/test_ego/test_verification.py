@@ -7,6 +7,7 @@ from pathlib import Path
 
 from genesis.ego.verification import (
     ExpectedOutputs,
+    _find_similar,
     parse_expected_outputs,
     verify_outputs,
 )
@@ -130,5 +131,120 @@ def test_verify_multiple_files(tmp_path: Path):
 def test_verify_no_files():
     """Empty files list passes vacuously."""
     expected = ExpectedOutputs(files=[])
+    result = verify_outputs(expected)
+    assert result.passed is True
+
+
+# --- _find_similar (fuzzy matching) ---
+
+
+def test_find_similar_suffix_added(tmp_path: Path):
+    """Expected 'foo.md', actual 'foo-v1.md' — should match."""
+    actual = tmp_path / "foo-v1.md"
+    actual.write_text("content")
+    expected = tmp_path / "foo.md"
+    match = _find_similar(expected)
+    assert match == actual
+
+
+def test_find_similar_name_variation(tmp_path: Path):
+    """Expected 'social-posts-article-5.md', actual with added words."""
+    actual = tmp_path / "social-posts-article5-stateless.md"
+    actual.write_text("content")
+    expected = tmp_path / "social-posts-article-5.md"
+    match = _find_similar(expected)
+    assert match == actual
+
+
+def test_find_similar_no_match(tmp_path: Path):
+    """Completely different filename should not match."""
+    actual = tmp_path / "master-marketing-plan.md"
+    actual.write_text("content")
+    expected = tmp_path / "arxiv-related-work-draft.md"
+    match = _find_similar(expected)
+    assert match is None
+
+
+def test_find_similar_wrong_extension(tmp_path: Path):
+    """Same stem but different extension should not match."""
+    actual = tmp_path / "report.json"
+    actual.write_text("{}")
+    expected = tmp_path / "report.md"
+    match = _find_similar(expected)
+    assert match is None
+
+
+def test_find_similar_prefers_recency(tmp_path: Path):
+    """When two candidates have same ratio, prefer most recent."""
+    import time
+
+    old_file = tmp_path / "report-old.md"
+    old_file.write_text("old content")
+    # Ensure different mtime
+    time.sleep(0.05)
+    new_file = tmp_path / "report-new.md"
+    new_file.write_text("new content")
+
+    expected = tmp_path / "report.md"
+    match = _find_similar(expected)
+    # Both score ~0.7-0.8 against "report", but new_file is more recent
+    assert match is not None
+    assert match == new_file
+
+
+def test_find_similar_empty_dir(tmp_path: Path):
+    """Empty directory returns None."""
+    expected = tmp_path / "anything.md"
+    match = _find_similar(expected)
+    assert match is None
+
+
+def test_find_similar_nonexistent_parent():
+    """Non-existent parent directory returns None."""
+    expected = Path("/nonexistent/dir/file.md")
+    match = _find_similar(expected)
+    assert match is None
+
+
+# --- verify_outputs with fuzzy matching ---
+
+
+def test_verify_fuzzy_match_passes(tmp_path: Path):
+    """Missing exact file but fuzzy match found — should pass."""
+    actual = tmp_path / "arxiv-related-work-draft-v1.md"
+    actual.write_text("## Related Work\nGenesis is a cognitive architecture.")
+    expected = ExpectedOutputs(
+        files=[str(tmp_path / "arxiv-related-work-draft.md")],
+        min_size_bytes=10,
+        required_strings=["## Related Work"],
+    )
+    result = verify_outputs(expected)
+    assert result.passed is True
+    assert result.failures == []
+
+
+def test_verify_fuzzy_match_checks_content(tmp_path: Path):
+    """Fuzzy-matched file still must pass content checks."""
+    actual = tmp_path / "report-v2.md"
+    actual.write_text("Some content without the required heading.")
+    expected = ExpectedOutputs(
+        files=[str(tmp_path / "report.md")],
+        required_strings=["## Summary"],
+    )
+    result = verify_outputs(expected)
+    assert result.passed is False
+    assert any("Missing required string" in f for f in result.failures)
+    # Failure message should reference the fuzzy-matched path for debugging
+    assert any("fuzzy match" in f for f in result.failures)
+
+
+def test_verify_no_fuzzy_for_exact_match(tmp_path: Path):
+    """When exact file exists, fuzzy matching is not attempted."""
+    exact = tmp_path / "output.md"
+    exact.write_text("correct content")
+    # Also create a similarly-named file
+    decoy = tmp_path / "output-v2.md"
+    decoy.write_text("decoy content")
+    expected = ExpectedOutputs(files=[str(exact)])
     result = verify_outputs(expected)
     assert result.passed is True

@@ -743,8 +743,23 @@ class UserEgoContextBuilder:
         except (ValueError, TypeError):
             return None
 
+    # Pure-infrastructure keywords — escalations containing these are
+    # filtered from the user ego's view.  The genesis ego handles infra;
+    # the user ego only sees user-impacting escalations.
+    _INFRA_ESCALATION_KEYWORDS = frozenset({
+        "cost_unknown", "budget cap", "dream cycle", "deepseek",
+        "provider fail", "circuit breaker", "qdrant", "heartbeat",
+        "dead letter", "watchdog", "systemd", "memory growth",
+    })
+
     async def _genesis_escalations_section(self, *, depth: str = "deep") -> str:
-        """Escalations from the Genesis ego that need user ego attention."""
+        """Escalations from the Genesis ego that need user ego attention.
+
+        Pure infrastructure escalations (matching ``_INFRA_ESCALATION_KEYWORDS``)
+        are filtered out — the genesis ego owns those.  The user ego only sees
+        escalations with potential user impact (outreach failures, dispatch
+        issues, etc.).
+        """
         lines = ["## Genesis Ego Escalations\n"]
 
         try:
@@ -769,6 +784,15 @@ class UserEgoContextBuilder:
             logger.error("Failed to query escalations", exc_info=True)
             lines.append("*Could not query escalations.*\n")
             return "\n".join(lines)
+
+        # Filter out pure infrastructure escalations — the genesis ego
+        # handles those.  Keep escalations with user-facing impact.
+        rows = [
+            r for r in rows
+            if not any(
+                kw in r[1].lower() for kw in self._INFRA_ESCALATION_KEYWORDS
+            )
+        ]
 
         if not rows:
             lines.append("*No escalations from Genesis ego.*\n")
