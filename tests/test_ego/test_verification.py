@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from genesis.ego.verification import (
@@ -176,7 +177,6 @@ def test_find_similar_wrong_extension(tmp_path: Path):
 
 def test_find_similar_prefers_recency(tmp_path: Path):
     """When two candidates have same ratio, prefer most recent."""
-    import time
 
     old_file = tmp_path / "report-old.md"
     old_file.write_text("old content")
