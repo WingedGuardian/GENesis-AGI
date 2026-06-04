@@ -81,6 +81,7 @@ def search(
     source_type: str | None = None,
     wing: str | None = None,
     room: str | None = None,
+    life_domain: str | None = None,
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
 ) -> list[dict]:
@@ -114,6 +115,10 @@ def search(
     if room:
         conditions.append(
             FieldCondition(key="room", match=MatchValue(value=room))
+        )
+    if life_domain:
+        conditions.append(
+            FieldCondition(key="life_domain", match=MatchValue(value=life_domain))
         )
     if include_only_subsystems:
         conditions.append(
