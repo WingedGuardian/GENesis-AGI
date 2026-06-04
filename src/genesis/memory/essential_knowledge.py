@@ -96,16 +96,16 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
 
     # Life domain breakdown: employment vs personal vs genesis signal counts
     if wing_stats:
-        from genesis.memory.taxonomy import _EMPLOYMENT_WINGS, _GENESIS_WINGS
+        from genesis.memory.taxonomy import EMPLOYMENT_WINGS, GENESIS_WINGS
         employment_count = sum(
-            wing_stats.get(w, 0) for w in _EMPLOYMENT_WINGS
+            wing_stats.get(w, 0) for w in EMPLOYMENT_WINGS
         )
         genesis_count = sum(
-            wing_stats.get(w, 0) for w in _GENESIS_WINGS
+            wing_stats.get(w, 0) for w in GENESIS_WINGS
         )
         personal_count = sum(
             c for w, c in wing_stats.items()
-            if w not in _EMPLOYMENT_WINGS and w not in _GENESIS_WINGS
+            if w not in EMPLOYMENT_WINGS and w not in GENESIS_WINGS
         )
         if employment_count > 0 or personal_count > 0:
             parts.append(

@@ -36,12 +36,12 @@ WINGS = frozenset({
 })
 
 # Wings that belong to the "genesis" life domain (system internals).
-_GENESIS_WINGS = frozenset({
+GENESIS_WINGS = frozenset({
     "memory", "learning", "routing", "infrastructure", "channels", "autonomy",
 })
 
 # Wings that belong to the "employment" life domain (user's job/work).
-_EMPLOYMENT_WINGS = frozenset({"employment", "career"})
+EMPLOYMENT_WINGS = frozenset({"employment", "career"})
 
 # Valid life domains
 LIFE_DOMAINS = frozenset({"personal", "employment", "genesis"})
@@ -370,9 +370,9 @@ def classify_life_domain(
                 return domain
 
     # Infer from wing
-    if wing in _GENESIS_WINGS:
+    if wing in GENESIS_WINGS:
         return "genesis"
-    if wing in _EMPLOYMENT_WINGS:
+    if wing in EMPLOYMENT_WINGS:
         return "employment"
     return "personal"
 

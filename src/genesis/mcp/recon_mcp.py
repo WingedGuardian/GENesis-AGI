@@ -162,6 +162,12 @@ async def recon_store_finding(
     if _db is None:
         return {"error": "Database not initialized"}
 
+    # Validate life_domain if provided
+    if life_domain is not None:
+        from genesis.memory.taxonomy import LIFE_DOMAINS
+        if life_domain not in LIFE_DOMAINS:
+            return {"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}
+
     finding_id = str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
 

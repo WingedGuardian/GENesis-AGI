@@ -538,16 +538,21 @@ class HybridRetriever:
                     # Qdrant already filtered — guaranteed match
                     filtered.append(mid)
                 elif life_domain and not wing and not room:
-                    # FTS5-only + life_domain filter: check the tag string
+                    # FTS5-only + life_domain filter only (no wing/room):
+                    # check the life_domain tag in the FTS5 tags string.
                     fhit = fts_by_id.get(mid)
                     if fhit:
                         tags_str = fhit.get("tags", "")
                         if f"life_domain:{life_domain}" in tags_str:
                             filtered.append(mid)
                 else:
-                    # FTS5-only candidate with wing/room filter — no
-                    # wing/room data in FTS5, exclude since we can't
-                    # verify membership.
+                    # FTS5-only candidate with wing/room filter active —
+                    # no wing/room data in FTS5, exclude since we can't
+                    # verify membership. When wing/room + life_domain are
+                    # combined, wing/room takes precedence and FTS5-only
+                    # candidates are excluded (same as before life_domain
+                    # was added). This is intentional: wing/room is the
+                    # stronger structural filter.
                     pass
             candidates = filtered
 
