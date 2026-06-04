@@ -69,8 +69,20 @@ fi
 # Check config/contribution.local.yaml first (user override), then base config.
 # Default: enabled (if neither file exists or key is absent).
 # Mirrors the Python settings layer's deep-merge: local overrides base per-key.
+# IMPORTANT: resolve config from the MAIN repo root, not the worktree.
+# .local.yaml files are gitignored and only exist in the main checkout.
+# In worktrees, git-common-dir points to the main .git, whose parent is the
+# main repo root.
 if [[ -n "$_REPO_ROOT" ]]; then
-    _CONTRIB_CFG_DIR="$_REPO_ROOT/config"
+    _GIT_COMMON=$(git rev-parse --git-common-dir 2>/dev/null || echo "")
+    if [[ -n "$_GIT_COMMON" && "$_GIT_COMMON" != ".git" ]]; then
+        # In a worktree: git-common-dir is an absolute path to the main .git
+        _MAIN_ROOT=$(cd "$_GIT_COMMON/.." 2>/dev/null && pwd -P)
+    else
+        # In the main checkout: repo root IS the main root
+        _MAIN_ROOT="$_REPO_ROOT"
+    fi
+    _CONTRIB_CFG_DIR="$_MAIN_ROOT/config"
     _CONTRIB_DISABLED=""
     # Local override takes precedence (if the key is present in it)
     if [[ -f "$_CONTRIB_CFG_DIR/contribution.local.yaml" ]] \
