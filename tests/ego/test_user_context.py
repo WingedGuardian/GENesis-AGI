@@ -384,8 +384,8 @@ class TestUserEgoContextBuilder:
             "(id, source, type, category, content, priority, resolved, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
             (
-                "esc1", "genesis_ego", "escalation_to_user_ego", "infrastructure",
-                "Qdrant backup failed twice — needs user decision", "high", 0,
+                "esc1", "genesis_ego", "escalation_to_user_ego", "outreach",
+                "Outreach pipeline down — scheduled messages not sending", "high", 0,
             ),
         )
         builder = UserEgoContextBuilder(
@@ -393,8 +393,27 @@ class TestUserEgoContextBuilder:
         )
         result = await builder.build()
         assert "Genesis Ego Escalations" in result
-        assert "Qdrant backup failed twice" in result
+        assert "Outreach pipeline down" in result
         assert "[high]" in result
+
+    @pytest.mark.asyncio
+    async def test_escalations_infra_filtered(self, db, mock_health_data, capabilities):
+        """Pure infrastructure escalations are filtered from user ego context."""
+        await db.execute(
+            "INSERT INTO observations "
+            "(id, source, type, category, content, priority, resolved, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+            (
+                "esc_infra", "genesis_ego", "escalation_to_user_ego", "infrastructure",
+                "Qdrant backup failed twice — needs user decision", "high", 0,
+            ),
+        )
+        builder = UserEgoContextBuilder(
+            db=db, health_data=mock_health_data, capabilities=capabilities,
+        )
+        result = await builder.build()
+        assert "Qdrant backup failed twice" not in result
+        assert "No escalations from Genesis ego" in result
 
     @pytest.mark.asyncio
     async def test_escalations_empty(self, db, mock_health_data, capabilities):

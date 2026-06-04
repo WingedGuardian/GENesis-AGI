@@ -4,6 +4,11 @@ After an ego-dispatched session completes, this module checks whether
 the expected deliverables actually exist and meet minimum criteria.
 Verification is opt-in: proposals without ``expected_outputs`` metadata
 skip verification entirely.
+
+When an expected file is missing, a fuzzy-match fallback searches the
+parent directory for similarly-named files (using SequenceMatcher).
+This catches common dispatch mismatches (added suffixes, version numbers,
+slight name variations) without false-positiving on unrelated files.
 """
 
 from __future__ import annotations
@@ -11,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -58,8 +64,54 @@ def parse_expected_outputs(raw: str | None) -> ExpectedOutputs | None:
     )
 
 
+def _find_similar(expected: Path, *, min_ratio: float = 0.6) -> Path | None:
+    """Fuzzy-match against files in the same directory.
+
+    Searches the parent directory for files with the same extension whose
+    stem is similar to the expected filename.  When multiple candidates
+    match, prefers higher similarity; ties broken by most-recently-modified
+    (to avoid stale artifacts from previous dispatches).
+
+    Returns the best match, or ``None`` if nothing scores above *min_ratio*.
+    """
+    parent = expected.parent
+    if not parent.is_dir():
+        return None
+
+    best: Path | None = None
+    best_score = 0.0
+    best_mtime = 0.0
+
+    for candidate in parent.iterdir():
+        if not candidate.is_file() or candidate.suffix != expected.suffix:
+            continue
+        ratio = SequenceMatcher(None, expected.stem, candidate.stem).ratio()
+        if ratio < min_ratio:
+            continue
+        mtime = candidate.stat().st_mtime
+        # Higher ratio wins; same ratio → most recently modified wins
+        if ratio > best_score or (ratio == best_score and mtime > best_mtime):
+            best_score = ratio
+            best_mtime = mtime
+            best = candidate
+
+    if best is not None:
+        logger.warning(
+            "Fuzzy match: expected %s → found %s (ratio=%.2f)",
+            expected.name,
+            best.name,
+            best_score,
+        )
+    return best
+
+
 def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
     """Check file existence, size, and required content strings.
+
+    When an expected file is missing, attempts a fuzzy match against
+    similarly-named files in the same directory.  If a match is found,
+    verification continues against that file (size + content checks)
+    and the result is treated as a pass with a logged warning.
 
     This is synchronous filesystem I/O — callers in async contexts should
     wrap in ``asyncio.to_thread`` if latency is a concern. In practice
@@ -70,13 +122,22 @@ def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
 
     for filepath in expected.files:
         path = Path(filepath)
+        fuzzy = False
         if not path.exists():
-            failures.append(f"Missing file: {filepath}")
-            continue
+            # Fuzzy fallback: search parent directory for similar files
+            similar = _find_similar(path)
+            if similar is not None:
+                path = similar
+                fuzzy = True
+            else:
+                failures.append(f"Missing file: {filepath}")
+                continue
+        # Use the resolved path in failure messages so operators can find the file
+        label = f"{path} (fuzzy match for {filepath})" if fuzzy else filepath
         size = path.stat().st_size
         if size < expected.min_size_bytes:
             failures.append(
-                f"File too small: {filepath} ({size}B < {expected.min_size_bytes}B)"
+                f"File too small: {label} ({size}B < {expected.min_size_bytes}B)"
             )
         if expected.required_strings:
             try:
@@ -84,9 +145,9 @@ def verify_outputs(expected: ExpectedOutputs) -> VerificationResult:
                 for req in expected.required_strings:
                     if req not in content:
                         failures.append(
-                            f"Missing required string in {filepath}: {req!r}"
+                            f"Missing required string in {label}: {req!r}"
                         )
             except OSError as exc:
-                failures.append(f"Cannot read {filepath}: {exc}")
+                failures.append(f"Cannot read {label}: {exc}")
 
     return VerificationResult(passed=len(failures) == 0, failures=failures)
