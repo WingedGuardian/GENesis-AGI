@@ -73,7 +73,9 @@ async def knowledge_recall(
     assert memory_mod._retriever is not None
     assert memory_mod._db is not None
 
-    vector_results = await memory_mod._retriever.recall(query, source="knowledge", limit=limit)
+    vector_results = await memory_mod._retriever.recall(
+        query, source="knowledge", limit=limit, project_type=project,
+    )
 
     fts_results: list[dict] = []
     try:

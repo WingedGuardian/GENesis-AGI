@@ -63,6 +63,7 @@ _KNOWLEDGE_SECTION_ORDER = [
     "Goals & Priorities",
     "Interaction Patterns",
     "Recent Themes",
+    "Life Structure",
 ]
 
 _KNOWLEDGE_SECTION_LIMITS = {
@@ -72,6 +73,7 @@ _KNOWLEDGE_SECTION_LIMITS = {
     "Goals & Priorities": 10,
     "Interaction Patterns": 10,
     "Recent Themes": 10,
+    "Life Structure": 10,
 }
 
 _KNOWLEDGE_FIELD_MAP = {
@@ -100,6 +102,12 @@ _KNOWLEDGE_FIELD_MAP = {
     "decision": "Interaction Patterns",
     "autonomy": "Interaction Patterns",
     "operational": "Interaction Patterns",
+    # Life structure
+    "employment": "Life Structure",
+    "job": "Life Structure",
+    "income": "Life Structure",
+    "life_structure": "Life Structure",
+    "life_domain": "Life Structure",
 }
 
 

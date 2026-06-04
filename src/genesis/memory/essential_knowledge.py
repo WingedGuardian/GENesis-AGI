@@ -94,6 +94,27 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
             room_str = ", ".join(rooms) if rooms else "uncategorized"
             parts.append(f"- {wing} ({count}): {room_str}")
 
+    # Life domain breakdown: employment vs personal vs genesis signal counts
+    if wing_stats:
+        from genesis.memory.taxonomy import _EMPLOYMENT_WINGS, _GENESIS_WINGS
+        employment_count = sum(
+            wing_stats.get(w, 0) for w in _EMPLOYMENT_WINGS
+        )
+        genesis_count = sum(
+            wing_stats.get(w, 0) for w in _GENESIS_WINGS
+        )
+        personal_count = sum(
+            c for w, c in wing_stats.items()
+            if w not in _EMPLOYMENT_WINGS and w not in _GENESIS_WINGS
+        )
+        if employment_count > 0 or personal_count > 0:
+            parts.append(
+                f"\n### Life Domains\n"
+                f"- employment: {employment_count} memories\n"
+                f"- personal: {personal_count} memories\n"
+                f"- genesis: {genesis_count} memories"
+            )
+
     return "\n".join(parts)
 
 

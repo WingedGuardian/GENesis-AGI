@@ -48,6 +48,7 @@ async def memory_recall(
     compact: bool = False,
     wing: str | None = None,
     room: str | None = None,
+    life_domain: str | None = None,
     include_graph: bool = True,
     expand_query_terms: bool = True,
     mode: str = "auto",
@@ -69,6 +70,7 @@ async def memory_recall(
             fetch full content for specific IDs. Saves tokens and ~500ms.
         wing: Filter results to this structural domain (e.g., "infrastructure").
         room: Filter results to this topic within a wing.
+        life_domain: Filter by life domain: "personal", "employment", or "genesis".
         include_graph: If False, skip graph traversal (saves ~500ms per call).
         expand_query_terms: If True, expand the FTS5 query via tag co-occurrence
             analysis (~500ms first call, ~10ms cached). Broadens recall for
@@ -95,6 +97,12 @@ async def memory_recall(
             relevance. Adds ~300ms latency. Default False — opt-in per call.
     """
     import time as _time
+
+    # Validate life_domain early to catch typos before expensive search
+    if life_domain is not None:
+        from genesis.memory.taxonomy import LIFE_DOMAINS
+        if life_domain not in LIFE_DOMAINS:
+            return [{"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}]
 
     _t0 = _time.monotonic()
     memory_mod = _memory_mod()
@@ -145,7 +153,8 @@ async def memory_recall(
     else:
         results = await memory_mod._retriever.recall(
             query, source=source, limit=limit, min_activation=min_activation,
-            wing=wing, room=room, expand_query_terms=expand_query_terms,
+            wing=wing, room=room, life_domain=life_domain,
+            expand_query_terms=expand_query_terms,
             include_subsystem=include_subsystem,
             only_subsystem=only_subsystem,
             rerank=rerank,

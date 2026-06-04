@@ -119,6 +119,23 @@ user model. If a recon finding looks user-relevant, flag it for user confirmatio
 in the cognitive state update or via the user question mechanism — do not auto-
 ingest it as a user signal.
 
+### Missed Insights Sweep
+
+Review unresolved observations from the past 30 days that are:
+- NOT connected to any active goal (no matching `goal_id`)
+- NOT referenced by any pending follow-up
+- Still potentially relevant to the user's life dimensions
+
+For each, evaluate:
+- **Still actionable?** If yes, create a follow-up via `follow_up_create` or
+  connect to an existing goal. This anchors the insight so it won't age out.
+- **Stale or irrelevant?** Let it expire naturally. No action needed.
+- **Pattern emerging?** If multiple unanchored insights cluster around the
+  same theme, create an `interaction_theme` observation to surface the pattern.
+
+This sweep prevents important-but-untracked insights from silently falling
+off the ego's radar after the 7-day active context window.
+
 ### Cost Reconciliation (if cost summary is provided)
 
 Note any concerning budget consumption patterns. Flag if daily/weekly/monthly

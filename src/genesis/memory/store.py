@@ -100,6 +100,8 @@ class MemoryStore:
         valid_at: str | None = None,
         invalid_at: str | None = None,
         source_subsystem: str | None = None,
+        life_domain: str | None = None,
+        project_type: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -108,6 +110,15 @@ class MemoryStore:
                 ``_COLLECTION_MAP`` lookup. Default routing: ``episodic`` types →
                 ``episodic_memory``, ``knowledge`` types → ``knowledge_base``.
         """
+        # Validate life_domain if explicitly provided
+        if life_domain is not None:
+            from genesis.memory.taxonomy import LIFE_DOMAINS
+            if life_domain not in LIFE_DOMAINS:
+                raise ValueError(
+                    f"life_domain must be one of {sorted(LIFE_DOMAINS)}, "
+                    f"got {life_domain!r}"
+                )
+
         # Dedup: skip if exact content already stored (any collection)
         try:
             existing = await memory_crud.find_exact_duplicate(
@@ -172,10 +183,20 @@ class MemoryStore:
             )
             wing = wing or taxo.wing
             room = room or taxo.room
+            if not life_domain:
+                life_domain = taxo.life_domain
+        # Derive life_domain from wing if still not set
+        if not life_domain:
+            from genesis.memory.taxonomy import classify_life_domain
+            life_domain = classify_life_domain(wing, tags=resolved_tags)
         # Append wing tag for FTS5 keyword searchability
         wing_tag = f"wing:{wing}"
         if wing_tag not in resolved_tags:
             resolved_tags = [*resolved_tags, wing_tag]
+        # Append life_domain tag for FTS5 searchability
+        ld_tag = f"life_domain:{life_domain}"
+        if ld_tag not in resolved_tags:
+            resolved_tags = [*resolved_tags, ld_tag]
 
         embedding_ok = not force_fts5_only
         if embedding_ok:
@@ -203,6 +224,7 @@ class MemoryStore:
                         "memory_class": resolved_class,
                         "wing": wing,
                         "room": room,
+                        "life_domain": life_domain,
                     }
                     # Provenance fields — trace memory back to source conversation
                     if source_session_id:
@@ -217,6 +239,8 @@ class MemoryStore:
                         payload["source_pipeline"] = source_pipeline
                     if source_subsystem:
                         payload["source_subsystem"] = source_subsystem
+                    if project_type:
+                        payload["project_type"] = project_type
 
                     upsert_point(
                         self._qdrant,

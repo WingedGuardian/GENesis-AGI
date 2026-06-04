@@ -31,8 +31,20 @@ WINGS = frozenset({
     "research",
     "integrations",
     "career",
+    "employment",
     "general",
 })
+
+# Wings that belong to the "genesis" life domain (system internals).
+_GENESIS_WINGS = frozenset({
+    "memory", "learning", "routing", "infrastructure", "channels", "autonomy",
+})
+
+# Wings that belong to the "employment" life domain (user's job/work).
+_EMPLOYMENT_WINGS = frozenset({"employment", "career"})
+
+# Valid life domains
+LIFE_DOMAINS = frozenset({"personal", "employment", "genesis"})
 
 # Rooms per wing — used for classification and validation
 ROOMS: dict[str, list[str]] = {
@@ -71,16 +83,21 @@ ROOMS: dict[str, list[str]] = {
     "career": [
         "applications", "profile", "research", "outreach",
     ],
+    "employment": [
+        "job_knowledge", "customer_intel", "demo_prep",
+        "meeting_notes", "competitive_intel",
+    ],
     "general": ["uncategorized"],
 }
 
 
 @dataclass(frozen=True, slots=True)
 class Classification:
-    """Result of classifying a memory into wing/room."""
+    """Result of classifying a memory into wing/room and life domain."""
     wing: str
     room: str
     confidence: float  # 0.0 - 1.0
+    life_domain: str = "personal"  # "personal" | "employment" | "genesis"
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +140,7 @@ _PATH_PATTERNS: list[tuple[str, str, str]] = [
     (r"src/genesis/db/", "infrastructure", "database"),
     (r"guardian", "infrastructure", "guardian"),
     (r"sentinel", "infrastructure", "sentinel"),
-    (r"health", "infrastructure", "health"),
+    (r"health[_ ](?:check|probe|status|data|alert)", "infrastructure", "health"),
 
     # channels wing — specific before catch-all
     (r"src/genesis/channels/telegram", "channels", "telegram"),
@@ -238,6 +255,31 @@ _KEYWORD_MAP: dict[str, tuple[str, str]] = {
     "recruiter": ("career", "outreach"),
     "careerops": ("career", "applications"),
     "jerbs": ("career", "applications"),
+    # employment wing — job-specific domain knowledge, customer context,
+    # demo preparation, and competitive intelligence related to the user's
+    # current employer/role. Distinct from "career" (job search/applications).
+    "customer meeting": ("employment", "meeting_notes"),
+    "customer call": ("employment", "meeting_notes"),
+    "account intel": ("employment", "customer_intel"),
+    "customer intel": ("employment", "customer_intel"),
+    "demo prep": ("employment", "demo_prep"),
+    "demo environment": ("employment", "demo_prep"),
+    "prior auth": ("employment", "job_knowledge"),
+    "prior authorization": ("employment", "job_knowledge"),
+    "fhir": ("employment", "job_knowledge"),
+    "hl7": ("employment", "job_knowledge"),
+    "health plan": ("employment", "job_knowledge"),
+    "payer": ("employment", "job_knowledge"),
+    "clinical guideline": ("employment", "job_knowledge"),
+    "care management": ("employment", "job_knowledge"),
+    "claims processing": ("employment", "job_knowledge"),
+    "competitor analysis": ("employment", "competitive_intel"),
+    "competitive landscape": ("employment", "competitive_intel"),
+    "sales call": ("employment", "meeting_notes"),
+    "prospect": ("employment", "customer_intel"),
+    "deal pipeline": ("employment", "customer_intel"),
+    "poc": ("employment", "demo_prep"),
+    "proof of concept": ("employment", "demo_prep"),
 }
 
 # ---------------------------------------------------------------------------
@@ -296,12 +338,43 @@ _TAG_WING_MAP: dict[str, str] = {
     "job_search": "career",
     "resume": "career",
     "ats": "career",
+    # employment tag map
+    "employment": "employment",
+    "customer": "employment",
+    "demo": "employment",
+    "competitive_intel": "employment",
+    "job_knowledge": "employment",
 }
 
 
 # ---------------------------------------------------------------------------
 # Classifier
 # ---------------------------------------------------------------------------
+
+
+def classify_life_domain(
+    wing: str,
+    *,
+    tags: list[str] | None = None,
+) -> str:
+    """Derive life domain from wing classification and optional tags.
+
+    Explicit ``life_domain:X`` tags take priority over wing-based inference.
+    """
+    # Check for explicit life_domain tag override
+    for tag in (tags or []):
+        tag_lower = tag.lower()
+        if tag_lower.startswith("life_domain:"):
+            domain = tag_lower.split(":", 1)[1]
+            if domain in LIFE_DOMAINS:
+                return domain
+
+    # Infer from wing
+    if wing in _GENESIS_WINGS:
+        return "genesis"
+    if wing in _EMPLOYMENT_WINGS:
+        return "employment"
+    return "personal"
 
 
 def classify(
@@ -311,7 +384,7 @@ def classify(
     source: str = "",
     source_pipeline: str = "",
 ) -> Classification:
-    """Classify a memory into wing/room based on content and metadata.
+    """Classify a memory into wing/room and life domain based on content and metadata.
 
     Priority order:
     1. File paths in content (strongest signal, 0.9 confidence)
@@ -319,6 +392,9 @@ def classify(
     3. Tags (0.6 confidence)
     4. Source pipeline (0.5 confidence)
     5. Fallback: general/uncategorized (0.1 confidence)
+
+    Life domain is derived from the resulting wing classification,
+    with explicit ``life_domain:X`` tags taking priority.
     """
     content_lower = content.lower()
     tags_lower = [t.lower() for t in (tags or [])]
@@ -326,7 +402,10 @@ def classify(
     # 1. Path-based — strongest signal
     for pattern, wing, room in _PATH_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
-            return Classification(wing=wing, room=room, confidence=0.9)
+            return Classification(
+                wing=wing, room=room, confidence=0.9,
+                life_domain=classify_life_domain(wing, tags=tags),
+            )
 
     # 2. Keyword-based — check content for domain keywords
     best_keyword: tuple[str, str] | None = None
@@ -339,7 +418,10 @@ def classify(
             best_keyword_pos = pos
 
     if best_keyword:
-        return Classification(wing=best_keyword[0], room=best_keyword[1], confidence=0.7)
+        return Classification(
+            wing=best_keyword[0], room=best_keyword[1], confidence=0.7,
+            life_domain=classify_life_domain(best_keyword[0], tags=tags),
+        )
 
     # 3. Tag-based — check existing tags
     for tag in tags_lower:
@@ -350,7 +432,10 @@ def classify(
             if tag_key in tag:
                 # Room defaults to first room in wing
                 room = ROOMS[wing][0]
-                return Classification(wing=wing, room=room, confidence=0.6)
+                return Classification(
+                    wing=wing, room=room, confidence=0.6,
+                    life_domain=classify_life_domain(wing, tags=tags),
+                )
 
     # 4. Source pipeline
     pipeline_wing_map = {
@@ -364,10 +449,16 @@ def classify(
     }
     if source_pipeline in pipeline_wing_map:
         wing, room = pipeline_wing_map[source_pipeline]
-        return Classification(wing=wing, room=room, confidence=0.5)
+        return Classification(
+            wing=wing, room=room, confidence=0.5,
+            life_domain=classify_life_domain(wing, tags=tags),
+        )
 
     # 5. Fallback
-    return Classification(wing="general", room="uncategorized", confidence=0.1)
+    return Classification(
+        wing="general", room="uncategorized", confidence=0.1,
+        life_domain=classify_life_domain("general", tags=tags),
+    )
 
 
 def detect_wing_from_prompt(prompt: str, file_paths: list[str] | None = None) -> str | None:

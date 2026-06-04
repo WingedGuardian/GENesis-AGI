@@ -93,6 +93,7 @@ async def ingest_knowledge_unit(
         memory_class=memory_class,
         source_session_id=source_session_id,
         force_fts5_only=force_fts5_only,
+        project_type=project,
     )
 
     # If we replaced an existing entry whose Qdrant point ID differs from
