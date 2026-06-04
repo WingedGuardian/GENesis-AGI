@@ -110,6 +110,15 @@ class MemoryStore:
                 ``_COLLECTION_MAP`` lookup. Default routing: ``episodic`` types →
                 ``episodic_memory``, ``knowledge`` types → ``knowledge_base``.
         """
+        # Validate life_domain if explicitly provided
+        if life_domain is not None:
+            from genesis.memory.taxonomy import LIFE_DOMAINS
+            if life_domain not in LIFE_DOMAINS:
+                raise ValueError(
+                    f"life_domain must be one of {sorted(LIFE_DOMAINS)}, "
+                    f"got {life_domain!r}"
+                )
+
         # Dedup: skip if exact content already stored (any collection)
         try:
             existing = await memory_crud.find_exact_duplicate(

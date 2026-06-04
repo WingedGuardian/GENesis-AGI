@@ -527,19 +527,27 @@ class HybridRetriever:
         # 9. Sort by fused score descending
         candidates.sort(key=lambda m: fused[m], reverse=True)
 
-        # 9b. Filter FTS5-only candidates by wing/room (Qdrant results
-        #     are already filtered at query time; this catches FTS5-only
-        #     candidates that don't match the requested wing/room).
-        if wing or room:
+        # 9b. Filter FTS5-only candidates by wing/room/life_domain (Qdrant
+        #     results are already filtered at query time; this catches
+        #     FTS5-only candidates that don't match the requested filters).
+        if wing or room or life_domain:
             filtered: list[str] = []
             for mid in candidates:
                 qhit = qdrant_by_id.get(mid)
                 if qhit:
                     # Qdrant already filtered — guaranteed match
                     filtered.append(mid)
+                elif life_domain and not wing and not room:
+                    # FTS5-only + life_domain filter: check the tag string
+                    fhit = fts_by_id.get(mid)
+                    if fhit:
+                        tags_str = fhit.get("tags", "")
+                        if f"life_domain:{life_domain}" in tags_str:
+                            filtered.append(mid)
                 else:
-                    # FTS5-only candidate — no wing/room data, exclude
-                    # since we can't verify membership.
+                    # FTS5-only candidate with wing/room filter — no
+                    # wing/room data in FTS5, exclude since we can't
+                    # verify membership.
                     pass
             candidates = filtered
 

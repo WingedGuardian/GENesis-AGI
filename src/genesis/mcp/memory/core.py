@@ -98,6 +98,12 @@ async def memory_recall(
     """
     import time as _time
 
+    # Validate life_domain early to catch typos before expensive search
+    if life_domain is not None:
+        from genesis.memory.taxonomy import LIFE_DOMAINS
+        if life_domain not in LIFE_DOMAINS:
+            return [{"error": f"life_domain must be one of {sorted(LIFE_DOMAINS)}, got {life_domain!r}"}]
+
     _t0 = _time.monotonic()
     memory_mod = _memory_mod()
     memory_mod._require_init()

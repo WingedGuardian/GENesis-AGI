@@ -154,7 +154,8 @@ async def recon_store_finding(
 
     Args:
         life_domain: Optional life domain tag ("personal", "employment", "genesis").
-            Stored as a metadata marker in the content for domain filtering.
+            Stored as a content annotation for context — NOT queryable via
+            recon_findings. To query by domain, grep the content field.
 
     Returns the finding ID.
     """
