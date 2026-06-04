@@ -148,8 +148,13 @@ async def recon_store_finding(
     priority: str = "medium",
     source_url: str | None = None,
     expires_at: str | None = None,
+    life_domain: str | None = None,
 ) -> dict:
     """Store a new recon finding as an observation.
+
+    Args:
+        life_domain: Optional life domain tag ("personal", "employment", "genesis").
+            Stored as a metadata marker in the content for domain filtering.
 
     Returns the finding ID.
     """
@@ -164,6 +169,8 @@ async def recon_store_finding(
         content = f"{title}\n\n{summary}"
     if source_url:
         content += f"\n\nSource: {source_url}"
+    if life_domain:
+        content += f"\n\n[life_domain: {life_domain}]"
 
     await obs_crud.create(
         _db,
@@ -177,7 +184,7 @@ async def recon_store_finding(
         expires_at=expires_at,
     )
 
-    return {"finding_id": finding_id, "created_at": now}
+    return {"finding_id": finding_id, "created_at": now, "life_domain": life_domain}
 
 
 @mcp.tool()
