@@ -202,6 +202,20 @@ Verify before any commit:
   Check CI via `gh pr checks`. Bare `pytest` without a file path is banned.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 
+## Pre-Merge Gate
+
+When "merge when green" is requested, wait for BOTH CI checks AND
+automated review comments before merging:
+
+1. After CI passes, check PR comments for the automated code review
+   (structural review, PII scan). Use `gh api repos/.../issues/{pr}/comments`.
+2. If review present → read findings, address warnings before merging.
+3. If review absent after ~5 minutes AND daily quota (15/day) is
+   exhausted → merge on CI alone, note in PR that review was
+   quota-limited.
+4. Never hard-block indefinitely — the review is a soft gate with a
+   quota ceiling.
+
 ## Reference Router
 
 Read references ONLY when relevant to the specific task. Do NOT load all
