@@ -101,6 +101,7 @@ class MemoryStore:
         invalid_at: str | None = None,
         source_subsystem: str | None = None,
         life_domain: str | None = None,
+        project_type: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -229,6 +230,8 @@ class MemoryStore:
                         payload["source_pipeline"] = source_pipeline
                     if source_subsystem:
                         payload["source_subsystem"] = source_subsystem
+                    if project_type:
+                        payload["project_type"] = project_type
 
                     upsert_point(
                         self._qdrant,

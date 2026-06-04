@@ -187,6 +187,7 @@ class HybridRetriever:
         wing: str | None = None,
         room: str | None = None,
         life_domain: str | None = None,
+        project_type: str | None = None,
         include_subsystem: bool | list[str] = False,
         only_subsystem: str | list[str] | None = None,
         rerank: bool = True,
@@ -265,6 +266,7 @@ class HybridRetriever:
                         wing=wing,
                         room=room,
                         life_domain=life_domain,
+                        project_type=project_type,
                         exclude_subsystems=exclude_subsystems,
                         include_only_subsystems=include_only_subsystems,
                     )
