@@ -21,7 +21,7 @@ async def db():
 
 @pytest.fixture
 def gatherer():
-    return ContextGatherer(budget_daily=2.0, budget_weekly=10.0, budget_monthly=30.0)
+    return ContextGatherer()
 
 
 class TestDetectPendingWork:
@@ -108,7 +108,6 @@ class TestGather:
         bundle = await gatherer.gather(db)
         assert bundle.recent_observations == []
         assert bundle.intelligence_digest != ""  # always has a message
-        assert isinstance(bundle.cost_summary.daily_usd, float)
 
     @pytest.mark.asyncio
     async def test_gather_with_data(self, db, gatherer):
@@ -165,7 +164,6 @@ class TestGatherForCalibration:
     async def test_returns_expected_keys(self, db, gatherer):
         data = await gatherer.gather_for_calibration(db)
         assert "procedure_stats" in data
-        assert "cost_summary" in data
         assert "recent_assessments" in data
 
 
@@ -206,21 +204,9 @@ class TestProcedureStats:
         assert bundle.procedure_stats.low_performers[0]["success_rate"] == 0.2
 
 
-class TestCostSummary:
+class TestCostSummaryRemoved:
     @pytest.mark.asyncio
-    async def test_empty_costs(self, db, gatherer):
+    async def test_no_cost_summary_field(self, db, gatherer):
+        """Cost summary fully removed from ContextBundle."""
         bundle = await gatherer.gather(db)
-        assert bundle.cost_summary.daily_usd == 0.0
-
-    @pytest.mark.asyncio
-    async def test_with_cost_events(self, db, gatherer):
-        now = datetime.now(UTC).isoformat()
-        await db.execute(
-            "INSERT INTO cost_events (id, event_type, cost_usd, created_at) "
-            "VALUES ('c1', 'llm_call', 0.5, ?)",
-            (now,),
-        )
-        await db.commit()
-        bundle = await gatherer.gather(db)
-        assert bundle.cost_summary.daily_usd == 0.5
-        assert bundle.cost_summary.daily_budget_pct == 0.25
+        assert not hasattr(bundle, "cost_summary")

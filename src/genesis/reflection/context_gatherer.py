@@ -9,12 +9,10 @@ import aiosqlite
 
 from genesis.db.crud import (
     cognitive_state,
-    cost_events,
     observations,
 )
 from genesis.reflection.types import (
     ContextBundle,
-    CostSummary,
     PendingWorkSummary,
     ProcedureStats,
 )
@@ -29,19 +27,12 @@ _COGNITIVE_STATE_STALE_HOURS = 24
 class ContextGatherer:
     """Assembles comprehensive context for deep reflection from multiple DB sources."""
 
-    def __init__(self, *, budget_daily: float = 2.0, budget_weekly: float = 10.0,
-                 budget_monthly: float = 30.0):
-        self._budget_daily = budget_daily
-        self._budget_weekly = budget_weekly
-        self._budget_monthly = budget_monthly
-
     async def gather(self, db: aiosqlite.Connection) -> ContextBundle:
         """Gather all context needed for a deep reflection invocation."""
         cog_state = await cognitive_state.render(db)
         recent_obs = await self._recent_observations(db)
         proc_stats = await self._procedure_stats(db)
         intel_digest = await self._intelligence_digest(db)
-        cost = await self._cost_summary(db)
         pending = await self.detect_pending_work(db)
         conversations = self._recent_conversation_turns()
         surplus_digest, surplus_ids = await self._promoted_surplus_digest(db)
@@ -52,7 +43,6 @@ class ContextGatherer:
             recent_observations=recent_obs,
             procedure_stats=proc_stats,
             intelligence_digest=intel_digest,
-            cost_summary=cost,
             pending_work=pending,
             recent_conversations=conversations,
             surplus_digest=surplus_digest,
@@ -184,7 +174,6 @@ class ContextGatherer:
     async def gather_for_calibration(self, db: aiosqlite.Connection) -> dict:
         """Gather data for weekly quality calibration."""
         proc_stats = await self._procedure_stats(db)
-        cost = await self._cost_summary(db)
 
         # Get recent self-assessment scores for trend comparison
         assessments = await observations.query(
@@ -197,11 +186,6 @@ class ContextGatherer:
                 "avg_success_rate": proc_stats.avg_success_rate,
                 "low_performers": proc_stats.low_performers,
                 "quarantined": proc_stats.total_quarantined,
-            },
-            "cost_summary": {
-                "daily_usd": cost.daily_usd,
-                "weekly_usd": cost.weekly_usd,
-                "monthly_usd": cost.monthly_usd,
             },
             "recent_assessments": [
                 {"created_at": a["created_at"], "content": a["content"][:500]}
@@ -287,28 +271,6 @@ class ContextGatherer:
             total_quarantined=quarantined_count,
             avg_success_rate=round(avg_rate, 3),
             low_performers=sorted(low, key=lambda x: x["success_rate"]),
-        )
-
-    async def _cost_summary(self, db: aiosqlite.Connection) -> CostSummary:
-        """Compute cost summary for current day/week/month."""
-        now = datetime.now(UTC)
-        day_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        week_start = (now - timedelta(days=now.weekday())).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        ).isoformat()
-        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
-
-        daily = await cost_events.sum_cost(db, since=day_start)
-        weekly = await cost_events.sum_cost(db, since=week_start)
-        monthly = await cost_events.sum_cost(db, since=month_start)
-
-        return CostSummary(
-            daily_usd=round(daily, 4),
-            weekly_usd=round(weekly, 4),
-            monthly_usd=round(monthly, 4),
-            daily_budget_pct=round(daily / self._budget_daily, 3) if self._budget_daily > 0 else 0,
-            weekly_budget_pct=round(weekly / self._budget_weekly, 3) if self._budget_weekly > 0 else 0,
-            monthly_budget_pct=round(monthly / self._budget_monthly, 3) if self._budget_monthly > 0 else 0,
         )
 
     async def _outreach_stats(self, db: aiosqlite.Connection) -> dict:
