@@ -404,50 +404,13 @@ class TestGenesisEgoContextBuilder:
     # ── Cost ────────────────────────────────────────────────────────────
 
     @pytest.mark.asyncio
-    async def test_cost_section(self, db, mock_health_data, capabilities):
-        await db.execute(
-            "INSERT INTO cost_events "
-            "(id, event_type, cost_usd, created_at) "
-            "VALUES (?, ?, ?, datetime('now'))",
-            ("c1", "llm_call", 0.15, ),
-        )
-        await db.execute(
-            "INSERT INTO cost_events "
-            "(id, event_type, cost_usd, created_at) "
-            "VALUES (?, ?, ?, datetime('now'))",
-            ("c2", "llm_call", 0.25, ),
-        )
+    async def test_cost_section_removed(self, db, mock_health_data, capabilities):
+        """Cost section intentionally removed to prevent budget escalation loop."""
         builder = GenesisEgoContextBuilder(
             db=db, health_data=mock_health_data, capabilities=capabilities,
         )
         result = await builder.build()
-        assert "Cost Status" in result
-        assert "$0.40" in result
-
-    @pytest.mark.asyncio
-    async def test_cost_section_with_ego_spend(self, db, mock_health_data, capabilities):
-        await db.execute(
-            "INSERT INTO ego_cycles "
-            "(id, output_text, proposals_json, focus_summary, model_used, "
-            "cost_usd, input_tokens, output_tokens, duration_ms, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
-            ("cyc1", "output", "[]", "focus", "opus-4", 0.08, 1000, 500, 3000),
-        )
-        builder = GenesisEgoContextBuilder(
-            db=db, health_data=mock_health_data, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "Ego spend today" in result
-        assert "$0.08" in result
-
-    @pytest.mark.asyncio
-    async def test_cost_section_empty(self, db, mock_health_data, capabilities):
-        builder = GenesisEgoContextBuilder(
-            db=db, health_data=mock_health_data, capabilities=capabilities,
-        )
-        result = await builder.build()
-        assert "Cost Status" in result
-        assert "$0.0000" in result
+        assert "Cost Status" not in result
 
     # ── Output Contract ─────────────────────────────────────────────────
 
@@ -490,7 +453,6 @@ class TestGenesisEgoContextBuilder:
             "## Awareness Signals",
             "## Unresolved Observations",
             "## Maintenance Follow-ups",
-            "## Cost Status",
             "## Active Proposals",
             "## Output Contract",
         ]
