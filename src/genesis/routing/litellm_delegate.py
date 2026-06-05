@@ -90,6 +90,27 @@ _CUSTOM_MODEL_COSTS: dict[str, dict] = {
         "mode": "chat",
         "litellm_provider": "nvidia_nim",
     },
+    # Response-model keys — OpenRouter's response.model omits the
+    # provider prefix. Register these so litellm.completion_cost() can
+    # look up costs even when it infers from response.model directly.
+    # Assumption: litellm has no built-in cost entry for deepseek-v4-*
+    # as of 2026-06-05 (litellm 1.78.7). Re-verify on litellm upgrades.
+    "deepseek/deepseek-v4-pro": {
+        "input_cost_per_token": 4.35e-7,
+        "output_cost_per_token": 8.7e-7,
+        "max_input_tokens": 131072,
+        "max_output_tokens": 131072,
+        "mode": "chat",
+        "litellm_provider": "openrouter",
+    },
+    "deepseek/deepseek-v4-flash": {
+        "input_cost_per_token": 9.83e-8,
+        "output_cost_per_token": 1.966e-7,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "mode": "chat",
+        "litellm_provider": "openrouter",
+    },
 }
 
 for _model, _cost in _CUSTOM_MODEL_COSTS.items():
@@ -144,7 +165,9 @@ class LiteLLMDelegate:
             else:
                 cost_known = True
                 try:
-                    cost = litellm.completion_cost(completion_response=response)
+                    cost = litellm.completion_cost(
+                        completion_response=response, model=model_string,
+                    )
                 except Exception:
                     cost = 0.0
                     cost_known = False

@@ -28,7 +28,6 @@ class GenesisEgoContextBuilder:
     - awareness_ticks for recent signal values
     - observations for unresolved Genesis-internal items
     - follow_ups for maintenance threads
-    - cost_events for budget tracking
     """
 
     def __init__(
@@ -85,7 +84,11 @@ class GenesisEgoContextBuilder:
             ("signals", self._signals_section),
             ("observations", self._observations_section),
             ("follow_ups", self._follow_ups_section),
-            ("cost", self._cost_section),
+            # Cost section removed — the genesis ego's identity doc says
+            # "Do NOT opine on config values... budget caps... are user
+            # decisions."  Feeding cost data every cycle caused a 10+
+            # escalation loop.  Cost data remains visible via health_status
+            # MCP and the dashboard for human review.
             ("proposal_history", self._proposal_history_section),
             ("proposal_board", self._proposal_board_section),
             ("execution_outcomes", self._execution_outcomes_section),
@@ -378,41 +381,6 @@ class GenesisEgoContextBuilder:
 
             pin_tag = " [pinned]" if fu.get("pinned") else ""
             lines.append(f"- [id:{fid}] [{priority}/{status}]{pin_tag} **{strategy}**: {content}")
-
-        lines.append("")
-        return "\n".join(lines)
-
-    async def _cost_section(self, *, depth: str = "deep") -> str:
-        """Daily spend and budget status."""
-        lines = ["## Cost Status\n"]
-
-        try:
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM cost_events "
-                "WHERE created_at >= ?",
-                (today,),
-            )
-            row = await cursor.fetchone()
-            daily_spend = row[0] if row else 0.0
-        except Exception:
-            logger.error("Failed to query cost_events", exc_info=True)
-            lines.append("*Cost data unavailable.*\n")
-            return "\n".join(lines)
-
-        lines.append(f"- **Today's spend**: ${daily_spend:.4f}")
-
-        try:
-            cursor = await self._db.execute(
-                "SELECT COALESCE(SUM(cost_usd), 0.0) FROM ego_cycles "
-                "WHERE created_at >= ?",
-                (today,),
-            )
-            row = await cursor.fetchone()
-            ego_spend = row[0] if row else 0.0
-            lines.append(f"- **Ego spend today**: ${ego_spend:.4f}")
-        except Exception:
-            pass
 
         lines.append("")
         return "\n".join(lines)

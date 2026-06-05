@@ -747,7 +747,7 @@ class UserEgoContextBuilder:
     # filtered from the user ego's view.  The genesis ego handles infra;
     # the user ego only sees user-impacting escalations.
     _INFRA_ESCALATION_KEYWORDS = frozenset({
-        "cost_unknown", "budget cap", "dream cycle", "deepseek",
+        "cost_unknown", "dream cycle", "deepseek",
         "provider fail", "circuit breaker", "qdrant", "heartbeat",
         "dead letter", "watchdog", "systemd", "memory growth",
     })
