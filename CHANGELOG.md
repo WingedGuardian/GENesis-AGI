@@ -7,6 +7,53 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ---
 
+## [v3.0b14] - 2026-06-04
+
+### Added
+
+- **Voice S2S pipeline** (#524, #525, #530, #532, #535) --- speech-to-
+  speech voice conversations via Wyoming protocol and GPT-Realtime API.
+  Includes conciseness nudge, audio output fix, and 30-minute idle
+  timeout.
+- **Ego notification pipeline** (#531) --- proposals deliver through
+  outreach with dedup, rate limiting, and quiet hours. Content firewall
+  prevents information leakage in dispatched content sessions.
+- **Ego domain separation** (#529) --- user ego and genesis ego operate
+  with distinct information boundaries. Domain-aware realist catches
+  cross-domain proposals before delivery.
+- **Verified autonomy** (#521, #522) --- ECE calibration metric and
+  quality scorer for autonomous execution. Adversarial review layer
+  validates dispatch outcomes.
+- **Dispatch gate** (#516) --- ego proposals route through the autonomy
+  approval pipeline before execution.
+- **Life domain model** (#539) --- memory system supports life domain
+  tags (employment, personal, genesis). User profile structured around
+  life dimensions.
+- **Essential knowledge: active work** (#509) --- real-time active work
+  section in the ego's essential context window.
+- **Dashboard contribution toggle** (#533) --- contribution offers can
+  be enabled or disabled from the dashboard Settings tab.
+- **Hook pipeline wiring** (#518) --- outcome verification, skill
+  injection, and feedback audit connected to the hook system.
+
+### Fixed
+
+- **Ego reactive spinning** (#538) --- reactive signal threshold raised
+  from WARNING to ERROR, eliminating thousands of noise-driven ego
+  cycles per week. Infrastructure escalations filtered from user ego
+  context. Dispatch verification fuzzy-matches similar filenames
+  instead of false-failing.
+- **Contribution hook in worktrees** (#538) --- config gate resolves
+  from the main repo root instead of the worktree path.
+- **Dream cycle OOM** (#517, #528) --- entity resolution OOM guard
+  prevents unbounded Qdrant searches. Chunked dedup handles large
+  memory buckets without memory exhaustion.
+- **DeepSeek V4 cost tracking** (#526) --- custom cost entries for
+  models not in litellm's registry. Dream cycle hardening for edge
+  cases.
+
+---
+
 ## [v3.0b13] - 2026-06-01
 
 ### Added
