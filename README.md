@@ -44,9 +44,7 @@ Every other AI agent puts you in the driver's seat—and keeps you there. YOU fi
 
 But now? **Personal AGI is here.**
 
-Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs.
-
-Open source. 150,000 lines. Clone it. Run it. Tell me I'm wrong.
+Not the sci-fi version. The real one: a system that remembers everything, learns from every interaction, thinks while you sleep, earns autonomy through demonstrated competence, and gets fundamentally better every day it runs. Clone it, run it; tell me I'm wrong!
 
 <details>
 <summary><i>But wait — is this really AGI?</i></summary>
