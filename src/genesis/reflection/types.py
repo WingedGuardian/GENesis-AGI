@@ -85,18 +85,6 @@ class ProcedureStats:
 
 
 @dataclass(frozen=True)
-class CostSummary:
-    """Cost summary for a time period."""
-
-    daily_usd: float = 0.0
-    weekly_usd: float = 0.0
-    monthly_usd: float = 0.0
-    daily_budget_pct: float = 0.0
-    weekly_budget_pct: float = 0.0
-    monthly_budget_pct: float = 0.0
-
-
-@dataclass(frozen=True)
 class ContextBundle:
     """All context assembled for a deep reflection invocation."""
 
@@ -105,7 +93,6 @@ class ContextBundle:
     procedure_stats: ProcedureStats = field(default_factory=ProcedureStats)
     intelligence_digest: str = ""
     skill_reports: list[dict] = field(default_factory=list)
-    cost_summary: CostSummary = field(default_factory=CostSummary)
     pending_work: PendingWorkSummary = field(default_factory=PendingWorkSummary)
     recent_conversations: list[dict] = field(default_factory=list)
     surplus_digest: str = ""

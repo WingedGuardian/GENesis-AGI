@@ -311,7 +311,6 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
     """Strategic reflection with context_gatherer uses enriched path with observations."""
     from genesis.reflection.types import (
         ContextBundle,
-        CostSummary,
         PendingWorkSummary,
         ProcedureStats,
     )
@@ -326,8 +325,6 @@ async def test_strategic_enriched_path_includes_observations_and_pointers(db, mo
         intelligence_digest="",
         pending_work=PendingWorkSummary(memory_consolidation=False),
         procedure_stats=ProcedureStats(total_active=0, total_quarantined=0, avg_success_rate=0, low_performers=[]),
-        cost_summary=CostSummary(daily_usd=0.0, weekly_usd=0.0, monthly_usd=0.0,
-                                 daily_budget_pct=0.0, weekly_budget_pct=0.0, monthly_budget_pct=0.0),
         recent_conversations=[],
         gathered_observation_ids=("obs-1",),
     ))

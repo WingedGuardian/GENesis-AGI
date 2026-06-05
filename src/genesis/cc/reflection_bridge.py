@@ -623,15 +623,6 @@ class CCReflectionBridge:
             if stats.low_performers:
                 parts.append(f"Low performers: {json.dumps(stats.low_performers)}")
 
-        # Cost summary
-        cost = bundle.cost_summary
-        parts.append(
-            f"\n## Cost Summary\n"
-            f"Today: ${cost.daily_usd:.4f} ({cost.daily_budget_pct:.0%} of daily budget)\n"
-            f"This week: ${cost.weekly_usd:.4f} ({cost.weekly_budget_pct:.0%} of weekly)\n"
-            f"This month: ${cost.monthly_usd:.4f} ({cost.monthly_budget_pct:.0%} of monthly)"
-        )
-
         # Recent user conversation
         if bundle.recent_conversations:
             conv_lines = []

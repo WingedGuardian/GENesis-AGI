@@ -5,7 +5,6 @@ import pytest
 from genesis.reflection.types import (
     AssessmentDimension,
     ContextBundle,
-    CostSummary,
     DeepReflectionJob,
     DeepReflectionOutput,
     DimensionScore,
@@ -72,18 +71,6 @@ class TestProcedureStats:
         assert ps.total_active == 0
         assert ps.avg_success_rate == 0.0
         assert ps.low_performers == []
-
-
-class TestCostSummary:
-    def test_defaults(self):
-        cs = CostSummary()
-        assert cs.daily_usd == 0.0
-        assert cs.monthly_budget_pct == 0.0
-
-    def test_with_values(self):
-        cs = CostSummary(daily_usd=1.5, daily_budget_pct=0.75)
-        assert cs.daily_usd == 1.5
-        assert cs.daily_budget_pct == 0.75
 
 
 class TestContextBundle:

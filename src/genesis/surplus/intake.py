@@ -537,6 +537,7 @@ async def _route_to_knowledge(
     # Build provenance.
     provenance = {
         "source_doc": f"intake:{scored.source.value}",
+        "source_pipeline": "surplus",
         "ingested_at": datetime.now(UTC).isoformat(),
     }
     if scored.generating_model:

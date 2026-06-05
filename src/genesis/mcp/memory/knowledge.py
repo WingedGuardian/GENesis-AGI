@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 _AUTHORITY_BOOST: dict[str, float] = {
     "curated": 1.5,
     "conversation": 1.0,
+    "surplus": 0.7,
     "recon": 0.5,
 }
 
