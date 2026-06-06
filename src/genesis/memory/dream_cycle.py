@@ -493,10 +493,7 @@ async def _synthesize_and_deprecate(
     # ── Adversarial review ──
     # A different-provider LLM reviews the synthesis for information loss.
     # Fail-safe: if review fails or errors, block this cluster.
-    from genesis.memory.adversarial_review import (
-        SynthesisBlockedError,
-        check_synthesis_faithfulness,
-    )
+    from genesis.memory.adversarial_review import check_synthesis_faithfulness
     adversarial_verdict = await check_synthesis_faithfulness(
         router=router,
         originals=[

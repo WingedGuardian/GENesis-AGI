@@ -61,13 +61,16 @@ async def _check_claim_duplicate(
     Uses FTS5 keyword search to find candidates, then Jaccard overlap
     to confirm. Deduplicates across all sessions.
     """
-    from genesis.memory.source_verification import _extract_terms
-
-    terms = _extract_terms(content)
+    import re
+    # Use a simple alphanumeric tokenizer inline rather than importing
+    # the private _extract_terms. Avoids cross-module private API coupling.
+    words = re.findall(r"[a-z0-9]+", content.lower())
+    terms = {w for w in words if len(w) > 2}
     if len(terms) < 3:
         return False  # Too short to meaningfully dedup
 
-    # Build FTS5 query from top terms (limit to 5 to avoid overly specific matches)
+    # Build FTS5 query from top terms. Only use pure alphanumeric terms —
+    # hyphens are FTS5 NOT operators, apostrophes cause parse errors.
     query_terms = sorted(terms, key=len, reverse=True)[:5]
     fts_query = " OR ".join(query_terms)
 
@@ -255,8 +258,6 @@ async def run_extraction_cycle(
                         session_id, overlap_result.overlap,
                         extraction.confidence, extraction.content,
                     )
-                    summary.setdefault("source_unverified", 0)
-                    summary["source_unverified"] += 1
 
                 # ── Cross-session claim dedup ──
                 # Check if a highly similar extraction already exists.
@@ -297,6 +298,10 @@ async def run_extraction_cycle(
                         **kwargs, force_fts5_only=True,
                     )
                     summary["entities_extracted"] += 1
+                    # Count source-unverified only for stored extractions
+                    if not overlap_result.verified:
+                        summary.setdefault("source_unverified", 0)
+                        summary["source_unverified"] += 1
                     session_extraction_count += 1
                     _newly_stored.append(
                         (memory_id, extraction.content, cc_session_id)
