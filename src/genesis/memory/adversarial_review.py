@@ -41,6 +41,11 @@ Respond with JSON only, no other text:
 - If you find information loss: {{"verdict": "FAIL", "missing": ["<specific item 1>", "<specific item 2>"]}}
 - If the synthesis faithfully preserves all information: {{"verdict": "PASS"}}
 
+Also check: do any of the originals contradict each other due to being recorded \
+at different times? If the synthesis resolves a temporal conflict, does it preserve \
+the CURRENT state and note the historical change? Flag any case where outdated \
+information is presented as current in the missing list.
+
 Your default assumption is that something was lost. You must actively convince \
 yourself nothing is missing before returning PASS."""
 

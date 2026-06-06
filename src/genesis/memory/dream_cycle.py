@@ -133,6 +133,7 @@ async def run(
         "memories_deprecated": 0,
         "adversarial_blocked": 0,
         "shrink_gate_blocked": 0,
+        "rollback_flagged": False,
         "errors": [],
     }
 
@@ -251,6 +252,22 @@ async def run(
             "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
             run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
         )
+
+        # ── Rollback flagging ──
+        # If >50% of synthesis attempts were blocked, flag the run for
+        # manual review. Do NOT auto-rollback.
+        total_blocked = report["adversarial_blocked"] + report["shrink_gate_blocked"]
+        total_attempted = merged + total_blocked
+        if total_attempted > 0:
+            block_rate = total_blocked / total_attempted
+            if block_rate > 0.50:
+                report["rollback_flagged"] = True
+                logger.critical(
+                    "Dream cycle %s: %.0f%% of syntheses blocked (%d/%d). "
+                    "Manual review recommended. Run rollback('%s') if needed.",
+                    run_id[:8], block_rate * 100,
+                    total_blocked, total_attempted, run_id,
+                )
 
     # ── Sprint 2 phases (each handles dry_run internally) ──────────────
 

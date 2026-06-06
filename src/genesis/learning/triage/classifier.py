@@ -88,6 +88,14 @@ class TriageClassifier:
             "  3 = FULL_ANALYSIS — full outcome + delta analysis",
             "  4 = FULL_PLUS_WORKAROUND — complex, needs workaround extraction",
             "",
+            "## Bias Correction",
+            "Interactions where the user corrected the assistant, expressed frustration,",
+            "or identified a mistake are MORE valuable for learning than smooth interactions.",
+            "A correction is WORTH_THINKING (2) or higher. Smooth, happy interactions are",
+            "QUICK_NOTE (1) unless they contain genuinely novel technical information.",
+            "Do NOT inflate depth because the user praised the response — praise signals",
+            "satisfaction, not learning value.",
+            "",
         ]
 
         if calibration:
