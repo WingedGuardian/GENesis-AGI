@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import random
+import statistics
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
     from genesis.memory.store import MemoryStore
     from genesis.routing.router import Router
+
+from genesis.memory.adversarial_review import SynthesisBlockedError
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,8 @@ async def run(
         "clusters_merged": 0,
         "clusters_skipped_large": 0,
         "memories_deprecated": 0,
+        "adversarial_blocked": 0,
+        "shrink_gate_blocked": 0,
         "errors": [],
     }
 
@@ -220,6 +225,17 @@ async def run(
                 )
                 merged += 1
                 report["memories_deprecated"] += result["deprecated_count"]
+            except SynthesisBlockedError as exc:
+                # Adversarial review or shrink gate blocked this cluster.
+                # Not an error — a quality gate working as intended.
+                if "catastrophic shrink" in str(exc):
+                    report["shrink_gate_blocked"] += 1
+                else:
+                    report["adversarial_blocked"] += 1
+                logger.info(
+                    "Dream cycle %s: cluster of %d blocked: %s",
+                    run_id[:8], len(cluster), exc,
+                )
             except Exception as exc:
                 report["errors"].append({
                     "cluster_size": len(cluster),
@@ -474,6 +490,43 @@ async def _synthesize_and_deprecate(
 
     synthesis = _parse_synthesis_response(result.content, wing, room)
 
+    # ── Adversarial review ──
+    # A different-provider LLM reviews the synthesis for information loss.
+    # Fail-safe: if review fails or errors, block this cluster.
+    from genesis.memory.adversarial_review import (
+        SynthesisBlockedError,
+        check_synthesis_faithfulness,
+    )
+    adversarial_verdict = await check_synthesis_faithfulness(
+        router=router,
+        originals=[
+            {"content": item["payload"].get("content", ""),
+             "confidence": item["payload"].get("confidence", 0.5)}
+            for item in cluster
+        ],
+        synthesis_text=synthesis.get("content", ""),
+    )
+    if not adversarial_verdict.passed:
+        raise SynthesisBlockedError(
+            missing=adversarial_verdict.missing,
+            error=adversarial_verdict.error,
+        )
+
+    # ── Catastrophic-shrink gate ──
+    # Block synthesis if it's <50% the combined length of originals.
+    originals_length = sum(
+        len(item["payload"].get("content", "")) for item in cluster
+    )
+    synthesis_length = len(synthesis.get("content", ""))
+    if originals_length > 0 and synthesis_length < originals_length * 0.5:
+        raise SynthesisBlockedError(
+            error=(
+                f"catastrophic shrink: synthesis {synthesis_length} chars "
+                f"vs originals {originals_length} chars "
+                f"({synthesis_length / originals_length:.0%})"
+            ),
+        )
+
     # Merge tags from originals + synthesis
     all_tags = set()
     for item in cluster:
@@ -485,17 +538,24 @@ async def _synthesize_and_deprecate(
     all_tags.add("synthesized")
     all_tags.add(f"dream_cycle_run_id:{run_id}")
 
-    # Store synthesized memory via MemoryStore
-    max_confidence = max(
+    # Store synthesized memory via MemoryStore.
+    # Use median confidence with a ceiling to prevent confidence inflation
+    # through consolidation cycles. max() lets a single high-confidence
+    # memory inflate the synthesis; median is resistant to outliers.
+    # Ceiling prevents unbounded growth across dream cycle runs.
+    source_confidences = [
         item["payload"].get("confidence", 0.5)
         for item in cluster
-    )
+    ]
+    median_confidence = statistics.median(source_confidences)
+    _CONFIDENCE_CEILING = 0.85
+
     new_memory_id = await store.store(
         synthesis["content"],
         source="dream_cycle",
         memory_type="episodic",
         tags=sorted(all_tags),
-        confidence=max(max_confidence, synthesis.get("confidence", 0.8)),
+        confidence=min(median_confidence, _CONFIDENCE_CEILING),
         source_pipeline="dream_cycle",
         wing=synthesis.get("wing", wing),
         room=synthesis.get("room", room),
