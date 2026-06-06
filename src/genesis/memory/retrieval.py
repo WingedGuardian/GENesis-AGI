@@ -130,6 +130,94 @@ def _rrf_fuse(
     return scores
 
 
+def _get_candidate_content(
+    mid: str,
+    qdrant_by_id: dict[str, dict],
+    fts_by_id: dict[str, dict],
+) -> str:
+    """Get content for a memory candidate from either Qdrant or FTS source."""
+    qhit = qdrant_by_id.get(mid)
+    if qhit:
+        return qhit.get("payload", {}).get("content", "")
+    fhit = fts_by_id.get(mid)
+    if fhit:
+        return fhit.get("content", "")
+    return ""
+
+
+def _apply_diversity_penalty(
+    candidates: list[str],
+    fused: dict[str, float],
+    qdrant_by_id: dict[str, dict],
+    fts_by_id: dict[str, dict],
+    *,
+    jaccard_threshold: float = 0.80,
+    penalty: float = 0.5,
+    max_per_cluster: int = 3,
+) -> list[str]:
+    """Penalize echo clusters in retrieval results.
+
+    When multiple candidates have near-identical content (Jaccard >= threshold),
+    only the highest-scored one keeps its full score. Others get penalized by
+    ``penalty`` multiplier. At most ``max_per_cluster`` candidates survive from
+    any echo cluster.
+
+    Prevents sycophantic memory clusters from dominating retrieval.
+    """
+    from genesis.memory.source_verification import compute_jaccard
+
+    if len(candidates) < 2:
+        return candidates
+
+    # Sort by score first so we process highest-scored candidates first
+    sorted_cands = sorted(candidates, key=lambda m: fused.get(m, 0.0), reverse=True)
+
+    # Track which cluster each candidate belongs to (Union-Find light)
+    cluster_of: dict[str, int] = {}
+    cluster_count: dict[int, int] = {}
+    next_cluster = 0
+
+    # Cache content to avoid repeated lookups
+    content_cache: dict[str, str] = {}
+    for mid in sorted_cands:
+        content_cache[mid] = _get_candidate_content(mid, qdrant_by_id, fts_by_id)
+
+    # Greedy clustering: compare each candidate against earlier (higher-scored) ones
+    for i, mid in enumerate(sorted_cands):
+        content_i = content_cache[mid]
+        if not content_i:
+            continue
+
+        matched_cluster = None
+        for j in range(i):
+            earlier = sorted_cands[j]
+            content_j = content_cache.get(earlier, "")
+            if not content_j:
+                continue
+            if compute_jaccard(content_i, content_j) >= jaccard_threshold:
+                matched_cluster = cluster_of.get(earlier)
+                break
+
+        if matched_cluster is not None:
+            cluster_of[mid] = matched_cluster
+            cluster_count[matched_cluster] = cluster_count.get(matched_cluster, 1) + 1
+            # Penalize if cluster already has max members
+            if cluster_count[matched_cluster] > max_per_cluster:
+                # Remove entirely — too many echoes
+                fused[mid] = 0.0
+            else:
+                # Penalize but keep
+                fused[mid] *= penalty
+        else:
+            # New cluster
+            cluster_of[mid] = next_cluster
+            cluster_count[next_cluster] = 1
+            next_cluster += 1
+
+    # Return candidates that still have positive scores
+    return [mid for mid in candidates if fused.get(mid, 0.0) > 0.0]
+
+
 async def _expired_candidate_ids(
     db: aiosqlite.Connection,
     candidate_ids: set[str],
@@ -394,6 +482,7 @@ class HybridRetriever:
                 tags=payload.get("tags") or [] if qdrant_hit else [],
                 now=now_str,
                 memory_class=mem_class,
+                last_retrieved_at=payload.get("last_retrieved_at") if qdrant_hit else None,
             )
             activation_by_id[mid] = act.final_score
 
@@ -524,6 +613,14 @@ class HybridRetriever:
             mid for mid in fused if activation_by_id.get(mid, 0.0) >= min_activation
         ]
 
+        # 8b. Diversity penalty — collapse echo clusters
+        # If multiple candidates have near-identical content (Jaccard ≥ 0.80),
+        # penalize lower-ranked echoes to prevent sycophantic memory clusters
+        # from dominating retrieval results.
+        candidates = _apply_diversity_penalty(
+            candidates, fused, qdrant_by_id, fts_by_id,
+        )
+
         # 9. Sort by fused score descending
         candidates.sort(key=lambda m: fused[m], reverse=True)
 
@@ -554,7 +651,7 @@ class HybridRetriever:
         # 10. Take top limit
         top = candidates[:limit]
 
-        # 11. Increment retrieved_count for returned results
+        # 11. Increment retrieved_count + stamp last_retrieved_at
         for mid in top:
             qdrant_hit = qdrant_by_id.get(mid)
             if qdrant_hit:
@@ -565,7 +662,10 @@ class HybridRetriever:
                         self._qdrant,
                         collection=coll,
                         point_id=mid,
-                        payload={"retrieved_count": old_count + 1},
+                        payload={
+                            "retrieved_count": old_count + 1,
+                            "last_retrieved_at": now_str,
+                        },
                     )
                 except Exception:
                     logger.warning(
