@@ -81,6 +81,38 @@ class EffortLevel(StrEnum):
     MAX = "max"
 
 
+# Ordered list used for ceiling comparisons (low → max).
+_EFFORT_RANK: list[EffortLevel] = [
+    EffortLevel.LOW,
+    EffortLevel.MEDIUM,
+    EffortLevel.HIGH,
+    EffortLevel.XHIGH,
+    EffortLevel.MAX,
+]
+
+# Maximum effort tier supported by each CC model.
+# XHIGH and MAX are Opus-only; the API silently accepts them on
+# Sonnet/Haiku (no error, just wasted/meaningless). Guard at dispatch
+# so intent is always visible in logs.
+_MODEL_EFFORT_CEILING: dict[CCModel, EffortLevel] = {
+    CCModel.OPUS: EffortLevel.MAX,
+    CCModel.SONNET: EffortLevel.HIGH,
+    CCModel.HAIKU: EffortLevel.HIGH,
+}
+
+
+def clamp_effort(model: CCModel, effort: EffortLevel) -> EffortLevel:
+    """Return *effort* clamped to the maximum supported by *model*.
+
+    XHIGH and MAX are Opus-only.  Sonnet/Haiku ceiling is HIGH.
+    Returns the (possibly clamped) effort; caller should warn on mismatch.
+    """
+    ceiling = _MODEL_EFFORT_CEILING.get(model, EffortLevel.HIGH)
+    if _EFFORT_RANK.index(effort) > _EFFORT_RANK.index(ceiling):
+        return ceiling
+    return effort
+
+
 @dataclass(frozen=True)
 class CCInvocation:
     prompt: str

@@ -564,6 +564,19 @@ echo "  CC temp: ${CC_TMP_DIR} (budget: 500MB, sacred: 150MB)"
 echo "  ~/.genesis/ initialized"
 echo
 
+# --- Journal size cap ---
+echo "--- Capping systemd journal size ---"
+JOURNALD_DROP_IN="/etc/systemd/journald.conf.d/genesis-size-cap.conf"
+if [[ "$(sudo cat "$JOURNALD_DROP_IN" 2>/dev/null)" != $'[Journal]\nSystemMaxUse=200M' ]]; then
+    sudo mkdir -p /etc/systemd/journald.conf.d/
+    printf '[Journal]\nSystemMaxUse=200M\n' | sudo tee "$JOURNALD_DROP_IN" >/dev/null
+    sudo systemctl restart systemd-journald 2>/dev/null || true
+    echo "  Journal capped at 200MB (~7 days rolling)"
+else
+    echo "  Journal cap already set (200MB)"
+fi
+echo
+
 # --- Systemd service sync ---
 echo "--- Syncing systemd service files ---"
 SYSTEMD_USER_DIR="$HOME/.config/systemd/user"

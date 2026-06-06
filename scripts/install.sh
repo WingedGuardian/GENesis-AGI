@@ -21,7 +21,7 @@
 #   OLLAMA_EMBEDDING_MODEL — Ollama embedding model (default: qwen3-embedding:0.6b-fp16)
 #   GENESIS_ENABLE_OLLAMA  — Enable local Ollama (default: false; cloud is default)
 #   QDRANT_VERSION         — Qdrant version to install if missing (default: 1.14.0)
-#   CC_VERSION             — Claude Code version to install (default: 2.1.87)
+#   CC_VERSION             — Claude Code version to install (default: 2.1.160)
 #   GH_VERSION             — gh CLI version if pkg-mgr fails (default: 2.65.0)
 #   RIPGREP_VERSION        — ripgrep version if pkg-mgr fails (default: 14.1.1)
 #   NODE_MAJOR             — Node.js major version (default: 20)
@@ -1144,7 +1144,7 @@ echo ""
 # ══════════════════════════════════════════════════════════════
 #  Step 12 — Claude Code install + login
 # ══════════════════════════════════════════════════════════════
-CC_VERSION="${CC_VERSION:-2.1.87}"  # Pinned — scrollback regression in 2.1.89+
+CC_VERSION="${CC_VERSION:-2.1.160}"  # CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 fixes scrollback (added in PR #479)
 echo "  [12/$TOTAL_STEPS] Setting up Claude Code (v${CC_VERSION})..."
 
 if command -v claude &>/dev/null; then
@@ -1152,18 +1152,20 @@ if command -v claude &>/dev/null; then
     echo "    . Claude Code already installed ($cc_ver)"
 else
     echo "    Installing Claude Code via npm..."
-    # npm install -g needs write access to /usr/local/lib/node_modules.
-    # Use sudo if available (typical in containers), fall back to plain npm.
-    _npm_cmd="npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+    # Pin to /usr/local prefix explicitly. Without this, dual-prefix containers
+    # (where the system has both /usr/lib/node_modules and /usr/local/lib/node_modules)
+    # land CC in the wrong place — `which claude` resolves to /usr/local/bin/claude
+    # but the install goes to /usr/lib/. See docs/reference/cc-compatibility.md.
+    _npm_cmd="npm install -g --prefix /usr/local @anthropic-ai/claude-code@${CC_VERSION}"
     if [ "$(id -u)" != "0" ] && command -v sudo &>/dev/null; then
-        _npm_cmd="sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+        _npm_cmd="sudo npm install -g --prefix /usr/local @anthropic-ai/claude-code@${CC_VERSION}"
     fi
     if timeout 300 $_npm_cmd; then
         cc_ver=$(claude --version 2>/dev/null || echo "unknown")
         echo "    + Claude Code installed ($cc_ver)"
     else
         echo "    WARNING: Claude Code installation failed"
-        echo "    Install manually: sudo npm install -g @anthropic-ai/claude-code@${CC_VERSION}"
+        echo "    Install manually: sudo npm install -g --prefix /usr/local @anthropic-ai/claude-code@${CC_VERSION}"
         SETUP_WARNINGS=1
     fi
 fi
@@ -1184,6 +1186,58 @@ fi
 if ! grep -q 'DISABLE_INSTALLATION_CHECKS' "$HOME/.bashrc" 2>/dev/null; then
     echo 'export DISABLE_INSTALLATION_CHECKS=1  # Genesis: npm-only CC install' >> "$HOME/.bashrc"
     echo "    + Suppressed CC native installer prompt (npm-only)"
+fi
+
+# Suppress CC auto-updater via user-level ~/.claude/settings.json.
+# Repo-level .claude/settings.json is NOT sufficient — it only applies when
+# CC is launched from the project directory. The auto-updater runs in
+# contexts where repo settings don't apply, so we set it at the user level.
+# See docs/reference/cc-compatibility.md for the discovery.
+_settings_file="$HOME/.claude/settings.json"
+mkdir -p "$HOME/.claude"
+if [ ! -f "$_settings_file" ]; then
+    cat > "$_settings_file" <<'CCSETTINGS'
+{
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_UPDATES": "1"
+  }
+}
+CCSETTINGS
+    echo "    + Created $_settings_file with auto-updater suppression"
+else
+    # Merge — preserves any existing env vars and other top-level keys.
+    if python3 - "$_settings_file" <<'PYEOF' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(2)
+if not isinstance(data, dict):
+    sys.exit(2)
+env = data.setdefault("env", {})
+if not isinstance(env, dict):
+    sys.exit(2)
+changed = False
+for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
+    if env.get(key) != "1":
+        env[key] = "1"
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print("merged")
+else:
+    print("unchanged")
+PYEOF
+    then
+        echo "    + Auto-updater suppression set in $_settings_file"
+    else
+        echo "    WARNING: Could not merge auto-updater settings into $_settings_file"
+        echo "    Add manually:  {\"env\": {\"DISABLE_AUTOUPDATER\": \"1\", \"DISABLE_UPDATES\": \"1\"}}"
+    fi
 fi
 
 # Login guidance (interactive only)

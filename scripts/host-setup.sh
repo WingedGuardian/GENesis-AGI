@@ -1133,11 +1133,14 @@ if [ "$_host_node_ok" = "0" ]; then
     fi
 fi
 
-CC_VERSION="${CC_VERSION:-2.1.87}"
+CC_VERSION="${CC_VERSION:-2.1.160}"  # CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 fixes scrollback (added in PR #479)
 if ! command -v claude &>/dev/null; then
     echo "  Installing Claude Code v${CC_VERSION} on host..."
     if command -v npm &>/dev/null; then
-        sudo npm install -g "@anthropic-ai/claude-code@${CC_VERSION}" 2>/dev/null && \
+        # Pass PATH through sudo — npm is often installed via nvm and not in
+        # sudo's secure_path. Without this, sudo reports "npm: command not found"
+        # even though npm works fine for the user.
+        sudo env "PATH=$PATH" npm install -g "@anthropic-ai/claude-code@${CC_VERSION}" 2>/dev/null && \
             echo "  + Claude Code $(claude --version 2>/dev/null || echo "$CC_VERSION") installed on host" || \
             echo "  WARNING: npm install of Claude Code failed."
     else
@@ -1145,6 +1148,55 @@ if ! command -v claude &>/dev/null; then
     fi
 else
     echo "  . Claude Code already on host ($(claude --version 2>/dev/null))"
+fi
+
+# Suppress CC auto-updater via user-level ~/.claude/settings.json on the host.
+# The repo's .claude/settings.json doesn't apply when CC runs outside the project
+# directory, and CC's auto-updater silently bumps the version in that context.
+# See docs/reference/cc-compatibility.md for the discovery.
+_host_user="${SUDO_USER:-$(whoami)}"
+_host_home=$(eval echo "~$_host_user")
+_host_settings_file="$_host_home/.claude/settings.json"
+mkdir -p "$_host_home/.claude"
+if [ ! -f "$_host_settings_file" ]; then
+    cat > "$_host_settings_file" <<'CCSETTINGS'
+{
+  "env": {
+    "DISABLE_AUTOUPDATER": "1",
+    "DISABLE_UPDATES": "1"
+  }
+}
+CCSETTINGS
+    chown "$_host_user:" "$_host_settings_file" 2>/dev/null || true
+    echo "  + Created $_host_settings_file with auto-updater suppression"
+else
+    if python3 - "$_host_settings_file" <<'PYEOF' 2>/dev/null
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(2)
+if not isinstance(data, dict):
+    sys.exit(2)
+env = data.setdefault("env", {})
+if not isinstance(env, dict):
+    sys.exit(2)
+changed = False
+for key in ("DISABLE_AUTOUPDATER", "DISABLE_UPDATES"):
+    if env.get(key) != "1":
+        env[key] = "1"
+        changed = True
+if changed:
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+PYEOF
+    then
+        echo "  + Auto-updater suppression set in $_host_settings_file"
+    else
+        echo "  WARNING: Could not merge auto-updater settings into $_host_settings_file"
+    fi
 fi
 
 # ── Convenience alias on host ─────────────────────────────────

@@ -309,16 +309,35 @@ class TestAnalyzerIntegration:
 
 
 class TestRegistryCheck:
-    """Remote npm registry version monitoring.
-
-    _check_registry_version() is now a no-op — Genesis is pegged to a
-    specific CC version. These tests verify it produces no observations.
-    """
+    """Remote npm registry version monitoring."""
 
     @pytest.mark.asyncio
-    async def test_registry_check_is_noop(self, collector, db) -> None:
-        """_check_registry_version is a no-op — no observations stored."""
-        await collector._check_registry_version("1.0.0")
+    async def test_registry_newer_creates_observation(self, collector, db) -> None:
+        """When registry has a newer version, a cc_version_available observation is stored."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="2.0.0",
+        ):
+            await collector._check_registry_version("1.0.0")
+
+        cursor = await db.execute(
+            "SELECT content FROM observations WHERE type = 'cc_version_available'",
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        import json as _json
+        data = _json.loads(row[0])
+        assert data["installed"] == "1.0.0"
+        assert data["available"] == "2.0.0"
+
+    @pytest.mark.asyncio
+    async def test_registry_same_version_no_observation(self, collector, db) -> None:
+        """When registry matches installed, no observation is created."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="1.0.0",
+        ):
+            await collector._check_registry_version("1.0.0")
 
         cursor = await db.execute(
             "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
@@ -327,15 +346,53 @@ class TestRegistryCheck:
         assert row[0] == 0
 
     @pytest.mark.asyncio
-    async def test_registry_check_silent(self, collector, db) -> None:
-        """No-op doesn't raise regardless of input."""
-        await collector._check_registry_version("1.0.0")  # Should not raise
+    async def test_registry_older_version_no_observation(self, collector, db) -> None:
+        """When registry is older than installed, no observation is created."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="0.9.0",
+        ):
+            await collector._check_registry_version("1.0.0")
 
         cursor = await db.execute(
             "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
         )
         row = await cursor.fetchone()
         assert row[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_registry_empty_response_no_observation(self, collector, db) -> None:
+        """When npm returns empty string, no observation is created."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="",
+        ):
+            await collector._check_registry_version("1.0.0")
+
+        cursor = await db.execute(
+            "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 0
+
+    @pytest.mark.asyncio
+    async def test_registry_check_deduped_on_repeat_calls(self, collector, db) -> None:
+        """Second call with same newer registry version skips npm and creates no duplicate."""
+        with patch.object(
+            CCVersionCollector, "_get_registry_version",
+            new_callable=AsyncMock, return_value="2.0.0",
+        ) as mock_npm:
+            await collector._check_registry_version("1.0.0")  # Creates observation
+            await collector._check_registry_version("1.0.0")  # Should be a no-op
+
+        # npm called exactly once — gated by unresolved observation on second call
+        mock_npm.assert_awaited_once()
+
+        cursor = await db.execute(
+            "SELECT count(*) FROM observations WHERE type = 'cc_version_available'",
+        )
+        row = await cursor.fetchone()
+        assert row[0] == 1
 
     def test_is_newer_basic(self) -> None:
         """Semver comparison works correctly."""

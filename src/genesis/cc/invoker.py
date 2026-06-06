@@ -21,7 +21,7 @@ from genesis.cc.exceptions import (
     CCSessionError,
     CCTimeoutError,
 )
-from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent
+from genesis.cc.types import CCInvocation, CCModel, CCOutput, StreamEvent, clamp_effort
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,13 @@ class CCInvoker:
         args = [self._claude_path, "-p"]
         args += ["--model", str(inv.model)]
         args += ["--output-format", inv.output_format]
-        args += ["--effort", str(inv.effort)]
+        effort = clamp_effort(inv.model, inv.effort)
+        if effort != inv.effort:
+            logger.warning(
+                "Effort %r exceeds max for model %r — clamping to %r",
+                str(inv.effort), str(inv.model), str(effort),
+            )
+        args += ["--effort", str(effort)]
         system_prompt = inv.system_prompt
         if system_prompt and inv.skip_permissions and self._protected_paths:
             protection_context = self._protected_paths.format_for_prompt()
@@ -294,10 +300,15 @@ class CCInvoker:
         env = self._build_env(invocation)
         start = time.monotonic()
 
+        # Extract dispatched effort from args — may differ from invocation.effort
+        # if clamp_effort() clamped it for a non-Opus model.
+        effort_idx = args.index("--effort") + 1
+        dispatched_effort = args[effort_idx]
+
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, invocation.effort, invocation.timeout_s,
+            invocation.model, dispatched_effort, invocation.timeout_s,
             prompt_preview,
         )
 
@@ -415,10 +426,15 @@ class CCInvoker:
         env = self._build_env(invocation)
         start = time.monotonic()
 
+        # Extract dispatched effort from args — may differ from invocation.effort
+        # if clamp_effort() clamped it for a non-Opus model.
+        effort_idx = args.index("--effort") + 1
+        dispatched_effort = args[effort_idx]
+
         prompt_preview = invocation.prompt[:80].replace("\n", " ")
         logger.info(
             "CC streaming session starting: model=%s effort=%s timeout=%ds prompt=%r...",
-            invocation.model, invocation.effort, invocation.timeout_s,
+            invocation.model, dispatched_effort, invocation.timeout_s,
             prompt_preview,
         )
 
