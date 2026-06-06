@@ -361,10 +361,16 @@ call_sites:
   # Free-tier only. Separate from 22_tagging (entity extraction).
   dream_cycle_synthesis:
     chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
+    - groq-free
+    retry_profile: background
+  # Adversarial challenge of synthesis output. Different provider from
+  # synthesis (Kimi challenges DeepSeek) ensures model independence.
+  dream_cycle_synthesis_challenge:
+    chain:
     - nvidia-nim-kimi
     - groq-free
-    - mistral-small-free
-    - openrouter-free
     retry_profile: background
   dream_cycle_entity_check:
     chain:
@@ -372,6 +378,13 @@ call_sites:
     - groq-free
     - mistral-small-free
     - openrouter-free
+    retry_profile: background
+  # Adversarial challenge of entity "duplicate" verdicts. Flipped pairing:
+  # DeepSeek challenges Kimi's entity judgments.
+  dream_cycle_entity_challenge:
+    chain:
+    - nvidia-nim-deepseek
+    - openrouter-deepseek-v4-flash
     retry_profile: background
   27_pre_execution_assessment:
     chain:
