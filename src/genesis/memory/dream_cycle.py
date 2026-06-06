@@ -197,6 +197,23 @@ async def run(
     if dry_run:
         report["sample_clusters"] = _sample_clusters(all_clusters, n=5)
 
+    # Phase 2b — Cross-wing similarity scan (detection only)
+    # Finds memories that are similar across different wings. Creates links
+    # but never merges or deprecates cross-wing. Runs in both dry_run and live.
+    try:
+        cross_wing = await _cross_wing_scan(
+            qdrant=qdrant, db=db, buckets=buckets, run_id=run_id,
+        )
+        report["cross_wing_findings"] = cross_wing
+        if cross_wing:
+            logger.info(
+                "Dream cycle %s: %d cross-wing finding(s)",
+                run_id[:8], len(cross_wing),
+            )
+    except Exception:
+        logger.warning("Cross-wing scan failed", exc_info=True)
+        report["cross_wing_findings"] = []
+
     # Phase 3+4 — Synthesize and deprecate (live mode only)
     if not dry_run:
         all_clusters.sort(key=len, reverse=True)
@@ -363,6 +380,127 @@ async def _scroll_and_group(
 ) -> dict[tuple[str, str], list[dict]]:
     """Async wrapper — offloads blocking Qdrant scroll I/O to thread pool."""
     return await asyncio.to_thread(_scroll_and_group_sync, qdrant)
+
+
+async def _cross_wing_scan(
+    *,
+    qdrant: QdrantClient,
+    db: aiosqlite.Connection,
+    buckets: dict[tuple[str, str], list[dict]],
+    run_id: str,
+    top_n_per_wing: int = 20,
+    similarity_threshold: float = 0.90,
+    contradiction_threshold: float = 0.95,
+) -> list[dict]:
+    """Scan for similar memories across different wings.
+
+    Takes the top-N highest-confidence memories from each wing and searches
+    for cross-wing matches via Qdrant similarity search. Creates links for
+    findings but never merges or deprecates.
+
+    Returns a list of finding dicts for the report.
+    """
+    from genesis.qdrant.collections import search as qdrant_search
+
+    # Group points by wing (collapse rooms within each wing)
+    wing_points: dict[str, list[dict]] = defaultdict(list)
+    for (_wing, _room), points in buckets.items():
+        wing_points[_wing].extend(points)
+
+    wings = list(wing_points.keys())
+    if len(wings) < 2:
+        return []
+
+    # Take top-N per wing by confidence
+    wing_top: dict[str, list[dict]] = {}
+    for wing, points in wing_points.items():
+        sorted_pts = sorted(
+            points,
+            key=lambda p: p.get("payload", {}).get("confidence", 0.0),
+            reverse=True,
+        )
+        wing_top[wing] = sorted_pts[:top_n_per_wing]
+
+    # Get vectors for top points
+    all_top_ids = [p["id"] for pts in wing_top.values() for p in pts]
+    vectors = await asyncio.to_thread(
+        _batch_get_vectors, qdrant, all_top_ids,
+    )
+
+    findings: list[dict] = []
+    link_count = 0
+
+    for i, wing_a in enumerate(wings):
+        for wing_b in wings[i + 1:]:
+            # Search wing_b for memories similar to wing_a's top memories
+            for point in wing_top.get(wing_a, []):
+                vec = vectors.get(point["id"])
+                if not vec:
+                    continue
+
+                try:
+                    hits = await asyncio.to_thread(
+                        qdrant_search,
+                        qdrant,
+                        collection=COLLECTION,
+                        query_vector=vec,
+                        limit=5,
+                        wing=wing_b,
+                    )
+                except Exception:
+                    continue
+
+                for hit in hits:
+                    score = hit.get("score", 0.0)
+                    if score < similarity_threshold:
+                        continue
+
+                    content_a = point.get("payload", {}).get("content", "")[:200]
+                    content_b = hit.get("payload", {}).get("content", "")[:200]
+
+                    link_type = (
+                        "contradicts" if score >= contradiction_threshold
+                        else "related_to"
+                    )
+
+                    # Create link between cross-wing memories
+                    try:
+                        from genesis.db.crud import memory_links
+                        await memory_links.create(
+                            db,
+                            source_id=point["id"],
+                            target_id=hit["id"],
+                            link_type=link_type,
+                            strength=round(score, 4),
+                            created_at=datetime.now(UTC).isoformat(),
+                        )
+                        link_count += 1
+                    except Exception:
+                        logger.debug(
+                            "Cross-wing link creation failed",
+                            exc_info=True,
+                        )
+
+                    findings.append({
+                        "wing_a": wing_a,
+                        "wing_b": wing_b,
+                        "memory_a": point["id"][:8],
+                        "memory_b": hit["id"][:8],
+                        "cosine": round(score, 3),
+                        "link_type": link_type,
+                        "content_a_preview": content_a,
+                        "content_b_preview": content_b,
+                    })
+
+    if link_count:
+        try:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
+        except Exception:
+            pass
+
+    return findings
+
 
 
 # ── Phase 2: Cluster ────────────────────────────────────────────────────
