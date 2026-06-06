@@ -56,21 +56,25 @@ value is in naming the gaps, not hiding them.
 - **Fact vs. opinion conflation** — "Genesis uses SQLite WAL" and
   "Genesis's memory system is sophisticated" are stored identically.
   No structural marker distinguishes verifiable facts from judgments.
-- **Stale fact consolidation** — dream cycle can merge a stale memory
-  with a current one, blending outdated and current information without
-  flagging temporal conflict.
+- **Stale fact consolidation** — adversarial review now checks for
+  temporal conflicts, but relies on LLM judgment to detect them.
+  Structural temporal markers are not compared.
 - **Slow vocabulary rotation** — same sycophantic claim restated with
   different words each session can evade lexical dedup if Jaccard drops
   below 0.70.
 
 ### Structural
 
-- **Wing/room isolation blind spots** — dream cycle groups by
-  `(wing, room)`. Conflicting facts across wings are never compared.
-- **Connection pass as amplifier** — sycophantically similar memories
-  form dense link clusters, getting amplified in graph-boosted retrieval.
-- **No automatic rollback trigger** — dream cycle has `rollback()` but
-  nothing calls it automatically. Bad runs persist until manual discovery.
+- **Wing/room isolation** — cross-wing scan (PR 2) detects and links
+  similar memories across wings, but does not merge them. Conflicting
+  facts across wings are now linked as `contradicts` but resolution is
+  manual. *(Partially addressed: PR 2)*
+- **Connection pass as amplifier** — retrieval diversity penalty (PR 2)
+  collapses echo clusters at retrieval time, but the underlying link
+  density is unchanged. *(Partially addressed: PR 2)*
+- **Rollback trigger** — dream cycle now flags runs with >50% blocked
+  syntheses via `logger.critical()`. Manual rollback still required.
+  *(Partially addressed: PR 2)*
 
 ### External
 
@@ -100,3 +104,4 @@ them is part of the design — they represent known limitations, not bugs.
 | Date | PR | What Changed |
 |------|-----|-------------|
 | 2026-06-06 | Immune System PR 1 | Source-overlap, claim dedup, confidence cap, adversarial challenge (synthesis + entity), shrink gate, shadow gates activated |
+| 2026-06-06 | Immune System PR 2 | Triage counter-bias, retrieval diversity penalty, cross-wing scan, temporal conflict detection, rollback flagging, activation-aware decay |
