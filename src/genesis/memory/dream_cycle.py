@@ -23,6 +23,7 @@ import asyncio
 import json
 import logging
 import random
+import statistics
 import uuid
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
 
     from genesis.memory.store import MemoryStore
     from genesis.routing.router import Router
+
+from genesis.memory.adversarial_review import SynthesisBlockedError
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +131,9 @@ async def run(
         "clusters_merged": 0,
         "clusters_skipped_large": 0,
         "memories_deprecated": 0,
+        "adversarial_blocked": 0,
+        "shrink_gate_blocked": 0,
+        "rollback_flagged": False,
         "errors": [],
     }
 
@@ -191,6 +197,23 @@ async def run(
     if dry_run:
         report["sample_clusters"] = _sample_clusters(all_clusters, n=5)
 
+    # Phase 2b — Cross-wing similarity scan (detection only)
+    # Finds memories that are similar across different wings. Creates links
+    # but never merges or deprecates cross-wing. Runs in both dry_run and live.
+    try:
+        cross_wing = await _cross_wing_scan(
+            qdrant=qdrant, db=db, buckets=buckets, run_id=run_id,
+        )
+        report["cross_wing_findings"] = cross_wing
+        if cross_wing:
+            logger.info(
+                "Dream cycle %s: %d cross-wing finding(s)",
+                run_id[:8], len(cross_wing),
+            )
+    except Exception:
+        logger.warning("Cross-wing scan failed", exc_info=True)
+        report["cross_wing_findings"] = []
+
     # Phase 3+4 — Synthesize and deprecate (live mode only)
     if not dry_run:
         all_clusters.sort(key=len, reverse=True)
@@ -220,6 +243,17 @@ async def run(
                 )
                 merged += 1
                 report["memories_deprecated"] += result["deprecated_count"]
+            except SynthesisBlockedError as exc:
+                # Adversarial review or shrink gate blocked this cluster.
+                # Not an error — a quality gate working as intended.
+                if "catastrophic shrink" in str(exc):
+                    report["shrink_gate_blocked"] += 1
+                else:
+                    report["adversarial_blocked"] += 1
+                logger.info(
+                    "Dream cycle %s: cluster of %d blocked: %s",
+                    run_id[:8], len(cluster), exc,
+                )
             except Exception as exc:
                 report["errors"].append({
                     "cluster_size": len(cluster),
@@ -235,6 +269,22 @@ async def run(
             "Dream cycle %s: merged %d clusters, deprecated %d memories, %d errors",
             run_id[:8], merged, report["memories_deprecated"], len(report["errors"]),
         )
+
+        # ── Rollback flagging ──
+        # If >50% of synthesis attempts were blocked, flag the run for
+        # manual review. Do NOT auto-rollback.
+        total_blocked = report["adversarial_blocked"] + report["shrink_gate_blocked"]
+        total_attempted = merged + total_blocked
+        if total_attempted > 0:
+            block_rate = total_blocked / total_attempted
+            if block_rate > 0.50:
+                report["rollback_flagged"] = True
+                logger.critical(
+                    "Dream cycle %s: %.0f%% of syntheses blocked (%d/%d). "
+                    "Manual review recommended. Run rollback('%s') if needed.",
+                    run_id[:8], block_rate * 100,
+                    total_blocked, total_attempted, run_id,
+                )
 
     # ── Sprint 2 phases (each handles dry_run internally) ──────────────
 
@@ -330,6 +380,135 @@ async def _scroll_and_group(
 ) -> dict[tuple[str, str], list[dict]]:
     """Async wrapper — offloads blocking Qdrant scroll I/O to thread pool."""
     return await asyncio.to_thread(_scroll_and_group_sync, qdrant)
+
+
+async def _cross_wing_scan(
+    *,
+    qdrant: QdrantClient,
+    db: aiosqlite.Connection,
+    buckets: dict[tuple[str, str], list[dict]],
+    run_id: str,
+    top_n_per_wing: int = 20,
+    similarity_threshold: float = 0.90,
+) -> list[dict]:
+    """Scan for similar memories across different wings.
+
+    Takes the top-N highest-confidence memories from each wing and searches
+    for cross-wing matches via Qdrant similarity search. Creates links for
+    findings but never merges or deprecates.
+
+    Returns a list of finding dicts for the report.
+    """
+    from genesis.qdrant.collections import search as qdrant_search
+
+    # Group points by wing (collapse rooms within each wing)
+    wing_points: dict[str, list[dict]] = defaultdict(list)
+    for (_wing, _room), points in buckets.items():
+        wing_points[_wing].extend(points)
+
+    wings = list(wing_points.keys())
+    if len(wings) < 2:
+        return []
+
+    # Take top-N per wing by confidence
+    wing_top: dict[str, list[dict]] = {}
+    for wing, points in wing_points.items():
+        sorted_pts = sorted(
+            points,
+            key=lambda p: p.get("payload", {}).get("confidence", 0.0),
+            reverse=True,
+        )
+        wing_top[wing] = sorted_pts[:top_n_per_wing]
+
+    # Get vectors for top points
+    all_top_ids = [p["id"] for pts in wing_top.values() for p in pts]
+    vectors = await asyncio.to_thread(
+        _batch_get_vectors, qdrant, all_top_ids,
+    )
+
+    findings: list[dict] = []
+    link_count = 0
+
+    for i, wing_a in enumerate(wings):
+        for wing_b in wings[i + 1:]:
+            # Search wing_b for memories similar to wing_a's top memories
+            for point in wing_top.get(wing_a, []):
+                vec = vectors.get(point["id"])
+                if not vec:
+                    continue
+
+                try:
+                    hits = await asyncio.to_thread(
+                        qdrant_search,
+                        qdrant,
+                        collection=COLLECTION,
+                        query_vector=vec,
+                        limit=5,
+                        wing=wing_b,
+                    )
+                except Exception:
+                    continue
+
+                for hit in hits:
+                    score = hit.get("score", 0.0)
+                    if score < similarity_threshold:
+                        continue
+
+                    content_a = point.get("payload", {}).get("content", "")[:200]
+                    content_b = hit.get("payload", {}).get("content", "")[:200]
+
+                    # Cosine similarity alone cannot detect contradiction —
+                    # high cosine means similar, not contradictory. Use
+                    # related_to for all cross-wing findings. Contradiction
+                    # detection would require an LLM semantic check.
+                    link_type = "related_to"
+
+                    # Create link between cross-wing memories (skip if exists)
+                    try:
+                        from genesis.db.crud import memory_links
+                        # Check for existing link to avoid UNIQUE constraint
+                        # failures on subsequent runs
+                        existing = await db.execute(
+                            "SELECT 1 FROM memory_links "
+                            "WHERE source_id = ? AND target_id = ? LIMIT 1",
+                            (point["id"], hit["id"]),
+                        )
+                        if not await existing.fetchone():
+                            await memory_links.create(
+                                db,
+                                source_id=point["id"],
+                                target_id=hit["id"],
+                                link_type=link_type,
+                                strength=round(score, 4),
+                                created_at=datetime.now(UTC).isoformat(),
+                            )
+                            link_count += 1
+                    except Exception:
+                        logger.debug(
+                            "Cross-wing link creation failed",
+                            exc_info=True,
+                        )
+
+                    findings.append({
+                        "wing_a": wing_a,
+                        "wing_b": wing_b,
+                        "memory_a": point["id"][:8],
+                        "memory_b": hit["id"][:8],
+                        "cosine": round(score, 3),
+                        "link_type": link_type,
+                        "content_a_preview": content_a,
+                        "content_b_preview": content_b,
+                    })
+
+    if link_count:
+        try:
+            from genesis.memory.graph import invalidate_graph_cache
+            invalidate_graph_cache()
+        except Exception:
+            pass
+
+    return findings
+
 
 
 # ── Phase 2: Cluster ────────────────────────────────────────────────────
@@ -474,6 +653,40 @@ async def _synthesize_and_deprecate(
 
     synthesis = _parse_synthesis_response(result.content, wing, room)
 
+    # ── Adversarial review ──
+    # A different-provider LLM reviews the synthesis for information loss.
+    # Fail-safe: if review fails or errors, block this cluster.
+    from genesis.memory.adversarial_review import check_synthesis_faithfulness
+    adversarial_verdict = await check_synthesis_faithfulness(
+        router=router,
+        originals=[
+            {"content": item["payload"].get("content", ""),
+             "confidence": item["payload"].get("confidence", 0.5)}
+            for item in cluster
+        ],
+        synthesis_text=synthesis.get("content", ""),
+    )
+    if not adversarial_verdict.passed:
+        raise SynthesisBlockedError(
+            missing=adversarial_verdict.missing,
+            error=adversarial_verdict.error,
+        )
+
+    # ── Catastrophic-shrink gate ──
+    # Block synthesis if it's <50% the combined length of originals.
+    originals_length = sum(
+        len(item["payload"].get("content", "")) for item in cluster
+    )
+    synthesis_length = len(synthesis.get("content", ""))
+    if originals_length > 0 and synthesis_length < originals_length * 0.5:
+        raise SynthesisBlockedError(
+            error=(
+                f"catastrophic shrink: synthesis {synthesis_length} chars "
+                f"vs originals {originals_length} chars "
+                f"({synthesis_length / originals_length:.0%})"
+            ),
+        )
+
     # Merge tags from originals + synthesis
     all_tags = set()
     for item in cluster:
@@ -485,17 +698,24 @@ async def _synthesize_and_deprecate(
     all_tags.add("synthesized")
     all_tags.add(f"dream_cycle_run_id:{run_id}")
 
-    # Store synthesized memory via MemoryStore
-    max_confidence = max(
+    # Store synthesized memory via MemoryStore.
+    # Use median confidence with a ceiling to prevent confidence inflation
+    # through consolidation cycles. max() lets a single high-confidence
+    # memory inflate the synthesis; median is resistant to outliers.
+    # Ceiling prevents unbounded growth across dream cycle runs.
+    source_confidences = [
         item["payload"].get("confidence", 0.5)
         for item in cluster
-    )
+    ]
+    median_confidence = statistics.median(source_confidences)
+    _CONFIDENCE_CEILING = 0.85
+
     new_memory_id = await store.store(
         synthesis["content"],
         source="dream_cycle",
         memory_type="episodic",
         tags=sorted(all_tags),
-        confidence=max(max_confidence, synthesis.get("confidence", 0.8)),
+        confidence=min(median_confidence, _CONFIDENCE_CEILING),
         source_pipeline="dream_cycle",
         wing=synthesis.get("wing", wing),
         room=synthesis.get("room", room),

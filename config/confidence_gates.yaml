@@ -1,20 +1,19 @@
 # Confidence gating thresholds — tunable at runtime via settings_update
 #
-# Current LLM output distribution: 0.70-0.95, clusters at 0.70/0.80/0.85/0.90/0.95
-# After prompt calibration, expect lower values to appear.
-# Start permissive (shadow mode), raise thresholds after observing real distribution.
-#
-# shadow_mode: true = log what would be filtered but don't enforce
+# LLM output distribution: 0.70-0.95, clusters at 0.70/0.80/0.85/0.90/0.95
+# Shadow mode gates activated 2026-06-06 as part of the memory immune
+# system PR. Thresholds raised from 0.3 to 0.5 to catch the low-quality
+# tail without mass-filtering. Monitor for 2 weeks to calibrate.
 
 observation_write:
-  min_confidence: 0.3
-  shadow_mode: true
+  min_confidence: 0.5
+  shadow_mode: false
 
 memory_upsertion:
   min_confidence: 0.4
   shadow_mode: false
 
 deep_reflection:
-  min_confidence: 0.3
+  min_confidence: 0.5
   min_separability: 0.2
-  shadow_mode: true
+  shadow_mode: false

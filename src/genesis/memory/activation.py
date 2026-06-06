@@ -51,6 +51,7 @@ def compute_activation(
     half_life_days: float | None = None,
     now: str | None = None,
     memory_class: str = "fact",
+    last_retrieved_at: str | None = None,
 ) -> ActivationScore:
     """Compute activation score with category-aware decay.
 
@@ -61,6 +62,9 @@ def compute_activation(
         half_life_days: Explicit override. If set, bypasses category routing.
         memory_class: Classification (rule/fact/reference). Rules get 1.3x
             boost, references get 0.7x weight.
+        last_retrieved_at: ISO timestamp of last retrieval. Used for
+            activation-aware carryforward: recently-retrieved memories
+            decay more slowly even if they were created long ago.
     """
     now_dt = (
         datetime.fromisoformat(now) if now else datetime.now(UTC)
@@ -73,6 +77,24 @@ def compute_activation(
     age_days = (now_dt - created_dt).total_seconds() / 86400
 
     effective_hl = _effective_half_life(source, tags, half_life_days)
+
+    # Activation-aware carryforward: if the memory was recently retrieved
+    # (within 30 days), boost its effective half-life by 1.5x. This prevents
+    # memories from being penalized for being off-topic in recent sessions
+    # when they were genuinely useful when their topic was active.
+    _RECENTLY_GROUNDED_DAYS = 30
+    _GROUNDING_BOOST = 1.5
+    if last_retrieved_at:
+        try:
+            last_dt = datetime.fromisoformat(last_retrieved_at)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=UTC)
+            days_since_retrieval = (now_dt - last_dt).total_seconds() / 86400
+            if days_since_retrieval <= _RECENTLY_GROUNDED_DAYS:
+                effective_hl *= _GROUNDING_BOOST
+        except (ValueError, TypeError):
+            pass  # Malformed timestamp — skip boost
+
     recency = math.exp(-0.693 * age_days / effective_hl)
     access_freq = min(1.0, math.log(1 + retrieved_count) / math.log(1 + 20))
     connectivity = min(1.0, math.log(1 + link_count) / math.log(1 + 10))

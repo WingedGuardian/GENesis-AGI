@@ -226,6 +226,49 @@ async def run_entity_resolution(
                     reasoning = verdict.get("reasoning", "")
 
                     if rel == "duplicate":
+                        # Adversarial second opinion: different-provider
+                        # LLM challenges the "duplicate" verdict before
+                        # permanent deprecation. Both must agree.
+                        try:
+                            from genesis.memory.adversarial_review import (
+                                check_entity_duplicate,
+                            )
+                            second_opinion = await check_entity_duplicate(
+                                router=router,
+                                content_a=content_a,
+                                content_b=content_b,
+                            )
+                            if second_opinion["relationship"] == "distinct":
+                                logger.info(
+                                    "Entity challenge override: %s vs %s — "
+                                    "primary=duplicate, challenge=distinct (%s). "
+                                    "Keeping both.",
+                                    point_a["id"][:8], point_b["id"][:8],
+                                    second_opinion["reasoning"],
+                                )
+                                report.setdefault("challenge_overrides", 0)
+                                report["challenge_overrides"] += 1
+                                await log_resolution(
+                                    db,
+                                    run_id=run_id,
+                                    action="flagged",
+                                    memory_id_a=point_a["id"],
+                                    memory_id_b=point_b["id"],
+                                    content_a=content_a,
+                                    content_b=content_b,
+                                    cosine_score=score,
+                                    llm_verdict="challenge_override_to_distinct",
+                                    llm_reasoning=second_opinion["reasoning"],
+                                )
+                                continue  # Skip deprecation
+                        except Exception:
+                            # Challenge call failed — fail-safe: skip deprecation
+                            logger.debug(
+                                "Entity challenge call failed, preserving both",
+                                exc_info=True,
+                            )
+                            continue
+
                         try:
                             await _deprecate_memory(
                                 qdrant, db, deprecated_id,

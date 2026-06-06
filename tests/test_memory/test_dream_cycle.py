@@ -213,8 +213,12 @@ class TestLiveRun:
             "room": "store",
             "synthesis_notes": "combined",
         })
+        adversarial_json = json.dumps({"verdict": "PASS"})
         mock_router.route_call = AsyncMock(
-            return_value=MagicMock(success=True, content=synthesis_json),
+            side_effect=[
+                MagicMock(success=True, content=synthesis_json),
+                MagicMock(success=True, content=adversarial_json),
+            ],
         )
 
         with patch(_SCROLL) as mock_scroll, \

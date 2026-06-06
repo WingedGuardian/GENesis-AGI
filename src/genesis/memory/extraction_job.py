@@ -28,6 +28,7 @@ from genesis.memory.extraction import (
     parse_extraction_response_full,
 )
 from genesis.memory.reference_extraction import extract_references_from_chunk
+from genesis.memory.source_verification import compute_jaccard, verify_source_overlap
 from genesis.util.jsonl import (
     chunk_messages,
     format_chunk_for_extraction,
@@ -46,6 +47,48 @@ _EXTRACTABLE_SOURCE_TAGS = {"foreground", "inbox"}
 
 # Transcript directory
 _TRANSCRIPT_DIR = Path.home() / ".claude" / "projects" / cc_project_dir()
+
+
+async def _check_claim_duplicate(
+    db: aiosqlite.Connection,
+    content: str,
+    *,
+    jaccard_threshold: float = 0.70,
+    fts5_limit: int = 10,
+) -> bool:
+    """Check if content is a near-duplicate of an existing memory.
+
+    Uses FTS5 keyword search to find candidates, then Jaccard overlap
+    to confirm. Deduplicates across all sessions.
+    """
+    import re
+    # Use a simple alphanumeric tokenizer inline rather than importing
+    # the private _extract_terms. Avoids cross-module private API coupling.
+    words = re.findall(r"[a-z0-9]+", content.lower())
+    terms = {w for w in words if len(w) > 2}
+    if len(terms) < 3:
+        return False  # Too short to meaningfully dedup
+
+    # Build FTS5 query from top terms. Only use pure alphanumeric terms —
+    # hyphens are FTS5 NOT operators, apostrophes cause parse errors.
+    query_terms = sorted(terms, key=len, reverse=True)[:5]
+    fts_query = " OR ".join(query_terms)
+
+    try:
+        cursor = await db.execute(
+            "SELECT memory_id, content FROM memory_fts "
+            "WHERE memory_fts MATCH ? LIMIT ?",
+            (fts_query, fts5_limit),
+        )
+        rows = await cursor.fetchall()
+    except Exception:
+        return False
+
+    for _memory_id, existing_content in rows:
+        if compute_jaccard(content, existing_content) >= jaccard_threshold:
+            return True
+
+    return False
 
 
 async def run_extraction_cycle(
@@ -193,14 +236,59 @@ async def run_extraction_cycle(
                 # episodic memory rows that already exist from prior cycles.
                 continue
 
+            # Build source text once per chunk for overlap verification
+            source_text = format_chunk_for_extraction(chunk)
+
             # Store each extraction with provenance
             for extraction in result.extractions:
+                # ── Source-overlap verification ──
+                # Check that extraction content actually appears in the
+                # source transcript chunk. Demote confidence for ungrounded
+                # extractions. See memory-immune-system-design.md §1.1.
+                overlap_result = verify_source_overlap(
+                    extraction.content, source_text,
+                )
+                if not overlap_result.verified:
+                    extraction.confidence = max(
+                        extraction.confidence - 0.3, 0.1,
+                    )
+                    logger.info(
+                        "Source-overlap FAIL for extraction in session %s "
+                        "(overlap=%.2f, confidence demoted to %.2f): %.80s",
+                        session_id, overlap_result.overlap,
+                        extraction.confidence, extraction.content,
+                    )
+
+                # ── Cross-session claim dedup ──
+                # Check if a highly similar extraction already exists.
+                # Uses FTS5 keyword search + Jaccard overlap.
+                # See memory-immune-system-design.md §1.2.
+                try:
+                    is_dup = await _check_claim_duplicate(
+                        db, extraction.content,
+                    )
+                    if is_dup:
+                        summary.setdefault("claims_deduped", 0)
+                        summary["claims_deduped"] += 1
+                        logger.info(
+                            "Cross-session dedup: skipping extraction in "
+                            "session %s (duplicate of existing memory): %.80s",
+                            session_id, extraction.content,
+                        )
+                        continue  # Skip this extraction entirely
+                except Exception:
+                    logger.debug("Claim dedup check failed", exc_info=True)
+
                 kwargs = extractions_to_store_kwargs(
                     extraction,
                     source_session_id=cc_session_id,
                     transcript_path=str(transcript_path),
                     source_line_range=(chunk_start, chunk_end),
                 )
+                # Tag unverified extractions for observability
+                if not overlap_result.verified:
+                    kwargs["tags"].append("source_unverified")
+
                 try:
                     # Queue-first: store FTS5-only, queue embedding for
                     # the recovery worker's paced drain. Prevents the
@@ -210,6 +298,10 @@ async def run_extraction_cycle(
                         **kwargs, force_fts5_only=True,
                     )
                     summary["entities_extracted"] += 1
+                    # Count source-unverified only for stored extractions
+                    if not overlap_result.verified:
+                        summary.setdefault("source_unverified", 0)
+                        summary["source_unverified"] += 1
                     session_extraction_count += 1
                     _newly_stored.append(
                         (memory_id, extraction.content, cc_session_id)
