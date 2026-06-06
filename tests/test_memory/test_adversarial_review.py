@@ -10,7 +10,6 @@ import pytest
 from genesis.memory.adversarial_review import (
     CALL_SITE_ENTITY,
     CALL_SITE_SYNTHESIS,
-    AdversarialVerdict,
     SynthesisBlockedError,
     _parse_verdict,
     check_entity_duplicate,

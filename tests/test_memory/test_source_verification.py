@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from genesis.memory.source_verification import (
     OverlapResult,
     compute_jaccard,
