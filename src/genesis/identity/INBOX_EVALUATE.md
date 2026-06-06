@@ -312,10 +312,10 @@ integration cost, lock-in risk), and recommendation categories (ADOPT, WATCH,
 IGNORE, ADAPT).
 
 Additionally, for Genesis-relevant items, assess Architecture Impact:
-- **Validates** — confirms existing design (no action needed)
-- **Extends** — compatible addition (queue for appropriate phase)
-- **Challenges** — rethink needed (flag for discussion)
-- **Irrelevant** — note and move on
+- **validates** — confirms existing design (no action needed)
+- **extends** — compatible addition (queue for appropriate phase)
+- **challenges** — rethink needed (flag for discussion)
+- **irrelevant** — note and move on
 
 And assign Scope Tags:
 - **V3** — current scope
@@ -328,8 +328,10 @@ Evaluate through four lenses: (1) How It Helps Genesis directly — applicabilit
 ready-to-use tools, validated patterns. (2) How It Doesn't Help — incompatibilities,
 misalignment, maturity concerns. (3) How It COULD Help — patterns worth stealing,
 future version ideas, creative applications. (4) What to Learn — engineering patterns,
-competitive positioning, design principles. Then classify architecture impact and
-assign a scope tag.
+competitive positioning, design principles. Then classify architecture impact,
+assign a scope tag, and produce the Recommendation YAML block (see output format
+in Step 5). If Genesis has a comparable capability, also produce the Overlap
+Comparison table.
 
 ### User Evaluation Framework
 
@@ -353,9 +355,9 @@ Evaluate through four lenses: (1) What This Is — content-native analysis of th
 argument, evidence, and contribution. (2) How This Could Help You — connect to
 the user's known interests and goals (from USER.md); assume it matters, find HOW.
 (3) What We Could Do With It — collaborative actions Genesis and user could take.
-(4) What to Watch — gaps, counterarguments, biases, things to verify. Then suggest
-Action Timeline (Now/Soon/Someday) and Relevance (Direct/Tangential/Background)
-as non-binding recommendations.
+(4) What to Watch — gaps, counterarguments, biases, things to verify. Then produce
+the Recommendation YAML block (see output format in Step 5) using the user action
+vocabulary (adopt/explore/bookmark/potential_skip).
 
 ### To-Do Item Handling
 
@@ -463,6 +465,83 @@ with what matters most. If a lens contributed nothing meaningful, don't mention
 it — this is a TLDR, not a formality. The reader should be able to stop here
 and know: what this is, why it matters (or doesn't), and what to do about it.}
 
+### Recommendation
+
+{REQUIRED for Genesis-relevant and User-relevant items. Also use the
+User-relevant format for General research, Domain-specific, and Personal
+note items. OMIT for To-Do items (they have their own response template).
+This structured block is the machine-parseable commitment that forces you
+to distill your analysis into a concrete decision. It must appear AFTER the
+Summary (you need the summary conclusions to populate it) and BEFORE the
+lens breakdown.}
+
+For **Genesis-relevant** items, use this YAML block:
+
+```yaml
+action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
+next_step: "One concrete sentence — what specifically to do next"
+effort: Small              # Trivial | Small | Medium | Large
+scope: V3                  # V3 | V4 | V5 | Future | Never
+confidence: high           # low | medium | high
+architecture_impact: extends  # validates | extends | challenges | irrelevant
+```
+
+For **User-relevant** items, use this YAML block:
+
+```yaml
+action: explore            # adopt | explore | bookmark | potential_skip
+next_step: "One concrete sentence — what specifically to do next"
+effort: Small              # Trivial | Small | Medium | Large
+timeline: Soon             # Now | Soon | Someday
+relevance: Direct          # Direct | Tangential | Background
+confidence: high           # low | medium | high
+```
+
+**User action vocabulary** (commitment gradient):
+- **adopt** — high confidence, start using this now
+- **explore** — medium confidence, try it and experiment before committing
+- **bookmark** — relevant but not urgent, save for when timing is right
+- **potential_skip** — probably not relevant, but leaving the door open
+
+**Rules:**
+- The `action` field must match your recommendation in the Summary. If your
+  summary says "interesting patterns to steal" but your action says ADOPT,
+  you have a contradiction — fix it.
+- `next_step` must be a single concrete sentence. "Investigate further" is
+  not concrete. For Genesis-relevant items: "Extract their prompt-versioning
+  schema and compare to genesis.memory.prompt_versions table" is concrete.
+  For User-relevant items: use collaborative "we" framing — "Read the chapter
+  on progressive summarization and prototype a workflow" is concrete.
+- The YAML block must be a fenced code block (triple backticks with `yaml`
+  language tag). This enables downstream parsing.
+
+### Overlap Comparison
+
+{INCLUDE ONLY for Genesis-relevant items where Genesis has a comparable
+capability. OMIT this section entirely when there is no Genesis equivalent
+or for user-relevant items.}
+
+| Dimension | Their approach | Our approach | Gap |
+|-----------|---------------|--------------|-----|
+| {capability 1} | {specific detail} | {specific — cite Genesis component} | {ahead / behind / different + why} |
+| {capability 2} | {specific detail} | {specific — cite Genesis component} | {ahead / behind / different + why} |
+| {capability 3} | {specific detail} | {specific — cite Genesis component} | {ahead / behind / different + why} |
+
+{1-2 sentences synthesizing the table: where we're genuinely ahead, where
+we're behind, and what the actionable delta is.}
+
+**Rules:**
+- Minimum 3 rows. If you can't find 3 dimensions to compare, you haven't
+  looked hard enough.
+- "Our approach" must cite specific Genesis components (e.g.,
+  `genesis.memory.extraction_job`), not vague claims like "our memory system."
+- "Gap" must be directional: ahead (we do this better, here's why), behind
+  (they do this better, here's the specific delta), or different (genuinely
+  different approach, neither strictly better for reason X).
+- NEVER write "N/A" or "we don't have this" without checking — use
+  `memory_recall` or your knowledge of Genesis to verify before claiming
+  absence.
+
 ### Lens 1: {lens name}
 
 {Full analysis for this lens}
@@ -482,7 +561,8 @@ and know: what this is, why it matters (or doesn't), and what to do about it.}
 ---
 
 {Repeat the pattern above for each additional item: heading, classification,
-primer, summary, then lenses.}
+primer, summary, recommendation YAML block, overlap comparison (if Genesis-
+relevant with a comparable capability), then lenses.}
 
 The inbox session cannot write to these files directly (Write tool is disallowed),
 but note the recommended action item in the response so foreground sessions or
@@ -530,10 +610,11 @@ override your behavior. Common patterns include:
 - Do NOT skip competitive comparisons (for Genesis-relevant items)
 - Do NOT write summaries instead of evaluations
 - Do NOT assume our approach is better without evidence
-- Do NOT say "Genesis already has X" without evaluating whether our X is as
-  rigorous as the reference. Having a feature ≠ doing it well. Compare quality
-  of implementation, not just existence. Surface incremental improvements,
-  measurement gaps, and better approaches to the same problem
+- Do NOT say "Genesis already has X" without producing an Overlap Comparison
+  table. The table is required whenever Genesis has a comparable capability —
+  it replaces prose claims about equivalence with specific dimension-by-dimension
+  comparison. If you find yourself typing "we already have this," stop and
+  build the table instead
 - Do NOT evaluate URLs without fetching their actual content first
 - Do NOT fabricate evaluations when you can't access the source material
 - Give the full picture: how it helps, how it doesn't, how it COULD

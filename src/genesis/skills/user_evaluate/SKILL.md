@@ -59,6 +59,33 @@ here and know the key takeaway.}
 **Action items:**
 - {concrete collaborative next step if any}
 
+### Recommendation
+
+```yaml
+action: explore            # adopt | explore | bookmark | potential_skip
+next_step: "One concrete sentence — what specifically to do next"
+effort: Small              # Trivial | Small | Medium | Large
+timeline: Soon             # Now | Soon | Someday
+relevance: Direct          # Direct | Tangential | Background
+confidence: high           # low | medium | high
+```
+
+**Action vocabulary** (commitment gradient):
+- **adopt** — high confidence, start using this now
+- **explore** — medium confidence, try it and experiment before committing
+- **bookmark** — relevant but not urgent, save for when timing is right
+- **potential_skip** — probably not relevant, but leaving the door open
+
+Rules:
+- REQUIRED on every evaluation. No exceptions.
+- The `action` field must match your recommendation in the Summary.
+- `next_step` must be concrete and collaborative ("we" framing). "Look into
+  this more" is not concrete. "Read the chapter on progressive summarization
+  and prototype a workflow in your Obsidian vault" is concrete.
+- `timeline` and `relevance` here are the machine-parseable source of truth.
+  The `**Timeline:** / **Relevance:**` line above is the human-readable
+  duplicate for quick scanning.
+
 ### What This Is
 
 {Content-native analysis — argument, evidence, contribution}
@@ -76,7 +103,18 @@ rather than the tool, patterns that make existing work more rigorous.
 
 When the user asks "what can we learn from this?" — the answer includes
 EVERYTHING: small refinements, architectural upgrades, measurement gaps,
-better approaches to the same problem. Not just "should we use this tool."}
+better approaches to the same problem. Not just "should we use this tool."
+
+If the user already does something similar (tool, technique, approach),
+consider producing a brief comparison:
+
+| Aspect | This approach | What you currently do | Delta |
+|--------|--------------|----------------------|-------|
+| {aspect} | {specific} | {specific, from user model} | {improvement?} |
+
+This is optional (unlike the Genesis eval's required Overlap Comparison),
+but encouraged when the user model reveals an existing practice in the
+same space. Keep it to 2-4 rows.}
 
 ### What to Watch
 
