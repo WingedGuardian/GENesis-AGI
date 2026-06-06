@@ -82,9 +82,10 @@ Rules:
 - `next_step` must be concrete and collaborative ("we" framing). "Look into
   this more" is not concrete. "Read the chapter on progressive summarization
   and prototype a workflow in your Obsidian vault" is concrete.
-- `timeline` and `relevance` here are the machine-parseable source of truth.
-  The `**Timeline:** / **Relevance:**` line above is the human-readable
-  duplicate for quick scanning.
+- `timeline` and `relevance` here are the machine-parseable version of the
+  tags. When invoked standalone, the `**Timeline:** / **Relevance:**` line
+  above serves as the human-readable quick-scan version. When invoked from
+  the inbox (INBOX_EVALUATE.md template), only the YAML block appears.
 
 ### What This Is
 

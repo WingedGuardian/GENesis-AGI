@@ -322,6 +322,7 @@ And assign Scope Tags:
 - **V4** — next version
 - **V5** — distant scope
 - **Future** — beyond V5
+- **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
 
 **If the skill file cannot be read**, apply this fallback framework:
 Evaluate through four lenses: (1) How It Helps Genesis directly — applicability,
@@ -437,9 +438,11 @@ Do NOT make any tool calls after writing this text.**
 
 ### Cognitive Ordering
 
-You think through all four lenses first, then compose the summary from those
-findings — but you format the output with the summary ABOVE the detailed lens
-breakdown. The reader sees the summary first; you write it last (cognitively).
+You think through all four lenses first, then compose the summary, the
+Recommendation YAML block, and the Overlap Comparison table (if applicable)
+from those findings — but you format the output with summary, recommendation,
+and comparison ABOVE the detailed lens breakdown. The reader sees the decision
+first; you write it last (cognitively).
 
 ### Output Format
 
