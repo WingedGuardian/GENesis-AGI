@@ -239,10 +239,34 @@ class EmbeddingProvider:
         self._disk_cache = None
         if cache_dir is not None:
             try:
+                import json as _json
+
                 import diskcache
+                import diskcache.core
+
+                class _SafeDisk(diskcache.Disk):
+                    """Disk using JSON instead of pickle (CVE-2025-69872)."""
+
+                    def store(self, value, read, key=diskcache.core.UNKNOWN):
+                        if isinstance(value, (list, dict)):
+                            value = _json.dumps(value)
+                        return super().store(value, read, key=key)
+
+                    def fetch(self, mode, filename, value, read):
+                        if mode == diskcache.core.MODE_PICKLE:
+                            return None
+                        data = super().fetch(mode, filename, value, read)
+                        if isinstance(data, str):
+                            try:
+                                return _json.loads(data)
+                            except (ValueError, _json.JSONDecodeError):
+                                return data
+                        return data
+
                 cache_dir.mkdir(parents=True, exist_ok=True)
                 self._disk_cache = diskcache.Cache(
                     str(cache_dir), size_limit=100_000_000,  # 100 MB
+                    disk=_SafeDisk,
                 )
             except Exception:
                 logger.warning(
