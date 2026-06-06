@@ -390,7 +390,6 @@ async def _cross_wing_scan(
     run_id: str,
     top_n_per_wing: int = 20,
     similarity_threshold: float = 0.90,
-    contradiction_threshold: float = 0.95,
 ) -> list[dict]:
     """Scan for similar memories across different wings.
 
@@ -458,23 +457,32 @@ async def _cross_wing_scan(
                     content_a = point.get("payload", {}).get("content", "")[:200]
                     content_b = hit.get("payload", {}).get("content", "")[:200]
 
-                    link_type = (
-                        "contradicts" if score >= contradiction_threshold
-                        else "related_to"
-                    )
+                    # Cosine similarity alone cannot detect contradiction —
+                    # high cosine means similar, not contradictory. Use
+                    # related_to for all cross-wing findings. Contradiction
+                    # detection would require an LLM semantic check.
+                    link_type = "related_to"
 
-                    # Create link between cross-wing memories
+                    # Create link between cross-wing memories (skip if exists)
                     try:
                         from genesis.db.crud import memory_links
-                        await memory_links.create(
-                            db,
-                            source_id=point["id"],
-                            target_id=hit["id"],
-                            link_type=link_type,
-                            strength=round(score, 4),
-                            created_at=datetime.now(UTC).isoformat(),
+                        # Check for existing link to avoid UNIQUE constraint
+                        # failures on subsequent runs
+                        existing = await db.execute(
+                            "SELECT 1 FROM memory_links "
+                            "WHERE source_id = ? AND target_id = ? LIMIT 1",
+                            (point["id"], hit["id"]),
                         )
-                        link_count += 1
+                        if not await existing.fetchone():
+                            await memory_links.create(
+                                db,
+                                source_id=point["id"],
+                                target_id=hit["id"],
+                                link_type=link_type,
+                                strength=round(score, 4),
+                                created_at=datetime.now(UTC).isoformat(),
+                            )
+                            link_count += 1
                     except Exception:
                         logger.debug(
                             "Cross-wing link creation failed",

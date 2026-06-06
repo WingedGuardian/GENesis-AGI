@@ -163,6 +163,9 @@ def _apply_diversity_penalty(
     any echo cluster.
 
     Prevents sycophantic memory clusters from dominating retrieval.
+
+    **Mutates ``fused`` in-place** — penalized scores are written directly
+    into the dict. Callers that need pre-penalty scores must copy first.
     """
     from genesis.memory.source_verification import compute_jaccard
 
@@ -200,7 +203,7 @@ def _apply_diversity_penalty(
 
         if matched_cluster is not None:
             cluster_of[mid] = matched_cluster
-            cluster_count[matched_cluster] = cluster_count.get(matched_cluster, 1) + 1
+            cluster_count[matched_cluster] = cluster_count.get(matched_cluster, 0) + 1
             # Penalize if cluster already has max members
             if cluster_count[matched_cluster] > max_per_cluster:
                 # Remove entirely — too many echoes
