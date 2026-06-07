@@ -295,7 +295,8 @@ class MorningReportGenerator:
             "WHERE status = 'active' "
             "ORDER BY CASE priority "
             "  WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
-            "  WHEN 'medium' THEN 3 ELSE 4 END"
+            "  WHEN 'medium' THEN 3 ELSE 4 END "
+            "LIMIT 10"
         )
         goal_rows = await cursor.fetchall()
         if goal_rows:
