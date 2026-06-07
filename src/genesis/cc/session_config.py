@@ -34,6 +34,7 @@ _MCP_PROFILES: dict[str, list[str]] = {
     "reflection": ["genesis-health", "genesis-memory"],
     "user_reflection": ["genesis-memory"],  # User ego: memory only, no health tools
     "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
+    "campaign": ["genesis-health", "genesis-memory", "genesis-outreach"],
     "interop": ["genesis-health", "genesis-memory"],
 }
 
