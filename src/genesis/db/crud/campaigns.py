@@ -123,6 +123,7 @@ async def complete_run(
     *,
     outcome: str,
     summary: str | None = None,
+    skip_reason: str | None = None,
     cost_usd: float = 0.0,
     session_id: str | None = None,
     finished_at: str | None = None,
@@ -130,10 +131,10 @@ async def complete_run(
     """Mark a run as completed with outcome details."""
     await db.execute(
         """UPDATE campaign_runs
-           SET outcome = ?, summary = ?, cost_usd = ?,
+           SET outcome = ?, summary = ?, skip_reason = ?, cost_usd = ?,
                session_id = ?, finished_at = ?
            WHERE id = ?""",
-        (outcome, summary, cost_usd, session_id, finished_at, run_id),
+        (outcome, summary, skip_reason, cost_usd, session_id, finished_at, run_id),
     )
     await db.commit()
 
