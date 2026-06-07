@@ -1,7 +1,7 @@
 """Tests for memory supersession — store with supersedes, mark_superseded, retrieval filtering."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -72,7 +72,7 @@ async def test_store_with_supersedes_marks_old_deprecated(store, db):
     db.execute = AsyncMock(side_effect=track_execute)
 
     with patch("genesis.memory.store.upsert_point"), \
-         patch("genesis.memory.store.update_payload") as mock_update, \
+         patch("genesis.memory.store.update_payload"), \
          patch("genesis.memory.store.memory_crud") as mock_mem:
         mock_mem.upsert = AsyncMock(return_value="id")
         mock_mem.create_metadata = AsyncMock(return_value=None)
