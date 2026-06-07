@@ -1,6 +1,6 @@
 mail_monitor:
   enabled: true
-  cron_expression: "0 5 * * 0"        # Sunday 05:00 UTC
+  cron_expression: "0 5 * * 0"        # Sunday 05:00 user timezone
   batch_size: 10                       # Max emails per Layer 2 CC session
   model: "sonnet"
   effort: "medium"
