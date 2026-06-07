@@ -59,6 +59,11 @@ async def memory_recall(
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
+    Routing: for ingested docs/APIs use knowledge_recall, for credentials/URLs
+    use reference_lookup, for learned procedures use procedure_recall.
+    memory_recall with source='both' searches everything but without
+    domain-specific filtering or credential audit logging.
+
     Args:
         source: 'episodic' | 'knowledge' | 'both' | None. Defaults to
             ``'both'`` — searches episodic and knowledge_base collections.
@@ -94,7 +99,8 @@ async def memory_recall(
             Used by ego's own self-recall path.
         rerank: If True, apply Voyage AI cross-encoder reranking after RRF
             fusion. Improves precision by rescoring candidates on semantic
-            relevance. Adds ~300ms latency. Default False — opt-in per call.
+            relevance. Adds ~300ms latency. Default True — disable with
+            rerank=False for latency-sensitive calls.
     """
     import time as _time
 
@@ -466,10 +472,14 @@ async def memory_proactive(
 async def memory_core_facts(
     limit: int = 10,
 ) -> list[dict]:
-    """High-confidence memories for system prompt injection.
+    """Retrieve individual high-confidence memories ranked by activation score.
 
-    Queries the memory store (Qdrant) for memories with confidence >= 0.7,
-    ranked by activation score. Returns compact summaries.
+    Returns full memory content — different from essential knowledge
+    auto-injection which provides aggregate system state briefing.
+    Use when you need specific high-confidence facts, not the system overview.
+
+    Queries Qdrant for memories with confidence >= 0.7, re-ranked by
+    multi-factor activation score (recency, access frequency, connectivity).
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()

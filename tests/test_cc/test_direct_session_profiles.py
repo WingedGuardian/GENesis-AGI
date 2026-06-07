@@ -175,11 +175,6 @@ def test_interact_blocks_recon_writes():
     assert "mcp__genesis-recon__recon_store_finding" in PROFILES["interact"]
 
 
-def test_interact_blocks_evolution_propose():
-    """Publishing sessions should not propose evolution changes."""
-    assert "mcp__genesis-memory__evolution_propose" in PROFILES["interact"]
-
-
 # --- Profile shape assertions ---
 
 def test_observe_is_most_restrictive():

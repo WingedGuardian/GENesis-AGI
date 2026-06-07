@@ -63,7 +63,10 @@ async def knowledge_recall(
     limit: int = 5,
     min_score: float = 0.15,
 ) -> list[dict]:
-    """Hybrid search scoped by project/domain, authority-tagged.
+    """Search the knowledge base (ingested authoritative sources like docs, APIs, papers).
+
+    For personal/experiential memories, use memory_recall instead.
+    For stored references (credentials, URLs), use reference_lookup.
 
     Returns fewer results than ``memory_recall`` by default (5 vs 10)
     and applies a post-authority-boost relevance floor (``min_score``)
@@ -455,7 +458,11 @@ async def reference_lookup(
     limit: int = 5,
     accessor_context: str | None = None,
 ) -> list[dict]:
-    """Hybrid retrieve reference entries matching a query.
+    """Search stored references (credentials, URLs, IPs, identifiers) with audit logging.
+
+    For the reference store only — use memory_recall for general memories,
+    knowledge_recall for ingested documents. Credential-kind entries get
+    audit-logged when accessed.
 
     Combines two paths, same pattern as ``knowledge_recall``:
     1. Vector search via ``HybridRetriever.recall(source="episodic")`` over

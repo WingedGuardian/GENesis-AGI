@@ -1,4 +1,4 @@
-"""memory-mcp — memory storage, retrieval, observations, and identity evolution.
+"""memory-mcp — memory storage, retrieval, and observations.
 
 Phase 5 implementation. Tool signatures match the architecture spec.
 """
@@ -12,9 +12,6 @@ from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 
-from genesis.db.crud import (
-    evolution_proposals,
-)
 from genesis.db.crud import (
     knowledge as knowledge_crud,
 )
@@ -46,7 +43,6 @@ __all__ = [
     "_db",
     "_qdrant",
     "_bookmark_mgr",
-    "evolution_proposals",
     "get_collection_info",
     "knowledge",
     "memory_links",
@@ -160,7 +156,6 @@ _bookmarks_tools = importlib.import_module(".bookmarks", __name__)  # noqa: F401
 _conversation_tools = importlib.import_module(".conversation", __name__)  # noqa: F401
 _core_tools = importlib.import_module(".core", __name__)  # noqa: F401
 _documents_tools = importlib.import_module(".documents", __name__)  # noqa: F401
-_identity_tools = importlib.import_module(".identity", __name__)  # noqa: F401
 _knowledge_tools = importlib.import_module(".knowledge", __name__)  # noqa: F401
 _observations_tools = importlib.import_module(".observations", __name__)  # noqa: F401
 _procedural_tools = importlib.import_module(".procedural", __name__)  # noqa: F401
