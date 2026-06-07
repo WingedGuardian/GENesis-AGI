@@ -77,6 +77,7 @@ delete it. See VOICE.md (advisory tone) for full reference.
 - Stable/normal metrics (compress to "All systems nominal")
 - Raw telemetry (tick counts, observation counts without context)
 - Engagement self-analysis (how many outreach messages were read/ignored)
+- Repository metrics (stars, forks, traffic) — not actionable
 - Fallback routing status (this is expected behavior)
 - CC version tracking (unless breaking change)
 - Cognitive state details (just count them)

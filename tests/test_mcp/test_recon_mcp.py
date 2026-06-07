@@ -31,11 +31,9 @@ async def tools(db):
 
 async def test_all_tools_registered(tools):
     for name in [
-        "recon_watchlist",
+        "recon_config",
         "recon_findings",
         "recon_triage",
-        "recon_schedule",
-        "recon_sources",
         "recon_store_finding",
     ]:
         assert name in tools, f"Missing tool: {name}"
@@ -58,13 +56,13 @@ def test_load_watchlist_has_required_fields():
         assert "priority" in p
 
 
-async def test_recon_watchlist_returns_all(tools):
-    result = await tools["recon_watchlist"].fn()
+async def test_recon_config_watchlist_returns_all(tools):
+    result = await tools["recon_config"].fn(aspect="watchlist")
     assert len(result) >= 5
 
 
-async def test_recon_watchlist_filters_by_priority(tools):
-    high = await tools["recon_watchlist"].fn(priority="high")
+async def test_recon_config_watchlist_filters_by_priority(tools):
+    high = await tools["recon_config"].fn(aspect="watchlist", priority="high")
     assert all(p["priority"] == "high" for p in high)
     assert len(high) >= 1
 

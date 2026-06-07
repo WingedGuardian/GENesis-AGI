@@ -106,7 +106,6 @@ _NO_MEMORY_WRITES = [
     "mcp__genesis-memory__procedure_store",
     "mcp__genesis-memory__reference_store",
     "mcp__genesis-memory__reference_delete",
-    "mcp__genesis-memory__evolution_propose",
 ]
 
 _NO_FOLLOW_UPS = [
@@ -132,7 +131,6 @@ PROFILES: dict[str, list[str]] = {
     ),
     "interact": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_ENGAGEMENT + _NO_RECON_WRITES
-        + ["mcp__genesis-memory__evolution_propose"]
     ),
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION

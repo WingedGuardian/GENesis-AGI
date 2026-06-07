@@ -126,7 +126,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="recon_schedules.yaml",
         readonly=False,
         needs_restart=False,
-        dedicated_tool="recon_schedule",
+        dedicated_tool="recon_config",
     ),
     "recon_watchlist": SettingsDomain(
         name="recon_watchlist",
@@ -134,8 +134,8 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="recon_watchlist.yaml",
         readonly=True,
         needs_restart=False,
-        dedicated_tool="recon_watchlist",
-        readonly_reason="Editable via the watchlist tool — ask Genesis to add or remove items.",
+        dedicated_tool="recon_config",
+        readonly_reason="Editable via the recon_config tool — ask Genesis to add or remove items.",
     ),
     "recon_sources": SettingsDomain(
         name="recon_sources",
@@ -143,7 +143,7 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
         config_filename="recon_sources.yaml",
         readonly=False,
         needs_restart=False,
-        dedicated_tool="recon_sources",
+        dedicated_tool="recon_config",
     ),
     "confidence_gates": SettingsDomain(
         name="confidence_gates",

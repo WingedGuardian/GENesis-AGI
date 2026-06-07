@@ -31,10 +31,14 @@ def _get_tree_client():
 
 @mcp.tool()
 async def document_index(path: str) -> dict:
-    """Upload a document to PageIndex for tree-indexed querying.
+    """Index a large document via PageIndex for tree-based querying.
 
-    Builds a hierarchical tree index that enables structure-aware
-    retrieval — better than chunk+embed for long, structured documents.
+    NOT for storing knowledge — use knowledge_ingest_source for that.
+    This tool enables structured querying of PDFs and long documents
+    that are too large to read directly via the Read tool.
+
+    Builds a hierarchical tree index for structure-aware retrieval —
+    better than chunk+embed for long, structured documents.
 
     Returns the doc_id and a summary of the tree structure.
     Use document_query to ask questions about the indexed document.
@@ -87,11 +91,12 @@ async def document_query(
     question: str,
     path_or_doc_id: str,
 ) -> dict:
-    """Query a document using PageIndex tree-based retrieval.
+    """Ask a question about a document previously indexed with document_index.
 
-    Provide either a file path (auto-indexes if needed) or a doc_id
-    from a previous document_index call. Returns an answer with
-    page citations.
+    Uses PageIndex tree-based retrieval for structure-aware answers
+    from large documents. Provide either a file path (auto-indexes if
+    needed) or a doc_id from a previous document_index call. Returns
+    an answer with page citations.
 
     Args:
         question: The question to ask about the document.
@@ -145,7 +150,7 @@ async def document_query(
 async def document_delete(doc_id: str) -> dict:
     """Delete a document from PageIndex and remove local cache.
 
-    Use after finishing analysis of a temporarily indexed document.
+    Cleans up after finishing analysis of a temporarily indexed document.
 
     Args:
         doc_id: The PageIndex document ID to delete.

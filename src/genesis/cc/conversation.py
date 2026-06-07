@@ -413,14 +413,21 @@ class ConversationLoop:
                         "\n\n## Recent conversation (session recovered)\n"
                         + recovery_context
                     )
-
-                # Topic-aware context: inject proposal board when in ego_proposals
-                if thread_id:
-                    topic_ctx = await self._build_topic_context(thread_id)
-                    if topic_ctx:
-                        system_prompt += topic_ctx
-
                 resume_id = None
+
+            # Topic-aware context: inject for BOTH new and resumed sessions.
+            # For new sessions, this adds to the system prompt directly.
+            # For resumed sessions, append_system_prompt=True means CC CLI
+            # appends this via --append-system-prompt alongside --resume,
+            # giving the LLM fresh proposal state and thread history on
+            # every message regardless of session age.
+            if thread_id:
+                topic_ctx = await self._build_topic_context(thread_id)
+                if topic_ctx:
+                    if system_prompt:
+                        system_prompt += topic_ctx
+                    else:
+                        system_prompt = topic_ctx
 
             invocation = CCInvocation(
                 prompt=prompt_text,
@@ -685,19 +692,21 @@ class ConversationLoop:
         """Build topic-specific context for the conversation system prompt.
 
         When the user is messaging in the ego_proposals topic, inject the
-        pending proposal board so the CC session can discuss and resolve them.
+        pending proposal board AND recent thread messages so the CC session
+        can discuss and resolve proposals with full conversational context.
         """
         if self._db is None:
             return None
         try:
             # Look up which topic this thread_id belongs to
             async with self._db.execute(
-                "SELECT category FROM telegram_topics WHERE thread_id = ?",
+                "SELECT category, chat_id FROM telegram_topics WHERE thread_id = ?",
                 (int(thread_id),),
             ) as cur:
                 row = await cur.fetchone()
             if not row or row[0] != "ego_proposals":
                 return None
+            topic_chat_id = row[1]
 
             # Fetch pending proposals
             from genesis.db.crud import ego as ego_crud
@@ -705,24 +714,47 @@ class ConversationLoop:
             pending = await ego_crud.list_proposals(
                 self._db, status="pending", limit=10,
             )
-            if not pending:
-                return "\n\n## Ego Proposals Topic\n\nNo pending proposals.\n"
 
             lines = ["\n\n## You Are in the Ego Proposals Topic\n"]
             lines.append(
                 "The user communicates with you here to review, approve, reject, "
                 "or discuss ego proposals. When the user indicates approval "
                 "(e.g., 'do it', 'yes', 'go ahead', 'approve 1'), resolve the "
-                "proposal. When they reject, mark it rejected with their reason. "
-                "When unclear, ask for clarification.\n"
+                "proposal. When they reject, mark it rejected with their reason.\n"
             )
-            lines.append("### Pending Proposals:\n")
-            for i, p in enumerate(pending, 1):
-                cat = p.get("action_category", "unknown")
-                content = (p.get("content") or "")[:120]
-                pid = p["id"]
-                lines.append(f"{i}. **[{cat}]** {content}")
-                lines.append(f"   ID: `{pid}`\n")
+
+            # ── Recent thread messages (scroll-up) ──────────────────────
+            # Fetch the last few messages so the LLM sees the actual digest
+            # messages the ego sent, not just an abstract proposal board.
+            # This is critical for understanding references like "this one"
+            # or "the older ones" — the user is responding to what they SEE
+            # in the thread, not to an internal data structure.
+            thread_messages = await self._fetch_thread_messages(
+                int(thread_id), chat_id=topic_chat_id, limit=8,
+            )
+            if thread_messages:
+                lines.append("### Recent Messages in This Thread:\n")
+                for m in thread_messages:
+                    sender = m.get("sender", "?")
+                    content = m.get("content", "")
+                    # Truncate very long messages but keep enough to see
+                    # proposal digests and their numbered items
+                    if len(content) > 800:
+                        content = content[:800] + "…"
+                    prefix = "User" if sender == "user" else "Genesis"
+                    lines.append(f"**{prefix}**: {content}\n")
+
+            # ── Pending proposals board ─────────────────────────────────
+            if not pending:
+                lines.append("\n### Pending Proposals:\n\nNone.\n")
+            else:
+                lines.append("### Pending Proposals:\n")
+                for i, p in enumerate(pending, 1):
+                    cat = p.get("action_category", "unknown")
+                    content = (p.get("content") or "")[:120]
+                    pid = p["id"]
+                    lines.append(f"{i}. **[{cat}]** {content}")
+                    lines.append(f"   ID: `{pid}`\n")
 
             lines.append(
                 "\n### To resolve a proposal:\n"
@@ -733,6 +765,10 @@ class ConversationLoop:
                 "- Reject with reason: `ego_proposal_resolve(action=\"reject\", "
                 "proposal_numbers=\"2\", reason=\"not relevant right now\")`\n"
                 "\n### Important:\n"
+                "- Match user intent to the proposals visible in the thread above.\n"
+                "  If the user says 'this one', they mean the most recently presented\n"
+                "  proposal. 'The older ones' means proposals listed under the\n"
+                "  '📋 N older proposal(s)' header in the digest.\n"
                 "- If the user gives guidance or corrections (not just approve/reject),\n"
                 "  store it via `memory_store` MCP so the ego sees it in future cycles.\n"
                 "- Always confirm what you did: 'Approved proposal 1: [content]'\n"
@@ -741,6 +777,35 @@ class ConversationLoop:
         except Exception:
             logger.debug("Failed to build topic context", exc_info=True)
             return None
+
+    async def _fetch_thread_messages(
+        self, thread_id: int, *, chat_id: int | None = None, limit: int = 8,
+    ) -> list[dict]:
+        """Fetch recent messages from a Telegram thread (scroll-up).
+
+        Uses both chat_id and thread_id to avoid cross-group leakage
+        (thread_ids are scoped per chat in Telegram).
+        """
+        if self._db is None:
+            return []
+        try:
+            if chat_id is not None:
+                query = """SELECT sender, content, timestamp FROM telegram_messages
+                           WHERE chat_id = ? AND thread_id = ?
+                           ORDER BY timestamp DESC LIMIT ?"""
+                params = (chat_id, thread_id, limit)
+            else:
+                query = """SELECT sender, content, timestamp FROM telegram_messages
+                           WHERE thread_id = ?
+                           ORDER BY timestamp DESC LIMIT ?"""
+                params = (thread_id, limit)
+            async with self._db.execute(query, params) as cur:
+                rows = await cur.fetchall()
+            # Return in chronological order (oldest first)
+            return [dict(r) for r in reversed(rows)]
+        except Exception:
+            logger.debug("Failed to fetch thread messages", exc_info=True)
+            return []
 
     async def _enrich_with_context(
         self, system_prompt: str | None, query: str,

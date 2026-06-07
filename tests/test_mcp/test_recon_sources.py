@@ -1,4 +1,4 @@
-"""Tests for recon_sources MCP tool."""
+"""Tests for recon_config sources aspect."""
 
 import pytest
 import yaml
@@ -29,45 +29,50 @@ async def tools(source_files):
 
 
 async def test_list_returns_watchlist_and_dynamic(tools):
-    result = await tools["recon_sources"].fn(action="list")
+    result = await tools["recon_config"].fn(aspect="sources", action="list")
     assert any(s["name"] == "TestProject" and s["origin"] == "watchlist" for s in result)
 
 
 async def test_add_dynamic_source(tools, source_files):
-    result = await tools["recon_sources"].fn(
-        action="add", source={"name": "NewSource", "url": "https://example.com", "type": "rss"},
+    result = await tools["recon_config"].fn(
+        aspect="sources", action="add",
+        source={"name": "NewSource", "url": "https://example.com", "type": "rss"},
     )
     assert result["added"] == "NewSource"
     assert result["total_dynamic"] == 1
 
-    listed = await tools["recon_sources"].fn(action="list")
+    listed = await tools["recon_config"].fn(aspect="sources", action="list")
     assert any(s["name"] == "NewSource" and s["origin"] == "dynamic" for s in listed)
 
 
 async def test_remove_dynamic_source(tools, source_files):
-    await tools["recon_sources"].fn(
-        action="add", source={"name": "Removable", "url": "x", "type": "rss"},
+    await tools["recon_config"].fn(
+        aspect="sources", action="add",
+        source={"name": "Removable", "url": "x", "type": "rss"},
     )
-    result = await tools["recon_sources"].fn(
-        action="remove", source={"name": "Removable"},
+    result = await tools["recon_config"].fn(
+        aspect="sources", action="remove",
+        source={"name": "Removable"},
     )
     assert result["found"] is True
     assert result["total_dynamic"] == 0
 
 
 async def test_cannot_remove_watchlist_entry(tools):
-    result = await tools["recon_sources"].fn(
-        action="remove", source={"name": "TestProject"},
+    result = await tools["recon_config"].fn(
+        aspect="sources", action="remove",
+        source={"name": "TestProject"},
     )
     assert "error" in result
     assert "immutable" in result["error"].lower() or "watchlist" in result["error"].lower()
 
 
 async def test_list_merges_both(tools):
-    await tools["recon_sources"].fn(
-        action="add", source={"name": "Dynamic1", "url": "x", "type": "web"},
+    await tools["recon_config"].fn(
+        aspect="sources", action="add",
+        source={"name": "Dynamic1", "url": "x", "type": "web"},
     )
-    result = await tools["recon_sources"].fn(action="list")
+    result = await tools["recon_config"].fn(aspect="sources", action="list")
     origins = {s["origin"] for s in result}
     assert "watchlist" in origins
     assert "dynamic" in origins

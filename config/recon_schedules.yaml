@@ -1,4 +1,4 @@
-# Recon gathering schedules — managed by recon_schedule MCP tool.
+# Recon gathering schedules — managed by recon_config MCP tool (aspect: schedule).
 schedules:
   email_recon:
     description: "Scan email for actionable items"

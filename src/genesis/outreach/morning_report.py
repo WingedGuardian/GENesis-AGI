@@ -228,6 +228,13 @@ class MorningReportGenerator:
         surplus = health.get("surplus", {})
         awareness = health.get("awareness", {})
         cc = health.get("cc_sessions", {})
+        # cc_sessions snapshot nests foreground/background as dicts
+        # (e.g. {"foreground": {"active": 2}}). Handle both nested and
+        # flat formats defensively for backward-compatible test fixtures.
+        fg = cc.get("foreground", 0)
+        fg_active = fg.get("active", 0) if isinstance(fg, dict) else fg
+        bg = cc.get("background", 0)
+        bg_active = bg.get("active", 0) if isinstance(bg, dict) else bg
         lines = [
             "## System Health",
             f"- Cost: ${cost.get('daily_usd', 0):.2f} today, ${cost.get('monthly_usd', 0):.2f} month",
@@ -235,7 +242,7 @@ class MorningReportGenerator:
             f"- Queues: deferred={queues.get('deferred_work', 0)}, dead_letters={queues.get('dead_letters', 0)}, pending_embeddings={queues.get('pending_embeddings', 0)}",
             f"- Surplus: {surplus.get('status', '?')}, queue_depth={surplus.get('queue_depth', 0)}",
             f"- Awareness: ticks_24h={awareness.get('ticks_24h', '?')}",
-            f"- CC Sessions: foreground={cc.get('foreground_active', 0)}, background={cc.get('background_active', 0)}, failed_24h={cc.get('failed_24h', 0)}",
+            f"- CC Sessions: foreground={fg_active}, background={bg_active}, failed_24h={cc.get('failed_24h', 0)}",
         ]
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:
