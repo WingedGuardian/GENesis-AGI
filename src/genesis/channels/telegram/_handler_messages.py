@@ -219,8 +219,8 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         # outreach messages lose all context when falling through to the
         # conversation handler.
         prompt_text = msg.text
-        if msg.reply_to_message and getattr(msg.reply_to_message, "text", None):
-            replied = msg.reply_to_message.text
+        replied = getattr(msg.reply_to_message, "text", None) if msg.reply_to_message else None
+        if isinstance(replied, str) and replied:
             if len(replied) > 2000:
                 replied = replied[:2000] + "…"
             prompt_text = (
