@@ -91,6 +91,46 @@ async def test_expire_old(db):
     assert new_row["status"] == "pending"
 
 
+@pytest.mark.asyncio
+async def test_expire_old_paginates(db):
+    """expire_old processes more than 50 items (query_pending limit)."""
+    old_time = datetime(2026, 3, 1, 0, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+
+    dlq_old = DeadLetterQueue(db, clock=lambda: old_time)
+    for i in range(75):
+        await dlq_old.enqueue(f"op_{i}", "{}", "provider", "err")
+
+    dlq_now = DeadLetterQueue(db, clock=lambda: now)
+    expired = await dlq_now.expire_old(max_age_hours=72)
+    assert expired == 75
+    assert await dlq_now.get_pending_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_expire_old_per_type_ttl(db):
+    """Per-operation-type TTLs are applied correctly."""
+    # 2h ago — expired for judge (1h TTL) but not for default (72h)
+    two_hours_ago = datetime(2026, 3, 4, 10, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+
+    dlq_old = DeadLetterQueue(db, clock=lambda: two_hours_ago)
+    judge_id = await dlq_old.enqueue("chain_exhausted:judge", "{}", "prov", "err")
+    chain_id = await dlq_old.enqueue("chain_exhausted:other", "{}", "prov", "err")
+    default_id = await dlq_old.enqueue("llm_call", "{}", "prov", "err")
+
+    dlq_now = DeadLetterQueue(db, clock=lambda: now)
+    expired = await dlq_now.expire_old(max_age_hours=72)
+
+    # judge (1h TTL) should be expired at 2h age
+    assert (await dl_crud.get_by_id(db, judge_id))["status"] == "expired"
+    # chain_exhausted (6h TTL) should NOT be expired at 2h age
+    assert (await dl_crud.get_by_id(db, chain_id))["status"] == "pending"
+    # default (72h TTL) should NOT be expired at 2h age
+    assert (await dl_crud.get_by_id(db, default_id))["status"] == "pending"
+    assert expired == 1
+
+
 # ── Redispatch tests ────────────────────────────────────────────────────
 
 

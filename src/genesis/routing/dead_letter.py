@@ -152,23 +152,32 @@ class DeadLetterQueue:
         """Mark pending items older than their TTL as 'expired'. Returns count.
 
         Uses per-operation-type TTLs where configured, falling back to
-        max_age_hours for operations without a specific TTL.
+        max_age_hours for operations without a specific TTL. Loops through
+        all pending items (query_pending returns paginated batches of 50).
         """
         now = self._clock()
-        items = await dl_crud.query_pending(self.db)
         count = 0
-        for item in items:
-            op_type = item.get("operation_type", "")
-            # Find matching TTL — longest prefix match
-            ttl_hours = max_age_hours
-            for pattern, hours in self._OPERATION_TTL_HOURS.items():
-                if op_type.startswith(pattern):
-                    ttl_hours = hours
-                    break
-            cutoff_iso = (now - timedelta(hours=ttl_hours)).isoformat()
-            if item["created_at"] < cutoff_iso:
-                await dl_crud.update_status(self.db, item["id"], status="expired")
-                count += 1
+        while True:
+            items = await dl_crud.query_pending(self.db)
+            if not items:
+                break
+            batch_expired = 0
+            for item in items:
+                op_type = item.get("operation_type", "")
+                # Find matching TTL — longest prefix match
+                ttl_hours = max_age_hours
+                for pattern, hours in self._OPERATION_TTL_HOURS.items():
+                    if op_type.startswith(pattern):
+                        ttl_hours = hours
+                        break
+                cutoff_iso = (now - timedelta(hours=ttl_hours)).isoformat()
+                if item["created_at"] < cutoff_iso:
+                    await dl_crud.update_status(self.db, item["id"], status="expired")
+                    batch_expired += 1
+            count += batch_expired
+            # If nothing expired in this batch, remaining items are still fresh
+            if batch_expired == 0:
+                break
         return count
 
     async def redispatch(self, dispatch_fn) -> tuple[int, int]:

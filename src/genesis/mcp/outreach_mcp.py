@@ -101,6 +101,60 @@ async def outreach_send(
 
 
 @mcp.tool()
+async def outreach_poll(
+    channel: str,
+    question: str,
+    answers: list[str],
+    duration_hours: int = 168,
+    allow_multiselect: bool = False,
+) -> str:
+    """Create a Discord poll via webhook. Returns JSON with message_id.
+
+    Args:
+        channel: Webhook name (e.g. "announcements", "general", "dev-discussion").
+        question: Poll question text (max 300 chars).
+        answers: List of answer options (max 10, each max 55 chars).
+        duration_hours: How long the poll stays open (default 7 days, max 768h).
+        allow_multiselect: Whether users can vote for multiple options.
+    """
+    import os
+
+    import httpx
+
+    # Resolve webhook URL from environment
+    env_key = f"DISCORD_WEBHOOK_{channel.upper().replace('-', '_')}"
+    webhook_url = os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        return json.dumps({"error": f"No webhook URL found (tried {env_key} and DISCORD_WEBHOOK_URL)"})
+
+    url = f"{webhook_url}?wait=true"
+    payload = {
+        "poll": {
+            "question": {"text": question[:300]},
+            "answers": [
+                {"poll_media": {"text": a[:55]}} for a in answers[:10]
+            ],
+            "duration": min(duration_hours, 768),
+            "allow_multiselect": allow_multiselect,
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            msg_id = data.get("id", "")
+        logger.info("Discord poll created via %s (msg_id=%s)", channel, msg_id)
+        return json.dumps({"status": "created", "message_id": msg_id, "channel": channel})
+    except httpx.HTTPStatusError as exc:
+        error_body = exc.response.text[:200] if exc.response else ""
+        return json.dumps({"error": f"Discord API error {exc.response.status_code}: {error_body}"})
+    except Exception as exc:
+        return json.dumps({"error": f"Poll creation failed: {exc}"})
+
+
+@mcp.tool()
 async def outreach_queue(
     category: str | None = None,
     channel: str | None = None,

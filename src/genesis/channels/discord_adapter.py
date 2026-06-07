@@ -84,6 +84,50 @@ class DiscordWebhookAdapter(ChannelAdapter):
         )
         return last_msg_id
 
+    async def send_poll(
+        self,
+        channel_id: str,
+        question: str,
+        answers: list[str],
+        *,
+        duration_hours: int = 168,
+        allow_multiselect: bool = False,
+    ) -> str:
+        """Create a Discord poll via webhook. Returns the message ID.
+
+        Args:
+            channel_id: Webhook name (looked up in webhooks dict).
+            question: Poll question (max 300 chars).
+            answers: List of answer strings (max 10, each max 55 chars).
+            duration_hours: Poll duration in hours (max 768, default 7 days).
+            allow_multiselect: Whether users can select multiple answers.
+        """
+        webhook_url = self._webhooks.get(channel_id, self._default)
+        url = f"{webhook_url}?wait=true"
+
+        payload: dict[str, Any] = {
+            "poll": {
+                "question": {"text": question[:300]},
+                "answers": [
+                    {"poll_media": {"text": a[:55]}} for a in answers[:10]
+                ],
+                "duration": min(duration_hours, 768),
+                "allow_multiselect": allow_multiselect,
+            }
+        }
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            msg_id = data.get("id", "")
+
+        logger.info(
+            "Discord poll created in %s (msg_id=%s, question=%.50s)",
+            channel_id, msg_id, question,
+        )
+        return msg_id
+
     async def send_typing(self, channel_id: str) -> None:
         """No-op — webhooks don't support typing indicators."""
 
@@ -94,6 +138,7 @@ class DiscordWebhookAdapter(ChannelAdapter):
             "reactions": False,
             "voice": False,
             "documents": False,
+            "polls": True,
             "max_length": _MAX_MESSAGE_LENGTH,
         }
 
