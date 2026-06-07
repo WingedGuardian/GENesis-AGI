@@ -41,7 +41,7 @@ class ContentPipelineModule:
         self._auto_capture_recon: bool = False
         self._auto_capture_trends: bool = False
         self._autonomous_drafting: bool = False
-        self._platform_targets: list[str] = ["telegram", "medium"]
+        self._platform_targets: list[str] = ["telegram", "medium", "discord"]
         self._engagement_threshold: int = 50
 
     @property

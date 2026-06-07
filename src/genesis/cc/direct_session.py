@@ -135,6 +135,9 @@ PROFILES: dict[str, list[str]] = {
     "research": (
         _UNIVERSAL_DISALLOW + _NO_OUTREACH_SEND + _NO_BROWSER_INTERACTION
     ),
+    "campaign": (
+        _UNIVERSAL_DISALLOW + _NO_BROWSER_INTERACTION
+    ),
 }
 
 VALID_PROFILES = frozenset(PROFILES.keys())
@@ -180,6 +183,16 @@ Your final message IS your deliverable.
 
 {_MISSION_INJECTION}
 """,
+    "campaign": f"""
+
+## Session Profile: campaign
+
+You have: Write, memory MCP tools, web tools, outreach_send.
+You do NOT have: Edit, Bash, NotebookEdit, browser tools.
+Your final message IS your deliverable. Write files to `~/.genesis/output/`.
+
+{_MISSION_INJECTION}
+""",
 }
 
 # Skills auto-injected by profile (always loaded for that profile)
@@ -187,6 +200,7 @@ _PROFILE_SKILLS: dict[str, list[str]] = {
     "interact": ["stealth-browser"],
     "research": [],
     "observe": [],
+    "campaign": ["voice-master"],
 }
 
 # Keyword triggers for content-related skills (scanned against prompt)
