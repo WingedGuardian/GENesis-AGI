@@ -736,10 +736,17 @@ class DirectSessionRunner:
             exceptions = set(request.tool_exceptions)
             disallowed = [t for t in disallowed if t not in exceptions]
 
-        # Give background sessions access to Genesis MCP servers (health + memory).
-        # Without this, the spawned CC process has no MCP tools (no browser, no
-        # memory_store, no observation_write).
-        mcp_config = self._config_builder.build_mcp_config(profile="reflection")
+        # Give background sessions access to Genesis MCP servers.
+        # Profile determines which servers: campaign/interact get outreach,
+        # observe/research get health + memory only.
+        _PROFILE_TO_MCP: dict[str, str] = {
+            "observe": "reflection",
+            "research": "reflection",
+            "interact": "sentinel",
+            "campaign": "campaign",
+        }
+        mcp_profile = _PROFILE_TO_MCP.get(request.profile, "reflection")
+        mcp_config = self._config_builder.build_mcp_config(profile=mcp_profile)
 
         # Prepend planning instruction if the caller opted in.
         prompt = request.prompt

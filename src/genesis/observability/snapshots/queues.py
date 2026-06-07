@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,52 @@ if TYPE_CHECKING:
     from genesis.routing.dead_letter import DeadLetterQueue
 
 logger = logging.getLogger(__name__)
+
+# Dead letter accumulation alerting — creates a critical observation when
+# pending items exceed this threshold. Checked on every awareness tick.
+_DEAD_LETTER_ALERT_THRESHOLD = 50
+# Cooldown prevents alert spam — one observation per hour max.
+_DEAD_LETTER_ALERT_COOLDOWN_S = 3600
+_last_dead_letter_alert_at: float = 0.0
+
+
+async def _alert_dead_letter_accumulation(db: aiosqlite.Connection | None, count: int) -> None:
+    """Create a critical observation when dead letters accumulate."""
+    global _last_dead_letter_alert_at
+
+    now = time.monotonic()
+    if now - _last_dead_letter_alert_at < _DEAD_LETTER_ALERT_COOLDOWN_S:
+        return  # Cooldown active
+
+    if db is None:
+        return
+
+    try:
+        import uuid
+
+        from genesis.db.crud import observations as obs_crud
+
+        obs_id = str(uuid.uuid4())
+        await obs_crud.create(
+            db,
+            id=obs_id,
+            source="dead_letter_monitor",
+            type="infrastructure_alert",
+            content=(
+                f"Dead letter queue has {count} pending items (threshold: "
+                f"{_DEAD_LETTER_ALERT_THRESHOLD}). Likely cause: provider "
+                f"chain exhaustion or circuit breaker stuck open. "
+                f"Check circuit breaker state and provider health."
+            ),
+            priority="critical",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        _last_dead_letter_alert_at = now
+        logger.warning(
+            "Dead letter alert: %d pending items (critical observation created)", count
+        )
+    except Exception:
+        logger.debug("Failed to create dead letter alert observation", exc_info=True)
 
 
 async def queues(
@@ -36,6 +83,9 @@ async def queues(
     if dead_letter:
         try:
             dead = await dead_letter.get_pending_count()
+            # Alert via observation when dead letters accumulate
+            if dead is not None and dead >= _DEAD_LETTER_ALERT_THRESHOLD:
+                await _alert_dead_letter_accumulation(db, dead)
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)
