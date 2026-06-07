@@ -1196,6 +1196,25 @@ class InboxMonitor:
                     errors.append(err)
                     logger.error(err)
 
+            # Create follow-ups from Recommendation blocks (non-fatal)
+            if output_text:
+                try:
+                    fu_count = await self._create_follow_ups_from_eval(
+                        evaluation_text=output_text,
+                        batch_id=batch_id,
+                        source_files=[item.file_path for item in batch],
+                    )
+                    if fu_count:
+                        logger.info(
+                            "Created %d follow-up(s) from inbox eval %s",
+                            fu_count, batch_id[:8],
+                        )
+                except Exception:
+                    logger.warning(
+                        "Follow-up creation from inbox eval failed (non-fatal)",
+                        exc_info=True,
+                    )
+
             url_failures = _has_url_failures(output_text, batch_content)
             if url_failures:
                 logger.warning(
@@ -1409,6 +1428,70 @@ class InboxMonitor:
                     "check.failed",
                     "Inbox check failed with exception",
                 )
+
+    # ------------------------------------------------------------------
+    # Follow-up creation from evaluation Recommendation blocks
+    # ------------------------------------------------------------------
+
+    # Classification → (strategy, priority, pinned)
+    _ACTION_MAP: dict[str, tuple[str, str, bool]] = {
+        "adopt":  ("user_input_needed", "high",   True),
+        "adapt":  ("user_input_needed", "medium", True),
+        "watch":  ("ego_judgment",      "low",    False),
+        "explore": ("user_input_needed", "medium", True),
+        "bookmark": ("ego_judgment",     "low",    False),
+    }
+
+    async def _create_follow_ups_from_eval(
+        self,
+        evaluation_text: str,
+        batch_id: str,
+        source_files: list[str],
+    ) -> int:
+        """Parse Recommendation blocks and create follow-ups for actionable items.
+
+        Returns the number of follow-ups created.
+        """
+        from genesis.db.crud import follow_ups
+        from genesis.inbox.recommendation import parse_recommendations
+
+        recs = parse_recommendations(evaluation_text)
+        created = 0
+        source_name = ", ".join(Path(f).name for f in source_files)
+
+        for rec in recs:
+            if not rec.is_actionable:
+                continue
+
+            action_key = rec.action.lower().replace("_", " ").strip()
+            mapping = self._ACTION_MAP.get(action_key)
+            if mapping is None:
+                logger.debug(
+                    "Unmapped action '%s' — skipping follow-up", rec.action,
+                )
+                continue
+
+            strategy, priority, pinned = mapping
+
+            title = rec.item_title or "Untitled"
+            content = f"[{rec.action.upper()}] {title}: {rec.next_step}"
+            reason = (
+                f"Inbox evaluation {batch_id[:8]}: {source_name}. "
+                f"Confidence: {rec.confidence}. Effort: {rec.effort}."
+            )
+
+            await follow_ups.create(
+                self._db,
+                content=content,
+                source="inbox_evaluation",
+                reason=reason,
+                strategy=strategy,
+                priority=priority,
+                pinned=pinned,
+            )
+            created += 1
+
+        return created
 
 
 def _compute_new_content(old_content: str, new_content: str) -> str:
