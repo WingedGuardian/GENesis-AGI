@@ -267,6 +267,7 @@ def _resolve_format_target(platform: str):
 
     mapping: dict[str, FormatTarget] = {
         "telegram": FormatTarget.TELEGRAM,
+        "discord": FormatTarget.DISCORD,
         "email": FormatTarget.EMAIL,
         "linkedin": FormatTarget.LINKEDIN,
         "twitter": FormatTarget.TWITTER,
