@@ -227,7 +227,7 @@ class MorningReportGenerator:
             f"- Queues: deferred={queues.get('deferred_work', 0)}, dead_letters={queues.get('dead_letters', 0)}, pending_embeddings={queues.get('pending_embeddings', 0)}",
             f"- Surplus: {surplus.get('status', '?')}, queue_depth={surplus.get('queue_depth', 0)}",
             f"- Awareness: ticks_24h={awareness.get('ticks_24h', '?')}",
-            f"- CC Sessions: foreground={cc.get('foreground_active', 0)}, background={cc.get('background_active', 0)}, failed_24h={cc.get('failed_24h', 0)}",
+            f"- CC Sessions: foreground={cc.get('foreground', {}).get('active', 0)}, background={cc.get('background', {}).get('active', 0)}, failed_24h={cc.get('failed_24h', 0)}",
         ]
         pending_embed = queues.get('pending_embeddings', 0)
         if pending_embed and pending_embed > 100:

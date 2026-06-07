@@ -214,8 +214,22 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
         await _send_typing_safe(ctx, msg.chat)
         typing_ka.start()
 
+        # Include reply-to message content so the LLM sees what the user
+        # is responding to. Without this, quote-replies to ego digests or
+        # outreach messages lose all context when falling through to the
+        # conversation handler.
+        prompt_text = msg.text
+        if msg.reply_to_message and getattr(msg.reply_to_message, "text", None):
+            replied = msg.reply_to_message.text
+            if len(replied) > 2000:
+                replied = replied[:2000] + "…"
+            prompt_text = (
+                f"[User replied to this message:]\n{replied}\n\n"
+                f"[User's reply:]\n{msg.text}"
+            )
+
         response = await ctx.loop.handle_message_streaming(
-            msg.text,
+            prompt_text,
             user_id=f"tg-{user.id}",
             channel=ChannelType.TELEGRAM,
             on_event=on_event,
