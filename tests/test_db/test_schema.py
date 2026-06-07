@@ -53,6 +53,8 @@ EXPECTED_TABLES = [
     "ego_intentions",
     "entity_resolution_audit",
     "centrality_cache",
+    "campaigns",
+    "campaign_runs",
 ]
 
 

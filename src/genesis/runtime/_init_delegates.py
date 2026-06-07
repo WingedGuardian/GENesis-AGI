@@ -28,6 +28,7 @@ from pathlib import Path
 from genesis.runtime.init import (
     autonomy,
     awareness,
+    campaigns,
     cc_relay,
     db,
     direct_session,
@@ -119,6 +120,9 @@ class _InitDelegatesMixin:
 
     async def _init_outreach(self) -> None:
         await outreach.init(self)
+
+    async def _init_campaigns(self) -> None:
+        await campaigns.init(self)
 
     async def _init_user_jobs(self) -> None:
         await user_jobs.init(self)

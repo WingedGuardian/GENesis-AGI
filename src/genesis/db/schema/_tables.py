@@ -1242,6 +1242,47 @@ TABLES = {
             used_in_optimization  INTEGER DEFAULT 0
         )
     """,
+    "campaigns": """
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id                TEXT PRIMARY KEY,
+            name              TEXT NOT NULL UNIQUE,
+            strategy_doc_path TEXT NOT NULL,
+            cron_cadence      TEXT NOT NULL,
+            model             TEXT NOT NULL DEFAULT 'sonnet',
+            effort            TEXT NOT NULL DEFAULT 'medium',
+            session_profile   TEXT NOT NULL DEFAULT 'research',
+            status            TEXT NOT NULL DEFAULT 'active' CHECK (
+                status IN ('active', 'paused', 'completed', 'failed')
+            ),
+            state_json        TEXT NOT NULL DEFAULT '{}',
+            pre_checks        TEXT NOT NULL DEFAULT '["rate_limit", "budget", "slots_available"]',
+            max_daily_cost_usd REAL NOT NULL DEFAULT 1.0,
+            created_at        TEXT NOT NULL,
+            paused_at         TEXT,
+            last_run_at       TEXT,
+            total_runs        INTEGER NOT NULL DEFAULT 0,
+            total_cost_usd    REAL NOT NULL DEFAULT 0.0
+        )
+    """,
+    "campaign_runs": """
+        CREATE TABLE IF NOT EXISTS campaign_runs (
+            id              TEXT PRIMARY KEY,
+            campaign_id     TEXT NOT NULL REFERENCES campaigns(id),
+            started_at      TEXT NOT NULL,
+            finished_at     TEXT,
+            trigger_type    TEXT NOT NULL DEFAULT 'scheduled' CHECK (
+                trigger_type IN ('scheduled', 'manual', 'event')
+            ),
+            outcome         TEXT NOT NULL DEFAULT 'pending' CHECK (
+                outcome IN ('pending', 'success', 'skip', 'error')
+            ),
+            skip_reason     TEXT,
+            summary         TEXT,
+            cost_usd        REAL NOT NULL DEFAULT 0.0,
+            session_id      TEXT,
+            state_snapshot   TEXT
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1473,6 +1514,12 @@ INDEXES = [
     # reflection corpus
     "CREATE INDEX IF NOT EXISTS idx_corpus_depth ON reflection_corpus(depth)",
     "CREATE INDEX IF NOT EXISTS idx_corpus_quality ON reflection_corpus(quality_label)",
+    # campaigns
+    "CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status)",
+    "CREATE INDEX IF NOT EXISTS idx_campaigns_name ON campaigns(name)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_runs_campaign ON campaign_runs(campaign_id)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_runs_outcome ON campaign_runs(outcome)",
+    "CREATE INDEX IF NOT EXISTS idx_campaign_runs_started ON campaign_runs(started_at DESC)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

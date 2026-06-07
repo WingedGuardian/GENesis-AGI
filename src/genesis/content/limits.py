@@ -9,6 +9,12 @@ PLATFORM_LIMITS: dict[FormatTarget, PlatformLimits] = {
         supports_html=True,
         supports_code_blocks=True,
     ),
+    FormatTarget.DISCORD: PlatformLimits(
+        max_length=2000,
+        supports_markdown=True,
+        supports_html=False,
+        supports_code_blocks=True,
+    ),
     FormatTarget.TWITTER: PlatformLimits(
         max_length=280,
         supports_markdown=False,

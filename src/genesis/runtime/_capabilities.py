@@ -61,6 +61,7 @@ _CAPABILITY_DESCRIPTIONS: dict[str, str] = {
     "serena": "Serena MCP — LSP-powered semantic code intelligence (Pyright). Symbol lookup, call site analysis, type-aware refactoring. External tool, not Genesis-managed.",
     "voice_wyoming": "Wyoming STT+TTS servers — audio transport for HA voice pipeline (:10300/:10301)",
     "voice_s2s": "Speech-to-speech session manager — GPT-Realtime/Gemini Live voice front-end with Genesis tool calling",
+    "campaigns": "Campaign subsystem — persistent, scheduled, LLM-driven operations with strategy docs, pre-checks, and autonomous session dispatch",
 }
 
 
