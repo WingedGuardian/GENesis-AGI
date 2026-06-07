@@ -163,6 +163,14 @@ class MorningReportGenerator:
         except Exception:
             logger.warning("Morning report: follow-ups unavailable", exc_info=True)
 
+        # 5b. Inbox follow-ups resolved by ego (weekly safety net)
+        try:
+            inbox_resolved = await self._get_inbox_resolved_digest()
+            if inbox_resolved:
+                sections.append(f"## Inbox Follow-ups (Ego-resolved)\n{inbox_resolved}")
+        except Exception:
+            logger.warning("Morning report: inbox resolved digest unavailable", exc_info=True)
+
         # 6. Outreach summary (just total count, no self-analysis)
         try:
             engagement = await self._get_engagement_summary()
@@ -435,6 +443,28 @@ class MorningReportGenerator:
                 lines.append(f"- ✓ {row[0][:200]}")
 
         return "\n".join(lines) if lines else None
+
+    async def _get_inbox_resolved_digest(self) -> str | None:
+        """Weekly digest of inbox follow-ups resolved by ego.
+
+        Only included when there are ego-resolved inbox follow-ups in the
+        last 7 days. Gives the user visibility into what the ego handled
+        without requiring them to check the dashboard.
+        """
+        from genesis.db.crud import follow_ups
+
+        resolved = await follow_ups.get_recently_resolved(
+            self._db, source="inbox_evaluation", days=7,
+        )
+        if not resolved:
+            return None
+
+        lines = [f"Ego resolved {len(resolved)} inbox follow-up(s) this week:"]
+        for fu in resolved[:10]:
+            content = (fu.get("content") or "?")[:150]
+            notes = (fu.get("resolution_notes") or "no notes")[:100]
+            lines.append(f"- {content} — {notes}")
+        return "\n".join(lines)
 
     async def _get_critical_issues(self) -> str | None:
         """Return critical issues text ONLY if WARNING+ alerts are active.
