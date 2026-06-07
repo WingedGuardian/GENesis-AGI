@@ -410,6 +410,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             await self._run_init_step_async("outreach", self._init_outreach)
 
         if _full:
+            await self._run_init_step_async("campaigns", self._init_campaigns)
+
+        if _full:
             await self._run_init_step_async("user_jobs", self._init_user_jobs)
 
         await self._run_init_step_async("autonomy", self._init_autonomy)

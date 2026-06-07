@@ -68,6 +68,27 @@ async def init(rt: GenesisRuntime) -> None:
                 recipients["email"] = gmail_addr
             logger.info("Email channel adapter registered (from: %s)", gmail_addr)
 
+        # Wire Discord webhook adapter if webhook URL exists
+        discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL")
+        if discord_webhook:
+            from genesis.channels.discord_adapter import DiscordWebhookAdapter
+
+            discord_webhooks = {}
+            for key, val in os.environ.items():
+                if key.startswith("DISCORD_WEBHOOK_") and key != "DISCORD_WEBHOOK_URL" and val:
+                    name = key[len("DISCORD_WEBHOOK_"):].lower().replace("_", "-")
+                    discord_webhooks[name] = val
+
+            channels["discord"] = DiscordWebhookAdapter(
+                webhooks=discord_webhooks,
+                default_webhook=discord_webhook,
+            )
+            if "discord" not in recipients:
+                recipients["discord"] = os.environ.get(
+                    "OUTREACH_RECIPIENT_DISCORD", "dev-discussion"
+                )
+            logger.info("Discord webhook adapter registered")
+
         rt._outreach_pipeline = _Pipeline(
             governance=governance,
             drafter=drafter,
