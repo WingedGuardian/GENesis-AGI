@@ -2114,10 +2114,16 @@ proposal and return a JSON array of verdicts.
 ## Rules
 {rule_1}
 
-2. **Check for zombies.** If a proposal covers substantially the same topic
-   as a recent proposal that was recycled/withdrawn/deferred/expired, and
-   nothing has changed in the circumstances, REJECT: "Zombie — proposed
-   before with no change in circumstances."
+2. **Check for zombies and duplicates.**
+   - ZOMBIE: If a proposal covers substantially the same topic as a recent
+     proposal that was recycled/withdrawn/deferred/expired, and nothing has
+     changed in the circumstances, REJECT: "Zombie — proposed before with
+     no change in circumstances."
+   - DUPLICATE: If a proposal covers substantially the same **topic** as a
+     currently **pending** or **approved** proposal in the history table,
+     REJECT: "Duplicate — same topic already pending/approved." Note: two
+     proposals about the same project but covering different aspects (e.g.,
+     different paper sections, different pipeline stages) are NOT duplicates.
 
 3. **Check feasibility.** If a proposal requires a capability Genesis
    genuinely doesn't have, AMEND with a feasible alternative.

@@ -221,6 +221,25 @@ class ProposalWorkflow:
                 goal_id = raw_goal_id
 
             proposal_content = p.get("content", "")
+            hash_val = _content_hash(proposal_content)
+
+            # Dedup: skip if identical content already pending/approved
+            try:
+                cursor = await self._db.execute(
+                    "SELECT 1 FROM ego_proposals "
+                    "WHERE content_hash = ? AND status IN ('pending', 'approved') "
+                    "LIMIT 1",
+                    (hash_val,),
+                )
+                if await cursor.fetchone():
+                    logger.info(
+                        "Proposal dedup: skipping exact duplicate (hash=%s)",
+                        hash_val[:12],
+                    )
+                    continue
+            except Exception:
+                logger.debug("Proposal dedup check failed, proceeding", exc_info=True)
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -242,7 +261,7 @@ class ProposalWorkflow:
                 realist_reasoning=p.get("_realist_reasoning"),
                 ego_source=ego_source,
                 goal_id=goal_id,
-                content_hash=_content_hash(proposal_content),
+                content_hash=hash_val,
                 content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
                 expected_outputs=_serialize_expected_outputs(
