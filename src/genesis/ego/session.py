@@ -1189,7 +1189,7 @@ class EgoSession:
             except Exception:
                 logger.debug("Pending cap check failed, proceeding", exc_info=True)
 
-            batch_id, ids = await self._proposals.create_batch(
+            batch_id, ids, created = await self._proposals.create_batch(
                 proposals,
                 cycle_id=cycle_id,
                 ego_source=self._source_tag,
@@ -1205,7 +1205,7 @@ class EgoSession:
                 from genesis.db.crud import intervention_journal as journal_crud
 
                 now = datetime.now(UTC).isoformat()
-                for pid, prop in zip(ids, proposals, strict=False):
+                for pid, prop in zip(ids, created, strict=False):
                     await journal_crud.create(
                         self._db,
                         ego_source=self._source_tag,
@@ -2114,10 +2114,16 @@ proposal and return a JSON array of verdicts.
 ## Rules
 {rule_1}
 
-2. **Check for zombies.** If a proposal covers substantially the same topic
-   as a recent proposal that was recycled/withdrawn/deferred/expired, and
-   nothing has changed in the circumstances, REJECT: "Zombie — proposed
-   before with no change in circumstances."
+2. **Check for zombies and duplicates.**
+   - ZOMBIE: If a proposal covers substantially the same topic as a recent
+     proposal that was recycled/withdrawn/deferred/expired, and nothing has
+     changed in the circumstances, REJECT: "Zombie — proposed before with
+     no change in circumstances."
+   - DUPLICATE: If a proposal covers substantially the same **topic** as a
+     currently **pending** or **approved** proposal in the history table,
+     REJECT: "Duplicate — same topic already pending/approved." Note: two
+     proposals about the same project but covering different aspects (e.g.,
+     different paper sections, different pipeline stages) are NOT duplicates.
 
 3. **Check feasibility.** If a proposal requires a capability Genesis
    genuinely doesn't have, AMEND with a feasible alternative.

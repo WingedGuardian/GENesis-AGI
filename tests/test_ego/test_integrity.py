@@ -129,6 +129,150 @@ async def test_create_proposal_without_integrity(db):
     assert row["original_content"] is None
 
 
+# ── Proposal dedup: content_hash enforcement in create_batch ────────────────
+
+
+async def test_create_batch_skips_exact_duplicate(db):
+    """create_batch skips proposals whose content_hash matches a pending one."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    # Create first batch — should succeed
+    _, ids1, _ = await wf.create_batch(
+        [{"content": "Investigate star spike", "action_type": "investigate"}],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids1) == 1
+
+    # Create second batch with identical content — should be deduped
+    _, ids2, _ = await wf.create_batch(
+        [{"content": "Investigate star spike", "action_type": "investigate"}],
+        cycle_id="cycle-2",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids2) == 0  # deduped — no new proposals created
+
+
+async def test_create_batch_allows_different_content(db):
+    """create_batch allows proposals with different content."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    _, ids1, _ = await wf.create_batch(
+        [{"content": "Investigate star spike", "action_type": "investigate"}],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids1) == 1
+
+    _, ids2, _ = await wf.create_batch(
+        [{"content": "Draft Discord milestone post", "action_type": "dispatch"}],
+        cycle_id="cycle-2",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids2) == 1  # different content — allowed
+
+
+async def test_create_batch_allows_after_rejection(db):
+    """Re-proposing content that was rejected should succeed."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    _, ids1, _ = await wf.create_batch(
+        [{"content": "Investigate star spike", "action_type": "investigate"}],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids1) == 1
+
+    # Reject the proposal
+    await ego_crud.resolve_proposal(db, ids1[0], status="rejected")
+
+    # Re-propose — should succeed since the original is no longer pending
+    _, ids2, _ = await wf.create_batch(
+        [{"content": "Investigate star spike", "action_type": "investigate"}],
+        cycle_id="cycle-2",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids2) == 1  # allowed — prior proposal was rejected
+
+
+async def test_create_batch_empty_content_not_blocked(db):
+    """Empty content proposals should not block each other via hash collision."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    _, ids1, _ = await wf.create_batch(
+        [{"content": "", "action_type": "investigate"}],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids1) == 1
+
+    # Second empty-content proposal should NOT be blocked
+    _, ids2, _ = await wf.create_batch(
+        [{"content": "", "action_type": "dispatch"}],
+        cycle_id="cycle-2",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids2) == 1  # empty content bypasses dedup
+
+
+async def test_create_batch_returns_created_proposals(db):
+    """create_batch returns the proposals that were actually created."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    p1 = {"content": "First proposal", "action_type": "investigate"}
+    p2 = {"content": "Second proposal", "action_type": "dispatch"}
+    _, ids, created = await wf.create_batch(
+        [p1, p2],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids) == 2
+    assert len(created) == 2
+    assert created[0]["content"] == "First proposal"
+    assert created[1]["content"] == "Second proposal"
+
+
+async def test_create_batch_created_proposals_exclude_deduped(db):
+    """created_proposals list excludes deduped proposals for correct pairing."""
+    from genesis.ego.proposals import ProposalWorkflow
+
+    wf = ProposalWorkflow(db=db)
+
+    # Create a pending proposal
+    _, ids1, _ = await wf.create_batch(
+        [{"content": "Duplicate me", "action_type": "investigate"}],
+        cycle_id="cycle-1",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids1) == 1
+
+    # Batch with dup in the middle: [new, dup, new]
+    _, ids2, created2 = await wf.create_batch(
+        [
+            {"content": "First new", "action_type": "dispatch"},
+            {"content": "Duplicate me", "action_type": "investigate"},
+            {"content": "Second new", "action_type": "dispatch"},
+        ],
+        cycle_id="cycle-2",
+        ego_source="user_ego_cycle",
+    )
+    assert len(ids2) == 2  # dup skipped
+    assert len(created2) == 2
+    # Verify alignment — ids pair with the right proposals
+    assert created2[0]["content"] == "First new"
+    assert created2[1]["content"] == "Second new"
+
+
 # ── Realist gate: _original_content propagation ─────────────────────────────
 
 

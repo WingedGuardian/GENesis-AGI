@@ -171,10 +171,12 @@ class ProposalWorkflow:
         *,
         cycle_id: str | None = None,
         ego_source: str | None = None,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], list[dict]]:
         """Create a batch of proposals from ego output dicts.
 
-        Returns ``(batch_id, [proposal_ids])``.
+        Returns ``(batch_id, [proposal_ids], [created_proposals])``.
+        The third element mirrors the created IDs so callers can pair
+        them correctly even when dedup skips mid-batch proposals.
         """
         batch_id = uuid.uuid4().hex[:16]
         created_at = datetime.now(UTC).isoformat()
@@ -198,6 +200,7 @@ class ProposalWorkflow:
         from genesis.ego.integrity import content_size as _content_size
 
         ids: list[str] = []
+        created_proposals: list[dict] = []
         for p in proposals:
             pid = uuid.uuid4().hex[:16]
             rank_val = p.get("rank")
@@ -221,6 +224,24 @@ class ProposalWorkflow:
                 goal_id = raw_goal_id
 
             proposal_content = p.get("content", "")
+            hash_val = _content_hash(proposal_content) if proposal_content else None
+
+            # Dedup: skip if identical content already pending/approved.
+            # Skip check for empty content to avoid false collisions on
+            # the fixed SHA-256 of the empty string.
+            if hash_val:
+                try:
+                    if await ego_crud.has_pending_proposal_with_hash(
+                        self._db, hash_val,
+                    ):
+                        logger.info(
+                            "Proposal dedup: skipping exact duplicate (hash=%s)",
+                            hash_val[:12],
+                        )
+                        continue
+                except Exception:
+                    logger.warning("Proposal dedup check failed, proceeding", exc_info=True)
+
             await ego_crud.create_proposal(
                 self._db,
                 id=pid,
@@ -242,7 +263,7 @@ class ProposalWorkflow:
                 realist_reasoning=p.get("_realist_reasoning"),
                 ego_source=ego_source,
                 goal_id=goal_id,
-                content_hash=_content_hash(proposal_content),
+                content_hash=hash_val,
                 content_size=_content_size(proposal_content),
                 original_content=p.get("_original_content"),
                 expected_outputs=_serialize_expected_outputs(
@@ -250,13 +271,14 @@ class ProposalWorkflow:
                 ),
             )
             ids.append(pid)
+            created_proposals.append(p)
 
         logger.info(
             "Created ego proposal batch %s with %d proposals",
             batch_id,
             len(ids),
         )
-        return batch_id, ids
+        return batch_id, ids, created_proposals
 
     # -- Formatting --------------------------------------------------------
 
