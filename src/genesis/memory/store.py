@@ -367,27 +367,16 @@ class MemoryStore:
         SQLite.  Sets ``deprecated=True`` and ``merged_into`` in the Qdrant
         payload.  Creates a ``succeeded_by`` link from old to new.
         """
-        # SQLite: mark deprecated + record successor
-        await self._db.execute(
-            "UPDATE memory_metadata SET deprecated = 1, "
-            "superseded_by = ?, superseded_at = ? "
-            "WHERE memory_id = ?",
-            (new_id, timestamp, old_id),
-        )
-        await self._db.commit()
+        # SQLite: mark deprecated + record successor (via CRUD module)
+        await memory_crud.mark_superseded(self._db, old_id, new_id, timestamp)
 
         # Qdrant: look up collection from metadata, then update payload
-        cursor = await self._db.execute(
-            "SELECT collection, embedding_status FROM memory_metadata "
-            "WHERE memory_id = ?",
-            (old_id,),
-        )
-        row = await cursor.fetchone()
-        if row and row[1] != "fts5_only":
+        meta = await memory_crud.get_metadata(self._db, old_id)
+        if meta and meta["embedding_status"] != "fts5_only":
             try:
                 update_payload(
                     self._qdrant,
-                    collection=row[0],
+                    collection=meta["collection"],
                     point_id=old_id,
                     payload={"deprecated": True, "merged_into": new_id},
                 )

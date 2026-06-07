@@ -102,6 +102,10 @@ async def memory_recall(
             fusion. Improves precision by rescoring candidates on semantic
             relevance. Adds ~300ms latency. Default True — disable with
             rerank=False for latency-sensitive calls.
+        include_deprecated: If True, include superseded/deprecated memories
+            in results. Default False — only current (non-deprecated) memories
+            are returned. Use True for audit/history queries (e.g., tracing
+            how a belief evolved over time).
     """
     import time as _time
 
