@@ -1189,7 +1189,7 @@ class EgoSession:
             except Exception:
                 logger.debug("Pending cap check failed, proceeding", exc_info=True)
 
-            batch_id, ids = await self._proposals.create_batch(
+            batch_id, ids, created = await self._proposals.create_batch(
                 proposals,
                 cycle_id=cycle_id,
                 ego_source=self._source_tag,
@@ -1205,7 +1205,7 @@ class EgoSession:
                 from genesis.db.crud import intervention_journal as journal_crud
 
                 now = datetime.now(UTC).isoformat()
-                for pid, prop in zip(ids, proposals, strict=False):
+                for pid, prop in zip(ids, created, strict=False):
                     await journal_crud.create(
                         self._db,
                         ego_source=self._source_tag,
