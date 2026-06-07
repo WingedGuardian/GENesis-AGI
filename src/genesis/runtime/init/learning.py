@@ -10,7 +10,7 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.env import cc_project_dir
+from genesis.env import cc_project_dir, user_timezone
 
 if TYPE_CHECKING:
     from genesis.runtime._core import GenesisRuntime
@@ -186,7 +186,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _calibration_with_health,
-            CronTrigger(hour=3, minute=0),
+            CronTrigger(hour=3, minute=0, timezone=user_timezone()),
             id="triage_calibration_daily",
             max_instances=1,
             misfire_grace_time=3600,
@@ -257,7 +257,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _harvest_and_store,
-            CronTrigger(hour="*/6", minute=15),
+            CronTrigger(hour="*/6", minute=15, timezone=user_timezone()),
             id="auto_memory_harvest",
             max_instances=1,
             misfire_grace_time=3600,
@@ -279,7 +279,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _observation_expiry_sweep,
-            CronTrigger(hour=2, minute=0),
+            CronTrigger(hour=2, minute=0, timezone=user_timezone()),
             id="observation_expiry_sweep",
             max_instances=1,
             misfire_grace_time=3600,
@@ -301,7 +301,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _follow_up_retention_sweep,
-            CronTrigger(hour=2, minute=30),
+            CronTrigger(hour=2, minute=30, timezone=user_timezone()),
             id="follow_up_retention_sweep",
             max_instances=1,
             misfire_grace_time=3600,
@@ -364,7 +364,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _expire_dead_letters,
-            CronTrigger(hour=1, minute=30),
+            CronTrigger(hour=1, minute=30, timezone=user_timezone()),
             id="dead_letter_expiry",
             max_instances=1,
             misfire_grace_time=3600,
@@ -386,7 +386,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _expire_stale_messages,
-            CronTrigger(hour=2, minute=30),
+            CronTrigger(hour=2, minute=30, timezone=user_timezone()),
             id="message_queue_expiry",
             max_instances=1,
             misfire_grace_time=3600,
@@ -419,7 +419,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _redispatch_dead_letters,
-            CronTrigger(hour="0,6,12,18", minute=45),
+            CronTrigger(hour="0,6,12,18", minute=45, timezone=user_timezone()),
             id="dead_letter_redispatch",
             max_instances=1,
             misfire_grace_time=3600,
@@ -510,7 +510,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _evolve_user_model,
-            CronTrigger(hour=4, minute=30),
+            CronTrigger(hour=4, minute=30, timezone=user_timezone()),
             id="user_model_evolution",
             max_instances=1,
             misfire_grace_time=3600,
@@ -537,7 +537,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _reap_stale_sessions,
-            CronTrigger(hour="1,7,13,19", minute=30),
+            CronTrigger(hour="1,7,13,19", minute=30, timezone=user_timezone()),
             id="session_reaper",
             max_instances=1,
             misfire_grace_time=3600,
@@ -559,7 +559,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _refresh_capability_map,
-            CronTrigger(hour="4,16", minute=15),
+            CronTrigger(hour="4,16", minute=15, timezone=user_timezone()),
             id="capability_map_refresh",
             max_instances=1,
             misfire_grace_time=3600,
@@ -579,7 +579,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _reap_activity_log,
-            CronTrigger(hour="2,8,14,20", minute=0),
+            CronTrigger(hour="2,8,14,20", minute=0, timezone=user_timezone()),
             id="activity_log_reaper",
             max_instances=1,
             misfire_grace_time=3600,
@@ -724,9 +724,13 @@ async def init(rt: GenesisRuntime) -> None:
                 rt.record_job_failure("process_reaper", str(exc))
                 logger.exception("Process reaper failed")
 
+        # CronTrigger instead of IntervalTrigger: IntervalTrigger resets on
+        # server restart, so the reaper never fires if the server restarts
+        # within the hour.  Runs at :15 past every hour to avoid collision
+        # with hour-boundary jobs.
         rt._learning_scheduler.add_job(
             _reap_stale_processes,
-            IntervalTrigger(hours=1),
+            CronTrigger(minute=15),
             id="process_reaper",
             max_instances=1,
             misfire_grace_time=600,
@@ -755,7 +759,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_skill_evolution,
-            CronTrigger(day_of_week="sun", hour=4, minute=0),
+            CronTrigger(day_of_week="sun", hour=4, minute=0, timezone=user_timezone()),
             id="skill_evolution",
             max_instances=1,
             misfire_grace_time=3600,
@@ -775,7 +779,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_j9_eval_aggregation,
-            CronTrigger(day_of_week="sun", hour=5, minute=0),
+            CronTrigger(day_of_week="sun", hour=5, minute=0, timezone=user_timezone()),
             id="j9_eval_aggregation",
             max_instances=1,
             misfire_grace_time=3600,

@@ -71,7 +71,10 @@ class MailMonitor:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
         from apscheduler.triggers.cron import CronTrigger
 
+        from genesis.env import user_timezone
+
         self._scheduler = AsyncIOScheduler()
+        tz = user_timezone()
 
         # Parse cron expression: "minute hour day_of_month month day_of_week"
         parts = self._config.cron_expression.split()
@@ -82,13 +85,14 @@ class MailMonitor:
                 day=parts[2],
                 month=parts[3],
                 day_of_week=parts[4],
+                timezone=tz,
             )
         else:
             logger.warning(
                 "Invalid cron expression %r, using default Sunday 5am",
                 self._config.cron_expression,
             )
-            trigger = CronTrigger(day_of_week="sun", hour=5)
+            trigger = CronTrigger(day_of_week="sun", hour=5, timezone=tz)
 
         self._scheduler.add_job(
             self._run_batch_safe,
