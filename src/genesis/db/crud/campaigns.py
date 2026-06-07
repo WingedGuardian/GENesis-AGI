@@ -15,7 +15,7 @@ async def create_campaign(
     created_at: str,
     model: str = "sonnet",
     effort: str = "medium",
-    session_profile: str = "interact",
+    session_profile: str = "research",
     status: str = "active",
     state_json: str = "{}",
     pre_checks: str = '["rate_limit", "budget", "slots_available"]',

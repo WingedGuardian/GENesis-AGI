@@ -245,17 +245,33 @@ def _read_strategy_doc(path: str) -> str:
 async def _check_session_status(db: Any, session_id: str) -> dict | None:
     """Check if a DirectSession has completed.
 
-    Returns the session result dict if completed, or None if still running.
+    Returns:
+        dict — session result if completed (success or failure)
+        None — session is still running (found in DB with active status)
+
+    If the session is not found in the DB (pruned, lost), returns a
+    synthetic failure result so the campaign doesn't stall permanently.
     """
     try:
         from genesis.db.crud import cc_sessions
 
         row = await cc_sessions.get_by_id(db, session_id)
         if not row:
-            return None
+            # Session not found — treat as completed with error to avoid
+            # permanent stall. This can happen if sessions are pruned by
+            # cleanup while a campaign tick is pending.
+            logger.warning(
+                "Campaign pending session %s not found in DB — treating as failed",
+                session_id,
+            )
+            return {
+                "success": False,
+                "output_text": "",
+                "cost_usd": 0.0,
+            }
 
         status = row.get("status", "")
-        if status in ("completed", "failed", "error"):
+        if status in ("completed", "failed"):
             metadata = {}
             raw_meta = row.get("metadata", "")
             if raw_meta:
@@ -304,6 +320,9 @@ async def _capture_session_results(
         # Couldn't parse — use raw text as summary
         summary = output_text[:500] if output_text else "No output"
 
+    # Capture session ID before clearing pending markers
+    completed_session_id = state.get("_pending_session_id")
+
     # Clear pending markers
     state.pop("_pending_session_id", None)
     state.pop("_pending_run_id", None)
@@ -318,7 +337,7 @@ async def _capture_session_results(
             outcome="success" if success else "error",
             summary=summary,
             cost_usd=cost_usd,
-            session_id=state.get("_pending_session_id"),
+            session_id=completed_session_id,
             finished_at=datetime.now(UTC).isoformat(),
         )
 

@@ -1250,7 +1250,7 @@ TABLES = {
             cron_cadence      TEXT NOT NULL,
             model             TEXT NOT NULL DEFAULT 'sonnet',
             effort            TEXT NOT NULL DEFAULT 'medium',
-            session_profile   TEXT NOT NULL DEFAULT 'interact',
+            session_profile   TEXT NOT NULL DEFAULT 'research',
             status            TEXT NOT NULL DEFAULT 'active' CHECK (
                 status IN ('active', 'paused', 'completed', 'failed')
             ),

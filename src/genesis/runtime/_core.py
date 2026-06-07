@@ -238,6 +238,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         self._ego_proposal_workflow: object | None = None
         self._genesis_ego_session: object | None = None  # Genesis ego (COO)
         self._genesis_ego_cadence_manager: object | None = None
+        self._campaign_runner: object | None = None
 
         # Global pause state — blocks all background dispatches when True.
         self._paused: bool = False
@@ -505,6 +506,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             ("mail_monitor", self._mail_monitor),
             ("surplus_scheduler", self._surplus_scheduler),
             ("learning_scheduler", self._learning_scheduler),
+            ("campaign_runner", self._campaign_runner),
             ("awareness_loop", self._awareness_loop),
         ]:
             if component is None:
@@ -572,6 +574,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "autonomy": "_autonomy_manager",
         "modules": "_module_registry",
         "pipeline": "_pipeline_orchestrator",
+        "campaigns": "_campaign_runner",
     }
 
     def _run_init_step(self, name: str, func) -> None:
