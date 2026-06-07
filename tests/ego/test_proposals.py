@@ -172,7 +172,7 @@ class TestProposalCRUD:
 
 class TestProposalWorkflow:
     async def test_create_batch_inserts(self, workflow, db):
-        batch_id, ids = await workflow.create_batch(
+        batch_id, ids, _ = await workflow.create_batch(
             _sample_proposals(3), cycle_id="cycle1",
         )
         assert len(ids) == 3
@@ -194,7 +194,7 @@ class TestProposalWorkflow:
             "execution_plan": "background CC, ~$0.30",
             "recurring": True,
         }]
-        batch_id, ids = await workflow.create_batch(props)
+        batch_id, ids, _ = await workflow.create_batch(props)
         row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
         assert row["rank"] == 1
         assert row["execution_plan"] == "background CC, ~$0.30"
@@ -216,7 +216,7 @@ class TestProposalWorkflow:
             "confidence": 0.8,
             "goal_id": goal_id,
         }]
-        batch_id, ids = await workflow.create_batch(props)
+        batch_id, ids, _ = await workflow.create_batch(props)
         row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
         assert row["goal_id"] == goal_id
 
@@ -229,7 +229,7 @@ class TestProposalWorkflow:
             "confidence": 0.7,
             "goal_id": "fake-goal-that-doesnt-exist",
         }]
-        batch_id, ids = await workflow.create_batch(props)
+        batch_id, ids, _ = await workflow.create_batch(props)
         row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
         assert row["goal_id"] is None
 
@@ -240,7 +240,7 @@ class TestProposalWorkflow:
             "content": "Fix memory index",
             "confidence": 0.9,
         }]
-        batch_id, ids = await workflow.create_batch(props)
+        batch_id, ids, _ = await workflow.create_batch(props)
         row = (await ego_crud.list_proposals_by_batch(db, batch_id))[0]
         assert row["goal_id"] is None
 
@@ -322,7 +322,7 @@ class TestProposalWorkflow:
     async def test_send_digest_calls_topic_manager(
         self, workflow, db, mock_topic_manager,
     ):
-        batch_id, _ = await workflow.create_batch(_sample_proposals(2))
+        batch_id, _, _ = await workflow.create_batch(_sample_proposals(2))
         delivery = await workflow.send_digest(batch_id)
         assert delivery == "msg12345"
         mock_topic_manager.send_to_category.assert_called_once()
@@ -330,7 +330,7 @@ class TestProposalWorkflow:
         assert call_args[0][0] == "ego_proposals"
 
     async def test_send_digest_stores_mapping(self, workflow, db):
-        batch_id, _ = await workflow.create_batch(_sample_proposals(1))
+        batch_id, _, _ = await workflow.create_batch(_sample_proposals(1))
         delivery = await workflow.send_digest(batch_id)
         assert await ego_crud.get_batch_for_delivery(db, delivery) == batch_id
         assert await ego_crud.get_state(
@@ -339,13 +339,13 @@ class TestProposalWorkflow:
 
     async def test_send_digest_no_topic_manager(self, db):
         wf = ProposalWorkflow(db=db, topic_manager=None)
-        batch_id, _ = await wf.create_batch(_sample_proposals(1))
+        batch_id, _, _ = await wf.create_batch(_sample_proposals(1))
         assert await wf.send_digest(batch_id) is None
 
     async def test_correction_stored_on_reject_with_reason(
         self, workflow, db, mock_memory_store,
     ):
-        batch_id, ids = await workflow.create_batch(_sample_proposals(2))
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(2))
         await workflow.send_digest(batch_id)
         mock_memory_store.reset_mock()
 
@@ -366,7 +366,7 @@ class TestProposalWorkflow:
     async def test_no_correction_on_reject_without_reason(
         self, workflow, db, mock_memory_store,
     ):
-        batch_id, ids = await workflow.create_batch(_sample_proposals(1))
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(1))
         mock_memory_store.reset_mock()
 
         await workflow.resolve_proposals(
@@ -377,7 +377,7 @@ class TestProposalWorkflow:
     async def test_no_correction_on_approve(
         self, workflow, db, mock_memory_store,
     ):
-        batch_id, ids = await workflow.create_batch(_sample_proposals(1))
+        batch_id, ids, _ = await workflow.create_batch(_sample_proposals(1))
         mock_memory_store.reset_mock()
 
         await workflow.resolve_proposals(
@@ -394,7 +394,7 @@ class TestProposalWorkflow:
             topic_manager=mock_topic_manager,
             memory_store=bad_store,
         )
-        batch_id, ids = await wf.create_batch(_sample_proposals(1))
+        batch_id, ids, _ = await wf.create_batch(_sample_proposals(1))
         results = await wf.resolve_proposals(
             batch_id, {1: ("rejected", "bad idea")},
         )

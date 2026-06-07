@@ -333,7 +333,7 @@ class TestRealistFilterIntegration:
         ]
 
         workflow = ProposalWorkflow(db=db)
-        batch_id, ids = await workflow.create_batch(proposals)
+        batch_id, ids, _ = await workflow.create_batch(proposals)
 
         prop = await ego_crud.get_proposal(db, ids[0])
         assert prop["realist_verdict"] == "pass"
@@ -353,7 +353,7 @@ class TestRealistFilterIntegration:
         ]
 
         workflow = ProposalWorkflow(db=db)
-        batch_id, ids = await workflow.create_batch(proposals)
+        batch_id, ids, _ = await workflow.create_batch(proposals)
 
         prop = await ego_crud.get_proposal(db, ids[0])
         assert prop["realist_verdict"] is None
@@ -371,7 +371,7 @@ class TestEgoSourceIsolation:
 
         proposals = [{"action_type": "dispatch", "content": "Test", "confidence": 0.8}]
         workflow = ProposalWorkflow(db=db)
-        _, ids = await workflow.create_batch(
+        _, ids, _ = await workflow.create_batch(
             proposals, ego_source="user_ego_cycle",
         )
         prop = await ego_crud.get_proposal(db, ids[0])
@@ -384,7 +384,7 @@ class TestEgoSourceIsolation:
 
         proposals = [{"action_type": "dispatch", "content": "Old", "confidence": 0.5}]
         workflow = ProposalWorkflow(db=db)
-        _, ids = await workflow.create_batch(proposals)
+        _, ids, _ = await workflow.create_batch(proposals)
         prop = await ego_crud.get_proposal(db, ids[0])
         assert prop["ego_source"] is None
 

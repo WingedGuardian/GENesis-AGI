@@ -114,7 +114,7 @@ def mock_context_builder():
 @pytest.fixture
 def mock_proposal_workflow():
     pw = AsyncMock()
-    pw.create_batch.return_value = ("batch123", ["p1"])
+    pw.create_batch.return_value = ("batch123", ["p1"], [{"content": "test"}])
     pw.send_digest.return_value = "msg456"
     return pw
 
