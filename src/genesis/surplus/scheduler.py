@@ -151,7 +151,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5, timezone=user_timezone()),
+                CronTrigger(day_of_week="sat", hour=9, timezone=user_timezone()),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -219,12 +219,17 @@ class SurplusScheduler:
 
     async def start(self) -> None:
         """Start the surplus scheduler with brainstorm check and dispatch jobs."""
+        # Brainstorm check: twice daily (1am + 1pm local).
+        # CronTrigger instead of IntervalTrigger — IntervalTrigger resets on
+        # restart.  Config param brainstorm_check_hours is unused since this
+        # conversion; the fixed schedule replaces the interval cadence.
+        from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.brainstorm_check,
-            IntervalTrigger(hours=self._brainstorm_interval),
+            CronTrigger(hour="1,13", minute=0, timezone=user_timezone()),
             id="surplus_brainstorm_check",
             max_instances=1,
-            misfire_grace_time=300,
+            misfire_grace_time=3600,
         )
         self._scheduler.add_job(
             self._dispatch_loop,
@@ -251,29 +256,32 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Recon gather: Tue & Fri 1:45am local (~3.5 day cadence).
+        # CronTrigger instead of IntervalTrigger — IntervalTrigger(hours=84)
+        # never fires if server restarts within 84h.  Config param
+        # recon_gather_hours is unused since this conversion.
         self._scheduler.add_job(
             self.run_recon_gather,
-            IntervalTrigger(hours=self._recon_gather_hours),
+            CronTrigger(day_of_week="tue,fri", hour=1, minute=45, timezone=user_timezone()),
             id="recon_gather",
             max_instances=1,
-            misfire_grace_time=300,
+            misfire_grace_time=3600,
         )
-        # Model intelligence: weekly Sunday 6am (per config/recon_schedules.yaml)
+        # Model intelligence: weekly Sunday 8am local (after dream cycle clears)
         if self._model_intelligence_job is not None:
-            from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_model_intelligence,
-                CronTrigger(day_of_week="sun", hour=6, timezone=user_timezone()),
+                CronTrigger(day_of_week="sun", hour=8, timezone=user_timezone()),
                 id="model_intelligence",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Models.md synthesis: weekly Sunday 8am — updates model catalog from recon
+        # Models.md synthesis: weekly Sunday 10am — updates model catalog from recon.
+        # Runs 2h after model_intelligence to consume its findings (soft dep).
         if self._models_md_synthesis_job is not None:
-            from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_models_md_synthesis,
-                CronTrigger(day_of_week="sun", hour=8, timezone=user_timezone()),
+                CronTrigger(day_of_week="sun", hour=10, timezone=user_timezone()),
                 id="models_md_synthesis",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -297,18 +305,20 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am local)
+        # Wing audit: twice-weekly memory taxonomy review (Tue & Fri 2am local).
+        # Moved off Sunday to avoid dream cycle congestion.
         self._scheduler.add_job(
             self.schedule_wing_audit,
-            CronTrigger(day_of_week="sun,wed", hour=2, timezone=user_timezone()),
+            CronTrigger(day_of_week="tue,fri", hour=2, timezone=user_timezone()),
             id="wing_audit",
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # CC memory staleness scan: weekly Sunday 3am local
+        # CC memory staleness scan: weekly Wednesday 3am local.
+        # Moved off Sunday to spread weekly jobs across the week.
         self._scheduler.add_job(
             self.schedule_cc_memory_staleness,
-            CronTrigger(day_of_week="sun", hour=3, timezone=user_timezone()),
+            CronTrigger(day_of_week="wed", hour=3, timezone=user_timezone()),
             id="cc_memory_staleness",
             max_instances=1,
             misfire_grace_time=3600,
@@ -320,13 +330,18 @@ class SurplusScheduler:
             max_instances=1,
             misfire_grace_time=300,
         )
+        # Analytical tasks: daily 7am local — LLM-based gap clustering,
+        # prompt effectiveness, anticipatory research.
+        # CronTrigger instead of IntervalTrigger — IntervalTrigger resets on
+        # restart.  Config param analytical_hours is unused since this
+        # conversion.
         if self._analytical_hours > 0:
             self._scheduler.add_job(
                 self.schedule_analytical,
-                IntervalTrigger(hours=self._analytical_hours),
+                CronTrigger(hour=7, minute=0, timezone=user_timezone()),
                 id="schedule_analytical",
                 max_instances=1,
-                misfire_grace_time=300,
+                misfire_grace_time=3600,
             )
         if self._j9_eval_batch_hours > 0:
             # CronTrigger instead of IntervalTrigger: IntervalTrigger resets
@@ -341,23 +356,27 @@ class SurplusScheduler:
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Fresh session test: weekly Sunday 5 AM local
+        # Fresh session test: weekly Saturday 9 AM local.
+        # Moved off Sunday to avoid dream cycle congestion.
         if self._fresh_session_test_executor is not None:
-            from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5, timezone=user_timezone()),
+                CronTrigger(day_of_week="sat", hour=9, timezone=user_timezone()),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
+        # Model eval: daily 7:30am local — model quality benchmarks.
+        # CronTrigger instead of IntervalTrigger — IntervalTrigger resets on
+        # restart.  Config param model_eval_hours is unused since this
+        # conversion.
         if self._model_eval_hours > 0:
             self._scheduler.add_job(
                 self.schedule_model_eval,
-                IntervalTrigger(hours=self._model_eval_hours),
+                CronTrigger(hour=7, minute=30, timezone=user_timezone()),
                 id="schedule_model_eval",
                 max_instances=1,
-                misfire_grace_time=300,
+                misfire_grace_time=3600,
             )
         if self._follow_up_dispatcher is not None:
             self._scheduler.add_job(

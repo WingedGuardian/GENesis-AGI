@@ -517,7 +517,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _evolve_user_model,
-            CronTrigger(hour=4, minute=30, timezone=user_timezone()),
+            CronTrigger(hour=6, minute=30, timezone=user_timezone()),  # moved from 4:30 to avoid dream cycle window
             id="user_model_evolution",
             max_instances=1,
             misfire_grace_time=3600,
@@ -566,7 +566,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _refresh_capability_map,
-            CronTrigger(hour="4,16", minute=15, timezone=user_timezone()),
+            CronTrigger(hour="9,21", minute=15, timezone=user_timezone()),  # moved from 4:15/16:15 to avoid dream cycle window
             id="capability_map_refresh",
             max_instances=1,
             misfire_grace_time=3600,
@@ -766,13 +766,14 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_skill_evolution,
-            CronTrigger(day_of_week="sun", hour=4, minute=0, timezone=user_timezone()),
+            CronTrigger(day_of_week="sat", hour=4, minute=0, timezone=user_timezone()),  # moved off Sunday to avoid dream cycle
             id="skill_evolution",
             max_instances=1,
             misfire_grace_time=3600,
         )
 
-        # J-9 eval weekly aggregation (Sundays 5am — after skill evolution)
+        # J-9 eval weekly aggregation (Sundays 7am — after dream cycle clears).
+        # Hard dep on 7-day rolling window — must stay Sunday.
         async def _run_j9_eval_aggregation():
             try:
                 from genesis.eval.j9_aggregator import run_weekly_aggregation
@@ -786,7 +787,7 @@ async def init(rt: GenesisRuntime) -> None:
 
         rt._learning_scheduler.add_job(
             _run_j9_eval_aggregation,
-            CronTrigger(day_of_week="sun", hour=5, minute=0, timezone=user_timezone()),
+            CronTrigger(day_of_week="sun", hour=7, minute=30, timezone=user_timezone()),  # :30 to avoid schedule_analytical at 7:00
             id="j9_eval_aggregation",
             max_instances=1,
             misfire_grace_time=3600,

@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 # Maps scheduler attribute names to subsystem display names
 _SCHEDULER_SUBSYSTEMS = {
     "_surplus_scheduler": "Surplus",
+    "_learning_scheduler": "Learning",
     "_outreach_scheduler": "Outreach",
     "_reflection_scheduler": "Reflection",
     "_awareness_loop": "Awareness",
@@ -22,8 +23,15 @@ _SCHEDULER_SUBSYSTEMS = {
 
 
 def _extract_apscheduler_jobs(component, subsystem: str) -> list[dict]:
-    """Extract job info from an APScheduler-backed component."""
+    """Extract job info from an APScheduler-backed component.
+
+    Handles both wrapper objects (with ``._scheduler``) and raw
+    ``AsyncIOScheduler`` instances (e.g., ``_learning_scheduler``).
+    """
     scheduler = getattr(component, "_scheduler", None)
+    # Fall back to treating component itself as the scheduler (raw scheduler case)
+    if scheduler is None and hasattr(component, "get_jobs"):
+        scheduler = component
     if scheduler is None or not getattr(scheduler, "running", False):
         return []
 
