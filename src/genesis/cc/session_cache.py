@@ -6,7 +6,7 @@ lightweight Python script with no DB access. It reads
 session header. This module keeps that cache file in sync.
 
 Call sites:
-  - session_set_model / session_set_effort MCP tools — writes on explicit change
+  - session_config MCP tool — writes on explicit change
 """
 
 from __future__ import annotations

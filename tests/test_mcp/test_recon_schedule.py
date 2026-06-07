@@ -1,4 +1,4 @@
-"""Tests for recon_schedule MCP tool."""
+"""Tests for recon_config schedule aspect."""
 
 import pytest
 import yaml
@@ -26,13 +26,16 @@ async def tools(schedule_file):
 
 
 async def test_view_schedule(tools):
-    result = await tools["recon_schedule"].fn(job_type="email_recon")
+    result = await tools["recon_config"].fn(aspect="schedule", job_type="email_recon")
     assert result["cron"] == "0 5 * * *"
     assert result["enabled"] is True
 
 
 async def test_update_schedule(tools, schedule_file):
-    result = await tools["recon_schedule"].fn(job_type="email_recon", new_schedule="0 4 * * *")
+    result = await tools["recon_config"].fn(
+        aspect="schedule", action="update",
+        job_type="email_recon", new_schedule="0 4 * * *",
+    )
     assert result["updated"] is True
     assert result["cron"] == "0 4 * * *"
 
@@ -42,6 +45,6 @@ async def test_update_schedule(tools, schedule_file):
 
 
 async def test_unknown_job_type(tools):
-    result = await tools["recon_schedule"].fn(job_type="nonexistent")
+    result = await tools["recon_config"].fn(aspect="schedule", job_type="nonexistent")
     assert "error" in result
     assert "nonexistent" in result["error"]

@@ -115,7 +115,7 @@ def main() -> None:
         # is always accurate. The sidecar file goes stale when CC's native
         # /model command is used (it doesn't call Genesis MCP tools).
         # Effort is injected because CC doesn't expose it in its system
-        # prompt — the sidecar (written by session_set_effort MCP) is the
+        # prompt — the sidecar (written by session_config MCP) is the
         # best-available signal.
         effort = "high"  # default — user's preferred effort level
         if _SESSION_CONFIG.exists():
@@ -305,7 +305,7 @@ def main() -> None:
         "You have genesis-health, genesis-memory, genesis-outreach, and genesis-recon MCP servers.\n"
         "Use memory tools (memory_recall, memory_store) for cross-session knowledge.\n"
         "Use health tools (health_status, health_errors, health_alerts) for system state.\n"
-        "Use session tools (session_set_model, session_set_effort) to switch model/effort.\n"
+        "Use session_config tool to switch model and/or effort.\n"
         "Use outreach tools (outreach_queue, outreach_digest) to check proactive messages.\n"
         "Use recon tools for project watchlist and findings.\n"
         "Use bookmark tools (bookmark_shelve, bookmark_unshelve) to save and find sessions."
@@ -327,7 +327,7 @@ def main() -> None:
             lines.append(
                 "\n**MCP Tools:** memory_recall/memory_store, "
                 "health_status/health_errors/health_alerts, "
-                "session_set_model/session_set_effort, "
+                "session_config, "
                 "outreach_queue/outreach_digest, recon tools, "
                 "bookmark_shelve/bookmark_unshelve.\n\n"
                 "**Skill Library:** Browse `src/genesis/skills/` or "

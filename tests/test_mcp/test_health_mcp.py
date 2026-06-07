@@ -16,7 +16,7 @@ async def test_all_tools_registered():
     tools = await mcp.get_tools()
     for name in [
         "health_status", "health_errors", "health_alerts",
-        "session_set_model", "session_set_effort",
+        "session_config",
     ]:
         assert name in tools, f"Missing tool: {name}"
 

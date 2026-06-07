@@ -1,4 +1,4 @@
-"""session_set_model and session_set_effort tools."""
+"""session_config tool — set model and/or effort for a conversation session."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ async def _impl_session_set_model(session_id: str, model: str) -> dict:
         _persist_session_config(model=model)
         return {"success": True, "model": model, "note": "Takes effect on your next response."}
     except Exception as exc:
-        logger.error("session_set_model failed for %s: %s", session_id[:8], exc, exc_info=True)
+        logger.error("session_config model failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session model: {type(exc).__name__}: {exc}"}
 
 
@@ -63,29 +63,69 @@ async def _impl_session_set_effort(session_id: str, effort: str) -> dict:
         _persist_session_config(effort=effort)
         return {"success": True, "effort": effort, "note": "Takes effect on your next response."}
     except Exception as exc:
-        logger.error("session_set_effort failed for %s: %s", session_id[:8], exc, exc_info=True)
+        logger.error("session_config effort failed for %s: %s", session_id[:8], exc, exc_info=True)
         return {"error": f"Failed to update session effort: {type(exc).__name__}: {exc}"}
 
 
 @mcp.tool()
-async def session_set_model(session_id: str, model: str) -> dict:
-    """Switch the model for a Genesis conversation session.
+async def session_config(
+    session_id: str,
+    model: str | None = None,
+    effort: str | None = None,
+) -> dict:
+    """Set model and/or effort for a Genesis conversation session.
 
-    Call this when the user asks to switch models, e.g. 'switch to opus',
-    'use haiku', 'change to sonnet'. Valid models: sonnet, opus, haiku.
+    Call when the user asks to switch models ('use opus', 'switch to haiku')
+    or effort ('think harder', 'low effort', 'max effort'). Both parameters
+    are optional — pass only what you want to change.
+
+    Valid models: sonnet, opus, haiku.
+    Valid efforts: low, medium, high, xhigh, max.
     Pass the Session ID from your system configuration.
-    The change takes effect on the next response.
+    Changes take effect on the next response.
     """
-    return await _impl_session_set_model(session_id, model)
+    import genesis.mcp.health_mcp as health_mcp_mod
 
+    if model is None and effort is None:
+        return {"error": "Provide at least one of 'model' or 'effort' to change."}
+    if not session_id or not session_id.strip():
+        return {"error": "Session ID is required"}
 
-@mcp.tool()
-async def session_set_effort(session_id: str, effort: str) -> dict:
-    """Switch the thinking effort for a Genesis conversation session.
+    # Pre-validate both params before any DB writes to prevent partial application
+    clean_model: str | None = None
+    clean_effort: str | None = None
+    if model is not None:
+        clean_model = model.lower().strip()
+        if clean_model not in _VALID_MODELS:
+            return {"error": f"Invalid model '{clean_model}'. Valid: {', '.join(sorted(_VALID_MODELS))}"}
+    if effort is not None:
+        clean_effort = effort.lower().strip()
+        if clean_effort not in _VALID_EFFORTS:
+            return {"error": f"Invalid effort '{clean_effort}'. Valid: {', '.join(sorted(_VALID_EFFORTS))}"}
 
-    Call this when the user asks to change thinking effort, e.g. 'use high
-    thinking', 'think harder', 'low effort', 'max effort'. Valid levels:
-    low, medium, high, xhigh, max. Pass the Session ID from your system configuration.
-    The change takes effect on the next response.
-    """
-    return await _impl_session_set_effort(session_id, effort)
+    _service = health_mcp_mod._service
+    if _service is None or _service._db is None:
+        return {"error": "Database not available"}
+
+    # Single DB call with both params — update_model_effort handles None params
+    try:
+        from genesis.db.crud import cc_sessions
+
+        updated = await cc_sessions.update_model_effort(
+            _service._db, session_id, model=clean_model, effort=clean_effort,
+        )
+        if not updated:
+            return {"error": f"Session '{session_id}' not found"}
+    except Exception as exc:
+        logger.error("session_config failed for %s: %s", session_id[:8], exc, exc_info=True)
+        return {"error": f"Failed to update session: {type(exc).__name__}: {exc}"}
+
+    # Single cache persist after DB succeeds
+    _persist_session_config(model=clean_model, effort=clean_effort)
+
+    result: dict = {"success": True, "note": "Takes effect on your next response."}
+    if clean_model is not None:
+        result["model"] = clean_model
+    if clean_effort is not None:
+        result["effort"] = clean_effort
+    return result

@@ -95,18 +95,86 @@ def _save_sources(sources: list[dict]) -> None:
 
 
 @mcp.tool()
-async def recon_watchlist(
+async def recon_config(
+    aspect: str,
+    action: str = "view",
+    job_type: str | None = None,
+    new_schedule: str | None = None,
+    source: dict | None = None,
     priority: str | None = None,
-) -> list[dict]:
-    """Return the hardcoded project watchlist.
+) -> list[dict] | dict:
+    """View or modify recon configuration.
 
-    These are projects Genesis actively monitors for updates, changes,
-    and releases. Filtered by priority if provided.
+    aspect: 'watchlist' | 'schedule' | 'sources'
+
+    For watchlist (read-only):
+      action='view', optional priority filter.
+
+    For schedule:
+      action='view' to list all schedules, or + job_type for one.
+      action='update' + job_type + new_schedule to change cron expression.
+
+    For sources:
+      action='list' to see watchlist + dynamic sources merged.
+      action='add' + source dict to add a dynamic source.
+      action='remove' + source dict to remove a dynamic source.
+      Watchlist entries are immutable.
     """
-    projects = _load_watchlist()
-    if priority:
-        projects = [p for p in projects if p.get("priority") == priority]
-    return projects
+    valid_aspects = {"watchlist", "schedule", "sources"}
+    if aspect not in valid_aspects:
+        return {"error": f"Invalid aspect '{aspect}'. Must be one of: {sorted(valid_aspects)}"}
+
+    if aspect == "watchlist":
+        projects = _load_watchlist()
+        if priority:
+            projects = [p for p in projects if p.get("priority") == priority]
+        return projects
+
+    if aspect == "schedule":
+        schedules = _load_schedules()
+        if not job_type:
+            if action == "view":
+                return [{"job_type": k, **v} for k, v in schedules.items()]
+            return {"error": "job_type is required for schedule update"}
+        if job_type not in schedules:
+            return {"error": f"Unknown job_type '{job_type}'. Available: {list(schedules.keys())}"}
+        if action == "view":
+            return {"job_type": job_type, **schedules[job_type]}
+        if action == "update":
+            if not new_schedule:
+                return {"error": "new_schedule is required for schedule update"}
+            schedules[job_type]["cron"] = new_schedule
+            _save_schedules(schedules)
+            return {"job_type": job_type, "updated": True, **schedules[job_type]}
+        return {"error": f"Invalid action '{action}' for schedule. Must be view or update."}
+
+    # aspect == "sources"
+    if action == "view" or action == "list":
+        watchlist = [{"origin": "watchlist", **p} for p in _load_watchlist()]
+        dynamic = [{"origin": "dynamic", **s} for s in _load_sources()]
+        return watchlist + dynamic
+
+    if action == "add":
+        if not source or "name" not in source:
+            return {"error": "source dict with 'name' required for add"}
+        sources = _load_sources()
+        sources.append(source)
+        _save_sources(sources)
+        return {"added": source["name"], "total_dynamic": len(sources)}
+
+    if action == "remove":
+        if not source or "name" not in source:
+            return {"error": "source dict with 'name' required for remove"}
+        watchlist_names = {p["name"] for p in _load_watchlist()}
+        if source["name"] in watchlist_names:
+            return {"error": f"Cannot remove watchlist entry '{source['name']}'. Watchlist is immutable."}
+        sources = _load_sources()
+        before = len(sources)
+        sources = [s for s in sources if s.get("name") != source["name"]]
+        _save_sources(sources)
+        return {"removed": source["name"], "found": len(sources) < before, "total_dynamic": len(sources)}
+
+    return {"error": f"Invalid action '{action}' for sources. Must be list, add, or remove."}
 
 
 @mcp.tool()
@@ -220,69 +288,6 @@ async def recon_triage(
         )
         await _db.commit()
         return {"success": cursor.rowcount > 0, "action": "defer"}
-
-
-@mcp.tool()
-async def recon_schedule(
-    job_type: str,
-    new_schedule: str | None = None,
-) -> dict:
-    """View or modify a recon gathering schedule.
-
-    If new_schedule is None, returns the current schedule for job_type.
-    Otherwise updates the cron expression.
-    """
-    schedules = _load_schedules()
-
-    if job_type not in schedules:
-        return {"error": f"Unknown job_type '{job_type}'. Available: {list(schedules.keys())}"}
-
-    if new_schedule is None:
-        return {"job_type": job_type, **schedules[job_type]}
-
-    schedules[job_type]["cron"] = new_schedule
-    _save_schedules(schedules)
-    return {"job_type": job_type, "updated": True, **schedules[job_type]}
-
-
-@mcp.tool()
-async def recon_sources(
-    action: str,
-    source: dict | None = None,
-) -> list[dict] | dict:
-    """Manage watched sources. action: add, remove, or list.
-
-    list: returns merged watchlist + dynamic sources.
-    add/remove: operate on dynamic sources only (watchlist is immutable).
-    source dict should have at minimum: name, url, type.
-    """
-    if action == "list":
-        watchlist = [{"origin": "watchlist", **p} for p in _load_watchlist()]
-        dynamic = [{"origin": "dynamic", **s} for s in _load_sources()]
-        return watchlist + dynamic
-
-    if action == "add":
-        if not source or "name" not in source:
-            return {"error": "source dict with 'name' required for add"}
-        sources = _load_sources()
-        sources.append(source)
-        _save_sources(sources)
-        return {"added": source["name"], "total_dynamic": len(sources)}
-
-    if action == "remove":
-        if not source or "name" not in source:
-            return {"error": "source dict with 'name' required for remove"}
-        # Cannot remove watchlist entries
-        watchlist_names = {p["name"] for p in _load_watchlist()}
-        if source["name"] in watchlist_names:
-            return {"error": f"Cannot remove watchlist entry '{source['name']}'. Watchlist is immutable."}
-        sources = _load_sources()
-        before = len(sources)
-        sources = [s for s in sources if s.get("name") != source["name"]]
-        _save_sources(sources)
-        return {"removed": source["name"], "found": len(sources) < before, "total_dynamic": len(sources)}
-
-    return {"error": f"Invalid action '{action}'. Must be add, remove, or list."}
 
 
 @mcp.tool()

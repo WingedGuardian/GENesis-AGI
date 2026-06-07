@@ -2,7 +2,7 @@
 #
 # These are hardcoded watch targets. The recon system checks these on schedule
 # regardless of salience scoring or LLM judgment. Add/remove entries here;
-# recon_sources (MCP tool) manages dynamic sources separately.
+# recon_config (MCP tool, aspect: sources) manages dynamic sources separately.
 #
 # Fields:
 #   name:        Human-readable project name
