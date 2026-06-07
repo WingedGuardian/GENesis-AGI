@@ -157,7 +157,7 @@ async def async_cleanup():
     individually guarded so a crashed Camoufox won't hang cleanup.
     Each cleanup step has a 10s timeout (user-approved) to prevent hanging
     if the Playwright Node.js driver or browser process is stuck. Orphaned
-    processes that survive timeout are caught by the process reaper (4h cycle).
+    processes that survive timeout are caught by the process reaper (hourly at :15).
     """
     global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
     global _idle_task, _last_used

@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
 from genesis.db.crud import surplus as surplus_crud
+from genesis.env import user_timezone
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.types import Severity, Subsystem
 from genesis.surplus.brainstorm import BrainstormRunner
@@ -150,7 +151,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5, timezone="UTC"),
+                CronTrigger(day_of_week="sun", hour=5, timezone=user_timezone()),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -262,7 +263,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_model_intelligence,
-                CronTrigger(day_of_week="sun", hour=6, timezone="UTC"),
+                CronTrigger(day_of_week="sun", hour=6, timezone=user_timezone()),
                 id="model_intelligence",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -272,7 +273,7 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.run_models_md_synthesis,
-                CronTrigger(day_of_week="sun", hour=8, timezone="UTC"),
+                CronTrigger(day_of_week="sun", hour=8, timezone=user_timezone()),
                 id="models_md_synthesis",
                 max_instances=1,
                 misfire_grace_time=3600,
@@ -281,33 +282,33 @@ class SurplusScheduler:
         from apscheduler.triggers.cron import CronTrigger
         self._scheduler.add_job(
             self.run_dream_cycle,
-            CronTrigger(day_of_week="sun", hour=4, timezone="UTC"),
+            CronTrigger(day_of_week="sun", hour=4, timezone=user_timezone()),
             id="dream_cycle",
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # GitNexus reindex: Mon & Thu 5am UTC (~72h apart).
+        # GitNexus reindex: Mon & Thu 5am local (~72h apart).
         # Uses CronTrigger (not IntervalTrigger) — IntervalTrigger resets
         # on restart and would never fire if server restarts more often.
         self._scheduler.add_job(
             self.run_gitnexus_reindex,
-            CronTrigger(day_of_week="mon,thu", hour=5, timezone="UTC"),
+            CronTrigger(day_of_week="mon,thu", hour=5, timezone=user_timezone()),
             id="gitnexus_reindex",
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am UTC)
+        # Wing audit: twice-weekly memory taxonomy review (Sun & Wed 2am local)
         self._scheduler.add_job(
             self.schedule_wing_audit,
-            CronTrigger(day_of_week="sun,wed", hour=2, timezone="UTC"),
+            CronTrigger(day_of_week="sun,wed", hour=2, timezone=user_timezone()),
             id="wing_audit",
             max_instances=1,
             misfire_grace_time=3600,
         )
-        # CC memory staleness scan: weekly Sunday 3am UTC
+        # CC memory staleness scan: weekly Sunday 3am local
         self._scheduler.add_job(
             self.schedule_cc_memory_staleness,
-            CronTrigger(day_of_week="sun", hour=3, timezone="UTC"),
+            CronTrigger(day_of_week="sun", hour=3, timezone=user_timezone()),
             id="cc_memory_staleness",
             max_instances=1,
             misfire_grace_time=3600,
@@ -335,17 +336,17 @@ class SurplusScheduler:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self.schedule_j9_eval_batch,
-                CronTrigger(hour=3, timezone="UTC"),  # 3 AM UTC daily
+                CronTrigger(hour=3, timezone=user_timezone()),  # 3 AM local daily
                 id="schedule_j9_eval_batch",
                 max_instances=1,
                 misfire_grace_time=3600,
             )
-        # Fresh session test: weekly Sunday 5 AM UTC
+        # Fresh session test: weekly Sunday 5 AM local
         if self._fresh_session_test_executor is not None:
             from apscheduler.triggers.cron import CronTrigger
             self._scheduler.add_job(
                 self._schedule_fresh_session_test,
-                CronTrigger(day_of_week="sun", hour=5, timezone="UTC"),
+                CronTrigger(day_of_week="sun", hour=5, timezone=user_timezone()),
                 id="schedule_fresh_session_test",
                 max_instances=1,
                 misfire_grace_time=3600,

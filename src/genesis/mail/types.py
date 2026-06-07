@@ -10,7 +10,7 @@ class MailConfig:
     """Configuration for the mail monitor."""
 
     enabled: bool = True
-    cron_expression: str = "0 5 * * 0"  # Sunday 05:00 UTC
+    cron_expression: str = "0 5 * * 0"  # Sunday 05:00 (user timezone)
     batch_size: int = 10  # Max emails per Layer 2 CC session
     model: str = "sonnet"  # Layer 2 model
     effort: str = "medium"  # Layer 2 effort
@@ -18,7 +18,7 @@ class MailConfig:
     max_retries: int = 3
     imap_timeout_s: int = 30
     max_emails_per_run: int = 50  # Safety cap per batch run
-    # timezone removed — uses genesis.env.user_timezone()
+    # timezone: caller passes user_timezone() to CronTrigger
     min_relevance: int = 3  # Layer 1 filter: only relevance >= this goes to judge
 
 
