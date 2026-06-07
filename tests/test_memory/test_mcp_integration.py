@@ -72,7 +72,7 @@ async def test_memory_store_delegates(mock_deps, tools):
     memory_mcp._store.store.assert_awaited_once_with(
         "hello", "test", memory_type="episodic", tags=None, confidence=0.5,
         memory_class=None, source_pipeline="conversation",
-        wing=None, room=None, collection=None,
+        wing=None, room=None, collection=None, supersedes=None,
     )
 
 
@@ -101,7 +101,7 @@ async def test_memory_recall_delegates(mock_deps, tools):
         wing=None, room=None, life_domain=None,
         expand_query_terms=True,
         include_subsystem=False, only_subsystem=None,
-        rerank=True,
+        rerank=True, include_deprecated=False,
     )
 
 

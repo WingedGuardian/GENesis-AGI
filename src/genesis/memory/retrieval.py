@@ -282,6 +282,7 @@ class HybridRetriever:
         include_subsystem: bool | list[str] = False,
         only_subsystem: str | list[str] | None = None,
         rerank: bool = True,
+        include_deprecated: bool = False,
     ) -> list[RetrievalResult]:
         """Hybrid retrieval: Qdrant + FTS5 + activation, fused via RRF.
 
@@ -360,6 +361,7 @@ class HybridRetriever:
                         project_type=project_type,
                         exclude_subsystems=exclude_subsystems,
                         include_only_subsystems=include_only_subsystems,
+                        include_deprecated=include_deprecated,
                     )
                 for hit in hits:
                     hit["_collection"] = coll
@@ -416,6 +418,7 @@ class HybridRetriever:
             boolean=fts_is_boolean,
             exclude_subsystems=exclude_subsystems,
             include_only_subsystems=include_only_subsystems,
+            include_deprecated=include_deprecated,
         )
 
         fts_by_id: dict[str, dict] = {}

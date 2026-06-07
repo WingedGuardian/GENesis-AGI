@@ -153,6 +153,7 @@ async def search_ranked(
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
     as_of: str | None = None,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """FTS5 search returning rank scores for RRF fusion.
 
@@ -194,12 +195,14 @@ async def search_ranked(
         "OR memory_metadata.invalid_at > ?)"
     )
     params.append(as_of)
-    # Always-on dream cycle deprecation filter: exclude consolidated memories.
+    # Dream cycle deprecation filter: exclude consolidated memories by default.
     # NULL deprecated (legacy rows pre-migration) = not deprecated.
-    sql += (
-        " AND (memory_metadata.deprecated IS NULL "
-        "OR memory_metadata.deprecated = 0)"
-    )
+    # Pass include_deprecated=True for audit/history queries.
+    if not include_deprecated:
+        sql += (
+            " AND (memory_metadata.deprecated IS NULL "
+            "OR memory_metadata.deprecated = 0)"
+        )
     if exclude_subsystems:
         placeholders = ",".join("?" * len(exclude_subsystems))
         sql += (
@@ -291,6 +294,51 @@ async def invalidate_memory(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def mark_superseded(
+    db: aiosqlite.Connection,
+    old_id: str,
+    new_id: str,
+    timestamp: str,
+) -> bool:
+    """Mark a memory as superseded by a newer memory.
+
+    Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at``.
+    Returns True if the memory was found and updated.
+    """
+    cursor = await db.execute(
+        "UPDATE memory_metadata SET deprecated = 1, "
+        "superseded_by = ?, superseded_at = ? "
+        "WHERE memory_id = ?",
+        (new_id, timestamp, old_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_metadata(
+    db: aiosqlite.Connection,
+    memory_id: str,
+) -> dict | None:
+    """Return metadata row for a memory_id, or None if not found."""
+    cursor = await db.execute(
+        "SELECT memory_id, collection, embedding_status, deprecated, "
+        "superseded_by, superseded_at FROM memory_metadata "
+        "WHERE memory_id = ?",
+        (memory_id,),
+    )
+    row = await cursor.fetchone()
+    if not row:
+        return None
+    return {
+        "memory_id": row[0],
+        "collection": row[1],
+        "embedding_status": row[2],
+        "deprecated": row[3],
+        "superseded_by": row[4],
+        "superseded_at": row[5],
+    }
 
 
 async def delete_metadata(db: aiosqlite.Connection, *, memory_id: str) -> bool:

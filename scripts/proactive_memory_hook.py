@@ -576,10 +576,16 @@ async def _search_qdrant(
         # Default exclusion of subsystem writes. ``must_not`` against a
         # missing payload key preserves the point — legacy rows without
         # ``source_subsystem`` continue to surface.
-        filter_block["must_not"] = [{
-            "key": "source_subsystem",
-            "match": {"any": list(_PROACTIVE_EXCLUDED_SUBSYSTEMS)},
-        }]
+        filter_block["must_not"] = [
+            {
+                "key": "source_subsystem",
+                "match": {"any": list(_PROACTIVE_EXCLUDED_SUBSYSTEMS)},
+            },
+            {
+                "key": "deprecated",
+                "match": {"value": True},
+            },
+        ]
         body["filter"] = filter_block
 
         async with httpx.AsyncClient(timeout=2.0) as client:
