@@ -348,6 +348,19 @@ async def set_mode(db: aiosqlite.Connection, mode: str, ego_key: str = "ego_mode
 # ---------------------------------------------------------------------------
 
 
+async def has_pending_proposal_with_hash(
+    db: aiosqlite.Connection, content_hash: str,
+) -> bool:
+    """Check if a pending or approved proposal with this content hash exists."""
+    cursor = await db.execute(
+        "SELECT 1 FROM ego_proposals "
+        "WHERE content_hash = ? AND status IN ('pending', 'approved') "
+        "LIMIT 1",
+        (content_hash,),
+    )
+    return await cursor.fetchone() is not None
+
+
 async def create_proposal(
     db: aiosqlite.Connection,
     *,

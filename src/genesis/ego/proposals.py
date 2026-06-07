@@ -231,13 +231,9 @@ class ProposalWorkflow:
             # the fixed SHA-256 of the empty string.
             if hash_val:
                 try:
-                    cursor = await self._db.execute(
-                        "SELECT 1 FROM ego_proposals "
-                        "WHERE content_hash = ? AND status IN ('pending', 'approved') "
-                        "LIMIT 1",
-                        (hash_val,),
-                    )
-                    if await cursor.fetchone():
+                    if await ego_crud.has_pending_proposal_with_hash(
+                        self._db, hash_val,
+                    ):
                         logger.info(
                             "Proposal dedup: skipping exact duplicate (hash=%s)",
                             hash_val[:12],
