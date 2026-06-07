@@ -61,8 +61,12 @@ class CampaignRunner:
         """Add an APScheduler job for a campaign."""
         from apscheduler.triggers.cron import CronTrigger
 
+        from genesis.env import user_timezone
+
         try:
-            trigger = CronTrigger.from_crontab(camp["cron_cadence"])
+            trigger = CronTrigger.from_crontab(
+                camp["cron_cadence"], timezone=user_timezone()
+            )
         except (ValueError, KeyError) as exc:
             logger.error(
                 "Invalid cron for campaign %s: %s", camp["name"], exc
