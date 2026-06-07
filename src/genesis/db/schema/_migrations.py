@@ -1239,6 +1239,14 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE memory_metadata ADD COLUMN dream_cycle_run_id TEXT",
         "memory_metadata.dream_cycle_run_id")
 
+    # Memory supersession: track which memory replaced this one (PR #551+).
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN superseded_by TEXT",
+        "memory_metadata.superseded_by")
+    await _try_alter(db,
+        "ALTER TABLE memory_metadata ADD COLUMN superseded_at TEXT",
+        "memory_metadata.superseded_at")
+
     # Observation de-escalation: track how many times an observation has
     # been surfaced (morning report, dashboard, critical alerting).
     await _try_alter(db,

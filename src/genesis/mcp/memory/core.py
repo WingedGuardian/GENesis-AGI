@@ -56,6 +56,7 @@ async def memory_recall(
     include_subsystem: bool | list[str] = False,
     only_subsystem: str | list[str] | None = None,
     rerank: bool = True,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """Hybrid search: Qdrant vectors + FTS5, RRF fusion, with optional graph enrichment.
 
@@ -164,6 +165,7 @@ async def memory_recall(
             include_subsystem=include_subsystem,
             only_subsystem=only_subsystem,
             rerank=rerank,
+            include_deprecated=include_deprecated,
         )
         pipeline_used = "standard"
 
@@ -405,6 +407,7 @@ async def memory_store(
     wing: str | None = None,
     room: str | None = None,
     collection: str | None = None,
+    supersedes: str | None = None,
 ) -> str:
     """Store memory with source metadata and type tag. Returns memory_id.
 
@@ -415,6 +418,9 @@ async def memory_store(
         room: Topic within the wing (auto-classified if not provided).
         collection: Explicit Qdrant collection override. Bypasses the default
             collection routing when provided (e.g. "knowledge_base").
+        supersedes: Memory ID that this new memory replaces. The old memory
+            will be marked as deprecated with a ``succeeded_by`` link to the
+            new one. Use when correcting stale facts.
     """
     memory_mod = _memory_mod()
     memory_mod._require_init()
@@ -422,7 +428,7 @@ async def memory_store(
     return await memory_mod._store.store(
         content, source, memory_type=memory_type, tags=tags, confidence=confidence,
         memory_class=memory_class, source_pipeline="conversation",
-        wing=wing, room=room, collection=collection,
+        wing=wing, room=room, collection=collection, supersedes=supersedes,
     )
 
 

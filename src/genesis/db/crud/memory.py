@@ -153,6 +153,7 @@ async def search_ranked(
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
     as_of: str | None = None,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """FTS5 search returning rank scores for RRF fusion.
 
@@ -194,12 +195,14 @@ async def search_ranked(
         "OR memory_metadata.invalid_at > ?)"
     )
     params.append(as_of)
-    # Always-on dream cycle deprecation filter: exclude consolidated memories.
+    # Dream cycle deprecation filter: exclude consolidated memories by default.
     # NULL deprecated (legacy rows pre-migration) = not deprecated.
-    sql += (
-        " AND (memory_metadata.deprecated IS NULL "
-        "OR memory_metadata.deprecated = 0)"
-    )
+    # Pass include_deprecated=True for audit/history queries.
+    if not include_deprecated:
+        sql += (
+            " AND (memory_metadata.deprecated IS NULL "
+            "OR memory_metadata.deprecated = 0)"
+        )
     if exclude_subsystems:
         placeholders = ",".join("?" * len(exclude_subsystems))
         sql += (

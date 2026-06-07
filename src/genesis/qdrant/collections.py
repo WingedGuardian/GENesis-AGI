@@ -85,6 +85,7 @@ def search(
     project_type: str | None = None,
     exclude_subsystems: list[str] | None = None,
     include_only_subsystems: list[str] | None = None,
+    include_deprecated: bool = False,
 ) -> list[dict]:
     """Search by vector similarity with optional payload filters.
 
@@ -98,12 +99,14 @@ def search(
     conditions: list = []
     must_not_conditions: list = []
 
-    # Always exclude deprecated memories (dream cycle soft-delete).
+    # Exclude deprecated memories (dream cycle soft-delete) by default.
     # Points without the field (legacy data) are preserved — Qdrant's
     # must_not only excludes points where the field exists AND matches.
-    must_not_conditions.append(
-        FieldCondition(key="deprecated", match=MatchValue(value=True))
-    )
+    # Pass include_deprecated=True for audit/history queries.
+    if not include_deprecated:
+        must_not_conditions.append(
+            FieldCondition(key="deprecated", match=MatchValue(value=True))
+        )
 
     if source_type:
         conditions.append(

@@ -18,7 +18,7 @@ from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.provider_activity import track_operation
 from genesis.observability.types import Severity, Subsystem
-from genesis.qdrant.collections import delete_point, upsert_point
+from genesis.qdrant.collections import delete_point, update_payload, upsert_point
 
 # Qdrant connection errors — broad catch for any transport/protocol failure
 try:
@@ -102,6 +102,7 @@ class MemoryStore:
         source_subsystem: str | None = None,
         life_domain: str | None = None,
         project_type: str | None = None,
+        supersedes: str | None = None,
     ) -> str:
         """Full store pipeline: embed -> Qdrant -> FTS5 -> auto-link. Returns memory_id.
 
@@ -342,7 +343,77 @@ class MemoryStore:
         # else: subsystem write — no pending_embeddings, no auto_link
         # (vector wasn't computed; link graph isn't consumed for filtered content)
 
+        # Supersession: mark old memory as deprecated, link to this one
+        if supersedes:
+            try:
+                await self._mark_superseded(supersedes, memory_id, now_iso)
+            except Exception:
+                logger.warning(
+                    "Failed to mark memory %s as superseded by %s",
+                    supersedes, memory_id, exc_info=True,
+                )
+
         return memory_id
+
+    async def _mark_superseded(
+        self,
+        old_id: str,
+        new_id: str,
+        timestamp: str,
+    ) -> None:
+        """Mark *old_id* as superseded by *new_id* in both SQLite and Qdrant.
+
+        Sets ``deprecated=1``, ``superseded_by``, and ``superseded_at`` in
+        SQLite.  Sets ``deprecated=True`` and ``merged_into`` in the Qdrant
+        payload.  Creates a ``succeeded_by`` link from old to new.
+        """
+        # SQLite: mark deprecated + record successor
+        await self._db.execute(
+            "UPDATE memory_metadata SET deprecated = 1, "
+            "superseded_by = ?, superseded_at = ? "
+            "WHERE memory_id = ?",
+            (new_id, timestamp, old_id),
+        )
+        await self._db.commit()
+
+        # Qdrant: look up collection from metadata, then update payload
+        cursor = await self._db.execute(
+            "SELECT collection, embedding_status FROM memory_metadata "
+            "WHERE memory_id = ?",
+            (old_id,),
+        )
+        row = await cursor.fetchone()
+        if row and row[1] != "fts5_only":
+            try:
+                update_payload(
+                    self._qdrant,
+                    collection=row[0],
+                    point_id=old_id,
+                    payload={"deprecated": True, "merged_into": new_id},
+                )
+            except Exception:
+                logger.warning(
+                    "Qdrant update_payload failed for superseded memory %s",
+                    old_id, exc_info=True,
+                )
+
+        # Create succeeded_by link for graph traversal
+        try:
+            await memory_links_crud.create(
+                self._db,
+                source_id=old_id,
+                target_id=new_id,
+                link_type="succeeded_by",
+                strength=1.0,
+                created_at=timestamp,
+            )
+        except Exception as link_exc:
+            # PK collision is fine (link already exists); log unexpected errors
+            if "UNIQUE constraint" not in str(link_exc):
+                logger.warning(
+                    "Failed to create succeeded_by link %s → %s: %s",
+                    old_id, new_id, link_exc,
+                )
 
     async def delete(self, memory_id: str) -> dict:
         """Delete a memory from all layers. Returns per-layer status.
