@@ -379,15 +379,36 @@ class ReconGatherer:
 
     @staticmethod
     def _load_watchlist() -> list[dict]:
-        """Load the hardcoded project watchlist."""
+        """Load project watchlist with local overlay support.
+
+        Base: ``config/recon_watchlist.yaml`` (committed, project-level)
+        Overlay: ``config/recon_watchlist.local.yaml`` (gitignored, install-level)
+
+        Projects from the local overlay are appended to the base list.
+        """
         if not _WATCHLIST_PATH.exists():
             return []
         try:
             import yaml
 
             with open(_WATCHLIST_PATH) as f:
-                data = yaml.safe_load(f)
-            return data.get("projects", []) if data else []
+                data = yaml.safe_load(f) or {}
+            projects = list(data.get("projects", []))
+
+            # Merge install-specific overlay (gitignored)
+            local_path = _WATCHLIST_PATH.with_suffix(".local.yaml")
+            if local_path.exists():
+                with open(local_path) as f:
+                    local_data = yaml.safe_load(f) or {}
+                local_projects = local_data.get("projects", [])
+                # Deduplicate by repo name
+                existing_repos = {p.get("repo") for p in projects}
+                for lp in local_projects:
+                    if lp.get("repo") not in existing_repos:
+                        projects.append(lp)
+                        existing_repos.add(lp.get("repo"))
+
+            return projects
         except Exception:
             logger.error("Failed to load watchlist", exc_info=True)
             return []
