@@ -76,9 +76,10 @@ With personal AI, you are the intelligence directing the tool. With personal AGI
 
 **How it does this:**
 
+- **Autonomous cognitive cycle** — a dual-ego architecture that wakes up, assesses the situation, proposes actions, and earns the right to execute them. Not waiting for prompts. Not following scripts. Thinking.
+- **Massive capability layer** — 60+ tools out of the box: browser automation, outreach pipeline, research, content creation, infrastructure monitoring, campaign execution. Not a framework you build on—a system that works, out of the box.
 - **4-layer memory** — essential knowledge, proactive recall, deep search, knowledge pipeline. Hybrid retrieval that compounds across months, not conversations.
 - **Closed-loop learning** — outcome classification, causal attribution, procedure extraction. Laplace-smoothed confidence, not vibes.
-- **Background cognition** — thinks, researches, audits, and communicates on free-tier compute while you sleep.
 - **Earned autonomy** — trust granted per action category through demonstrated competence. The system gets measurably better at its job, and it can show you the receipts.
 
 Day 1 — a strong generalist with full cognitive infrastructure.
