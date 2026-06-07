@@ -847,9 +847,11 @@ class TestRemoteInteraction:
             await browser._human_type(page, "#email", "hi")
 
         # Should clear field, click to focus, then type per-character
+        # (using keyboard.down + keyboard.up for hold-time simulation)
         page.fill.assert_awaited_once_with("#email", "", timeout=10000)
         page.click.assert_awaited_once_with("#email", timeout=10000)
-        assert page.keyboard.type.await_count == 2  # 'h', 'i'
+        assert page.keyboard.down.await_count == 2  # 'h', 'i'
+        assert page.keyboard.up.await_count == 2  # 'h', 'i'
 
     @pytest.mark.asyncio
     async def test_human_type_uses_atomic_fill_for_chromium(self):
