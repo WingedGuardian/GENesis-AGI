@@ -176,6 +176,7 @@
         sessionsExpanded: null,
         followUpsList: [],
         followUpsView: 'active',   // 'active' or 'all'
+        followUpsSourceMode: 'all', // 'all' | 'mine' | 'system'
         followUpsCounts: {},
         followUpsExpanded: null,
 
@@ -768,7 +769,9 @@
         },
         async fetchFollowUps() {
           try {
-            const resp = await fetchApi("/api/genesis/follow-ups?limit=50");
+            const sm = this.followUpsSourceMode;
+            const url = `/api/genesis/follow-ups?limit=50${sm !== 'all' ? '&source_mode=' + sm : ''}`;
+            const resp = await fetchApi(url);
             if (resp && resp.ok) {
               const data = await resp.json();
               this.followUpsList = data.follow_ups || [];
@@ -8280,6 +8283,17 @@
           <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
                   :style="$store.genesisDashboard.followUpsView === 'all' ? 'background:#2196F333; border:1px solid #2196F3; color:#2196F3; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
                   @click="$store.genesisDashboard.followUpsView = 'all'">All</button>
+          <!-- Source filter -->
+          <span style="border-left:1px solid #555; margin:0 0.25rem;"></span>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.followUpsSourceMode === 'all' ? 'background:#9c27b033; border:1px solid #9c27b0; color:#9c27b0; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.followUpsSourceMode = 'all'; $store.genesisDashboard.fetchFollowUps()">All Sources</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.followUpsSourceMode === 'mine' ? 'background:#ff980033; border:1px solid #ff9800; color:#ff9800; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.followUpsSourceMode = 'mine'; $store.genesisDashboard.fetchFollowUps()">Mine</button>
+          <button style="font-size:0.72rem; padding:0.2rem 0.6rem; border-radius:3px; cursor:pointer; transition:all 0.15s;"
+                  :style="$store.genesisDashboard.followUpsSourceMode === 'system' ? 'background:#00bcd433; border:1px solid #00bcd4; color:#00bcd4; font-weight:600;' : 'background:transparent; border:1px solid #666; color:#aaa;'"
+                  @click="$store.genesisDashboard.followUpsSourceMode = 'system'; $store.genesisDashboard.fetchFollowUps()">System</button>
         </div>
         <template x-if="$store.genesisDashboard.followUpsList.filter(f => {
           if ($store.genesisDashboard.followUpsView === 'active') return ['pending','in_progress','blocked'].includes(f.status);

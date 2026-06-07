@@ -63,6 +63,7 @@ from genesis.mcp.health import direct_session_tools as _direct_session_tools  # 
 from genesis.mcp.health import ego_tools as _ego_tools  # noqa: E402
 from genesis.mcp.health import errors as _errors  # noqa: E402
 from genesis.mcp.health import follow_up_tools as _follow_up_tools  # noqa: E402
+from genesis.mcp.health import inbox_digest as _inbox_digest  # noqa: E402
 from genesis.mcp.health import j9_eval as _j9_eval  # noqa: E402, F401
 from genesis.mcp.health import manifest as _manifest  # noqa: E402
 from genesis.mcp.health import module_ops as _module_ops  # noqa: E402
@@ -115,6 +116,7 @@ _impl_browser_clear_domain = _browser._impl_browser_clear_domain
 _impl_update_history_recent = _update_history._impl_update_history_recent
 _impl_follow_up_create = _follow_up_tools._impl_follow_up_create
 _impl_follow_up_list = _follow_up_tools._impl_follow_up_list
+_impl_inbox_digest = _inbox_digest._impl_inbox_digest
 _impl_ego_focus_reset = _ego_tools._impl_ego_focus_reset
 
 # direct_session_tools wired here
@@ -175,6 +177,8 @@ __all__ = [
     "_follow_up_tools",
     "_impl_follow_up_create",
     "_impl_follow_up_list",
+    "_inbox_digest",
+    "_impl_inbox_digest",
     "_ego_tools",
     "_impl_ego_focus_reset",
     "direct_session_tools",

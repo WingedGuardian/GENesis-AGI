@@ -32,20 +32,25 @@ async def follow_up_list():
 
     status_filter = request.args.get("status", "").strip() or None
     source_filter = request.args.get("source", "").strip() or None
+    source_mode = request.args.get("source_mode", "all").strip()
     limit = min(request.args.get("limit", 30, type=int), 200)
 
-    # source=user excludes ego-generated follow-ups from the view
-    exclude_source = "ego" if source_filter == "user" else None
+    # Backward compat: source=user maps to source_mode=mine
+    if source_filter == "user" and source_mode == "all":
+        source_mode = "mine"
 
     try:
         if status_filter:
             items = await follow_ups.get_by_status(rt.db, status_filter)
-            if exclude_source:
-                items = [i for i in items if exclude_source not in i.get("source", "")]
+            # Apply source_mode filter post-query for status-filtered results
+            if source_mode == "mine":
+                items = [i for i in items if i.get("source") == "foreground_session"]
+            elif source_mode == "system":
+                items = [i for i in items if i.get("source") != "foreground_session"]
             items = items[:limit]
         else:
             items = await follow_ups.get_recent(
-                rt.db, limit=limit, exclude_source=exclude_source,
+                rt.db, limit=limit, source_mode=source_mode,
             )
 
         counts = await follow_ups.get_summary_counts(rt.db)

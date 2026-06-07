@@ -379,3 +379,26 @@ async def query_by_batch(db: aiosqlite.Connection, batch_id: str) -> list[dict]:
         (batch_id,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_recent_completed(
+    db: aiosqlite.Connection,
+    *,
+    days: int = 7,
+    limit: int = 20,
+) -> list[dict]:
+    """Return recently completed inbox items with response paths.
+
+    Used by the inbox digest tool to show what was evaluated recently.
+    """
+    cursor = await db.execute(
+        """SELECT id, file_path, response_path, batch_id,
+                  created_at, processed_at
+           FROM inbox_items
+           WHERE status = 'completed'
+             AND response_path IS NOT NULL
+             AND created_at >= datetime('now', ? || ' days')
+           ORDER BY created_at DESC LIMIT ?""",
+        (f"-{days}", limit),
+    )
+    return [dict(row) for row in await cursor.fetchall()]
