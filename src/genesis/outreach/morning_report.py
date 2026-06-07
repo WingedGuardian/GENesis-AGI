@@ -275,6 +275,34 @@ class MorningReportGenerator:
         else:
             lines.append("- CC sessions: none in last 24h")
 
+        # Session topics (foreground only, last 24h) — what was actually worked on
+        cursor = await self._db.execute(
+            "SELECT topic FROM cc_sessions "
+            "WHERE started_at >= datetime('now', '-24 hours') "
+            "AND session_type = 'foreground' "
+            "AND topic != '' AND topic IS NOT NULL "
+            "ORDER BY started_at DESC LIMIT 15"
+        )
+        topic_rows = await cursor.fetchall()
+        if topic_rows:
+            lines.append("- Session topics (foreground):")
+            for r in topic_rows:
+                lines.append(f"  - {r[0][:120]}")
+
+        # Active user goals — enables the LLM to note priority alignment/drift
+        cursor = await self._db.execute(
+            "SELECT title, priority, category FROM user_goals "
+            "WHERE status = 'active' "
+            "ORDER BY CASE priority "
+            "  WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
+            "  WHEN 'medium' THEN 3 ELSE 4 END"
+        )
+        goal_rows = await cursor.fetchall()
+        if goal_rows:
+            lines.append("- Active user goals:")
+            for g in goal_rows:
+                lines.append(f"  - [{g[1]}] ({g[2]}) {g[0]}")
+
         # Inbox items — only report genuinely pending DB items (not filesystem output files)
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'"
