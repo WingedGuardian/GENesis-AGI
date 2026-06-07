@@ -247,6 +247,84 @@ the browser's built-in anti-detection:
 
 ---
 
+## Advanced Behavioral Rules
+
+These rules address detection surfaces beyond basic timing and clicks.
+Apply them in all Camoufox sessions unless site-specific guidance overrides.
+
+### Idle Mouse Micro-Jitter
+
+Real hands produce ±1-3px tremor while "still." Between actions (any
+dwell period >2s), the cursor must not be dead-still.
+
+- Emit 1-3 mousemove events every 1-2s during all dwell periods
+- Displacement: ±1-3px from current position (random, not oscillating)
+- Do NOT jitter during active movement (only during stillness)
+- Implemented in `_idle_jitter()` in browser.py
+
+### Keystroke Hold Time (keydown-to-keyup gap)
+
+Real keys are held briefly before release. Each keypress fires
+`keyboard.down(char)` → hold → `keyboard.up(char)`.
+
+- Hold time per key: sample from log-normal distribution
+- Calibration: median ~86ms (p5=48ms, p95=149ms) per CMU Keystroke dataset
+- Vary per keystroke -- NOT uniform across all keys
+- Flight time (key-up to next key-down): existing 50-200ms IKI still applies
+- Implemented in `_human_type()` in browser.py
+
+### Navigation Graph Depth
+
+Arriving directly at a form/auth page with no prior navigation is a
+strong bot signal regardless of per-page behavior.
+
+- For ANY target that is a form, login, checkout, or data-heavy endpoint:
+  navigate through at least 2 prior pages on the same domain
+- Dwell 2-5s on each prior page before proceeding
+- This generalizes the existing "visit careers page" rule to all targets
+- Referrer chain must be organic (not cold-start direct navigation)
+
+### Tab Visibility Switch
+
+Sessions maintaining continuous focus for >15s are atypical for humans.
+
+- For pages with >15s dwell before form interaction: simulate one
+  visibilitychange event (tab hidden + visible) before submission
+- Use `browser_run_js` to dispatch: `document.dispatchEvent(new Event('visibilitychange'))`
+- Or use actual tab switching if available
+
+### Scroll Patterns
+
+Real scrolling decelerates, occasionally goes backwards, and pauses at
+content boundaries.
+
+- Include at least one upward scroll segment per page (probability 0.2)
+- Decelerate scroll to zero over 200-400ms at end of each gesture
+- Add "scroll past then back" pattern when targeting form fields (p=0.3)
+- Scroll delta variance: 20-100px per event (never constant)
+- Implemented in `_human_scroll()` in browser.py
+
+### Pre-Form Element Interaction
+
+Direct-to-form behavior (first interaction is a form field) scores
+-0.1 to -0.3 on reCAPTCHA v3.
+
+- Before filling the first form field: move cursor to 1-2 non-form
+  elements (nav link, header, image), dwell 0.3-1.5s each
+- Then move to the first form field
+- This produces an interaction graph that doesn't start at the form target
+
+### Typo and Self-Correction (long text fields only)
+
+Real typists make errors at ~2% rate and correct them.
+
+- For text fields >20 characters: introduce one typo per ~50 chars
+- Type 1-2 wrong characters, pause 200-500ms, backspace, type correct
+- Do NOT apply to short fields (names, emails, passwords)
+- This is LLM-guided behavior, not auto-enforced in code
+
+---
+
 ## What This Skill Does NOT Cover
 
 - Browser fingerprinting (handled by Camoufox at C++ level)

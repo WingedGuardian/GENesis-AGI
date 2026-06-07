@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import random
 import time
@@ -841,6 +842,31 @@ def _check_page_drift(page) -> dict | None:
     return None
 
 
+# Module-level mouse position tracking (Playwright doesn't expose this).
+# Updated by _stealth_click and _idle_jitter; used for micro-jitter.
+_mouse_pos: dict[str, float] = {"x": 960.0, "y": 540.0}
+
+
+async def _idle_jitter(page, duration_s: float) -> None:
+    """Emit micro-movements during dwell to simulate hand tremor.
+
+    Real cursors produce ±1-3px displacement at ~0.5-1Hz while "still."
+    Call this during any dwell period >2s to avoid dead-cursor detection.
+    """
+    end = time.monotonic() + duration_s
+    while time.monotonic() < end:
+        await asyncio.sleep(random.uniform(0.8, 2.5))
+        if time.monotonic() >= end:
+            break
+        dx = random.uniform(-3, 3)
+        dy = random.uniform(-3, 3)
+        new_x = max(0, _mouse_pos["x"] + dx)
+        new_y = max(0, _mouse_pos["y"] + dy)
+        await page.mouse.move(new_x, new_y, steps=1)
+        _mouse_pos["x"] = new_x
+        _mouse_pos["y"] = new_y
+
+
 async def _human_delay() -> None:
     """Random delay mimicking human interaction timing.
 
@@ -862,6 +888,29 @@ async def _human_delay() -> None:
         delay = min(random.lognormvariate(1.2, 0.6), 15.0)
         delay = max(delay, 1.0)
         await asyncio.sleep(delay)
+
+
+async def _human_scroll(page, pixels: int, *, direction: str = "down") -> None:
+    """Scroll with human-like momentum, variance, and occasional back-scroll.
+
+    Emits variable-delta wheel events with decelerating pauses.
+    30% chance of a small back-scroll after reaching the target.
+    """
+    sign = -1 if direction == "up" else 1
+    scrolled = 0
+    while scrolled < pixels:
+        remaining = pixels - scrolled
+        delta = min(random.randint(20, 100), remaining)
+        await page.mouse.wheel(0, sign * delta)
+        scrolled += delta
+        # Deceleration: longer pauses as we approach target
+        pause = random.uniform(0.05, 0.15) * (1.0 + scrolled / max(pixels, 1))
+        await asyncio.sleep(pause)
+    # Occasional back-scroll (30% chance)
+    if random.random() < 0.3:
+        await asyncio.sleep(random.uniform(0.2, 0.5))
+        back = random.randint(10, 40)
+        await page.mouse.wheel(0, -sign * back)
 
 
 # ---------------------------------------------------------------------------
@@ -962,6 +1011,8 @@ async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
 
         # Hover first — generates mousemove trail to the element
         await page.mouse.move(target_x, target_y, steps=random.randint(5, 15))
+        _mouse_pos["x"] = target_x
+        _mouse_pos["y"] = target_y
         await asyncio.sleep(random.uniform(0.05, 0.2))
 
         # Click with realistic mousedown/mouseup gap
@@ -1076,9 +1127,17 @@ async def _human_type(page, selector: str, value: str) -> None:
     await page.fill(selector, "", timeout=10000)
     # Click to focus the field
     await page.click(selector, timeout=10000)
-    # Type per-keystroke with TRUE per-character IKI jitter
+    # Type per-keystroke with hold time + flight time (IKI) jitter.
+    # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
+    # Flight time: 50-200ms uniform with 5% thinking pauses.
     for char in value:
-        await page.keyboard.type(char)
+        # Hold phase: keydown → hold → keyup
+        hold_s = random.lognormvariate(math.log(0.086), 0.35)
+        hold_s = max(0.03, min(hold_s, 0.20))  # clamp 30-200ms
+        await page.keyboard.down(char)
+        await asyncio.sleep(hold_s)
+        await page.keyboard.up(char)
+        # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
         if random.random() < 0.05:
