@@ -99,7 +99,7 @@ class MailMonitor:
             trigger,
             id="mail_monitor_batch",
             max_instances=1,
-            misfire_grace_time=3600,
+            misfire_grace_time=21600,  # 6h — weekly job needs wide grace for restart churn
         )
         self._scheduler.start()
         logger.info("Mail monitor scheduled: %s", self._config.cron_expression)
