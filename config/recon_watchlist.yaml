@@ -1,8 +1,7 @@
 # Recon Watchlist — Projects Genesis actively monitors for updates.
 #
-# These are hardcoded watch targets. The recon system checks these on schedule
-# regardless of salience scoring or LLM judgment. Add/remove entries here;
-# recon_config (MCP tool, aspect: sources) manages dynamic sources separately.
+# Base watch targets (committed). Install-specific entries (e.g., your own
+# repo for star tracking) go in recon_watchlist.local.yaml (gitignored).
 #
 # Fields:
 #   name:        Human-readable project name
@@ -13,14 +12,6 @@
 #   urls:        Additional non-GitHub URLs to monitor (docs, blogs, changelogs)
 
 projects:
-
-  - name: GENesis-AGI
-    repo: WingedGuardian/GENesis-AGI
-    track: [stars]
-    priority: high
-    notes: >
-      Genesis public repo. Star count is the primary growth metric for the
-      marketing campaign. Track changes to measure outreach effectiveness.
 
   - name: Claude Code
     repo: anthropics/claude-code
