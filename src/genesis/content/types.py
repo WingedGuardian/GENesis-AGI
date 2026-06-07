@@ -9,6 +9,7 @@ from enum import StrEnum
 class FormatTarget(StrEnum):
     TELEGRAM = "telegram"
     EMAIL = "email"
+    DISCORD = "discord"
     LINKEDIN = "linkedin"
     TWITTER = "twitter"
     MEDIUM = "medium"
