@@ -69,7 +69,7 @@ a scoring axis is unremarkable, skip it here.}
 action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V3                  # V3 | V4 | V5 | Future | Never
+scope: V4                  # V4 (current) | V5 (next) | Future | Never
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
 ```
@@ -80,6 +80,10 @@ Rules:
 - `next_step` must be a single concrete sentence. "Investigate further" is
   not concrete. "Extract their prompt-versioning schema and compare to
   genesis.memory.prompt_versions table" is concrete.
+- Before rating IGNORE: check if the *topic* (not just the source) is relevant
+  to any active skill in `src/genesis/skills/`. A shallow source can raise an
+  important idea. Evaluate the idea, not the container. If the topic matters,
+  research it and rate the underlying concept — even if the source itself is thin.
 
 ### Overlap Comparison
 

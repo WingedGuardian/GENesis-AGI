@@ -2,7 +2,7 @@
 
 ## Current State
 
-Genesis core is feature-complete. Preparing for V4 work (meta-prompting,
+Genesis core is feature-complete. V4 work is active (meta-prompting,
 adaptive weights, channel learning, L5+ autonomy).
 
 **Ego sessions** (`src/genesis/ego/`) are **ACTIVE** (v3.0a11, PRs #26/#27).
