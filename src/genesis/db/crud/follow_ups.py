@@ -221,6 +221,7 @@ async def get_recent(
     *,
     limit: int = 20,
     exclude_source: str | None = None,
+    source_mode: str = "all",
 ) -> list[dict]:
     """Get recent follow-ups for dashboard display.
 
@@ -229,8 +230,28 @@ async def get_recent(
     exclude_source:
         If set, exclude rows where ``source LIKE %{exclude_source}%``.
         Use ``"ego"`` to hide ego-generated follow-ups from the user view.
+    source_mode:
+        Filter by source category:
+        - ``"all"`` — no filter (default)
+        - ``"mine"`` — only ``foreground_session`` source
+        - ``"system"`` — everything except ``foreground_session``
+        Takes precedence over ``exclude_source`` when not ``"all"``.
     """
-    if exclude_source:
+    if source_mode == "mine":
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups "
+            "WHERE source = 'foreground_session' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+    elif source_mode == "system":
+        cursor = await db.execute(
+            "SELECT * FROM follow_ups "
+            "WHERE source != 'foreground_session' "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+    elif exclude_source:
         cursor = await db.execute(
             "SELECT * FROM follow_ups "
             "WHERE source NOT LIKE ? "
@@ -242,6 +263,50 @@ async def get_recent(
             "SELECT * FROM follow_ups ORDER BY created_at DESC LIMIT ?",
             (limit,),
         )
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_by_source(
+    db: aiosqlite.Connection,
+    source: str,
+    *,
+    status: str | None = None,
+    days: int | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """Get follow-ups by source, optionally filtered by status and recency."""
+    query = "SELECT * FROM follow_ups WHERE source = ?"
+    params: list[str | int] = [source]
+    if status:
+        query += " AND status = ?"
+        params.append(status)
+    if days:
+        query += " AND created_at >= datetime('now', ? || ' days')"
+        params.append(f"-{days}")
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit)
+    cursor = await db.execute(query, params)
+    return [dict(row) for row in await cursor.fetchall()]
+
+
+async def get_recently_resolved(
+    db: aiosqlite.Connection,
+    *,
+    source: str | None = None,
+    days: int = 7,
+    limit: int = 20,
+) -> list[dict]:
+    """Get recently completed follow-ups, optionally filtered by source."""
+    query = "SELECT * FROM follow_ups WHERE status = 'completed'"
+    params: list[str | int] = []
+    if source:
+        query += " AND source = ?"
+        params.append(source)
+    query += " AND completed_at >= datetime('now', ? || ' days')"
+    params.append(f"-{days}")
+    query += " ORDER BY completed_at DESC LIMIT ?"
+    params.append(limit)
+    cursor = await db.execute(query, params)
     return [dict(row) for row in await cursor.fetchall()]
 
 
