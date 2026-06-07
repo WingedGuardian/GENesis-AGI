@@ -94,16 +94,12 @@ Classify each finding:
 
 ### Scope Tag
 Every actionable item gets a version tag:
-- **V3** — current scope, can be built now
-- **V4** — next version scope, note for design doc
-- **V5** — distant scope, note but don't design for yet
+- **V4** — current active scope (do it now)
+- **V5** — next version scope, note for design doc
 - **Future** — beyond V5, worth remembering for long-term evolution
 - **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
 
-### Phase Mapping
-V3 build phases (0-9) are all complete. Map actionable items to version
-scope only (V3 improvement, V4, V5, Future, Never). Do not reference
-build phase numbers — they are historical.
+V3 is complete. All new work is V4 or later.
 
 ## Phase 4: Discussion & Refinement
 
@@ -124,15 +120,15 @@ When evaluating autonomously (strategic reflection, surplus research):
 
 Evaluations produce action items. File them by scope:
 
-- **V3 improvements** (actionable now) → `docs/actions/genesis/active.md`
-- **V4/V5/deferred** (future scope) → `docs/actions/genesis/deferred.md`
+- **V4** (actionable now) → `docs/actions/genesis/active.md`
+- **V5/deferred** (future scope) → `docs/actions/genesis/deferred.md`
 
 Follow the format in `docs/actions/README.md`. Each item needs:
 - Source (this evaluation)
 - Date
 - Description of what to do
-- Scope tag (V3 / V4 / V5 / Future / Never)
-- For deferred items: reason for deferral
+- Scope tag (V4 / V5 / Future / Never)
+- For deferred items (V5+): reason for deferral
 
 ### Cross-Reference Updates
 When findings affect existing design documents, update them:

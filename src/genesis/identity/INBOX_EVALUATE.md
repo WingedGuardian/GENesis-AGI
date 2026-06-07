@@ -311,6 +311,16 @@ COULD Help, What to Learn), scoring axes (capability gap, replacement risk,
 integration cost, lock-in risk), and recommendation categories (ADOPT, WATCH,
 IGNORE, ADAPT).
 
+**Active Skill Cross-Reference (before IGNORE decisions):**
+Before rating any item IGNORE, check whether the *topic* it raises — not just
+the source content — is relevant to an active skill in `src/genesis/skills/`.
+A shallow source can raise an important topic. If the topic matters to an active
+skill or capability, treat the source as a signal: research the underlying idea,
+identify what Genesis should adopt or investigate, and rate accordingly. Evaluate
+the idea, not just the container. A 48-second video about behavioral biometrics
+that triggers research into mouse movement patterns for the stealth-browser skill
+is more valuable than a thorough whitepaper on an irrelevant domain.
+
 Additionally, for Genesis-relevant items, assess Architecture Impact:
 - **validates** — confirms existing design (no action needed)
 - **extends** — compatible addition (queue for appropriate phase)
@@ -318,9 +328,8 @@ Additionally, for Genesis-relevant items, assess Architecture Impact:
 - **irrelevant** — note and move on
 
 And assign Scope Tags:
-- **V3** — current scope
-- **V4** — next version
-- **V5** — distant scope
+- **V4** — current active scope (do it now)
+- **V5** — next version scope (defer)
 - **Future** — beyond V5
 - **Never** — doesn't fit Genesis philosophy, explicitly reject with reason
 
@@ -484,7 +493,7 @@ For **Genesis-relevant** items, use this YAML block:
 action: ADAPT              # ADOPT | ADAPT | WATCH | IGNORE
 next_step: "One concrete sentence — what specifically to do next"
 effort: Small              # Trivial | Small | Medium | Large
-scope: V3                  # V3 | V4 | V5 | Future | Never
+scope: V4                  # V4 (current) | V5 (next) | Future | Never
 confidence: high           # low | medium | high
 architecture_impact: extends  # validates | extends | challenges | irrelevant
 ```
