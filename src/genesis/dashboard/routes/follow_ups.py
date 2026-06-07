@@ -39,9 +39,6 @@ async def follow_up_list():
     if source_filter == "user" and source_mode == "all":
         source_mode = "mine"
 
-    # Legacy exclude_source only used when source_mode is "all"
-    exclude_source = "ego" if source_filter == "user" else None
-
     try:
         if status_filter:
             items = await follow_ups.get_by_status(rt.db, status_filter)
@@ -50,8 +47,6 @@ async def follow_up_list():
                 items = [i for i in items if i.get("source") == "foreground_session"]
             elif source_mode == "system":
                 items = [i for i in items if i.get("source") != "foreground_session"]
-            elif exclude_source:
-                items = [i for i in items if exclude_source not in i.get("source", "")]
             items = items[:limit]
         else:
             items = await follow_ups.get_recent(

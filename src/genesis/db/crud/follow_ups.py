@@ -297,6 +297,7 @@ async def get_recently_resolved(
     limit: int = 20,
 ) -> list[dict]:
     """Get recently completed follow-ups, optionally filtered by source."""
+    days = max(1, days)
     query = "SELECT * FROM follow_ups WHERE status = 'completed'"
     params: list[str | int] = []
     if source:

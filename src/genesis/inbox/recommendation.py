@@ -73,12 +73,6 @@ _YAML_BLOCK_RE = re.compile(
     r"```\s*yaml\s*\n(.*?)```", re.DOTALL,
 )
 
-# Extract item title from ## heading line
-_TITLE_RE = re.compile(
-    r"^## (?:\d+\.\s*)?(.+?)(?:\s*\{.*\})?\s*$", re.MULTILINE,
-)
-
-
 def parse_recommendations(evaluation_text: str) -> list[Recommendation]:
     """Extract all Recommendation YAML blocks from an evaluation response.
 
