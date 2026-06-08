@@ -142,11 +142,11 @@ class ReplyPoller:
             await self._check_follow_ups(stats)
             return stats
 
-        # 2. Mark ALL as read IMMEDIATELY to avoid IMAP collision
-        uids = [e.uid for e in raw_emails]
-        await self._imap.mark_read(uids)
+        # 2. Extract reply headers and match against threads.
+        #    Only mark MATCHED emails as read — unmatched emails stay
+        #    unread so the weekly MailMonitor can process them.
+        matched_uids: list[int] = []
 
-        # 3. Extract reply headers and match against threads
         for raw in raw_emails:
             try:
                 reply = _extract_reply_headers(raw)
@@ -162,7 +162,8 @@ class ReplyPoller:
                     stats["unmatched"] += 1
                     continue
 
-                # Match found — record the reply
+                # Match found — mark read and record
+                matched_uids.append(raw.uid)
                 stats["matched"] += 1
                 await self._tracker.record_reply(
                     thread_id=thread["id"],
@@ -192,6 +193,10 @@ class ReplyPoller:
                     "Error processing email UID %d", raw.uid, exc_info=True,
                 )
                 stats["errors"] += 1
+
+        # 3. Mark only matched emails as read
+        if matched_uids:
+            await self._imap.mark_read(matched_uids)
 
         # 4. Check for stale threads (follow-up scheduling)
         await self._check_follow_ups(stats)

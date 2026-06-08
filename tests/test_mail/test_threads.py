@@ -324,8 +324,8 @@ class TestReplyPoller:
         assert stats["matched"] == 1
         assert stats["unmatched"] == 0
 
-        # Verify mark_read was called immediately
-        mock_imap.mark_read.assert_called_once()
+        # Verify only matched UIDs were marked read
+        mock_imap.mark_read.assert_called_once_with([99])
 
         # Verify on_reply callback was called
         on_reply.assert_called_once()
@@ -348,6 +348,9 @@ class TestReplyPoller:
         stats = await poller.poll()
         assert stats["unmatched"] == 1
         assert stats["matched"] == 0
+
+        # Unmatched emails should NOT be marked read (left for weekly monitor)
+        mock_imap.mark_read.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_poll_checks_follow_ups(self, tracker):

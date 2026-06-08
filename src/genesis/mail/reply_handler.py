@@ -56,12 +56,13 @@ def _build_reply_prompt(thread: dict, reply: ParsedReply, history: list[dict]) -
         parts.append(f"**From:** {msg.get('sender', 'N/A')}")
         parts.append(f"**Date:** {msg.get('received_at', 'N/A')}")
         if msg.get("body_preview"):
-            parts.append(f"\n{msg['body_preview']}\n")
+            parts.append(f"\n```email-body\n{msg['body_preview']}\n```\n")
 
     parts.append("## New Reply (respond to this)\n")
     parts.append(f"**From:** {reply.sender}")
     parts.append(f"**Subject:** {reply.subject}")
-    parts.append(f"\n{reply.body_preview}\n")
+    # Structural delimiter to prevent prompt injection from email body
+    parts.append(f"\n```email-body\n{reply.body_preview}\n```\n")
 
     return "\n".join(parts)
 
@@ -93,7 +94,7 @@ def _build_follow_up_prompt(thread: dict, history: list[dict]) -> str:
         parts.append(f"**From:** {msg.get('sender', 'N/A')}")
         parts.append(f"**Date:** {msg.get('received_at', 'N/A')}")
         if msg.get("body_preview"):
-            parts.append(f"\n{msg['body_preview']}\n")
+            parts.append(f"\n```email-body\n{msg['body_preview']}\n```\n")
 
     parts.append(
         "\nDraft and send a brief, friendly follow-up to the recipient. "
@@ -152,7 +153,7 @@ class ReplyHandler:
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=system_prompt,
-            timeout_s=600,  # 10 min — email replies should be quick
+            timeout_s=7200,  # 2h project floor — session may call memory_recall + web_fetch  # 10 min — email replies should be quick
             notify=False,
             source_tag="mail_reply",
             caller_context=f"email_thread:{thread['id']}",
@@ -191,23 +192,29 @@ class ReplyHandler:
             model=CCModel.SONNET,
             effort=EffortLevel.MEDIUM,
             system_prompt=system_prompt,
-            timeout_s=600,
+            timeout_s=7200,  # 2h project floor — session may call memory_recall + web_fetch
             notify=False,
             source_tag="mail_follow_up",
             caller_context=f"email_thread:{thread['id']}",
         )
 
         try:
-            session_id = await self._runner.spawn(request)
-            # Mark thread as follow_up_sent BEFORE the session runs
-            # (the session will send the actual email)
+            # Mark follow_up_sent BEFORE spawn to prevent double-dispatch
+            # if spawn succeeds but the DB write after it would fail.
             await self._tracker.mark_follow_up_sent(thread["id"])
+            session_id = await self._runner.spawn(request)
             logger.info(
                 "Dispatched follow-up session %s for thread %s",
                 session_id, thread["id"],
             )
             return session_id
         except Exception:
+            # Revert to awaiting_reply so the next poll cycle retries
+            with contextlib.suppress(Exception):
+                from genesis.db.crud import email_threads as thread_crud
+                await thread_crud.update_status(
+                    self._tracker._db, thread["id"], "awaiting_reply",
+                )
             logger.error(
                 "Failed to dispatch follow-up for thread %s",
                 thread["id"], exc_info=True,

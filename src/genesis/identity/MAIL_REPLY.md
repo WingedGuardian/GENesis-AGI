@@ -46,7 +46,6 @@ Use `outreach_send` with these parameters:
 - `message`: Your reply text
 - `channel`: "email"
 - `category`: "notification"
-- `signal_type`: "mail_reply"
 - `urgency`: "normal"
 
 The email recipient is in the thread context. Include it in the message

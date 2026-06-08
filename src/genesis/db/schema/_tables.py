@@ -1287,7 +1287,7 @@ TABLES = {
     "email_threads": """
         CREATE TABLE IF NOT EXISTS email_threads (
             id                TEXT PRIMARY KEY,
-            sent_message_id   TEXT NOT NULL,
+            sent_message_id   TEXT NOT NULL UNIQUE,
             owner             TEXT NOT NULL DEFAULT 'outreach',
             owner_ref         TEXT,
             recipient         TEXT NOT NULL,
