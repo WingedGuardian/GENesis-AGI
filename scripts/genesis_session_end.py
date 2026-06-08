@@ -172,9 +172,62 @@ def main() -> None:
         ended_at=now,
     )
 
-    # 4. Trigger async essential knowledge regeneration (fire-and-forget).
+    # 4. If session ran in a worktree, backup transcript to main project dir.
+    _backup_worktree_transcript(transcript_path)
+
+    # 5. Trigger async essential knowledge regeneration (fire-and-forget).
     # Spawns a background subprocess since LLM/DB work exceeds 1500ms budget.
     _trigger_essential_knowledge_regen()
+
+
+def _backup_worktree_transcript(transcript_path: str) -> None:
+    """Copy worktree session JSONL to main project dir for --resume discovery.
+
+    When a CC session runs from a worktree, its conversation file lives in a
+    worktree-specific project dir (e.g., ~/.claude/projects/...-worktrees-foo/).
+    If the worktree is later removed, the session becomes undiscoverable by
+    --resume. This creates a hardlink (instant, no copy) in the main project
+    dir as a safety net.
+
+    Only fires on clean session exit. If the process is killed, this hook
+    does not run — that scenario needs a separate periodic backup.
+    """
+    if not transcript_path:
+        return
+    tp = Path(transcript_path)
+    if not tp.exists() or tp.suffix != ".jsonl":
+        return
+
+    project_dir = tp.parent
+    dir_name = project_dir.name
+    # Worktree project dirs contain "--claude-worktrees-" in their name
+    marker = "--claude-worktrees-"
+    if marker not in dir_name:
+        return
+
+    main_name = dir_name.split(marker)[0]
+    main_project_dir = project_dir.parent / main_name
+    if not main_project_dir.exists():
+        return
+
+    backup_path = main_project_dir / f"wt-{tp.name}"
+    if backup_path.exists():
+        return
+
+    try:
+        # Hardlink is instant — no data copy, survives worktree dir deletion
+        os.link(tp, backup_path)
+    except OSError:
+        # Cross-device or permission issue — fall back to copy
+        import shutil
+
+        try:
+            shutil.copy2(tp, backup_path)
+        except OSError as exc:
+            print(
+                f"SessionEnd hook: worktree transcript backup failed: {exc}",
+                file=sys.stderr,
+            )
 
 
 def _trigger_essential_knowledge_regen() -> None:
