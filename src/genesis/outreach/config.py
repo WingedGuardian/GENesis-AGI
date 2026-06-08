@@ -41,6 +41,16 @@ class OutreachConfig:
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
     )
+    # Voice proactive chiming — spoken alerts via HA TTS
+    voice_alert_ids: tuple[str, ...] = (
+        "infra:disk_low",
+        "infra:container_memory_high",
+        "cc:quota_exhausted",
+        "provider:credit_exhaustion",
+        "provider:embedding_failing",
+        "provider:qdrant_unreachable",
+    )
+    voice_hours: tuple[int, int] = (9, 2)  # 9am–2am local (wraps midnight)
     # Delivery routing: per-category target — "supergroup", "dm", or "both".
     # Falls back to "default" key, then "supergroup" if unset.
     # When forum_chat_id is not configured, "supergroup" degrades to DM.

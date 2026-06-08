@@ -413,6 +413,16 @@ class OutreachPipeline:
             except Exception:
                 logger.warning("Email thread registration failed", exc_info=True)
 
+        # Voice secondary delivery (fire-and-forget, no tracking)
+        if channel != "voice" and self._should_voice(request):
+            voice = self._channels.get("voice")
+            if voice:
+                try:
+                    await voice.send_message("", formatted.text)
+                    logger.info("Voice chime delivered for %s", outreach_id)
+                except Exception:
+                    logger.warning("Voice chime failed for %s", outreach_id, exc_info=True)
+
         logger.info("Outreach %s delivered via %s (delivery_id=%s)", outreach_id, channel, delivery_id)
         return OutreachResult(
             outreach_id=outreach_id,
@@ -422,6 +432,44 @@ class OutreachPipeline:
             delivery_id=str(delivery_id),
             governance_result=gov,
         )
+
+    def _should_voice(self, request: OutreachRequest) -> bool:
+        """Check if this request qualifies for voice secondary delivery."""
+        if not self._channels.get("voice"):
+            return False
+        if not self._config:
+            return False
+        # Match against voice alert IDs (signal_type prefix match)
+        voice_ids = self._config.voice_alert_ids
+        signal = request.signal_type or ""
+        id_match = any(signal.startswith(vid) for vid in voice_ids)
+        # Also match task completions (category ALERT from executor)
+        cat_match = (
+            request.category in (OutreachCategory.BLOCKER, OutreachCategory.ALERT)
+            and signal in ("task_completion", "health_alert")
+        )
+        if not (id_match or cat_match):
+            return False
+        return self._in_voice_hours()
+
+    def _in_voice_hours(self) -> bool:
+        """Check if current time is within voice notification hours."""
+        if not self._config:
+            return False
+        try:
+            import zoneinfo
+
+            from genesis.env import user_timezone
+            tz = zoneinfo.ZoneInfo(user_timezone())
+            now = datetime.now(tz)
+            start, end = self._config.voice_hours
+            if start < end:
+                return start <= now.hour < end
+            # Wraps midnight (e.g., 9am–2am)
+            return now.hour >= start or now.hour < end
+        except Exception:
+            logger.debug("Voice hours check failed", exc_info=True)
+            return False
 
     async def _defer(
         self, outreach_id: str, channel: str, content: str,
