@@ -89,6 +89,61 @@ async def test_generate_includes_health_in_context(db, mock_health, mock_drafter
 
 
 @pytest.mark.asyncio
+async def test_context_includes_session_topics(db, mock_health, mock_drafter):
+    """Session topics from foreground sessions appear in the activity context."""
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, effort, status, "
+        "started_at, last_activity_at, topic) VALUES (?, ?, ?, ?, ?, "
+        "datetime('now', '-2 hours'), datetime('now', '-1 hour'), ?)",
+        ("s1", "foreground", "opus", "high", "completed",
+         "Working on memory supersession chain"),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    call_args = mock_drafter.draft.call_args[0][0]
+    assert "memory supersession" in call_args.context.lower()
+    assert "Session topics" in call_args.context
+
+
+@pytest.mark.asyncio
+async def test_context_includes_user_goals(db, mock_health, mock_drafter):
+    """Active user goals appear in the activity context for drift detection."""
+    await db.execute(
+        "INSERT INTO user_goals (id, title, category, priority, status, "
+        "created_at, updated_at) VALUES (?, ?, ?, ?, ?, "
+        "datetime('now', '-7 days'), datetime('now'))",
+        ("g1", "W2 employment", "career", "high", "active"),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    call_args = mock_drafter.draft.call_args[0][0]
+    assert "W2 employment" in call_args.context
+    assert "Active user goals" in call_args.context
+
+
+@pytest.mark.asyncio
+async def test_background_sessions_excluded_from_topics(db, mock_health, mock_drafter):
+    """Background sessions should NOT appear in session topics."""
+    await db.execute(
+        "INSERT INTO cc_sessions (id, session_type, model, effort, status, "
+        "started_at, last_activity_at, topic) VALUES (?, ?, ?, ?, ?, "
+        "datetime('now', '-2 hours'), datetime('now', '-1 hour'), ?)",
+        ("bg1", "background_reflection", "sonnet", "medium", "completed",
+         "Internal reflection cycle"),
+    )
+    await db.commit()
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    await gen.generate()
+    call_args = mock_drafter.draft.call_args[0][0]
+    assert "Internal reflection cycle" not in call_args.context
+
+
+@pytest.mark.asyncio
 async def test_event_bus_emits_on_section_failure(db, mock_health, mock_drafter):
     """When a section fails, event_bus.emit should be called with WARNING."""
     event_bus = AsyncMock()
