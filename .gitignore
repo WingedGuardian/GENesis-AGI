@@ -34,6 +34,8 @@ data/*.db-journal
 data/cc-memory-backup/
 data/*.db-wal
 data/*.db-shm
+data/*.pre-update
+data/*.png
 *.egg-info/
 node_modules/
 firebase-debug.log
