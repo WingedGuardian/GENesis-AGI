@@ -147,7 +147,13 @@ class StandaloneAdapter:
         heartbeat_task.cancel()
 
     async def shutdown(self) -> None:
-        """Graceful shutdown."""
+        """Graceful shutdown.
+
+        Speaks "Server restarting" via HA TTS before stopping services.
+        If HA is unreachable, the TTS call may block up to 15s (httpx
+        timeout) before shutdown continues.  This is within systemd's
+        default TimeoutStopSec=90s.
+        """
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 

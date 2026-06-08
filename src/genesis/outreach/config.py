@@ -160,6 +160,10 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
         "health_alerts": {
             "immediate_escalation": list(config.immediate_escalation_alerts),
         },
+        "voice": {
+            "alert_ids": list(config.voice_alert_ids),
+            "hours": list(config.voice_hours),
+        },
         "delivery_routing": dict(config.delivery_routing),
     }
 
@@ -209,6 +213,12 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
                 "immediate_escalation",
                 _DEFAULTS.immediate_escalation_alerts,
             )
+        ),
+        voice_alert_ids=tuple(
+            raw.get("voice", {}).get("alert_ids", _DEFAULTS.voice_alert_ids)
+        ),
+        voice_hours=tuple(
+            raw.get("voice", {}).get("hours", _DEFAULTS.voice_hours)
         ),
         delivery_routing=raw.get("delivery_routing", {"default": "supergroup"}),
     )
