@@ -6,12 +6,15 @@ Inbound voice (HA → Genesis) arrives via the Flask endpoint in
 adapter handles outbound only: Genesis speaking to the user proactively.
 
 Two-step delivery:
-1. ``assist_satellite.announce`` with empty message — plays the built-in
-   pre-announce chime (gentle audio cue before Genesis speaks).
+1. ``media_player.play_media`` — plays a gentle chime audio file as an
+   audio cue before Genesis speaks.
 2. ``tts.speak`` — renders and plays the actual message via Piper.
 
-The announce service's own TTS rendering is unreliable (depends on
-pipeline TTS config), so we split chime and speech into separate calls.
+The chime uses ``media_player.play_media`` (not ``assist_satellite.announce``)
+because the announce service engages the voice assistant C++ state machine,
+which can unpredictably reopen the microphone via its internal
+``continue_conversation_`` flag.  The media player path stays entirely
+in the media layer — no voice assistant involvement.
 
 Registered with the outreach pipeline (time-gated to voice hours) for
 proactive alerts, and held by the standalone server for shutdown
@@ -34,30 +37,32 @@ logger = logging.getLogger(__name__)
 class VoiceChannelAdapter(ChannelAdapter):
     """Outbound voice via Home Assistant with pre-announce chime.
 
-    Two-step: ``assist_satellite.announce`` (chime only) then
+    Two-step: ``media_player.play_media`` (chime audio file) then
     ``tts.speak`` (actual message).  Falls back to ``tts.speak``
-    alone when no satellite entity is configured.
+    alone when no chime media ID is configured.
     """
 
     # Delay between chime and TTS — long enough for chime to finish,
-    # short enough to feel responsive.
-    CHIME_DELAY_S = 1.5
+    # short enough to feel responsive.  The default chime is ~0.45s.
+    CHIME_DELAY_S = 1.0
     # Delay after TTS dispatch during shutdown — gives HA time to
     # synthesize and deliver audio before Wyoming servers stop.
     SHUTDOWN_DRAIN_S = 4
+    # Default chime audio file (uploaded to HA /config/www/)
+    DEFAULT_CHIME_MEDIA_ID = "media-source://media_source/local/genesis_chime.wav"
 
     def __init__(
         self,
         *,
         ha_url: str | None = None,
         ha_token: str | None = None,
-        satellite_entity: str = "assist_satellite.home_assistant_voice_0a2841_assist_satellite",
+        chime_media_id: str = "",
         tts_entity: str = "tts.piper",
         media_player_entity: str = "media_player.home_assistant_voice_0a2841",
     ) -> None:
         self._ha_url = ha_url.rstrip("/") if ha_url else None
         self._ha_token = ha_token
-        self._satellite_entity = satellite_entity
+        self._chime_media_id = chime_media_id or self.DEFAULT_CHIME_MEDIA_ID
         self._tts_entity = tts_entity
         self._media_player = media_player_entity
 
@@ -79,10 +84,11 @@ class VoiceChannelAdapter(ChannelAdapter):
     ) -> str:
         """Speak text through HA with an optional pre-announce chime.
 
-        Plays a chime via ``assist_satellite.announce`` (empty message),
-        waits briefly, then speaks via ``tts.speak``.  The announce
-        service's own TTS rendering is unreliable (depends on pipeline
-        config), so we only use it for the chime sound.
+        Plays a chime audio file via ``media_player.play_media``, waits
+        briefly, then speaks via ``tts.speak``.  The chime uses the
+        media player directly (not ``assist_satellite.announce``) to
+        avoid engaging the voice assistant state machine, which can
+        unpredictably reopen the microphone.
 
         Pass ``preannounce=False`` to skip the chime (e.g. for rapid
         follow-up messages where a chime would be redundant).
@@ -99,15 +105,17 @@ class VoiceChannelAdapter(ChannelAdapter):
 
         try:
             async with httpx.AsyncClient(timeout=15) as client:
-                # Play pre-announce chime (if configured and requested)
-                if preannounce and self._satellite_entity:
+                # Play pre-announce chime via media player (not voice assistant)
+                if preannounce and self._chime_media_id:
                     try:
                         await client.post(
-                            f"{self._ha_url}/api/services/assist_satellite/announce",
+                            f"{self._ha_url}/api/services/media_player/play_media",
                             headers=headers,
                             json={
-                                "entity_id": self._satellite_entity,
-                                "message": "",
+                                "entity_id": self._media_player,
+                                "media_content_id": self._chime_media_id,
+                                "media_content_type": "music",
+                                "announce": True,
                             },
                         )
                         await asyncio.sleep(self.CHIME_DELAY_S)
