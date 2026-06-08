@@ -63,9 +63,9 @@ class TestVoiceConfig:
 
 class TestGenesisBridge:
     def test_tool_declarations_structure(self):
-        assert len(TOOL_DECLARATIONS) == 2
+        assert len(TOOL_DECLARATIONS) == 3
         names = {t["name"] for t in TOOL_DECLARATIONS}
-        assert names == {"ask_genesis", "web_search"}
+        assert names == {"ask_genesis", "web_search", "approve_pending"}
 
     def test_system_prompt_has_placeholders(self):
         assert "{voice_context}" in SYSTEM_INSTRUCTIONS
@@ -156,6 +156,53 @@ class TestGenesisBridge:
         prompt = bridge.get_system_prompt()
         assert "Genesis" in prompt
         assert "ask_genesis" in prompt
+        assert "approve_pending" in prompt or "APPROVAL" in prompt
+
+    async def test_approve_pending_no_gate(self):
+        bridge = GenesisBridge()
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "approved"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "not available" in data["error"]
+
+    async def test_approve_pending_success(self):
+        gate = AsyncMock()
+        gate.resolve_most_recent_pending_voice = AsyncMock(return_value="abc12345")
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "approved"}),
+        )
+        data = json.loads(result)
+        assert "result" in data
+        assert "approved" in data["result"]
+        gate.resolve_most_recent_pending_voice.assert_awaited_once_with(
+            decision="approved", resolved_by="voice:s2s",
+        )
+
+    async def test_approve_pending_no_pending(self):
+        gate = AsyncMock()
+        gate.resolve_most_recent_pending_voice = AsyncMock(return_value=None)
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "rejected"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "No pending" in data["error"]
+
+    async def test_approve_pending_invalid_decision(self):
+        gate = AsyncMock()
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "maybe"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid" in data["error"]
 
 
 # ─── VoiceConversationHandler tests ─────────────────────────────────────

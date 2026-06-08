@@ -151,6 +151,16 @@ class StandaloneAdapter:
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
+        # Voice "last breath" — notify user before services stop
+        voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
+        if voice_adapter:
+            try:
+                await voice_adapter.send_message(
+                    "", "Server restarting. Back in a moment.",
+                )
+            except Exception:
+                logger.debug("Shutdown voice notification failed", exc_info=True)
+
         if self._runtime and self._runtime.awareness_loop is not None:
             self._runtime.awareness_loop.request_stop()
 
@@ -294,7 +304,14 @@ class StandaloneAdapter:
             # Genesis bridge for tool calls — delegates ask_genesis to
             # the existing VoiceConversationHandler (no DRY violation)
             voice_handler = self._app.config.get("VOICE_HANDLER") if self._app else None
-            bridge = GenesisBridge(voice_handler=voice_handler)
+            approval_gate = (
+                self._runtime.autonomous_cli_approval_gate
+                if self._runtime else None
+            )
+            bridge = GenesisBridge(
+                voice_handler=voice_handler,
+                approval_gate=approval_gate,
+            )
 
             # S2S session manager (memory_store for transcript persistence)
             s2s_manager = S2SSessionManager(

@@ -85,7 +85,7 @@ class S2SSessionManager:
         *,
         bridge: GenesisBridge,
         memory_store: MemoryStore | None = None,
-        max_idle_seconds: int = 1800,
+        max_idle_seconds: int = 300,
     ) -> None:
         self._bridge = bridge
         self._memory_store = memory_store
