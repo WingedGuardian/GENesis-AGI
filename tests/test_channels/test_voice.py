@@ -203,15 +203,15 @@ class TestVoiceChannelAdapter:
 
     @pytest.mark.asyncio
     async def test_send_message_with_chime(self):
-        """Default path: chime via announce, then TTS via tts.speak."""
+        """Default path: chime via media_player.play_media, then tts.speak."""
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
         )
-        calls = []
+        payloads = []
 
         async def mock_post_fn(url, **kwargs):
-            calls.append(url)
+            payloads.append((url, kwargs.get("json", {})))
             resp = MagicMock()
             resp.raise_for_status = MagicMock()
             return resp
@@ -228,10 +228,15 @@ class TestVoiceChannelAdapter:
             result = await adapter.send_message("ch-1", "hello world")
             assert result  # Non-empty delivery ID
 
-            # Two calls: announce (chime) then tts.speak
-            assert len(calls) == 2
-            assert "assist_satellite/announce" in calls[0]
-            assert "tts/speak" in calls[1]
+            # Two calls: play_media (chime) then tts.speak
+            assert len(payloads) == 2
+            chime_url, chime_payload = payloads[0]
+            assert "media_player/play_media" in chime_url
+            assert chime_payload["media_content_id"] == adapter.DEFAULT_CHIME_MEDIA_ID
+            assert chime_payload["announce"] is True
+            assert "tts/speak" in payloads[1][0]
+            # No assist_satellite calls
+            assert not any("assist_satellite" in p[0] for p in payloads)
 
     @pytest.mark.asyncio
     async def test_send_message_no_preannounce(self):
@@ -271,7 +276,7 @@ class TestVoiceChannelAdapter:
 
         async def mock_post_fn(url, **kwargs):
             calls.append(url)
-            if "assist_satellite" in url:
+            if "media_player/play_media" in url:
                 raise httpx.HTTPStatusError(
                     "Not Found", request=MagicMock(), response=MagicMock(status_code=404),
                 )
@@ -291,12 +296,11 @@ class TestVoiceChannelAdapter:
             assert any("tts/speak" in c for c in calls)
 
     @pytest.mark.asyncio
-    async def test_send_message_no_satellite_skips_chime(self):
-        """Without satellite_entity, skips chime, only tts.speak."""
+    async def test_send_message_no_preannounce_skips_chime(self):
+        """preannounce=False skips chime even with chime configured."""
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
-            satellite_entity="",
         )
         calls = []
 
@@ -312,7 +316,7 @@ class TestVoiceChannelAdapter:
             )
             mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
 
-            await adapter.send_message("ch-1", "direct tts")
+            await adapter.send_message("ch-1", "direct tts", preannounce=False)
 
             assert len(calls) == 1
             assert "tts/speak" in calls[0]
