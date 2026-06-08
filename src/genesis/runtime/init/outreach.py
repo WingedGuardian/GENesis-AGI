@@ -104,6 +104,13 @@ async def init(rt: GenesisRuntime) -> None:
         if hasattr(rt, "_output_router") and rt._output_router is not None:
             rt._output_router.set_outreach_pipeline(rt._outreach_pipeline)
 
+        # Wire thread tracker (created during mail init) into pipeline for
+        # automatic email thread registration on outbound sends.
+        thread_tracker = getattr(rt, "_thread_tracker", None)
+        if thread_tracker is not None:
+            rt._outreach_pipeline.set_thread_tracker(thread_tracker)
+            logger.info("Thread tracker wired into outreach pipeline")
+
         engagement = EngagementTracker(rt._db)
         rt._engagement_tracker = engagement
 

@@ -101,11 +101,8 @@ async def init(rt: GenesisRuntime) -> None:
                 _register_reply_poll_job(rt._mail_monitor, reply_poller)
                 logger.info("Email reply poller registered (every 4h)")
 
-                # Wire thread tracker into outreach pipeline for auto-registration
-                pipeline = getattr(rt, "_outreach_pipeline", None)
-                if pipeline is not None and hasattr(pipeline, "set_thread_tracker"):
-                    pipeline.set_thread_tracker(thread_tracker)
-                    logger.info("Thread tracker wired into outreach pipeline")
+                # Thread tracker → outreach pipeline wiring happens in
+                # init/outreach.py (runs after mail init, so pipeline exists).
             except Exception:
                 logger.exception("Failed to initialize reply poller (mail monitor still active)")
         else:
