@@ -437,16 +437,20 @@ class OutreachPipeline:
     def _should_voice(self, request: OutreachRequest) -> bool:
         """Check if this request qualifies for voice secondary delivery.
 
-        Matches on category (BLOCKER, ALERT) rather than signal_type because
-        health alerts use generic signal_type="health_alert" not the specific
-        alert ID.  This covers health alerts AND task completions (which use
-        category=ALERT).
+        Matches on category (BLOCKER, ALERT, APPROVAL) rather than
+        signal_type because health alerts use generic signal_type.
+        APPROVAL included so pending approval requests are spoken
+        aloud — the user can then say "hey genesis, approve it".
         """
         if not self._channels.get("voice"):
             return False
         if not self._config:
             return False
-        if request.category not in (OutreachCategory.BLOCKER, OutreachCategory.ALERT):
+        if request.category not in (
+            OutreachCategory.BLOCKER,
+            OutreachCategory.ALERT,
+            OutreachCategory.APPROVAL,
+        ):
             return False
         return self._in_voice_hours()
 
