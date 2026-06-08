@@ -10,3 +10,10 @@ mail_monitor:
   max_emails_per_run: 50               # Safety cap per batch run
   # timezone uses system setting from ~/.genesis/config/genesis.yaml
   min_relevance: 3                     # Layer 1 filter: only relevance >= this goes to judge
+
+# Reply poller: lightweight IMAP check for replies to registered threads
+# Runs every 4h on the mail monitor's scheduler (hardcoded in init/mail.py)
+# No LLM cost — pure header matching. Follow-up auto-sends after 4 days.
+reply_poll:
+  follow_up_days: 4                    # Days before auto follow-up
+  max_fetch: 20                        # Max emails per poll cycle
