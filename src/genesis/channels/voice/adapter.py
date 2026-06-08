@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 
 import httpx
@@ -54,14 +55,19 @@ class VoiceChannelAdapter(ChannelAdapter):
         ha_url: str | None = None,
         ha_token: str | None = None,
         chime_media_id: str = "",
-        tts_entity: str = "tts.piper",
-        media_player_entity: str = "media_player.home_assistant_voice_0a2841",
+        tts_entity: str = "",
+        media_player_entity: str = "",
     ) -> None:
         self._ha_url = ha_url.rstrip("/") if ha_url else None
         self._ha_token = ha_token
         self._chime_media_id = chime_media_id or self.DEFAULT_CHIME_MEDIA_ID
-        self._tts_entity = tts_entity
-        self._media_player = media_player_entity
+        self._tts_entity = tts_entity or os.environ.get(
+            "HA_TTS_ENTITY", "tts.piper",
+        )
+        self._media_player = media_player_entity or os.environ.get(
+            "HA_MEDIA_PLAYER_ENTITY",
+            "media_player.home_assistant_voice_0a2841",
+        )
 
     async def start(self) -> None:
         """No-op — adapter is stateless, HA handles transport."""

@@ -174,7 +174,10 @@ class StandaloneAdapter:
                             "Content-Type": "application/json",
                         },
                         json={
-                            "entity_id": "assist_satellite.home_assistant_voice_0a2841_assist_satellite",
+                            "entity_id": os.environ.get(
+                                "HA_ASSIST_SATELLITE_ENTITY",
+                                "assist_satellite.home_assistant_voice_0a2841_assist_satellite",
+                            ),
                             "message": "",
                         },
                     )

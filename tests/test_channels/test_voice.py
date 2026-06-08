@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -182,6 +183,39 @@ class TestVoiceChannelAdapter:
         assert caps["voice"] is True
         assert caps["markdown"] is False
         assert caps["buttons"] is False
+
+    def test_entity_defaults_from_env(self):
+        """Entity IDs read from env vars when not passed explicitly."""
+        with patch.dict("os.environ", {
+            "HA_TTS_ENTITY": "tts.custom",
+            "HA_MEDIA_PLAYER_ENTITY": "media_player.custom_device",
+        }):
+            adapter = VoiceChannelAdapter()
+            assert adapter._tts_entity == "tts.custom"
+            assert adapter._media_player == "media_player.custom_device"
+
+    def test_entity_explicit_overrides_env(self):
+        """Explicit constructor params take precedence over env vars."""
+        with patch.dict("os.environ", {
+            "HA_TTS_ENTITY": "tts.from_env",
+            "HA_MEDIA_PLAYER_ENTITY": "media_player.from_env",
+        }):
+            adapter = VoiceChannelAdapter(
+                tts_entity="tts.explicit",
+                media_player_entity="media_player.explicit",
+            )
+            assert adapter._tts_entity == "tts.explicit"
+            assert adapter._media_player == "media_player.explicit"
+
+    def test_entity_fallback_without_env(self):
+        """Without env vars or explicit params, falls back to hardcoded defaults."""
+        # Scrub any HA_ env vars that might be set in the test environment
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("HA_")}
+        with patch.dict("os.environ", env, clear=True):
+            adapter = VoiceChannelAdapter()
+            assert adapter._tts_entity == "tts.piper"
+            assert "home_assistant_voice_0a2841" in adapter._media_player
 
     @pytest.mark.asyncio
     async def test_send_typing_noop(self):
