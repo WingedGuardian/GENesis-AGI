@@ -120,8 +120,9 @@ and report the result.
 APPROVAL RULES:
 - "approve it" / "yes go ahead" / "do it" → call approve_pending with \
 decision "approved".
-- "reject" / "no" / "don't do that" → call approve_pending with \
-decision "rejected".
+- "reject it" / "reject that" / "don't do that" → call approve_pending with \
+decision "rejected". Note: a bare "no" in conversation is NOT a rejection — \
+only explicit rejection language like "reject" triggers this.
 - You don't need a request ID. The system resolves the most recent pending request.
 
 {voice_context}

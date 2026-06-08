@@ -413,15 +413,16 @@ class OutreachPipeline:
             except Exception:
                 logger.warning("Email thread registration failed", exc_info=True)
 
-        # Voice secondary delivery (fire-and-forget, no tracking)
+        # Voice secondary delivery — non-blocking (must not delay primary path)
         if channel != "voice" and self._should_voice(request):
             voice = self._channels.get("voice")
             if voice:
-                try:
-                    await voice.send_message("", formatted.text)
-                    logger.info("Voice chime delivered for %s", outreach_id)
-                except Exception:
-                    logger.warning("Voice chime failed for %s", outreach_id, exc_info=True)
+                from genesis.util.tasks import tracked_task
+                tracked_task(
+                    voice.send_message("", formatted.text),
+                    name=f"voice-chime-{outreach_id[:8]}",
+                )
+                logger.info("Voice chime queued for %s", outreach_id)
 
         logger.info("Outreach %s delivered via %s (delivery_id=%s)", outreach_id, channel, delivery_id)
         return OutreachResult(
@@ -434,21 +435,18 @@ class OutreachPipeline:
         )
 
     def _should_voice(self, request: OutreachRequest) -> bool:
-        """Check if this request qualifies for voice secondary delivery."""
+        """Check if this request qualifies for voice secondary delivery.
+
+        Matches on category (BLOCKER, ALERT) rather than signal_type because
+        health alerts use generic signal_type="health_alert" not the specific
+        alert ID.  This covers health alerts AND task completions (which use
+        category=ALERT).
+        """
         if not self._channels.get("voice"):
             return False
         if not self._config:
             return False
-        # Match against voice alert IDs (signal_type prefix match)
-        voice_ids = self._config.voice_alert_ids
-        signal = request.signal_type or ""
-        id_match = any(signal.startswith(vid) for vid in voice_ids)
-        # Also match task completions (category ALERT from executor)
-        cat_match = (
-            request.category in (OutreachCategory.BLOCKER, OutreachCategory.ALERT)
-            and signal in ("task_completion", "health_alert")
-        )
-        if not (id_match or cat_match):
+        if request.category not in (OutreachCategory.BLOCKER, OutreachCategory.ALERT):
             return False
         return self._in_voice_hours()
 
