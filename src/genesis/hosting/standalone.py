@@ -167,7 +167,6 @@ class StandaloneAdapter:
                 await voice_adapter.send_message(
                     "", "Server restarting. Back in a moment.",
                 )
-                import asyncio
                 await asyncio.sleep(4)
             except Exception:
                 logger.debug("Shutdown voice notification failed", exc_info=True)
