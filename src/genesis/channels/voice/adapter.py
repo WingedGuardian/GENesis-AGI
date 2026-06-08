@@ -45,9 +45,6 @@ class VoiceChannelAdapter(ChannelAdapter):
     # Delay between chime and TTS — long enough for chime to finish,
     # short enough to feel responsive.  The default chime is ~0.45s.
     CHIME_DELAY_S = 1.0
-    # Delay after TTS dispatch during shutdown — gives HA time to
-    # synthesize and deliver audio before Wyoming servers stop.
-    SHUTDOWN_DRAIN_S = 4
     # Default chime audio file (uploaded to HA /config/www/)
     DEFAULT_CHIME_MEDIA_ID = "media-source://media_source/local/genesis_chime.wav"
 
