@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from genesis.channels.voice.adapter import VoiceChannelAdapter
@@ -201,7 +202,8 @@ class TestVoiceChannelAdapter:
         assert result == ""
 
     @pytest.mark.asyncio
-    async def test_send_message_with_ha(self):
+    async def test_send_message_announce(self):
+        """Default path uses assist_satellite.announce with preannounce chime."""
         adapter = VoiceChannelAdapter(
             ha_url="http://ha.local:8123",
             ha_token="test-token",
@@ -209,13 +211,95 @@ class TestVoiceChannelAdapter:
         with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
             mock_response = MagicMock()
             mock_response.raise_for_status = MagicMock()
+            mock_post = AsyncMock(return_value=mock_response)
             mock_client.return_value.__aenter__ = AsyncMock(
-                return_value=MagicMock(post=AsyncMock(return_value=mock_response)),
+                return_value=MagicMock(post=mock_post),
             )
             mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
 
             result = await adapter.send_message("ch-1", "hello world")
             assert result  # Non-empty delivery ID
+
+            # Verify it called assist_satellite/announce, not tts/speak
+            call_args = mock_post.call_args
+            assert "assist_satellite/announce" in call_args[0][0]
+            payload = call_args[1]["json"]
+            assert payload["message"] == "hello world"
+            assert payload["preannounce"] is True
+
+    @pytest.mark.asyncio
+    async def test_send_message_no_preannounce(self):
+        """preannounce=False skips the chime."""
+        adapter = VoiceChannelAdapter(
+            ha_url="http://ha.local:8123",
+            ha_token="test-token",
+        )
+        with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_post = AsyncMock(return_value=mock_response)
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=mock_post),
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await adapter.send_message("ch-1", "quick follow-up", preannounce=False)
+
+            payload = mock_post.call_args[1]["json"]
+            assert payload["preannounce"] is False
+
+    @pytest.mark.asyncio
+    async def test_send_message_fallback_to_tts(self):
+        """When announce fails, falls back to tts.speak."""
+        adapter = VoiceChannelAdapter(
+            ha_url="http://ha.local:8123",
+            ha_token="test-token",
+        )
+        call_count = 0
+
+        async def mock_post_fn(url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if "assist_satellite" in url:
+                raise httpx.HTTPStatusError(
+                    "Not Found", request=MagicMock(), response=MagicMock(status_code=404),
+                )
+            # tts.speak succeeds
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            return resp
+
+        with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=AsyncMock(side_effect=mock_post_fn)),
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            result = await adapter.send_message("ch-1", "test fallback")
+            assert result  # Still returns delivery ID
+            assert call_count == 2  # announce attempt + tts fallback
+
+    @pytest.mark.asyncio
+    async def test_send_message_no_satellite_uses_tts(self):
+        """Without satellite_entity, uses tts.speak directly."""
+        adapter = VoiceChannelAdapter(
+            ha_url="http://ha.local:8123",
+            ha_token="test-token",
+            satellite_entity="",
+        )
+        with patch("genesis.channels.voice.adapter.httpx.AsyncClient") as mock_client:
+            mock_response = MagicMock()
+            mock_response.raise_for_status = MagicMock()
+            mock_post = AsyncMock(return_value=mock_response)
+            mock_client.return_value.__aenter__ = AsyncMock(
+                return_value=MagicMock(post=mock_post),
+            )
+            mock_client.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await adapter.send_message("ch-1", "direct tts")
+
+            call_args = mock_post.call_args
+            assert "tts/speak" in call_args[0][0]
 
 
 # ── Voice API Endpoint ───────────────────────────────────────────────
