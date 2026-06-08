@@ -99,6 +99,8 @@ You have two tools. Use them.
 
 TOOL RULES (important — follow these strictly):
 - "what did we do / work on / discuss" → ALWAYS call ask_genesis. Never guess.
+- "what time is it / what's the date / what day is it" → answer from the \
+Current time in your context. No tool call needed.
 - "search / look up / what's the weather / news" → ALWAYS call web_search.
 - "can you search the web" or similar capability questions → call web_search \
 with a relevant query to demonstrate the capability.
@@ -252,16 +254,38 @@ class GenesisBridge:
         Extracts only the Active Context section from essential knowledge —
         the rest (wing counts, conversation pivots, ego proposals) is system
         telemetry that wastes tokens and confuses the voice model.
+
+        Includes the current local time so the model can answer "what
+        time is it?" without a tool call.  Refreshes each session (5min
+        idle timeout), so accuracy is within minutes.
         """
+        from datetime import datetime
+
+        from genesis.env import user_timezone
+
         voice_ctx = ""
         if _ESSENTIAL_KNOWLEDGE_PATH.exists():
             voice_ctx = _extract_voice_context(
                 _ESSENTIAL_KNOWLEDGE_PATH.read_text(),
             )
 
+        # Current time in user's timezone
+        import zoneinfo
+        try:
+            tz = zoneinfo.ZoneInfo(user_timezone())
+            now = datetime.now(tz)
+            time_str = now.strftime("%A, %B %d, %Y at %I:%M %p %Z")
+        except Exception:
+            time_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p UTC")
+
+        ctx_parts = [f"\nCurrent time: {time_str}"]
+        if voice_ctx:
+            ctx_parts.append(
+                f"What the user has been working on recently:\n{voice_ctx}",
+            )
+
         return SYSTEM_INSTRUCTIONS.format(
-            voice_context=f"\nWhat the user has been working on recently:\n{voice_ctx}"
-            if voice_ctx else "",
+            voice_context="\n".join(ctx_parts),
         )
 
 

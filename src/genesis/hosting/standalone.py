@@ -157,13 +157,17 @@ class StandaloneAdapter:
         logger.info("Shutdown requested")
         self._shutdown_event.set()
 
-        # Voice "last breath" — notify user before services stop
+        # Voice "last breath" — notify user before services stop.
+        # Drain delay gives HA time to synthesize + deliver audio
+        # before Wyoming servers shut down.
         voice_adapter = self._app.config.get("VOICE_ADAPTER") if self._app else None
         if voice_adapter:
             try:
                 await voice_adapter.send_message(
                     "", "Server restarting. Back in a moment.",
                 )
+                from genesis.channels.voice.adapter import VoiceChannelAdapter
+                await asyncio.sleep(VoiceChannelAdapter.SHUTDOWN_DRAIN_S)
             except Exception:
                 logger.debug("Shutdown voice notification failed", exc_info=True)
 
