@@ -183,7 +183,7 @@ async def outreach_poll(
                     topic=question[:100],
                     category="content",
                     salience_score=0.5,
-                    channel=channel,
+                    channel="discord",  # adapter name, not sub-channel
                     message_content=question,
                     created_at=now_iso,
                     delivery_id=msg_id,
