@@ -1,14 +1,17 @@
-"""Voice channel adapter — HA satellite announce for outbound speech.
+"""Voice channel adapter — HA TTS with pre-announce chime for outbound speech.
 
 Implements ``ChannelAdapter`` for voice output through Home Assistant.
 Inbound voice (HA → Genesis) arrives via the Flask endpoint in
 ``dashboard/routes/voice_api.py``, not through this adapter.  This
 adapter handles outbound only: Genesis speaking to the user proactively.
 
-Uses ``assist_satellite.announce`` for delivery — this plays a short
-pre-announce chime before the TTS message, giving the user a gentle
-audio cue that Genesis is about to speak.  Falls back to ``tts.speak``
-if the satellite entity is not configured.
+Two-step delivery:
+1. ``assist_satellite.announce`` with empty message — plays the built-in
+   pre-announce chime (gentle audio cue before Genesis speaks).
+2. ``tts.speak`` — renders and plays the actual message via Piper.
+
+The announce service's own TTS rendering is unreliable (depends on
+pipeline TTS config), so we split chime and speech into separate calls.
 
 Registered with the outreach pipeline (time-gated to voice hours) for
 proactive alerts, and held by the standalone server for shutdown
@@ -17,6 +20,7 @@ notifications.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -28,12 +32,16 @@ logger = logging.getLogger(__name__)
 
 
 class VoiceChannelAdapter(ChannelAdapter):
-    """Outbound voice via Home Assistant satellite announce.
+    """Outbound voice via Home Assistant with pre-announce chime.
 
-    Primary path: ``assist_satellite.announce`` — plays a pre-announce
-    chime then speaks TTS.  Falls back to ``tts.speak`` when no
-    satellite entity is configured.
+    Two-step: ``assist_satellite.announce`` (chime only) then
+    ``tts.speak`` (actual message).  Falls back to ``tts.speak``
+    alone when no satellite entity is configured.
     """
+
+    # Delay between chime and TTS — long enough for the chime to play,
+    # short enough to feel responsive.
+    CHIME_DELAY_S = 1.5
 
     def __init__(
         self,
@@ -66,11 +74,15 @@ class VoiceChannelAdapter(ChannelAdapter):
         preannounce: bool = True,
         **kwargs,
     ) -> str:
-        """Speak text through HA with a pre-announce chime.
+        """Speak text through HA with an optional pre-announce chime.
 
-        Uses ``assist_satellite.announce`` which plays a gentle chime
-        before TTS.  Falls back to ``tts.speak`` if announce fails or
-        the satellite entity is not configured.
+        Two-step delivery:
+        1. ``assist_satellite.announce`` with empty message (chime only)
+        2. Brief delay for chime to play
+        3. ``tts.speak`` for the actual message
+
+        The announce service's built-in TTS rendering is unreliable
+        (depends on pipeline config), so we only use it for the chime.
 
         Pass ``preannounce=False`` to skip the chime (e.g. for rapid
         follow-up messages where a chime would be redundant).
@@ -85,35 +97,29 @@ class VoiceChannelAdapter(ChannelAdapter):
             "Content-Type": "application/json",
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                if self._satellite_entity:
-                    # Primary: assist_satellite.announce (chime + TTS)
-                    payload: dict = {
-                        "entity_id": self._satellite_entity,
-                        "message": text,
-                        "preannounce": preannounce,
-                    }
-                    response = await client.post(
-                        f"{self._ha_url}/api/services/assist_satellite/announce",
-                        headers=headers,
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    logger.info(
-                        "Voice announce delivered: %d chars → %s (chime=%s)",
-                        len(text), self._satellite_entity, preannounce,
-                    )
-                else:
-                    # Fallback: tts.speak (no chime)
-                    await self._tts_speak(client, headers, text)
-        except Exception:
-            logger.warning("Voice announce failed, trying tts.speak fallback", exc_info=True)
+        # Step 1: Play pre-announce chime (if configured and requested)
+        if preannounce and self._satellite_entity:
             try:
                 async with httpx.AsyncClient(timeout=15) as client:
-                    await self._tts_speak(client, headers, text)
+                    await client.post(
+                        f"{self._ha_url}/api/services/assist_satellite/announce",
+                        headers=headers,
+                        json={
+                            "entity_id": self._satellite_entity,
+                            "message": "",
+                        },
+                    )
+                    # Wait for chime to play before speaking
+                    await asyncio.sleep(self.CHIME_DELAY_S)
             except Exception:
-                logger.error("Voice TTS fallback also failed", exc_info=True)
+                logger.warning("Pre-announce chime failed", exc_info=True)
+
+        # Step 2: Speak the actual message via tts.speak
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                await self._tts_speak(client, headers, text)
+        except Exception:
+            logger.error("Voice TTS delivery failed", exc_info=True)
 
         return delivery_id
 
@@ -135,7 +141,7 @@ class VoiceChannelAdapter(ChannelAdapter):
         )
         response.raise_for_status()
         logger.info(
-            "Voice TTS (fallback) delivered: %d chars → %s",
+            "Voice TTS delivered: %d chars → %s",
             len(text), self._media_player,
         )
 
