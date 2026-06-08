@@ -33,6 +33,7 @@ dependencies = [
 test = [
     "pytest>=8.0",
     "pytest-asyncio",
+    "pytest-timeout",
     "aioresponses>=0.7.7",
 ]
 browser = [
@@ -81,3 +82,4 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+timeout = 1800
