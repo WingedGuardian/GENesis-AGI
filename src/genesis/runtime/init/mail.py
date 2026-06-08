@@ -74,7 +74,71 @@ async def init(rt: GenesisRuntime) -> None:
 
         await rt._mail_monitor.start()
         logger.info("Genesis mail monitor started (cron=%s)", config.cron_expression)
+
+        # --- Reply poller: lightweight 4h IMAP check for thread replies ---
+        session_runner = getattr(rt, "_direct_session_runner", None)
+        if session_runner is not None:
+            try:
+                from genesis.mail.reply_handler import ReplyHandler
+                from genesis.mail.reply_poller import ReplyPoller
+                from genesis.mail.threads import ThreadTracker
+
+                thread_tracker = ThreadTracker(rt._db)
+                reply_handler = ReplyHandler(
+                    session_runner=session_runner,
+                    thread_tracker=thread_tracker,
+                )
+                reply_poller = ReplyPoller(
+                    imap_client=imap_client,
+                    thread_tracker=thread_tracker,
+                    on_reply=reply_handler.handle_reply,
+                    on_stale_thread=reply_handler.handle_follow_up,
+                )
+                rt._thread_tracker = thread_tracker
+                rt._reply_poller = reply_poller
+
+                # Register the reply poller on the mail monitor's scheduler
+                _register_reply_poll_job(rt._mail_monitor, reply_poller)
+                logger.info("Email reply poller registered (every 4h)")
+
+                # Wire thread tracker into outreach pipeline for auto-registration
+                pipeline = getattr(rt, "_outreach_pipeline", None)
+                if pipeline is not None and hasattr(pipeline, "set_thread_tracker"):
+                    pipeline.set_thread_tracker(thread_tracker)
+                    logger.info("Thread tracker wired into outreach pipeline")
+            except Exception:
+                logger.exception("Failed to initialize reply poller (mail monitor still active)")
+        else:
+            logger.info("Reply poller skipped — DirectSessionRunner not available")
+
     except ImportError:
         logger.warning("genesis.mail not available")
     except Exception:
         logger.exception("Failed to initialize mail monitor")
+
+
+def _register_reply_poll_job(monitor, reply_poller) -> None:
+    """Register the reply poller as a cron job on the mail monitor's scheduler."""
+    if monitor._scheduler is None:
+        logger.warning("Cannot register reply poller — scheduler not started")
+        return
+
+    from apscheduler.triggers.cron import CronTrigger
+
+    from genesis.env import user_timezone
+
+    tz = user_timezone()
+
+    async def _poll_safe() -> None:
+        try:
+            await reply_poller.poll()
+        except Exception:
+            logger.exception("Reply poller cycle failed")
+
+    monitor._scheduler.add_job(
+        _poll_safe,
+        CronTrigger(hour="*/4", minute=15, timezone=tz),  # :15 to offset from monitor
+        id="mail_reply_poller",
+        max_instances=1,
+        misfire_grace_time=3600,  # 1h grace for 4h interval
+    )

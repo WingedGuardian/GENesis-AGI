@@ -68,12 +68,17 @@ class OutreachPipeline:
         self._recipients = recipients or {}
         self._voice_helper = voice_helper  # GROUNDWORK(outreach-voice)
         self._reply_waiter: ReplyWaiter | None = None
+        self._thread_tracker: object | None = None  # Set via set_thread_tracker()
         self._topic_manager = None
         self._forum_chat_id: str | None = None
 
     def set_reply_waiter(self, waiter: ReplyWaiter) -> None:
         """Attach a ReplyWaiter for bidirectional outreach."""
         self._reply_waiter = waiter
+
+    def set_thread_tracker(self, tracker: object) -> None:
+        """Attach a ThreadTracker for email thread auto-registration."""
+        self._thread_tracker = tracker
 
     def reload_config(self, config: OutreachConfig) -> None:
         """Hot-reload outreach config on pipeline and governance gate."""
@@ -394,6 +399,19 @@ class OutreachPipeline:
                 content_hash=content_hash(request.context),
             )
             await outreach_crud.record_delivery(self._db, outreach_id, delivered_at=now)
+
+        # Auto-register email threads for reply tracking
+        if channel == "email" and self._thread_tracker is not None:
+            try:
+                await self._thread_tracker.register(
+                    message_id=str(delivery_id),
+                    recipient=delivery_recipient,
+                    subject=request.topic or "",
+                    context={"signal_type": request.signal_type or request.category.value,
+                             "outreach_id": outreach_id},
+                )
+            except Exception:
+                logger.warning("Email thread registration failed", exc_info=True)
 
         logger.info("Outreach %s delivered via %s (delivery_id=%s)", outreach_id, channel, delivery_id)
         return OutreachResult(
