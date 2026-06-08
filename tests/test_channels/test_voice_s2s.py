@@ -63,9 +63,9 @@ class TestVoiceConfig:
 
 class TestGenesisBridge:
     def test_tool_declarations_structure(self):
-        assert len(TOOL_DECLARATIONS) == 2
+        assert len(TOOL_DECLARATIONS) == 3
         names = {t["name"] for t in TOOL_DECLARATIONS}
-        assert names == {"ask_genesis", "web_search"}
+        assert names == {"ask_genesis", "web_search", "approve_pending"}
 
     def test_system_prompt_has_placeholders(self):
         assert "{voice_context}" in SYSTEM_INSTRUCTIONS
@@ -156,6 +156,53 @@ class TestGenesisBridge:
         prompt = bridge.get_system_prompt()
         assert "Genesis" in prompt
         assert "ask_genesis" in prompt
+        assert "approve_pending" in prompt or "APPROVAL" in prompt
+
+    async def test_approve_pending_no_gate(self):
+        bridge = GenesisBridge()
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "approved"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "not available" in data["error"]
+
+    async def test_approve_pending_success(self):
+        gate = AsyncMock()
+        gate.resolve_most_recent_pending_voice = AsyncMock(return_value="abc12345")
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "approved"}),
+        )
+        data = json.loads(result)
+        assert "result" in data
+        assert "approved" in data["result"]
+        gate.resolve_most_recent_pending_voice.assert_awaited_once_with(
+            decision="approved", resolved_by="voice:s2s",
+        )
+
+    async def test_approve_pending_no_pending(self):
+        gate = AsyncMock()
+        gate.resolve_most_recent_pending_voice = AsyncMock(return_value=None)
+
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "rejected"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "No pending" in data["error"]
+
+    async def test_approve_pending_invalid_decision(self):
+        gate = AsyncMock()
+        bridge = GenesisBridge(approval_gate=gate)
+        result = await bridge.handle_tool_call(
+            "approve_pending", json.dumps({"decision": "maybe"}),
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid" in data["error"]
 
 
 # ─── VoiceConversationHandler tests ─────────────────────────────────────
@@ -332,3 +379,120 @@ class TestS2SSessionManager:
         inp, out = await mgr.close("sat-1")
         assert inp == "hello"
         assert out == "hi"
+
+
+# ─── Voice hours + _should_voice tests ─────────────────────────────────
+
+
+class TestVoiceHours:
+    """Test _in_voice_hours midnight-wrap logic and _should_voice filtering."""
+
+    def _make_pipeline(self, *, voice_hours=(9, 2), has_voice=True):
+        """Build a minimal pipeline with voice config for testing."""
+        from genesis.outreach.config import OutreachConfig, QuietHours
+        from genesis.outreach.pipeline import OutreachPipeline
+
+        config = OutreachConfig(
+            quiet_hours=QuietHours(start="22:00", end="07:00"),
+            channel_preferences={"default": "telegram"},
+            thresholds={},
+            max_daily=5,
+            surplus_daily=1,
+            content_daily=3,
+            notification_daily=10,
+            morning_report_time="07:00",
+            engagement_timeout_hours=24,
+            engagement_poll_minutes=60,
+            voice_hours=voice_hours,
+        )
+        channels = {}
+        if has_voice:
+            channels["voice"] = MagicMock()
+        pipe = OutreachPipeline(
+            governance=MagicMock(),
+            drafter=MagicMock(),
+            formatter=MagicMock(),
+            channels=channels,
+            config=config,
+        )
+        return pipe
+
+    def _check_hour(self, pipe, hour, expected):
+        """Helper: check _in_voice_hours at a given hour."""
+        from datetime import UTC
+        from datetime import datetime as real_dt
+
+        fake_now = real_dt(2026, 6, 7, hour, 30, tzinfo=UTC)
+        with (
+            patch("genesis.env.user_timezone", return_value="UTC"),
+            patch("genesis.outreach.pipeline.datetime") as mock_dt,
+        ):
+            mock_dt.now.return_value = fake_now
+            assert pipe._in_voice_hours() is expected, f"hour={hour}"
+
+    def test_voice_hours_10pm_within_wrap(self):
+        """10pm should be within (9, 2) = 9am-2am."""
+        self._check_hour(self._make_pipeline(voice_hours=(9, 2)), 22, True)
+
+    def test_voice_hours_1am_within_wrap(self):
+        """1am should be within (9, 2) = 9am-2am."""
+        self._check_hour(self._make_pipeline(voice_hours=(9, 2)), 1, True)
+
+    def test_voice_hours_3am_outside_wrap(self):
+        """3am should be outside (9, 2) = 9am-2am."""
+        self._check_hour(self._make_pipeline(voice_hours=(9, 2)), 3, False)
+
+    def test_voice_hours_9am_boundary(self):
+        """9am should be within (9, 2)."""
+        self._check_hour(self._make_pipeline(voice_hours=(9, 2)), 9, True)
+
+    def test_voice_hours_2am_boundary_excluded(self):
+        """2am should be outside (9, 2) — end is exclusive."""
+        self._check_hour(self._make_pipeline(voice_hours=(9, 2)), 2, False)
+
+    def test_should_voice_no_voice_channel(self):
+        """_should_voice returns False when no voice channel registered."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline(has_voice=False)
+        req = OutreachRequest(
+            category=OutreachCategory.ALERT,
+            topic="test", context="test", salience_score=1.0,
+        )
+        assert not pipe._should_voice(req)
+
+    def test_should_voice_wrong_category(self):
+        """_should_voice returns False for non-alert categories."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.SURPLUS,
+            topic="test", context="test", salience_score=1.0,
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert not pipe._should_voice(req)
+
+    def test_should_voice_alert_in_hours(self):
+        """_should_voice returns True for ALERT category during voice hours."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.ALERT,
+            topic="test", context="test", salience_score=1.0,
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)
+
+    def test_should_voice_blocker_in_hours(self):
+        """_should_voice returns True for BLOCKER category during voice hours."""
+        from genesis.outreach.types import OutreachCategory, OutreachRequest
+
+        pipe = self._make_pipeline()
+        req = OutreachRequest(
+            category=OutreachCategory.BLOCKER,
+            topic="test", context="test", salience_score=1.0,
+        )
+        with patch.object(pipe, "_in_voice_hours", return_value=True):
+            assert pipe._should_voice(req)

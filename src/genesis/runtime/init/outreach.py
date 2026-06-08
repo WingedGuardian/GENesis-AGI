@@ -89,6 +89,19 @@ async def init(rt: GenesisRuntime) -> None:
                 )
             logger.info("Discord webhook adapter registered")
 
+        # Wire voice adapter for proactive chiming (HA TTS)
+        ha_url = os.environ.get("HA_URL", "")
+        ha_token = os.environ.get("HA_LONG_LIVED_TOKEN", "")
+        if ha_url and ha_token:
+            from genesis.channels.voice.adapter import VoiceChannelAdapter
+
+            channels["voice"] = VoiceChannelAdapter(
+                ha_url=ha_url, ha_token=ha_token,
+            )
+            if "voice" not in recipients:
+                recipients["voice"] = ""
+            logger.info("Voice channel adapter registered for outreach")
+
         rt._outreach_pipeline = _Pipeline(
             governance=governance,
             drafter=drafter,

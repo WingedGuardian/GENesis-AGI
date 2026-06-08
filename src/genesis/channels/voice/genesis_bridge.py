@@ -69,6 +69,27 @@ TOOL_DECLARATIONS = [
             "required": ["query"],
         },
     },
+    {
+        "type": "function",
+        "name": "approve_pending",
+        "description": (
+            "Approve or reject a pending action that requires user confirmation. "
+            "Call this when the user says 'approve', 'yes go ahead', 'do it', "
+            "'reject it', or similar. Resolves the most recent pending request. "
+            "You do NOT need a request ID — just the decision."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["approved", "rejected"],
+                    "description": "The user's decision",
+                },
+            },
+            "required": ["decision"],
+        },
+    },
 ]
 
 # System instructions for the S2S model
@@ -96,6 +117,14 @@ sentence target.
 - Don't narrate what you're doing ("Let me search..."). Just do it silently \
 and report the result.
 
+APPROVAL RULES:
+- "approve it" / "yes go ahead" / "do it" → call approve_pending with \
+decision "approved".
+- "reject it" / "reject that" / "don't do that" → call approve_pending with \
+decision "rejected". Note: a bare "no" in conversation is NOT a rejection — \
+only explicit rejection language like "reject" triggers this.
+- You don't need a request ID. The system resolves the most recent pending request.
+
 {voice_context}
 """
 
@@ -112,8 +141,10 @@ class GenesisBridge:
         self,
         *,
         voice_handler: VoiceConversationHandler | None = None,
+        approval_gate: object | None = None,
     ) -> None:
         self._voice_handler = voice_handler
+        self._approval_gate = approval_gate
 
     async def handle_tool_call(
         self, name: str, arguments: str, *, satellite_id: str = "s2s-default",
@@ -130,6 +161,8 @@ class GenesisBridge:
             )
         if name == "web_search":
             return await self._web_search(args.get("query", ""))
+        if name == "approve_pending":
+            return await self._approve_pending(args.get("decision", ""))
 
         return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -186,6 +219,32 @@ class GenesisBridge:
             logger.exception("Web search failed for voice query")
 
         return json.dumps({"error": "Web search unavailable"})
+
+    async def _approve_pending(self, decision: str) -> str:
+        """Approve or reject the most recent pending approval request.
+
+        Resolves sentinel_dispatch, sentinel_action, and
+        autonomous_cli_fallback types — all gated action types.
+        """
+        if not self._approval_gate:
+            return json.dumps({"error": "Approval system not available"})
+        if decision not in ("approved", "rejected"):
+            return json.dumps({"error": f"Invalid decision: {decision}"})
+
+        try:
+            request_id = await self._approval_gate.resolve_most_recent_pending_voice(
+                decision=decision, resolved_by="voice:s2s",
+            )
+        except Exception:
+            logger.exception("Voice approval failed")
+            return json.dumps({"error": "Approval processing failed"})
+
+        if request_id:
+            return json.dumps({
+                "result": f"Request {decision}",
+                "request_id": request_id[:8],
+            })
+        return json.dumps({"error": "No pending approval request found"})
 
     def get_system_prompt(self) -> str:
         """Build the system prompt with curated voice context.

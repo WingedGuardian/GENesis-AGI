@@ -375,6 +375,49 @@ class AutonomousCliApprovalGate:
             return request_id
         return None
 
+    async def resolve_most_recent_pending_voice(
+        self, *, decision: str, resolved_by: str,
+    ) -> str | None:
+        """Resolve the most-recent pending approval of ANY gated type.
+
+        Unlike :meth:`resolve_most_recent_pending` (which is intentionally
+        narrow to ``autonomous_cli_fallback`` for Telegram bare-text safety),
+        this method resolves sentinel_dispatch, sentinel_action, AND
+        autonomous_cli_fallback.  Appropriate for voice where the user
+        explicitly said "approve it" in response to a spoken notification.
+        """
+        if decision not in ("approved", "rejected"):
+            logger.warning(
+                "resolve_most_recent_pending_voice: invalid decision %r",
+                decision,
+            )
+            return None
+        _VOICE_GATED = {
+            "autonomous_cli_fallback",
+            "sentinel_dispatch",
+            "sentinel_action",
+        }
+        pending = await self._approval_manager.get_pending()
+        candidates = [
+            req for req in pending
+            if req.get("action_type") in _VOICE_GATED
+        ]
+        if not candidates:
+            return None
+        most_recent = candidates[-1]
+        request_id = str(most_recent["id"])
+        ok = await self._approval_manager.resolve(
+            request_id, status=decision, resolved_by=resolved_by,
+        )
+        if ok:
+            logger.info(
+                "Resolved most-recent approval %s (%s) as %s via %s",
+                request_id, most_recent.get("action_type"), decision,
+                resolved_by,
+            )
+            return request_id
+        return None
+
     async def approve_all_pending(self, *, resolved_by: str) -> int:
         """Approve every pending approval request.  Returns count approved."""
         pending = await self._approval_manager.get_pending()

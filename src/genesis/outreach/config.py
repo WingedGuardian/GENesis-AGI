@@ -41,6 +41,16 @@ class OutreachConfig:
         "awareness:tick_overdue",
         "service:health_data_uninitialized",
     )
+    # Voice proactive chiming — spoken alerts via HA TTS
+    voice_alert_ids: tuple[str, ...] = (
+        "infra:disk_low",
+        "infra:container_memory_high",
+        "cc:quota_exhausted",
+        "provider:credit_exhaustion",
+        "provider:embedding_failing",
+        "provider:qdrant_unreachable",
+    )
+    voice_hours: tuple[int, int] = (9, 2)  # 9am–2am local (wraps midnight)
     # Delivery routing: per-category target — "supergroup", "dm", or "both".
     # Falls back to "default" key, then "supergroup" if unset.
     # When forum_chat_id is not configured, "supergroup" degrades to DM.
@@ -150,6 +160,10 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
         "health_alerts": {
             "immediate_escalation": list(config.immediate_escalation_alerts),
         },
+        "voice": {
+            "alert_ids": list(config.voice_alert_ids),
+            "hours": list(config.voice_hours),
+        },
         "delivery_routing": dict(config.delivery_routing),
     }
 
@@ -199,6 +213,12 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
                 "immediate_escalation",
                 _DEFAULTS.immediate_escalation_alerts,
             )
+        ),
+        voice_alert_ids=tuple(
+            raw.get("voice", {}).get("alert_ids", _DEFAULTS.voice_alert_ids)
+        ),
+        voice_hours=tuple(
+            raw.get("voice", {}).get("hours", _DEFAULTS.voice_hours)
         ),
         delivery_routing=raw.get("delivery_routing", {"default": "supergroup"}),
     )
