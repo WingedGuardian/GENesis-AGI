@@ -45,6 +45,7 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "ego_notification": 12,  # Ego notifications — don't repeat same topic within 12h
     "mail_reply": 1,  # Email replies — short window to allow ack + full response
     "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
+    "discord_poll": 168,  # Discord polls — 7 days (matches default poll duration)
 }
 _DEFAULT_DEDUP_HOURS = 24
 

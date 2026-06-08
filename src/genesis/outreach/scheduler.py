@@ -12,9 +12,17 @@ from genesis.outreach.config import OutreachConfig
 from genesis.outreach.engagement import EngagementTracker
 from genesis.outreach.morning_report import MorningReportGenerator
 from genesis.outreach.pipeline import OutreachPipeline
-from genesis.outreach.types import OutreachCategory, OutreachRequest
+from genesis.outreach.types import OutreachCategory, OutreachRequest, OutreachStatus
 
 logger = logging.getLogger(__name__)
+
+# Discord sub-channel names used by campaign sessions in pending_outreach.
+# The outreach pipeline routes via adapter name ("discord"), not sub-channel.
+_DISCORD_CHANNELS = frozenset({
+    "announcements", "dev-discussion", "general", "showcase",
+    "getting-started", "design", "bug-reports", "feature-requests",
+    "troubleshooting",
+})
 
 
 class OutreachScheduler:
@@ -520,27 +528,44 @@ class OutreachScheduler:
                                 "Unknown category '%s' in pending outreach %s, using DIGEST",
                                 raw_cat, row["id"],
                             )
+
+                    # Map Discord sub-channel names to adapter name.
+                    # Campaign sessions queue with channel="announcements" etc.,
+                    # but the pipeline adapter is registered as "discord".
+                    raw_channel = row.get("channel", "telegram")
+                    channel = "discord" if raw_channel in _DISCORD_CHANNELS else raw_channel
+
                     req = OutreachRequest(
                         category=cat,
                         topic=row["message"][:100],
                         context=row["message"],
                         salience_score=0.7,
                         signal_type="pending_queue",
-                        channel=row.get("channel", "telegram"),
+                        channel=channel,
                     )
                     if row.get("urgency") == "high":
                         result = await self._pipeline.submit_urgent(req)
                     else:
                         result = await self._pipeline.submit(req)
-                    logger.info(
-                        "Drained pending outreach %s: %s",
-                        row["id"], result.status.value,
-                    )
-                    # Only mark delivered on success
-                    delivered_at = datetime.now(UTC).isoformat()
-                    await pending_outreach.mark_delivered(
-                        self._db, row["id"], delivered_at=delivered_at,
-                    )
+
+                    # Only mark delivered on actual success
+                    if result.status in (
+                        OutreachStatus.DELIVERED,
+                        OutreachStatus.ENGAGED,
+                    ):
+                        delivered_at = datetime.now(UTC).isoformat()
+                        await pending_outreach.mark_delivered(
+                            self._db, row["id"], delivered_at=delivered_at,
+                        )
+                        logger.info(
+                            "Drained pending outreach %s: %s",
+                            row["id"], result.status.value,
+                        )
+                    else:
+                        logger.warning(
+                            "Pending outreach %s not delivered (%s: %s) — will retry",
+                            row["id"], result.status.value, result.error or "",
+                        )
                 except Exception:
                     logger.error(
                         "Failed to deliver pending outreach %s — will retry next cycle",

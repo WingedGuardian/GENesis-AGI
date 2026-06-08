@@ -177,7 +177,11 @@ class CampaignRunner:
             return {"outcome": "error", "error": "Strategy doc not found or empty"}
 
         recent_runs = await crud.list_runs(self._db, campaign_id, limit=3)
-        prompt = _build_session_prompt(campaign, state, recent_runs, strategy_text)
+        channel_history = await _recent_channel_posts(self._db, days=7)
+        prompt = _build_session_prompt(
+            campaign, state, recent_runs, strategy_text,
+            channel_history=channel_history,
+        )
 
         from genesis.cc.direct_session import DirectSessionRequest
 
@@ -452,11 +456,35 @@ def _day_boundary_reset(
     return reset
 
 
+async def _recent_channel_posts(db: Any, *, days: int = 7) -> list[dict]:
+    """Fetch recent outreach_history entries for non-Telegram channels.
+
+    Gives campaign sessions visibility into what has already been posted,
+    preventing duplicate content.
+    """
+    try:
+        cursor = await db.execute(
+            "SELECT signal_type, topic, channel, delivered_at "
+            "FROM outreach_history "
+            "WHERE channel != 'telegram' AND delivered_at IS NOT NULL "
+            "AND delivered_at >= datetime('now', ?) "
+            "ORDER BY delivered_at DESC LIMIT 20",
+            (f"-{days} days",),
+        )
+        columns = [d[0] for d in cursor.description]
+        return [dict(zip(columns, row, strict=False)) for row in await cursor.fetchall()]
+    except Exception:
+        logger.debug("Failed to fetch channel history for campaign prompt", exc_info=True)
+        return []
+
+
 def _build_session_prompt(
     campaign: dict,
     state: dict,
     recent_runs: list[dict],
     strategy_text: str,
+    *,
+    channel_history: list[dict] | None = None,
 ) -> str:
     """Build the user-message prompt for the CC session."""
     # Remove internal state keys from what the LLM sees
@@ -477,6 +505,18 @@ def _build_session_prompt(
 
     if run_summaries:
         parts.append("\n## Recent Runs\n" + "\n".join(run_summaries))
+
+    if channel_history:
+        lines = []
+        for post in channel_history:
+            lines.append(
+                f"- [{post['delivered_at']}] {post['signal_type']} → "
+                f"#{post['channel']}: {post['topic']}"
+            )
+        parts.append(
+            "\n## Recent Channel Activity (already posted — do NOT repeat)\n"
+            + "\n".join(lines)
+        )
 
     parts.append(
         "\n## Instructions"

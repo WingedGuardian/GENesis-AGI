@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
+from datetime import UTC, datetime
 
 import httpx
 from fastmcp import FastMCP
@@ -125,6 +127,26 @@ async def outreach_poll(
     if not webhook_url:
         return json.dumps({"error": f"No webhook URL found (tried {env_key} and DISCORD_WEBHOOK_URL)"})
 
+    # ── Dedup check: skip if same poll posted within 7 days ──
+    if _db is not None:
+        from genesis.outreach.governance import content_hash
+
+        chash = content_hash(question)
+        try:
+            cursor = await _db.execute(
+                "SELECT COUNT(*) FROM outreach_history "
+                "WHERE signal_type = 'discord_poll' AND content_hash = ? "
+                "AND delivered_at IS NOT NULL "
+                "AND delivered_at >= datetime('now', '-7 days')",
+                (chash,),
+            )
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                logger.info("Discord poll dedup: skipping duplicate (hash=%s)", chash[:12])
+                return json.dumps({"status": "skipped", "reason": "duplicate_poll_within_7_days"})
+        except Exception:
+            logger.debug("Poll dedup check failed, proceeding", exc_info=True)
+
     url = f"{webhook_url}?wait=true"
     payload = {
         "poll": {
@@ -144,6 +166,35 @@ async def outreach_poll(
             data = resp.json()
             msg_id = data.get("id", "")
         logger.info("Discord poll created via %s (msg_id=%s)", channel, msg_id)
+
+        # ── Record to outreach_history for dedup + campaign visibility ──
+        if _db is not None:
+            from genesis.outreach.governance import content_hash as _ch
+
+            now_iso = datetime.now(UTC).isoformat()
+            outreach_id = str(uuid.uuid4())
+            try:
+                from genesis.db.crud import outreach as outreach_crud
+
+                await outreach_crud.create(
+                    _db,
+                    id=outreach_id,
+                    signal_type="discord_poll",
+                    topic=question[:100],
+                    category="content",
+                    salience_score=0.5,
+                    channel="discord",  # adapter name, not sub-channel
+                    message_content=question,
+                    created_at=now_iso,
+                    delivery_id=msg_id,
+                    content_hash=_ch(question),
+                )
+                await outreach_crud.record_delivery(
+                    _db, outreach_id, delivered_at=now_iso,
+                )
+            except Exception:
+                logger.warning("Failed to record poll in outreach_history", exc_info=True)
+
         return json.dumps({"status": "created", "message_id": msg_id, "channel": channel})
     except httpx.HTTPStatusError as exc:
         error_body = exc.response.text[:200] if exc.response else ""
