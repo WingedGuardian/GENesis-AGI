@@ -43,6 +43,8 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "content_review": 1,  # Short window — distinct content pieces may share topics
     "cli_approval": 0,  # Never dedup — every approval request must be delivered
     "ego_notification": 12,  # Ego notifications — don't repeat same topic within 12h
+    "mail_reply": 1,  # Email replies — short window to allow ack + full response
+    "mail_follow_up": 24,  # Follow-up emails — one per day max per topic
 }
 _DEFAULT_DEDUP_HOURS = 24
 
