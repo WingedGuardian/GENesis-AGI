@@ -157,27 +157,24 @@ class DeadLetterQueue:
         """
         now = self._clock()
         count = 0
-        while True:
-            items = await dl_crud.query_pending(self.db)
-            if not items:
-                break
-            batch_expired = 0
-            for item in items:
-                op_type = item.get("operation_type", "")
-                # Find matching TTL — longest prefix match
-                ttl_hours = max_age_hours
-                for pattern, hours in self._OPERATION_TTL_HOURS.items():
-                    if op_type.startswith(pattern):
-                        ttl_hours = hours
-                        break
-                cutoff_iso = (now - timedelta(hours=ttl_hours)).isoformat()
-                if item["created_at"] < cutoff_iso:
-                    await dl_crud.update_status(self.db, item["id"], status="expired")
-                    batch_expired += 1
-            count += batch_expired
-            # If nothing expired in this batch, remaining items are still fresh
-            if batch_expired == 0:
-                break
+        # Use a high limit to fetch all pending items at once.
+        # Dead letter counts are bounded (~hundreds) so this is safe.
+        # Avoids pagination issues with mixed per-type TTLs where fresh
+        # long-TTL items on early pages could prevent reaching stale
+        # short-TTL items on later pages.
+        items = await dl_crud.query_pending(self.db, limit=10000)
+        for item in items:
+            op_type = item.get("operation_type", "")
+            # Find matching TTL — longest prefix match
+            ttl_hours = max_age_hours
+            for pattern, hours in self._OPERATION_TTL_HOURS.items():
+                if op_type.startswith(pattern):
+                    ttl_hours = hours
+                    break
+            cutoff_iso = (now - timedelta(hours=ttl_hours)).isoformat()
+            if item["created_at"] < cutoff_iso:
+                await dl_crud.update_status(self.db, item["id"], status="expired")
+                count += 1
         return count
 
     async def redispatch(self, dispatch_fn) -> tuple[int, int]:

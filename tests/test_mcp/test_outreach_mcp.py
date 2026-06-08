@@ -1,7 +1,7 @@
 """Tests for outreach-mcp server — verify all tools are registered."""
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -11,9 +11,9 @@ from genesis.mcp.outreach_mcp import mcp
 
 async def test_all_tools_registered():
     tools = await mcp.get_tools()
-    for name in ["outreach_send", "outreach_queue", "outreach_engagement",
-                 "outreach_preferences", "outreach_digest",
-                 "outreach_send_and_wait"]:
+    for name in ["outreach_send", "outreach_poll", "outreach_queue",
+                 "outreach_engagement", "outreach_preferences",
+                 "outreach_digest", "outreach_send_and_wait"]:
         assert name in tools, f"Missing tool: {name}"
 
 
@@ -95,3 +95,96 @@ async def test_send_and_wait_invalid_category():
         assert "invalid category" in result.lower()
     finally:
         mcp_mod._pipeline = old_pipeline
+
+
+# ── outreach_poll tests ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_outreach_poll_no_webhook():
+    """Should return error when no webhook env var is set."""
+    tools = await mcp.get_tools()
+    with patch.dict("os.environ", {}, clear=True):
+        result = await tools["outreach_poll"].fn(
+            channel="announcements",
+            question="Test?",
+            answers=["A", "B"],
+        )
+    data = json.loads(result)
+    assert "error" in data
+    assert "No webhook URL" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_outreach_poll_success():
+    """Should POST poll payload and return message_id."""
+    tools = await mcp.get_tools()
+
+    # httpx Response is sync — use MagicMock, not AsyncMock
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"id": "poll-msg-999"}
+    mock_response.raise_for_status = MagicMock()
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    env = {"DISCORD_WEBHOOK_ANNOUNCEMENTS": "https://discord.com/api/webhooks/123/tok"}
+    with patch.dict("os.environ", env, clear=False), \
+         patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client):
+        result = await tools["outreach_poll"].fn(
+            channel="announcements",
+            question="What do you think?",
+            answers=["Option A", "Option B", "Option C"],
+            duration_hours=48,
+        )
+
+    data = json.loads(result)
+    assert data["status"] == "created"
+    assert data["message_id"] == "poll-msg-999"
+
+    # Verify POST payload structure
+    call_args = mock_client.post.call_args
+    url = call_args[0][0]
+    assert "123/tok" in url
+    assert "wait=true" in url
+    payload = call_args[1]["json"]
+    assert payload["poll"]["question"]["text"] == "What do you think?"
+    assert len(payload["poll"]["answers"]) == 3
+    assert payload["poll"]["duration"] == 48
+
+
+@pytest.mark.asyncio
+async def test_outreach_poll_http_error():
+    """Should return error on Discord API failure."""
+    import httpx
+
+    tools = await mcp.get_tools()
+
+    # httpx Response is sync — use MagicMock
+    mock_response = MagicMock()
+    mock_response.status_code = 403
+    mock_response.text = "Forbidden"
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "403", request=MagicMock(), response=mock_response,
+    )
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+
+    env = {"DISCORD_WEBHOOK_GENERAL": "https://discord.com/api/webhooks/456/tok2"}
+    with patch.dict("os.environ", env, clear=False), \
+         patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client):
+        result = await tools["outreach_poll"].fn(
+            channel="general",
+            question="Test?",
+            answers=["Yes", "No"],
+        )
+
+    data = json.loads(result)
+    assert "error" in data
+    assert "403" in data["error"]

@@ -131,6 +131,36 @@ async def test_expire_old_per_type_ttl(db):
     assert expired == 1
 
 
+@pytest.mark.asyncio
+async def test_expire_old_mixed_ttl_across_pages(db):
+    """Expire items with short TTL even when preceded by fresh long-TTL items.
+
+    Regression test: with mixed per-type TTLs across pages, fresh items
+    with long TTLs must not cause early exit before reaching stale items
+    with short TTLs on later pages.
+    """
+    ten_hours_ago = datetime(2026, 3, 4, 2, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 3, 4, 12, 0, 0, tzinfo=UTC)
+
+    dlq_old = DeadLetterQueue(db, clock=lambda: ten_hours_ago)
+    # Fill first page (50+) with long-TTL items that won't expire
+    for i in range(55):
+        await dlq_old.enqueue(f"llm_call_{i}", "{}", "prov", "err")
+    # Add short-TTL items that SHOULD expire (on second page)
+    judge_ids = []
+    for i in range(5):
+        jid = await dlq_old.enqueue(f"chain_exhausted:judge_{i}", "{}", "prov", "err")
+        judge_ids.append(jid)
+
+    dlq_now = DeadLetterQueue(db, clock=lambda: now)
+    expired = await dlq_now.expire_old(max_age_hours=72)
+
+    # All judge items (1h TTL, 10h old) should be expired
+    assert expired == 5
+    for jid in judge_ids:
+        assert (await dl_crud.get_by_id(db, jid))["status"] == "expired"
+
+
 # ── Redispatch tests ────────────────────────────────────────────────────
 
 

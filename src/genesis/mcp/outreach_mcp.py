@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 
+import httpx
 from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
@@ -117,10 +119,6 @@ async def outreach_poll(
         duration_hours: How long the poll stays open (default 7 days, max 768h).
         allow_multiselect: Whether users can vote for multiple options.
     """
-    import os
-
-    import httpx
-
     # Resolve webhook URL from environment
     env_key = f"DISCORD_WEBHOOK_{channel.upper().replace('-', '_')}"
     webhook_url = os.environ.get(env_key) or os.environ.get("DISCORD_WEBHOOK_URL")
