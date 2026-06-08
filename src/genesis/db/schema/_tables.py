@@ -1283,6 +1283,38 @@ TABLES = {
             state_snapshot   TEXT
         )
     """,
+    # ─── Email thread tracking ───────────────────────────────────────────────
+    "email_threads": """
+        CREATE TABLE IF NOT EXISTS email_threads (
+            id                TEXT PRIMARY KEY,
+            sent_message_id   TEXT NOT NULL,
+            owner             TEXT NOT NULL DEFAULT 'outreach',
+            owner_ref         TEXT,
+            recipient         TEXT NOT NULL,
+            subject           TEXT,
+            context           TEXT,
+            status            TEXT NOT NULL DEFAULT 'awaiting_reply' CHECK (
+                status IN ('awaiting_reply', 'replied', 'follow_up_sent', 'closed')
+            ),
+            follow_up_after   TEXT,
+            follow_up_sent_at TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        )
+    """,
+    "email_thread_messages": """
+        CREATE TABLE IF NOT EXISTS email_thread_messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            thread_id       TEXT NOT NULL REFERENCES email_threads(id),
+            message_id      TEXT NOT NULL,
+            direction       TEXT NOT NULL CHECK (direction IN ('sent', 'received')),
+            sender          TEXT,
+            subject         TEXT,
+            body_preview    TEXT,
+            received_at     TEXT NOT NULL,
+            UNIQUE(message_id)
+        )
+    """,
 }
 
 # FTS5 virtual tables (in-memory SQLite does NOT support FTS5 unless compiled with it)
@@ -1521,6 +1553,11 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_campaign_runs_campaign ON campaign_runs(campaign_id)",
     "CREATE INDEX IF NOT EXISTS idx_campaign_runs_outcome ON campaign_runs(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_campaign_runs_started ON campaign_runs(started_at DESC)",
+    # email threads
+    "CREATE INDEX IF NOT EXISTS idx_email_threads_message_id ON email_threads(sent_message_id)",
+    "CREATE INDEX IF NOT EXISTS idx_email_threads_status ON email_threads(status)",
+    "CREATE INDEX IF NOT EXISTS idx_email_threads_follow_up ON email_threads(follow_up_after)",
+    "CREATE INDEX IF NOT EXISTS idx_email_thread_messages_thread ON email_thread_messages(thread_id)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────
