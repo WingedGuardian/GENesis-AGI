@@ -132,12 +132,16 @@ well-represented in USER.md. Don't store transient conversational context
 On the FIRST message of a new session (not on resume), begin your response
 with a one-line status header before your actual reply:
 
-`[model / effort]`
+`[model version / effort]`
 
-Example: `[sonnet / medium]` or `[opus / high]`
+Example: `[Sonnet 4.6 / medium]` or `[Opus 4.8 / high]`
 
 - **Model**: Derive from your environment section ("You are powered by the model
-  named..."). Map to: opus, sonnet, or haiku.
+  named...") using the exact model ID. Map the ID to name + version:
+  `claude-opus-4-8` → `Opus 4.8`, `claude-sonnet-4-6` → `Sonnet 4.6`,
+  `claude-haiku-4-5` → `Haiku 4.5`. Include the version — never bare `opus`.
+  If the user switches model mid-session via `/model`, use the switched-to
+  model on your next first-of-session header.
 - **Effort**: Read from the Session Configuration block injected at session start.
   If absent, default to `high`.
 
