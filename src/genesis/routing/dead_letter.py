@@ -152,11 +152,17 @@ class DeadLetterQueue:
         """Mark pending items older than their TTL as 'expired'. Returns count.
 
         Uses per-operation-type TTLs where configured, falling back to
-        max_age_hours for operations without a specific TTL.
+        max_age_hours for operations without a specific TTL. Loops through
+        all pending items (query_pending returns paginated batches of 50).
         """
         now = self._clock()
-        items = await dl_crud.query_pending(self.db)
         count = 0
+        # Use a high limit to fetch all pending items at once.
+        # Dead letter counts are bounded (~hundreds) so this is safe.
+        # Avoids pagination issues with mixed per-type TTLs where fresh
+        # long-TTL items on early pages could prevent reaching stale
+        # short-TTL items on later pages.
+        items = await dl_crud.query_pending(self.db, limit=10000)
         for item in items:
             op_type = item.get("operation_type", "")
             # Find matching TTL — longest prefix match

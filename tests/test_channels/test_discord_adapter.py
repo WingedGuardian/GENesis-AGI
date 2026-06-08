@@ -146,6 +146,76 @@ class TestLifecycle:
         await adapter.send_typing("any-channel")
 
 
+class TestSendPoll:
+    @pytest.mark.anyio
+    async def test_sends_poll_payload(self, adapter: DiscordWebhookAdapter) -> None:
+        """send_poll posts correct poll structure to webhook."""
+        with patch("genesis.channels.discord_adapter.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = AsyncMock(
+                status_code=200,
+                json=lambda: {"id": "poll-msg-1"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            msg_id = await adapter.send_poll(
+                "dev-discussion",
+                "What's your favorite?",
+                ["Option A", "Option B", "Option C"],
+                duration_hours=24,
+            )
+
+            assert msg_id == "poll-msg-1"
+            call_kwargs = mock_client.post.call_args
+            payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            assert "poll" in payload
+            assert payload["poll"]["question"]["text"] == "What's your favorite?"
+            assert len(payload["poll"]["answers"]) == 3
+            assert payload["poll"]["duration"] == 24
+            assert payload["poll"]["allow_multiselect"] is False
+
+    @pytest.mark.anyio
+    async def test_poll_truncates_long_values(self, adapter: DiscordWebhookAdapter) -> None:
+        """Poll question and answers are truncated to Discord limits."""
+        with patch("genesis.channels.discord_adapter.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = AsyncMock(
+                status_code=200,
+                json=lambda: {"id": "poll-msg-2"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            long_question = "Q" * 500
+            long_answer = "A" * 100
+
+            await adapter.send_poll("dev-discussion", long_question, [long_answer])
+
+            call_kwargs = mock_client.post.call_args
+            payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json")
+            assert len(payload["poll"]["question"]["text"]) == 300
+            assert len(payload["poll"]["answers"][0]["poll_media"]["text"]) == 55
+
+    @pytest.mark.anyio
+    async def test_poll_uses_named_webhook(self, adapter: DiscordWebhookAdapter) -> None:
+        """send_poll resolves webhook by channel name."""
+        with patch("genesis.channels.discord_adapter.httpx.AsyncClient") as mock_cls:
+            mock_client = AsyncMock()
+            mock_client.post.return_value = AsyncMock(
+                status_code=200,
+                json=lambda: {"id": "poll-msg-3"},
+            )
+            mock_cls.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            await adapter.send_poll("showcase", "Test?", ["Yes", "No"])
+
+            call_url = mock_client.post.call_args[0][0]
+            assert "222/token-bbb" in call_url
+            assert "wait=true" in call_url
+
+
 class TestEngagement:
     @pytest.mark.anyio
     async def test_engagement_signals_neutral(self, adapter: DiscordWebhookAdapter) -> None:
