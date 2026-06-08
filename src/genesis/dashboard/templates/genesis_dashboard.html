@@ -160,7 +160,7 @@
           sidebarCollapsed: false,
           _resizing: false,
         },
-        fileUpload: { dragging: false, uploading: false, error: null },
+        fileUpload: { dragging: false, uploading: false, error: null, success: null, progress: null },
 
         // ── Work tab state (tasks + sessions + follow-ups) ──────
         taskList: [],
@@ -678,23 +678,56 @@
         async uploadFile(event) {
           event.preventDefault();
           this.fileUpload.dragging = false;
+          // Re-entrancy guard: ignore new drops/selections while a batch is in
+          // flight, so concurrent runs don't interleave the shared uploading/
+          // progress flags and misreport UI state.
+          if (this.fileUpload.uploading) return;
           this.fileUpload.error = null;
-          const files = event.dataTransfer?.files || event.target?.files;
-          if (!files || files.length === 0) return;
+          this.fileUpload.success = null;
+          const fileList = Array.from(event.dataTransfer?.files || event.target?.files || []);
+          if (fileList.length === 0) return;
           this.fileUpload.uploading = true;
-          try {
-            const form = new FormData();
-            form.append("file", files[0]);
-            const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
-            if (resp && resp.ok) {
-              const data = await resp.json();
-              this.fetchFiles(data.path.substring(0, data.path.lastIndexOf("/")));
-            } else {
-              const err = resp ? await resp.json() : {};
-              this.fileUpload.error = err.error || "Upload failed";
+          const uploaded = [];
+          const failures = [];
+          let lastDir = null;
+          // Upload each file sequentially via the single-file endpoint so every
+          // file gets the backend's sanitize / dedup / size-cap checks.
+          for (let i = 0; i < fileList.length; i++) {
+            const f = fileList[i];
+            this.fileUpload.progress = fileList.length > 1
+              ? `Uploading ${i + 1} of ${fileList.length}: ${f.name}`
+              : `Uploading ${f.name}...`;
+            try {
+              const form = new FormData();
+              form.append("file", f);
+              const resp = await fetchApi("/api/genesis/files/upload", { method: "POST", body: form });
+              if (resp && resp.ok) {
+                const data = await resp.json();
+                uploaded.push(data.filename);
+                lastDir = data.path.substring(0, data.path.lastIndexOf("/"));
+              } else {
+                const err = resp ? await resp.json() : {};
+                failures.push(`${f.name}: ${err.error || "failed"}`);
+              }
+            } catch (e) {
+              failures.push(`${f.name}: ${e.message}`);
             }
-          } catch (e) { this.fileUpload.error = "Upload failed: " + e.message; }
+          }
+          this.fileUpload.progress = null;
           this.fileUpload.uploading = false;
+          if (uploaded.length) {
+            const dest = lastDir || "~/.genesis/uploads";
+            this.fileUpload.success = uploaded.length === 1
+              ? `Uploaded ${uploaded[0]} → ${dest}`
+              : `Uploaded ${uploaded.length} files → ${dest} (${uploaded.join(", ")})`;
+            // Stay put — refresh the current directory in place (no jump to uploads).
+            if (this.fileBrowser.path) { this.fetchFiles(this.fileBrowser.path); }
+          }
+          if (failures.length) {
+            this.fileUpload.error = `${failures.length} failed — ${failures.join("; ")}`;
+          }
+          // Reset the file input so re-selecting the same file fires @change again.
+          if (event.target && event.target.value !== undefined) { event.target.value = ""; }
         },
         _startFileBrowserResize(e, sidebar) {
           this.fileBrowser._resizing = true;
@@ -7889,11 +7922,17 @@
              @click="$refs.fileUploadInput.click()"
              :style="`border: 1px dashed ${$store.genesisDashboard.fileUpload.dragging ? 'var(--color-accent)' : 'var(--color-border)'}; border-radius: 6px; padding: 0.6rem 1rem; text-align: center; cursor: pointer; margin-bottom: 0.75rem; transition: border-color .2s; background: ${$store.genesisDashboard.fileUpload.dragging ? 'rgba(99,102,241,.06)' : 'transparent'};`">
           <span style="font-size: .8rem; color: var(--color-text-secondary);"
-                x-text="$store.genesisDashboard.fileUpload.uploading ? 'Uploading...' : 'Drop files here to upload — no processing, just storage'"></span>
-          <input type="file" x-ref="fileUploadInput" style="display:none" @change="$store.genesisDashboard.uploadFile($event)">
+                x-text="$store.genesisDashboard.fileUpload.uploading ? ($store.genesisDashboard.fileUpload.progress || 'Uploading...') : 'Drop files here to upload — no processing, just storage'"></span>
+          <input type="file" multiple x-ref="fileUploadInput" style="display:none" @change="$store.genesisDashboard.uploadFile($event)">
         </div>
         <template x-if="$store.genesisDashboard.fileUpload.error">
           <div style="color: var(--color-error-text); font-size: .8rem; margin-bottom: .5rem;" x-text="$store.genesisDashboard.fileUpload.error"></div>
+        </template>
+        <template x-if="$store.genesisDashboard.fileUpload.success">
+          <div style="color:#66bb6a; font-size: .8rem; margin-bottom: .5rem; font-family:monospace; word-break:break-all;">
+            <span class="material-symbols-outlined" style="font-size:0.9rem;vertical-align:middle;">check_circle</span>
+            <span x-text="$store.genesisDashboard.fileUpload.success"></span>
+          </div>
         </template>
         <!-- Breadcrumb / path bar -->
         <div style="display:flex; gap:0.3rem; align-items:center; margin-bottom:0.75rem; font-size:0.75rem; flex-wrap:wrap;">
@@ -7912,7 +7951,7 @@
                   x-text="$store.genesisDashboard.fileBrowser.sidebarCollapsed ? 'Show Files' : 'Hide Files'"></button>
         </div>
 
-        <div style="display:flex;">
+        <div style="display:flex; min-height:calc(100vh - 280px);">
           <!-- Directory listing -->
           <div x-show="!$store.genesisDashboard.fileBrowser.sidebarCollapsed"
                x-ref="fileBrowserSidebar"
