@@ -343,7 +343,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
         alerts.append({
             "id": alert_id,
             "severity": "WARNING",
-            "message": f"Watchdog has {wd_failures} consecutive failures (reason: {watchdog_state.get('last_reason', 'unknown')})",
+            "message": f"Watchdog triggered {wd_failures} consecutive restarts (reason: {watchdog_state.get('last_reason', 'unknown')})",
         })
         current_ids.add(alert_id)
 
