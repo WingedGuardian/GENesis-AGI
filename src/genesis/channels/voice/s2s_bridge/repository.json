@@ -1,12 +1,12 @@
 {
-  "name": "Home Assistant OpenAI Realtime Voice Agent",
-  "url": "https://github.com/fjfricke/ha-openai-realtime",
-  "maintainer": "Felix Fricke",
+  "name": "Genesis Voice Bridge",
+  "url": "https://github.com/WingedGuardian/GENesis-AGI",
+  "maintainer": "Genesis",
   "addons": [
     {
-      "slug": "openai_realtime_voice_agent",
-      "name": "OpenAI Realtime Voice Agent",
-      "version": "0.1.0"
+      "slug": "genesis_voice_bridge",
+      "name": "Genesis Voice Bridge",
+      "version": "0.2.0"
     }
   ]
 }

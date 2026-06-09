@@ -56,10 +56,15 @@ RUN \
     && echo "LLVM_CONFIG_PATH=$LLVM_CONFIG_PATH" \
     && export LLVM_CONFIG="${LLVM_CONFIG_PATH:-/usr/bin/llvm-config}" \
     && echo "Using LLVM_CONFIG=$LLVM_CONFIG" \
-    && rm -f poetry.lock* \
     && LLVM_CONFIG="$LLVM_CONFIG" POETRY_VIRTUALENVS_CREATE=false poetry install --only=main --no-root --no-interaction --no-ansi \
     && rm -f pyproject.toml \
     && rm -rf openai_realtime_voice_agent/
+
+# Stage installed packages into a known directory for clean COPY
+RUN mkdir -p /staging/site-packages /staging/bin \
+    && PYTHON_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") \
+    && cp -r "$PYTHON_SITE"/* /staging/site-packages/ \
+    && cp -r /usr/local/bin/* /staging/bin/ 2>/dev/null || true
 
 # Runtime stage - minimal image without build tools
 FROM ${BUILD_FROM}
@@ -81,21 +86,16 @@ RUN \
 # Switch to bash after installation
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Copy installed Python packages from builder stage
-# Find Python site-packages directory and copy packages
+# Copy installed Python packages from builder staging directory
+# Uses standard COPY --from (no BuildKit required) for HA Supervisor compatibility
+COPY --from=builder /staging/site-packages/ /tmp/site-packages/
+COPY --from=builder /staging/bin/ /usr/local/bin/
 RUN \
-    --mount=from=builder,source=/usr/lib,target=/builder-lib \
-    --mount=from=builder,source=/usr/local/bin,target=/builder-bin \
     PYTHON_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])") \
-    && echo "Target site-packages: $PYTHON_SITE" \
-    && find /builder-lib -type d -name "site-packages" | while read src_dir; do \
-        echo "Copying from $src_dir to $PYTHON_SITE"; \
-        mkdir -p "$PYTHON_SITE"; \
-        cp -r "$src_dir"/* "$PYTHON_SITE"/ 2>/dev/null || true; \
-    done \
-    && if [ -d "/builder-bin" ]; then \
-        cp -r /builder-bin/* /usr/local/bin/ 2>/dev/null || true; \
-    fi
+    && echo "Installing packages to: $PYTHON_SITE" \
+    && mkdir -p "$PYTHON_SITE" \
+    && cp -r /tmp/site-packages/* "$PYTHON_SITE"/ \
+    && rm -rf /tmp/site-packages
 
 # Copy application code
 COPY app/ /app/
