@@ -99,6 +99,7 @@ api:
     key: !secret api_encryption_key
   on_client_connected:
     - lambda: id(init_in_progress) = false;
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
     # Start micro_wake_word when API connects (ensures it's ready)
     - micro_wake_word.start:
