@@ -1026,12 +1026,9 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: hey_mycroft
-      id: hey_mycroft
+    # Custom "Hey Genesis" wake word — trained model hosted on HA web server
+    - model: http://192.168.50.99:8123/local/wake_words/hey_genesis.json
+      id: hey_genesis
   vad:
   on_wake_word_detected:
     - if:
