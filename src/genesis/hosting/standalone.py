@@ -361,6 +361,8 @@ class StandaloneAdapter:
             await self._wyoming_stt.start()
 
             self._s2s_manager = s2s_manager
+            if self._app:
+                self._app.config["GENESIS_BRIDGE"] = bridge
 
             # Pre-warm: open WebSocket to GPT-Realtime so the first wake
             # word doesn't pay the 1.75s connection + config cost.
