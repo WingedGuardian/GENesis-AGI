@@ -21,6 +21,8 @@ CONF_ON_CONNECTED = "on_connected"
 CONF_ON_DISCONNECTED = "on_disconnected"
 CONF_ON_ERROR = "on_error"
 CONF_ON_STOPPED = "on_stopped"
+CONF_ON_BOT_STARTED_SPEAKING = "on_bot_started_speaking"
+CONF_ON_BOT_STOPPED_SPEAKING = "on_bot_stopped_speaking"
 
 CONFIG_SCHEMA = cv.Schema(
     {
@@ -32,6 +34,8 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(CONF_ON_DISCONNECTED): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_ERROR): automation.validate_automation(single=True),
         cv.Optional(CONF_ON_STOPPED): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_BOT_STARTED_SPEAKING): automation.validate_automation(single=True),
+        cv.Optional(CONF_ON_BOT_STOPPED_SPEAKING): automation.validate_automation(single=True),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -81,6 +85,16 @@ async def to_code(config):
     if CONF_ON_STOPPED in config:
         await automation.build_automation(
             var.get_stopped_trigger(), [], config[CONF_ON_STOPPED]
+        )
+
+    if CONF_ON_BOT_STARTED_SPEAKING in config:
+        await automation.build_automation(
+            var.get_bot_started_speaking_trigger(), [], config[CONF_ON_BOT_STARTED_SPEAKING]
+        )
+
+    if CONF_ON_BOT_STOPPED_SPEAKING in config:
+        await automation.build_automation(
+            var.get_bot_stopped_speaking_trigger(), [], config[CONF_ON_BOT_STOPPED_SPEAKING]
         )
 
 

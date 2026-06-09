@@ -121,11 +121,18 @@ void VoiceAssistantWebSocket::loop() {
     }
   }
   
-  // Audio input is handled via callback (on_microphone_data_)
-  // No need to poll here
-  
-  // Audio output is handled directly in process_received_audio_()
-  // No queue processing needed here
+  // Bot speaking edge detection — fire triggers on state transitions
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    bool speaking_now = this->is_bot_speaking();
+    if (speaking_now && !this->was_bot_speaking_) {
+      this->bot_started_speaking_trigger_.trigger();
+    } else if (!speaking_now && this->was_bot_speaking_) {
+      this->bot_stopped_speaking_trigger_.trigger();
+    }
+    this->was_bot_speaking_ = speaking_now;
+  } else {
+    this->was_bot_speaking_ = false;
+  }
 }
 
 void VoiceAssistantWebSocket::dump_config() {

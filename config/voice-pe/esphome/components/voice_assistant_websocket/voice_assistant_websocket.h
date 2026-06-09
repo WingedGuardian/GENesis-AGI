@@ -55,6 +55,8 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> *get_disconnected_trigger() { return &this->disconnected_trigger_; }
   Trigger<> *get_error_trigger() { return &this->error_trigger_; }
   Trigger<> *get_stopped_trigger() { return &this->stopped_trigger_; }
+  Trigger<> *get_bot_started_speaking_trigger() { return &this->bot_started_speaking_trigger_; }
+  Trigger<> *get_bot_stopped_speaking_trigger() { return &this->bot_stopped_speaking_trigger_; }
 
  protected:
   void connect_websocket_();
@@ -83,6 +85,9 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> disconnected_trigger_{};
   Trigger<> error_trigger_{};
   Trigger<> stopped_trigger_{};
+  Trigger<> bot_started_speaking_trigger_{};
+  Trigger<> bot_stopped_speaking_trigger_{};
+  bool was_bot_speaking_{false};  // For edge detection in loop()
   
   // Audio buffers
   std::vector<uint8_t> input_buffer_;

@@ -1497,7 +1497,7 @@ voice_assistant_websocket:
   # State callbacks for LED control
   on_connected:
     - lambda: id(init_in_progress) = false;
-    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Set to idle to show blue pulse (only if running)
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};  # Show spinning dots while WS active
     - script.execute: control_leds
     # Apply ducking to media when voice assistant starts
     - mixer_speaker.apply_ducking:
@@ -1505,7 +1505,7 @@ voice_assistant_websocket:
         decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
         duration: 0.0s
   on_disconnected:
-    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Back to idle (LEDs off), device is still ready
     - script.execute: control_leds
     # Ensure micro_wake_word continues running after disconnect
     - micro_wake_word.start:
@@ -1516,13 +1516,19 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
   on_stopped:
-    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Back to idle (LEDs off)
     - script.execute: control_leds
     # Restore media volume when voice assistant stops
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
+  on_bot_started_speaking:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+    - script.execute: control_leds
+  on_bot_stopped_speaking:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+    - script.execute: control_leds
   on_error:
     - if:
         condition:
