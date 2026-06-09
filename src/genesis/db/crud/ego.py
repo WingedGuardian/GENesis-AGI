@@ -553,6 +553,68 @@ async def execute_proposal(
     return cursor.rowcount > 0
 
 
+async def claim_proposal_for_dispatch(
+    db: aiosqlite.Connection,
+    id: str,
+) -> bool:
+    """Atomically claim an approved proposal for dispatch.
+
+    Sets status='executed' and user_response='dispatching' ONLY if the
+    proposal is still in 'approved' status. The WHERE guard prevents
+    double-dispatch when multiple callers (cadence, Telegram, dashboard)
+    race to claim the same proposal.
+
+    Unlike execute_proposal(), this does NOT set resolved_at — the
+    original resolved_at timestamp must be preserved for the 48h
+    staleness guard.
+
+    Returns True if claimed, False if already claimed by another path.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'executed', "
+        "user_response = 'dispatching' "
+        "WHERE id = ? AND status = 'approved'",
+        (id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def record_dispatch_session(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    session_id: str,
+) -> bool:
+    """Record the actual session ID after successful dispatch spawn."""
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET user_response = ? WHERE id = ?",
+        (session_id, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def revert_failed_dispatch(
+    db: aiosqlite.Connection,
+    id: str,
+) -> bool:
+    """Revert a proposal from executed back to approved after dispatch failure.
+
+    Only reverts if the proposal is still in 'executed' status — prevents
+    overwriting a valid resolution that occurred between the failed
+    dispatch and this revert.
+    """
+    cursor = await db.execute(
+        "UPDATE ego_proposals SET status = 'approved', "
+        "user_response = NULL "
+        "WHERE id = ? AND status = 'executed'",
+        (id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 async def update_proposal_outcome(
     db: aiosqlite.Connection,
     proposal_id: str,

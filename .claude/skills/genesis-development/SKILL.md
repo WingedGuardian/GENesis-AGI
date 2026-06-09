@@ -204,17 +204,18 @@ Verify before any commit:
 
 ## Pre-Merge Gate
 
-When "merge when green" is requested, wait for BOTH CI checks AND
-automated review comments before merging:
+`git_push_guard.py` enforces a **hard gate** on review findings:
 
-1. After CI passes, check PR comments for the automated code review
-   (structural review, PII scan). Use `gh api repos/.../issues/{pr}/comments`.
-2. If review present → read findings, address warnings before merging.
-3. If review absent after ~5 minutes AND daily quota (15/day) is
-   exhausted → merge on CI alone, note in PR that review was
-   quota-limited.
-4. Never hard-block indefinitely — the review is a soft gate with a
-   quota ceiling.
+1. After CI passes, the merge hook automatically checks PR comments
+   for automated review findings (ERROR, [P1], HARD BLOCK).
+2. If review present with **blocking findings** → merge is **BLOCKED**
+   by the hook (exit code 2). Fix the findings first.
+3. If review present with only WARNINGs/NOTEs → merge allowed.
+4. If no review comments at all (quota exhausted) → merge allowed
+   on CI alone. Note in PR that review was quota-limited.
+5. **Override**: Append `# review-override` to the merge command to
+   bypass the gate (e.g., `gh pr merge 123 --squash --admin  # review-override`).
+   The override is logged. Use only when findings are intentionally accepted.
 
 ## Reference Router
 

@@ -21,10 +21,17 @@ logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-recon")
 
-_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
-_WATCHLIST_PATH = _CONFIG_DIR / "recon_watchlist.yaml"
-_SCHEDULES_PATH = _CONFIG_DIR / "recon_schedules.yaml"
-_SOURCES_PATH = _CONFIG_DIR / "recon_sources.yaml"
+_REPO_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+_USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
+
+# Watchlist is read-only (curated by developer), always from repo
+_WATCHLIST_PATH = _REPO_CONFIG_DIR / "recon_watchlist.yaml"
+
+# Schedules and sources are user-modifiable — prefer user override
+_REPO_SCHEDULES = _REPO_CONFIG_DIR / "recon_schedules.yaml"
+_REPO_SOURCES = _REPO_CONFIG_DIR / "recon_sources.yaml"
+_USER_SCHEDULES = _USER_CONFIG_DIR / "recon_schedules.yaml"
+_USER_SOURCES = _USER_CONFIG_DIR / "recon_sources.yaml"
 
 _db: aiosqlite.Connection | None = None
 _router: object | None = None
@@ -66,28 +73,32 @@ def _load_watchlist() -> list[dict]:
 
 
 def _load_schedules() -> dict[str, dict]:
-    if not _SCHEDULES_PATH.exists():
+    path = _USER_SCHEDULES if _USER_SCHEDULES.exists() else _REPO_SCHEDULES
+    if not path.exists():
         return {}
-    with open(_SCHEDULES_PATH) as f:
+    with open(path) as f:
         data = yaml.safe_load(f)
     return data.get("schedules", {}) if data else {}
 
 
 def _save_schedules(schedules: dict[str, dict]) -> None:
-    with open(_SCHEDULES_PATH, "w") as f:
+    _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_USER_SCHEDULES, "w") as f:
         yaml.safe_dump({"schedules": schedules}, f, default_flow_style=False, sort_keys=False)
 
 
 def _load_sources() -> list[dict]:
-    if not _SOURCES_PATH.exists():
+    path = _USER_SOURCES if _USER_SOURCES.exists() else _REPO_SOURCES
+    if not path.exists():
         return []
-    with open(_SOURCES_PATH) as f:
+    with open(path) as f:
         data = yaml.safe_load(f)
     return data.get("sources", []) if data else []
 
 
 def _save_sources(sources: list[dict]) -> None:
-    with open(_SOURCES_PATH, "w") as f:
+    _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(_USER_SOURCES, "w") as f:
         yaml.safe_dump({"sources": sources}, f, default_flow_style=False, sort_keys=False)
 
 
@@ -328,7 +339,7 @@ async def recon_run_model_intelligence() -> dict:
     profile_registry = None
     try:
         from genesis.routing.model_profiles import ModelProfileRegistry
-        profiles_path = _CONFIG_DIR / "model_profiles.yaml"
+        profiles_path = _REPO_CONFIG_DIR / "model_profiles.yaml"
         if profiles_path.exists():
             profile_registry = ModelProfileRegistry(profiles_path)
             profile_registry.load()

@@ -260,95 +260,66 @@ class MorningReportGenerator:
         return "\n".join(lines)
 
     async def _get_activity_summary(self) -> str:
+        from genesis.db.crud import cc_sessions as sessions_crud
+        from genesis.db.crud import inbox_items as inbox_crud
+        from genesis.db.crud import observations as obs_crud
+        from genesis.db.crud import user_goals as goals_crud
+
         lines = []
 
         # CC Sessions in last 24h
-        cursor = await self._db.execute(
-            "SELECT status, COUNT(*) FROM cc_sessions "
-            "WHERE started_at >= datetime('now', '-24 hours') "
-            "GROUP BY status"
-        )
-        rows = await cursor.fetchall()
-        if rows:
-            parts = [f"{r[0]}={r[1]}" for r in rows]
+        status_counts = await sessions_crud.get_status_counts(self._db, hours=24)
+        if status_counts:
+            parts = [f"{s}={c}" for s, c in status_counts.items()]
             lines.append(f"- CC sessions: {', '.join(parts)}")
         else:
             lines.append("- CC sessions: none in last 24h")
 
         # Session topics (foreground only, last 24h) — what was actually worked on
-        cursor = await self._db.execute(
-            "SELECT topic FROM cc_sessions "
-            "WHERE started_at >= datetime('now', '-24 hours') "
-            "AND session_type = 'foreground' "
-            "AND topic != '' AND topic IS NOT NULL "
-            "ORDER BY started_at DESC LIMIT 15"
-        )
-        topic_rows = await cursor.fetchall()
-        if topic_rows:
+        topics = await sessions_crud.get_recent_topics(self._db, hours=24, limit=15)
+        if topics:
             lines.append("- Session topics (foreground):")
-            for r in topic_rows:
-                lines.append(f"  - {r[0][:120]}")
+            for t in topics:
+                lines.append(f"  - {t[:120]}")
 
         # Active user goals — enables the LLM to note priority alignment/drift
-        cursor = await self._db.execute(
-            "SELECT title, priority, category FROM user_goals "
-            "WHERE status = 'active' "
-            "ORDER BY CASE priority "
-            "  WHEN 'critical' THEN 1 WHEN 'high' THEN 2 "
-            "  WHEN 'medium' THEN 3 ELSE 4 END "
-            "LIMIT 10"
-        )
-        goal_rows = await cursor.fetchall()
+        goal_rows = await goals_crud.list_active(self._db, limit=10)
         if goal_rows:
             lines.append("- Active user goals:")
             for g in goal_rows:
-                lines.append(f"  - [{g[1]}] ({g[2]}) {g[0]}")
+                lines.append(f"  - [{g['priority']}] ({g['category']}) {g['title']}")
 
-        # Inbox items — only report genuinely pending DB items (not filesystem output files)
-        cursor = await self._db.execute(
-            "SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'"
-        )
-        pending_inbox = (await cursor.fetchone())[0]
+        # Inbox items — only report genuinely pending DB items
+        pending_inbox = await inbox_crud.count_pending(self._db)
         if pending_inbox > 0:
             lines.append(f"- Inbox: {pending_inbox} items awaiting evaluation")
 
         # User-relevant observations with content preview (top 5)
-        # Filter: unresolved + not yet surfaced + not internal type
-        placeholders = ",".join("?" for _ in _INTERNAL_OBS_TYPES)
-        cursor = await self._db.execute(
-            f"SELECT id, priority, type, content FROM observations "
-            f"WHERE resolved = 0 AND surfaced_at IS NULL "
-            f"AND type NOT IN ({placeholders}) "
-            "ORDER BY CASE priority "
-            "  WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, "
-            "created_at DESC LIMIT 5",
-            _INTERNAL_OBS_TYPES,
+        obs_rows = await obs_crud.get_unsurfaced(
+            self._db,
+            priority_filter=("high", "medium", "low"),
+            exclude_types=_INTERNAL_OBS_TYPES,
+            limit=5,
         )
-        rows = await cursor.fetchall()
-        if rows:
+        if obs_rows:
             lines.append("- User-relevant observations (unresolved):")
             obs_ids = []
-            for r in rows:
-                obs_ids.append(r[0])
-                content_preview = (r[3] or "?")[:120]
-                lines.append(f"  - [{r[1]}] {r[2]}: {content_preview}")
+            for r in obs_rows:
+                obs_ids.append(r["id"])
+                content_preview = (r["content"] or "?")[:120]
+                lines.append(f"  - [{r['priority']}] {r['type']}: {content_preview}")
 
-            # Track retrieval and influence (displayed to user = influenced awareness)
+            # Track retrieval and influence
             try:
-                from genesis.db.crud import observations as obs_crud
                 await obs_crud.increment_retrieved_batch(self._db, obs_ids)
                 await obs_crud.mark_influenced_batch(self._db, obs_ids)
             except Exception:
                 logger.warning("Failed to track morning report observation consumption", exc_info=True)
 
         # Genesis-internal observation count (single summary line)
-        cursor = await self._db.execute(
-            f"SELECT COUNT(*) FROM observations "
-            f"WHERE resolved = 0 AND type IN ({placeholders})",
-            _INTERNAL_OBS_TYPES,
+        internal_count = await obs_crud.count_unresolved_by_types(
+            self._db, types=_INTERNAL_OBS_TYPES,
         )
-        row = await cursor.fetchone()
-        internal_count = row[0] if row else 0
         if internal_count:
             lines.append(
                 f"- Genesis internal: {internal_count} items tracked "
@@ -358,13 +329,9 @@ class MorningReportGenerator:
         return "\n".join(lines) if lines else "No activity data."
 
     async def _get_cognitive_state(self) -> str:
-        cursor = await self._db.execute(
-            "SELECT section, content, created_at FROM cognitive_state "
-            "WHERE (expires_at IS NULL OR expires_at > datetime('now')) "
-            "AND created_at > datetime('now', '-24 hours') "
-            "ORDER BY section, created_at DESC LIMIT 10"
-        )
-        rows = await cursor.fetchall()
+        from genesis.db.crud import cognitive_state as cs_crud
+
+        rows = await cs_crud.get_recent_active(self._db, hours=24, limit=10)
         if not rows:
             return "No active cognitive state entries (all >24h old — skipped)."
         header = (
@@ -375,36 +342,35 @@ class MorningReportGenerator:
         )
         entry_lines = []
         for r in rows:
-            age = _relative_age(r[2])
-            aging_tag = " [AGING]" if _age_seconds(r[2]) > 43200 else ""  # >12h
-            entry_lines.append(f"- [{r[0]}]{aging_tag} {r[1][:300]} ({age})")
+            age = _relative_age(r["created_at"])
+            aging_tag = " [AGING]" if _age_seconds(r["created_at"]) > 43200 else ""  # >12h
+            entry_lines.append(f"- [{r['section']}]{aging_tag} {r['content'][:300]} ({age})")
         return header + "\n" + "\n".join(entry_lines)
 
     async def _get_pending_items(self) -> str:
+        from genesis.db.crud import approval_requests as approval_crud
+        from genesis.db.crud import ego as ego_crud
+        from genesis.db.crud import message_queue as mq_crud
+
         lines: list[str] = []
 
         # Message queue items
-        cursor = await self._db.execute(
-            "SELECT message_type, source, priority, content, created_at "
-            "FROM message_queue "
-            "WHERE responded_at IS NULL AND expired_at IS NULL "
-            "AND content NOT LIKE '%Untitled%' "
-            "ORDER BY priority, created_at LIMIT 10"
-        )
-        rows = await cursor.fetchall()
-        for r in rows:
+        mq_rows = await mq_crud.query_pending(self._db)
+        for r in mq_rows:
+            content = r.get("content", "")
+            if "Untitled" in content:
+                continue
             lines.append(
-                f"- [{r[0]}] priority={r[2]}, from={r[1] or '?'}, "
-                f"created={r[4]}: {r[3][:200]}"
+                f"- [{r.get('message_type', '?')}] "
+                f"priority={r.get('priority', '?')}, "
+                f"from={r.get('source') or '?'}, "
+                f"created={r.get('created_at', '?')}: {content[:200]}"
             )
 
         # Pending ego proposals (user needs to approve/reject on dashboard)
         try:
-            cursor = await self._db.execute(
-                "SELECT id, content, urgency, created_at FROM ego_proposals "
-                "WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5"
-            )
-            proposals = await cursor.fetchall()
+            proposals = await ego_crud.list_pending_proposals(self._db)
+            proposals = proposals[:5]
             if proposals:
                 lines.append(
                     f"- {len(proposals)} pending ego proposal(s) "
@@ -412,8 +378,8 @@ class MorningReportGenerator:
                 )
                 for p in proposals:
                     lines.append(
-                        f"  - {(p[1] or '?')[:150]} "
-                        f"(urgency={p[2] or 'normal'})"
+                        f"  - {(p.get('content') or '?')[:150]} "
+                        f"(urgency={p.get('urgency') or 'normal'})"
                     )
         except Exception:
             logger.warning(
@@ -422,17 +388,14 @@ class MorningReportGenerator:
 
         # Pending approval requests
         try:
-            cursor = await self._db.execute(
-                "SELECT id, description, created_at FROM approval_requests "
-                "WHERE status = 'pending' ORDER BY created_at DESC LIMIT 5"
-            )
-            approvals = await cursor.fetchall()
+            approvals = await approval_crud.list_pending(self._db)
+            approvals = approvals[:5]
             if approvals:
                 lines.append(
                     f"- {len(approvals)} pending approval request(s):"
                 )
                 for a in approvals:
-                    lines.append(f"  - {(a[1] or '?')[:150]}")
+                    lines.append(f"  - {(a.get('description') or '?')[:150]}")
         except Exception:
             logger.warning(
                 "Morning report: approval requests query failed",
@@ -466,17 +429,13 @@ class MorningReportGenerator:
                 lines.append(f"- {fu['content'][:150]} — {reason[:100]}")
 
         # Recently completed (last 24h)
-        cursor = await self._db.execute(
-            "SELECT content, resolution_notes FROM follow_ups "
-            "WHERE status = 'completed' "
-            "AND completed_at >= datetime('now', '-24 hours') "
-            "ORDER BY completed_at DESC LIMIT 5"
+        completed = await follow_ups.get_recently_completed(
+            self._db, hours=24, limit=5,
         )
-        completed = await cursor.fetchall()
         if completed:
             lines.append("**Completed (24h):**")
             for row in completed:
-                lines.append(f"- ✓ {row[0][:200]}")
+                lines.append(f"- ✓ {row['content'][:200]}")
 
         return "\n".join(lines) if lines else None
 
@@ -557,12 +516,8 @@ class MorningReportGenerator:
             stats = await get_engagement_stats(self._db, days=7)
         except Exception:
             # Fallback to simple count
-            cursor = await self._db.execute(
-                "SELECT COUNT(*) FROM outreach_history "
-                "WHERE created_at >= datetime('now', '-7 days')"
-            )
-            row = await cursor.fetchone()
-            total = row[0] if row else 0
+            from genesis.db.crud.outreach import count_recent
+            total = await count_recent(self._db, days=7)
             return f"- {total} messages sent in last 7 days." if total else "- No outreach in last 7 days."
 
         total = stats["total"]
@@ -629,13 +584,8 @@ class MorningReportGenerator:
             return None
 
         # Provide last report timestamp so LLM can compress unchanged items
-        cursor = await self._db.execute(
-            "SELECT created_at FROM outreach_history "
-            "WHERE signal_type = 'morning_report' "
-            "ORDER BY created_at DESC LIMIT 1 OFFSET 1"  # Previous report, not this one
-        )
-        row = await cursor.fetchone()
-        last_report_at = row[0] if row else None
+        from genesis.db.crud.outreach import get_previous_report_time
+        last_report_at = await get_previous_report_time(self._db)
 
         # Parse last_report_at to datetime for correct comparison
         # (outreach_history uses space-separated format, surfaced_at uses ISO T-format)

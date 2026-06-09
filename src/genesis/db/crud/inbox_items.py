@@ -402,3 +402,12 @@ async def get_recent_completed(
         (f"-{days}", limit),
     )
     return [dict(row) for row in await cursor.fetchall()]
+
+
+async def count_pending(db: aiosqlite.Connection) -> int:
+    """Count inbox items with status 'pending'."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM inbox_items WHERE status = 'pending'"
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0

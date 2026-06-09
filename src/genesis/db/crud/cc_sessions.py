@@ -280,3 +280,139 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     cursor = await db.execute("DELETE FROM cc_sessions WHERE id = ?", (id,))
     await db.commit()
     return cursor.rowcount > 0
+
+
+# -- Extraction helpers -------------------------------------------------------
+
+
+async def get_all_cc_session_ids(db: aiosqlite.Connection) -> set[str]:
+    """Return set of all non-null cc_session_id values."""
+    cursor = await db.execute(
+        "SELECT cc_session_id FROM cc_sessions WHERE cc_session_id IS NOT NULL"
+    )
+    return {row[0] for row in await cursor.fetchall()}
+
+
+async def register_from_filesystem(
+    db: aiosqlite.Connection,
+    *,
+    id: str,
+    cc_session_id: str,
+    started_at: str,
+) -> bool:
+    """Auto-register a session discovered from filesystem transcripts.
+
+    Uses INSERT OR IGNORE so duplicates are silently skipped.
+    Returns True if a new row was inserted.
+    """
+    cursor = await db.execute(
+        "INSERT OR IGNORE INTO cc_sessions "
+        "(id, cc_session_id, session_type, model, source_tag, "
+        " status, started_at, last_activity_at) "
+        "VALUES (?, ?, 'foreground', 'unknown', 'foreground', "
+        " 'completed', ?, ?)",
+        (id, cc_session_id, started_at, started_at),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_extractable(
+    db: aiosqlite.Connection,
+    *,
+    source_tags: tuple[str, ...],
+    statuses: tuple[str, ...] = ("active", "completed", "checkpointed"),
+) -> list[dict]:
+    """Query sessions eligible for memory extraction."""
+    tag_ph = ",".join("?" for _ in source_tags)
+    status_ph = ",".join("?" for _ in statuses)
+    cursor = await db.execute(
+        f"SELECT id, cc_session_id, source_tag, last_extracted_at, "
+        f"       last_extracted_line, started_at "
+        f"FROM cc_sessions "
+        f"WHERE source_tag IN ({tag_ph}) "
+        f"  AND status IN ({status_ph}) "
+        f"ORDER BY started_at DESC",
+        (*source_tags, *statuses),
+    )
+    columns = [d[0] for d in cursor.description]
+    return [dict(zip(columns, row, strict=True)) for row in await cursor.fetchall()]
+
+
+async def update_extraction_watermark(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    last_extracted_line: int,
+    last_extracted_at: str,
+) -> bool:
+    """Update the extraction watermark for a session."""
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? "
+        "WHERE id = ?",
+        (last_extracted_at, last_extracted_line, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def get_keywords(db: aiosqlite.Connection, id: str) -> str | None:
+    """Get the keywords string for a session."""
+    cursor = await db.execute(
+        "SELECT keywords FROM cc_sessions WHERE id = ?", (id,),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def update_topic_and_keywords(
+    db: aiosqlite.Connection,
+    id: str,
+    *,
+    topic: str,
+    keywords: str,
+) -> bool:
+    """Update the session topic and keywords index."""
+    cursor = await db.execute(
+        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
+        (topic, keywords, id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+# -- Aggregate helpers (morning report, etc.) ---------------------------------
+
+
+async def get_status_counts(
+    db: aiosqlite.Connection,
+    *,
+    hours: int = 24,
+) -> dict[str, int]:
+    """Count sessions by status within the given time window."""
+    cursor = await db.execute(
+        "SELECT status, COUNT(*) FROM cc_sessions "
+        "WHERE started_at >= datetime('now', ? || ' hours') "
+        "GROUP BY status",
+        (f"-{hours}",),
+    )
+    return {row[0]: row[1] for row in await cursor.fetchall()}
+
+
+async def get_recent_topics(
+    db: aiosqlite.Connection,
+    *,
+    hours: int = 24,
+    session_type: str = "foreground",
+    limit: int = 15,
+) -> list[str]:
+    """Get recent non-empty session topics."""
+    cursor = await db.execute(
+        "SELECT topic FROM cc_sessions "
+        "WHERE started_at >= datetime('now', ? || ' hours') "
+        "AND session_type = ? "
+        "AND topic != '' AND topic IS NOT NULL "
+        "ORDER BY started_at DESC LIMIT ?",
+        (f"-{hours}", session_type, limit),
+    )
+    return [row[0] for row in await cursor.fetchall()]
