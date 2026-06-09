@@ -511,6 +511,28 @@ async def delete_by_source_and_type(
     return cursor.rowcount
 
 
+async def resolve_by_source_and_type(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+    resolved_at: str,
+    resolution_notes: str,
+) -> int:
+    """Resolve all unresolved observations matching a source + type pair.
+
+    Returns the number of rows resolved.
+    """
+    cursor = await db.execute(
+        "UPDATE observations SET resolved = 1, resolved_at = ?, "
+        "resolution_notes = ? "
+        "WHERE source = ? AND type = ? AND resolved = 0",
+        (resolved_at, resolution_notes, source, type),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 # -- Surfacing ----------------------------------------------------------------
 
 
