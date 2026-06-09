@@ -26,7 +26,7 @@ options:
 schema:
   openai_api_key: password  # pragma: allowlist secret
   websocket_port: int(1024,65535)
-  genesis_url: url
+  genesis_url: str
   genesis_token: password  # pragma: allowlist secret
   vad_threshold: float(0.0,1.0)
   vad_prefix_padding_ms: int
