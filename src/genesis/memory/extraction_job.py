@@ -230,6 +230,32 @@ async def run_extraction_cycle(
                     session_id, chunk_start, chunk_end, exc_info=True,
                 )
 
+            # Stream 2: procedure candidate extraction (same pattern as
+            # references). Only in normal mode — procedure candidates are
+            # a new extraction type flagged by the SLM, routed to the Judge
+            # LLM for validation. Each Judge call is timeout-guarded.
+            if not reference_only_mode:
+                try:
+                    from genesis.memory.procedure_extraction import (
+                        extract_procedures_from_chunk,
+                    )
+
+                    proc_count = await extract_procedures_from_chunk(
+                        result.extractions,
+                        db=db,
+                        router=router,
+                        source_session_id=cc_session_id,
+                        chunk_context=format_chunk_for_extraction(chunk),
+                    )
+                    summary["procedures_extracted"] = (
+                        summary.get("procedures_extracted", 0) + proc_count
+                    )
+                except Exception:
+                    logger.warning(
+                        "Procedure extraction failed on session %s chunk %d-%d",
+                        session_id, chunk_start, chunk_end, exc_info=True,
+                    )
+
             if reference_only_mode:
                 # Skip the episodic storage loop — history mining uses this
                 # path to populate the reference store without duplicating
