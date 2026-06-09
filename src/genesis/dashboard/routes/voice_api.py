@@ -267,7 +267,11 @@ def voice_system_prompt():
     if bridge is None:
         return jsonify({"error": "Genesis bridge not initialized"}), 503
 
-    return jsonify({"prompt": bridge.get_system_prompt()})
+    try:
+        return jsonify({"prompt": bridge.get_system_prompt()})
+    except Exception:
+        logger.error("Failed to generate system prompt", exc_info=True)
+        return jsonify({"error": "Failed to generate system prompt"}), 500
 
 
 @voice_api_bp.route("/v1/voice/tool_declarations", methods=["GET"])
