@@ -199,14 +199,21 @@ class WebSocketHandler:
 
         # Start pipeline in background with exception tracking
         pipeline_task = asyncio.create_task(runner.run(task))
-        pipeline_task.add_done_callback(
-            lambda t: t.exception() and logger.error("Pipeline task failed: %s", t.exception())
-        )
+        pipeline_task.add_done_callback(self._on_pipeline_done)
         self._pipeline_task = pipeline_task
         logger.info("✅ Pipeline started for WebSocket connection")
         logger.info("✅ Pipeline initialized successfully")
 
         return pipeline, runner, task
+
+    @staticmethod
+    def _on_pipeline_done(task: asyncio.Task) -> None:
+        """Log exceptions from background pipeline tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("Pipeline task failed: %s", exc, exc_info=exc)
 
     def extract_client_id(self, websocket) -> str:
         """
