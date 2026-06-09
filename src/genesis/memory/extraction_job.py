@@ -425,13 +425,12 @@ async def _find_extractable_sessions(
     This ensures interactive CLI sessions (which bypass cc_sessions registration)
     are still discoverable for extraction.
     """
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     # Phase 1: Auto-register untracked transcripts from filesystem
     if transcript_dir.is_dir():
         try:
-            known_cursor = await db.execute(
-                "SELECT cc_session_id FROM cc_sessions WHERE cc_session_id IS NOT NULL"
-            )
-            known_ids = {row[0] for row in await known_cursor.fetchall()}
+            known_ids = await sessions_crud.get_all_cc_session_ids(db)
 
             for jsonl_file in transcript_dir.glob("*.jsonl"):
                 session_id = jsonl_file.stem
@@ -450,15 +449,12 @@ async def _find_extractable_sessions(
                     jsonl_file.stat().st_mtime, tz=UTC,
                 )
                 mtime_iso = mtime.isoformat()
-                await db.execute(
-                    "INSERT OR IGNORE INTO cc_sessions "
-                    "(id, cc_session_id, session_type, model, source_tag, "
-                    " status, started_at, last_activity_at) "
-                    "VALUES (?, ?, 'foreground', 'unknown', 'foreground', "
-                    " 'completed', ?, ?)",
-                    (session_id, session_id, mtime_iso, mtime_iso),
+                await sessions_crud.register_from_filesystem(
+                    db,
+                    id=session_id,
+                    cc_session_id=session_id,
+                    started_at=mtime_iso,
                 )
-            await db.commit()
         except Exception:
             logger.warning(
                 "Filesystem transcript discovery failed — falling back to DB-only",
@@ -466,20 +462,9 @@ async def _find_extractable_sessions(
             )
 
     # Phase 2: Query all extractable sessions (including newly registered ones)
-    cursor = await db.execute(
-        """
-        SELECT id, cc_session_id, source_tag, last_extracted_at,
-               last_extracted_line, started_at
-        FROM cc_sessions
-        WHERE source_tag IN ({})
-          AND status IN ('active', 'completed', 'checkpointed')
-        ORDER BY started_at DESC
-        """.format(",".join("?" for _ in _EXTRACTABLE_SOURCE_TAGS)),
-        tuple(_EXTRACTABLE_SOURCE_TAGS),
+    return await sessions_crud.get_extractable(
+        db, source_tags=_EXTRACTABLE_SOURCE_TAGS,
     )
-    rows = await cursor.fetchall()
-    columns = [d[0] for d in cursor.description]
-    return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
 async def _update_watermark(
@@ -488,13 +473,14 @@ async def _update_watermark(
     line_number: int,
 ) -> None:
     """Update the extraction watermark for a session."""
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     now_iso = datetime.now(UTC).isoformat()
-    await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? "
-        "WHERE id = ?",
-        (now_iso, line_number, session_id),
+    await sessions_crud.update_extraction_watermark(
+        db, session_id,
+        last_extracted_line=line_number,
+        last_extracted_at=now_iso,
     )
-    await db.commit()
 
 
 async def _update_session_index(
@@ -510,23 +496,20 @@ async def _update_session_index(
     latest chunk's topic (most recent = most complete context).
     Appends to existing keywords rather than overwriting.
     """
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     # Read existing keywords to merge
-    cursor = await db.execute(
-        "SELECT keywords FROM cc_sessions WHERE id = ?", (session_id,),
-    )
-    row = await cursor.fetchone()
+    existing_str = await sessions_crud.get_keywords(db, session_id)
     existing = set()
-    if row and row[0]:
-        existing = {k.strip() for k in row[0].split(",") if k.strip()}
+    if existing_str:
+        existing = {k.strip() for k in existing_str.split(",") if k.strip()}
 
     merged = sorted(existing | keywords)
     keywords_str = ", ".join(merged)
 
-    await db.execute(
-        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
-        (topic, keywords_str, session_id),
+    await sessions_crud.update_topic_and_keywords(
+        db, session_id, topic=topic, keywords=keywords_str,
     )
-    await db.commit()
     logger.info(
         "Session %s indexed: topic=%r, keywords=%d",
         session_id[:8], topic[:60], len(merged),

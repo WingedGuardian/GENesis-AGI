@@ -133,15 +133,17 @@ class CCVersionCollector:
 
     async def _get_last_known_version(self) -> str | None:
         """Read last known CC version from observations table."""
-        cursor = await self._db.execute(
-            "SELECT content FROM observations "
-            "WHERE source = 'cc_version' AND type = 'cc_version_baseline' "
-            "ORDER BY created_at DESC LIMIT 1",
+        from genesis.db.crud import observations
+
+        rows = await observations.query(
+            self._db,
+            source="cc_version",
+            type="cc_version_baseline",
+            limit=1,
         )
-        row = await cursor.fetchone()
-        if row:
+        if rows:
             try:
-                data = json.loads(row[0] if isinstance(row, tuple) else row["content"])
+                data = json.loads(rows[0].get("content", "{}"))
                 return data.get("version")
             except (json.JSONDecodeError, TypeError):
                 return None
@@ -153,11 +155,9 @@ class CCVersionCollector:
 
         now = datetime.now(UTC).isoformat()
         # Remove previous baselines to keep exactly one current
-        await self._db.execute(
-            "DELETE FROM observations "
-            "WHERE source = 'cc_version' AND type = 'cc_version_baseline'",
+        await observations.delete_by_source_and_type(
+            self._db, source="cc_version", type="cc_version_baseline",
         )
-        await self._db.commit()
         await observations.create(
             self._db,
             id=str(uuid.uuid4()),
@@ -204,14 +204,17 @@ class CCVersionCollector:
         # Gate: skip npm if we already have an unresolved notification.
         # This prevents a new outbound call + observation every 5-min tick
         # while the user stays on an older version.
-        cursor = await self._db.execute(
-            "SELECT 1 FROM observations WHERE source = 'cc_version' "
-            "AND type = 'cc_version_available' AND resolved = 0 LIMIT 1",
-        )
-        if await cursor.fetchone():
-            return
-
         from genesis.db.crud import observations
+
+        existing = await observations.query(
+            self._db,
+            source="cc_version",
+            type="cc_version_available",
+            resolved=False,
+            limit=1,
+        )
+        if existing:
+            return
 
         registry = await self._get_registry_version()
         if not registry:

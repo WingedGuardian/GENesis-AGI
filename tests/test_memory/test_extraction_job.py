@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -132,26 +132,19 @@ class TestFindExtractableSessions:
     @pytest.mark.asyncio
     async def test_filters_by_source_tag(self):
         db = AsyncMock()
-        cursor = AsyncMock()
-        cursor.description = [
-            ("id",), ("cc_session_id",), ("source_tag",),
-            ("last_extracted_at",), ("last_extracted_line",), ("started_at",),
+        mock_sessions = [
+            {"id": "s1", "cc_session_id": "cc1", "source_tag": "foreground",
+             "last_extracted_at": None, "last_extracted_line": 0, "started_at": "2026-03-23"},
+            {"id": "s2", "cc_session_id": "cc2", "source_tag": "inbox",
+             "last_extracted_at": None, "last_extracted_line": 0, "started_at": "2026-03-23"},
         ]
-        cursor.fetchall = AsyncMock(return_value=[
-            ("s1", "cc1", "foreground", None, 0, "2026-03-23"),
-            ("s2", "cc2", "inbox", None, 0, "2026-03-23"),
-        ])
-        db.execute = AsyncMock(return_value=cursor)
-
-        sessions = await _find_extractable_sessions(db)
-        assert len(sessions) == 2
-        assert sessions[0]["source_tag"] == "foreground"
-        assert sessions[1]["source_tag"] == "inbox"
-
-        # Verify SQL includes proper filter
-        sql = db.execute.call_args[0][0]
-        assert "source_tag IN" in sql
-        assert "active" in sql
+        with patch("genesis.db.crud.cc_sessions.get_extractable",
+                    new_callable=AsyncMock, return_value=mock_sessions) as mock_get:
+            sessions = await _find_extractable_sessions(db)
+            assert len(sessions) == 2
+            assert sessions[0]["source_tag"] == "foreground"
+            assert sessions[1]["source_tag"] == "inbox"
+            mock_get.assert_called_once()
 
 
 class TestUpdateWatermark:
@@ -160,12 +153,12 @@ class TestUpdateWatermark:
     @pytest.mark.asyncio
     async def test_updates_watermark(self):
         db = AsyncMock()
-        await _update_watermark(db, "session-1", 150)
-        db.execute.assert_called_once()
-        sql = db.execute.call_args[0][0]
-        assert "last_extracted_at" in sql
-        assert "last_extracted_line" in sql
-        db.commit.assert_called_once()
+        with patch("genesis.db.crud.cc_sessions.update_extraction_watermark",
+                    new_callable=AsyncMock, return_value=True) as mock_update:
+            await _update_watermark(db, "session-1", 150)
+            mock_update.assert_called_once()
+            call_kwargs = mock_update.call_args
+            assert call_kwargs[1]["last_extracted_line"] == 150
 
 
 class TestRunExtractionCycle:
