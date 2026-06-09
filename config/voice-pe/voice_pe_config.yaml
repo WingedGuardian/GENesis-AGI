@@ -1298,16 +1298,20 @@ speaker:
     buffer_duration: 100ms
     audio_dac: aic3204_dac
   
-  # Virtual speaker to combine announcement and media streams together into one output
-  # This enables ducking functionality (lowering media volume when voice assistant speaks)
+  # Virtual speaker to combine announcement, media, and voice assistant streams
+  # Three inputs: announcements (wake sounds, TTS), media (music), voice (OpenAI S2S)
+  # Each has its own lifecycle — voice assistant audio must not stop when announcements end
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
     num_channels: 2
+    task_stack_in_psram: true  # Keep mixer task in PSRAM to save heap (matches stock firmware)
     source_speakers:
       - id: announcement_mixing_input
         timeout: never
       - id: media_mixing_input
+        timeout: never
+      - id: voice_mixing_input
         timeout: never
   
   # Resampler for voice assistant announcements (24kHz -> 48kHz)
@@ -1319,9 +1323,11 @@ speaker:
   
   # Resampler for voice assistant audio (24kHz -> 48kHz)
   # Used directly by voice_assistant_websocket component
+  # IMPORTANT: feeds voice_mixing_input (NOT announcement_mixing_input) so the
+  # voice assistant audio path stays alive when announcement sounds finish playing
   - platform: resampler
     id: voice_resampling_speaker
-    output_speaker: announcement_mixing_input
+    output_speaker: voice_mixing_input
     sample_rate: 48000  # Output sample rate
     bits_per_sample: 16
     buffer_duration: 500ms
