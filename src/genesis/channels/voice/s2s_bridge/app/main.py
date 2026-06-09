@@ -150,7 +150,12 @@ class Application:
         pass
 
     async def _ensure_openai_service(self, client_id: str | None = None):
-        """Create a new OpenAI service instance for a client.
+        """Ensure the OpenAI service is ready for a client.
+
+        On first call (startup): creates a new service instance, registers tools.
+        On subsequent calls (client connect): resets the existing service's
+        conversation to get a fresh OpenAI session (refreshes the 60-min clock)
+        while keeping the same service object in the pipeline.
 
         Args:
             client_id: Optional client ID for session management
@@ -159,22 +164,34 @@ class Application:
             self._pipeline_lock = asyncio.Lock()
 
         async with self._pipeline_lock:
-            if client_id is None:
-                logger.warning("⚠️ No client_id provided to _ensure_openai_service")
-
-            # Create new session
-            if client_id:
-                logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
-            else:
-                logger.info("🆕 Creating new OpenAI Session...")
-
-            # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
+            # If service already exists, reset its conversation to get a fresh
+            # OpenAI session. This is much lighter than creating a new service
+            # (which would orphan the pipeline's reference to the old one).
+            if self.openai_service is not None and client_id is not None:
+                logger.info(f"🔄 Resetting OpenAI session for client {client_id}...")
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
-                    logger.debug(f"Cached context from previous session for client {client_id}")
                 except Exception as e:
-                    logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
+                    logger.warning(f"⚠️ Error caching context: {e}")
+
+                try:
+                    await self.openai_service.reset_conversation()
+                    logger.info(f"✅ OpenAI session reset for client {client_id}")
+                except Exception as e:
+                    logger.warning(f"⚠️ Session reset failed, creating new service: {e}")
+                    # Fall through to create a new service
+                    self.openai_service = None
+
+                if self.openai_service is not None:
+                    # Register service with session manager
+                    self.session_manager.set_current_service(client_id, self.openai_service)
+                    return self.openai_service
+
+            # First call or reset failed — create a brand new service
+            if client_id:
+                logger.info(f"🆕 Creating new OpenAI service for client {client_id}...")
+            else:
+                logger.info("🆕 Creating new OpenAI service (initial)...")
 
             # Create session properties with audio configuration
             from pipecat.services.openai.realtime.events import (
@@ -227,15 +244,15 @@ class Application:
                 if not tool_name:
                     continue
 
-                async def genesis_tool_handler(params, _name=tool_name):
+                async def genesis_tool_handler(params):
                     """Dispatch tool call to Genesis via HTTP."""
                     try:
                         result = await self.genesis_tool_service.call_tool(
-                            _name, params.arguments,
+                            params.function_name, params.arguments,
                         )
                         await params.result_callback(json.dumps(result))
                     except Exception as exc:
-                        logger.error("Genesis tool %s failed: %s", _name, exc)
+                        logger.error("Genesis tool %s failed: %s", params.function_name, exc)
                         await params.result_callback(
                             json.dumps({"error": str(exc)}),
                         )
