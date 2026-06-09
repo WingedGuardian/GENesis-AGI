@@ -86,6 +86,13 @@ class STTEventHandler(AsyncEventHandler):
             self._width = start.width
             self._channels = start.channels
             self._audio_bytes.clear()
+            # Flush stale audio from previous failed pipeline runs.
+            # Safe: AudioStart fires once per pipeline run, always before
+            # any new audio is processed.  In normal operation the queue
+            # is already empty (TTS consumed it); this only catches
+            # orphaned audio left by ConnectionResetError or similar.
+            if self._tts_server:
+                self._tts_server.clear_queue()
             return True
 
         if AudioChunk.is_type(event.type):
@@ -116,7 +123,16 @@ class STTEventHandler(AsyncEventHandler):
             else:
                 transcript = await self._handle_fallback(audio)
 
-            await self.write_event(Transcript(text=transcript).event())
+            try:
+                await self.write_event(Transcript(text=transcript).event())
+            except Exception:
+                # Transcript write failed (e.g. ConnectionResetError).
+                # Audio is already queued on the TTS server — clear it
+                # to prevent the next pipeline run from serving stale
+                # audio (the "turn behind" bug).
+                if self._tts_server:
+                    self._tts_server.clear_queue()
+                raise
             return True
 
         return True
@@ -176,6 +192,12 @@ class STTEventHandler(AsyncEventHandler):
                     break
                 elif event.type == "error":
                     logger.error("S2S response error: %s", event.text)
+                    # Flush any partial audio and close the broken session
+                    # so the next call creates a fresh one.
+                    if self._tts_server:
+                        self._tts_server.clear_queue()
+                    with contextlib.suppress(Exception):
+                        await self._s2s_manager.close(satellite_id)
                     return await self._handle_fallback(audio)
 
             # Queue response audio for TTS server BEFORE returning transcript
@@ -194,6 +216,10 @@ class STTEventHandler(AsyncEventHandler):
 
         except Exception:
             logger.exception("S2S processing failed, falling back")
+            if self._tts_server:
+                self._tts_server.clear_queue()
+            with contextlib.suppress(Exception):
+                await self._s2s_manager.close(satellite_id)
             return await self._handle_fallback(audio)
 
     async def _handle_fallback(self, audio: bytes) -> str:

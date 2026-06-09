@@ -281,6 +281,153 @@ class TestWyomingTTSServer:
         # maxlen=5
         assert len(server._audio_queue) == 5
 
+    def test_clear_queue_empties_and_resets_event(self):
+        from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+        server = WyomingTTSServer()
+        server.queue_audio(b"\x01" * 100)
+        server.queue_audio(b"\x02" * 100)
+        assert len(server._audio_queue) == 2
+        assert server._audio_ready.is_set()
+
+        server.clear_queue()
+        assert len(server._audio_queue) == 0
+        assert not server._audio_ready.is_set()
+
+    def test_clear_queue_noop_when_empty(self):
+        from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+        server = WyomingTTSServer()
+        # Should not raise or log when queue is already empty
+        server.clear_queue()
+        assert len(server._audio_queue) == 0
+
+
+# ─── STT handler queue + session cleanup tests ────────────────────────
+
+
+class TestSTTQueueCleanup:
+    """Tests for TTS queue clearing on failures and AudioStart."""
+
+    def _make_handler(self, *, s2s_manager=None, tts_server=None):
+        """Build a STTEventHandler with mocked dependencies."""
+        from genesis.channels.voice.wyoming_stt import STTEventHandler
+
+        handler = STTEventHandler(
+            MagicMock(),  # reader
+            MagicMock(),  # writer
+            s2s_manager=s2s_manager,
+            tts_server=tts_server,
+        )
+        return handler
+
+    async def test_audio_start_clears_tts_queue(self):
+        """AudioStart should flush stale audio from the TTS queue."""
+        from wyoming.audio import AudioStart
+
+        from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+        tts = WyomingTTSServer()
+        tts.queue_audio(b"\x01" * 100)  # orphaned audio
+        assert len(tts._audio_queue) == 1
+
+        handler = self._make_handler(tts_server=tts)
+        event = AudioStart(rate=16000, width=2, channels=1).event()
+        await handler.handle_event(event)
+
+        assert len(tts._audio_queue) == 0
+        assert not tts._audio_ready.is_set()
+
+    async def test_audio_start_noop_without_tts_server(self):
+        """AudioStart should not fail when no TTS server is set."""
+        from wyoming.audio import AudioStart
+
+        handler = self._make_handler(tts_server=None)
+        event = AudioStart(rate=16000, width=2, channels=1).event()
+        # Should not raise
+        result = await handler.handle_event(event)
+        assert result is True
+
+    async def test_s2s_error_closes_session_and_clears_queue(self):
+        """S2S error event should close the dead session and clear queue."""
+        from genesis.channels.voice.s2s_session import S2SResponseEvent
+        from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+        tts = WyomingTTSServer()
+        tts.queue_audio(b"\xff" * 100)  # simulate pre-existing audio
+        s2s_mgr = AsyncMock()
+        s2s_mgr.close = AsyncMock()
+
+        # Simulate: get_or_create returns session, connect succeeds,
+        # send_turn succeeds, but receive_response yields an error.
+        mock_session = MagicMock()
+        mock_session.connection = MagicMock()
+        s2s_mgr.get_or_create = AsyncMock(return_value=mock_session)
+        s2s_mgr.connect = AsyncMock()
+        s2s_mgr.send_turn = AsyncMock()
+
+        async def _error_response(session):
+            yield S2SResponseEvent(type="error", text="WebSocket closed")
+
+        s2s_mgr.receive_response = _error_response
+
+        handler = self._make_handler(s2s_manager=s2s_mgr, tts_server=tts)
+        handler._handle_fallback = AsyncMock(return_value="fallback text")
+
+        # Need enough audio to pass the minimum threshold
+        audio = b"\x00\x00" * 3200  # 200ms at 16kHz
+        result = await handler._handle_s2s(audio)
+
+        assert result == "fallback text"
+        assert len(tts._audio_queue) == 0  # queue was cleared
+        s2s_mgr.close.assert_awaited_once_with("ha-voice-default")
+
+    async def test_s2s_exception_closes_session_and_clears_queue(self):
+        """Exception in _handle_s2s should close session and clear queue."""
+        from genesis.channels.voice.wyoming_tts import WyomingTTSServer
+
+        tts = WyomingTTSServer()
+        tts.queue_audio(b"\x01" * 100)  # simulate partial audio queued
+        s2s_mgr = AsyncMock()
+        s2s_mgr.close = AsyncMock()
+
+        mock_session = MagicMock()
+        mock_session.connection = MagicMock()
+        s2s_mgr.get_or_create = AsyncMock(return_value=mock_session)
+        s2s_mgr.connect = AsyncMock()
+        s2s_mgr.send_turn = AsyncMock(side_effect=ConnectionError("dead WS"))
+
+        handler = self._make_handler(s2s_manager=s2s_mgr, tts_server=tts)
+        handler._handle_fallback = AsyncMock(return_value="fallback text")
+
+        audio = b"\x00\x00" * 3200
+        result = await handler._handle_s2s(audio)
+
+        assert result == "fallback text"
+        assert len(tts._audio_queue) == 0  # queue cleared
+        s2s_mgr.close.assert_awaited_once_with("ha-voice-default")
+
+    async def test_s2s_exception_close_failure_still_falls_back(self):
+        """If closing the session also fails, we still fall back gracefully."""
+        s2s_mgr = AsyncMock()
+        s2s_mgr.close = AsyncMock(side_effect=Exception("close also broken"))
+
+        mock_session = MagicMock()
+        mock_session.connection = MagicMock()
+        s2s_mgr.get_or_create = AsyncMock(return_value=mock_session)
+        s2s_mgr.connect = AsyncMock()
+        s2s_mgr.send_turn = AsyncMock(side_effect=ConnectionError("dead"))
+
+        handler = self._make_handler(s2s_manager=s2s_mgr, tts_server=None)
+        handler._handle_fallback = AsyncMock(return_value="fallback")
+
+        audio = b"\x00\x00" * 3200
+        result = await handler._handle_s2s(audio)
+
+        assert result == "fallback"
+        # close was attempted even though it failed
+        s2s_mgr.close.assert_awaited_once()
+
 
 # ─── S2S Session Manager tests ──────────────────────────────────────────
 

@@ -197,6 +197,17 @@ class S2SSessionManager:
             "role": "user",
             "content": [{"type": "input_audio", "audio": encoded}],
         })
+
+        # Brief pause to let the model ingest the audio before we request
+        # a response.  Without this, response.create() can fire before
+        # the audio is processed, causing the model to produce a generic
+        # greeting instead of answering the actual question.
+        # TODO: Replace with conversation.item.created ack-wait for a
+        # deterministic signal instead of a fixed delay.  Requires
+        # consuming events from the connection here without interfering
+        # with receive_response()'s async iterator.
+        await asyncio.sleep(0.3)
+
         await session.connection.response.create()
 
     async def receive_response(
