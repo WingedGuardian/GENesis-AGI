@@ -170,10 +170,22 @@ class ReplyHandler:
         """Handle an incoming reply by dispatching a DirectSession.
 
         Returns:
-            Session ID if dispatched, None if skipped.
+            Session ID if dispatched, None if skipped (including when
+            blocked by the content sanitizer).
         """
         from genesis.cc.direct_session import DirectSessionRequest
         from genesis.cc.types import CCModel, EffortLevel
+        from genesis.security.sanitizer import ContentSanitizer, ContentSource
+
+        # Check for high-severity injection patterns before processing
+        sanitizer = ContentSanitizer()
+        check = sanitizer.sanitize(reply.body_preview, ContentSource.EMAIL)
+        if sanitizer.should_block(check):
+            logger.warning(
+                "Reply blocked for thread %s: patterns=%s risk=%.3f",
+                thread.get("id"), check.detected_patterns, check.risk_score,
+            )
+            return None
 
         history = await self._tracker.get_thread_history(thread["id"])
         prompt = _build_reply_prompt(thread, reply, history)
