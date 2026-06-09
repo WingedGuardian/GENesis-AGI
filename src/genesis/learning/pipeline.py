@@ -161,21 +161,24 @@ def build_triage_pipeline(
                 except Exception:
                     logger.error("Autonomy calibration failed (non-fatal)", exc_info=True)
 
-        # 6.5. Procedure extraction (error-isolated — must not crash pipeline)
+        # 6.5. Procedure extraction — DEPRECATED (30-day grace period)
         #
-        # Triggers by outcome:
-        #  - APPROACH_FAILURE: capture what went wrong, gated by novelty.
-        #  - WORKAROUND_SUCCESS: capture the workaround pattern, gated by novelty.
-        #  - SUCCESS on AUTONOMOUS channels: capture the working pattern so the
-        #    next autonomous run has a baseline. Gated by novelty so this doesn't
-        #    flood the table. Foreground SUCCESS is NOT auto-extracted — the
-        #    user/CC drives that via `procedure_store` calls.
+        # The new path runs in extraction_job.py via two streams:
+        #   Stream 1: programmatic struggle detection (action spine + heuristics)
+        #   Stream 2: SLM extraction prompt flagging (procedure_candidate type)
+        # Both route through the Judge LLM on call site 38.
+        #
+        # This legacy path (500-char summary extractor) remains as a fallback
+        # during the transition. Remove after 2026-07-09.
         is_autonomous = summary.channel in _AUTONOMOUS_CHANNELS
         if router is not None and (
             outcome in (OutcomeClass.APPROACH_FAILURE, OutcomeClass.WORKAROUND_SUCCESS)
             or (outcome == OutcomeClass.SUCCESS and is_autonomous)
         ):
             try:
+                logger.debug(
+                    "Running deprecated procedure extraction (legacy 500-char path)"
+                )
                 summary_text = f"User: {summary.user_text}\nOutput: {summary.response_text[:500]}"
                 await extract_procedure(
                     db,
