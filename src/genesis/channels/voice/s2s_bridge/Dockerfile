@@ -50,6 +50,13 @@ COPY app/ /tmp/openai_realtime_voice_agent/app/
 WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV POETRY_VIRTUALENVS_CREATE=false
+# Pre-install llvmlite: Poetry's PEP 517 isolated build uses a setuptools
+# version that's incompatible with llvmlite 0.44.0 (spawn() dry_run kwarg).
+# Installing with pip --no-build-isolation uses our pinned setuptools.
+RUN pip3 install --no-cache-dir --break-system-packages "setuptools<75.6.0"
+RUN LLVM_CONFIG=/usr/bin/llvm-config \
+    pip3 install --no-cache-dir --break-system-packages --no-build-isolation \
+    "llvmlite==0.44.0"
 # Find and set LLVM_CONFIG path
 RUN \
     LLVM_CONFIG_PATH=$(which llvm-config || find /usr/bin /usr/local/bin -name llvm-config* 2>/dev/null | head -1) \
