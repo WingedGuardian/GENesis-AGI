@@ -371,3 +371,170 @@ class TestScenarioField:
 ```'''
         result = parse_extraction_response_full(response)
         assert result.extractions[0].extraction_type == "procedure_candidate"
+
+
+# ── Additional tests from specialist review ─────────────────────────────────
+
+
+class TestBuildActionSpineEdgeCases:
+    """Edge cases for action spine parser (T5, T6 from testing specialist)."""
+
+    def _write_jsonl(self, entries: list[dict]) -> Path:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+            return Path(f.name)
+
+    def test_orphaned_tool_use_marked_as_error(self):
+        """T5: tool_use with no matching tool_result → outcome='error'."""
+        from genesis.learning.procedural.struggle_detector import build_action_spine
+
+        path = self._write_jsonl([{
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Bash",
+                "input": {"command": "long-running-cmd"},
+                "id": "orphan_1",
+            }]},
+        }])
+        spine = build_action_spine(path)
+        assert len(spine) == 1
+        assert spine[0]["outcome"] == "error"
+        assert "no result received" in spine[0]["error_text"]
+
+    def test_string_content_block(self):
+        """T6: message.content as plain string (not list)."""
+        from genesis.learning.procedural.struggle_detector import build_action_spine
+
+        path = self._write_jsonl([{
+            "type": "user",
+            "message": {"content": "hello, this is plain text"},
+        }])
+        spine = build_action_spine(path)
+        assert len(spine) == 1
+        assert spine[0]["type"] == "user"
+        assert "hello, this is plain text" in spine[0]["args_summary"]
+
+    def test_malformed_jsonl_lines_skipped(self):
+        """Garbage lines interspersed with valid entries."""
+        from genesis.learning.procedural.struggle_detector import build_action_spine
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            f.write("not valid json\n")
+            f.write('{"partial": \n')
+            f.write(json.dumps({
+                "type": "user",
+                "message": {"content": [{"type": "text", "text": "valid entry"}]},
+            }) + "\n")
+            f.write("more garbage\n")
+            path = Path(f.name)
+
+        spine = build_action_spine(path)
+        assert len(spine) == 1
+        assert spine[0]["args_summary"] == "valid entry"
+
+    def test_multiple_tool_uses_in_one_message(self):
+        """Assistant message with multiple tool_use blocks."""
+        from genesis.learning.procedural.struggle_detector import build_action_spine
+
+        path = self._write_jsonl([
+            {
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}, "id": "t1"},
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": "/a"}, "id": "t2"},
+                ]},
+            },
+            {
+                "type": "user",
+                "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "file.txt", "is_error": False},
+                    {"type": "tool_result", "tool_use_id": "t2", "content": "contents", "is_error": False},
+                ]},
+            },
+        ])
+        spine = build_action_spine(path)
+        tool_entries = [e for e in spine if e["type"] == "tool"]
+        assert len(tool_entries) == 2
+        assert tool_entries[0]["tool"] == "Bash"
+        assert tool_entries[1]["tool"] == "Read"
+        assert all(e["outcome"] == "ok" for e in tool_entries)
+
+
+class TestJudgeResponseParsingEdgeCases:
+    """Additional Judge parsing tests (from testing specialist)."""
+
+    def test_rejects_json_array(self):
+        """LLM returns [{...}] instead of {...}."""
+        from genesis.learning.procedural.judge import _parse_judge_response
+
+        response = '[{"worth_storing": true, "task_type": "t", "principle": "p", "steps": ["1"]}]'
+        assert _parse_judge_response(response) is None
+
+    def test_rejects_empty_string(self):
+        from genesis.learning.procedural.judge import _parse_judge_response
+
+        assert _parse_judge_response("") is None
+
+    def test_rejects_html_garbage(self):
+        from genesis.learning.procedural.judge import _parse_judge_response
+
+        assert _parse_judge_response("<html><body>Error 500</body></html>") is None
+
+    def test_rejects_empty_task_type(self):
+        from genesis.learning.procedural.judge import _parse_judge_response
+
+        response = '{"worth_storing": true, "task_type": "", "principle": "p", "steps": ["1"]}'
+        assert _parse_judge_response(response) is None
+
+    def test_rejects_empty_steps(self):
+        from genesis.learning.procedural.judge import _parse_judge_response
+
+        response = '{"worth_storing": true, "task_type": "t", "principle": "p", "steps": []}'
+        assert _parse_judge_response(response) is None
+
+
+class TestScoreStruggleSignals:
+    """Individual signal tests (from testing specialist)."""
+
+    def test_user_corrections_increase_score(self):
+        """User correction phrases should increase struggle score."""
+        from genesis.learning.procedural.struggle_detector import score_struggle
+
+        # Base: 4 clean tool calls
+        base_spine = [
+            {"turn": i, "type": "tool", "tool": "Bash",
+             "args_summary": f"cmd{i}", "outcome": "ok", "error_text": ""}
+            for i in range(1, 5)
+        ]
+        base_score = score_struggle(base_spine)
+
+        # Add user correction
+        with_correction = base_spine + [{
+            "turn": 5, "type": "user", "tool": None,
+            "args_summary": "that didn't work, try again",
+            "outcome": "ok", "error_text": "",
+        }]
+        corrected_score = score_struggle(with_correction)
+        assert corrected_score > base_score
+
+    def test_approach_pivots_detected(self):
+        """Tool changes after error clusters should increase score."""
+        from genesis.learning.procedural.struggle_detector import score_struggle
+
+        spine = [
+            {"turn": 1, "type": "tool", "tool": "Bash",
+             "args_summary": "scp file", "outcome": "error", "error_text": "err"},
+            {"turn": 2, "type": "tool", "tool": "Bash",
+             "args_summary": "scp file2", "outcome": "error", "error_text": "err"},
+            {"turn": 3, "type": "tool", "tool": "Read",
+             "args_summary": "docs", "outcome": "ok", "error_text": ""},
+            {"turn": 4, "type": "tool", "tool": "Read",
+             "args_summary": "more", "outcome": "error", "error_text": "err"},
+            {"turn": 5, "type": "tool", "tool": "Edit",
+             "args_summary": "fix", "outcome": "ok", "error_text": ""},
+        ]
+        score = score_struggle(spine)
+        # Has errors + pivots, should be non-trivial
+        assert score > 0.2

@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Timeout for a single Judge LLM call inside the chunk loop.
-# The Judge is a classification call (5-15s typical). 60s is generous
-# without being dangerous inside a per-chunk loop.
+# Timeout for Judge LLM calls. Must match judge.JUDGE_TIMEOUT_SECS.
+# Kept as local constant to avoid top-level memory → learning import.
 _JUDGE_TIMEOUT_SECS = 60.0
 
 

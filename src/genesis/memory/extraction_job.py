@@ -439,6 +439,7 @@ async def run_extraction_cycle(
                 struggle_score = score_struggle(spine)
                 if struggle_score >= STRUGGLE_THRESHOLD:
                     from genesis.learning.procedural.judge import (
+                        JUDGE_TIMEOUT_SECS,
                         judge_struggle_procedure,
                     )
 
@@ -447,7 +448,7 @@ async def run_extraction_cycle(
                             db, spine, struggle_score, transcript_path, router,
                             source_session_id=cc_session_id,
                         ),
-                        timeout=60.0,
+                        timeout=JUDGE_TIMEOUT_SECS,
                     )
                     if proc_id:
                         summary["struggle_procedures"] = (

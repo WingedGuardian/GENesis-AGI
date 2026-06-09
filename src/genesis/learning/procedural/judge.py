@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 _CALL_SITE = "38_procedure_extraction"
 
+# Timeout for Judge LLM calls. Shared by both Stream 1 and Stream 2
+# callers (extraction_job.py and procedure_extraction.py).
+JUDGE_TIMEOUT_SECS = 60.0
+
 _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
