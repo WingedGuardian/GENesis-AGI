@@ -205,7 +205,7 @@ class ReplyHandler:
             model=CCModel.SONNET,
             effort=EffortLevel.HIGH,
             system_prompt=system_prompt,
-            timeout_s=600,  # 10 min — mail profile has no memory/web tools
+            timeout_s=1200,  # 20 min — mail profile has no memory/web tools
             notify=False,
             source_tag="mail_reply",
             caller_context=f"email_thread:{thread['id']}",
@@ -244,7 +244,7 @@ class ReplyHandler:
             model=CCModel.SONNET,
             effort=EffortLevel.MEDIUM,
             system_prompt=system_prompt,
-            timeout_s=600,  # 10 min — mail profile has no memory/web tools
+            timeout_s=1200,  # 20 min — mail profile has no memory/web tools
             notify=False,
             source_tag="mail_follow_up",
             caller_context=f"email_thread:{thread['id']}",
