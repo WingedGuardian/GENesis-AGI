@@ -18,11 +18,13 @@ from genesis.ego.types import EgoConfig
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = Path(__file__).resolve().parents[3] / "config"
+_REPO_CONFIG = Path(__file__).resolve().parents[3] / "config" / "ego.yaml"
+_USER_CONFIG = Path.home() / ".genesis" / "config" / "ego.yaml"
 
 
 def _config_path() -> Path:
-    return _CONFIG_DIR / "ego.yaml"
+    """User override if it exists, otherwise repo default."""
+    return _USER_CONFIG if _USER_CONFIG.exists() else _REPO_CONFIG
 
 
 def load_ego_config(path: Path | None = None) -> EgoConfig:
@@ -57,9 +59,10 @@ def load_ego_config(path: Path | None = None) -> EgoConfig:
 
 
 def save_ego_config(config: EgoConfig, path: Path | None = None) -> None:
-    """Atomic write of ego config to YAML."""
+    """Atomic write of ego config to user config dir (~/.genesis/config/)."""
     if path is None:
-        path = _config_path()
+        path = _USER_CONFIG
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     data = {
         k: v
