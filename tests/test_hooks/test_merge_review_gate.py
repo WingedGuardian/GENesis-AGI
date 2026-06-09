@@ -231,6 +231,32 @@ class TestCheckPrReviewFindings:
             should_block, msg = guard_module._check_pr_review_findings("100")
         assert not should_block
 
+    def test_error_plus_incidental_clean_phrase_blocks(self, guard_module):
+        """A real ERROR heading with incidental prose should still block."""
+        output = self._make_gh_output([
+            ("chatgpt-codex-connector[bot]", "Bot",
+             "### ERROR — hardcoded credential\n\nUse env vars.\n\n"
+             "No issues found in the formatting section."),
+        ])
+        with patch.object(guard_module.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=output, stderr="",
+            )
+            should_block, msg = guard_module._check_pr_review_findings("100")
+        assert should_block
+
+    def test_null_body_fails_open(self, guard_module):
+        """GitHub API returning body: null should not crash."""
+        output = json.dumps([
+            {"login": "chatgpt-codex-connector[bot]", "type": "Bot", "body": None},
+        ])
+        with patch.object(guard_module.subprocess, "run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=output, stderr="",
+            )
+            should_block, msg = guard_module._check_pr_review_findings("100")
+        assert not should_block
+
     def test_p2_only_allows_merge(self, guard_module):
         """Review with only [P2] markers → allow."""
         output = self._make_gh_output([

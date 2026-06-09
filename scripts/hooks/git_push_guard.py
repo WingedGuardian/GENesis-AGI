@@ -99,7 +99,7 @@ def _check_mergeable(pr_num: str) -> str | None:
 # Matches structural review ERRORs, gstack [P1] markers, and PII hard blocks.
 _BLOCKING_PATTERNS = [
     re.compile(r"^#{2,3}\s*(?:🔴\s*)?ERROR\b", re.MULTILINE),
-    re.compile(r"\[P1\]"),
+    re.compile(r"\[P1\](?!\d)"),
     re.compile(r"HARD\s+BLOCK", re.IGNORECASE),
 ]
 
@@ -109,7 +109,7 @@ _BLOCKING_PATTERNS = [
 _CLEAN_PATTERNS = [
     re.compile(r"(?:PII|Secrets|Wording)\s*(?:scan)?:\s*\**CLEAN\**", re.IGNORECASE),
     re.compile(r"Pre-Landing Review:\s*No issues found", re.IGNORECASE),
-    re.compile(r"No issues found", re.IGNORECASE),
+    re.compile(r"^Pre-Landing Review:\s*No issues found", re.IGNORECASE | re.MULTILINE),
     re.compile(r"VERDICT:\s*PASS", re.IGNORECASE),
 ]
 
@@ -158,8 +158,11 @@ def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool
     except json.JSONDecodeError:
         return False, ""  # Fail-open on parse error
 
+    # GitHub API can return "body": null for deleted comments —
+    # use `or ""` to coerce None to empty string (get's default only
+    # fires when the key is absent, not when the value is None).
     comments: list[tuple[str, str, str]] = [
-        (c.get("login", ""), c.get("type", ""), c.get("body", ""))
+        (c.get("login") or "", c.get("type") or "", c.get("body") or "")
         for c in raw_comments
     ]
 
@@ -304,8 +307,8 @@ def main() -> int:
                     print(review_msg, file=sys.stderr)
                     return 2
 
-    except (json.JSONDecodeError, KeyError):
-        pass  # Fail-open on parse errors
+    except Exception:
+        pass  # Fail-open on any error — never block legitimate work
 
     return 0
 
