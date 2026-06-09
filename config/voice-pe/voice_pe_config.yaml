@@ -1431,37 +1431,39 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # Play wake sound if enabled (for all wake words)
+          # If voice assistant is already running or connecting, handle the
+          # wake word as an interrupt (if bot is speaking) or ignore it.
+          # NEVER stop+restart — that kills the active WS connection and
+          # causes the "Only one client allowed" race on the addon side.
           - if:
               condition:
-                switch.is_on: wake_sound
+                or:
+                  - voice_assistant_websocket.is_running:
+                      id: voice_assistant_ws
+                  - voice_assistant_websocket.is_connected:
+                      id: voice_assistant_ws
               then:
-                - script.execute:
-                    id: play_sound
-                    priority: true
-                    sound_file: !lambda 'return id(wake_word_triggered_sound);'
-                - delay: 300ms
-          # Handle wake word based on bot speaking state
-          - if:
-              condition:
-                voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
-              then:
-                # Voice assistant is running - check if bot is speaking
+                # Already in a session — only interrupt if bot is speaking
                 - if:
                     condition:
                       voice_assistant_websocket.is_bot_speaking:
                         id: voice_assistant_ws
                     then:
-                      # Bot is speaking - interrupt instead of disconnect
                       - voice_assistant_websocket.interrupt:
                           id: voice_assistant_ws
-                    else:
-                      # Bot not speaking - stop voice assistant (disconnect)
-                      - voice_assistant_websocket.stop:
-                          id: voice_assistant_ws
+                # If bot is not speaking, ignore the wake word — user is
+                # already in a conversation and the mic is active
               else:
-                # Voice assistant not running - start it
+                # Voice assistant not running — start a new session
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: !lambda 'return id(wake_word_triggered_sound);'
+                      - delay: 300ms
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
 
