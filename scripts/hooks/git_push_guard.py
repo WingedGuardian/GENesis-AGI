@@ -7,6 +7,7 @@ Catches all variations of pushing to or merging into the main branch:
 - git push -u origin main
 - git merge <branch> (when on main)
 - gh pr merge (without --admin — requires explicit user approval flag)
+- gh pr merge with unresolved review findings (ERROR/[P1]/HARD BLOCK)
 
 Stdlib-only. Fail-open on parse errors (don't block legitimate work).
 """
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -75,8 +77,6 @@ def _get_push_remote_and_branch(cmd: str) -> tuple[str | None, str | None]:
 
 def _extract_pr_number(cmd: str) -> str | None:
     """Extract PR number from a gh pr merge command."""
-    import re
-
     match = re.search(r"gh pr merge\s+(\d+)", cmd)
     return match.group(1) if match else None
 
@@ -91,6 +91,116 @@ def _check_mergeable(pr_num: str) -> str | None:
         return result.stdout.strip() if result.returncode == 0 else None
     except Exception:
         return None  # Fail-open
+
+
+# ── Review findings detection ──────────────────────────────────────────
+
+# Patterns that indicate blocking review findings.
+# Matches structural review ERRORs, gstack [P1] markers, and PII hard blocks.
+_BLOCKING_PATTERNS = [
+    re.compile(r"^#{2,3}\s*(?:🔴\s*)?ERROR\b", re.MULTILINE),
+    re.compile(r"\[P1\]"),
+    re.compile(r"HARD\s+BLOCK", re.IGNORECASE),
+]
+
+# Patterns that indicate the review was clean (no real findings).
+# If a comment matches both blocking AND clean, clean wins — it means
+# the reviewer mentioned the category but found nothing.
+_CLEAN_PATTERNS = [
+    re.compile(r"(?:PII|Secrets|Wording)\s*(?:scan)?:\s*\**CLEAN\**", re.IGNORECASE),
+    re.compile(r"Pre-Landing Review:\s*No issues found", re.IGNORECASE),
+    re.compile(r"No issues found", re.IGNORECASE),
+    re.compile(r"VERDICT:\s*PASS", re.IGNORECASE),
+]
+
+# Bot usernames that post automated reviews
+_REVIEW_BOTS = {"chatgpt-codex-connector[bot]", "github-actions[bot]"}
+
+
+def _check_pr_review_findings(pr_num: str, *, force: bool = False) -> tuple[bool, str]:
+    """Check PR comments for unresolved automated review findings.
+
+    Returns (should_block, message).
+
+    Fail-open: returns (False, "") on any error — the hook must never
+    become a single point of failure for merges.
+    """
+    if force:
+        print(
+            f"NOTE: Review gate override for PR #{pr_num}. "
+            "Findings acknowledged by session.",
+            file=sys.stderr,
+        )
+        return False, ""
+
+    try:
+        # Fetch comments as JSON array with author info
+        result = subprocess.run(
+            [
+                "gh", "api",
+                f"repos/:owner/:repo/issues/{pr_num}/comments",
+                "--jq", '[.[] | {login: .user.login, type: .user.type, body: .body}]',
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return False, ""  # Fail-open on API error
+    except Exception:
+        return False, ""  # Fail-open
+
+    output = result.stdout.strip()
+    if not output or output == "[]":
+        return False, ""  # No comments at all — allow (quota-exhausted case)
+
+    # Parse JSON array of comments
+    try:
+        raw_comments = json.loads(output)
+    except json.JSONDecodeError:
+        return False, ""  # Fail-open on parse error
+
+    comments: list[tuple[str, str, str]] = [
+        (c.get("login", ""), c.get("type", ""), c.get("body", ""))
+        for c in raw_comments
+    ]
+
+    if not comments:
+        return False, ""
+
+    # Walk comments in reverse (most recent first). The last review
+    # comment determines the state — if findings were addressed and a
+    # re-review posted, the newer clean review wins.
+    for login, user_type, body in reversed(comments):
+        # Only check bot comments (automated reviews)
+        if user_type != "Bot" and login not in _REVIEW_BOTS:
+            continue
+
+        # Skip Codex quota-exhausted messages (not a real review)
+        if "reached your Codex usage limits" in body and not any(
+            p.search(body) for p in _BLOCKING_PATTERNS
+        ):
+            continue
+
+        # Check if this review is clean
+        is_clean = any(p.search(body) for p in _CLEAN_PATTERNS)
+
+        # Check for blocking findings
+        blocking_matches = [p.pattern for p in _BLOCKING_PATTERNS if p.search(body)]
+
+        if blocking_matches and not is_clean:
+            # Found unresolved findings in the most recent review
+            return True, (
+                f"Automated review has unresolved findings.\n"
+                f"Matched patterns: {', '.join(blocking_matches[:3])}\n"
+                f"Fix the findings, or append '# review-override' to "
+                f"the merge command to acknowledge and proceed."
+            )
+
+        if is_clean or not blocking_matches:
+            # Most recent review is clean or has no blocking findings
+            return False, ""
+
+    # No bot review comments found — allow (no review posted)
+    return False, ""
 
 
 def main() -> int:
@@ -179,6 +289,19 @@ def main() -> int:
                         "Resolve before merging.",
                         file=sys.stderr,
                     )
+                    return 2
+
+                # Check for unresolved review findings
+                force_override = bool(re.search(r"#\s*review-override\b", cmd))
+                should_block, review_msg = _check_pr_review_findings(
+                    pr_num, force=force_override,
+                )
+                if should_block:
+                    print(
+                        f"BLOCKED: PR #{pr_num} has unresolved review findings.",
+                        file=sys.stderr,
+                    )
+                    print(review_msg, file=sys.stderr)
                     return 2
 
     except (json.JSONDecodeError, KeyError):
