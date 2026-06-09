@@ -286,3 +286,38 @@ class TestMergeGateIntegration:
         result = _run_guard("gh pr merge 100 --squash")
         assert result.returncode == 2
         assert "--admin" in result.stderr
+
+    def test_sqlite3_write_blocked(self):
+        """sqlite3 with write operations is hard blocked."""
+        result = _run_guard('sqlite3 genesis.db "DELETE FROM knowledge_units"')
+        assert result.returncode == 2
+        assert "sqlite3" in result.stderr.lower() or "database" in result.stderr.lower()
+
+    def test_sqlite3_read_allowed(self):
+        """sqlite3 with SELECT is allowed."""
+        result = _run_guard('sqlite3 genesis.db "SELECT COUNT(*) FROM observations"')
+        assert result.returncode == 0
+
+    def test_git_commit_no_verify_blocked(self):
+        """git commit --no-verify is hard blocked."""
+        result = _run_guard('git commit --no-verify -m "bypass"')
+        assert result.returncode == 2
+        assert "no-verify" in result.stderr.lower()
+
+    def test_kill_command_warns(self):
+        """kill command produces a soft warning (exit 0)."""
+        result = _run_guard("kill -9 12345")
+        assert result.returncode == 0
+        assert "kill" in result.stderr.lower() or "process" in result.stderr.lower()
+
+    def test_git_config_write_warns(self):
+        """git config set produces a soft warning."""
+        result = _run_guard("git config core.hooksPath /tmp/evil")
+        assert result.returncode == 0
+        assert "config" in result.stderr.lower()
+
+    def test_git_config_read_silent(self):
+        """git config --get does not warn."""
+        result = _run_guard("git config --get user.name")
+        assert result.returncode == 0
+        assert result.stderr.strip() == ""

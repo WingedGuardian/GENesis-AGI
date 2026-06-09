@@ -307,6 +307,46 @@ def main() -> int:
                     print(review_msg, file=sys.stderr)
                     return 2
 
+        # ── sqlite3 write operations ────────────────────────────────
+        if "sqlite3" in cmd and re.search(
+            r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b", cmd, re.IGNORECASE,
+        ):
+            print(
+                "BLOCKED: Direct database writes via sqlite3 are not allowed. "
+                "Use CRUD modules or MCP tools instead.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # ── git commit --no-verify ────────────────────────────────
+        if "git commit" in cmd and "--no-verify" in cmd:
+            print(
+                "BLOCKED: --no-verify bypasses review enforcement hooks. "
+                "Remove --no-verify and run /review first.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # ── Process kill (soft warn) ──────────────────────────────
+        if re.search(r"(?:^|\s|&&|;)\s*(?:kill|killall|pkill)\s", cmd):
+            print(
+                "⚠️  STOP: Process kill detected. "
+                "Have you received explicit user approval?",
+                file=sys.stderr,
+            )
+
+        # ── git config writes (soft warn) ─────────────────────────
+        if (
+            "git config" in cmd
+            and not re.search(r"git config\s+(--get|--list|-l|--show)\b", cmd)
+            and re.search(r"git config\s+[\w.-]+\s+\S", cmd)
+        ):
+                print(
+                    "⚠️  STOP: git config modification detected. "
+                    "Have you received explicit user approval?",
+                    file=sys.stderr,
+                )
+
     except Exception:
         pass  # Fail-open on any error — never block legitimate work
 
