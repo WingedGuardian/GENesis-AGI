@@ -17,6 +17,7 @@ async def create(
     tools_used: list[str],
     context_tags: list[str],
     created_at: str,
+    scenario: str | None = None,
     person_id: str | None = None,
     speculative: int = 1,
     attempted_workarounds: list | None = None,
@@ -33,13 +34,14 @@ async def create(
 ) -> str:
     await db.execute(
         """INSERT INTO procedural_memory
-           (id, person_id, task_type, principle, steps, tools_used, context_tags,
-            speculative, attempted_workarounds, version, created_at,
+           (id, person_id, task_type, principle, scenario, steps, tools_used,
+            context_tags, speculative, attempted_workarounds, version, created_at,
             activation_tier, tool_trigger, success_count, confidence,
             source, promotion_history, principle_embedding,
             extraction_context, first_mover)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (id, person_id, task_type, principle, json.dumps(steps), json.dumps(tools_used),
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (id, person_id, task_type, principle, scenario,
+         json.dumps(steps), json.dumps(tools_used),
          json.dumps(context_tags), speculative,
          json.dumps(attempted_workarounds) if attempted_workarounds else None,
          version, created_at, activation_tier,

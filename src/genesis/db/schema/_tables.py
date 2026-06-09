@@ -13,6 +13,7 @@ TABLES = {
             person_id        TEXT,               -- GROUNDWORK(multi-person)
             task_type         TEXT NOT NULL,
             principle         TEXT NOT NULL,
+            scenario          TEXT,                -- "when to use this" trigger condition (ReMe omega)
             steps             TEXT NOT NULL,       -- JSON array of step strings
             tools_used        TEXT NOT NULL,       -- JSON array of tool names
             context_tags      TEXT NOT NULL,       -- JSON array of tags
