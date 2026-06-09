@@ -1,0 +1,6 @@
+{
+  "build_from": {
+    "amd64": "ghcr.io/home-assistant/amd64-base:latest",
+    "aarch64": "ghcr.io/home-assistant/aarch64-base:latest"
+  }
+}

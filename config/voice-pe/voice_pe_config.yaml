@@ -38,8 +38,21 @@ substitutions:
   voice_assist_not_ready_phase_id: '10'
   voice_assist_error_phase_id: '11'
   # Server URL is now defined in secrets.yaml as server_url
-  # Sound file for wake word (local file)
-  wake_word_triggered_sound_file: wake_sound.flac
+  # Substitutions for audio files
+  wake_word_triggered_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
+  center_button_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_press.flac
+  center_button_double_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_double_press.flac
+  center_button_triple_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_triple_press.flac
+  center_button_long_press_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/center_button_long_press.flac
+  jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac
+  jack_disconnected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_disconnected.flac
+  mute_switch_on_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_on.flac
+  mute_switch_off_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/mute_switch_off.flac
+  factory_reset_initiated_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_initiated.mp3
+  factory_reset_cancelled_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_cancelled.mp3
+  factory_reset_confirmed_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_confirmed.mp3
+  easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
+  easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
 
 esphome:
   name: ha-voice-openai
@@ -52,6 +65,14 @@ esphome:
       - script.execute: control_leds
       - delay: 1s
       - switch.turn_on: internal_speaker_amp
+      # If after 10 minutes, the device is still initializing (It did not yet connect to Home Assistant), turn off the init_in_progress variable and run the script to refresh the LED status
+      - delay: 10min
+      - if:
+          condition:
+            lambda: return id(init_in_progress);
+          then:
+            - lambda: id(init_in_progress) = false;
+            - script.execute: control_leds
       # init_in_progress will be set to false when API connects (see api.on_client_connected)
       # micro_wake_word will be started when API connects (see api.on_client_connected)
 
@@ -99,6 +120,7 @@ api:
     key: !secret api_encryption_key
   on_client_connected:
     - lambda: id(init_in_progress) = false;
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
     # Start micro_wake_word when API connects (ensures it's ready)
     - micro_wake_word.start:
@@ -163,6 +185,11 @@ globals:
     type: bool
     restore_value: no
     initial_value: 'false'
+  # Global variable storing if a factory reset was requested. If it is set to true, the device will factory reset once the center button is released
+  - id: factory_reset_requested
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
 switch:
   # Master mute switch
@@ -222,53 +249,45 @@ binary_sensor:
       - script.execute: control_leds
     on_release:
       - script.execute: control_leds
+      # If a factory reset is requested, factory reset on release
+      - if:
+          condition:
+            lambda: return id(factory_reset_requested);
+          then:
+            - button.press: factory_reset_button
     on_multi_click:
       # Simple Click: Start/Stop Voice Assistant
       - timing:
           - ON for at most 1s
           - OFF for at least 0.25s
         then:
-          - logger.log:
-              format: "Button clicked - checking conditions"
-              level: INFO
           - if:
               condition:
-                lambda: return !id(init_in_progress);
+                lambda: return !id(init_in_progress) && !id(color_changed);
               then:
-                - logger.log:
-                    format: "init_in_progress is false, checking voice assistant state"
-                    level: INFO
                 - if:
                     condition:
                       voice_assistant_websocket.is_running:
                         id: voice_assistant_ws
                     then:
-                      - logger.log:
-                          format: "Voice assistant is running - stopping"
-                          level: INFO
                       - voice_assistant_websocket.stop:
                           id: voice_assistant_ws
                     else:
-                      - logger.log:
-                          format: "Voice assistant is not running - checking mute switch"
-                          level: INFO
                       - if:
                           condition:
-                            switch.is_off: master_mute_switch
+                            and:
+                              - switch.is_off: master_mute_switch
+                              - not:
+                                  voice_assistant_websocket.is_running:
+                                    id: voice_assistant_ws
                           then:
-                            - logger.log:
-                                format: "Mute switch is OFF - starting voice assistant"
-                                level: INFO
+                            - script.execute:
+                                id: play_sound
+                                priority: true
+                                sound_file: !lambda 'return id(center_button_press_sound);'
+                            - delay: 300ms
                             - voice_assistant_websocket.start:
                                 id: voice_assistant_ws
-                          else:
-                            - logger.log:
-                                format: "Voice assistant blocked: device is muted"
-                                level: WARN
-              else:
-                - logger.log:
-                    format: "init_in_progress is true - blocking voice assistant start"
-                    level: INFO
       # Double Click
       - timing:
           - ON for at most 1s
@@ -280,6 +299,10 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed);
               then:
+                - script.execute:
+                    id: play_sound
+                    priority: false
+                    sound_file: !lambda 'return id(center_button_double_press_sound);'
                 - event.trigger:
                     id: button_press_event
                     event_type: "double_press"
@@ -296,6 +319,10 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed);
               then:
+                - script.execute:
+                    id: play_sound
+                    priority: false
+                    sound_file: !lambda 'return id(center_button_triple_press_sound);'
                 - event.trigger:
                     id: button_press_event
                     event_type: "triple_press"
@@ -307,10 +334,102 @@ binary_sensor:
               condition:
                 lambda: return !id(init_in_progress) && !id(color_changed);
               then:
+                - script.execute:
+                    id: play_sound
+                    priority: false
+                    sound_file: !lambda 'return id(center_button_long_press_sound);'
                 - light.turn_off: voice_assistant_leds
                 - event.trigger:
                     id: button_press_event
                     event_type: "long_press"
+      # Very important do not remove. Trust me :D
+      - timing:
+          # H ....
+          - ON for at most 0.2s
+          - OFF for 0s to 2s
+          - ON for at most 0.2s
+          - OFF for 0s to 2s
+          - ON for at most 0.2s
+          - OFF for 0s to 2s
+          - ON for at most 0.2s
+          - OFF for 0.5s to 2s
+          # A ._
+          - ON for at most 0.2s
+          - OFF for 0s to 2s
+          - ON for 0.2s to 2s
+        then:
+          - if:
+              condition:
+                lambda: return !id(init_in_progress);
+              then:
+                - light.turn_on:
+                    brightness: 100%
+                    id: voice_assistant_leds
+                    effect: "Tick"
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: !lambda 'return id(easter_egg_tick_sound);'
+                - delay: 4s
+                - light.turn_off: voice_assistant_leds
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: !lambda 'return id(easter_egg_tada_sound);'
+                - light.turn_on:
+                    brightness: 100%
+                    id: voice_assistant_leds
+                    effect: "Rainbow"
+                - event.trigger:
+                    id: button_press_event
+                    event_type: "easter_egg_press"
+      # Factory Reset Warning
+      - timing:
+          - ON for at least 10s
+        then:
+          - if:
+              condition:
+                lambda: return !id(dial_touched);
+              then:
+                - light.turn_on:
+                    brightness: 100%
+                    id: voice_assistant_leds
+                    effect: "Factory Reset Coming Up"
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: !lambda 'return id(factory_reset_initiated_sound);'
+                - wait_until:
+                    binary_sensor.is_off: center_button
+                - if:
+                    condition:
+                      lambda: return !id(factory_reset_requested);
+                    then:
+                      - light.turn_off: voice_assistant_leds
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: !lambda 'return id(factory_reset_cancelled_sound);'
+      # Factory Reset Confirmed
+      - timing:
+          - ON for at least 22s
+        then:
+          - if:
+              condition:
+                lambda: return !id(dial_touched);
+              then:
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: !lambda 'return id(factory_reset_confirmed_sound);'
+                - light.turn_on:
+                    brightness: 100%
+                    red: 100%
+                    green: 0%
+                    blue: 0%
+                    id: voice_assistant_leds
+                    effect: "none"
+                - lambda: id(factory_reset_requested) = true;
 
   # Hardware mute switch (Side of the device)
   - platform: gpio
@@ -318,12 +437,21 @@ binary_sensor:
     internal: true
     pin: GPIO3
     on_press:
+      # Play mute on sound only if software mute isn't enabled
       - if:
           condition:
             - switch.is_off: master_mute_switch
           then:
+            - script.execute:
+                id: play_sound
+                priority: false
+                sound_file: !lambda 'return id(mute_switch_on_sound);'
             - microphone.mute:
     on_release:
+      - script.execute:
+          id: play_sound
+          priority: false
+          sound_file: !lambda 'return id(mute_switch_off_sound);'
       - microphone.unmute:
   # Audio Jack Plugged sensor
   - platform: gpio
@@ -336,12 +464,22 @@ binary_sensor:
     on_press:
       - lambda: id(jack_plugged_recently) = true;
       - script.execute: control_leds
+      - delay: 200ms
+      - script.execute:
+          id: play_sound
+          priority: false
+          sound_file: !lambda 'return id(jack_connected_sound);'
       - delay: 800ms
       - lambda: id(jack_plugged_recently) = false;
       - script.execute: control_leds
     on_release:
       - lambda: id(jack_unplugged_recently) = true;
       - script.execute: control_leds
+      - delay: 200ms
+      - script.execute:
+          id: play_sound
+          priority: false
+          sound_file: !lambda 'return id(jack_disconnected_sound);'
       - delay: 800ms
       - lambda: id(jack_unplugged_recently) = false;
       - script.execute: control_leds
@@ -570,6 +708,127 @@ light:
                 it[i] = fail_color;
               }
             }
+      - addressable_lambda:
+          name: "Volume Display"
+          update_interval: 50ms
+          lambda: |-
+            auto light_color = id(led_ring).current_values;
+            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                  light_color.get_blue() * 255);
+            Color silenced_color(255, 0, 0);
+            auto volume_ratio = 12.0f * id(voice_media_player).volume;
+            for (uint8_t i = 0; i < 12; i++) {
+              if (i <= volume_ratio) {
+                it[(6+i)%12] = color * min( 255.0f * (volume_ratio - i) , 255.0f ) ;
+              } else {
+                it[(6+i)%12] = Color::BLACK;
+              }
+            }
+            if (id(voice_media_player).volume == 0.0f) {
+              it[6] = silenced_color;
+            }
+      - addressable_lambda:
+          name: "Center Button Touched"
+          update_interval: 16ms
+          lambda: |-
+            if (initial_run) {
+              // set voice_assistant_leds light to colors based on led_ring
+              auto led_ring_cv = id(led_ring).current_values;
+              auto va_leds_call = id(voice_assistant_leds).make_call();
+              va_leds_call.from_light_color_values(led_ring_cv);
+              va_leds_call.set_brightness( min ( max( id(led_ring).current_values.get_brightness() , 0.2f ) + 0.1f , 1.0f ) );
+              va_leds_call.set_state(true);
+              va_leds_call.perform();
+            }
+            auto light_color = id(voice_assistant_leds).current_values;
+            Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                  light_color.get_blue() * 255);
+            for (uint8_t i = 0; i < 12; i++) {
+              it[i] = color;
+            }
+      - addressable_lambda:
+          name: "Jack Plugged"
+          update_interval: 40ms
+          lambda: |-
+              static uint8_t index = 0;
+              if (initial_run) {
+                index = 0;
+              }
+              auto light_color = id(led_ring).current_values;
+              Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                    light_color.get_blue() * 255);
+              if (index <= 6) {
+                for (uint8_t i = 0; i < 12; i++) {
+                  if (i == index) {
+                    it[i] = color;
+                  } else if (i == (12 - index) % 12) {
+                    it[i] = color;
+                  } else {
+                    it[i] = Color::BLACK;
+                  }
+                }
+              }
+              index = (index + 1);
+      - addressable_lambda:
+          name: "Jack Unplugged"
+          update_interval: 40ms
+          lambda: |-
+              static uint8_t index = 0;
+              if (initial_run) {
+                index = 0;
+              }
+              auto light_color = id(led_ring).current_values;
+              Color color(light_color.get_red() * 255, light_color.get_green() * 255,
+                    light_color.get_blue() * 255);
+              if (index <= 6) {
+                for (uint8_t i = 0; i < 12; i++) {
+                  if (i == 6 - index) {
+                    it[i] = color;
+                  } else if (i == (6 + index) % 12) {
+                    it[i] = color;
+                  } else {
+                    it[i] = Color::BLACK;
+                  }
+                }
+              }
+              index = (index + 1);
+      - addressable_rainbow:
+          name: "Rainbow"
+          width: 12
+      - addressable_lambda:
+          name: "Tick"
+          update_interval: 333ms
+          lambda: |-
+            static uint8_t index = 0;
+            Color color(255, 0, 0);
+            if (initial_run) {
+              index = 0;
+            }
+            for (uint8_t i = 0; i < 12; i++) {
+              if (i <= index ) {
+                it[i] = Color::BLACK;
+              } else {
+                it[i] = color;
+              }
+            }
+            index = (index + 1) % 12;
+      - addressable_lambda:
+          name: "Factory Reset Coming Up"
+          update_interval: 1s
+          lambda: |-
+            static uint8_t index = 0;
+            Color color(255, 0, 0);
+            if (initial_run) {
+              index = 0;
+            }
+            for (uint8_t i = 0; i < 12; i++) {
+              if (i <= index ) {
+                it[i] = color;
+              } else {
+                it[i] = Color::BLACK;
+              }
+            }
+            index = (index + 1) % 12;
       - addressable_twinkle:
           name: "Twinkle"
           twinkle_probability: 50%
@@ -585,9 +844,9 @@ light:
     initial_state:
       color_mode: rgb
       brightness: 66%
-      red: 9.4%
-      green: 73.3%
-      blue: 94.9%
+      red: 100%
+      green: 100%
+      blue: 100%
     segments:
       - id: leds_internal
         from: 7
@@ -631,6 +890,7 @@ event:
       - double_press
       - triple_press
       - long_press
+      - easter_egg_press
 
 script:
   # Master script controlling the LEDs
@@ -817,35 +1077,46 @@ script:
           effect: "Twinkle"
 
   # Script executed when the dial is touched
+  # A number of LEDs turn on indicating a visual representation of the volume of the media player entity.
   - id: control_leds_dial_touched
     then:
+      - light.turn_on:
+          brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
+          id: voice_assistant_leds
+          effect: "Volume Display"
       - delay: 1s
       - lambda: id(dial_touched) = false;
+      - sensor.rotary_encoder.set_value:
+          id: dial
+          value: 0
       - script.execute: control_leds
 
   # Script executed when the jack has just been plugged
+  # A ripple effect
   - id: control_leds_jack_plugged_recently
     then:
       - light.turn_on:
           brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
           id: voice_assistant_leds
-          effect: "none"
+          effect: "Jack Plugged"
 
   # Script executed when the jack has just been unplugged
+  # A ripple effect
   - id: control_leds_jack_unplugged_recently
     then:
       - light.turn_on:
           brightness: !lambda return max( id(led_ring).current_values.get_brightness() , 0.2f );
           id: voice_assistant_leds
-          effect: "none"
+          effect: "Jack Unplugged"
 
   # Script executed when the center button is touched
+  # The complete LED ring turns on
   - id: control_leds_center_button_touched
     then:
       - light.turn_on:
           brightness: !lambda return min ( max( id(led_ring).current_values.get_brightness() , 0.2f ) + 0.1f , 1.0f );
           id: voice_assistant_leds
-          effect: "none"
+          effect: "Center Button Touched"
 
   # Script executed when the volume is increased/decreased from the dial
   - id: control_volume
@@ -987,10 +1258,40 @@ media_player:
       num_channels: 2
       sample_rate: 48000
     files:
-      # Wake sound played when "okay nabu" is detected (if wake_sound switch is enabled)
-      # File format: FLAC (48kHz, stereo recommended)
+      # Wake sound played when wake word is detected (if wake_sound switch is enabled)
       - id: wake_word_triggered_sound
         file: ${wake_word_triggered_sound_file}
+      # Center button sounds
+      - id: center_button_press_sound
+        file: ${center_button_press_sound_file}
+      - id: center_button_double_press_sound
+        file: ${center_button_double_press_sound_file}
+      - id: center_button_triple_press_sound
+        file: ${center_button_triple_press_sound_file}
+      - id: center_button_long_press_sound
+        file: ${center_button_long_press_sound_file}
+      # Jack sounds
+      - id: jack_connected_sound
+        file: ${jack_connected_sound_file}
+      - id: jack_disconnected_sound
+        file: ${jack_disconnected_sound_file}
+      # Mute switch sounds
+      - id: mute_switch_on_sound
+        file: ${mute_switch_on_sound_file}
+      - id: mute_switch_off_sound
+        file: ${mute_switch_off_sound_file}
+      # Factory reset sounds
+      - id: factory_reset_initiated_sound
+        file: ${factory_reset_initiated_sound_file}
+      - id: factory_reset_cancelled_sound
+        file: ${factory_reset_cancelled_sound_file}
+      - id: factory_reset_confirmed_sound
+        file: ${factory_reset_confirmed_sound_file}
+      # Easter egg sounds
+      - id: easter_egg_tick_sound
+        file: ${easter_egg_tick_sound_file}
+      - id: easter_egg_tada_sound
+        file: ${easter_egg_tada_sound_file}
     on_mute:
       - script.execute: control_leds
     on_unmute:
@@ -1026,12 +1327,10 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
-    - model: hey_mycroft
-      id: hey_mycroft
+    # Custom "Hey Genesis" wake word — trained model hosted on HA web server
+    # URL uses !secret so private HA IP stays out of the repo
+    - model: !secret hey_genesis_model_url
+      id: hey_genesis
   vad:
   on_wake_word_detected:
     - if:
@@ -1183,6 +1482,12 @@ button:
     entity_category: config
     disabled_by_default: true
     icon: "mdi:restart"
+  - platform: factory_reset
+    id: factory_reset_button
+    name: "Factory reset"
+    entity_category: config
+    disabled_by_default: true
+    icon: "mdi:factory"
 
 debug:
   update_interval: 5s

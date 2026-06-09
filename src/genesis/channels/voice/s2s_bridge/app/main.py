@@ -99,6 +99,14 @@ class Application:
                 "You are Genesis, a cognitive AI partner.",
             )
 
+        # Initialize audio recording service before WebSocket handler (handler needs it)
+        self.audio_recording_service = AudioRecordingService(
+            enable_recording=enable_recording,
+            sample_rate=24000,
+            chunk_duration_seconds=30,
+            output_dir="recordings"
+        )
+
         # Initialize WebSocket handler
         self.websocket_handler = WebSocketHandler(
             host=websocket_host,
@@ -114,14 +122,6 @@ class Application:
         self.vad_prefix_padding_ms = vad_prefix_padding_ms
         self.vad_silence_duration_ms = vad_silence_duration_ms
         self.instructions = instructions
-
-        # Initialize audio recording service (optional)
-        self.audio_recording_service = AudioRecordingService(
-            enable_recording=enable_recording,
-            sample_rate=24000,
-            chunk_duration_seconds=30,
-            output_dir="recordings"
-        )
 
         logger.info("✅ Application initialized - ready to accept WebSocket connections")
 

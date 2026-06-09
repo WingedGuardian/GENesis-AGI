@@ -197,8 +197,12 @@ class WebSocketHandler:
         runner = PipelineRunner()
         task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
 
-        # Start pipeline in background
-        asyncio.create_task(runner.run(task))
+        # Start pipeline in background with exception tracking
+        pipeline_task = asyncio.create_task(runner.run(task))
+        pipeline_task.add_done_callback(
+            lambda t: t.exception() and logger.error("Pipeline task failed: %s", t.exception())
+        )
+        self._pipeline_task = pipeline_task
         logger.info("✅ Pipeline started for WebSocket connection")
         logger.info("✅ Pipeline initialized successfully")
 
