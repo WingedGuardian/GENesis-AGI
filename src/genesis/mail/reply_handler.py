@@ -123,11 +123,12 @@ def _build_follow_up_prompt(thread: dict, history: list[dict]) -> str:
 
     parts.append("\n## Original Thread\n")
     for msg in history:
-        parts.append(f"### [{msg['direction'].upper()}] {msg.get('subject', 'N/A')}")
+        direction = "SENT" if msg["direction"] == "sent" else "RECEIVED"
+        parts.append(f"### [{direction}] {msg.get('subject', 'N/A')}")
         parts.append(f"**From:** {msg.get('sender', 'N/A')}")
         parts.append(f"**Date:** {msg.get('received_at', 'N/A')}")
         if msg.get("body_preview"):
-            if msg["direction"] == "received":
+            if direction == "RECEIVED":
                 result = sanitizer.sanitize(msg["body_preview"], ContentSource.EMAIL)
                 parts.append(f"\n<{boundary}>\n{result.wrapped}\n</{boundary}>\n")
             else:
