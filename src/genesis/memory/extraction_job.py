@@ -417,6 +417,51 @@ async def run_extraction_cycle(
                     db, session_id,
                     keywords=all_keywords, topic=latest_topic,
                 )
+
+            # Stream 1: struggle detection (runs once per session, after all
+            # chunks). Parses the full JSONL into an action spine, scores
+            # struggle heuristics, and routes to Judge if above threshold.
+            try:
+                import asyncio
+
+                from genesis.learning.procedural.struggle_detector import (
+                    STRUGGLE_THRESHOLD,
+                    build_action_spine,
+                    score_struggle,
+                )
+
+                spine = build_action_spine(transcript_path)
+                struggle_score = score_struggle(spine)
+                if struggle_score >= STRUGGLE_THRESHOLD:
+                    from genesis.learning.procedural.judge import (
+                        judge_struggle_procedure,
+                    )
+
+                    proc_id = await asyncio.wait_for(
+                        judge_struggle_procedure(
+                            db, spine, struggle_score, transcript_path, router,
+                            source_session_id=cc_session_id,
+                        ),
+                        timeout=60.0,
+                    )
+                    if proc_id:
+                        summary["struggle_procedures"] = (
+                            summary.get("struggle_procedures", 0) + 1
+                        )
+                    logger.info(
+                        "Struggle detection for %s: score=%.2f, stored=%s",
+                        session_id, struggle_score, proc_id is not None,
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "Struggle judge timed out for session %s", session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Struggle detection failed for session %s",
+                    session_id, exc_info=True,
+                )
+
         summary["sessions_processed"] += 1
 
     # Cross-session connection discovery (vector-based, no LLM)
