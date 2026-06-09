@@ -53,6 +53,7 @@ class Application:
         self.session_manager: SessionManager | None = None
         self.current_task: PipelineTask | None = None
         self._pipeline_lock: asyncio.Lock | None = None
+        self._has_had_client: bool = False  # Track if any client has connected
 
     async def initialize(self) -> None:
         """Initialize all components."""
@@ -164,10 +165,12 @@ class Application:
             self._pipeline_lock = asyncio.Lock()
 
         async with self._pipeline_lock:
-            # If service already exists, reset its conversation to get a fresh
-            # OpenAI session. This is much lighter than creating a new service
-            # (which would orphan the pipeline's reference to the old one).
-            if self.openai_service is not None and client_id is not None:
+            # If service already exists AND a client has connected before,
+            # reset the conversation to get a fresh OpenAI session.
+            # Skip reset on FIRST client connect — the service was just created
+            # at startup and has no context to reset. Calling reset_conversation()
+            # on an unused service crashes (NoneType context).
+            if self.openai_service is not None and client_id is not None and self._has_had_client:
                 logger.info(f"🔄 Resetting OpenAI session for client {client_id}...")
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
@@ -178,14 +181,23 @@ class Application:
                     await self.openai_service.reset_conversation()
                     logger.info(f"✅ OpenAI session reset for client {client_id}")
                 except Exception as e:
-                    logger.warning(f"⚠️ Session reset failed, creating new service: {e}")
-                    # Fall through to create a new service
-                    self.openai_service = None
+                    logger.warning(f"⚠️ Session reset failed: {e}")
+                    # Don't fall through to create new service — that orphans
+                    # the pipeline reference. The existing service may still work.
+                    logger.info("⚠️ Continuing with existing service (pipeline reference preserved)")
 
+                self._has_had_client = True
                 if self.openai_service is not None:
                     # Register service with session manager
                     self.session_manager.set_current_service(client_id, self.openai_service)
                     return self.openai_service
+
+            # First client connect — service exists from startup, just use it
+            if self.openai_service is not None and client_id is not None:
+                logger.info(f"✅ First client connect for {client_id} — using initial service")
+                self._has_had_client = True
+                self.session_manager.set_current_service(client_id, self.openai_service)
+                return self.openai_service
 
             # First call or reset failed — create a brand new service
             if client_id:
