@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import os
 import time
@@ -185,3 +186,104 @@ def voice_chat_completions():
             "total_tokens": 0,
         },
     })
+
+
+# ── S2S Bridge Tool Dispatch ────────────────────────────────────────
+# Called by the voice S2S addon (HA Docker container) to dispatch
+# Genesis tool calls triggered by the OpenAI Realtime model.
+# Same auth + event loop bridge pattern as voice_chat_completions.
+
+# Tool call timeout: 30s covers memory recall + web search + approval.
+# Voice responses should be fast — if a tool call takes >30s, it's hung.
+_TOOL_CALL_TIMEOUT_SECONDS = 30.0
+
+
+@voice_api_bp.route("/v1/voice/tool_call", methods=["POST"])
+def voice_tool_call():
+    """Dispatch a tool call from the S2S voice bridge addon.
+
+    Expects JSON: ``{"tool_name": "ask_genesis", "arguments": {"query": "..."}}``.
+    Returns the tool result as JSON.
+    """
+    auth_error = _check_voice_token()
+    if auth_error:
+        return jsonify({"error": auth_error}), 401
+
+    bridge = current_app.config.get("GENESIS_BRIDGE")
+    event_loop = current_app.config.get("GENESIS_EVENT_LOOP")
+
+    if bridge is None:
+        return jsonify({"error": "Genesis bridge not initialized"}), 503
+
+    if event_loop is None or not event_loop.is_running():
+        return jsonify({"error": "Event loop not available"}), 503
+
+    data = request.get_json(force=True, silent=True) or {}
+    tool_name = data.get("tool_name", "").strip()
+    arguments = data.get("arguments", {})
+
+    if not tool_name:
+        return jsonify({"error": "tool_name is required"}), 400
+
+    start = time.monotonic()
+    future = asyncio.run_coroutine_threadsafe(
+        bridge.handle_tool_call(tool_name, json.dumps(arguments)),
+        event_loop,
+    )
+
+    try:
+        result_json = future.result(timeout=_TOOL_CALL_TIMEOUT_SECONDS)
+    except TimeoutError:
+        future.cancel()
+        elapsed = time.monotonic() - start
+        logger.error("Tool call %s timed out after %.1fs", tool_name, elapsed)
+        return jsonify({"error": f"Tool call timed out after {elapsed:.0f}s"}), 504
+    except Exception:
+        logger.error("Tool call %s failed", tool_name, exc_info=True)
+        return jsonify({"error": "Tool call failed"}), 500
+
+    elapsed_ms = int((time.monotonic() - start) * 1000)
+    logger.info("Voice tool_call: %s → %dms", tool_name, elapsed_ms)
+
+    # bridge.handle_tool_call returns a JSON string — parse and return
+    try:
+        return jsonify(json.loads(result_json))
+    except (json.JSONDecodeError, TypeError):
+        return jsonify({"result": result_json})
+
+
+@voice_api_bp.route("/v1/voice/system_prompt", methods=["GET"])
+def voice_system_prompt():
+    """Return the Genesis voice system prompt for the S2S model.
+
+    Called by the voice addon at session start to configure the
+    OpenAI Realtime model with Genesis persona + context.
+    """
+    auth_error = _check_voice_token()
+    if auth_error:
+        return jsonify({"error": auth_error}), 401
+
+    bridge = current_app.config.get("GENESIS_BRIDGE")
+    if bridge is None:
+        return jsonify({"error": "Genesis bridge not initialized"}), 503
+
+    try:
+        return jsonify({"prompt": bridge.get_system_prompt()})
+    except Exception:
+        logger.error("Failed to generate system prompt", exc_info=True)
+        return jsonify({"error": "Failed to generate system prompt"}), 500
+
+
+@voice_api_bp.route("/v1/voice/tool_declarations", methods=["GET"])
+def voice_tool_declarations():
+    """Return the tool declarations for the S2S model session config.
+
+    Called by the voice addon at session start to register Genesis
+    tools with the OpenAI Realtime API.
+    """
+    auth_error = _check_voice_token()
+    if auth_error:
+        return jsonify({"error": auth_error}), 401
+
+    from genesis.channels.voice.genesis_bridge import TOOL_DECLARATIONS
+    return jsonify({"tools": TOOL_DECLARATIONS})

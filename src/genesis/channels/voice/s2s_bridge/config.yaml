@@ -1,0 +1,39 @@
+name: OpenAI Realtime Voice Agent
+version: "0.1.0"
+slug: openai_realtime_voice_agent
+description: Voice control using OpenAI Realtime API with WebSocket support for ESP32 devices
+url: https://github.com/fjfricke/ha-openai-realtime
+arch:
+  - aarch64
+  - amd64
+init: false
+startup: application
+boot: auto
+host_network: true
+options:
+  openai_api_key: ""
+  websocket_port: 8080
+  ha_mcp_url: ""
+  longlived_token: ""
+  # Turn detection settings
+  vad_threshold: 0.5
+  vad_prefix_padding_ms: 300
+  vad_silence_duration_ms: 500
+  # OpenAI instructions
+  instructions: "You are the Home Assistant Voice Agent and can control the Smart Home."
+  # Session management
+  session_reuse_timeout_seconds: 300  # 5 Minuten (in Sekunden)
+  # Audio recording (optional, for debugging)
+  enable_recording: false
+schema:
+  openai_api_key: password  # pragma: allowlist secret
+  websocket_port: int(1024,65535)
+  ha_mcp_url: str
+  longlived_token: password  # pragma: allowlist secret
+  vad_threshold: float(0.0,1.0)
+  vad_prefix_padding_ms: int
+  vad_silence_duration_ms: int
+  instructions: str
+  session_reuse_timeout_seconds: int(0,3600)  # bis 1 Stunde
+  enable_recording: bool
+image: ghcr.io/fjfricke/ha-openai-realtime/openai-realtime-voice-agent-{arch}

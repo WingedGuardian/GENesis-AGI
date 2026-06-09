@@ -475,3 +475,128 @@ class TestVoiceAPI:
             finally:
                 loop.call_soon_threadsafe(loop.stop)
                 t.join(timeout=2)
+
+    # ── S2S Bridge Tool Dispatch Endpoints ──────────────────────────
+
+    def test_tool_call_no_bridge(self, app):
+        """Returns 503 when bridge is not initialized."""
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.post(
+                "/v1/voice/tool_call",
+                json={"tool_name": "ask_genesis", "arguments": {"query": "test"}},
+            )
+            assert resp.status_code == 503
+
+    def test_tool_call_missing_name(self, app):
+        """Returns 400 when tool_name is missing."""
+        import json as json_mod
+        bridge = MagicMock()
+        bridge.handle_tool_call = AsyncMock(return_value=json_mod.dumps({"answer": "ok"}))
+        app.config["GENESIS_BRIDGE"] = bridge
+
+        import threading
+
+        loop = app.config["GENESIS_EVENT_LOOP"]
+
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        t = threading.Thread(target=run_loop, daemon=True)
+        t.start()
+        try:
+            with (
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                app.test_client() as client,
+            ):
+                resp = client.post(
+                    "/v1/voice/tool_call",
+                    json={"arguments": {"query": "test"}},
+                )
+                assert resp.status_code == 400
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=2)
+
+    def test_tool_call_dispatches_to_bridge(self, app):
+        """Successful tool call dispatches to GenesisBridge."""
+        import json as json_mod
+        import threading
+
+        bridge = MagicMock()
+        bridge.handle_tool_call = AsyncMock(
+            return_value=json_mod.dumps({"answer": "Genesis recalls you worked on voice."})
+        )
+        app.config["GENESIS_BRIDGE"] = bridge
+
+        loop = app.config["GENESIS_EVENT_LOOP"]
+
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+
+        t = threading.Thread(target=run_loop, daemon=True)
+        t.start()
+        try:
+            with (
+                patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+                app.test_client() as client,
+            ):
+                resp = client.post(
+                    "/v1/voice/tool_call",
+                    json={"tool_name": "ask_genesis", "arguments": {"query": "what did we work on"}},
+                )
+                assert resp.status_code == 200
+                data = resp.get_json()
+                assert "answer" in data
+                assert "voice" in data["answer"]
+                bridge.handle_tool_call.assert_called_once()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            t.join(timeout=2)
+
+    def test_tool_call_auth_required(self, app):
+        """Auth check works on tool_call endpoint."""
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": "secret"}),
+            app.test_client() as client,
+        ):
+            resp = client.post(
+                "/v1/voice/tool_call",
+                json={"tool_name": "ask_genesis", "arguments": {}},
+            )
+            assert resp.status_code == 401
+
+    def test_system_prompt_endpoint(self, app):
+        """System prompt endpoint returns Genesis persona."""
+        bridge = MagicMock()
+        bridge.get_system_prompt.return_value = "You are Genesis, a cognitive AI partner."
+        app.config["GENESIS_BRIDGE"] = bridge
+
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.get("/v1/voice/system_prompt")
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert "prompt" in data
+            assert "Genesis" in data["prompt"]
+
+    def test_tool_declarations_endpoint(self, app):
+        """Tool declarations endpoint returns the 3 Genesis voice tools."""
+        with (
+            patch.dict("os.environ", {"GENESIS_MCP_HTTP_TOKEN": ""}, clear=False),
+            app.test_client() as client,
+        ):
+            resp = client.get("/v1/voice/tool_declarations")
+            assert resp.status_code == 200
+            data = resp.get_json()
+            assert "tools" in data
+            tool_names = [t["name"] for t in data["tools"]]
+            assert "ask_genesis" in tool_names
+            assert "web_search" in tool_names
+            assert "approve_pending" in tool_names
