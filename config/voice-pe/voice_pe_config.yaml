@@ -1020,33 +1020,17 @@ script:
           effect: "Twinkle"
 
   # Script executed when the voice assistant is idle
-  # If voice assistant is running AND connected, show blue pulse; otherwise turn off
+  # Idle = LEDs off (matches stock firmware behavior)
+  # The voice_assistant_websocket component doesn't expose conversation state
+  # (listening/thinking/replying), so we keep idle dark to avoid confusion.
   - id: control_leds_voice_assistant_idle_phase
     then:
+      - light.turn_off: voice_assistant_leds
       - if:
           condition:
-            and:
-              - voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
-              - voice_assistant_websocket.is_connected:
-                  id: voice_assistant_ws
+            light.is_on: led_ring
           then:
-            # Voice assistant is active and connected - show blue pulse
-            - light.turn_on:
-                brightness: 66%
-                red: 0%
-                green: 0%
-                blue: 100%
-                id: voice_assistant_leds
-                effect: "Active Pulse"
-          else:
-            # Voice assistant is not active or not connected - turn off
-            - light.turn_off: voice_assistant_leds
-            - if:
-                condition:
-                  light.is_on: led_ring
-                then:
-                  light.turn_on: led_ring
+            light.turn_on: led_ring
 
   # Script executed when the voice assistant is waiting for a command
   - id: control_leds_voice_assistant_waiting_for_command_phase
