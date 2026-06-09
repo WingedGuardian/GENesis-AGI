@@ -635,7 +635,11 @@ function updateSidePanel(data) {
 
         const wd = services.watchdog || {};
         if (wd.consecutive_failures > 0) {
-            svcEl.appendChild(sectionRow('WD Failures', String(wd.consecutive_failures), 'color:#ffe600;font-weight:600'));
+            const label = wd.last_reason ? wd.last_reason.replace(/_/g, ' ') : 'restart';
+            const val = wd.consecutive_failures <= 3
+                ? `${wd.consecutive_failures} (${label})`
+                : `${wd.consecutive_failures} restarts`;
+            svcEl.appendChild(sectionRow('WD Restarts', val, 'color:#ffe600;font-weight:600'));
         }
         if (wd.in_backoff) {
             svcEl.appendChild(sectionRow('WD Status', 'in backoff', 'color:#ffe600'));

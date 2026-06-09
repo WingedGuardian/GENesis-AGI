@@ -2575,8 +2575,9 @@
           if (hf?.detected && hf.status === "degraded") {
             return { state: "degraded", reason: `${hf.name} is degraded` };
           }
-          if ((services?.watchdog?.consecutive_failures || 0) > 0) {
-            return { state: "degraded", reason: "watchdog has recent consecutive failures" };
+          if ((services?.watchdog?.consecutive_failures || 0) > 3) {
+            const wd = services.watchdog;
+            return { state: "degraded", reason: `watchdog: ${wd.consecutive_failures} repeated restarts (${wd.last_reason || 'unknown'})` };
           }
           // Sentinel — container-side guardian. Below liveness checks above so a
           // dead bridge/timer/host_framework still wins; an escalated Sentinel
@@ -4289,7 +4290,7 @@
                           :style="`background: ${$store.genesisDashboard.health.services?.watchdog_timer?.active_state === 'active' ? '#4caf50' : ['failed', 'inactive'].includes($store.genesisDashboard.health.services?.watchdog_timer?.active_state) ? '#d9534f' : '#666'}`"></span>
                     Watchdog
                     <span style="opacity: 0.6; font-size: 0.75rem"
-                          x-text="($store.genesisDashboard.health.services?.watchdog?.consecutive_failures || 0) > 0 ? '(' + $store.genesisDashboard.health.services.watchdog.consecutive_failures + ' fails)' : ''"></span>
+                          x-text="(() => { const n = $store.genesisDashboard.health.services?.watchdog?.consecutive_failures || 0; if (n === 0) return ''; const reason = $store.genesisDashboard.health.services?.watchdog?.last_reason; const label = reason ? reason.replace(/_/g, ' ') : 'restart'; return n <= 3 ? `(${label})` : `(${n} restarts)`; })()"></span>
                   </div>
                   <!-- Sentinel (container-side guardian) -->
                   <div style="font-size: 0.82rem; margin-bottom: 0.2rem; cursor: default;"
