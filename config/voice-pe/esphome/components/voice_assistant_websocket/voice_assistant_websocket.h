@@ -44,7 +44,7 @@ class VoiceAssistantWebSocket : public Component {
   
   bool is_running() const { return this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
   bool is_connected() const { return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_); }
-  bool is_bot_speaking() const;  // Check if bot is currently speaking (within 500ms of last audio)
+  bool is_bot_speaking() const;  // Check if bot is currently speaking (within 1500ms of last audio)
   
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
     this->state_callback_ = std::move(callback);

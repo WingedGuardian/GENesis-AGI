@@ -234,7 +234,7 @@ class WebSocketHandler:
         self,
         transport: WebsocketServerTransport,
         on_client_connected_callback: Callable[[str], Awaitable[None]],
-        on_client_disconnected_callback: Callable[[str], None] | None = None,
+        on_client_disconnected_callback: Callable[[str], Awaitable[None]] | None = None,
         openai_service_getter: Callable[[str], OpenAIRealtimeLLMService | None] | None = None
     ):
         """
@@ -260,7 +260,7 @@ class WebSocketHandler:
                 client_id = self.extract_client_id(websocket)
                 if client_id:
                     logger.info(f"🔌 Client {client_id} disconnected")
-                    on_client_disconnected_callback(client_id)
+                    await on_client_disconnected_callback(client_id)
 
         # Handle text messages from client (e.g., interrupt messages)
         @transport.event_handler("on_client_message")

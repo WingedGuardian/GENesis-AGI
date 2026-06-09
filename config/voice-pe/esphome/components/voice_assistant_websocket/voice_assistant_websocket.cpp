@@ -523,12 +523,14 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
 }
 
 bool VoiceAssistantWebSocket::is_bot_speaking() const {
-  // Bot is considered speaking if we received audio within the last 500ms
+  // Bot is considered speaking if we received audio within the last 1500ms.
+  // 1500ms (not 500ms) to prevent false "stopped speaking" during brief gaps
+  // in OpenAI's audio stream (network jitter, processing pauses).
   if (this->last_speaker_audio_time_ == 0) {
     return false;  // No audio received yet
   }
   uint32_t time_since_last_audio = millis() - this->last_speaker_audio_time_;
-  return time_since_last_audio < 500;  // 500ms threshold
+  return time_since_last_audio < 1500;
 }
 
 void VoiceAssistantWebSocket::interrupt() {
