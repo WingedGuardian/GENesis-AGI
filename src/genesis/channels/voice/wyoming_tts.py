@@ -193,6 +193,21 @@ class WyomingTTSServer:
         self._audio_queue.append(audio)
         self._audio_ready.set()
 
+    def clear_queue(self) -> None:
+        """Discard all queued audio (stale from failed pipeline runs).
+
+        Called on ``AudioStart`` to flush orphaned audio from previous
+        failed pipeline runs.  Without this, a ``ConnectionResetError``
+        during transcript write leaves audio in the queue, and the next
+        pipeline run serves the wrong (previous) response — the
+        "turn behind" bug.
+        """
+        count = len(self._audio_queue)
+        if count:
+            self._audio_queue.clear()
+            self._audio_ready.clear()
+            logger.info("Cleared %d stale audio item(s) from TTS queue", count)
+
     async def start(self) -> None:
         """Start the Wyoming TTS server."""
         uri = f"tcp://{self._host}:{self._port}"
