@@ -1,8 +1,8 @@
 """Content sanitizer — boundary markers and injection pattern detection.
 
-Detection is LOG-ONLY. The sanitizer never blocks or modifies content.
-It wraps content in boundary markers and annotates with risk scores so
-downstream consumers can make informed decisions.
+For internal sources, detection is LOG-ONLY — the sanitizer never blocks
+or modifies content. For perimeter sources (EMAIL, INBOX), callers can
+use should_block() to check if high-severity patterns warrant blocking.
 """
 
 from __future__ import annotations
@@ -51,14 +51,23 @@ class SanitizationResult:
     source: ContentSource
 
 
+# Perimeter sources — inbound channels where an external actor can
+# send content directly to Genesis. These get stricter treatment.
+_PERIMETER_SOURCES = frozenset({ContentSource.EMAIL, ContentSource.INBOX})
+
+# Risk threshold for perimeter blocking. HIGH severity (0.9) on EMAIL
+# (source risk 0.7) gives: 0.7 * (0.5 + 0.9 * 0.5) = 0.665.
+_PERIMETER_BLOCK_THRESHOLD = 0.6
+
+
 class ContentSanitizer:
     """Sanitize third-party content before LLM prompt inclusion.
 
-    Two capabilities:
+    Three capabilities:
     1. Boundary marker wrapping — wraps content in XML tags with source metadata
     2. Pattern detection — scans for injection patterns, returns risk score
-
-    Detection is LOG-ONLY. Content is never blocked or modified.
+    3. Perimeter blocking — should_block() for high-severity patterns on
+       perimeter sources (EMAIL, INBOX). Internal paths remain log-only.
     """
 
     def __init__(self, patterns: list[InjectionPattern] | None = None) -> None:
@@ -115,3 +124,15 @@ class ContentSanitizer:
             detected_patterns=detected,
             source=source,
         )
+
+    @staticmethod
+    def should_block(result: SanitizationResult) -> bool:
+        """Check if content should be blocked at the perimeter.
+
+        Only returns True for perimeter sources (EMAIL, INBOX) with
+        high-severity injection patterns. Internal paths and low-risk
+        patterns remain log-only and are never blocked.
+        """
+        if result.source not in _PERIMETER_SOURCES:
+            return False
+        return result.risk_score >= _PERIMETER_BLOCK_THRESHOLD

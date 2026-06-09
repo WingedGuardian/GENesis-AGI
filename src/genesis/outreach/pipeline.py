@@ -298,7 +298,7 @@ class OutreachPipeline:
         reply_markup: object | None = None,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
-        recipient = self._recipients.get(channel, "")
+        recipient = request.validated_recipient or self._recipients.get(channel, "")
         if not adapter or not recipient:
             logger.warning("No adapter/recipient for channel %s — deferring", channel)
             await self._defer(
@@ -354,6 +354,24 @@ class OutreachPipeline:
                     request.category.value, topic_cat or "?",
                 )
             thread_id = None
+
+        # Scan outbound email content for sensitive data patterns
+        if channel == "email":
+            from genesis.security.output_scanner import scan_outbound
+
+            scan = scan_outbound(formatted.text)
+            if not scan.safe:
+                logger.warning(
+                    "Outbound email quarantined: %s patterns %s",
+                    scan.risk_level, scan.detected,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id,
+                    status=OutreachStatus.FAILED,
+                    channel=channel,
+                    message_content=formatted.text,
+                    error=f"Content scan quarantine: {scan.detected}",
+                )
 
         try:
             delivery_id = await adapter.send_message(

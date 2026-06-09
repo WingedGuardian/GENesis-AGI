@@ -109,6 +109,29 @@ _DEFAULT_PATTERNS: list[InjectionPattern] = [
         severity_score=SEVERITY_LOW,
         description="References encoding schemes that may be evasion attempts",
     ),
+    # ── Perimeter-relevant patterns ──────────────────────────────
+    InjectionPattern(
+        name="information_extraction",
+        regex=(
+            r"(?i)(list|share|tell\s+me|reveal|show|output|print|display)"
+            r"\s+(all\s+)?(your|the)\s+"
+            r"(tools|system\s+prompt|instructions|configuration|memory|"
+            r"knowledge|capabilities|internals|credentials|api\s+keys)"
+        ),
+        severity="HIGH",
+        severity_score=SEVERITY_HIGH,
+        description="Requests to extract system information or tool inventory",
+    ),
+    InjectionPattern(
+        name="delegation_attack",
+        regex=(
+            r"(?i)(forward|send|relay|transmit|email|message)"
+            r"\s+(this|the\s+following|these|it)\s+to\s+"
+        ),
+        severity="MEDIUM",
+        severity_score=SEVERITY_MEDIUM,
+        description="Requests to relay content to third-party addresses",
+    ),
 ]
 
 

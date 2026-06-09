@@ -220,8 +220,11 @@ def test_addenda_do_not_mention_reference_store_for_persistence():
 
 
 def test_all_addenda_include_mission_injection():
-    """All profiles must include the adapt-and-overcome mission text."""
+    """All non-perimeter profiles must include the adapt-and-overcome mission text."""
+    _PERIMETER_PROFILES = {"mail"}
     for profile, addendum in _PROFILE_ADDENDA.items():
+        if profile in _PERIMETER_PROFILES:
+            continue  # Perimeter profiles use their own framing
         assert "Adapt and overcome" in addendum, (
             f"{profile} addendum should include mission injection"
         )
@@ -273,3 +276,72 @@ def test_observe_profile_does_not_upgrade_model():
     req = DirectSessionRequest(prompt="test", profile="observe", model=CCModel.HAIKU)
     inv = runner._build_invocation(req)
     assert inv.model == CCModel.HAIKU
+
+
+# --- Mail profile: perimeter session restrictions ---
+
+def test_mail_profile_exists():
+    assert "mail" in PROFILES
+    assert "mail" in VALID_PROFILES
+
+
+def test_mail_blocks_universal():
+    for tool in _UNIVERSAL_BLOCKED:
+        assert tool in PROFILES["mail"], f"mail should block {tool}"
+
+
+def test_mail_blocks_write():
+    assert "Write" in PROFILES["mail"]
+
+
+def test_mail_blocks_web_tools():
+    assert "WebFetch" in PROFILES["mail"]
+    assert "WebSearch" in PROFILES["mail"]
+
+
+def test_mail_blocks_memory_writes():
+    assert "mcp__genesis-memory__observation_write" in PROFILES["mail"]
+    assert "mcp__genesis-memory__procedure_store" in PROFILES["mail"]
+    assert "mcp__genesis-memory__reference_store" in PROFILES["mail"]
+
+
+def test_mail_blocks_follow_ups():
+    assert "mcp__genesis-health__follow_up_create" in PROFILES["mail"]
+
+
+def test_mail_blocks_outreach_extras():
+    assert "mcp__genesis-outreach__outreach_send_and_wait" in PROFILES["mail"]
+    assert "mcp__genesis-outreach__outreach_poll" in PROFILES["mail"]
+    assert "mcp__genesis-outreach__outreach_digest" in PROFILES["mail"]
+
+
+def test_mail_allows_outreach_send():
+    """Mail sessions need outreach_send to reply to emails."""
+    assert "mcp__genesis-outreach__outreach_send" not in PROFILES["mail"]
+
+
+def test_mail_blocks_browser_interaction():
+    assert "mcp__genesis-health__browser_click" in PROFILES["mail"]
+
+
+def test_mail_blocks_recon_writes():
+    assert "mcp__genesis-recon__recon_store_finding" in PROFILES["mail"]
+
+
+def test_mail_addendum_mentions_internals_private():
+    addendum = _build_profile_addendum("mail")
+    assert "internals private" in addendum
+
+
+def test_mail_addendum_does_not_include_mission_injection():
+    """Mail profile uses its own framing, not the mission injection."""
+    addendum = _build_profile_addendum("mail")
+    # Mail has its own directive instead of the generic mission text
+    assert "outreach_send" in addendum
+
+
+def test_mail_profile_does_not_upgrade_model():
+    runner = _make_runner()
+    req = DirectSessionRequest(prompt="test", profile="mail", model=CCModel.SONNET)
+    inv = runner._build_invocation(req)
+    assert inv.model == CCModel.SONNET
