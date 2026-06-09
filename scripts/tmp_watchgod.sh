@@ -40,20 +40,27 @@ log() {
 # ── Helpers ──────────────────────────────────────────────────
 dir_usage_mb() {
     # Total disk usage of a directory in MB
-    du -sm "$1" 2>/dev/null | awk '{print $1}' || echo 0
+    # NOTE: capture first, then default — pipefail + '|| echo 0' appends
+    # a spurious '0' when du exits non-zero but awk already emitted output.
+    local result
+    result=$(du -sm "$1" 2>/dev/null | awk '{print $1}') || true
+    echo "${result:-0}"
 }
 
 tmp_usage_pct() {
     if df -T /tmp 2>/dev/null | grep -q tmpfs; then
         # tmpfs: filesystem percentage is meaningful
-        df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %' || echo 0
+        local result
+        result=$(df --output=pcent /tmp 2>/dev/null | tail -1 | tr -d ' %') || true
+        echo "${result:-0}"
     else
         # Not tmpfs (/tmp on root disk): use absolute free space thresholds.
         # Danger is the same regardless of disk size — CC sessions need ~60MB
         # each, sacred ground is 150MB.  Percentage-based thresholds are
         # meaningless when measuring the whole root filesystem.
         local free_mb
-        free_mb=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M' || echo 9999)
+        free_mb=$(df -BM --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' M') || true
+        free_mb="${free_mb:-9999}"
         if (( free_mb > 2048 )); then echo 0       # >2GB free  → green
         elif (( free_mb > 1024 )); then echo 60     # 1-2GB free → yellow
         elif (( free_mb > 500 )); then echo 75      # 500M-1GB  → orange
@@ -64,7 +71,9 @@ tmp_usage_pct() {
 
 fs_free_mb() {
     # Free space on the filesystem containing the given path, in MB
-    df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' M' || echo 999999
+    local result
+    result=$(df -BM --output=avail "$1" 2>/dev/null | tail -1 | tr -d ' M') || true
+    echo "${result:-999999}"
 }
 
 write_state() {
