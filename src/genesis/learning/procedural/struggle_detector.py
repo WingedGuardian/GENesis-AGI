@@ -146,6 +146,12 @@ def build_action_spine(transcript_path: Path) -> list[dict]:
     except Exception:
         logger.warning("Failed to parse transcript for action spine", exc_info=True)
 
+    # Mark orphaned tool_use entries (no matching tool_result) as errors.
+    # This happens when sessions crash mid-execution.
+    for entry in pending_tools.values():
+        entry["outcome"] = "error"
+        entry["error_text"] = "no result received (session may have crashed)"
+
     return spine
 
 

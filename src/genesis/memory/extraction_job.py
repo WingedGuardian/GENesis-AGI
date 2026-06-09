@@ -267,6 +267,11 @@ async def run_extraction_cycle(
 
             # Store each extraction with provenance
             for extraction in result.extractions:
+                # procedure_candidate extractions are routed to the Judge
+                # (Stream 2 above). Don't also store them as episodic memory.
+                if extraction.extraction_type == "procedure_candidate":
+                    continue
+
                 # ── Source-overlap verification ──
                 # Check that extraction content actually appears in the
                 # source transcript chunk. Demote confidence for ungrounded

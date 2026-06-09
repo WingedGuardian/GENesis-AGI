@@ -25,22 +25,9 @@ _JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
 
 # ── Prompts ──────────────────────────────────────────────────────────────────
 
-_STRUGGLE_PROMPT = """\
-Given this session's tool call history, extract a reusable procedure.
-
-## Action Spine
-{spine_text}
-
-## Struggle Score: {score:.2f}
-
-Write a procedure that would prevent this struggle next time.
-If this does NOT contain a genuinely reusable procedure, set worth_storing \
-to false.
-
-Return JSON in backticks:
-
+_JSON_SCHEMA_EXAMPLE = """\
 ```json
-{{
+{
   "worth_storing": true,
   "reason": "why this is worth storing",
   "task_type": "descriptive-kebab-slug",
@@ -50,40 +37,44 @@ Return JSON in backticks:
   "tools_used": ["tool1", "tool2"],
   "context_tags": ["domain1", "domain2"],
   "tool_trigger": ["Bash", "Read"]
-}}
-```
-"""
+}
+```"""
 
-_EXTRACTION_PROMPT = """\
-A procedure candidate was flagged during transcript extraction.
 
-## Candidate
-Content: {content}
-Scenario: {scenario}
-Entities: {entities}
+def _build_struggle_prompt(spine_text: str, score: float) -> str:
+    """Build struggle judge prompt. Uses concatenation instead of str.format()
+    to avoid KeyError on { } in transcript content (JSON tool args, etc.)."""
+    return (
+        "Given this session's tool call history, extract a reusable procedure.\n\n"
+        "## Action Spine\n"
+        + spine_text + "\n\n"
+        "## Struggle Score: " + f"{score:.2f}" + "\n\n"
+        "Write a procedure that would prevent this struggle next time.\n"
+        "If this does NOT contain a genuinely reusable procedure, set "
+        "worth_storing to false.\n\n"
+        "Return JSON in backticks:\n\n"
+        + _JSON_SCHEMA_EXAMPLE
+    )
 
-## Surrounding Context
-{chunk_context}
 
-Evaluate: is this a genuinely reusable procedure worth storing?
-If not, set worth_storing to false with a reason.
-
-Return JSON in backticks:
-
-```json
-{{
-  "worth_storing": true,
-  "reason": "why this is worth storing",
-  "task_type": "descriptive-kebab-slug",
-  "scenario": "When to use: <trigger condition>",
-  "principle": "What this teaches: <summary>",
-  "steps": ["1. ...", "2. ..."],
-  "tools_used": ["tool1", "tool2"],
-  "context_tags": ["domain1", "domain2"],
-  "tool_trigger": ["Bash", "Read"]
-}}
-```
-"""
+def _build_extraction_prompt(
+    content: str, scenario: str, entities: str, chunk_context: str,
+) -> str:
+    """Build extraction-flag judge prompt. Uses concatenation to avoid
+    KeyError on { } in transcript content."""
+    return (
+        "A procedure candidate was flagged during transcript extraction.\n\n"
+        "## Candidate\n"
+        "Content: " + content + "\n"
+        "Scenario: " + scenario + "\n"
+        "Entities: " + entities + "\n\n"
+        "## Surrounding Context\n"
+        + chunk_context[:3000] + "\n\n"
+        "Evaluate: is this a genuinely reusable procedure worth storing?\n"
+        "If not, set worth_storing to false with a reason.\n\n"
+        "Return JSON in backticks:\n\n"
+        + _JSON_SCHEMA_EXAMPLE
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -114,15 +105,26 @@ def _parse_judge_response(text: str) -> dict | None:
     return data
 
 
-def _get_embedder():
-    """Lazy embedder for novelty check. Returns None if unavailable."""
-    try:
-        from genesis.memory.embeddings import EmbeddingProvider
+_EMBEDDING_PROVIDER = None
 
-        return EmbeddingProvider()
-    except Exception:
-        logger.warning("EmbeddingProvider unavailable for Judge novelty check")
-        return None
+# Fail-open rate limiter: at most one procedure per task_type per cooldown
+# when the embedder is unavailable. Prevents table flooding during outages.
+_FAIL_OPEN_COOLDOWN_SECS = 3600  # 1 hour
+_fail_open_timestamps: dict[str, float] = {}
+
+
+def _get_embedder():
+    """Lazy singleton embedder for novelty check. Returns None if unavailable."""
+    global _EMBEDDING_PROVIDER
+    if _EMBEDDING_PROVIDER is None:
+        try:
+            from genesis.memory.embeddings import EmbeddingProvider
+
+            _EMBEDDING_PROVIDER = EmbeddingProvider()
+        except Exception:
+            logger.warning("EmbeddingProvider unavailable for Judge novelty check")
+            return None
+    return _EMBEDDING_PROVIDER
 
 
 async def _store_judged_procedure(
@@ -160,6 +162,20 @@ async def _store_judged_procedure(
     is_novel, max_sim, principle_vec, fell_open = await _principle_is_novel(
         db, task_type=task_type, new_principle=principle, embedder=embedder,
     )
+
+    # Fail-open rate limiter: when the novelty gate couldn't check
+    # (embedder down), allow at most one per task_type per cooldown window.
+    if fell_open:
+        import time
+
+        last = _fail_open_timestamps.get(task_type, 0.0)
+        if time.monotonic() - last < _FAIL_OPEN_COOLDOWN_SECS:
+            logger.info(
+                "Judge: rate-limited fail-open store for %s (cooldown active)",
+                task_type,
+            )
+            return None
+        _fail_open_timestamps[task_type] = time.monotonic()
 
     if not is_novel:
         logger.info(
@@ -231,7 +247,7 @@ async def judge_struggle_procedure(
 
     spine_text = format_spine_for_judge(spine)
 
-    prompt = _STRUGGLE_PROMPT.format(spine_text=spine_text, score=score)
+    prompt = _build_struggle_prompt(spine_text, score)
 
     try:
         result = await router.route_call(
@@ -270,11 +286,11 @@ async def judge_extraction_candidate(
     Called by procedure_extraction.py for each procedure_candidate extraction.
     Returns procedure ID on success, None on rejection.
     """
-    prompt = _EXTRACTION_PROMPT.format(
+    prompt = _build_extraction_prompt(
         content=candidate.get("principle", ""),
         scenario=candidate.get("scenario", ""),
         entities=", ".join(candidate.get("tools_used", [])),
-        chunk_context=chunk_context[:3000],  # Cap context to avoid token overflow
+        chunk_context=chunk_context,
     )
 
     try:
