@@ -298,7 +298,7 @@ class OutreachPipeline:
         reply_markup: object | None = None,
     ) -> OutreachResult:
         adapter = self._channels.get(channel)
-        recipient = self._recipients.get(channel, "")
+        recipient = request.validated_recipient or self._recipients.get(channel, "")
         if not adapter or not recipient:
             logger.warning("No adapter/recipient for channel %s — deferring", channel)
             await self._defer(

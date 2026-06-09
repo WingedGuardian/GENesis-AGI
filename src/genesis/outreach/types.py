@@ -52,6 +52,10 @@ class OutreachRequest:
     drive_alignment: str | None = None
     labeled_surplus: bool = False
     source_id: str | None = None
+    # When set, overrides the pipeline's default recipient for this
+    # delivery. Used by thread-aware email routing to send replies
+    # to the correct per-thread recipient.
+    validated_recipient: str | None = None
 
 
 @dataclass(frozen=True)
