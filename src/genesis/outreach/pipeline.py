@@ -355,6 +355,24 @@ class OutreachPipeline:
                 )
             thread_id = None
 
+        # Scan outbound email content for sensitive data patterns
+        if channel == "email":
+            from genesis.security.output_scanner import scan_outbound
+
+            scan = scan_outbound(formatted.text)
+            if not scan.safe:
+                logger.warning(
+                    "Outbound email quarantined: %s patterns %s",
+                    scan.risk_level, scan.detected,
+                )
+                return OutreachResult(
+                    outreach_id=outreach_id,
+                    status=OutreachStatus.FAILED,
+                    channel=channel,
+                    message_content=formatted.text,
+                    error=f"Content scan quarantine: {scan.detected}",
+                )
+
         try:
             delivery_id = await adapter.send_message(
                 delivery_recipient, formatted.text,
