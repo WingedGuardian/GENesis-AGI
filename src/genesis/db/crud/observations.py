@@ -493,6 +493,24 @@ async def delete(db: aiosqlite.Connection, id: str) -> bool:
     return cursor.rowcount > 0
 
 
+async def delete_by_source_and_type(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+) -> int:
+    """Delete all observations matching a source + type pair.
+
+    Returns the number of rows deleted.
+    """
+    cursor = await db.execute(
+        "DELETE FROM observations WHERE source = ? AND type = ?",
+        (source, type),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 # -- Surfacing ----------------------------------------------------------------
 
 
@@ -628,5 +646,23 @@ async def count_unresolved(
         sql += f" AND type NOT IN ({placeholders})"
         params.extend(exclude_types)
     cursor = await db.execute(sql, params)
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def count_unresolved_by_types(
+    db: aiosqlite.Connection,
+    *,
+    types: tuple[str, ...] | frozenset[str],
+) -> int:
+    """Count unresolved observations matching a set of types."""
+    if not types:
+        return 0
+    placeholders = ",".join("?" for _ in types)
+    cursor = await db.execute(
+        f"SELECT COUNT(*) FROM observations "
+        f"WHERE resolved = 0 AND type IN ({placeholders})",
+        tuple(types),
+    )
     row = await cursor.fetchone()
     return row[0] if row else 0
