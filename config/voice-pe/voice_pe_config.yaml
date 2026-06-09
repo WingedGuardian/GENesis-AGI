@@ -1028,7 +1028,8 @@ micro_wake_word:
   stop_after_detection: false
   models:
     # Custom "Hey Genesis" wake word — trained model hosted on HA web server
-    - model: http://192.168.50.99:8123/local/wake_words/hey_genesis.json
+    # URL uses !secret so private HA IP stays out of the repo
+    - model: !secret hey_genesis_model_url
       id: hey_genesis
   vad:
   on_wake_word_detected:
