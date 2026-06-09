@@ -96,8 +96,11 @@ def _build_reply_prompt(thread: dict, reply: ParsedReply, history: list[dict]) -
 
 def _build_follow_up_prompt(thread: dict, history: list[dict]) -> str:
     """Build the user prompt for a follow-up session (no reply received)."""
+    from genesis.security.sanitizer import ContentSanitizer, ContentSource
+
     nonce = secrets.token_hex(8)
     boundary = f"email-content-{nonce}"
+    sanitizer = ContentSanitizer()
 
     parts = [
         "## Follow-Up Email — No Reply Received\n",
@@ -124,7 +127,11 @@ def _build_follow_up_prompt(thread: dict, history: list[dict]) -> str:
         parts.append(f"**From:** {msg.get('sender', 'N/A')}")
         parts.append(f"**Date:** {msg.get('received_at', 'N/A')}")
         if msg.get("body_preview"):
-            parts.append(f"\n<{boundary}>\n{msg['body_preview']}\n</{boundary}>\n")
+            if msg["direction"] == "received":
+                result = sanitizer.sanitize(msg["body_preview"], ContentSource.EMAIL)
+                parts.append(f"\n<{boundary}>\n{result.wrapped}\n</{boundary}>\n")
+            else:
+                parts.append(f"\n<{boundary}>\n{msg['body_preview']}\n</{boundary}>\n")
 
     parts.append(
         "\nDraft and send a brief, friendly follow-up to the recipient. "

@@ -70,12 +70,13 @@ _OUTPUT_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ),
 ]
 
-# Patterns that indicate critical leakage (immediate quarantine)
+# Patterns that indicate critical leakage (immediate quarantine).
+# credential_assignment is intentionally NOT critical — it matches
+# natural prose ("secret to our approach:", "token expiry is 86400s").
 _CRITICAL_PATTERNS = frozenset({
     "api_key_openai",
     "api_key_anthropic",
     "api_key_groq",
-    "credential_assignment",
     "env_variable_secret",
 })
 

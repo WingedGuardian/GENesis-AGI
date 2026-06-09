@@ -53,7 +53,7 @@ def test_detects_credential_assignment():
     result = scan_outbound("Set password=MyS3cretP@ssw0rd123 in config")
     assert not result.safe
     assert "credential_assignment" in result.detected
-    assert result.risk_level == "high"
+    assert result.risk_level == "medium"  # Not critical — prone to false positives
 
 
 def test_detects_env_variable():

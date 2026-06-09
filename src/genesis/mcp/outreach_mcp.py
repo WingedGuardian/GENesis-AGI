@@ -91,6 +91,10 @@ async def outreach_send(
 
     # Resolve per-thread recipient for email sends
     validated_recipient: str | None = None
+    if channel == "email" and not thread_id:
+        logger.warning(
+            "outreach_send email without thread_id — using pipeline default recipient"
+        )
     if thread_id and channel == "email" and _db is not None:
         from genesis.db.crud import email_threads
         thread = await email_threads.get_thread(_db, thread_id)
