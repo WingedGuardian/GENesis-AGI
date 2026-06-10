@@ -3,13 +3,13 @@
 # Override with: --build-arg BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 ARG BUILD_FROM=ghcr.io/home-assistant/aarch64-base:latest
 
-# Build stage - install dependencies with pip using pre-built wheels
+# Build stage - compile native deps then install Python packages
 FROM ${BUILD_FROM} AS builder
 
 # Set shell (use sh for Alpine, bash will be installed)
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
-# Install build dependencies + gcompat (enables manylinux wheel support on Alpine)
+# Install build dependencies + LLVM 20 from Alpine edge (required by llvmlite 0.47.0)
 RUN \
     apk add --no-cache \
         bash \
@@ -21,8 +21,13 @@ RUN \
         curl \
         gcc \
         g++ \
-        gcompat \
-        libstdc++
+        make \
+        cmake \
+        libstdc++ \
+    && apk add --no-cache --repository=http://dl-cdn.alpinelinux.org/alpine/edge/main \
+        llvm20-dev llvm20-static \
+    && ln -sf /usr/lib/llvm20/bin/llvm-config /usr/bin/llvm-config \
+    && /usr/bin/llvm-config --version
 
 # Switch to bash after installation
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -38,11 +43,16 @@ COPY pyproject.toml poetry.lock* /tmp/
 RUN mkdir -p /tmp/genesis_voice_bridge
 COPY app/ /tmp/genesis_voice_bridge/app/
 
-# Install dependencies using Poetry (pre-built manylinux wheels via gcompat)
+# Install dependencies — pre-install llvmlite from source (needs LLVM),
+# then let Poetry handle the rest
 WORKDIR /tmp
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 ENV POETRY_VIRTUALENVS_CREATE=false
-RUN poetry install --only=main --no-root --no-interaction --no-ansi \
+RUN LLVM_CONFIG=/usr/bin/llvm-config \
+    pip3 install --no-cache-dir --break-system-packages --no-build-isolation \
+    "llvmlite==0.47.0"
+RUN LLVM_CONFIG=/usr/bin/llvm-config \
+    poetry install --only=main --no-root --no-interaction --no-ansi \
     && rm -f pyproject.toml \
     && rm -rf genesis_voice_bridge/
 
@@ -59,7 +69,6 @@ FROM ${BUILD_FROM}
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
 # Install only runtime dependencies (bash first for compatibility)
-# gcompat enables manylinux wheel binaries (numba, onnxruntime, llvmlite)
 RUN \
     apk add --no-cache \
         bash \
@@ -69,7 +78,6 @@ RUN \
         ffmpeg \
         alsa-lib \
         alsa-utils \
-        gcompat \
         libstdc++
 
 # Switch to bash after installation
