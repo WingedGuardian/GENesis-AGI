@@ -148,7 +148,7 @@ curl -s http://localhost:6333/collections | jq .
 ## Step 10: Claude Code
 
 ```bash
-npm install -g @anthropic-ai/claude-code@2.1.160
+npm install -g @anthropic-ai/claude-code@2.1.170
 ```
 
 ## Step 11: Verification
