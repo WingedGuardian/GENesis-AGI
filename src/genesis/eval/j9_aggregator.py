@@ -200,7 +200,9 @@ async def _compute_memory_quality(
         "mrr": round(sum(mrrs) / len(mrrs), 4) if mrrs else None,
         "usage_rate": round(total_used / total_usage_checked, 4) if total_usage_checked else None,
         "total_recalls": total_recalls,
-        "total_memories_judged": len(relevance_events),
+        # Count only memories that actually fed the metrics (grouped under a
+        # recall_event_id) — not orphan events that contribute nothing.
+        "total_memories_judged": sum(len(v) for v in by_recall.values()),
     }
     return metrics, total_recalls
 
