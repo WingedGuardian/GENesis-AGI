@@ -240,20 +240,25 @@ def _trash_worktree(
     try:
         TRASH_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Write metadata before moving (in case move fails)
+        # Write metadata to staging file BEFORE the move. If the move
+        # fails we just have a harmless orphan file. If the process
+        # dies after the move but before metadata lands inside the
+        # trash dir, we still have it at the staging path.
         meta = {
             "original_path": str(wt_path),
             "branch": branch,
             "commit": wt.get("head", ""),
             "trashed_at": datetime.now(UTC).isoformat(),
         }
+        staging_meta = TRASH_DIR / f".{trash_path.name}.meta.staging"
+        staging_meta.write_text(json.dumps(meta, indent=2))
 
         # Move worktree to trash
         shutil.move(str(wt_path), str(trash_path))
 
-        # Write metadata into trash entry
-        meta_path = trash_path / ".trash_meta.json"
-        meta_path.write_text(json.dumps(meta, indent=2))
+        # Move staging metadata into the trash entry
+        final_meta = trash_path / ".trash_meta.json"
+        staging_meta.rename(final_meta)
 
         # Clean git's worktree registration
         subprocess.run(
