@@ -586,8 +586,45 @@ def get_container_anon_memory() -> tuple[int, int] | None:
         return None
 
 
-def restart_bridge(service: str = "genesis-bridge.service") -> int:
+def _wait_until_active(
+    service: str, *, timeout_s: int = 60, poll_interval_s: float = 2.0,
+) -> bool:
+    """Poll ``systemctl --user is-active`` until *service* is active or timeout.
+
+    Mirrors WatchdogChecker._is_bridge_active's probe. Used to confirm the
+    true post-restart state instead of trusting the restart client's exit.
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "is-active", service],
+                capture_output=True, text=True, timeout=5, env=systemctl_env(),
+            )
+            if result.stdout.strip() == "active":
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+        time.sleep(poll_interval_s)
+    return False
+
+
+def restart_bridge(service: str = "genesis-bridge.service", *, timeout_s: int = 120) -> int:
     """Restart the specified Genesis service via systemctl. Returns exit code.
+
+    Returns 0 if the service is confirmed active after the restart, 1 if not,
+    -2 if systemctl is missing.
+
+    Verifies the *actual* service state rather than trusting the systemctl
+    client's exit. A graceful genesis-server restart's stop phase is bounded
+    by systemd's ~90s TimeoutStopSec; under load it can exceed a short client
+    timeout, but killing the client does NOT abort the systemd restart job —
+    systemd completes it independently. So on a slow/timed-out client we poll
+    is-active before declaring failure, instead of returning a spurious error
+    (which previously left the watchdog unit `failed` after a successful
+    restart). ``timeout_s`` (default 120s) clears systemd's stop bound with
+    margin while still bounding a genuinely hung systemctl — important because
+    the watchdog timer cannot overlap oneshot runs.
 
     Defaults to genesis-bridge.service for backward compatibility.
     Pass checker.target_service to restart the auto-detected service.
@@ -596,18 +633,29 @@ def restart_bridge(service: str = "genesis-bridge.service") -> int:
     try:
         result = subprocess.run(
             ["systemctl", "--user", "restart", service],
-            capture_output=True, text=True, timeout=30, env=systemctl_env(),
+            capture_output=True, text=True, timeout=timeout_s, env=systemctl_env(),
         )
         if result.returncode == 0:
             logger.info("%s restart command succeeded", service)
-        else:
-            logger.error("%s restart failed: %s", service, result.stderr)
-        return result.returncode
+            return 0
+        logger.error("%s restart returned %d: %s — verifying actual state",
+                     service, result.returncode, result.stderr)
     except subprocess.TimeoutExpired:
-        logger.error("%s restart command timed out", service, exc_info=True)
-        return -1
+        # Client exceeded the budget; systemd finishes the restart job
+        # independently. Verify rather than assume failure.
+        logger.warning(
+            "%s restart client exceeded %ds — verifying actual service state "
+            "(systemd completes the restart independently of the client)",
+            service, timeout_s,
+        )
     except FileNotFoundError:
-        logger.error("systemctl not found — cannot restart bridge")
+        logger.error("systemctl not found — cannot restart %s", service)
         return -2
+
+    if _wait_until_active(service):
+        logger.info("%s confirmed active after restart", service)
+        return 0
+    logger.error("%s not active after restart attempt", service)
+    return 1
 
 

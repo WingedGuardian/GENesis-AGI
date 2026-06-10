@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -464,3 +465,59 @@ class TestZombieSuppressionDuringHeavyWorkload:
         checker = _make_checker(tmp_path, status, stabilization_s=120)
         result = checker.check()
         assert result == WatchdogAction.SKIP
+
+
+class TestRestartBridge:
+    """restart_bridge verifies actual service state instead of trusting the
+    systemctl client's exit (regression: a slow-but-successful restart used to
+    return -1 → exit 255 → watchdog unit `failed`)."""
+
+    def test_clean_restart_returns_zero(self):
+        from genesis.autonomy import watchdog as wd
+
+        completed = MagicMock(returncode=0, stderr="")
+        with patch.object(wd.subprocess, "run", return_value=completed) as run, \
+                patch.object(wd, "_wait_until_active") as wait:
+            assert wd.restart_bridge("genesis-server.service") == 0
+            run.assert_called_once()
+            wait.assert_not_called()  # clean exit needs no verification
+
+    def test_timeout_then_active_returns_zero(self):
+        from genesis.autonomy import watchdog as wd
+
+        timeout = subprocess.TimeoutExpired(cmd=["systemctl"], timeout=120)
+        with patch.object(wd.subprocess, "run", side_effect=timeout), \
+                patch.object(wd, "_wait_until_active", return_value=True):
+            # Killing the client doesn't abort the systemd job; it came up.
+            assert wd.restart_bridge("genesis-server.service") == 0
+
+    def test_timeout_then_not_active_returns_one(self):
+        from genesis.autonomy import watchdog as wd
+
+        timeout = subprocess.TimeoutExpired(cmd=["systemctl"], timeout=120)
+        with patch.object(wd.subprocess, "run", side_effect=timeout), \
+                patch.object(wd, "_wait_until_active", return_value=False):
+            assert wd.restart_bridge("genesis-server.service") == 1
+
+    def test_nonzero_then_active_returns_zero(self):
+        from genesis.autonomy import watchdog as wd
+
+        failed = MagicMock(returncode=1, stderr="boom")
+        with patch.object(wd.subprocess, "run", return_value=failed), \
+                patch.object(wd, "_wait_until_active", return_value=True):
+            assert wd.restart_bridge("genesis-server.service") == 0
+
+    def test_systemctl_missing_returns_minus_two(self):
+        from genesis.autonomy import watchdog as wd
+
+        with patch.object(wd.subprocess, "run", side_effect=FileNotFoundError()):
+            assert wd.restart_bridge("genesis-server.service") == -2
+
+    def test_wait_until_active_polls_until_active(self):
+        from genesis.autonomy import watchdog as wd
+
+        inactive = MagicMock(stdout="activating")
+        active = MagicMock(stdout="active")
+        with patch.object(wd.subprocess, "run", side_effect=[inactive, active]), \
+                patch.object(wd.time, "sleep"):
+            assert wd._wait_until_active("genesis-server.service", timeout_s=30) is True
