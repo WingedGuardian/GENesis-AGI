@@ -37,8 +37,6 @@ substitutions:
   voice_assist_replying_phase_id: '5'
   voice_assist_not_ready_phase_id: '10'
   voice_assist_error_phase_id: '11'
-  # Change this to true in case you have a hidden SSID at home.
-  hidden_ssid: "false"
   # Server URL is now defined in secrets.yaml as server_url
   # Substitutions for audio files
   wake_word_triggered_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/wake_word_triggered.flac
@@ -55,8 +53,6 @@ substitutions:
   factory_reset_confirmed_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/factory_reset_confirmed.mp3
   easter_egg_tick_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tick.mp3
   easter_egg_tada_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/easter_egg_tada.mp3
-  timer_finished_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/timer_finished.flac
-  error_cloud_expired_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/error_cloud_expired.mp3
 
 esphome:
   name: ha-voice-openai
@@ -103,7 +99,7 @@ wifi:
   id: wifi_id
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  fast_connect: ${hidden_ssid}
+  fast_connect: false
   on_connect:
     - lambda: id(improv_ble_in_progress) = false;
     - script.execute: control_leds
@@ -283,36 +279,19 @@ binary_sensor:
                     else:
                       - if:
                           condition:
-                            media_player.is_announcing:
-                              id: voice_media_player
+                            and:
+                              - switch.is_off: master_mute_switch
+                              - not:
+                                  voice_assistant_websocket.is_running:
+                                    id: voice_assistant_ws
                           then:
-                            - media_player.stop:
-                                announcement: true
-                                id: voice_media_player
-                          else:
-                            - if:
-                                condition:
-                                  media_player.is_playing:
-                                    id: voice_media_player
-                                then:
-                                  - media_player.pause:
-                                      id: voice_media_player
-                                else:
-                                  - if:
-                                      condition:
-                                        and:
-                                          - switch.is_off: master_mute_switch
-                                          - not:
-                                              voice_assistant_websocket.is_running:
-                                                id: voice_assistant_ws
-                                      then:
-                                        - script.execute:
-                                            id: play_sound
-                                            priority: true
-                                            sound_file: !lambda 'return id(center_button_press_sound);'
-                                        - delay: 300ms
-                                        - voice_assistant_websocket.start:
-                                            id: voice_assistant_ws
+                            - script.execute:
+                                id: play_sound
+                                priority: true
+                                sound_file: !lambda 'return id(center_button_press_sound);'
+                            - delay: 300ms
+                            - voice_assistant_websocket.start:
+                                id: voice_assistant_ws
       # Double Click
       - timing:
           - ON for at most 1s
@@ -1386,12 +1365,6 @@ media_player:
         file: ${easter_egg_tick_sound_file}
       - id: easter_egg_tada_sound
         file: ${easter_egg_tada_sound_file}
-      # Timer finished sound (for future timer support)
-      - id: timer_finished_sound
-        file: ${timer_finished_sound_file}
-      # Cloud expired error sound
-      - id: error_cloud_expired_sound
-        file: ${error_cloud_expired_sound_file}
     on_mute:
       - script.execute: control_leds
     on_unmute:

@@ -331,3 +331,20 @@ async def purge_completed(
     )
     await db.commit()
     return cursor.rowcount
+
+
+async def get_recently_completed(
+    db: aiosqlite.Connection,
+    *,
+    hours: int = 24,
+    limit: int = 5,
+) -> list[dict]:
+    """Get follow-ups completed within the given time window."""
+    cursor = await db.execute(
+        "SELECT content, resolution_notes FROM follow_ups "
+        "WHERE status = 'completed' "
+        "AND completed_at >= datetime('now', ? || ' hours') "
+        "ORDER BY completed_at DESC LIMIT ?",
+        (f"-{hours}", limit),
+    )
+    return [dict(row) for row in await cursor.fetchall()]

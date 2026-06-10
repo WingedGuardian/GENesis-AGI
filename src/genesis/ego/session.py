@@ -1331,16 +1331,10 @@ class EgoSession:
 
             # Atomically claim the proposal BEFORE spawning to prevent
             # double-dispatch (sweep_approved_proposals is a second path).
-            # Use raw SQL to preserve resolved_at (the approval timestamp
-            # the staleness guard depends on).
-            cursor = await self._db.execute(
-                "UPDATE ego_proposals SET status = 'executed', "
-                "user_response = 'dispatching' "
-                "WHERE id = ? AND status = 'approved'",
-                (proposal_id,),
+            claimed = await ego_crud.claim_proposal_for_dispatch(
+                self._db, proposal_id,
             )
-            await self._db.commit()
-            if cursor.rowcount == 0:
+            if not claimed:
                 logger.info(
                     "Execution brief for proposal %s skipped — already claimed",
                     proposal_id,
@@ -1358,12 +1352,9 @@ class EgoSession:
                     caller_context=f"ego_proposal:{proposal_id}",
                 )
                 session_id = await self._direct_session_runner.spawn(request)
-                # Update with actual session ID
-                await self._db.execute(
-                    "UPDATE ego_proposals SET user_response = ? WHERE id = ?",
-                    (f"session:{session_id}", proposal_id),
+                await ego_crud.record_dispatch_session(
+                    self._db, proposal_id, session_id=f"session:{session_id}",
                 )
-                await self._db.commit()
                 try:
                     from genesis.db.crud import intervention_journal as journal_crud
 
@@ -1387,12 +1378,9 @@ class EgoSession:
                     exc_info=True,
                 )
                 try:
-                    await self._db.execute(
-                        "UPDATE ego_proposals SET status = 'approved', "
-                        "user_response = NULL WHERE id = ?",
-                        (proposal_id,),
+                    await ego_crud.revert_failed_dispatch(
+                        self._db, proposal_id,
                     )
-                    await self._db.commit()
                 except Exception:
                     logger.error(
                         "Failed to revert proposal %s — stuck at executed",
@@ -1782,17 +1770,12 @@ class EgoSession:
                 model = CCModel.SONNET
 
             # Atomically claim the proposal BEFORE spawning to prevent
-            # double-dispatch (_process_execution_briefs is a second path).
-            # Use raw SQL to preserve resolved_at (the approval timestamp
-            # the staleness guard depends on).
-            cursor = await self._db.execute(
-                "UPDATE ego_proposals SET status = 'executed', "
-                "user_response = 'dispatching' "
-                "WHERE id = ? AND status = 'approved'",
-                (prop["id"],),
+            # double-dispatch (_process_execution_briefs is a second path,
+            # and sweep can be triggered from cadence, Telegram, and dashboard).
+            claimed = await ego_crud.claim_proposal_for_dispatch(
+                self._db, prop["id"],
             )
-            await self._db.commit()
-            if cursor.rowcount == 0:
+            if not claimed:
                 logger.debug(
                     "Proposal %s already claimed — skipping",
                     prop["id"],
@@ -1810,12 +1793,9 @@ class EgoSession:
                     caller_context=f"ego_proposal:{prop['id']}",
                 )
                 session_id = await self._direct_session_runner.spawn(request)
-                # Update with actual session ID
-                await self._db.execute(
-                    "UPDATE ego_proposals SET user_response = ? WHERE id = ?",
-                    (f"session:{session_id}", prop["id"]),
+                await ego_crud.record_dispatch_session(
+                    self._db, prop["id"], session_id=f"session:{session_id}",
                 )
-                await self._db.commit()
                 dispatched.append(prop["id"])
                 logger.info(
                     "Sweep dispatched proposal %s → session %s",
@@ -1832,12 +1812,9 @@ class EgoSession:
                 )
                 try:
                     # Revert so sweep can retry on next cycle
-                    await self._db.execute(
-                        "UPDATE ego_proposals SET status = 'approved', "
-                        "user_response = NULL WHERE id = ?",
-                        (prop["id"],),
+                    await ego_crud.revert_failed_dispatch(
+                        self._db, prop["id"],
                     )
-                    await self._db.commit()
                 except Exception:
                     logger.error(
                         "Failed to revert proposal %s — stuck at executed",

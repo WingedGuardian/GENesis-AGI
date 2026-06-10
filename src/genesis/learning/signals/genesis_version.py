@@ -345,15 +345,17 @@ class GenesisVersionCollector:
 
     async def _get_baseline(self) -> str | None:
         """Read last known Genesis HEAD from observations."""
-        cursor = await self._db.execute(
-            "SELECT content FROM observations "
-            "WHERE source = 'genesis_version' AND type = 'genesis_version_baseline' "
-            "ORDER BY created_at DESC LIMIT 1",
+        from genesis.db.crud import observations
+
+        rows = await observations.query(
+            self._db,
+            source="genesis_version",
+            type="genesis_version_baseline",
+            limit=1,
         )
-        row = await cursor.fetchone()
-        if row:
+        if rows:
             try:
-                data = json.loads(row[0] if isinstance(row, tuple) else row["content"])
+                data = json.loads(rows[0].get("content", "{}"))
                 return data.get("version")
             except (json.JSONDecodeError, TypeError):
                 return None
@@ -364,11 +366,9 @@ class GenesisVersionCollector:
         from genesis.db.crud import observations
 
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "DELETE FROM observations "
-            "WHERE source = 'genesis_version' AND type = 'genesis_version_baseline'",
+        await observations.delete_by_source_and_type(
+            self._db, source="genesis_version", type="genesis_version_baseline",
         )
-        await self._db.commit()
         await observations.create(
             self._db,
             id=str(uuid.uuid4()),
@@ -404,17 +404,16 @@ class GenesisVersionCollector:
         alert clears immediately instead of waiting for the next
         upstream check.
         """
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "UPDATE observations "
-            "SET resolved = 1, resolved_at = ?, "
-            "    resolution_notes = ? "
-            "WHERE source = 'genesis_version' "
-            "  AND type = 'genesis_update_available' "
-            "  AND resolved = 0",
-            (now, f"resolved by local update to {current_head}"),
+        await observations.resolve_by_source_and_type(
+            self._db,
+            source="genesis_version",
+            type="genesis_update_available",
+            resolved_at=now,
+            resolution_notes=f"resolved by local update to {current_head}",
         )
-        await self._db.commit()
 
     async def _resolve_pending_update_failed(self, current_head: str) -> None:
         """Resolve any unresolved genesis_update_failed observations.
@@ -424,17 +423,16 @@ class GenesisVersionCollector:
         the failure observation is no longer relevant — resolve it so the
         alert clears and the sentinel can auto-unstick.
         """
+        from genesis.db.crud import observations
+
         now = datetime.now(UTC).isoformat()
-        await self._db.execute(
-            "UPDATE observations "
-            "SET resolved = 1, resolved_at = ?, "
-            "    resolution_notes = ? "
-            "WHERE source = 'genesis_version' "
-            "  AND type = 'genesis_update_failed' "
-            "  AND resolved = 0",
-            (now, f"resolved by successful update to {current_head}"),
+        await observations.resolve_by_source_and_type(
+            self._db,
+            source="genesis_version",
+            type="genesis_update_failed",
+            resolved_at=now,
+            resolution_notes=f"resolved by successful update to {current_head}",
         )
-        await self._db.commit()
 
     async def _store_update_available(
         self, current: str, behind: int, summary: str,

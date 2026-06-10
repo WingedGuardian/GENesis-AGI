@@ -54,8 +54,14 @@ async def outreach_send(
     preferred_timing: str | None = None,
     salience_score: float = 0.5,
     labeled_surplus: bool = False,
+    thread_id: str | None = None,
 ) -> str:
-    """Queue a message for delivery. Returns outreach_id."""
+    """Queue a message for delivery. Returns outreach_id.
+
+    For email replies, pass thread_id to route to the correct recipient.
+    The thread_id maps to a registered email thread whose recipient is
+    used for delivery.
+    """
     if not _pipeline:
         # Queue for genesis-server to pick up on next cycle
         if _db is not None:
@@ -83,6 +89,24 @@ async def outreach_send(
     except ValueError:
         return f"Error: invalid category '{category}'"
 
+    # Resolve per-thread recipient for email sends
+    validated_recipient: str | None = None
+    if channel == "email" and not thread_id:
+        logger.warning(
+            "outreach_send email without thread_id — using pipeline default recipient"
+        )
+    if thread_id and channel == "email" and _db is not None:
+        from genesis.db.crud import email_threads
+        thread = await email_threads.get_thread(_db, thread_id)
+        if thread:
+            validated_recipient = thread.get("recipient")
+            logger.info(
+                "Thread %s resolved recipient: %s",
+                thread_id, validated_recipient,
+            )
+        else:
+            logger.warning("Thread %s not found for recipient lookup", thread_id)
+
     req = OutreachRequest(
         category=cat,
         topic=message[:100],
@@ -91,6 +115,7 @@ async def outreach_send(
         signal_type=category,
         channel=channel,
         labeled_surplus=labeled_surplus,
+        validated_recipient=validated_recipient,
     )
     if urgency == "critical":
         result = await _pipeline.submit_urgent(req)

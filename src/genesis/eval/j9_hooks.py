@@ -8,12 +8,31 @@ code paths.
 from __future__ import annotations
 
 import logging
+import os
 
 import aiosqlite
 
 from genesis.db.crud import j9_eval
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_session_id(explicit: str | None) -> str | None:
+    """Resolve session_id via fallback chain: explicit → ContextVar → env var.
+
+    MCP servers run in separate processes and can't see the ContextVar,
+    but they inherit GENESIS_SESSION_ID from the CCInvoker's env.
+    """
+    if explicit:
+        return explicit
+    try:
+        from genesis.observability.session_context import get_session_id
+        ctx_sid = get_session_id()
+        if ctx_sid:
+            return ctx_sid
+    except ImportError:
+        pass  # MCP servers may not have session_context available
+    return os.environ.get("GENESIS_SESSION_ID")
 
 
 async def emit_recall_fired(
@@ -61,7 +80,7 @@ async def emit_recall_fired(
             db,
             dimension="memory",
             event_type="recall_fired",
-            session_id=session_id,
+            session_id=_resolve_session_id(session_id),
             metrics=metrics,
         )
     except Exception:
@@ -109,7 +128,7 @@ async def emit_procedure_invoked(
             dimension="procedure",
             event_type="procedure_invoked",
             subject_id=procedure_id,
-            session_id=session_id,
+            session_id=_resolve_session_id(session_id),
             metrics={
                 "confidence_at_invoke": confidence,
                 "matched_tags": matched_tags[:10],

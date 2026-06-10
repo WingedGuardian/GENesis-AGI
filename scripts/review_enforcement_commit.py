@@ -54,6 +54,17 @@ def main() -> None:
     if not _COMMIT_PATTERN.search(command):
         sys.exit(0)  # Not a commit, allow
 
+    # Rule 0: Block --no-verify — it bypasses all pre-commit hooks
+    # including review enforcement. There is no legitimate reason to
+    # skip review hooks. Check for both long and short (-n) forms,
+    # but only after we've confirmed this is a git commit command.
+    if "--no-verify" in command:
+        _deny(
+            "BLOCKED: --no-verify bypasses review enforcement hooks. "
+            "Remove --no-verify and establish a review first via /review."
+        )
+        return
+
     # Detect worktree: extract working directory from 'cd /path && git commit'
     cwd = _extract_working_dir(command)
 

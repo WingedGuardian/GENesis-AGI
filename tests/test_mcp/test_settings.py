@@ -33,7 +33,10 @@ def config_dir(tmp_path: Path) -> Path:
 @pytest.fixture(autouse=True)
 def _patch_config_dir(config_dir: Path):
     """Redirect all config reads/writes to the temp dir."""
-    with patch("genesis.mcp.health.settings._CONFIG_DIR", config_dir):
+    with (
+        patch("genesis.mcp.health.settings._CONFIG_DIR", config_dir),
+        patch("genesis.mcp.health.settings._USER_CONFIG_DIR", config_dir),
+    ):
         yield
 
 
@@ -406,7 +409,7 @@ class TestValidateInboxMonitor:
 
 def test_atomic_write(config_dir: Path):
     data = {"key": "value", "nested": {"a": 1}}
-    with patch("genesis.mcp.health.settings._CONFIG_DIR", config_dir):
+    with patch("genesis.mcp.health.settings._USER_CONFIG_DIR", config_dir):
         path = _atomic_yaml_write("test.yaml", data)
     assert path.exists()
     loaded = yaml.safe_load(path.read_text())
@@ -415,7 +418,7 @@ def test_atomic_write(config_dir: Path):
 
 def test_atomic_write_overwrites(config_dir: Path):
     (config_dir / "test.yaml").write_text("old: data\n")
-    with patch("genesis.mcp.health.settings._CONFIG_DIR", config_dir):
+    with patch("genesis.mcp.health.settings._USER_CONFIG_DIR", config_dir):
         _atomic_yaml_write("test.yaml", {"new": "data"})
     loaded = yaml.safe_load((config_dir / "test.yaml").read_text())
     assert loaded == {"new": "data"}

@@ -17,6 +17,15 @@ logger = logging.getLogger(__name__)
 _FAILURE_LOG_INTERVAL_S = 300
 _last_failure_log: dict[str, float] = {}
 
+# Default timeout for litellm.acompletion() calls (seconds).  Prevents
+# indefinite hangs when a provider accepts TCP but stalls on response.
+# litellm's own default is ambiguous (600s in completion(), 6000s global
+# constant) and clearly failed to fire during a 20-minute production hang
+# (deepseek-v4-pro via OpenRouter, 2026-06-08).  120s is generous for all
+# Genesis call sites (max observed: ~1500 input / ~8K output tokens).
+# Callers can override via kwargs if a specific call site needs longer.
+_DEFAULT_TIMEOUT_S = 120
+
 
 def _should_log_failure(provider: str) -> bool:
     now = time.monotonic()
@@ -137,6 +146,8 @@ class LiteLLMDelegate:
         api_key = _resolve_api_key(cfg.provider_type)
 
         call_kwargs = {**kwargs}
+        if "timeout" not in call_kwargs:
+            call_kwargs["timeout"] = _DEFAULT_TIMEOUT_S
         if api_key:
             call_kwargs["api_key"] = api_key
         if cfg.base_url:

@@ -190,3 +190,35 @@ async def find_recent_unengaged(
         (f"-{hours} hours",),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+async def get_previous_report_time(
+    db: aiosqlite.Connection,
+) -> str | None:
+    """Get the timestamp of the most recent previous morning report.
+
+    Returns the created_at of the second-most-recent morning_report entry
+    (OFFSET 1 skips the current report being generated).
+    """
+    cursor = await db.execute(
+        "SELECT created_at FROM outreach_history "
+        "WHERE signal_type = 'morning_report' "
+        "ORDER BY created_at DESC LIMIT 1 OFFSET 1",
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else None
+
+
+async def count_recent(
+    db: aiosqlite.Connection,
+    *,
+    days: int = 7,
+) -> int:
+    """Count outreach messages sent within the given time window."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM outreach_history "
+        "WHERE created_at >= datetime('now', ? || ' days')",
+        (f"-{days}",),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0

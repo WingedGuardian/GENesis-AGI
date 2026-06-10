@@ -86,9 +86,13 @@ _DEFAULTS = OutreachConfig(
 )
 
 
+_REPO_CONFIG = Path(__file__).parent.parent.parent.parent / "config" / "outreach.yaml"
+_USER_CONFIG = Path.home() / ".genesis" / "config" / "outreach.yaml"
+
+
 def _config_path() -> Path:
-    """Return the default outreach config path."""
-    return Path(__file__).parent.parent.parent.parent / "config" / "outreach.yaml"
+    """User override if it exists, otherwise repo default."""
+    return _USER_CONFIG if _USER_CONFIG.exists() else _REPO_CONFIG
 
 
 def validate_preferences(preferences: dict) -> list[str]:
@@ -133,9 +137,10 @@ def validate_preferences(preferences: dict) -> list[str]:
 
 
 def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> None:
-    """Serialize OutreachConfig back to YAML. Atomic write via temp file + rename."""
+    """Serialize OutreachConfig back to user config dir (~/.genesis/config/)."""
     if path is None:
-        path = _config_path()
+        path = _USER_CONFIG
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     data: dict = {
         "quiet_hours": {

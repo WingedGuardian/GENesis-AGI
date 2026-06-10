@@ -57,7 +57,7 @@ async def metrics_compounding():
         dimensions[dim] = {
             "headline_metric": headline_key,
             "current_value": (
-                latest["metrics"].get(headline_key) if latest else None
+                latest.get("metrics", {}).get(headline_key) if latest else None
             ),
             "series": series,
             "weeks_of_data": len(series),

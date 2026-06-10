@@ -473,6 +473,10 @@ class MailMonitor:
             )
 
         try:
+            # Judge outputs JSON decisions only — no tools needed.
+            _no_mcp = str(
+                Path(__file__).resolve().parents[2] / "config" / "no_mcp.json"
+            )
             invocation = CCInvocation(
                 prompt=prompt,
                 model=self._config.model,
@@ -481,6 +485,7 @@ class MailMonitor:
                 timeout_s=self._config.timeout_s,
                 skip_permissions=True,
                 disallowed_tools=["Write", "Edit", "Agent", "NotebookEdit"],
+                mcp_config=_no_mcp,
                 working_dir=background_session_dir(),
             )
             cc_output = await self._invoker.run(invocation)
@@ -632,7 +637,12 @@ class MailMonitor:
         decision: dict,
         batch_id: str,
     ) -> None:
-        """Store a single KEEP decision via intake pipeline."""
+        """Store a single KEEP decision as an observation.
+
+        Findings from untrusted email content are stored as observations
+        (expire after 30 days, surfaced in morning reports for review)
+        rather than being ingested into the permanent knowledge base.
+        """
         content_hash = hashlib.sha256(
             f"email_recon:{email.message_id}".encode(),
         ).hexdigest()[:16]
@@ -652,29 +662,18 @@ class MailMonitor:
             f"Judge rationale: {rationale}"
         )
 
-        try:
-            from genesis.surplus.intake import IntakeSource, run_intake
-            await run_intake(
-                content=content,
-                source=IntakeSource.EMAIL_RECON,
-                source_task_type="email_recon",
-                db=self._db,
-            )
-        except Exception:
-            # Fallback: store as observation directly (old behavior)
-            logger.warning("Intake failed for email_recon finding — falling back to direct observation", exc_info=True)
-            now = datetime.now(UTC).isoformat()
-            await observations.create(
-                self._db,
-                id=str(uuid.uuid4()),
-                source="recon",
-                type="finding",
-                category="email_recon",
-                content=content,
-                priority="medium",
-                created_at=now,
-                content_hash=content_hash,
-            )
+        now = datetime.now(UTC).isoformat()
+        await observations.create(
+            self._db,
+            id=str(uuid.uuid4()),
+            source="recon",
+            type="finding",
+            category="email_recon",
+            content=content,
+            priority="medium",
+            created_at=now,
+            content_hash=content_hash,
+        )
 
     def _build_judge_prompt(self, briefs: list[EmailBrief]) -> str:
         """Build the Layer 2 judge prompt from paralegal briefs."""

@@ -45,6 +45,7 @@ async def procedure_store(
     steps: list[str],
     tools_used: list[str],
     context_tags: list[str],
+    scenario: str | None = None,
     tool_trigger: list[str] | None = None,
 ) -> str:
     """Store a learned procedure. Returns the procedure ID.
@@ -76,6 +77,7 @@ async def procedure_store(
         memory_mod._db,
         task_type=task_type,
         principle=principle,
+        scenario=scenario,
         steps=steps,
         tools_used=tools_used,
         context_tags=context_tags,

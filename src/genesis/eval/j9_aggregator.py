@@ -13,6 +13,7 @@ Dimensions:
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
@@ -521,6 +522,22 @@ _MIN_SAMPLES = {"memory": 10, "ego": 5, "procedural": 5,
                 "awareness": 20, "reflection": 10}
 
 
+def _score_with_zero_fill(
+    available: list[tuple[float | None, float]],
+    *,
+    max_nulls: int = 1,
+) -> float | None:
+    """Compute weighted score, treating null factors as 0.0.
+
+    Returns None if more than *max_nulls* factors are null — the grade
+    should be withheld rather than computed from mostly-absent data.
+    """
+    null_count = sum(1 for v, _ in available if v is None)
+    if null_count > max_nulls:
+        return None
+    return sum((v if v is not None else 0.0) * w for v, w in available) * 100
+
+
 def _score_to_grade(score: float | None) -> str | None:
     """Convert a 0-100 score to a letter grade. None if insufficient data."""
     if score is None:
@@ -557,16 +574,17 @@ async def _grade_memory(
                "total_recalls": total}
 
     available = [(p5, 0.4), (mrr, 0.3), (usage, 0.3)]
-    valid = [(v, w) for v, w in available if v is not None]
 
-    if not valid or total < _MIN_SAMPLES["memory"]:
+    if all(v is None for v, _ in available) or total < _MIN_SAMPLES["memory"]:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": total,
                 "reason": f"insufficient data ({total} recalls, need {_MIN_SAMPLES['memory']})"}
 
-    # Re-normalize weights if some factors are missing
-    total_weight = sum(w for _, w in valid)
-    score = sum(v * w / total_weight for v, w in valid) * 100
+    score = _score_with_zero_fill(available, max_nulls=1)
+    if score is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
             "factors": factors, "sample_count": total}
@@ -580,8 +598,10 @@ async def _grade_ego(
 ) -> dict:
     """Grade ego subsystem from dimension 3 metrics.
 
-    Factors: approval_rate (40%), execution_success (30%),
-    confidence_calibration_accuracy (30%).
+    Factors: calibration_accuracy (40%), execution_success (40%),
+    approval_rate (20%). Calibration and delivery matter most — an ego
+    that proposes bold/rejected ideas with accurate self-assessment
+    is healthier than one that only proposes safe bets.
     """
     metrics = dimension_results.get("ego", {})
     approval = metrics.get("approval_rate")
@@ -608,16 +628,18 @@ async def _grade_ego(
                "calibration_accuracy": cal_accuracy,
                "total_proposals": total}
 
-    available = [(approval, 0.4), (exec_success, 0.3), (cal_accuracy, 0.3)]
-    valid = [(v, w) for v, w in available if v is not None]
+    available = [(cal_accuracy, 0.4), (exec_success, 0.4), (approval, 0.2)]
 
-    if not valid or total < _MIN_SAMPLES["ego"]:
+    if all(v is None for v, _ in available) or total < _MIN_SAMPLES["ego"]:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": total,
                 "reason": f"insufficient data ({total} proposals, need {_MIN_SAMPLES['ego']})"}
 
-    total_weight = sum(w for _, w in valid)
-    score = sum(v * w / total_weight for v, w in valid) * 100
+    score = _score_with_zero_fill(available, max_nulls=1)
+    if score is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total,
+                "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
             "factors": factors, "sample_count": total}
@@ -649,15 +671,24 @@ async def _grade_procedural(
                "total_procedures": total_procs}
 
     available = [(success, 0.5), (confidence, 0.25), (activity, 0.25)]
-    valid = [(v, w) for v, w in available if v is not None]
 
-    if not valid or invocations < _MIN_SAMPLES["procedural"]:
+    if invocations < _MIN_SAMPLES["procedural"]:
         return {"grade": None, "score": None, "factors": factors,
                 "sample_count": invocations,
                 "reason": f"insufficient data ({invocations} invocations, need {_MIN_SAMPLES['procedural']})"}
 
-    total_weight = sum(w for _, w in valid)
-    score = sum(v * w / total_weight for v, w in valid) * 100
+    # Primary factor gate: success_rate is the most important signal.
+    # Without it, grading on confidence + activity alone is misleading.
+    if success is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": "primary metric (success_rate) not yet measurable"}
+
+    score = _score_with_zero_fill(available, max_nulls=1)
+    if score is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": invocations,
+                "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
             "factors": factors, "sample_count": invocations}
@@ -671,8 +702,15 @@ async def _grade_awareness(
 ) -> dict:
     """Grade awareness subsystem from awareness_ticks data.
 
-    Factors: tick_regularity (30%), classification_rate (40%),
-    depth_balance (30%).
+    Factors: tick_regularity (60%), signal_completeness (40%).
+
+    tick_regularity measures whether the awareness loop fires on schedule.
+    signal_completeness measures whether all expected signal collectors are
+    producing output — catches broken collectors whose signals disappear.
+
+    Classification rate and depth balance are tracked as informational
+    factors but NOT scored, because a quiet system (94%+ unclassified
+    ticks) is healthy behavior, not a failure.
     """
     # Total ticks in period
     cursor = await db.execute(
@@ -683,7 +721,34 @@ async def _grade_awareness(
     row = await cursor.fetchone()
     total_ticks = row["cnt"] if row else 0
 
-    # Classified ticks (non-null classified_depth)
+    # Tick regularity: expect ~2000+/week (5-min ticks, 2016 per week).
+    expected_ticks = 2016  # 7 * 24 * 60 / 5
+    tick_regularity = min(total_ticks / expected_ticks, 1.0) if total_ticks else 0.0
+
+    # Signal completeness: are all expected collectors producing output?
+    # Sample recent ticks and count distinct signal names.
+    cursor = await db.execute(
+        "SELECT signals_json FROM awareness_ticks "
+        "WHERE created_at >= ? AND created_at < ? "
+        "ORDER BY created_at DESC LIMIT 10",
+        (since, until),
+    )
+    signal_names: set[str] = set()
+    for tick_row in await cursor.fetchall():
+        try:
+            raw = tick_row["signals_json"] if isinstance(tick_row, dict) else tick_row[0]
+            signals = json.loads(raw)
+            for s in signals:
+                name = s.get("name", "")
+                if name:
+                    signal_names.add(name)
+        except (json.JSONDecodeError, TypeError, KeyError, AttributeError):
+            pass
+    # 18 expected signals (21 total minus 3 conditional: genesis/cc version, stale items)
+    expected_signals = 18
+    signal_completeness = min(len(signal_names) / expected_signals, 1.0) if expected_signals else 0.0
+
+    # Informational: classification stats (not scored)
     cursor = await db.execute(
         "SELECT classified_depth, COUNT(*) as cnt FROM awareness_ticks "
         "WHERE created_at >= ? AND created_at < ? "
@@ -695,27 +760,9 @@ async def _grade_awareness(
     depth_dist = {r["classified_depth"]: r["cnt"] for r in depth_rows}
     classified_count = sum(depth_dist.values())
 
-    # Tick regularity: expect ~2000+/week (5-min ticks, 2016 per week).
-    # Score as ratio to expected, capped at 1.0.
-    expected_ticks = 2016  # 7 * 24 * 60 / 5
-    tick_regularity = min(total_ticks / expected_ticks, 1.0) if total_ticks else 0.0
-
-    # Classification rate: what fraction of ticks got classified
-    classification_rate = classified_count / total_ticks if total_ticks else 0.0
-
-    # Depth balance: entropy-like measure of depth distribution.
-    # Perfect balance (all 4 depths equal) = 1.0. All one depth = 0.0.
-    depth_balance = 0.0
-    if classified_count > 0 and len(depth_dist) > 1:
-        import math
-        probs = [c / classified_count for c in depth_dist.values()]
-        max_entropy = math.log(4)  # 4 depth levels
-        entropy = -sum(p * math.log(p) for p in probs if p > 0)
-        depth_balance = entropy / max_entropy if max_entropy else 0.0
-
     factors = {"tick_regularity": round(tick_regularity, 4),
-               "classification_rate": round(classification_rate, 4),
-               "depth_balance": round(depth_balance, 4),
+               "signal_completeness": round(signal_completeness, 4),
+               "unique_signals": len(signal_names),
                "total_ticks": total_ticks,
                "classified_count": classified_count,
                "depth_distribution": depth_dist}
@@ -725,8 +772,12 @@ async def _grade_awareness(
                 "sample_count": total_ticks,
                 "reason": f"insufficient data ({total_ticks} ticks, need {_MIN_SAMPLES['awareness']})"}
 
-    score = (tick_regularity * 0.3 + classification_rate * 0.4
-             + depth_balance * 0.3) * 100
+    available = [(tick_regularity, 0.6), (signal_completeness, 0.4)]
+    score = _score_with_zero_fill(available, max_nulls=0)
+    if score is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_ticks,
+                "reason": "factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
             "factors": factors, "sample_count": total_ticks}
@@ -783,8 +834,12 @@ async def _grade_reflection(
                 "sample_count": total_obs,
                 "reason": f"insufficient data ({total_obs} observations, need {_MIN_SAMPLES['reflection']})"}
 
-    score = (volume_score * 0.25 + influence_rate * 0.5
-             + type_diversity * 0.25) * 100
+    available = [(volume_score, 0.25), (influence_rate, 0.5), (type_diversity, 0.25)]
+    score = _score_with_zero_fill(available, max_nulls=1)
+    if score is None:
+        return {"grade": None, "score": None, "factors": factors,
+                "sample_count": total_obs,
+                "reason": "too many factors unavailable"}
 
     return {"grade": _score_to_grade(score), "score": round(score, 1),
             "factors": factors, "sample_count": total_obs}

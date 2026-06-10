@@ -448,7 +448,8 @@ call_sites:
     - openrouter-deepseek-v4
     - groq-free
     default_paid: true
-    description: Extract reusable procedures from interaction outcomes
+    description: Judge + store procedures from struggle detection and extraction
+      pipeline candidates
   40_ego_focus_selection:
     chain:
     - groq-free

@@ -221,8 +221,14 @@ def _local_filename(filename: str) -> str:
 
 
 def _load_yaml_local(filename: str) -> dict:
-    """Read the .local.yaml overlay for a config file. Returns {} if none."""
-    path = _CONFIG_DIR / _local_filename(filename)
+    """Read the .local.yaml overlay for a config file. Returns {} if none.
+
+    Checks user config dir first (~/.genesis/config/), falls back to
+    repo config/ for backwards compatibility with existing installs.
+    """
+    local_name = _local_filename(filename)
+    user_path = _USER_CONFIG_DIR / local_name
+    path = user_path if user_path.is_file() else _CONFIG_DIR / local_name
     if not path.is_file():
         return {}
     try:
@@ -246,9 +252,17 @@ def _load_yaml_merged(filename: str) -> dict:
     return _deep_merge(base, local)
 
 
+_USER_CONFIG_DIR = Path.home() / ".genesis" / "config"
+
+
 def _atomic_yaml_write(filename: str, data: dict) -> Path:
-    """Write YAML atomically via tempfile + rename. Returns the written path."""
-    path = _CONFIG_DIR / filename
+    """Write YAML atomically to user config dir (~/.genesis/config/).
+
+    Runtime config writes go to the user directory, not the repo tree,
+    so git status stays clean and user settings don't leak into PRs.
+    """
+    _USER_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = _USER_CONFIG_DIR / filename
     tmp_fd, tmp_path = tempfile.mkstemp(
         dir=str(path.parent), suffix=".yaml.tmp",
     )
@@ -650,7 +664,10 @@ async def _impl_settings_get(domain: str) -> dict:
         if isinstance(wrapper, dict):
             wrapper.pop(field, None)
     local_file = _local_filename(entry.config_filename)
-    has_local = (_CONFIG_DIR / local_file).is_file()
+    has_local = (
+        (_USER_CONFIG_DIR / local_file).is_file()
+        or (_CONFIG_DIR / local_file).is_file()
+    )
     result = {
         "domain": domain,
         "config": config,
@@ -659,7 +676,7 @@ async def _impl_settings_get(domain: str) -> dict:
         "source_file": f"config/{entry.config_filename}",
     }
     if has_local:
-        result["local_override_file"] = f"config/{local_file}"
+        result["local_override_file"] = f"~/.genesis/config/{local_file}"
     return result
 
 

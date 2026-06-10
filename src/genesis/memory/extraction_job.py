@@ -230,6 +230,32 @@ async def run_extraction_cycle(
                     session_id, chunk_start, chunk_end, exc_info=True,
                 )
 
+            # Stream 2: procedure candidate extraction (same pattern as
+            # references). Only in normal mode — procedure candidates are
+            # a new extraction type flagged by the SLM, routed to the Judge
+            # LLM for validation. Each Judge call is timeout-guarded.
+            if not reference_only_mode:
+                try:
+                    from genesis.memory.procedure_extraction import (
+                        extract_procedures_from_chunk,
+                    )
+
+                    proc_count = await extract_procedures_from_chunk(
+                        result.extractions,
+                        db=db,
+                        router=router,
+                        source_session_id=cc_session_id,
+                        chunk_context=format_chunk_for_extraction(chunk),
+                    )
+                    summary["procedures_extracted"] = (
+                        summary.get("procedures_extracted", 0) + proc_count
+                    )
+                except Exception:
+                    logger.warning(
+                        "Procedure extraction failed on session %s chunk %d-%d",
+                        session_id, chunk_start, chunk_end, exc_info=True,
+                    )
+
             if reference_only_mode:
                 # Skip the episodic storage loop — history mining uses this
                 # path to populate the reference store without duplicating
@@ -241,6 +267,11 @@ async def run_extraction_cycle(
 
             # Store each extraction with provenance
             for extraction in result.extractions:
+                # procedure_candidate extractions are routed to the Judge
+                # (Stream 2 above). Don't also store them as episodic memory.
+                if extraction.extraction_type == "procedure_candidate":
+                    continue
+
                 # ── Source-overlap verification ──
                 # Check that extraction content actually appears in the
                 # source transcript chunk. Demote confidence for ungrounded
@@ -391,6 +422,52 @@ async def run_extraction_cycle(
                     db, session_id,
                     keywords=all_keywords, topic=latest_topic,
                 )
+
+            # Stream 1: struggle detection (runs once per session, after all
+            # chunks). Parses the full JSONL into an action spine, scores
+            # struggle heuristics, and routes to Judge if above threshold.
+            try:
+                import asyncio
+
+                from genesis.learning.procedural.struggle_detector import (
+                    STRUGGLE_THRESHOLD,
+                    build_action_spine,
+                    score_struggle,
+                )
+
+                spine = build_action_spine(transcript_path)
+                struggle_score = score_struggle(spine)
+                if struggle_score >= STRUGGLE_THRESHOLD:
+                    from genesis.learning.procedural.judge import (
+                        JUDGE_TIMEOUT_SECS,
+                        judge_struggle_procedure,
+                    )
+
+                    proc_id = await asyncio.wait_for(
+                        judge_struggle_procedure(
+                            db, spine, struggle_score, transcript_path, router,
+                            source_session_id=cc_session_id,
+                        ),
+                        timeout=JUDGE_TIMEOUT_SECS,
+                    )
+                    if proc_id:
+                        summary["struggle_procedures"] = (
+                            summary.get("struggle_procedures", 0) + 1
+                        )
+                    logger.info(
+                        "Struggle detection for %s: score=%.2f, stored=%s",
+                        session_id, struggle_score, proc_id is not None,
+                    )
+            except TimeoutError:
+                logger.warning(
+                    "Struggle judge timed out for session %s", session_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Struggle detection failed for session %s",
+                    session_id, exc_info=True,
+                )
+
         summary["sessions_processed"] += 1
 
     # Cross-session connection discovery (vector-based, no LLM)
@@ -425,13 +502,12 @@ async def _find_extractable_sessions(
     This ensures interactive CLI sessions (which bypass cc_sessions registration)
     are still discoverable for extraction.
     """
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     # Phase 1: Auto-register untracked transcripts from filesystem
     if transcript_dir.is_dir():
         try:
-            known_cursor = await db.execute(
-                "SELECT cc_session_id FROM cc_sessions WHERE cc_session_id IS NOT NULL"
-            )
-            known_ids = {row[0] for row in await known_cursor.fetchall()}
+            known_ids = await sessions_crud.get_all_cc_session_ids(db)
 
             for jsonl_file in transcript_dir.glob("*.jsonl"):
                 session_id = jsonl_file.stem
@@ -450,15 +526,12 @@ async def _find_extractable_sessions(
                     jsonl_file.stat().st_mtime, tz=UTC,
                 )
                 mtime_iso = mtime.isoformat()
-                await db.execute(
-                    "INSERT OR IGNORE INTO cc_sessions "
-                    "(id, cc_session_id, session_type, model, source_tag, "
-                    " status, started_at, last_activity_at) "
-                    "VALUES (?, ?, 'foreground', 'unknown', 'foreground', "
-                    " 'completed', ?, ?)",
-                    (session_id, session_id, mtime_iso, mtime_iso),
+                await sessions_crud.register_from_filesystem(
+                    db,
+                    id=session_id,
+                    cc_session_id=session_id,
+                    started_at=mtime_iso,
                 )
-            await db.commit()
         except Exception:
             logger.warning(
                 "Filesystem transcript discovery failed — falling back to DB-only",
@@ -466,20 +539,9 @@ async def _find_extractable_sessions(
             )
 
     # Phase 2: Query all extractable sessions (including newly registered ones)
-    cursor = await db.execute(
-        """
-        SELECT id, cc_session_id, source_tag, last_extracted_at,
-               last_extracted_line, started_at
-        FROM cc_sessions
-        WHERE source_tag IN ({})
-          AND status IN ('active', 'completed', 'checkpointed')
-        ORDER BY started_at DESC
-        """.format(",".join("?" for _ in _EXTRACTABLE_SOURCE_TAGS)),
-        tuple(_EXTRACTABLE_SOURCE_TAGS),
+    return await sessions_crud.get_extractable(
+        db, source_tags=_EXTRACTABLE_SOURCE_TAGS,
     )
-    rows = await cursor.fetchall()
-    columns = [d[0] for d in cursor.description]
-    return [dict(zip(columns, row, strict=True)) for row in rows]
 
 
 async def _update_watermark(
@@ -488,13 +550,14 @@ async def _update_watermark(
     line_number: int,
 ) -> None:
     """Update the extraction watermark for a session."""
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     now_iso = datetime.now(UTC).isoformat()
-    await db.execute(
-        "UPDATE cc_sessions SET last_extracted_at = ?, last_extracted_line = ? "
-        "WHERE id = ?",
-        (now_iso, line_number, session_id),
+    await sessions_crud.update_extraction_watermark(
+        db, session_id,
+        last_extracted_line=line_number,
+        last_extracted_at=now_iso,
     )
-    await db.commit()
 
 
 async def _update_session_index(
@@ -510,23 +573,20 @@ async def _update_session_index(
     latest chunk's topic (most recent = most complete context).
     Appends to existing keywords rather than overwriting.
     """
+    from genesis.db.crud import cc_sessions as sessions_crud
+
     # Read existing keywords to merge
-    cursor = await db.execute(
-        "SELECT keywords FROM cc_sessions WHERE id = ?", (session_id,),
-    )
-    row = await cursor.fetchone()
+    existing_str = await sessions_crud.get_keywords(db, session_id)
     existing = set()
-    if row and row[0]:
-        existing = {k.strip() for k in row[0].split(",") if k.strip()}
+    if existing_str:
+        existing = {k.strip() for k in existing_str.split(",") if k.strip()}
 
     merged = sorted(existing | keywords)
     keywords_str = ", ".join(merged)
 
-    await db.execute(
-        "UPDATE cc_sessions SET topic = ?, keywords = ? WHERE id = ?",
-        (topic, keywords_str, session_id),
+    await sessions_crud.update_topic_and_keywords(
+        db, session_id, topic=topic, keywords=keywords_str,
     )
-    await db.commit()
     logger.info(
         "Session %s indexed: topic=%r, keywords=%d",
         session_id[:8], topic[:60], len(merged),

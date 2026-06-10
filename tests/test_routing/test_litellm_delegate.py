@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from genesis.routing.litellm_delegate import (
+    _DEFAULT_TIMEOUT_S,
     LiteLLMDelegate,
     _build_model_string,
     _resolve_api_key,
@@ -203,6 +204,48 @@ async def test_call_passes_api_key():
 
         call_args = mock_litellm.acompletion.call_args
         assert call_args.kwargs["api_key"] == "test-key-xyz"
+
+
+# ── Timeout default ───────────────────────────────────────────────────────
+
+
+async def test_call_passes_default_timeout():
+    """acompletion should receive timeout=_DEFAULT_TIMEOUT_S by default."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+        )
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["timeout"] == _DEFAULT_TIMEOUT_S
+
+
+async def test_call_allows_timeout_override():
+    """Caller-supplied timeout should override the default."""
+    config = _config()
+    delegate = LiteLLMDelegate(config)
+    mock_resp = _mock_response()
+
+    with patch("genesis.routing.litellm_delegate.litellm") as mock_litellm:
+        mock_litellm.acompletion = AsyncMock(return_value=mock_resp)
+        mock_litellm.completion_cost.return_value = 0.0
+
+        await delegate.call(
+            "test-provider", "llama-3.3-70b-versatile",
+            [{"role": "user", "content": "Hi"}],
+            timeout=300,
+        )
+
+        call_kwargs = mock_litellm.acompletion.call_args.kwargs
+        assert call_kwargs["timeout"] == 300
 
 
 # ── Error classification ───────────────────────────────────────────────────

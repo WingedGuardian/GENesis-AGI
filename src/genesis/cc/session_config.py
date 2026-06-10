@@ -36,6 +36,7 @@ _MCP_PROFILES: dict[str, list[str]] = {
     "sentinel": ["genesis-health", "genesis-memory", "genesis-outreach"],
     "campaign": ["genesis-health", "genesis-memory", "genesis-outreach"],
     "interop": ["genesis-health", "genesis-memory"],
+    "mail": ["genesis-outreach"],  # Perimeter: outreach only, no memory/health
 }
 
 
