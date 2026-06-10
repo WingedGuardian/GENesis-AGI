@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -153,6 +154,23 @@ def background_session_dir() -> str:
     """
     _BACKGROUND_SESSION_DIR.mkdir(parents=True, exist_ok=True)
     return str(_BACKGROUND_SESSION_DIR)
+
+
+def cc_project_key(working_dir: str) -> str:
+    """Claude Code's project-key encoding for a working-directory path.
+
+    CC names each project's transcript directory under
+    ``~/.claude/projects/`` by replacing every non-alphanumeric character
+    in the absolute path with ``-`` (consecutive separators are NOT
+    collapsed).  e.g. ``/home/u/.genesis/background-sessions`` →
+    ``-home-u--genesis-background-sessions`` (the ``/.`` becomes ``--``).
+
+    Replicating the FULL encoding (not just ``/`` → ``-``) matters because
+    the background-session dir is ``~/.genesis/...``: the leading dot must
+    be encoded too, or the derived transcript path is wrong and downstream
+    readers (audit, bookmark enrichment) silently miss the transcript.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", working_dir)
 
 
 @dataclass(frozen=True)

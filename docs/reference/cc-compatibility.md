@@ -9,15 +9,20 @@
 > through 8 evaluation lenses (see analyzer prompt for details). This document
 > is updated manually after each evaluation.
 >
-> Created: 2026-03-09 | Last updated: 2026-06-02
+> Created: 2026-03-09 | Last updated: 2026-06-10
 
 ---
 
 ## Current CC Version
 
-**Installed:** Claude Code 2.1.160 (upgraded 2026-06-01 from 2.1.138 — enables Opus 4.8)
-**Pin in scripts:** `CC_VERSION=2.1.160` in `scripts/install.sh` and `scripts/host-setup.sh`
-**Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+)
+**Installed:** Claude Code 2.1.170 — **container + host VM** (both upgraded 2026-06-10 from 2.1.160 — adds Fable 5 access + inherited-env transcript fix). Container via npm (`--prefix /usr/local`); host via native installer (`claude install 2.1.170`).
+**Pin in scripts:** `CC_VERSION=2.1.170` in `scripts/install.sh` and `scripts/host-setup.sh`
+**Minimum required by Genesis:** Not yet formalized (all current code works with 2.0+).
+`requiredMinimumVersion`/`requiredMaximumVersion` (2.1.163) were evaluated as a way
+to enforce a floor, but they are **managed-settings-only** (read only from
+`/etc/claude-code/managed-settings.json` on Linux — never from user/project
+`settings.json`). Formalizing a floor would require a system-level managed-settings
+file + install-script automation; deferred as a separate follow-up.
 
 ---
 
@@ -154,6 +159,13 @@ When a new CC version is released, run through this:
 | 2.1.157 | — | Fix tmux copy-on-select regression | Relevant for Linux/tmux users |
 | 2.1.159 | 2026-06-01 | Opus 4.8 stable | Tested — all 8 integration tests passed; CCInvoker E2E verified |
 | 2.1.160 | 2026-06-01 | Current `latest` tag (promoted from `next` mid-upgrade) | **Upgraded to this version.** Auto-updater bumped from 2.1.159 in flight. Re-verified E2E via CCInvoker for Sonnet and Opus 4.8. |
+| 2.1.161 | 2026-06-10 | Fixes `--output-format json`/`text` stdout corruption from background subagents; parallel-tool failures no longer cancel sibling calls; background sessions no longer boot a stale model from daemon env; `claude mcp` secret redaction | **Benefits Genesis** (json output + per-session `--model` pinning). No action. |
+| 2.1.162 | 2026-06-10 | `claude agents --json waitingFor`; WebFetch permission precedence for preapproved domains; MCP sub-1000 ms timeout fix; read-only config-dir hang fix | Additive/fixes. Genesis blocks WebFetch via a hook, not `WebFetch()` rules — no impact. |
+| 2.1.163 | 2026-06-10 | `requiredMinimumVersion`/`requiredMaximumVersion` (**managed-settings only**); `/plugin list`; Stop/SubagentStop hooks gain `additionalContext`; hook `if:"Bash(...)"` now matches inside subshells/backticks | Version floor noted (managed-only — deferred, see Current CC Version). Genesis hooks use tool-name `matcher`s, not `if:` command conditions — `if:` change does not apply. |
+| 2.1.165, 2.1.167–2.1.168 | — | Bug fixes and reliability improvements | No action |
+| 2.1.166 | 2026-06-10 | `fallbackModel` (up to 3 fallbacks); glob patterns in deny tool-name position; hardened cross-session `SendMessage` authority; thinking-disable on think-by-default models | `fallbackModel` deliberately **not** adopted — silent auto-degrade conflicts with "quality over cost." Glob deny redundant with `bash_safety_hook.sh`. |
+| 2.1.169 | 2026-06-10 | `--safe-mode`/`CLAUDE_CODE_SAFE_MODE`; `/cd`; `disableBundledSkills`; `--mcp-config` + managed-MCP enforcement fixes; background sessions preserve `--bare`/`--ide` across retire→wake; project-env (`ANTHROPIC_MODEL`) honored on pre-warmed workers | Fixes touch flags Genesis uses (`--mcp-config`, `--bare`). Smoke-tested post-upgrade. No config change. |
+| 2.1.170 | 2026-06-10 | **Claude Fable 5 (Mythos-class)** model access; fixed sessions not saving transcripts (and missing from `--resume`) when launched from a shell that inherited CC env vars | **Upgraded to this version.** Fable 5 → separate eval follow-up (background sessions pin `--model`, so no leak). Transcript fix benefits Genesis background sessions (inherited-env spawn path). |
 
 ---
 
@@ -194,19 +206,30 @@ Running `sudo npm install -g` without `--prefix /usr/local` lands in `/usr/lib/`
 does not update the `claude` binary on PATH. **`scripts/install.sh` now passes
 `--prefix /usr/local` automatically** — manual upgrades still need it.
 
-**Host VM variation:** The host VM uses CC's **native installer** (stores versioned
-binaries in `~/.local/share/claude/versions/`). On host VMs with this setup, install
-without `--prefix`:
+**Host VM variation (verified 2026-06-10):** The host VM uses CC's **native
+installer** — NOT npm. Versioned binaries live in `~/.local/share/claude/versions/`
+with `~/.local/bin/claude` a symlink to the active version. **Do NOT `npm install`
+on the host** — npm and the native installer conflict. Update to a specific version
+with the native installer's own command (use the full path, since `~/.local/bin` is
+usually not on the host's login/SSH PATH):
 ```bash
-sudo env "PATH=$PATH" npm install -g @anthropic-ai/claude-code@<version>
+"$HOME/.local/bin/claude" install <version>   # e.g. 2.1.170 — repoints the symlink, keeps old versions for rollback
+"$HOME/.local/bin/claude" --version           # verify
 ```
-The `env "PATH=$PATH"` is needed when npm is installed via nvm (not in sudo's secure
-PATH). If the native installer's postinstall fails to download the new binary,
-manually update the symlink:
+Rollback is just `claude install <old-version>` (prior versions remain in
+`versions/`). `DISABLE_AUTOUPDATER=1` is set on the host, so updates are manual.
+
+**Host CC reachability — important:** The host's login/SSH shell PATH does NOT
+include `~/.local/bin`, so a bare `claude --version` over SSH (and the Guardian
+gateway's `version` op) reports `"unavailable"` even when CC is installed and fine.
+What matters is that the **`genesis-guardian.service` systemd unit explicitly sets
+`PATH=$HOME/.local/bin:...`**, so Guardian diagnosis (`cc.path: "claude"`)
+resolves the binary correctly. Verify the real state with:
 ```bash
-ln -sf ~/.nvm/versions/node/<version>/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe \
-  ~/.local/bin/claude
+env -i PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" claude --version
 ```
+The host CC binary is managed separately from the Genesis→Guardian *code* sync
+(`redeploy`/`update` gateway verbs sync code only, never the CC binary).
 
 ### Auto-Updater Suppression Requires User-Level Settings
 
