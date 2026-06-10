@@ -44,7 +44,7 @@ class VoiceAssistantWebSocket : public Component {
   
   bool is_running() const { return this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING; }
   bool is_connected() const { return this->websocket_client_ != nullptr && esp_websocket_client_is_connected(this->websocket_client_); }
-  bool is_bot_speaking() const;  // Check if bot is currently speaking (within 500ms of last audio)
+  bool is_bot_speaking() const;  // Check if bot is currently speaking (within 1500ms of last audio)
   
   void set_state_callback(std::function<void(VoiceAssistantWebSocketState)> &&callback) {
     this->state_callback_ = std::move(callback);
@@ -55,6 +55,8 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> *get_disconnected_trigger() { return &this->disconnected_trigger_; }
   Trigger<> *get_error_trigger() { return &this->error_trigger_; }
   Trigger<> *get_stopped_trigger() { return &this->stopped_trigger_; }
+  Trigger<> *get_bot_started_speaking_trigger() { return &this->bot_started_speaking_trigger_; }
+  Trigger<> *get_bot_stopped_speaking_trigger() { return &this->bot_stopped_speaking_trigger_; }
 
  protected:
   void connect_websocket_();
@@ -83,6 +85,9 @@ class VoiceAssistantWebSocket : public Component {
   Trigger<> disconnected_trigger_{};
   Trigger<> error_trigger_{};
   Trigger<> stopped_trigger_{};
+  Trigger<> bot_started_speaking_trigger_{};
+  Trigger<> bot_stopped_speaking_trigger_{};
+  bool was_bot_speaking_{false};  // For edge detection in loop()
   
   // Audio buffers
   std::vector<uint8_t> input_buffer_;

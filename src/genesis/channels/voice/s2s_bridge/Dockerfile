@@ -104,7 +104,8 @@ RUN \
     && cp -r /tmp/site-packages/* "$PYTHON_SITE"/ \
     && rm -rf /tmp/site-packages
 
-# Copy application code
+# Copy application code (ARG invalidates cache on rebuild)
+ARG CACHE_BUST=1
 COPY app/ /app/
 
 # Copy root filesystem

@@ -121,11 +121,18 @@ void VoiceAssistantWebSocket::loop() {
     }
   }
   
-  // Audio input is handled via callback (on_microphone_data_)
-  // No need to poll here
-  
-  // Audio output is handled directly in process_received_audio_()
-  // No queue processing needed here
+  // Bot speaking edge detection — fire triggers on state transitions
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    bool speaking_now = this->is_bot_speaking();
+    if (speaking_now && !this->was_bot_speaking_) {
+      this->bot_started_speaking_trigger_.trigger();
+    } else if (!speaking_now && this->was_bot_speaking_) {
+      this->bot_stopped_speaking_trigger_.trigger();
+    }
+    this->was_bot_speaking_ = speaking_now;
+  } else {
+    this->was_bot_speaking_ = false;
+  }
 }
 
 void VoiceAssistantWebSocket::dump_config() {
@@ -516,12 +523,14 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
 }
 
 bool VoiceAssistantWebSocket::is_bot_speaking() const {
-  // Bot is considered speaking if we received audio within the last 500ms
+  // Bot is considered speaking if we received audio within the last 1500ms.
+  // 1500ms (not 500ms) to prevent false "stopped speaking" during brief gaps
+  // in OpenAI's audio stream (network jitter, processing pauses).
   if (this->last_speaker_audio_time_ == 0) {
     return false;  // No audio received yet
   }
   uint32_t time_since_last_audio = millis() - this->last_speaker_audio_time_;
-  return time_since_last_audio < 500;  // 500ms threshold
+  return time_since_last_audio < 1500;
 }
 
 void VoiceAssistantWebSocket::interrupt() {

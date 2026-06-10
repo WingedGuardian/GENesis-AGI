@@ -150,7 +150,12 @@ class Application:
         pass
 
     async def _ensure_openai_service(self, client_id: str | None = None):
-        """Create a new OpenAI service instance for a client.
+        """Ensure the OpenAI service is ready for a client.
+
+        On first call (startup): creates a new service instance, registers tools.
+        On subsequent calls (client connect): resets the existing service's
+        conversation to get a fresh OpenAI session (refreshes the 60-min clock)
+        while keeping the same service object in the pipeline.
 
         Args:
             client_id: Optional client ID for session management
@@ -159,22 +164,42 @@ class Application:
             self._pipeline_lock = asyncio.Lock()
 
         async with self._pipeline_lock:
-            if client_id is None:
-                logger.warning("⚠️ No client_id provided to _ensure_openai_service")
-
-            # Create new session
-            if client_id:
-                logger.info(f"🆕 Creating new OpenAI Session for Client {client_id}...")
-            else:
-                logger.info("🆕 Creating new OpenAI Session...")
-
-            # Cache context from old service before creating new one
-            if client_id and self.openai_service is not None:
+            # Service already exists (pipeline holds reference) — reconnect to OpenAI.
+            # The service was disconnected either at startup (deferred connection)
+            # or when the previous client left.
+            if self.openai_service is not None and client_id is not None:
                 try:
                     self.session_manager.cleanup_before_new_session(client_id)
-                    logger.debug(f"Cached context from previous session for client {client_id}")
                 except Exception as e:
-                    logger.warning(f"⚠️ Error caching context from old service for client {client_id}: {e}")
+                    logger.warning(f"⚠️ Error caching context: {e}")
+
+                if self.openai_service._context is not None:
+                    # Context exists from a previous conversation — full reset
+                    # (disconnects, processes completed calls, reconnects)
+                    logger.info(f"🔄 Resetting OpenAI session for client {client_id}...")
+                    try:
+                        await self.openai_service.reset_conversation()
+                        logger.info(f"✅ OpenAI session reset for client {client_id}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Session reset failed, reconnecting: {e}")
+                        # Fallback: just reconnect (session.created will re-send config)
+                        await self.openai_service._connect()
+                else:
+                    # No context yet (first-ever client, or service was just created).
+                    # Just connect — session.created fires on every new WS connection
+                    # and triggers _update_settings() to send tools/instructions.
+                    logger.info(f"🔗 Connecting OpenAI session for client {client_id}...")
+                    await self.openai_service._connect()
+                    logger.info(f"✅ OpenAI session connected for client {client_id}")
+
+                self.session_manager.set_current_service(client_id, self.openai_service)
+                return self.openai_service
+
+            # First call or reset failed — create a brand new service
+            if client_id:
+                logger.info(f"🆕 Creating new OpenAI service for client {client_id}...")
+            else:
+                logger.info("🆕 Creating new OpenAI service (initial)...")
 
             # Create session properties with audio configuration
             from pipecat.services.openai.realtime.events import (
@@ -227,15 +252,15 @@ class Application:
                 if not tool_name:
                     continue
 
-                async def genesis_tool_handler(params, _name=tool_name):
+                async def genesis_tool_handler(params):
                     """Dispatch tool call to Genesis via HTTP."""
                     try:
                         result = await self.genesis_tool_service.call_tool(
-                            _name, params.arguments,
+                            params.function_name, params.arguments,
                         )
                         await params.result_callback(json.dumps(result))
                     except Exception as exc:
-                        logger.error("Genesis tool %s failed: %s", _name, exc)
+                        logger.error("Genesis tool %s failed: %s", params.function_name, exc)
                         await params.result_callback(
                             json.dumps({"error": str(exc)}),
                         )
@@ -259,12 +284,32 @@ class Application:
         """Run the application."""
         await self.initialize()
 
-        # Create initial OpenAI service (will be replaced per connection)
+        # Create initial OpenAI service — needed by pipeline at build time.
+        # The service auto-connects during pipeline start (StartFrame → start() → _connect()).
+        # A background task disconnects after pipeline is ready, deferring the 60-min clock.
         await self._ensure_openai_service()
 
         # Build pipeline - based on pipecat-examples, one pipeline handles all connections
         # The transport manages multiple connections internally
         self._build_pipeline_for_transport(self.websocket_transport, "server")
+
+        # Background task: wait for pipeline to start, then disconnect from OpenAI.
+        # StartFrame → start() → _connect() happens during runner.run(). We can't
+        # disconnect before that (nothing to disconnect) or synchronously after (run blocks).
+        # Instead, schedule a deferred disconnect that waits for the WS to be established.
+        async def _deferred_disconnect():
+            """Wait for pipeline to connect to OpenAI, then disconnect to save the 60-min clock."""
+            for _ in range(30):  # Wait up to 15s for connection
+                await asyncio.sleep(0.5)
+                if self.openai_service and self.openai_service._websocket:
+                    await asyncio.sleep(1)  # Let session.created + _update_settings() complete
+                    async with self._pipeline_lock:
+                        # Only disconnect if no client has connected in the meantime
+                        if self.openai_service and self.openai_service._websocket:
+                            await self.openai_service._disconnect()
+                            logger.info("💤 OpenAI session deferred — will connect on first client")
+                    return
+            logger.warning("⚠️ Deferred disconnect: service never connected (pipeline may not have started)")
 
         # Setup WebSocket event handlers
         async def on_client_connected(client_id: str):
@@ -273,12 +318,20 @@ class Application:
             if self.audio_recording_service:
                 self.audio_recording_service.start_new_session(client_id)
 
-        def on_client_disconnected(client_id: str):
+        async def on_client_disconnected(client_id: str):
             """Handle client disconnection."""
             if self.session_manager:
                 self.session_manager.handle_client_disconnect(client_id, self.openai_service)
             if self.audio_recording_service:
                 self.audio_recording_service.stop_recording()
+            # Disconnect from OpenAI to stop the 60-min session clock.
+            # Acquire lock to prevent race with concurrent on_client_connected.
+            if self.openai_service is not None:
+                if self._pipeline_lock is None:
+                    self._pipeline_lock = asyncio.Lock()
+                async with self._pipeline_lock:
+                    await self.openai_service._disconnect()
+                    logger.info("💤 OpenAI session closed — client disconnected")
 
         # Function to get OpenAI service for a client
         def get_openai_service_for_client(client_id: str) -> OpenAIRealtimeLLMService | None:
@@ -293,6 +346,9 @@ class Application:
             on_client_disconnected_callback=on_client_disconnected,
             openai_service_getter=get_openai_service_for_client
         )
+
+        # Schedule deferred disconnect — runs concurrently with runner.run()
+        asyncio.create_task(_deferred_disconnect())
 
         try:
             # Start the pipeline runner - this will start the WebSocket server

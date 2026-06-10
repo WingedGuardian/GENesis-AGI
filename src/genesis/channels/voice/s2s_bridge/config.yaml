@@ -1,5 +1,5 @@
 name: Genesis Voice Bridge
-version: "0.2.0"
+version: "0.2.1"
 slug: genesis_voice_bridge
 description: Bidirectional voice bridge using OpenAI Realtime API — connects Voice PE to Genesis via WebSocket
 url: https://github.com/WingedGuardian/GENesis-AGI

@@ -256,7 +256,11 @@ binary_sensor:
           then:
             - button.press: factory_reset_button
     on_multi_click:
-      # Simple Click: Start/Stop Voice Assistant
+      # Simple Click: Abort things in priority order, or start voice assistant
+      #   1. Voice Assistant running → stop it
+      #   2. Announcement playing → stop announcement
+      #   3. Media playing → pause media
+      #   4. Otherwise → start voice assistant (if not muted)
       - timing:
           - ON for at most 1s
           - OFF for at least 0.25s
@@ -860,7 +864,7 @@ power_supply:
     pin: GPIO45
 
 sensor:
-  # The dial (rotary encoder) - for volume control
+  # The dial. Used to control volume and hue of the LED ring.
   - platform: rotary_encoder
     id: dial
     pin_a: GPIO16
@@ -868,15 +872,31 @@ sensor:
     resolution: 2
     on_clockwise:
       - lambda: id(dial_touched) = true;
-      - script.execute:
-          id: control_volume
-          increase_volume: true
+      - if:
+          condition:
+            binary_sensor.is_off: center_button
+          then:
+            - script.execute:
+                id: control_volume
+                increase_volume: true
+          else:
+            - script.execute:
+                id: control_hue
+                increase_hue: true
       - script.execute: control_leds
     on_anticlockwise:
       - lambda: id(dial_touched) = true;
-      - script.execute:
-          id: control_volume
-          increase_volume: false
+      - if:
+          condition:
+            binary_sensor.is_off: center_button
+          then:
+            - script.execute:
+                id: control_volume
+                increase_volume: false
+          else:
+            - script.execute:
+                id: control_hue
+                increase_hue: false
       - script.execute: control_leds
 
 event:
@@ -897,6 +917,10 @@ script:
   - id: control_leds
     then:
       - lambda: |
+          if (id(voice_kit_component).is_failed()) {
+            id(control_leds_voice_kit_startup_failed).execute();
+            return;
+          }
           if (id(improv_ble_in_progress)) {
             id(control_leds_improv_ble_state).execute();
           } else if (id(init_in_progress)) {
@@ -975,33 +999,17 @@ script:
           effect: "Twinkle"
 
   # Script executed when the voice assistant is idle
-  # If voice assistant is running AND connected, show blue pulse; otherwise turn off
+  # Idle = LEDs off (matches stock firmware behavior)
+  # The voice_assistant_websocket component doesn't expose conversation state
+  # (listening/thinking/replying), so we keep idle dark to avoid confusion.
   - id: control_leds_voice_assistant_idle_phase
     then:
+      - light.turn_off: voice_assistant_leds
       - if:
           condition:
-            and:
-              - voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
-              - voice_assistant_websocket.is_connected:
-                  id: voice_assistant_ws
+            light.is_on: led_ring
           then:
-            # Voice assistant is active and connected - show blue pulse
-            - light.turn_on:
-                brightness: 66%
-                red: 0%
-                green: 0%
-                blue: 100%
-                id: voice_assistant_leds
-                effect: "Active Pulse"
-          else:
-            # Voice assistant is not active or not connected - turn off
-            - light.turn_off: voice_assistant_leds
-            - if:
-                condition:
-                  light.is_on: led_ring
-                then:
-                  light.turn_on: led_ring
+            light.turn_on: led_ring
 
   # Script executed when the voice assistant is waiting for a command
   - id: control_leds_voice_assistant_waiting_for_command_phase
@@ -1142,6 +1150,65 @@ script:
           value: 0
       - script.execute: control_leds
 
+  # Script executed when the hue is increased/decreased from the dial (center button held + dial)
+  - id: control_hue
+    mode: restart
+    parameters:
+      increase_hue: bool  # True: Increase hue / False: Decrease hue.
+    then:
+      - delay: 16ms
+      - if:
+          condition:
+            lambda: return(abs(int(id(dial).state)) > 3 || id(color_changed));
+          then:
+            - lambda: |
+                id(color_changed) = true;
+                auto light_color = id(voice_assistant_leds).current_values;
+                int hue = 0;
+                float saturation = 0;
+                float value = 0;
+                rgb_to_hsv( light_color.get_red(),
+                            light_color.get_green(),
+                            light_color.get_blue(),
+                            hue,
+                            saturation,
+                            value);
+                if (increase_hue) {
+                  hue = (hue + 10) % 360;
+                } else {
+                  hue = (hue + 350) % 360;
+                }
+                if (saturation < 0.05) {
+                  saturation = 1;
+                }
+                float red = 0;
+                float green = 0;
+                float blue = 0;
+                hsv_to_rgb( hue,
+                            saturation,
+                            value,
+                            red,
+                            green,
+                            blue);
+                id(voice_assistant_leds).make_call().set_rgb(red, green, blue).perform();
+      - wait_until:
+          binary_sensor.is_off: center_button
+      - lambda: |
+          id(dial_touched) = false;
+          // Save the new LED color/state to led_ring, maintaining its brightness and state
+          auto led_ring_call = id(led_ring).make_call();
+          auto va_leds_cv = id(voice_assistant_leds).current_values;
+          led_ring_call.from_light_color_values(va_leds_cv);
+          led_ring_call.set_brightness(id(led_ring).current_values.get_brightness());
+          led_ring_call.set_state(id(led_ring).current_values.is_on());
+          led_ring_call.perform();
+      - sensor.rotary_encoder.set_value:
+          id: dial
+          value: 0
+      - script.execute: control_leds
+      - delay: 500ms
+      - lambda: id(color_changed) = false;
+
   # Script to play a sound file via media player
   # Used for wake word sounds and other audio feedback
   # Based on original Home Assistant Voice implementation
@@ -1210,16 +1277,20 @@ speaker:
     buffer_duration: 100ms
     audio_dac: aic3204_dac
   
-  # Virtual speaker to combine announcement and media streams together into one output
-  # This enables ducking functionality (lowering media volume when voice assistant speaks)
+  # Virtual speaker to combine announcement, media, and voice assistant streams
+  # Three inputs: announcements (wake sounds, TTS), media (music), voice (OpenAI S2S)
+  # Each has its own lifecycle — voice assistant audio must not stop when announcements end
   - platform: mixer
     id: mixing_speaker
     output_speaker: i2s_audio_speaker
     num_channels: 2
+    task_stack_in_psram: true  # Keep mixer task in PSRAM to save heap (matches stock firmware)
     source_speakers:
       - id: announcement_mixing_input
         timeout: never
       - id: media_mixing_input
+        timeout: never
+      - id: voice_mixing_input
         timeout: never
   
   # Resampler for voice assistant announcements (24kHz -> 48kHz)
@@ -1231,9 +1302,11 @@ speaker:
   
   # Resampler for voice assistant audio (24kHz -> 48kHz)
   # Used directly by voice_assistant_websocket component
+  # IMPORTANT: feeds voice_mixing_input (NOT announcement_mixing_input) so the
+  # voice assistant audio path stays alive when announcement sounds finish playing
   - platform: resampler
     id: voice_resampling_speaker
-    output_speaker: announcement_mixing_input
+    output_speaker: voice_mixing_input
     sample_rate: 48000  # Output sample rate
     bits_per_sample: 16
     buffer_duration: 500ms
@@ -1337,37 +1410,39 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # Play wake sound if enabled (for all wake words)
+          # If voice assistant is already running or connecting, handle the
+          # wake word as an interrupt (if bot is speaking) or ignore it.
+          # NEVER stop+restart — that kills the active WS connection and
+          # causes the "Only one client allowed" race on the addon side.
           - if:
               condition:
-                switch.is_on: wake_sound
+                or:
+                  - voice_assistant_websocket.is_running:
+                      id: voice_assistant_ws
+                  - voice_assistant_websocket.is_connected:
+                      id: voice_assistant_ws
               then:
-                - script.execute:
-                    id: play_sound
-                    priority: true
-                    sound_file: !lambda 'return id(wake_word_triggered_sound);'
-                - delay: 300ms
-          # Handle wake word based on bot speaking state
-          - if:
-              condition:
-                voice_assistant_websocket.is_running:
-                  id: voice_assistant_ws
-              then:
-                # Voice assistant is running - check if bot is speaking
+                # Already in a session — only interrupt if bot is speaking
                 - if:
                     condition:
                       voice_assistant_websocket.is_bot_speaking:
                         id: voice_assistant_ws
                     then:
-                      # Bot is speaking - interrupt instead of disconnect
                       - voice_assistant_websocket.interrupt:
                           id: voice_assistant_ws
-                    else:
-                      # Bot not speaking - stop voice assistant (disconnect)
-                      - voice_assistant_websocket.stop:
-                          id: voice_assistant_ws
+                # If bot is not speaking, ignore the wake word — user is
+                # already in a conversation and the mic is active
               else:
-                # Voice assistant not running - start it
+                # Voice assistant not running — start a new session
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: !lambda 'return id(wake_word_triggered_sound);'
+                      - delay: 300ms
                 - voice_assistant_websocket.start:
                     id: voice_assistant_ws
 
@@ -1403,7 +1478,7 @@ voice_assistant_websocket:
   # State callbacks for LED control
   on_connected:
     - lambda: id(init_in_progress) = false;
-    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Set to idle to show blue pulse (only if running)
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};  # Show spinning dots while WS active
     - script.execute: control_leds
     # Apply ducking to media when voice assistant starts
     - mixer_speaker.apply_ducking:
@@ -1411,7 +1486,7 @@ voice_assistant_websocket:
         decibel_reduction: 20  # Lower media volume by 20dB when voice assistant is active
         duration: 0.0s
   on_disconnected:
-    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Back to idle (LEDs off), device is still ready
     - script.execute: control_leds
     # Ensure micro_wake_word continues running after disconnect
     - micro_wake_word.start:
@@ -1422,13 +1497,19 @@ voice_assistant_websocket:
         decibel_reduction: 0
         duration: 1.0s
   on_stopped:
-    - lambda: id(voice_assistant_phase) = ${voice_assist_not_ready_phase_id};
+    - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};  # Back to idle (LEDs off)
     - script.execute: control_leds
     # Restore media volume when voice assistant stops
     - mixer_speaker.apply_ducking:
         id: media_mixing_input
         decibel_reduction: 0
         duration: 1.0s
+  on_bot_started_speaking:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_replying_phase_id};
+    - script.execute: control_leds
+  on_bot_stopped_speaking:
+    - lambda: id(voice_assistant_phase) = ${voice_assist_waiting_for_command_phase_id};
+    - script.execute: control_leds
   on_error:
     - if:
         condition:
@@ -1474,6 +1555,31 @@ text_sensor:
         return {"Idle"};
       }
     update_interval: 5s
+
+select:
+  - platform: template
+    name: "Wake word sensitivity"
+    id: wake_word_sensitivity
+    optimistic: true
+    initial_option: Slightly sensitive
+    restore_value: true
+    entity_category: config
+    options:
+      - Slightly sensitive
+      - Moderately sensitive
+      - Very sensitive
+    on_value:
+      # Sets wake word probability cutoff for hey_genesis model
+      # Values adapted from stock firmware (analogous to hey_jarvis, a 2-word wake phrase)
+      # Lower cutoff = more sensitive (more false accepts), higher cutoff = less sensitive
+      lambda: |-
+        if (x == "Slightly sensitive") {
+          id(hey_genesis).set_probability_cutoff(248);   // 0.97 — model default, lowest false accepts
+        } else if (x == "Moderately sensitive") {
+          id(hey_genesis).set_probability_cutoff(235);   // 0.92 — moderate sensitivity
+        } else if (x == "Very sensitive") {
+          id(hey_genesis).set_probability_cutoff(212);   // 0.83 — highest sensitivity
+        }
 
 button:
   - platform: restart
