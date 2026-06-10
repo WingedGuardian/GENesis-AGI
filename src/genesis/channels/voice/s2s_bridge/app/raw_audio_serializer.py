@@ -2,18 +2,13 @@
 import logging
 
 from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
-from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.serializers.base_serializer import FrameSerializer
 
 logger = logging.getLogger(__name__)
 
 
 class RawAudioSerializer(FrameSerializer):
     """Serializer that treats all binary messages as raw PCM audio."""
-
-    @property
-    def type(self) -> FrameSerializerType:
-        """Get the serialization type - binary for raw audio."""
-        return FrameSerializerType.BINARY
 
     async def deserialize(self, message: bytes) -> InputAudioRawFrame:
         """Deserialize binary message as raw PCM audio frame.

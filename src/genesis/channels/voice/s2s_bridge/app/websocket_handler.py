@@ -1,6 +1,5 @@
 """WebSocket handler for managing WebSocket connections and pipelines."""
 import asyncio
-import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
@@ -102,8 +101,6 @@ class WebSocketHandler:
             port=self.port,
             params=WebsocketServerParams(
                 serializer=serializer,
-                audio_in_enabled=True,
-                audio_out_enabled=True,
             )
         )
 
@@ -242,7 +239,6 @@ class WebSocketHandler:
         transport: WebsocketServerTransport,
         on_client_connected_callback: Callable[[str], Awaitable[None]],
         on_client_disconnected_callback: Callable[[str], Awaitable[None]] | None = None,
-        openai_service_getter: Callable[[str], OpenAIRealtimeLLMService | None] | None = None
     ):
         """
         Setup WebSocket event handlers.
@@ -251,7 +247,6 @@ class WebSocketHandler:
             transport: The WebSocket transport instance
             on_client_connected_callback: Async callback function(client_id) called when client connects
             on_client_disconnected_callback: Optional callback function(client_id) called when client disconnects
-            openai_service_getter: Optional function(client_id) -> OpenAIRealtimeLLMService to get service for interrupt
         """
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport: WebsocketServerTransport, websocket):
@@ -268,62 +263,6 @@ class WebSocketHandler:
                 if client_id:
                     logger.info(f"🔌 Client {client_id} disconnected")
                     await on_client_disconnected_callback(client_id)
-
-        # Handle text messages from client (e.g., interrupt messages)
-        @transport.event_handler("on_client_message")
-        async def on_client_message(transport: WebsocketServerTransport, websocket, message):
-            """Handle text messages from WebSocket client."""
-            try:
-                client_id = self.extract_client_id(websocket)
-
-                # Try to parse as JSON
-                if isinstance(message, bytes):
-                    message = message.decode('utf-8')
-
-                try:
-                    data = json.loads(message)
-                    message_type = data.get("type")
-
-                    if message_type == "interrupt":
-                        logger.info(f"🛑 Interrupt received from client {client_id}")
-
-                        # Get OpenAI service for this client
-                        openai_service = None
-                        if openai_service_getter:
-                            openai_service = openai_service_getter(client_id)
-
-                        if openai_service:
-                            # Send interrupt event to OpenAI Realtime API
-                            # The interrupt event tells OpenAI to stop speaking and listen for user input
-                            try:
-                                # Try to send interrupt event directly to the service
-                                # OpenAI Realtime API expects: {"type": "response.interrupt"}
-                                if hasattr(openai_service, 'send_interrupt'):
-                                    await openai_service.send_interrupt()
-                                    logger.info(f"✅ Interrupt sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, 'push_event'):
-                                    # Send interrupt event via push_event
-                                    await openai_service.push_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt event sent to OpenAI service for client {client_id}")
-                                elif hasattr(openai_service, '_send_event'):
-                                    # Try private method if available
-                                    await openai_service._send_event({"type": "response.interrupt"})
-                                    logger.info(f"✅ Interrupt sent via _send_event to OpenAI service for client {client_id}")
-                                else:
-                                    # Fallback: log warning
-                                    logger.warning(f"⚠️ Could not find method to send interrupt to OpenAI service. Available methods: {[m for m in dir(openai_service) if not m.startswith('__')]}")
-                            except Exception as e:
-                                logger.error(f"❌ Error sending interrupt to OpenAI service: {e}", exc_info=True)
-                        else:
-                            logger.warning(f"⚠️ No OpenAI service found for client {client_id}, cannot send interrupt")
-                    else:
-                        logger.debug(f"📨 Received message from client {client_id}: {message_type}")
-
-                except json.JSONDecodeError:
-                    logger.debug(f"📨 Received non-JSON message from client {client_id}: {message[:100]}")
-
-            except Exception as e:
-                logger.error(f"❌ Error handling client message: {e}", exc_info=True)
 
     async def cleanup(self):
         """Cleanup WebSocket handler resources."""

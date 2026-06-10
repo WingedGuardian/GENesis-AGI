@@ -333,18 +333,10 @@ class Application:
                     await self.openai_service._disconnect()
                     logger.info("💤 OpenAI session closed — client disconnected")
 
-        # Function to get OpenAI service for a client
-        def get_openai_service_for_client(client_id: str) -> OpenAIRealtimeLLMService | None:
-            """Get OpenAI service for a specific client."""
-            if self.session_manager:
-                return self.session_manager.get_current_service(client_id)
-            return self.openai_service
-
         self.websocket_handler.setup_event_handlers(
             transport=self.websocket_transport,
             on_client_connected_callback=on_client_connected,
             on_client_disconnected_callback=on_client_disconnected,
-            openai_service_getter=get_openai_service_for_client
         )
 
         # Schedule deferred disconnect — runs concurrently with runner.run()
