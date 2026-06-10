@@ -337,8 +337,8 @@ async def test_grade_ego_with_data(db):
     assert result["grade"] is not None
     assert result["score"] is not None
     assert result["sample_count"] == 29
-    # 24% approval → score should be low
-    assert result["score"] < 60  # D or F territory
+    # Calibration + execution dominate; approval demoted to 20%
+    assert result["score"] < 70  # C or below
 
 
 async def test_grade_procedural_insufficient_invocations(db):
@@ -356,15 +356,56 @@ async def test_grade_procedural_insufficient_invocations(db):
     assert "insufficient" in result.get("reason", "")
 
 
+async def test_grade_procedural_null_success_rate(db):
+    """Procedural grade returns no-grade when success_rate is null (primary factor)."""
+    dimension_results = {
+        "procedure": {
+            "success_rate": None,
+            "mean_confidence": 0.8,
+            "invocation_count": 20,
+            "total_procedures": 30,
+        },
+    }
+    result = await _grade_procedural(db, "2026-05-01", "2026-05-08", dimension_results)
+    assert result["grade"] is None
+    assert "success_rate" in result.get("reason", "")
+
+
+async def test_zero_fill_single_null_penalizes(db):
+    """A single null factor is treated as 0.0, not skipped."""
+    from genesis.eval.j9_aggregator import _score_with_zero_fill
+
+    # All present: (0.8 * 0.4 + 0.6 * 0.3 + 0.7 * 0.3) * 100 ≈ 71.0
+    all_present = [(0.8, 0.4), (0.6, 0.3), (0.7, 0.3)]
+    assert abs(_score_with_zero_fill(all_present, max_nulls=1) - 71.0) < 0.01
+
+    # One null: (0.8 * 0.4 + 0.0 * 0.3 + 0.7 * 0.3) * 100 ≈ 53.0
+    one_null = [(0.8, 0.4), (None, 0.3), (0.7, 0.3)]
+    assert abs(_score_with_zero_fill(one_null, max_nulls=1) - 53.0) < 0.01
+
+
+async def test_zero_fill_multiple_nulls_returns_none(db):
+    """More than max_nulls null factors → no grade."""
+    from genesis.eval.j9_aggregator import _score_with_zero_fill
+
+    two_nulls = [(0.8, 0.4), (None, 0.3), (None, 0.3)]
+    assert _score_with_zero_fill(two_nulls, max_nulls=1) is None
+
+
 async def test_grade_awareness_from_ticks(db):
-    """Awareness grade computes from awareness_ticks data."""
-    # Insert some awareness ticks
+    """Awareness grade uses tick_regularity + signal_completeness."""
+    import json as _json
+
+    # Build realistic signals_json with 20 distinct signal names
+    signals = [{"name": f"signal_{i}", "value": 0.5} for i in range(20)]
+    signals_json = _json.dumps(signals)
+
     for i in range(25):
         depth = ["Micro", "Light", "Deep", "Strategic"][i % 4] if i < 20 else None
         await db.execute(
             "INSERT INTO awareness_ticks (id, created_at, source, classified_depth, "
-            "signals_json, scores_json) VALUES (?, ?, 'scheduled', ?, '[]', '[]')",
-            (f"tick-{i}", "2026-05-05T12:00:00Z", depth),
+            "signals_json, scores_json) VALUES (?, ?, 'scheduled', ?, ?, '[]')",
+            (f"tick-{i}", "2026-05-05T12:00:00Z", depth, signals_json),
         )
     await db.commit()
 
@@ -373,7 +414,24 @@ async def test_grade_awareness_from_ticks(db):
     assert result["score"] is not None
     assert result["sample_count"] == 25
     assert result["factors"]["classified_count"] == 20
-    assert result["factors"]["depth_balance"] > 0  # Some balance among 4 depths
+    # Signal completeness: 20 unique signals vs 18 expected → 1.0 (capped)
+    assert result["factors"]["signal_completeness"] == 1.0
+    assert result["factors"]["unique_signals"] == 20
+
+
+async def test_grade_awareness_empty_signals(db):
+    """Signal_completeness = 0.0 when signals_json is empty, not a crash."""
+    for i in range(25):
+        await db.execute(
+            "INSERT INTO awareness_ticks (id, created_at, source, classified_depth, "
+            "signals_json, scores_json) VALUES (?, ?, 'scheduled', NULL, '[]', '[]')",
+            (f"tick-{i}", "2026-05-05T12:00:00Z"),
+        )
+    await db.commit()
+    result = await _grade_awareness(db, "2026-05-01", "2026-05-08", {})
+    assert result["grade"] is not None
+    assert result["factors"]["signal_completeness"] == 0.0
+    assert result["factors"]["unique_signals"] == 0
 
 
 async def test_grade_reflection_from_observations(db):
