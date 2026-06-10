@@ -116,6 +116,29 @@ async def run_weekly_aggregation(db: aiosqlite.Connection) -> dict[str, dict]:
 # ── Dimension 1: Memory Retrieval Quality ────────────────────────────────────
 
 
+def _dedupe_by_pair(events: list[dict]) -> list[dict]:
+    """Keep one event per (recall_event_id, memory_id) pair.
+
+    Defends the metrics against duplicate relevance/used events (e.g. produced
+    by a batch that re-judged the same window before checkpointing existed).
+    Keeps the first occurrence — callers pass timestamp-DESC events, so that is
+    the most recent judgment. Events missing either id are kept as-is.
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for ev in events:
+        m = ev.get("metrics", {})
+        rid = m.get("recall_event_id")
+        mid = m.get("memory_id")
+        if rid and mid:
+            key = (rid, mid)
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(ev)
+    return out
+
+
 async def _compute_memory_quality(
     db: aiosqlite.Connection, since: str, until: str,
 ) -> tuple[dict, int]:
@@ -124,6 +147,9 @@ async def _compute_memory_quality(
         db, dimension="memory", event_type="recall_relevance",
         since=since, until=until, limit=5000,
     )
+    # Defensive dedup: duplicate (recall, memory) judgments must not skew the
+    # average (pre-checkpoint batches could emit the same pair multiple times).
+    relevance_events = _dedupe_by_pair(relevance_events)
 
     if not relevance_events:
         return {"precision_at_5": None, "hit_rate": None, "mrr": None,
@@ -164,6 +190,7 @@ async def _compute_memory_quality(
         db, dimension="memory", event_type="recall_used",
         since=since, until=until, limit=5000,
     )
+    used_events = _dedupe_by_pair(used_events)
     total_used = sum(1 for ev in used_events if ev.get("metrics", {}).get("used"))
     total_usage_checked = len(used_events)
 
