@@ -76,6 +76,7 @@ from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
 
+campaign_tools = _campaign_tools
 codebase = _codebase
 db_schema = _db_schema
 errors = _errors
@@ -129,12 +130,14 @@ _impl_direct_session_list = _direct_session_tools._impl_direct_session_list
 # Re-export init functions for runtime wiring
 init_task_tools = _task_tools.init_task_tools
 init_direct_session_tools = _direct_session_tools.init_direct_session_tools
+init_campaign_tools = _campaign_tools.init_campaign_tools
 
 __all__ = [
     "mcp",
     "init_health_mcp",
     "init_task_tools",
     "init_direct_session_tools",
+    "init_campaign_tools",
     "_service",
     "_event_bus",
     "_activity_tracker",

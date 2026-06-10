@@ -188,3 +188,50 @@ async def test_outreach_poll_http_error():
     data = json.loads(result)
     assert "error" in data
     assert "403" in data["error"]
+
+
+# ── standalone category validation tests ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_standalone_invalid_category():
+    """Standalone path should reject invalid categories before enqueuing."""
+    mock_db = AsyncMock()
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = mock_db
+        tools = await mcp.get_tools()
+        result = await tools["outreach_send"].fn(
+            message="Test", category="discord", channel="discord",
+        )
+        data = json.loads(result)
+        assert "error" in data
+        assert "Invalid category" in data["error"]
+        assert "discord" in data["error"]
+        # Verify DB was NOT called (message not enqueued)
+        mock_db.execute.assert_not_called()
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db
+
+
+@pytest.mark.asyncio
+async def test_send_standalone_valid_category():
+    """Standalone path should accept valid categories and enqueue."""
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = AsyncMock()
+        with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+             patch("genesis.db.crud.pending_outreach.enqueue", new_callable=AsyncMock, return_value="pending-123"):
+            tools = await mcp.get_tools()
+            result = await tools["outreach_send"].fn(
+                message="Test post", category="content", channel="discord",
+            )
+        data = json.loads(result)
+        assert data["status"] == "queued"
+        assert data["pending_id"] == "pending-123"
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db

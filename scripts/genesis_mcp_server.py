@@ -190,6 +190,19 @@ def _bootstrap_health(transport_kwargs: dict) -> None:
                     exc_info=True,
                 )
 
+            # Wire campaign tools with DB-only access.
+            # Standalone MCP provides read/update access to campaigns;
+            # trigger and schedule hot-reload require the main server.
+            try:
+                from genesis.mcp.health.campaign_tools import init_campaign_tools
+
+                init_campaign_tools(runner=None, db=db)
+            except Exception:
+                logger.warning(
+                    "Campaign tools not available in standalone MCP",
+                    exc_info=True,
+                )
+
             clear_mcp_crash("health")
             yield
         finally:
