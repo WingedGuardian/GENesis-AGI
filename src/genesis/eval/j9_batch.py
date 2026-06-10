@@ -106,6 +106,7 @@ class J9EvalBatchExecutor:
             dimension="memory",
             event_type="recall_fired",
             since=since,
+            until=until,
             limit=200,
         )
 
@@ -181,21 +182,27 @@ class J9EvalBatchExecutor:
                 else:
                     errors += 1
 
-        await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 _judge_and_store(i, event, query, mid)
                 for i, (event, query, mid) in enumerate(worklist)
             ),
             return_exceptions=True,
         )
+        # return_exceptions=True turns a raised coroutine into a returned value;
+        # surface it instead of silently dropping it.
+        for r in results:
+            if isinstance(r, Exception):
+                logger.warning("J9 judge coroutine raised: %s", r)
+                errors += 1
 
         # Pass 2: recall_used — check if recalled memories were referenced
         # in session-extracted content (text overlap, no LLM needed).
-        used_count = await self._compute_recall_used(
+        used_count, used_cut_short = await self._compute_recall_used(
             since, until, recall_events, deadline,
         )
 
-        partial = deferred > 0
+        partial = deferred > 0 or used_cut_short
         content = (
             f"J9 eval batch: scored {scored} memory-query pairs "
             f"({errors} errors, {len(already_judged)} already-judged skipped, "
@@ -229,6 +236,14 @@ class J9EvalBatchExecutor:
             until=until,
             limit=_CHECKPOINT_QUERY_LIMIT,
         )
+        if len(events) >= _CHECKPOINT_QUERY_LIMIT:
+            # Checkpoint may be incomplete → some pairs could be re-judged.
+            # Loud rather than silent (the very backlog this fix prevents).
+            logger.warning(
+                "J9 checkpoint query for %s hit limit %d — checkpoint may be "
+                "incomplete; some pairs may be re-judged this run",
+                event_type, _CHECKPOINT_QUERY_LIMIT,
+            )
         pairs: set[tuple[str, str]] = set()
         for ev in events:
             m = ev.get("metrics", {})
@@ -241,16 +256,19 @@ class J9EvalBatchExecutor:
     async def _compute_recall_used(
         self, since: str, until: str, recall_events: list[dict],
         deadline: float,
-    ) -> int:
+    ) -> tuple[int, bool]:
         """Check if recalled memories were referenced in session-extracted content.
 
         Uses text overlap (trigram similarity) between recalled memory content
         and memories extracted from the same session. No LLM calls needed.
         Checkpointed (skips already-emitted pairs) and deadline-aware so a
         retried run resumes rather than re-emitting duplicates.
+
+        Returns ``(used_count, cut_short)`` — ``cut_short`` is True if the
+        deadline interrupted pass 2 (remaining sessions resume next run).
         """
         if self._db is None:
-            return 0
+            return 0, False
 
         already_used = await self._judged_pairs(
             since, until, event_type="recall_used",
@@ -264,10 +282,12 @@ class J9EvalBatchExecutor:
                 by_session.setdefault(sid, []).append(ev)
 
         used_count = 0
+        cut_short = False
         for session_id, events in by_session.items():
             if not session_id:
                 continue  # Skip events without session attribution
             if time.monotonic() > deadline:
+                cut_short = True
                 break  # Out of budget — remaining sessions resume next run
             # Get memories extracted FROM this session via pending_embeddings
             # which tracks source_session_id for each extracted memory.
@@ -327,7 +347,7 @@ class J9EvalBatchExecutor:
                     except Exception:
                         logger.debug("Failed to emit recall_used for %s", mid)
 
-        return used_count
+        return used_count, cut_short
 
     async def _get_memory_content(self, memory_id: str) -> str | None:
         """Fetch memory content from Qdrant payload or FTS5."""
