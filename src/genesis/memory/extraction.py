@@ -67,6 +67,24 @@ DO NOT extract:
 - Git operations (commit hashes, merge descriptions, branch operations)
 - Routine procedural decisions ("decided to create new commit instead of amending")
 
+DO extract as type "procedure_candidate":
+- Non-obvious approaches that worked (the fix was X instead of Y because Z)
+- Workarounds for tools or systems (e.g., "HA Supervisor requires full
+  uninstall/reinstall to pick up code changes")
+- Multi-step processes figured out through investigation
+- Recovery patterns: tried A, it failed, the fix was B
+- Context-dependent knowledge: this only works when condition C
+
+A procedure_candidate extraction should include:
+- content: what to do (the procedure itself)
+- scenario: when this applies (natural language trigger condition)
+- entities: tools, systems, services involved
+
+Do NOT extract as procedure_candidate:
+- Obvious operations (git commit, pip install, standard CLI usage)
+- One-time fixes specific to this exact situation with no reuse value
+- Debugging steps that only apply to this particular bug
+
 Respond with a JSON object inside backticks containing:
 1. "extractions" — array of extracted facts
 2. "session_keywords" — array of keywords from this conversation (proper nouns,
@@ -135,11 +153,12 @@ class Extraction:
     """A single extracted entity/decision/evaluation from a conversation."""
 
     content: str
-    extraction_type: str  # entity, decision, evaluation, action_item, preference, concept
+    extraction_type: str  # entity, decision, evaluation, action_item, preference, concept, procedure_candidate
     confidence: float
     entities: list[str] = field(default_factory=list)
     relationships: list[dict] = field(default_factory=list)
     temporal: str | None = None
+    scenario: str | None = None  # "when to use this" — procedure_candidate extractions only
     # SVO event fields (populated when extraction describes a concrete action)
     event_subject: str | None = None
     event_verb: str | None = None
@@ -241,6 +260,7 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
         if ext_type not in (
             "entity", "decision", "evaluation",
             "action_item", "preference", "concept",
+            "procedure_candidate",
         ):
             ext_type = "entity"
 
@@ -281,6 +301,11 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
             event_verb = str(event["verb"]) if event.get("verb") else None
             event_object = str(event["object"]) if event.get("object") else None
 
+        # Parse optional scenario field (procedure_candidate extractions)
+        scenario = item.get("scenario")
+        if scenario is not None:
+            scenario = str(scenario).strip() or None
+
         extractions.append(Extraction(
             content=content,
             extraction_type=ext_type,
@@ -288,6 +313,7 @@ def parse_extraction_response_full(text: str) -> ParsedResponse:
             entities=entities,
             relationships=valid_rels,
             temporal=temporal,
+            scenario=scenario,
             event_subject=event_subject,
             event_verb=event_verb,
             event_object=event_object,
