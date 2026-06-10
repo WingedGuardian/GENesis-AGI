@@ -233,6 +233,16 @@
                         "timeout": 2000
                     }
                 ]
+            },
+            {
+                "matcher": "ExitWorktree",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/worktree_cwd_guard.py --exit-worktree",
+                        "timeout": 2000
+                    }
+                ]
             }
         ],
         "Stop": [
