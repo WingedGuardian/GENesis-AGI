@@ -196,15 +196,20 @@ npm pinning gives full version control. Upgrades are deliberate via recon triage
 from npm. Set `DISABLE_INSTALLATION_CHECKS=1` to suppress this. The install script
 adds this to `~/.bashrc` automatically. Do NOT run `claude install`.
 
-**Dual npm prefix gotcha (2026-06-01):** Container systems may have two npm prefix
-locations (`/usr/local` and `/usr`). `which claude` resolves to `/usr/local/bin/claude`,
-so installs must explicitly target that prefix:
+**Dual npm prefix gotcha (2026-06-01, revised 2026-06-10):** Containers may have
+multiple npm prefix locations. The install script now auto-detects which prefix PATH
+resolves by checking `npm config get prefix`:
+- **User-level prefix** (e.g. `~/.npm-global`): installs without sudo or `--prefix`,
+  so `which claude` finds the new binary directly.
+- **System-level prefix** (`/usr/local` or `/usr`): installs with `sudo --prefix /usr/local`
+  to avoid the `/usr/lib` misrouting issue.
+
+For manual upgrades, use plain `npm install -g` (no `--prefix`) — it installs to
+your configured prefix, which is what PATH finds:
 ```bash
-sudo npm install -g --prefix /usr/local @anthropic-ai/claude-code@<version>
+npm install -g @anthropic-ai/claude-code@<version>
 ```
-Running `sudo npm install -g` without `--prefix /usr/local` lands in `/usr/lib/` and
-does not update the `claude` binary on PATH. **`scripts/install.sh` now passes
-`--prefix /usr/local` automatically** — manual upgrades still need it.
+If your prefix requires root (`/usr/local`), add `sudo --prefix /usr/local`.
 
 **Host VM variation (verified 2026-06-10):** The host VM uses CC's **native
 installer** — NOT npm. Versioned binaries live in `~/.local/share/claude/versions/`
