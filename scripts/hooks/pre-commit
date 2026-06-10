@@ -31,8 +31,9 @@ if git diff --cached --name-only | grep -vE '\.example$' | grep -qE '\.env$|\.en
     exit 1
 fi
 
-# Block common secret patterns
-if git diff --cached --diff-filter=ACM -z -- '*.py' '*.js' '*.json' '*.yml' '*.yaml' '*.toml' '*.md' | \
+# Block common secret patterns (exclude tests/ — test fixtures use fake keys)
+if git diff --cached --diff-filter=ACM -z -- '*.py' '*.js' '*.json' '*.yml' '*.yaml' '*.toml' '*.md' \
+   ':!tests/*' ':!test_*' | \
    grep -PIz '(?i)(sk-[a-zA-Z0-9]{20,}|AKIA[A-Z0-9]{16}|ghp_[a-zA-Z0-9]{36}|-----BEGIN (RSA |EC )?PRIVATE KEY-----)' 2>/dev/null; then
     echo "BLOCKED: Possible secret/API key detected in staged changes."
     echo "If this is a false positive, commit with --no-verify (but think twice)."
