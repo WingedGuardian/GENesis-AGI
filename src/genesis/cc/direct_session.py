@@ -35,6 +35,7 @@ from genesis.cc.types import (
     SessionType,
     StreamEvent,
     background_session_dir,
+    cc_project_key,
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.tasks import tracked_task
@@ -836,19 +837,18 @@ class DirectSessionRunner:
 
         # Derive transcript path from CC's project-key convention:
         # working_dir ~/.genesis/background-sessions → project key
-        # -home-ubuntu--genesis-background-sessions → transcript .jsonl
+        # -home-ubuntu--genesis-background-sessions → transcript .jsonl.
+        # NOTE: CC encodes EVERY non-alphanumeric char (incl. the leading
+        # dot of ~/.genesis) as '-', so use cc_project_key — a bare
+        # .replace("/", "-") leaves the dot and yields a wrong path.
         transcript_path = ""
         if result.cc_session_id:
             from pathlib import Path
 
-            project_key = (
-                background_session_dir()
-                .replace("/", "-")
-                .lstrip("-")
-            )
+            project_key = cc_project_key(background_session_dir())
             transcript_path = str(
                 Path.home() / ".claude" / "projects"
-                / f"-{project_key}" / f"{result.cc_session_id}.jsonl"
+                / project_key / f"{result.cc_session_id}.jsonl"
             )
 
         existing.update({

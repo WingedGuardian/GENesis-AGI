@@ -12,7 +12,24 @@ from genesis.cc.types import (
     SessionType,
     StreamEvent,
     background_session_dir,
+    cc_project_key,
 )
+
+
+def test_cc_project_key_encodes_slashes_and_dots():
+    # CC names the transcript dir under ~/.claude/projects/ by mapping
+    # EVERY non-alphanumeric char in the abs working-dir path to '-'
+    # (no collapsing). The leading dot of ~/.genesis must become '-',
+    # yielding a double-dash. The old bug only replaced '/', leaving the
+    # dot intact and producing a wrong (nonexistent) path.
+    assert (
+        cc_project_key("/home/ubuntu/.genesis/background-sessions")
+        == "-home-ubuntu--genesis-background-sessions"
+    )
+
+
+def test_cc_project_key_preserves_existing_dashes():
+    assert cc_project_key("/a/b-c/d") == "-a-b-c-d"
 
 
 def test_enums_have_expected_values():
