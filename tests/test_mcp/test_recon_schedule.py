@@ -16,7 +16,10 @@ def schedule_file(tmp_path, monkeypatch):
             "web_monitoring": {"description": "Web check", "cron": "0 6 * * 5", "enabled": True},
         }
     }))
-    monkeypatch.setattr(recon_mcp, "_SCHEDULES_PATH", path)
+    # Module uses _USER_SCHEDULES (if exists) else _REPO_SCHEDULES
+    monkeypatch.setattr(recon_mcp, "_USER_SCHEDULES", path)
+    monkeypatch.setattr(recon_mcp, "_REPO_SCHEDULES", path)
+    monkeypatch.setattr(recon_mcp, "_USER_CONFIG_DIR", tmp_path)
     return path
 
 

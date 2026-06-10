@@ -11,7 +11,10 @@ from genesis.mcp.recon_mcp import mcp
 def source_files(tmp_path, monkeypatch):
     sources_path = tmp_path / "recon_sources.yaml"
     sources_path.write_text(yaml.safe_dump({"sources": []}))
-    monkeypatch.setattr(recon_mcp, "_SOURCES_PATH", sources_path)
+    # Module uses _USER_SOURCES (if exists) else _REPO_SOURCES
+    monkeypatch.setattr(recon_mcp, "_USER_SOURCES", sources_path)
+    monkeypatch.setattr(recon_mcp, "_REPO_SOURCES", sources_path)
+    monkeypatch.setattr(recon_mcp, "_USER_CONFIG_DIR", tmp_path)
 
     watchlist_path = tmp_path / "recon_watchlist.yaml"
     watchlist_path.write_text(yaml.safe_dump({
